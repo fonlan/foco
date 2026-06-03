@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "app",
+    "agent",
+    "providers",
+    "tools",
+    "graph",
+    "mcp",
+    "store",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+foco-agent = { path = "agent" }
+foco-graph = { path = "graph" }
+foco-mcp = { path = "mcp" }
+foco-providers = { path = "providers" }
+foco-store = { path = "store" }
+foco-tools = { path = "tools" }

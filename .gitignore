@@ -1,4 +1,8 @@
-TODO.md
 AGENTS.md
 
 .mem/
+.codegraph/
+target/
+node_modules/
+web/dist/
+*.tsbuildinfo

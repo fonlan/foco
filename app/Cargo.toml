@@ -1,0 +1,17 @@
+[package]
+name = "foco-app"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "foco"
+path = "main.rs"
+
+[dependencies]
+foco-agent.workspace = true
+foco-graph.workspace = true
+foco-mcp.workspace = true
+foco-providers.workspace = true
+foco-store.workspace = true
+foco-tools.workspace = true
