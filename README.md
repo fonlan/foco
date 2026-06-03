@@ -48,6 +48,13 @@ the selected provider through `genai`, and `POST /api/models/manual` also saves
 model-provider associations, the active provider, and the model thinking level.
 Capability warnings are shown without silently changing saved choices.
 
+Workspace databases store LLM audit records in `llm_requests` and streamed audit
+events in `llm_request_events`. Audit inserts require request time, workspace,
+provider, model, status/final state, latency fields, normalized token usage, and
+non-secret request/response JSON. Authorization headers and API-key fields are
+redacted before persistence, and cache ratio is calculated from normalized input
+and cache-read token counts.
+
 For live frontend development, run the Vite dev server alongside the backend:
 
 ```bash

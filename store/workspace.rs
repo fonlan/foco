@@ -5,17 +5,24 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 
 use crate::config::WorkspaceConfig;
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 1;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 2;
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: MIGRATION_001,
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: MIGRATION_001,
+    },
+    Migration {
+        version: 2,
+        sql: MIGRATION_002,
+    },
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceDatabaseInfo {
@@ -305,38 +312,46 @@ impl WorkspaceDatabase {
         &mut self,
         request: NewLlmRequest<'_>,
     ) -> Result<(), WorkspaceDatabaseError> {
-        let now = now_timestamp();
+        validate_llm_request_tokens(&request)?;
+
+        let cache_ratio = calculate_cache_ratio(request.input_tokens, request.cache_read_tokens)?;
+        let request_body_json =
+            redact_optional_audit_json(request.request_body_json, "request_body_json")?;
+        let response_body_json =
+            redact_optional_audit_json(request.response_body_json, "response_body_json")?;
 
         self.connection
             .execute(
                 "INSERT INTO llm_requests
                     (
-                        id, chat_id, provider_id, model_id, request_started_at,
+                        id, workspace_id, chat_id, provider_id, model_id, request_started_at,
                         first_token_at, completed_at, input_tokens, output_tokens,
-                        cache_read_tokens, cache_write_tokens, first_token_latency_ms,
-                        total_latency_ms, status_code, final_state, request_body_json,
-                        response_body_json
+                        cache_read_tokens, cache_write_tokens, cache_ratio,
+                        first_token_latency_ms, total_latency_ms, status_code, final_state,
+                        request_body_json, response_body_json
                     )
                  VALUES
-                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
                 params![
                     request.id,
+                    request.workspace_id,
                     request.chat_id,
                     request.provider_id,
                     request.model_id,
-                    now,
+                    request.request_started_at,
                     request.first_token_at,
                     request.completed_at,
                     request.input_tokens,
                     request.output_tokens,
                     request.cache_read_tokens,
                     request.cache_write_tokens,
+                    cache_ratio,
                     request.first_token_latency_ms,
                     request.total_latency_ms,
                     request.status_code,
                     request.final_state,
-                    request.request_body_json,
-                    request.response_body_json
+                    request_body_json,
+                    response_body_json
                 ],
             )
             .map_err(|source| self.sqlite_error(source))?;
@@ -351,38 +366,103 @@ impl WorkspaceDatabase {
         self.connection
             .query_row(
                 "SELECT
-                    id, chat_id, provider_id, model_id, request_started_at,
+                    id, workspace_id, chat_id, provider_id, model_id, request_started_at,
                     first_token_at, completed_at, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_tokens, first_token_latency_ms,
-                    total_latency_ms, status_code, final_state, request_body_json,
-                    response_body_json
+                    cache_read_tokens, cache_write_tokens, cache_ratio,
+                    first_token_latency_ms, total_latency_ms, status_code, final_state,
+                    request_body_json, response_body_json
                  FROM llm_requests
                  WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok(LlmRequestRecord {
                         id: row.get(0)?,
-                        chat_id: row.get(1)?,
-                        provider_id: row.get(2)?,
-                        model_id: row.get(3)?,
-                        request_started_at: row.get(4)?,
-                        first_token_at: row.get(5)?,
-                        completed_at: row.get(6)?,
-                        input_tokens: row.get(7)?,
-                        output_tokens: row.get(8)?,
-                        cache_read_tokens: row.get(9)?,
-                        cache_write_tokens: row.get(10)?,
-                        first_token_latency_ms: row.get(11)?,
-                        total_latency_ms: row.get(12)?,
-                        status_code: row.get(13)?,
-                        final_state: row.get(14)?,
-                        request_body_json: row.get(15)?,
-                        response_body_json: row.get(16)?,
+                        workspace_id: row.get(1)?,
+                        chat_id: row.get(2)?,
+                        provider_id: row.get(3)?,
+                        model_id: row.get(4)?,
+                        request_started_at: row.get(5)?,
+                        first_token_at: row.get(6)?,
+                        completed_at: row.get(7)?,
+                        input_tokens: row.get(8)?,
+                        output_tokens: row.get(9)?,
+                        cache_read_tokens: row.get(10)?,
+                        cache_write_tokens: row.get(11)?,
+                        cache_ratio: row.get(12)?,
+                        first_token_latency_ms: row.get(13)?,
+                        total_latency_ms: row.get(14)?,
+                        status_code: row.get(15)?,
+                        final_state: row.get(16)?,
+                        request_body_json: row.get(17)?,
+                        response_body_json: row.get(18)?,
                     })
                 },
             )
             .optional()
             .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn insert_llm_request_event(
+        &mut self,
+        event: NewLlmRequestEvent<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let raw_chunk_json = redact_optional_audit_json(event.raw_chunk_json, "raw_chunk_json")?;
+        let normalized_event_json =
+            redact_audit_json(event.normalized_event_json, "normalized_event_json")?;
+
+        self.connection
+            .execute(
+                "INSERT INTO llm_request_events
+                    (
+                        id, llm_request_id, sequence, event_at, event_type,
+                        raw_chunk_json, normalized_event_json
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event.id,
+                    event.llm_request_id,
+                    event.sequence,
+                    event.event_at,
+                    event.event_type,
+                    raw_chunk_json,
+                    normalized_event_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn llm_request_events(
+        &self,
+        llm_request_id: &str,
+    ) -> Result<Vec<LlmRequestEventRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    id, llm_request_id, sequence, event_at, event_type,
+                    raw_chunk_json, normalized_event_json
+                 FROM llm_request_events
+                 WHERE llm_request_id = ?1
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![llm_request_id], |row| {
+                Ok(LlmRequestEventRecord {
+                    id: row.get(0)?,
+                    llm_request_id: row.get(1)?,
+                    sequence: row.get(2)?,
+                    event_at: row.get(3)?,
+                    event_type: row.get(4)?,
+                    raw_chunk_json: row.get(5)?,
+                    normalized_event_json: row.get(6)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
     }
 
     fn sqlite_error(&self, source: rusqlite::Error) -> WorkspaceDatabaseError {
@@ -447,9 +527,11 @@ pub struct RunEventRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewLlmRequest<'a> {
     pub id: &'a str,
+    pub workspace_id: &'a str,
     pub chat_id: Option<&'a str>,
     pub provider_id: &'a str,
     pub model_id: &'a str,
+    pub request_started_at: &'a str,
     pub first_token_at: Option<&'a str>,
     pub completed_at: Option<&'a str>,
     pub input_tokens: Option<i64>,
@@ -464,9 +546,10 @@ pub struct NewLlmRequest<'a> {
     pub response_body_json: Option<&'a str>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LlmRequestRecord {
     pub id: String,
+    pub workspace_id: Option<String>,
     pub chat_id: Option<String>,
     pub provider_id: String,
     pub model_id: String,
@@ -477,6 +560,7 @@ pub struct LlmRequestRecord {
     pub output_tokens: Option<i64>,
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
+    pub cache_ratio: Option<f64>,
     pub first_token_latency_ms: Option<i64>,
     pub total_latency_ms: Option<i64>,
     pub status_code: Option<i64>,
@@ -485,8 +569,37 @@ pub struct LlmRequestRecord {
     pub response_body_json: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewLlmRequestEvent<'a> {
+    pub id: &'a str,
+    pub llm_request_id: &'a str,
+    pub sequence: i64,
+    pub event_at: &'a str,
+    pub event_type: &'a str,
+    pub raw_chunk_json: Option<&'a str>,
+    pub normalized_event_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlmRequestEventRecord {
+    pub id: String,
+    pub llm_request_id: String,
+    pub sequence: i64,
+    pub event_at: String,
+    pub event_type: String,
+    pub raw_chunk_json: Option<String>,
+    pub normalized_event_json: String,
+}
+
 #[derive(Debug)]
 pub enum WorkspaceDatabaseError {
+    InvalidAuditJson {
+        field: &'static str,
+        source: serde_json::Error,
+    },
+    InvalidAuditTokens {
+        message: String,
+    },
     Io {
         path: PathBuf,
         source: io::Error,
@@ -514,6 +627,12 @@ pub enum WorkspaceDatabaseError {
 impl fmt::Display for WorkspaceDatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidAuditJson { field, source } => {
+                write!(formatter, "invalid LLM audit JSON in {field}: {source}")
+            }
+            Self::InvalidAuditTokens { message } => {
+                write!(formatter, "invalid LLM audit token usage: {message}")
+            }
             Self::Io { path, source } => write!(formatter, "{}: {}", path.display(), source),
             Self::MissingDatabaseParent { path } => write!(
                 formatter,
@@ -549,9 +668,11 @@ impl fmt::Display for WorkspaceDatabaseError {
 impl std::error::Error for WorkspaceDatabaseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::InvalidAuditJson { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
-            Self::MissingDatabaseParent { .. }
+            Self::InvalidAuditTokens { .. }
+            | Self::MissingDatabaseParent { .. }
             | Self::NonUtf8Path { .. }
             | Self::UnsupportedSchemaVersion { .. }
             | Self::WorkspaceNotDirectory { .. } => None,
@@ -733,6 +854,112 @@ fn collect_rows<T>(
 
 fn now_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn validate_llm_request_tokens(request: &NewLlmRequest<'_>) -> Result<(), WorkspaceDatabaseError> {
+    for (name, value) in [
+        ("input_tokens", request.input_tokens),
+        ("output_tokens", request.output_tokens),
+        ("cache_read_tokens", request.cache_read_tokens),
+        ("cache_write_tokens", request.cache_write_tokens),
+    ] {
+        if let Some(value) = value
+            && value < 0
+        {
+            return Err(WorkspaceDatabaseError::InvalidAuditTokens {
+                message: format!("{name} must be non-negative, got {value}"),
+            });
+        }
+    }
+
+    if let (Some(input_tokens), Some(cache_read_tokens)) =
+        (request.input_tokens, request.cache_read_tokens)
+    {
+        if input_tokens == 0 && cache_read_tokens > 0 {
+            return Err(WorkspaceDatabaseError::InvalidAuditTokens {
+                message: "cache_read_tokens cannot be positive when input_tokens is zero"
+                    .to_string(),
+            });
+        }
+
+        if cache_read_tokens > input_tokens {
+            return Err(WorkspaceDatabaseError::InvalidAuditTokens {
+                message: format!(
+                    "cache_read_tokens ({cache_read_tokens}) cannot exceed input_tokens ({input_tokens})"
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn calculate_cache_ratio(
+    input_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+) -> Result<Option<f64>, WorkspaceDatabaseError> {
+    match (input_tokens, cache_read_tokens) {
+        (Some(input_tokens), Some(cache_read_tokens)) if input_tokens > 0 => {
+            if cache_read_tokens > input_tokens {
+                return Err(WorkspaceDatabaseError::InvalidAuditTokens {
+                    message: format!(
+                        "cache_read_tokens ({cache_read_tokens}) cannot exceed input_tokens ({input_tokens})"
+                    ),
+                });
+            }
+
+            Ok(Some(cache_read_tokens as f64 / input_tokens as f64))
+        }
+        (Some(_), Some(_)) => Ok(None),
+        _ => Ok(None),
+    }
+}
+
+fn redact_optional_audit_json(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<Option<String>, WorkspaceDatabaseError> {
+    value.map(|json| redact_audit_json(json, field)).transpose()
+}
+
+fn redact_audit_json(value: &str, field: &'static str) -> Result<String, WorkspaceDatabaseError> {
+    let mut parsed: Value = serde_json::from_str(value)
+        .map_err(|source| WorkspaceDatabaseError::InvalidAuditJson { field, source })?;
+
+    redact_json_value(&mut parsed);
+
+    serde_json::to_string(&parsed)
+        .map_err(|source| WorkspaceDatabaseError::InvalidAuditJson { field, source })
+}
+
+fn redact_json_value(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if is_secret_audit_key(key) {
+                    *value = Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_json_value(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_value(item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn is_secret_audit_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| *character != '-' && *character != '_')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+
+    normalized == "authorization" || normalized.contains("apikey")
 }
 
 const MIGRATION_001: &str = r#"
@@ -923,4 +1150,28 @@ CREATE TABLE code_graph_fts_data (
     updated_at TEXT NOT NULL,
     UNIQUE (entity_kind, entity_id)
 );
+"#;
+
+const MIGRATION_002: &str = r#"
+ALTER TABLE llm_requests
+    ADD COLUMN workspace_id TEXT CHECK (workspace_id IS NULL OR length(workspace_id) > 0);
+
+ALTER TABLE llm_requests
+    ADD COLUMN cache_ratio REAL CHECK (cache_ratio IS NULL OR (cache_ratio >= 0.0 AND cache_ratio <= 1.0));
+
+CREATE INDEX llm_requests_workspace_started_at_idx ON llm_requests (workspace_id, request_started_at);
+
+CREATE TABLE llm_request_events (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    llm_request_id TEXT NOT NULL REFERENCES llm_requests(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    event_at TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK (length(event_type) > 0),
+    raw_chunk_json TEXT,
+    normalized_event_json TEXT NOT NULL,
+    UNIQUE (llm_request_id, sequence)
+);
+
+CREATE INDEX llm_request_events_request_sequence_idx ON llm_request_events (llm_request_id, sequence);
+CREATE INDEX llm_request_events_type_idx ON llm_request_events (event_type);
 "#;
