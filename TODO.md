@@ -19,13 +19,13 @@
 
 ## 01. Minimal Local App
 
-- [ ] Start a Tokio runtime from `app/main.rs`.
-- [ ] Start an Axum HTTP server bound to `127.0.0.1` on a configurable local port.
-- [ ] Add `GET /api/health`.
-- [ ] Serve a minimal frontend page from the local HTTP server.
-- [ ] Add frontend API wiring that calls `GET /api/health`.
-- [ ] Show the server health state in the frontend.
-- [ ] Verify that the app can be started locally and reached in a browser.
+- [x] Start a Tokio runtime from `app/main.rs`.
+- [x] Start an Axum HTTP server bound to `127.0.0.1` on a configurable local port.
+- [x] Add `GET /api/health`.
+- [x] Serve a minimal frontend page from the local HTTP server.
+- [x] Add frontend API wiring that calls `GET /api/health`.
+- [x] Show the server health state in the frontend.
+- [x] Verify that the app can be started locally and reached in a browser.
 
 ## 02. First-Run Config And Logging
 

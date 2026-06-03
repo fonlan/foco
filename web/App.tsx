@@ -1,60 +1,130 @@
-import { Blocks, Code2, Server, Terminal } from "lucide-react";
+import {
+  Activity,
+  CheckCircle2,
+  LoaderCircle,
+  RefreshCw,
+  ServerCrash,
+} from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
 
-const panels = [
-  {
-    icon: Blocks,
-    label: "Workspace",
-    value: "Cargo + npm",
-  },
-  {
-    icon: Server,
-    label: "Backend",
-    value: "Rust",
-  },
-  {
-    icon: Code2,
-    label: "Frontend",
-    value: "React 19",
-  },
-];
+type HealthResponse = {
+  service: string;
+  status: string;
+};
+
+type HealthState =
+  | { checkedAt?: string; kind: "loading"; message: string }
+  | { checkedAt: string; kind: "online"; message: string }
+  | { checkedAt: string; kind: "offline"; message: string };
 
 export function App() {
+  const [health, setHealth] = useState<HealthState>({
+    kind: "loading",
+    message: "Checking local server",
+  });
+
+  const refreshHealth = useCallback(async () => {
+    setHealth({ kind: "loading", message: "Checking local server" });
+
+    try {
+      const response = await fetch("/api/health", { cache: "no-store" });
+
+      if (!response.ok) {
+        throw new Error(`/api/health returned ${response.status}`);
+      }
+
+      const data = (await response.json()) as HealthResponse;
+
+      if (data.status !== "ok") {
+        throw new Error(`/api/health returned status "${data.status}"`);
+      }
+
+      setHealth({
+        checkedAt: new Date().toLocaleTimeString(),
+        kind: "online",
+        message: `${data.service} server is online`,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unknown error";
+
+      setHealth({
+        checkedAt: new Date().toLocaleTimeString(),
+        kind: "offline",
+        message,
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshHealth();
+  }, [refreshHealth]);
+
+  const StatusIcon =
+    health.kind === "online"
+      ? CheckCircle2
+      : health.kind === "offline"
+        ? ServerCrash
+        : LoaderCircle;
+
   return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-100">
-      <section className="mx-auto flex min-h-screen w-full max-w-5xl flex-col justify-center gap-8 px-6 py-10">
-        <header className="space-y-3">
-          <div className="flex items-center gap-3 text-emerald-300">
-            <Terminal aria-hidden="true" className="size-7" />
-            <span className="text-sm font-medium uppercase tracking-wide">
-              Foco
-            </span>
+    <main className="min-h-screen bg-[#f7f8fb] text-zinc-950">
+      <section className="mx-auto flex min-h-screen w-full max-w-3xl flex-col justify-center gap-6 px-6 py-10">
+        <header className="flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2 text-emerald-700">
+              <Activity aria-hidden="true" className="size-6" />
+              <span className="text-sm font-semibold uppercase tracking-wide">
+                Foco
+              </span>
+            </div>
+            <h1 className="mt-3 text-3xl font-semibold text-zinc-950">
+              Local app status
+            </h1>
           </div>
-          <h1 className="text-4xl font-semibold text-white sm:text-5xl">
-            Local agent workspace
-          </h1>
-          <p className="max-w-2xl text-base leading-7 text-zinc-300">
-            The repository skeleton is ready for the backend server, provider
-            runtime, graph tools, storage layer, and browser UI.
-          </p>
+
+          <button
+            className="inline-flex h-10 items-center gap-2 border border-zinc-300 bg-white px-4 text-sm font-medium text-zinc-900 shadow-sm transition hover:border-zinc-400 hover:bg-zinc-50"
+            onClick={() => void refreshHealth()}
+            type="button"
+          >
+            <RefreshCw aria-hidden="true" className="size-4" />
+            Refresh
+          </button>
         </header>
 
-        <div className="grid gap-3 sm:grid-cols-3">
-          {panels.map((panel) => {
-            const Icon = panel.icon;
+        <div className="border border-zinc-200 bg-white p-5 shadow-sm">
+          <div className="flex items-start gap-4">
+            <div
+              className={
+                health.kind === "online"
+                  ? "text-emerald-600"
+                  : health.kind === "offline"
+                    ? "text-rose-600"
+                    : "text-cyan-700"
+              }
+            >
+              <StatusIcon
+                aria-hidden="true"
+                className={
+                  health.kind === "loading" ? "size-7 animate-spin" : "size-7"
+                }
+              />
+            </div>
 
-            return (
-              <article
-                className="border border-zinc-800 bg-zinc-900/70 p-4"
-                key={panel.label}
-              >
-                <Icon aria-hidden="true" className="mb-5 size-6 text-cyan-300" />
-                <p className="text-sm text-zinc-400">{panel.label}</p>
-                <p className="mt-1 text-lg font-medium text-white">
-                  {panel.value}
+            <div className="min-w-0 flex-1" aria-live="polite">
+              <p className="text-sm font-medium uppercase tracking-wide text-zinc-500">
+                Server health
+              </p>
+              <p className="mt-2 break-words text-2xl font-semibold text-zinc-950">
+                {health.message}
+              </p>
+              {health.checkedAt ? (
+                <p className="mt-3 text-sm text-zinc-500">
+                  Last checked at {health.checkedAt}
                 </p>
-              </article>
-            );
-          })}
+              ) : null}
+            </div>
+          </div>
         </div>
       </section>
     </main>

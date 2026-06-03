@@ -5,7 +5,7 @@
     "web"
   ],
   "scripts": {
-    "backend": "cargo run -p foco-app",
+    "backend": "npm run build -w web && cargo run -p foco-app",
     "frontend": "npm run dev -w web",
     "test": "cargo test --workspace && npm run typecheck -w web",
     "typecheck": "npm run typecheck -w web",

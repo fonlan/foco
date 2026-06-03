@@ -10,13 +10,17 @@ Install frontend dependencies once:
 npm install
 ```
 
-Run the backend:
+Run the backend. This builds the frontend once, then serves it from the Rust
+HTTP server:
 
 ```bash
 npm run backend
 ```
 
-Run the frontend:
+The backend binds to `127.0.0.1:3210` by default. Set `FOCO_PORT` to use a
+different local port.
+
+For live frontend development, run the Vite dev server alongside the backend:
 
 ```bash
 npm run frontend

@@ -9,9 +9,13 @@ name = "foco"
 path = "main.rs"
 
 [dependencies]
+axum.workspace = true
 foco-agent.workspace = true
 foco-graph.workspace = true
 foco-mcp.workspace = true
 foco-providers.workspace = true
 foco-store.workspace = true
 foco-tools.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
