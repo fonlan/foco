@@ -5,9 +5,12 @@ use std::{
 };
 
 use axum::{Json, Router, routing::get};
+use foco_store::config::load_or_create_global_config;
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
+
+mod logging;
 
 const DEFAULT_PORT: u16 = 3210;
 const PORT_ENV: &str = "FOCO_PORT";
@@ -15,7 +18,22 @@ const PORT_ENV: &str = "FOCO_PORT";
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::main]
-async fn main() -> AppResult<()> {
+async fn main() {
+    if let Err(error) = run().await {
+        eprintln!("Foco startup failed: {error}");
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> AppResult<()> {
+    let loaded_config = load_or_create_global_config()?;
+    logging::init(&loaded_config.paths.logs_dir)?;
+
+    tracing::info!(
+        config = %loaded_config.config.to_redacted_log_json()?,
+        "loaded global config"
+    );
+
     let addr = local_addr()?;
     let frontend_dir = frontend_dist_dir()?;
     let app = Router::new()
@@ -23,6 +41,7 @@ async fn main() -> AppResult<()> {
         .fallback_service(ServeDir::new(frontend_dir));
     let listener = TcpListener::bind(addr).await?;
 
+    tracing::info!(%addr, "starting local HTTP server");
     println!("Foco is running at http://{addr}");
     axum::serve(listener, app).await?;
 

@@ -29,17 +29,17 @@
 
 ## 02. First-Run Config And Logging
 
-- [ ] Create `%USERPROFILE%\.foco` on first startup.
-- [ ] Create `%USERPROFILE%\.foco\config.json` on first startup.
-- [ ] Create `%USERPROFILE%\.foco\workspace` on first startup.
-- [ ] Register `Default Workspace` pointing to `%USERPROFILE%\.foco\workspace`.
-- [ ] Store global app settings, provider settings, model settings, MCP config, skill config, and workspace list in JSON.
-- [ ] Add strict config validation and return explicit startup errors for invalid config.
-- [ ] Add `tracing` based logging.
-- [ ] Write logs to `%USERPROFILE%\.foco\logs`.
-- [ ] Rotate logs by day using `foco-YYYY-MM-DD.log`.
-- [ ] Redact provider secrets from normal logs.
-- [ ] Add tests for first-run initialization and config loading.
+- [x] Create `%USERPROFILE%\.foco` on first startup.
+- [x] Create `%USERPROFILE%\.foco\config.json` on first startup.
+- [x] Create `%USERPROFILE%\.foco\workspace` on first startup.
+- [x] Register `Default Workspace` pointing to `%USERPROFILE%\.foco\workspace`.
+- [x] Store global app settings, provider settings, model settings, MCP config, skill config, and workspace list in JSON.
+- [x] Add strict config validation and return explicit startup errors for invalid config.
+- [x] Add `tracing` based logging.
+- [x] Write logs to `%USERPROFILE%\.foco\logs`.
+- [x] Rotate logs by day using `foco-YYYY-MM-DD.log`.
+- [x] Redact provider secrets from normal logs.
+- [x] Add tests for first-run initialization and config loading.
 
 ## 03. Workspace Database Foundation
 
