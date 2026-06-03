@@ -3,7 +3,8 @@ use std::{
     convert::Infallible,
     env, fs,
     net::{Ipv4Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
+    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -13,7 +14,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -47,7 +48,10 @@ use foco_store::{
         NewToolResult, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
     },
 };
-use foco_tools::{ToolExecution, builtin_tool_definitions, execute_builtin_tool};
+use foco_tools::{
+    RUN_COMMAND_TOOL, ToolExecution, WRITE_FILE_TOOL, builtin_tool_definitions,
+    execute_builtin_tool,
+};
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -119,6 +123,8 @@ async fn run() -> AppResult<()> {
             "/api/workspaces/{workspace_id}/chats/{chat_id}/messages",
             get(chat_messages),
         )
+        .route("/api/workspaces/{workspace_id}/git/status", get(git_status))
+        .route("/api/workspaces/{workspace_id}/git/diff", get(git_diff))
         .fallback_service(ServeDir::new(frontend_dir))
         .with_state(state);
     let listener = TcpListener::bind(addr).await?;
@@ -533,6 +539,60 @@ async fn chat_messages(
     Ok(Json(ChatMessagesResponse { messages }))
 }
 
+async fn git_status(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<GitStatusResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+
+    ensure_git_workspace(&workspace.path)?;
+    let status = run_git_command(&workspace.path, &["status", "--short"])?;
+
+    Ok(Json(GitStatusResponse {
+        is_git_repository: true,
+        files: parse_git_status_files(&status),
+        status,
+    }))
+}
+
+async fn git_diff(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Query(query): Query<GitDiffQuery>,
+) -> Result<Json<GitDiffResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let path = query
+        .path
+        .as_deref()
+        .map(normalize_workspace_relative_path)
+        .transpose()?;
+
+    ensure_git_workspace(&workspace.path)?;
+
+    let mut diff_args = vec!["diff"];
+    let mut staged_diff_args = vec!["diff", "--cached"];
+    if let Some(path) = path.as_deref() {
+        diff_args.push("--");
+        diff_args.push(path);
+        staged_diff_args.push("--");
+        staged_diff_args.push(path);
+    }
+
+    let status = run_git_command(&workspace.path, &["status", "--short"])?;
+    let diff = run_git_command(&workspace.path, &diff_args)?;
+    let staged_diff = run_git_command(&workspace.path, &staged_diff_args)?;
+
+    Ok(Json(GitDiffResponse {
+        path,
+        files: parse_git_status_files(&status),
+        status,
+        diff,
+        staged_diff,
+    }))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspacePathRequest {
@@ -580,6 +640,12 @@ struct ChatStreamRequest {
     model_id: String,
     thinking_level: Option<String>,
     message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitDiffQuery {
+    path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -690,6 +756,32 @@ struct ChatMessagesResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct GitStatusResponse {
+    is_git_repository: bool,
+    status: String,
+    files: Vec<GitStatusFileSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitStatusFileSummary {
+    path: String,
+    index_status: String,
+    worktree_status: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitDiffResponse {
+    path: Option<String>,
+    status: String,
+    diff: String,
+    staged_diff: String,
+    files: Vec<GitStatusFileSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ChatMessageSummary {
     id: String,
     role: String,
@@ -732,6 +824,9 @@ enum ChatSseEvent {
         tool_call_id: String,
         output: Value,
         is_error: bool,
+    },
+    GitDiffRefresh {
+        workspace_id: String,
     },
     Usage {
         usage: NeutralUsage,
@@ -1128,6 +1223,13 @@ impl PreparedChatContext {
                                 };
                                 events.push(captured_event(&result_event));
                                 yield Ok(sse_event(&result_event));
+                            }
+                            if tool_results_affect_git_diff(&next_tool_results) {
+                                let event = ChatSseEvent::GitDiffRefresh {
+                                    workspace_id: self.workspace_id.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                yield Ok(sse_event(&event));
                             }
 
                             append_tool_state_messages(
@@ -1697,6 +1799,15 @@ fn append_tool_state_messages(
     }
 }
 
+fn tool_results_affect_git_diff(tool_results: &[ExecutedToolCall]) -> bool {
+    tool_results.iter().any(|tool_result| {
+        matches!(
+            tool_result.name.as_str(),
+            WRITE_FILE_TOOL | RUN_COMMAND_TOOL
+        )
+    })
+}
+
 fn merge_usage(total: &mut NeutralUsage, next: &NeutralUsage) {
     add_usage_tokens(&mut total.input_tokens, next.input_tokens);
     add_usage_tokens(&mut total.output_tokens, next.output_tokens);
@@ -1752,6 +1863,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::ReasoningDelta { .. } => "reasoning_delta",
         ChatSseEvent::ToolCall { .. } => "tool_call",
         ChatSseEvent::ToolResult { .. } => "tool_result",
+        ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
         ChatSseEvent::Usage { .. } => "usage",
         ChatSseEvent::Complete { .. } => "completion",
         ChatSseEvent::Error { .. } => "error",
@@ -2044,6 +2156,130 @@ fn workspace_response_from_config(
         active_workspace_id: config.app.active_workspace_id.clone(),
         workspaces,
     }))
+}
+
+fn workspace_by_id<'a>(
+    config: &'a GlobalConfig,
+    workspace_id: &str,
+) -> Result<&'a WorkspaceConfig, ApiError> {
+    let workspace_id = workspace_id.trim();
+
+    if workspace_id.is_empty() {
+        return Err(ApiError::bad_request("workspace id must not be empty"));
+    }
+
+    config
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))
+}
+
+fn ensure_git_workspace(workspace_path: &Path) -> Result<(), ApiError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .map_err(|source| ApiError::internal(format!("failed to run git: {source}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    if output.status.success() && stdout.trim() == "true" {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        Err(ApiError::bad_request(format!(
+            "workspace is not a git repository: {}",
+            workspace_path.display()
+        )))
+    } else {
+        Err(ApiError::bad_request(format!(
+            "workspace is not a git repository: {} ({stderr})",
+            workspace_path.display()
+        )))
+    }
+}
+
+fn run_git_command(workspace_path: &Path, args: &[&str]) -> Result<String, ApiError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .args(args)
+        .output()
+        .map_err(|source| ApiError::internal(format!("failed to run git: {source}")))?;
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+
+    Err(ApiError::bad_request(format!(
+        "git {} exited with status {:?}: {}",
+        args.join(" "),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn normalize_workspace_relative_path(input: &str) -> Result<String, ApiError> {
+    let trimmed = input.trim();
+
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request("path must not be empty"));
+    }
+
+    let requested = Path::new(trimmed);
+    if requested.is_absolute() {
+        return Err(ApiError::bad_request(format!(
+            "path must be relative to the workspace: {trimmed}"
+        )));
+    }
+
+    for component in requested.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(ApiError::bad_request(format!(
+                "path escapes the workspace: {trimmed}"
+            )));
+        }
+    }
+
+    Ok(trimmed.replace('\\', "/"))
+}
+
+fn parse_git_status_files(status: &str) -> Vec<GitStatusFileSummary> {
+    status.lines().filter_map(parse_git_status_file).collect()
+}
+
+fn parse_git_status_file(line: &str) -> Option<GitStatusFileSummary> {
+    if line.len() < 4 {
+        return None;
+    }
+
+    let index_status = line.get(0..1)?.to_string();
+    let worktree_status = line.get(1..2)?.to_string();
+    let path = line
+        .get(3..)?
+        .split(" -> ")
+        .last()
+        .unwrap_or_default()
+        .trim()
+        .trim_matches('"')
+        .replace('\\', "/");
+
+    if path.is_empty() {
+        return None;
+    }
+
+    Some(GitStatusFileSummary {
+        path,
+        index_status,
+        worktree_status,
+    })
 }
 
 fn model_metadata_response(

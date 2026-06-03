@@ -229,10 +229,28 @@ type ChatStreamEvent =
       output: JsonValue;
       isError: boolean;
     }
+  | {
+      type: "gitDiffRefresh";
+      workspaceId: string;
+    }
   | { type: "error"; message: string };
 
 type WorkspaceFormMode = "add" | "create";
 type ViewMode = "chat" | "settings" | "stats";
+
+type GitStatusFileSummary = {
+  path: string;
+  indexStatus: string;
+  worktreeStatus: string;
+};
+
+type GitDiffResponse = {
+  path: string | null;
+  status: string;
+  diff: string;
+  stagedDiff: string;
+  files: GitStatusFileSummary[];
+};
 
 type ShellMessage = {
   id: string;
@@ -266,6 +284,10 @@ export function App() {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
+  const [gitDiff, setGitDiff] = useState<GitDiffResponse | null>(null);
+  const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
+  const [isLoadingDiff, setIsLoadingDiff] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [retryRunRequest, setRetryRunRequest] =
     useState<RetryRunRequest | null>(null);
@@ -293,6 +315,7 @@ export function App() {
     [settings],
   );
   const thinkingLevels = settings?.thinkingLevels ?? [];
+  const selectedDiffText = formatDiffText(gitDiff);
 
   const refreshWorkspaces = useCallback(async () => {
     setIsLoading(true);
@@ -330,6 +353,35 @@ export function App() {
     }
   }, []);
 
+  const loadGitDiff = useCallback(async (workspaceId: string, path: string | null) => {
+    setIsLoadingDiff(true);
+    setDiffError(null);
+
+    try {
+      const query = path ? `?path=${encodeURIComponent(path)}` : "";
+      const data = await requestJson<GitDiffResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/git/diff${query}`,
+      );
+      setGitDiff(data);
+      setSelectedDiffPath((current) => {
+        if (path) {
+          return path;
+        }
+
+        if (current && data.files.some((file) => file.path === current)) {
+          return current;
+        }
+
+        return null;
+      });
+    } catch (requestError) {
+      setGitDiff(null);
+      setDiffError(errorMessage(requestError));
+    } finally {
+      setIsLoadingDiff(false);
+    }
+  }, []);
+
   useEffect(() => {
     void refreshWorkspaces();
   }, [refreshWorkspaces]);
@@ -337,6 +389,17 @@ export function App() {
   useEffect(() => {
     void loadSettings();
   }, [loadSettings]);
+
+  useEffect(() => {
+    if (!activeWorkspace?.id) {
+      setGitDiff(null);
+      setSelectedDiffPath(null);
+      setDiffError(null);
+      return;
+    }
+
+    void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+  }, [activeWorkspace?.id, loadGitDiff, selectedDiffPath]);
 
   useEffect(() => {
     setSelectedModelId((current) =>
@@ -407,6 +470,7 @@ export function App() {
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
     setMessages([]);
+    setSelectedDiffPath(null);
   }
 
   async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
@@ -587,6 +651,11 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "gitDiffRefresh") {
+          void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
+          return;
+        }
+
         if (streamEvent.type === "error") {
           setError(streamEvent.message);
           setMessages((current) =>
@@ -644,7 +713,7 @@ export function App() {
 
   return (
     <main className="min-h-screen bg-zinc-100 text-zinc-950">
-      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[18rem_minmax(0,1fr)_3.5rem]">
+      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[18rem_minmax(0,1fr)_24rem]">
         <aside className="border-b border-zinc-200 bg-white lg:border-b-0 lg:border-r">
           <div className="flex h-full flex-col">
             <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3">
@@ -870,15 +939,20 @@ export function App() {
           )}
         </section>
 
-        <aside className="flex min-h-14 items-center justify-center border-t border-zinc-200 bg-white lg:min-h-screen lg:border-l lg:border-t-0">
-          <button
-            className="inline-flex h-10 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50 lg:h-auto lg:w-10 lg:flex-col lg:px-0 lg:py-3"
-            title="Git diff"
-            type="button"
-          >
-            <GitCompare aria-hidden="true" className="size-4" />
-            <span className="lg:[writing-mode:vertical-rl]">Diff</span>
-          </button>
+        <aside className="min-h-96 min-w-0 border-t border-zinc-200 bg-white lg:min-h-screen lg:border-l lg:border-t-0">
+          <GitDiffPanel
+            diffError={diffError}
+            diffText={selectedDiffText}
+            files={gitDiff?.files ?? []}
+            isLoading={isLoadingDiff}
+            onRefresh={() => {
+              if (activeWorkspace?.id) {
+                void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+              }
+            }}
+            onSelectFile={setSelectedDiffPath}
+            selectedPath={selectedDiffPath}
+          />
         </aside>
       </div>
     </main>
@@ -1147,6 +1221,99 @@ function PlaceholderPanel({
       <div className="flex items-center gap-3 rounded-md border border-zinc-200 bg-white px-4 py-3 text-zinc-700 shadow-sm">
         <Icon aria-hidden="true" className="size-5 text-teal-700" />
         <span className="text-sm font-medium">{title}</span>
+      </div>
+    </div>
+  );
+}
+
+function GitDiffPanel({
+  diffError,
+  diffText,
+  files,
+  isLoading,
+  onRefresh,
+  onSelectFile,
+  selectedPath,
+}: {
+  diffError: string | null;
+  diffText: string;
+  files: GitStatusFileSummary[];
+  isLoading: boolean;
+  onRefresh: () => void;
+  onSelectFile: (path: string | null) => void;
+  selectedPath: string | null;
+}) {
+  return (
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
+      <div className="flex items-center justify-between gap-3 border-b border-zinc-200 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <GitCompare aria-hidden="true" className="size-5 shrink-0 text-teal-700" />
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold">Git Diff</h2>
+            <p className="truncate text-xs text-zinc-500">
+              {selectedPath ?? "Workspace changes"}
+            </p>
+          </div>
+        </div>
+        <button
+          className="inline-flex size-8 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-700 transition hover:bg-zinc-50 disabled:cursor-not-allowed disabled:bg-zinc-100"
+          disabled={isLoading}
+          onClick={onRefresh}
+          title="Refresh diff"
+          type="button"
+        >
+          {isLoading ? (
+            <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+          ) : (
+            <RefreshCw aria-hidden="true" className="size-4" />
+          )}
+        </button>
+      </div>
+
+      {diffError ? (
+        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {diffError}
+        </div>
+      ) : null}
+
+      <div className="border-b border-zinc-200 px-3 py-3">
+        <button
+          className={diffFileButtonClass(selectedPath === null)}
+          onClick={() => onSelectFile(null)}
+          type="button"
+        >
+          <span className="truncate">All changed files</span>
+          <span className="text-xs text-zinc-500">{files.length}</span>
+        </button>
+        <div className="mt-2 max-h-56 space-y-1 overflow-y-auto">
+          {files.length ? (
+            files.map((file) => (
+              <button
+                className={diffFileButtonClass(selectedPath === file.path)}
+                key={file.path}
+                onClick={() => onSelectFile(file.path)}
+                type="button"
+              >
+                <span className="min-w-0 flex-1 truncate text-left">
+                  {file.path}
+                </span>
+                <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-[11px] text-zinc-600">
+                  {statusLabel(file)}
+                </span>
+              </button>
+            ))
+          ) : (
+            <div className="rounded-md bg-zinc-50 px-3 py-2 text-sm text-zinc-500">
+              No changes
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-auto bg-zinc-950">
+        <pre className="min-h-full whitespace-pre-wrap break-words px-4 py-4 font-mono text-[11px] leading-5 text-zinc-100">
+          {diffText || "No diff"}
+        </pre>
       </div>
     </div>
   );
@@ -2104,6 +2271,14 @@ function workspaceItemClass(active: boolean) {
   }`;
 }
 
+function diffFileButtonClass(active: boolean) {
+  return `flex h-8 w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 text-sm transition ${
+    active
+      ? "bg-teal-50 text-teal-900"
+      : "text-zinc-700 hover:bg-zinc-50 hover:text-zinc-950"
+  }`;
+}
+
 function TextField({
   inputMode,
   label,
@@ -2277,6 +2452,32 @@ function formatNumber(value: number) {
 
 function priceText(value: number | null) {
   return value === null ? "n/a" : `$${value}`;
+}
+
+function formatDiffText(diff: GitDiffResponse | null) {
+  if (!diff) {
+    return "";
+  }
+
+  const parts: string[] = [];
+
+  if (diff.stagedDiff.trim()) {
+    parts.push(`# staged\n${diff.stagedDiff.trimEnd()}`);
+  }
+
+  if (diff.diff.trim()) {
+    parts.push(`# unstaged\n${diff.diff.trimEnd()}`);
+  }
+
+  if (!parts.length && diff.status.trim()) {
+    parts.push(diff.status.trimEnd());
+  }
+
+  return parts.join("\n\n");
+}
+
+function statusLabel(file: GitStatusFileSummary) {
+  return `${file.indexStatus}${file.worktreeStatus}`.replaceAll(" ", ".");
 }
 
 async function readChatStream(
