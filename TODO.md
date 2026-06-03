@@ -43,14 +43,14 @@
 
 ## 03. Workspace Database Foundation
 
-- [ ] Create `<workspace>\.foco` when a workspace is added.
-- [ ] Create `<workspace>\.foco\foco.sqlite` for each workspace.
-- [ ] Add SQLite migration execution.
-- [ ] Add migration backup safety before schema upgrades.
-- [ ] Add core tables for chats, messages, run events, tool calls, tool results, terminal sessions, and LLM request records.
-- [ ] Add code graph tables for files, symbols, edges, references, imports, FTS data, file hashes, and parse status.
-- [ ] Add repository helpers in `store` for workspace metadata, chats, messages, run events, and LLM request records.
-- [ ] Add integration tests for workspace database creation and migrations.
+- [x] Create `<workspace>\.foco` when a workspace is added.
+- [x] Create `<workspace>\.foco\foco.sqlite` for each workspace.
+- [x] Add SQLite migration execution.
+- [x] Add migration backup safety before schema upgrades.
+- [x] Add core tables for chats, messages, run events, tool calls, tool results, terminal sessions, and LLM request records.
+- [x] Add code graph tables for files, symbols, edges, references, imports, FTS data, file hashes, and parse status.
+- [x] Add repository helpers in `store` for workspace metadata, chats, messages, run events, and LLM request records.
+- [x] Add integration tests for workspace database creation and migrations.
 
 ## 04. Minimal Product Shell UI
 

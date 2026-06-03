@@ -5,7 +5,7 @@ use std::{
 };
 
 use axum::{Json, Router, routing::get};
-use foco_store::config::load_or_create_global_config;
+use foco_store::{config::load_or_create_global_config, workspace::initialize_workspace_databases};
 use serde::Serialize;
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
@@ -32,6 +32,12 @@ async fn run() -> AppResult<()> {
     tracing::info!(
         config = %loaded_config.config.to_redacted_log_json()?,
         "loaded global config"
+    );
+
+    let workspace_databases = initialize_workspace_databases(&loaded_config.config.workspaces)?;
+    tracing::info!(
+        count = workspace_databases.len(),
+        "initialized workspace databases"
     );
 
     let addr = local_addr()?;

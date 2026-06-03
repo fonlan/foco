@@ -22,7 +22,8 @@ different local port.
 
 On first startup, Foco creates `%USERPROFILE%\.foco`, writes
 `%USERPROFILE%\.foco\config.json`, registers a `Default Workspace` at
-`%USERPROFILE%\.foco\workspace`, and writes daily logs to
+`%USERPROFILE%\.foco\workspace`, initializes the workspace database at
+`%USERPROFILE%\.foco\workspace\.foco\foco.sqlite`, and writes daily logs to
 `%USERPROFILE%\.foco\logs\foco-YYYY-MM-DD.log`.
 
 For live frontend development, run the Vite dev server alongside the backend:
