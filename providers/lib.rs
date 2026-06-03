@@ -5,8 +5,8 @@ use genai::{
     Client,
     adapter::AdapterKind,
     chat::{
-        ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ReasoningEffort, StreamEnd, Tool,
-        ToolCall as GenaiToolCall, Usage,
+        ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart, MessageContent,
+        ReasoningEffort, StreamEnd, Tool, ToolCall as GenaiToolCall, ToolResponse, Usage,
     },
     resolver::{AuthData, Endpoint, ProviderConfig},
 };
@@ -108,10 +108,16 @@ pub struct NeutralChatRequest {
     pub max_output_tokens: Option<u32>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NeutralChatMessage {
     pub role: NeutralChatRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<NeutralToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +126,7 @@ pub enum NeutralChatRole {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -271,17 +278,7 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
 
     let mut messages = Vec::with_capacity(request.messages.len());
     for message in &request.messages {
-        if message.content.trim().is_empty() {
-            return Err(ProviderConfigError::InvalidRequest(
-                "chat message content must not be empty".to_string(),
-            ));
-        }
-
-        messages.push(match message.role {
-            NeutralChatRole::System => ChatMessage::system(message.content.clone()),
-            NeutralChatRole::User => ChatMessage::user(message.content.clone()),
-            NeutralChatRole::Assistant => ChatMessage::assistant(message.content.clone()),
-        });
+        messages.push(genai_message(message)?);
     }
 
     let mut chat_request = ChatRequest::from_messages(messages);
@@ -290,6 +287,88 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
     }
 
     Ok(chat_request)
+}
+
+fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderConfigError> {
+    match message.role {
+        NeutralChatRole::System | NeutralChatRole::User => {
+            if message.content.trim().is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "chat message content must not be empty".to_string(),
+                ));
+            }
+            if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "system and user messages cannot contain tool state".to_string(),
+                ));
+            }
+
+            Ok(match message.role {
+                NeutralChatRole::System => ChatMessage::system(message.content.clone()),
+                NeutralChatRole::User => ChatMessage::user(message.content.clone()),
+                NeutralChatRole::Assistant | NeutralChatRole::Tool => unreachable!(),
+            })
+        }
+        NeutralChatRole::Assistant => {
+            if message.tool_calls.is_empty() {
+                if message.content.trim().is_empty() {
+                    return Err(ProviderConfigError::InvalidRequest(
+                        "assistant message content must not be empty unless it contains tool calls"
+                            .to_string(),
+                    ));
+                }
+
+                return Ok(ChatMessage::assistant(message.content.clone()));
+            }
+
+            let tool_calls = message
+                .tool_calls
+                .iter()
+                .map(genai_tool_call)
+                .collect::<Vec<_>>();
+            if message.content.trim().is_empty() {
+                return Ok(ChatMessage::from(tool_calls));
+            }
+
+            let mut parts = vec![ContentPart::Text(message.content.clone())];
+            if let Some(thought_signatures) = tool_calls
+                .first()
+                .and_then(|tool_call| tool_call.thought_signatures.clone())
+            {
+                parts.extend(
+                    thought_signatures
+                        .into_iter()
+                        .map(ContentPart::ThoughtSignature),
+                );
+            }
+            parts.extend(tool_calls.into_iter().map(ContentPart::ToolCall));
+
+            Ok(ChatMessage::assistant(MessageContent::from_parts(parts)))
+        }
+        NeutralChatRole::Tool => {
+            if !message.tool_calls.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "tool messages cannot contain tool calls".to_string(),
+                ));
+            }
+            if message.content.trim().is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "tool response content must not be empty".to_string(),
+                ));
+            }
+            let tool_call_id = message.tool_call_id.as_deref().ok_or_else(|| {
+                ProviderConfigError::InvalidRequest(
+                    "tool response message is missing tool_call_id".to_string(),
+                )
+            })?;
+            let mut response = ToolResponse::new(tool_call_id, message.content.clone());
+            if let Some(tool_name) = message.tool_name.as_deref() {
+                response = response.with_fn_name(tool_name);
+            }
+
+            Ok(ChatMessage::from(response))
+        }
+    }
 }
 
 fn genai_chat_options(request: &NeutralChatRequest) -> Result<ChatOptions, ProviderConfigError> {
@@ -374,6 +453,15 @@ fn neutral_tool_call(tool_call: &GenaiToolCall) -> NeutralToolCall {
         call_id: tool_call.call_id.clone(),
         name: tool_call.fn_name.clone(),
         arguments: tool_call.fn_arguments.clone(),
+        thought_signatures: tool_call.thought_signatures.clone(),
+    }
+}
+
+fn genai_tool_call(tool_call: &NeutralToolCall) -> GenaiToolCall {
+    GenaiToolCall {
+        call_id: tool_call.call_id.clone(),
+        fn_name: tool_call.name.clone(),
+        fn_arguments: tool_call.arguments.clone(),
         thought_signatures: tool_call.thought_signatures.clone(),
     }
 }
@@ -464,5 +552,48 @@ mod tests {
             normalized_base_url("https://api.openai.com/v1").expect("base url"),
             DEFAULT_OPENAI_BASE_URL
         );
+    }
+
+    #[test]
+    fn converts_tool_state_messages_for_genai_continuation() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-4o-mini".to_string(),
+            messages: vec![
+                NeutralChatMessage {
+                    role: NeutralChatRole::User,
+                    content: "Read the note.".to_string(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+                NeutralChatMessage {
+                    role: NeutralChatRole::Assistant,
+                    content: String::new(),
+                    tool_calls: vec![NeutralToolCall {
+                        call_id: "call-1".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({ "path": "note.txt" }),
+                        thought_signatures: None,
+                    }],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+                NeutralChatMessage {
+                    role: NeutralChatRole::Tool,
+                    content: r#"{"content":"hello"}"#.to_string(),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some("call-1".to_string()),
+                    tool_name: Some("read_file".to_string()),
+                },
+            ],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+        };
+
+        let chat_request = genai_chat_request(&request).expect("chat request");
+
+        assert!(chat_request.messages[1].content.contains_tool_call());
+        assert!(chat_request.messages[2].content.contains_tool_response());
     }
 }

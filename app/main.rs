@@ -22,6 +22,11 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{SecondsFormat, Utc};
+use foco_agent::{
+    ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo, build_system_prompt,
+    calculate_context_budget, detect_same_file_write_conflicts, estimate_json_tokens,
+    estimate_text_tokens, pack_context,
+};
 use foco_providers::{
     DEFAULT_OPENAI_BASE_URL, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
@@ -43,6 +48,7 @@ use foco_store::{
     },
 };
 use foco_tools::{ToolExecution, builtin_tool_definitions, execute_builtin_tool};
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -52,6 +58,7 @@ mod logging;
 
 const DEFAULT_PORT: u16 = 3210;
 const PORT_ENV: &str = "FOCO_PORT";
+const MAX_AGENT_TOOL_ROUNDS: usize = 8;
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -753,6 +760,7 @@ struct PreparedChatContext {
     assistant_sequence: i64,
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
+    context_budget: foco_agent::ContextBudget,
     request_body_json: String,
 }
 
@@ -788,7 +796,7 @@ struct ChatAuditOutcome {
 }
 
 impl PreparedChatContext {
-    fn into_sse_stream(self) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    fn into_sse_stream(mut self) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
         async_stream::stream! {
             let request_started_at = utc_timestamp();
             let started_at = Instant::now();
@@ -799,40 +807,49 @@ impl PreparedChatContext {
                 llm_request_id: self.llm_request_id.clone(),
             };
             let mut events = vec![captured_event(&start_event)];
-
-            yield Ok(sse_event(&start_event));
-
-            let mut provider_stream = match stream_chat(&self.provider_config, self.provider_request.clone()).await {
-                Ok(provider_stream) => provider_stream,
-                Err(error) => {
-                    let message = error.to_string();
-                    let event = ChatSseEvent::Error {
-                        message: message.clone(),
-                    };
-                    events.push(captured_event(&event));
-                    let outcome = failed_audit_outcome(started_at, &message);
-
-                    if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
-                        let event = ChatSseEvent::Error {
-                            message: persist_error.message,
-                        };
-                        yield Ok(sse_event(&event));
-                    } else {
-                        yield Ok(sse_event(&event));
-                    }
-
-                    return;
-                }
-            };
-
+            let active_tool_start_index = self.provider_request.messages.len();
             let mut assistant_text = String::new();
             let mut first_token_at = None;
             let mut first_token_latency_ms = None;
             let mut seen_tool_call_ids = HashSet::new();
+            let mut executed_tool_calls = Vec::new();
+            let mut provider_completions = Vec::new();
+            let mut total_usage = NeutralUsage::default();
+            let mut final_usage = None;
 
-            while let Some(event_result) = provider_stream.next_event().await {
-                let provider_event = match event_result {
-                    Ok(provider_event) => provider_event,
+            yield Ok(sse_event(&start_event));
+
+            for turn_index in 0..=MAX_AGENT_TOOL_ROUNDS {
+                let packed_messages = match pack_neutral_messages(
+                    self.provider_request.messages.clone(),
+                    &self.context_budget,
+                    active_tool_start_index,
+                ) {
+                    Ok(messages) => messages,
+                    Err(error) => {
+                        let message = error.message;
+                        let event = ChatSseEvent::Error {
+                            message: message.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        let outcome = failed_audit_outcome(started_at, &message);
+
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                            let event = ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                            yield Ok(sse_event(&event));
+                        } else {
+                            yield Ok(sse_event(&event));
+                        }
+
+                        return;
+                    }
+                };
+                let mut turn_request = self.provider_request.clone();
+                turn_request.messages = packed_messages;
+                let mut provider_stream = match stream_chat(&self.provider_config, turn_request).await {
+                    Ok(provider_stream) => provider_stream,
                     Err(error) => {
                         let message = error.to_string();
                         let event = ChatSseEvent::Error {
@@ -853,90 +870,53 @@ impl PreparedChatContext {
                         return;
                     }
                 };
+                let mut turn_text = String::new();
+                let mut completed_turn = false;
 
-                events.push(captured_provider_event(&provider_event));
-
-                match provider_event {
-                    NeutralChatStreamEvent::Start => {}
-                    NeutralChatStreamEvent::TextDelta { delta } => {
-                        capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                        assistant_text.push_str(&delta);
-                        let event = ChatSseEvent::TextDelta { delta };
-                        yield Ok(sse_event(&event));
-                    }
-                    NeutralChatStreamEvent::ReasoningDelta { delta } => {
-                        capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                        let event = ChatSseEvent::ReasoningDelta { delta };
-                        yield Ok(sse_event(&event));
-                    }
-                    NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
-                        capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                    }
-                    NeutralChatStreamEvent::ToolCall { tool_call } => {
-                        capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                        if seen_tool_call_ids.insert(tool_call.call_id.clone()) {
-                            let event = ChatSseEvent::ToolCall {
-                                assistant_message_id: self.assistant_message_id.clone(),
-                                tool_call: pending_tool_call_summary(&tool_call),
+                while let Some(event_result) = provider_stream.next_event().await {
+                    let provider_event = match event_result {
+                        Ok(provider_event) => provider_event,
+                        Err(error) => {
+                            let message = error.to_string();
+                            let event = ChatSseEvent::Error {
+                                message: message.clone(),
                             };
                             events.push(captured_event(&event));
+                            let outcome = failed_audit_outcome(started_at, &message);
+
+                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                                let event = ChatSseEvent::Error {
+                                    message: persist_error.message,
+                                };
+                                yield Ok(sse_event(&event));
+                            } else {
+                                yield Ok(sse_event(&event));
+                            }
+
+                            return;
+                        }
+                    };
+
+                    events.push(captured_provider_event(&provider_event));
+
+                    match provider_event {
+                        NeutralChatStreamEvent::Start => {}
+                        NeutralChatStreamEvent::TextDelta { delta } => {
+                            capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            assistant_text.push_str(&delta);
+                            turn_text.push_str(&delta);
+                            let event = ChatSseEvent::TextDelta { delta };
                             yield Ok(sse_event(&event));
                         }
-                    }
-                    NeutralChatStreamEvent::Usage { usage } => {
-                        let event = ChatSseEvent::Usage { usage };
-                        yield Ok(sse_event(&event));
-                    }
-                    NeutralChatStreamEvent::Complete {
-                        text,
-                        reasoning,
-                        tool_calls,
-                        usage,
-                        stop_reason,
-                        response_id,
-                    } => {
-                        if assistant_text.is_empty() && !text.is_empty() {
-                            let message = "provider completed without streaming assistant text deltas".to_string();
-                            let event = ChatSseEvent::Error {
-                                message: message.clone(),
-                            };
-                            events.push(captured_event(&event));
-                            let outcome = failed_audit_outcome(started_at, &message);
-
-                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
-                                let event = ChatSseEvent::Error {
-                                    message: persist_error.message,
-                                };
-                                yield Ok(sse_event(&event));
-                            } else {
-                                yield Ok(sse_event(&event));
-                            }
-
-                            return;
+                        NeutralChatStreamEvent::ReasoningDelta { delta } => {
+                            capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            let event = ChatSseEvent::ReasoningDelta { delta };
+                            yield Ok(sse_event(&event));
                         }
-
-                        if assistant_text.is_empty() && tool_calls.is_empty() {
-                            let message = "provider completed without assistant text or tool calls".to_string();
-                            let event = ChatSseEvent::Error {
-                                message: message.clone(),
-                            };
-                            events.push(captured_event(&event));
-                            let outcome = failed_audit_outcome(started_at, &message);
-
-                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
-                                let event = ChatSseEvent::Error {
-                                    message: persist_error.message,
-                                };
-                                yield Ok(sse_event(&event));
-                            } else {
-                                yield Ok(sse_event(&event));
-                            }
-
-                            return;
+                        NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
+                            capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                         }
-
-                        let mut executed_tool_calls = Vec::new();
-                        for tool_call in tool_calls {
+                        NeutralChatStreamEvent::ToolCall { tool_call } => {
                             capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                             if seen_tool_call_ids.insert(tool_call.call_id.clone()) {
                                 let event = ChatSseEvent::ToolCall {
@@ -946,110 +926,262 @@ impl PreparedChatContext {
                                 events.push(captured_event(&event));
                                 yield Ok(sse_event(&event));
                             }
-
-                            let started_at_text = utc_timestamp();
-                            let tool_execution = execute_builtin_tool(
-                                &self.workspace_path,
-                                &tool_call.name,
-                                tool_call.arguments.clone(),
-                            );
-                            let completed_at_text = utc_timestamp();
-                            let executed_tool_call = executed_tool_call(
-                                tool_call,
-                                tool_execution,
-                                started_at_text,
-                                completed_at_text,
-                            );
-                            let result_event = ChatSseEvent::ToolResult {
-                                assistant_message_id: self.assistant_message_id.clone(),
-                                tool_call_id: executed_tool_call.id.clone(),
-                                output: executed_tool_call.output.clone(),
-                                is_error: executed_tool_call.is_error,
-                            };
-                            events.push(captured_event(&result_event));
-                            yield Ok(sse_event(&result_event));
-                            executed_tool_calls.push(executed_tool_call);
                         }
+                        NeutralChatStreamEvent::Usage { usage } => {
+                            let event = ChatSseEvent::Usage { usage };
+                            yield Ok(sse_event(&event));
+                        }
+                        NeutralChatStreamEvent::Complete {
+                            text,
+                            reasoning,
+                            tool_calls,
+                            usage,
+                            stop_reason,
+                            response_id,
+                        } => {
+                            completed_turn = true;
 
-                        let assistant_message_text =
-                            assistant_message_text(&assistant_text, &executed_tool_calls);
-                        let completed_at = utc_timestamp();
-                        let outcome = ChatAuditOutcome {
-                            first_token_at,
-                            completed_at,
-                            first_token_latency_ms,
-                            total_latency_ms: elapsed_millis(started_at),
-                            input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
-                            output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
-                            cache_read_tokens: usage.as_ref().and_then(|usage| usage.cache_read_tokens),
-                            cache_write_tokens: usage.as_ref().and_then(|usage| usage.cache_write_tokens),
-                            final_state: "succeeded",
-                            response_body_json: Some(json!({
-                                "text": text,
-                                "reasoning": reasoning,
-                                "toolCalls": executed_tool_calls,
-                                "usage": usage,
-                                "stopReason": stop_reason,
-                                "responseId": response_id
-                            }).to_string()),
-                        };
+                            if turn_text.is_empty() && !text.is_empty() {
+                                let message = "provider completed without streaming assistant text deltas".to_string();
+                                let event = ChatSseEvent::Error {
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_audit_outcome(started_at, &message);
 
-                        match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), &executed_tool_calls) {
-                            Ok(()) => {
-                                let event = ChatSseEvent::Complete {
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                                    let event = ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                    yield Ok(sse_event(&event));
+                                } else {
+                                    yield Ok(sse_event(&event));
+                                }
+
+                                return;
+                            }
+
+                            if turn_text.is_empty() && tool_calls.is_empty() {
+                                let message = "provider completed without assistant text or tool calls".to_string();
+                                let event = ChatSseEvent::Error {
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_audit_outcome(started_at, &message);
+
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                                    let event = ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                    yield Ok(sse_event(&event));
+                                } else {
+                                    yield Ok(sse_event(&event));
+                                }
+
+                                return;
+                            }
+
+                            provider_completions.push(json!({
+                                "turnIndex": turn_index,
+                                "text": text.clone(),
+                                "reasoning": reasoning.clone(),
+                                "toolCalls": tool_calls.clone(),
+                                "usage": usage.clone(),
+                                "stopReason": stop_reason.clone(),
+                                "responseId": response_id.clone()
+                            }));
+
+                            if let Some(usage) = &usage {
+                                merge_usage(&mut total_usage, usage);
+                                final_usage = Some(total_usage.clone());
+                            }
+
+                            if tool_calls.is_empty() {
+                                let assistant_message_text =
+                                    assistant_message_text(&assistant_text, &executed_tool_calls);
+                                let complete_event = ChatSseEvent::Complete {
                                     chat_id: self.chat_id.clone(),
                                     assistant_message_id: self.assistant_message_id.clone(),
-                                    text: assistant_message_text,
-                                    usage,
-                                    stop_reason,
+                                    text: assistant_message_text.clone(),
+                                    usage: final_usage.clone(),
+                                    stop_reason: stop_reason.clone(),
                                 };
-                                yield Ok(sse_event(&event));
+                                events.push(captured_event(&complete_event));
+                                let completed_at = utc_timestamp();
+                                let outcome = ChatAuditOutcome {
+                                    first_token_at,
+                                    completed_at,
+                                    first_token_latency_ms,
+                                    total_latency_ms: elapsed_millis(started_at),
+                                    input_tokens: final_usage.as_ref().and_then(|usage| usage.input_tokens),
+                                    output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
+                                    cache_read_tokens: final_usage.as_ref().and_then(|usage| usage.cache_read_tokens),
+                                    cache_write_tokens: final_usage.as_ref().and_then(|usage| usage.cache_write_tokens),
+                                    final_state: "succeeded",
+                                    response_body_json: Some(json!({
+                                        "text": assistant_message_text.clone(),
+                                        "providerCompletions": provider_completions.clone(),
+                                        "toolCalls": executed_tool_calls.clone(),
+                                        "usage": final_usage.clone(),
+                                        "stopReason": stop_reason.clone()
+                                    }).to_string()),
+                                };
+
+                                match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), &executed_tool_calls) {
+                                    Ok(()) => {
+                                        yield Ok(sse_event(&complete_event));
+                                    }
+                                    Err(error) => {
+                                        let event = ChatSseEvent::Error {
+                                            message: error.message,
+                                        };
+                                        yield Ok(sse_event(&event));
+                                    }
+                                }
+
+                                return;
                             }
-                            Err(error) => {
+
+                            if turn_index >= MAX_AGENT_TOOL_ROUNDS {
+                                let message = format!(
+                                    "agent run exceeded {MAX_AGENT_TOOL_ROUNDS} tool continuation rounds"
+                                );
                                 let event = ChatSseEvent::Error {
-                                    message: error.message,
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_audit_outcome(started_at, &message);
+
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                                    let event = ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                    yield Ok(sse_event(&event));
+                                } else {
+                                    yield Ok(sse_event(&event));
+                                }
+
+                                return;
+                            }
+
+                            let pending_tool_calls = pending_tool_calls(&tool_calls);
+                            if let Err(error) = detect_same_file_write_conflicts(&pending_tool_calls) {
+                                let message = error.to_string();
+                                let event = ChatSseEvent::Error {
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_audit_outcome(started_at, &message);
+
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                                    let event = ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                    yield Ok(sse_event(&event));
+                                } else {
+                                    yield Ok(sse_event(&event));
+                                }
+
+                                return;
+                            }
+
+                            for tool_call in &tool_calls {
+                                capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                                if seen_tool_call_ids.insert(tool_call.call_id.clone()) {
+                                    let event = ChatSseEvent::ToolCall {
+                                        assistant_message_id: self.assistant_message_id.clone(),
+                                        tool_call: pending_tool_call_summary(tool_call),
+                                    };
+                                    events.push(captured_event(&event));
+                                    yield Ok(sse_event(&event));
+                                }
+                            }
+
+                            let next_tool_results = match execute_tool_calls_parallel(&self.workspace_path, tool_calls.clone()).await {
+                                Ok(tool_results) => tool_results,
+                                Err(error) => {
+                                    let message = error.message;
+                                    let event = ChatSseEvent::Error {
+                                        message: message.clone(),
+                                    };
+                                    events.push(captured_event(&event));
+                                    let outcome = failed_audit_outcome(started_at, &message);
+
+                                    if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                                        let event = ChatSseEvent::Error {
+                                            message: persist_error.message,
+                                        };
+                                        yield Ok(sse_event(&event));
+                                    } else {
+                                        yield Ok(sse_event(&event));
+                                    }
+
+                                    return;
+                                }
+                            };
+                            for executed_tool_call in &next_tool_results {
+                                let result_event = ChatSseEvent::ToolResult {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    tool_call_id: executed_tool_call.id.clone(),
+                                    output: executed_tool_call.output.clone(),
+                                    is_error: executed_tool_call.is_error,
+                                };
+                                events.push(captured_event(&result_event));
+                                yield Ok(sse_event(&result_event));
+                            }
+
+                            append_tool_state_messages(
+                                &mut self.provider_request.messages,
+                                tool_calls,
+                                &next_tool_results,
+                                turn_text,
+                            );
+                            executed_tool_calls.extend(next_tool_results);
+
+                            break;
+                        }
+                        NeutralChatStreamEvent::Error { message } => {
+                            let event = ChatSseEvent::Error {
+                                message: message.clone(),
+                            };
+                            events.push(captured_event(&event));
+                            let outcome = failed_audit_outcome(started_at, &message);
+
+                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                                let event = ChatSseEvent::Error {
+                                    message: persist_error.message,
                                 };
                                 yield Ok(sse_event(&event));
+                            } else {
+                                yield Ok(sse_event(&event));
                             }
+
+                            return;
                         }
-
-                        return;
-                    }
-                    NeutralChatStreamEvent::Error { message } => {
-                        let event = ChatSseEvent::Error {
-                            message: message.clone(),
-                        };
-                        events.push(captured_event(&event));
-                        let outcome = failed_audit_outcome(started_at, &message);
-
-                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
-                            let event = ChatSseEvent::Error {
-                                message: persist_error.message,
-                            };
-                            yield Ok(sse_event(&event));
-                        } else {
-                            yield Ok(sse_event(&event));
-                        }
-
-                        return;
                     }
                 }
-            }
 
-            let message = "provider stream ended without a completion event".to_string();
-            let event = ChatSseEvent::Error {
-                message: message.clone(),
-            };
-            events.push(captured_event(&event));
-            let outcome = failed_audit_outcome(started_at, &message);
+                if completed_turn {
+                    continue;
+                }
 
-            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                let message = "provider stream ended without a completion event".to_string();
                 let event = ChatSseEvent::Error {
-                    message: persist_error.message,
+                    message: message.clone(),
                 };
-                yield Ok(sse_event(&event));
-            } else {
-                yield Ok(sse_event(&event));
+                events.push(captured_event(&event));
+                let outcome = failed_audit_outcome(started_at, &message);
+
+                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                    let event = ChatSseEvent::Error {
+                        message: persist_error.message,
+                    };
+                    yield Ok(sse_event(&event));
+                } else {
+                    yield Ok(sse_event(&event));
+                }
+
+                return;
             }
         }
     }
@@ -1185,22 +1317,49 @@ fn prepare_chat_context(
         })
         .map_err(ApiError::from_workspace_error)?;
 
-    let mut neutral_messages = Vec::with_capacity(existing_messages.len() + 1);
+    let tool_definitions = builtin_tool_definitions();
+    let neutral_tools = tool_definitions
+        .iter()
+        .cloned()
+        .map(neutral_tool_definition)
+        .collect::<Vec<_>>();
+    let system_prompt = build_system_prompt(SystemPromptInput {
+        workspace_id: workspace.id.clone(),
+        workspace_name: workspace.name.clone(),
+        workspace_path: workspace.path.display().to_string(),
+        tools: tool_definitions
+            .iter()
+            .map(|tool| ToolPromptInfo {
+                name: tool.name.to_string(),
+                description: tool.description.to_string(),
+            })
+            .collect(),
+    });
+    let context_budget = calculate_context_budget(
+        limits.context_window,
+        limits.max_output_tokens,
+        estimate_text_tokens(&system_prompt),
+        estimate_tool_schema_tokens(&neutral_tools),
+    )
+    .map_err(|source| ApiError::bad_request(source.to_string()))?;
+
+    let mut neutral_messages = Vec::with_capacity(existing_messages.len() + 2);
+    neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
     for existing_message in existing_messages {
         neutral_messages.push(neutral_message_from_record(existing_message)?);
     }
-    neutral_messages.push(NeutralChatMessage {
-        role: NeutralChatRole::User,
-        content: message.to_string(),
-    });
+    neutral_messages.push(neutral_text_message(
+        NeutralChatRole::User,
+        message.to_string(),
+    ));
+    let active_tool_start_index = neutral_messages.len();
+    let neutral_messages =
+        pack_neutral_messages(neutral_messages, &context_budget, active_tool_start_index)?;
 
     let provider_request = NeutralChatRequest {
         model_id: model.id.clone(),
         messages: neutral_messages,
-        tools: builtin_tool_definitions()
-            .into_iter()
-            .map(neutral_tool_definition)
-            .collect(),
+        tools: neutral_tools,
         thinking_level: thinking_level.or_else(|| model.thinking_level.clone()),
         max_output_tokens: Some(max_output_tokens),
     };
@@ -1222,6 +1381,7 @@ fn prepare_chat_context(
         assistant_sequence,
         provider_config,
         provider_request,
+        context_budget,
         request_body_json,
     })
 }
@@ -1231,11 +1391,7 @@ fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMess
         "system" => NeutralChatRole::System,
         "user" => NeutralChatRole::User,
         "assistant" => NeutralChatRole::Assistant,
-        "tool" => {
-            return Err(ApiError::bad_request(
-                "chat contains tool-role messages; tool replay belongs to TODO step 10",
-            ));
-        }
+        "tool" => NeutralChatRole::Tool,
         other => {
             return Err(ApiError::bad_request(format!(
                 "chat contains unsupported message role '{other}'"
@@ -1243,9 +1399,32 @@ fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMess
         }
     };
 
+    if role != NeutralChatRole::Tool {
+        return Ok(neutral_text_message(role, message.content));
+    }
+
+    let metadata = parse_json_value(&message.metadata_json, "tool message metadata")?;
+    let tool_call_id = metadata
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "tool message '{}' is missing metadata.toolCallId",
+                message.id
+            ))
+        })?;
+    let tool_name = metadata
+        .get("toolName")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
     Ok(NeutralChatMessage {
         role,
         content: message.content,
+        tool_calls: Vec::new(),
+        tool_call_id: Some(tool_call_id),
+        tool_name,
     })
 }
 
@@ -1353,6 +1532,182 @@ fn persist_chat_result(
     }
 
     Ok(())
+}
+
+fn neutral_text_message(role: NeutralChatRole, content: String) -> NeutralChatMessage {
+    NeutralChatMessage {
+        role,
+        content,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        tool_name: None,
+    }
+}
+
+fn estimate_tool_schema_tokens(tools: &[NeutralToolDefinition]) -> u64 {
+    tools
+        .iter()
+        .map(|tool| {
+            estimate_text_tokens(&tool.name)
+                + estimate_text_tokens(&tool.description)
+                + estimate_json_tokens(&tool.input_schema)
+        })
+        .sum()
+}
+
+fn pack_neutral_messages(
+    messages: Vec<NeutralChatMessage>,
+    budget: &foco_agent::ContextBudget,
+    active_tool_start_index: usize,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    let latest_user_index = messages
+        .iter()
+        .rposition(|message| message.role == NeutralChatRole::User);
+    let pack_items = messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| ContextPackItem {
+            id: format!("message-{index}"),
+            estimated_tokens: if index == 0 {
+                0
+            } else {
+                neutral_message_estimated_tokens(message)
+            },
+            must_keep: index == 0
+                || Some(index) == latest_user_index
+                || index >= active_tool_start_index,
+        })
+        .collect::<Vec<_>>();
+    let packed = pack_context(&pack_items, budget.available_message_tokens)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+
+    Ok(packed
+        .selected_indices
+        .into_iter()
+        .map(|index| messages[index].clone())
+        .collect())
+}
+
+fn neutral_message_estimated_tokens(message: &NeutralChatMessage) -> u64 {
+    let mut tokens = estimate_text_tokens(&message.content);
+
+    for tool_call in &message.tool_calls {
+        tokens += neutral_tool_call_estimated_tokens(tool_call);
+    }
+
+    if let Some(tool_call_id) = &message.tool_call_id {
+        tokens += estimate_text_tokens(tool_call_id);
+    }
+
+    if let Some(tool_name) = &message.tool_name {
+        tokens += estimate_text_tokens(tool_name);
+    }
+
+    tokens
+}
+
+fn neutral_tool_call_estimated_tokens(tool_call: &NeutralToolCall) -> u64 {
+    let thought_tokens = tool_call
+        .thought_signatures
+        .as_ref()
+        .map(|signatures| {
+            signatures
+                .iter()
+                .map(|value| estimate_text_tokens(value))
+                .sum::<u64>()
+        })
+        .unwrap_or(0);
+
+    estimate_text_tokens(&tool_call.call_id)
+        + estimate_text_tokens(&tool_call.name)
+        + estimate_json_tokens(&tool_call.arguments)
+        + thought_tokens
+}
+
+fn pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingToolCall> {
+    tool_calls
+        .iter()
+        .map(|tool_call| PendingToolCall {
+            id: tool_call.call_id.clone(),
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+        })
+        .collect()
+}
+
+async fn execute_tool_calls_parallel(
+    workspace_path: &Path,
+    tool_calls: Vec<NeutralToolCall>,
+) -> Result<Vec<ExecutedToolCall>, ApiError> {
+    let tasks = tool_calls.into_iter().map(|tool_call| {
+        let workspace_path = workspace_path.to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let started_at_text = utc_timestamp();
+            let tool_execution = execute_builtin_tool(
+                &workspace_path,
+                &tool_call.name,
+                tool_call.arguments.clone(),
+            );
+            let completed_at_text = utc_timestamp();
+
+            executed_tool_call(
+                tool_call,
+                tool_execution,
+                started_at_text,
+                completed_at_text,
+            )
+        })
+    });
+    let results = join_all(tasks).await;
+    let mut executed_tool_calls = Vec::with_capacity(results.len());
+
+    for result in results {
+        executed_tool_calls.push(result.map_err(|source| {
+            ApiError::internal(format!("tool execution worker failed: {source}"))
+        })?);
+    }
+
+    Ok(executed_tool_calls)
+}
+
+fn append_tool_state_messages(
+    messages: &mut Vec<NeutralChatMessage>,
+    tool_calls: Vec<NeutralToolCall>,
+    tool_results: &[ExecutedToolCall],
+    assistant_text: String,
+) {
+    messages.push(NeutralChatMessage {
+        role: NeutralChatRole::Assistant,
+        content: assistant_text,
+        tool_calls,
+        tool_call_id: None,
+        tool_name: None,
+    });
+
+    for tool_result in tool_results {
+        messages.push(NeutralChatMessage {
+            role: NeutralChatRole::Tool,
+            content: serde_json::to_string(&tool_result.output)
+                .expect("tool outputs are always JSON serializable"),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_result.id.clone()),
+            tool_name: Some(tool_result.name.clone()),
+        });
+    }
+}
+
+fn merge_usage(total: &mut NeutralUsage, next: &NeutralUsage) {
+    add_usage_tokens(&mut total.input_tokens, next.input_tokens);
+    add_usage_tokens(&mut total.output_tokens, next.output_tokens);
+    add_usage_tokens(&mut total.cache_read_tokens, next.cache_read_tokens);
+    add_usage_tokens(&mut total.cache_write_tokens, next.cache_write_tokens);
+}
+
+fn add_usage_tokens(total: &mut Option<i64>, next: Option<i64>) {
+    if let Some(next) = next {
+        *total = Some(total.unwrap_or(0) + next);
+    }
 }
 
 fn failed_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome {

@@ -21,8 +21,16 @@ import {
   Terminal,
   User,
   Wrench,
+  X,
 } from "lucide-react";
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 type ChatSummary = {
   id: string;
@@ -234,6 +242,14 @@ type ShellMessage = {
   toolCalls: ChatToolCallSummary[];
 };
 
+type RetryRunRequest = {
+  workspaceId: string;
+  chatId: string | null;
+  content: string;
+  modelId: string;
+  thinkingLevel: string;
+};
+
 export function App() {
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>("");
@@ -251,10 +267,13 @@ export function App() {
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
   const [isSendingMessage, setIsSendingMessage] = useState(false);
+  const [retryRunRequest, setRetryRunRequest] =
+    useState<RetryRunRequest | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const activeRunAbortRef = useRef<AbortController | null>(null);
 
   const activeWorkspace = useMemo(
     () =>
@@ -408,15 +427,44 @@ export function App() {
       return;
     }
 
+    await runChatMessage({
+      chatId: activeChatId,
+      content,
+      modelId: selectedModelId,
+      thinkingLevel: selectedThinkingLevel,
+      workspaceId: activeWorkspace.id,
+    });
+  }
+
+  async function handleRetryRun() {
+    if (!retryRunRequest || isSendingMessage) {
+      return;
+    }
+
+    const retryRequest = retryRunRequest;
+    setActiveWorkspaceId(retryRequest.workspaceId);
+    setActiveChatId(retryRequest.chatId);
+    setSelectedModelId(retryRequest.modelId);
+    setSelectedThinkingLevel(retryRequest.thinkingLevel);
+    await runChatMessage(retryRequest);
+  }
+
+  function handleCancelRun() {
+    activeRunAbortRef.current?.abort();
+  }
+
+  async function runChatMessage(request: RetryRunRequest) {
     const localUserId = `local-user-${Date.now()}`;
     let assistantMessageId = `local-assistant-${Date.now()}`;
+    let requestChatId = request.chatId;
+    const abortController = new AbortController();
 
     setMessages((current) => [
       ...current,
       {
         id: localUserId,
         role: "user",
-        content,
+        content: request.content,
         toolCalls: [],
       },
       {
@@ -429,21 +477,24 @@ export function App() {
     ]);
     setDraftMessage("");
     setIsSendingMessage(true);
+    setRetryRunRequest(null);
     setError(null);
+    activeRunAbortRef.current = abortController;
 
     try {
       const response = await fetch(
-        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/chat/stream`,
+        `/api/workspaces/${encodeURIComponent(request.workspaceId)}/chat/stream`,
         {
           body: JSON.stringify({
-            chatId: activeChatId,
-            message: content,
-            modelId: selectedModelId,
-            thinkingLevel: selectedThinkingLevel || null,
+            chatId: request.chatId,
+            message: request.content,
+            modelId: request.modelId,
+            thinkingLevel: request.thinkingLevel || null,
           }),
           cache: "no-store",
           headers: { "Content-Type": "application/json" },
           method: "POST",
+          signal: abortController.signal,
         },
       );
 
@@ -454,6 +505,7 @@ export function App() {
       await readChatStream(response, (streamEvent) => {
         if (streamEvent.type === "start") {
           assistantMessageId = streamEvent.assistantMessageId;
+          requestChatId = streamEvent.chatId;
           setActiveChatId(streamEvent.chatId);
           setMessages((current) =>
             current.map((message) => {
@@ -484,6 +536,7 @@ export function App() {
 
         if (streamEvent.type === "complete") {
           setActiveChatId(streamEvent.chatId);
+          setRetryRunRequest(null);
           setMessages((current) =>
             current.map((message) =>
               message.id === assistantMessageId
@@ -552,8 +605,14 @@ export function App() {
 
       await refreshWorkspaces();
     } catch (requestError) {
-      const message = errorMessage(requestError);
+      const wasCancelled =
+        requestError instanceof DOMException && requestError.name === "AbortError";
+      const message = wasCancelled ? "Run cancelled." : errorMessage(requestError);
       setError(message);
+      setRetryRunRequest({
+        ...request,
+        chatId: requestChatId,
+      });
       setMessages((current) =>
         current.map((item) =>
           item.id === assistantMessageId
@@ -562,6 +621,9 @@ export function App() {
         ),
       );
     } finally {
+      if (activeRunAbortRef.current === abortController) {
+        activeRunAbortRef.current = null;
+      }
       setIsSendingMessage(false);
     }
   }
@@ -791,9 +853,12 @@ export function App() {
               isSendingMessage={isSendingMessage}
               messages={messages}
               onDraftMessageChange={setDraftMessage}
+              onCancelRun={handleCancelRun}
               onModelChange={setSelectedModelId}
+              onRetryRun={() => void handleRetryRun()}
               onSubmit={handleSendMessage}
               onThinkingLevelChange={setSelectedThinkingLevel}
+              canRetryRun={retryRunRequest !== null && !isSendingMessage}
               selectedModelId={selectedModelId}
               selectedThinkingLevel={selectedThinkingLevel}
               thinkingLevels={thinkingLevels}
@@ -822,12 +887,15 @@ export function App() {
 
 function ChatPanel({
   availableModels,
+  canRetryRun,
   draftMessage,
   isLoadingSettings,
   isSendingMessage,
   messages,
+  onCancelRun,
   onDraftMessageChange,
   onModelChange,
+  onRetryRun,
   onSubmit,
   onThinkingLevelChange,
   selectedModelId,
@@ -835,12 +903,15 @@ function ChatPanel({
   thinkingLevels,
 }: {
   availableModels: ConfiguredModelSummary[];
+  canRetryRun: boolean;
   draftMessage: string;
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
   messages: ShellMessage[];
+  onCancelRun: () => void;
   onDraftMessageChange: (value: string) => void;
   onModelChange: (value: string) => void;
+  onRetryRun: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onThinkingLevelChange: (value: string) => void;
   selectedModelId: string;
@@ -969,6 +1040,15 @@ function ChatPanel({
               value={draftMessage}
             />
             <button
+              className="inline-flex h-20 w-12 items-center justify-center rounded-md border border-rose-200 bg-white text-rose-700 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:text-zinc-400"
+              disabled={!isSendingMessage}
+              onClick={onCancelRun}
+              title="Cancel run"
+              type="button"
+            >
+              <X aria-hidden="true" className="size-5" />
+            </button>
+            <button
               className="inline-flex h-20 w-12 items-center justify-center rounded-md bg-teal-700 text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
               disabled={
                 isSendingMessage || !draftMessage.trim() || !selectedModelId
@@ -983,6 +1063,16 @@ function ChatPanel({
               )}
             </button>
           </div>
+          {canRetryRun ? (
+            <button
+              className="mt-2 inline-flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-medium text-zinc-700 transition hover:bg-zinc-50"
+              onClick={onRetryRun}
+              type="button"
+            >
+              <RefreshCw aria-hidden="true" className="size-3.5" />
+              Retry last run
+            </button>
+          ) : null}
         </form>
         <button
           className="mx-auto mt-3 flex h-9 w-full max-w-4xl items-center justify-between rounded-md border border-zinc-200 bg-zinc-50 px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-100"
