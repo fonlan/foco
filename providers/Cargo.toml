@@ -6,3 +6,7 @@ version.workspace = true
 
 [lib]
 path = "lib.rs"
+
+[dependencies]
+genai.workspace = true
+reqwest.workspace = true

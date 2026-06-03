@@ -13,10 +13,14 @@ use axum::{
     routing::{get, post},
 };
 use chrono::{SecondsFormat, Utc};
+use foco_providers::{
+    DEFAULT_OPENAI_BASE_URL, OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND, ProviderConnectionConfig,
+    normalized_base_url, parse_provider_kind, test_provider_connection,
+};
 use foco_store::{
     config::{
-        GlobalConfig, ModelLimits, ModelSettings, WorkspaceConfig, load_or_create_global_config,
-        save_global_config,
+        GlobalConfig, ModelLimits, ModelSettings, ProviderSettings, WorkspaceConfig,
+        load_or_create_global_config, save_global_config,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
@@ -77,6 +81,9 @@ async fn run() -> AppResult<()> {
         .route("/api/workspaces", get(workspaces))
         .route("/api/workspaces/create", post(create_workspace))
         .route("/api/workspaces/add", post(add_workspace))
+        .route("/api/settings", get(settings))
+        .route("/api/providers/manual", post(save_manual_provider))
+        .route("/api/providers/test", post(test_provider))
         .route("/api/model-metadata", get(model_metadata))
         .route("/api/model-metadata/refresh", post(refresh_model_metadata))
         .route("/api/models/manual", post(save_manual_model))
@@ -169,6 +176,100 @@ async fn add_workspace(
     workspace_response_from_config(&config)
 }
 
+async fn settings(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+
+    Ok(Json(settings_response(&config)))
+}
+
+async fn save_manual_provider(
+    State(state): State<AppState>,
+    Json(request): Json<ManualProviderRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let id = request.id.trim();
+    let name = request.name.trim();
+    let kind = request.kind.trim();
+    let base_url = optional_trimmed_string(request.base_url);
+    let existing_provider = config.providers.iter().find(|provider| provider.id == id);
+    let api_key = match optional_trimmed_string(request.api_key) {
+        Some(value) => Some(value),
+        None if request.clear_api_key.unwrap_or(false) => None,
+        None => existing_provider.and_then(|provider| provider.api_key.clone()),
+    };
+
+    if id.is_empty() {
+        return Err(ApiError::bad_request("provider id must not be empty"));
+    }
+
+    if name.is_empty() {
+        return Err(ApiError::bad_request("provider name must not be empty"));
+    }
+
+    let provider_kind =
+        parse_provider_kind(kind).map_err(|source| ApiError::bad_request(source.to_string()))?;
+    let normalized_base_url = match base_url {
+        Some(value) => Some(
+            normalized_base_url(&value)
+                .map_err(|source| ApiError::bad_request(source.to_string()))?,
+        ),
+        None => None,
+    };
+    let provider = ProviderSettings {
+        id: id.to_string(),
+        name: name.to_string(),
+        kind: provider_kind.as_str().to_string(),
+        enabled: request.enabled,
+        base_url: normalized_base_url,
+        api_key,
+    };
+
+    if let Some(stored_provider) = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == id)
+    {
+        *stored_provider = provider;
+    } else {
+        config.providers.push(provider);
+    }
+
+    save_config(&state, config.clone())?;
+
+    Ok(Json(settings_response(&config)))
+}
+
+async fn test_provider(
+    State(state): State<AppState>,
+    Json(request): Json<TestProviderRequest>,
+) -> Result<Json<ProviderTestResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let provider_id = request.provider_id.trim();
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| ApiError::bad_request(format!("provider was not found: {provider_id}")))?;
+
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "provider '{}' is disabled",
+            provider.id
+        )));
+    }
+
+    let connection_config = provider_connection_config(provider)?;
+    let model_count = test_provider_connection(&connection_config)
+        .await
+        .map_err(ApiError::from_provider_config_error)?;
+
+    Ok(Json(ProviderTestResponse {
+        ok: true,
+        message: format!("Connected; provider returned {model_count} models"),
+        model_count,
+    }))
+}
+
 async fn model_metadata(
     State(state): State<AppState>,
 ) -> Result<Json<ModelMetadataResponse>, ApiError> {
@@ -225,6 +326,10 @@ async fn save_manual_model(
     let display_name = request.display_name.trim();
     let context_window = request.context_window;
     let max_output_tokens = request.max_output_tokens;
+    let requested_provider_ids = request.provider_ids;
+    let requested_active_provider_id = request.active_provider_id;
+    let requested_thinking_level = request.thinking_level;
+    let clear_thinking_level = request.clear_thinking_level.unwrap_or(false);
     let metadata_key = request
         .metadata_key
         .as_ref()
@@ -286,15 +391,31 @@ async fn save_manual_model(
     };
 
     let existing_model = config.models.iter().find(|model| model.id == model_id);
+    let provider_ids = normalize_model_provider_ids(requested_provider_ids, existing_model)?;
+    let active_provider_id = match requested_active_provider_id {
+        Some(value) => optional_trimmed_string(Some(value)),
+        None => existing_model.and_then(|model| model.active_provider_id.clone()),
+    };
+    let active_provider_id = if provider_ids.is_empty() {
+        None
+    } else {
+        active_provider_id
+    };
+    let thinking_level = match requested_thinking_level {
+        Some(value) => optional_trimmed_string(Some(value)),
+        None if clear_thinking_level => None,
+        None => existing_model.and_then(|model| model.thinking_level.clone()),
+    };
+
+    validate_model_provider_references(&config, &provider_ids, active_provider_id.as_deref())?;
+
     let model = ModelSettings {
         id: model_id.to_string(),
         display_name: display_name.to_string(),
         enabled: request.enabled,
-        provider_ids: existing_model
-            .map(|model| model.provider_ids.clone())
-            .unwrap_or_default(),
-        active_provider_id: existing_model.and_then(|model| model.active_provider_id.clone()),
-        thinking_level: existing_model.and_then(|model| model.thinking_level.clone()),
+        provider_ids,
+        active_provider_id,
+        thinking_level,
         metadata_key: metadata_key
             .clone()
             .or_else(|| metadata_record.as_ref().map(|record| record.key.clone())),
@@ -341,6 +462,73 @@ struct ManualModelRequest {
     metadata_key: Option<String>,
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
+    provider_ids: Option<Vec<String>>,
+    active_provider_id: Option<String>,
+    thinking_level: Option<String>,
+    clear_thinking_level: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualProviderRequest {
+    id: String,
+    name: String,
+    kind: String,
+    enabled: bool,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    clear_api_key: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TestProviderRequest {
+    provider_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsResponse {
+    provider_kinds: Vec<ProviderKindSummary>,
+    thinking_levels: Vec<ThinkingLevelSummary>,
+    providers: Vec<ConfiguredProviderSummary>,
+    configured_models: Vec<ConfiguredModelSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderKindSummary {
+    kind: &'static str,
+    label: &'static str,
+    default_base_url: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThinkingLevelSummary {
+    value: &'static str,
+    label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfiguredProviderSummary {
+    id: String,
+    name: String,
+    kind: String,
+    kind_label: &'static str,
+    enabled: bool,
+    base_url: Option<String>,
+    has_api_key: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderTestResponse {
+    ok: bool,
+    message: String,
+    model_count: usize,
 }
 
 #[derive(Serialize)]
@@ -373,6 +561,11 @@ struct ConfiguredModelSummary {
     max_output_tokens: Option<u64>,
     can_enable: bool,
     missing_limits: Vec<&'static str>,
+    provider_ids: Vec<String>,
+    active_provider_id: Option<String>,
+    thinking_level: Option<String>,
+    supports_thinking: bool,
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -429,6 +622,10 @@ impl ApiError {
 
     fn from_model_metadata_error(error: ModelMetadataError) -> Self {
         Self::internal(error.to_string())
+    }
+
+    fn from_provider_config_error(error: foco_providers::ProviderConfigError) -> Self {
+        Self::bad_request(error.to_string())
     }
 }
 
@@ -489,6 +686,105 @@ fn save_config(state: &AppState, config: GlobalConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn settings_response(config: &GlobalConfig) -> SettingsResponse {
+    SettingsResponse {
+        provider_kinds: vec![
+            ProviderKindSummary {
+                kind: OPENAI_CHAT_KIND,
+                label: "OpenAI Chat",
+                default_base_url: DEFAULT_OPENAI_BASE_URL,
+            },
+            ProviderKindSummary {
+                kind: OPENAI_RESPONSES_KIND,
+                label: "OpenAI Responses",
+                default_base_url: DEFAULT_OPENAI_BASE_URL,
+            },
+        ],
+        thinking_levels: vec![
+            ThinkingLevelSummary {
+                value: "minimal",
+                label: "Minimal",
+            },
+            ThinkingLevelSummary {
+                value: "low",
+                label: "Low",
+            },
+            ThinkingLevelSummary {
+                value: "medium",
+                label: "Medium",
+            },
+            ThinkingLevelSummary {
+                value: "high",
+                label: "High",
+            },
+            ThinkingLevelSummary {
+                value: "xhigh",
+                label: "Extra High",
+            },
+        ],
+        providers: config
+            .providers
+            .iter()
+            .map(configured_provider_summary)
+            .collect(),
+        configured_models: config
+            .models
+            .iter()
+            .map(|model| configured_model_summary_for_config(model, config))
+            .collect(),
+    }
+}
+
+fn configured_provider_summary(provider: &ProviderSettings) -> ConfiguredProviderSummary {
+    ConfiguredProviderSummary {
+        id: provider.id.clone(),
+        name: provider.name.clone(),
+        kind: provider.kind.clone(),
+        kind_label: provider_kind_label(&provider.kind),
+        enabled: provider.enabled,
+        base_url: provider.base_url.clone(),
+        has_api_key: provider
+            .api_key
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        warnings: provider_warnings(provider),
+    }
+}
+
+fn provider_warnings(provider: &ProviderSettings) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if !provider.enabled {
+        warnings.push("Provider is disabled.".to_string());
+    }
+
+    if provider
+        .api_key
+        .as_deref()
+        .map(|value| value.trim().is_empty())
+        .unwrap_or(true)
+    {
+        warnings.push("Provider has no API key.".to_string());
+    }
+
+    if parse_provider_kind(&provider.kind).is_err() {
+        warnings.push(format!("Provider kind '{}' is unsupported.", provider.kind));
+    }
+
+    warnings
+}
+
+fn configured_model_summary_for_config(
+    model: &ModelSettings,
+    config: &GlobalConfig,
+) -> ConfiguredModelSummary {
+    let mut summary = configured_model_summary(model);
+    summary.supports_thinking = model_supports_thinking(model, config);
+    summary.warnings = model_warnings(model, config, summary.can_enable, summary.supports_thinking);
+    summary
+}
+
 fn workspace_response_from_config(
     config: &GlobalConfig,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
@@ -533,7 +829,11 @@ fn model_metadata_response(
         fetched_at,
         cache_path: cache_path.display().to_string(),
         models,
-        configured_models: config.models.iter().map(configured_model_summary).collect(),
+        configured_models: config
+            .models
+            .iter()
+            .map(|model| configured_model_summary_for_config(model, config))
+            .collect(),
     }
 }
 
@@ -561,7 +861,173 @@ fn configured_model_summary(model: &ModelSettings) -> ConfiguredModelSummary {
         max_output_tokens,
         can_enable: missing_limits.is_empty(),
         missing_limits,
+        provider_ids: model.provider_ids.clone(),
+        active_provider_id: model.active_provider_id.clone(),
+        thinking_level: model.thinking_level.clone(),
+        supports_thinking: false,
+        warnings: Vec::new(),
     }
+}
+
+fn provider_connection_config(
+    provider: &ProviderSettings,
+) -> Result<ProviderConnectionConfig, ApiError> {
+    Ok(ProviderConnectionConfig {
+        kind: parse_provider_kind(&provider.kind)
+            .map_err(|source| ApiError::bad_request(source.to_string()))?,
+        base_url: provider.base_url.clone(),
+        api_key: provider.api_key.clone(),
+    })
+}
+
+fn normalize_model_provider_ids(
+    requested_provider_ids: Option<Vec<String>>,
+    existing_model: Option<&ModelSettings>,
+) -> Result<Vec<String>, ApiError> {
+    let values = match requested_provider_ids {
+        Some(values) => values,
+        None => {
+            return Ok(existing_model
+                .map(|model| model.provider_ids.clone())
+                .unwrap_or_default());
+        }
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut provider_ids = Vec::new();
+
+    for value in values {
+        let provider_id = value.trim();
+
+        if provider_id.is_empty() {
+            continue;
+        }
+
+        if seen.insert(provider_id.to_string()) {
+            provider_ids.push(provider_id.to_string());
+        }
+    }
+
+    Ok(provider_ids)
+}
+
+fn validate_model_provider_references(
+    config: &GlobalConfig,
+    provider_ids: &[String],
+    active_provider_id: Option<&str>,
+) -> Result<(), ApiError> {
+    for provider_id in provider_ids {
+        if !config
+            .providers
+            .iter()
+            .any(|provider| provider.id == *provider_id)
+        {
+            return Err(ApiError::bad_request(format!(
+                "model references missing provider '{}'",
+                provider_id
+            )));
+        }
+    }
+
+    if let Some(active_provider_id) = active_provider_id {
+        if !provider_ids
+            .iter()
+            .any(|provider_id| provider_id == active_provider_id)
+        {
+            return Err(ApiError::bad_request(format!(
+                "active provider '{}' is not associated with the model",
+                active_provider_id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn model_supports_thinking(model: &ModelSettings, config: &GlobalConfig) -> bool {
+    let has_responses_provider = model.provider_ids.iter().any(|provider_id| {
+        config
+            .providers
+            .iter()
+            .any(|provider| provider.id == *provider_id && provider.kind == OPENAI_RESPONSES_KIND)
+    });
+    let id = model.id.to_ascii_lowercase();
+
+    has_responses_provider
+        || id.starts_with("o1")
+        || id.starts_with("o3")
+        || id.starts_with("o4")
+        || id.starts_with("gpt-5")
+        || id.contains("reasoning")
+        || id.contains("thinking")
+}
+
+fn model_warnings(
+    model: &ModelSettings,
+    config: &GlobalConfig,
+    can_enable: bool,
+    supports_thinking: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if model.enabled && !can_enable {
+        warnings.push("Enabled model is missing required limits.".to_string());
+    }
+
+    if model.enabled && model.provider_ids.is_empty() {
+        warnings.push("Enabled model is not associated with any provider.".to_string());
+    }
+
+    if let Some(active_provider_id) = &model.active_provider_id {
+        if !model
+            .provider_ids
+            .iter()
+            .any(|provider_id| provider_id == active_provider_id)
+        {
+            warnings.push(format!(
+                "Active provider '{}' is not associated with this model.",
+                active_provider_id
+            ));
+        }
+    } else if !model.provider_ids.is_empty() {
+        warnings.push("Model has providers but no active provider selected.".to_string());
+    }
+
+    for provider_id in &model.provider_ids {
+        match config
+            .providers
+            .iter()
+            .find(|provider| provider.id == *provider_id)
+        {
+            Some(provider) if !provider.enabled => {
+                warnings.push(format!("Provider '{}' is disabled.", provider.name));
+            }
+            Some(_) => {}
+            None => warnings.push(format!("Provider '{}' does not exist.", provider_id)),
+        }
+    }
+
+    if model.thinking_level.is_some() && !supports_thinking {
+        warnings.push(
+            "Thinking level is saved, but Foco cannot verify this model supports thinking options."
+                .to_string(),
+        );
+    }
+
+    warnings
+}
+
+fn provider_kind_label(kind: &str) -> &'static str {
+    match kind {
+        OPENAI_CHAT_KIND => "OpenAI Chat",
+        OPENAI_RESPONSES_KIND => "OpenAI Responses",
+        _ => "Unsupported",
+    }
+}
+
+fn optional_trimmed_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn cached_model_record(

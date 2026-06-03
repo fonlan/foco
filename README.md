@@ -41,6 +41,13 @@ support. The settings page also saves manually filled model limits through
 `POST /api/models/manual`; enabled models must have both context window and max
 output tokens, or config validation fails with an explicit error.
 
+Provider settings are managed from the same settings page and persisted in
+`%USERPROFILE%\.foco\config.json`. `POST /api/providers/manual` saves OpenAI
+Chat and OpenAI Responses provider configs, `POST /api/providers/test` checks
+the selected provider through `genai`, and `POST /api/models/manual` also saves
+model-provider associations, the active provider, and the model thinking level.
+Capability warnings are shown without silently changing saved choices.
+
 For live frontend development, run the Vite dev server alongside the backend:
 
 ```bash

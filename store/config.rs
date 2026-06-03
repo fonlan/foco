@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use foco_providers::{normalized_base_url, parse_provider_kind};
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -221,6 +222,16 @@ impl GlobalConfig {
             validate_id(config_path, "provider.id", &provider.id)?;
             require_non_empty(config_path, "provider.name", &provider.name)?;
             require_non_empty(config_path, "provider.kind", &provider.kind)?;
+            parse_provider_kind(&provider.kind).map_err(|source| ConfigError::Validation {
+                path: config_path.map(Path::to_path_buf),
+                message: source.to_string(),
+            })?;
+            if let Some(base_url) = &provider.base_url {
+                normalized_base_url(base_url).map_err(|source| ConfigError::Validation {
+                    path: config_path.map(Path::to_path_buf),
+                    message: source.to_string(),
+                })?;
+            }
         }
 
         validate_unique_named_items(
@@ -282,6 +293,8 @@ impl GlobalConfig {
             }
 
             if let Some(active_provider_id) = &model.active_provider_id {
+                validate_id(config_path, "model.active_provider_id", active_provider_id)?;
+
                 if !model.provider_ids.iter().any(|id| id == active_provider_id) {
                     return invalid_config(
                         config_path,
@@ -291,6 +304,10 @@ impl GlobalConfig {
                         ),
                     );
                 }
+            }
+
+            if let Some(thinking_level) = &model.thinking_level {
+                validate_id(config_path, "model.thinking_level", thinking_level)?;
             }
 
             for provider_id in &model.provider_ids {

@@ -9,8 +9,10 @@ import {
   Folder,
   FolderPlus,
   GitCompare,
+  KeyRound,
   LoaderCircle,
   MessageSquare,
+  PlugZap,
   Plus,
   RefreshCw,
   Send,
@@ -76,6 +78,11 @@ type ConfiguredModelSummary = {
   maxOutputTokens: number | null;
   canEnable: boolean;
   missingLimits: string[];
+  providerIds: string[];
+  activeProviderId: string | null;
+  thinkingLevel: string | null;
+  supportsThinking: boolean;
+  warnings: string[];
 };
 
 type ModelMetadataResponse = {
@@ -92,6 +99,59 @@ type ModelFormState = {
   maxOutputTokens: string;
   modelId: string;
   contextWindow: string;
+  providerIds: string[];
+  activeProviderId: string;
+  thinkingLevel: string;
+};
+
+type ProviderKindSummary = {
+  kind: string;
+  label: string;
+  defaultBaseUrl: string;
+};
+
+type ThinkingLevelSummary = {
+  value: string;
+  label: string;
+};
+
+type ConfiguredProviderSummary = {
+  id: string;
+  name: string;
+  kind: string;
+  kindLabel: string;
+  enabled: boolean;
+  baseUrl: string | null;
+  hasApiKey: boolean;
+  warnings: string[];
+};
+
+type SettingsResponse = {
+  providerKinds: ProviderKindSummary[];
+  thinkingLevels: ThinkingLevelSummary[];
+  providers: ConfiguredProviderSummary[];
+  configuredModels: ConfiguredModelSummary[];
+};
+
+type ProviderFormState = {
+  apiKey: string;
+  baseUrl: string;
+  clearApiKey: boolean;
+  enabled: boolean;
+  id: string;
+  kind: string;
+  name: string;
+};
+
+type ProviderTestResponse = {
+  ok: boolean;
+  message: string;
+  modelCount: number;
+};
+
+type ProviderTestState = {
+  message: string;
+  status: "error" | "ok" | "testing";
 };
 
 type WorkspaceFormMode = "add" | "create";
@@ -567,12 +627,21 @@ function PlaceholderPanel({
 
 function SettingsPanel() {
   const [metadata, setMetadata] = useState<ModelMetadataResponse | null>(null);
+  const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedMetadataKey, setSelectedMetadataKey] = useState("");
   const [modelSearch, setModelSearch] = useState("");
   const [form, setForm] = useState<ModelFormState>(() => emptyModelForm());
+  const [providerForm, setProviderForm] = useState<ProviderFormState>(() =>
+    emptyProviderForm(),
+  );
   const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isSavingProvider, setIsSavingProvider] = useState(false);
+  const [providerTests, setProviderTests] = useState<
+    Record<string, ProviderTestState>
+  >({});
   const [error, setError] = useState<string | null>(null);
 
   const selectedMetadata = useMemo(
@@ -607,6 +676,15 @@ function SettingsPanel() {
   const enabledNeedsLimits =
     form.enabled &&
     (!form.contextWindow.trim() || !form.maxOutputTokens.trim());
+  const providerKinds = settings?.providerKinds ?? [];
+  const providers = settings?.providers ?? [];
+  const thinkingLevels = settings?.thinkingLevels ?? [];
+  const configuredModels =
+    settings?.configuredModels ?? metadata?.configuredModels ?? [];
+  const selectedProviderKind = providerKinds.find(
+    (kind) => kind.kind === providerForm.kind,
+  );
+  const selectedProviderIds = new Set(form.providerIds);
 
   const loadMetadata = useCallback(async () => {
     setIsLoading(true);
@@ -624,9 +702,28 @@ function SettingsPanel() {
     }
   }, []);
 
+  const loadSettings = useCallback(async () => {
+    setIsLoadingSettings(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings");
+      setSettings(data);
+      setProviderForm((current) => ({
+        ...current,
+        kind: current.kind || data.providerKinds[0]?.kind || "openai-responses",
+      }));
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsLoadingSettings(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadMetadata();
-  }, [loadMetadata]);
+    void loadSettings();
+  }, [loadMetadata, loadSettings]);
 
   function selectMetadataModel(key: string) {
     setSelectedMetadataKey(key);
@@ -642,6 +739,9 @@ function SettingsPanel() {
       modelId: model.key,
       contextWindow: numberInputValue(model.contextWindow),
       maxOutputTokens: numberInputValue(model.maxOutputTokens),
+      providerIds: [],
+      activeProviderId: "",
+      thinkingLevel: "",
     });
   }
 
@@ -653,6 +753,21 @@ function SettingsPanel() {
       modelId: model.id,
       contextWindow: numberInputValue(model.contextWindow),
       maxOutputTokens: numberInputValue(model.maxOutputTokens),
+      providerIds: model.providerIds,
+      activeProviderId: model.activeProviderId ?? "",
+      thinkingLevel: model.thinkingLevel ?? "",
+    });
+  }
+
+  function editConfiguredProvider(provider: ConfiguredProviderSummary) {
+    setProviderForm({
+      apiKey: "",
+      baseUrl: provider.baseUrl ?? "",
+      clearApiKey: false,
+      enabled: provider.enabled,
+      id: provider.id,
+      kind: provider.kind,
+      name: provider.name,
     });
   }
 
@@ -695,17 +810,105 @@ function SettingsPanel() {
               form.maxOutputTokens,
               "Max output tokens",
             ),
+            providerIds: form.providerIds,
+            activeProviderId: form.activeProviderId,
+            thinkingLevel: form.thinkingLevel || null,
+            clearThinkingLevel: !form.thinkingLevel,
           }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
       );
       setMetadata(data);
+      await loadSettings();
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
       setIsSaving(false);
     }
+  }
+
+  async function saveProvider(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSavingProvider(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>(
+        "/api/providers/manual",
+        {
+          body: JSON.stringify({
+            apiKey: providerForm.apiKey || null,
+            baseUrl: providerForm.baseUrl || null,
+            clearApiKey: providerForm.clearApiKey,
+            enabled: providerForm.enabled,
+            id: providerForm.id,
+            kind: providerForm.kind,
+            name: providerForm.name,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setSettings(data);
+      setProviderForm((current) => ({
+        ...current,
+        apiKey: "",
+        clearApiKey: false,
+      }));
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingProvider(false);
+    }
+  }
+
+  async function testProvider(providerId: string) {
+    setProviderTests((current) => ({
+      ...current,
+      [providerId]: { message: "Testing connection...", status: "testing" },
+    }));
+    setError(null);
+
+    try {
+      const data = await requestJson<ProviderTestResponse>(
+        "/api/providers/test",
+        {
+          body: JSON.stringify({ providerId }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setProviderTests((current) => ({
+        ...current,
+        [providerId]: { message: data.message, status: data.ok ? "ok" : "error" },
+      }));
+    } catch (requestError) {
+      setProviderTests((current) => ({
+        ...current,
+        [providerId]: {
+          message: errorMessage(requestError),
+          status: "error",
+        },
+      }));
+    }
+  }
+
+  function toggleModelProvider(providerId: string, checked: boolean) {
+    setForm((current) => {
+      const providerIds = checked
+        ? [...current.providerIds, providerId].filter(uniqueString)
+        : current.providerIds.filter((id) => id !== providerId);
+      const activeProviderId = providerIds.includes(current.activeProviderId)
+        ? current.activeProviderId
+        : providerIds[0] ?? "";
+
+      return {
+        ...current,
+        activeProviderId,
+        providerIds,
+      };
+    });
   }
 
   return (
@@ -714,7 +917,9 @@ function SettingsPanel() {
         <section className="border-b border-zinc-200 pb-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
-              <h2 className="text-base font-semibold">Model Metadata</h2>
+              <h2 className="text-base font-semibold">
+                Provider And Model Settings
+              </h2>
               <p className="mt-1 truncate text-xs text-zinc-500">
                 {metadata?.fetchedAt
                   ? `Fetched ${metadata.fetchedAt} from ${metadata.sourceUrl}`
@@ -742,6 +947,235 @@ function SettingsPanel() {
             {error}
           </div>
         ) : null}
+
+        <section className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+          <form
+            className="rounded-md border border-zinc-200 bg-white px-4 py-4"
+            onSubmit={(event) => void saveProvider(event)}
+          >
+            <div className="mb-4 flex items-center gap-2">
+              <PlugZap aria-hidden="true" className="size-5 text-teal-700" />
+              <h3 className="text-sm font-semibold">Provider</h3>
+            </div>
+            <div className="space-y-3">
+              <div className="grid gap-3 sm:grid-cols-2">
+                <TextField
+                  label="Provider ID"
+                  onChange={(value) =>
+                    setProviderForm((current) => ({ ...current, id: value }))
+                  }
+                  placeholder="openai"
+                  value={providerForm.id}
+                />
+                <TextField
+                  label="Name"
+                  onChange={(value) =>
+                    setProviderForm((current) => ({
+                      ...current,
+                      name: value,
+                    }))
+                  }
+                  placeholder="OpenAI"
+                  value={providerForm.name}
+                />
+              </div>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-zinc-600">
+                  Kind
+                </span>
+                <select
+                  className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) =>
+                    setProviderForm((current) => ({
+                      ...current,
+                      kind: event.target.value,
+                    }))
+                  }
+                  value={providerForm.kind || providerKinds[0]?.kind || ""}
+                >
+                  {providerKinds.map((kind) => (
+                    <option key={kind.kind} value={kind.kind}>
+                      {kind.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <TextField
+                label="Base URL"
+                onChange={(value) =>
+                  setProviderForm((current) => ({
+                    ...current,
+                    baseUrl: value,
+                  }))
+                }
+                placeholder={selectedProviderKind?.defaultBaseUrl ?? ""}
+                value={providerForm.baseUrl}
+              />
+              <TextField
+                label="API Key"
+                onChange={(value) =>
+                  setProviderForm((current) => ({ ...current, apiKey: value }))
+                }
+                placeholder="Leave blank to keep saved key"
+                value={providerForm.apiKey}
+              />
+              <label className="flex items-center justify-between gap-3 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2">
+                <span className="text-sm font-medium text-zinc-700">
+                  Enable provider
+                </span>
+                <input
+                  checked={providerForm.enabled}
+                  className="size-4 accent-teal-700"
+                  onChange={(event) =>
+                    setProviderForm((current) => ({
+                      ...current,
+                      enabled: event.target.checked,
+                    }))
+                  }
+                  type="checkbox"
+                />
+              </label>
+              <label className="flex items-center justify-between gap-3 rounded-md border border-zinc-200 bg-white px-3 py-2">
+                <span className="text-sm font-medium text-zinc-700">
+                  Clear saved API key
+                </span>
+                <input
+                  checked={providerForm.clearApiKey}
+                  className="size-4 accent-teal-700"
+                  onChange={(event) =>
+                    setProviderForm((current) => ({
+                      ...current,
+                      clearApiKey: event.target.checked,
+                    }))
+                  }
+                  type="checkbox"
+                />
+              </label>
+              <button
+                className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-zinc-900 px-3 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
+                disabled={
+                  isSavingProvider ||
+                  !providerForm.id.trim() ||
+                  !providerForm.name.trim() ||
+                  !providerForm.kind.trim()
+                }
+                type="submit"
+              >
+                {isSavingProvider ? (
+                  <LoaderCircle
+                    aria-hidden="true"
+                    className="size-4 animate-spin"
+                  />
+                ) : (
+                  <KeyRound aria-hidden="true" className="size-4" />
+                )}
+                Save Provider
+              </button>
+            </div>
+          </form>
+
+          <section className="rounded-md border border-zinc-200 bg-white">
+            <div className="flex items-center justify-between gap-3 border-b border-zinc-200 px-4 py-3">
+              <h3 className="text-sm font-semibold">Configured Providers</h3>
+              <button
+                className="inline-flex size-8 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-700 transition hover:bg-zinc-50"
+                disabled={isLoadingSettings}
+                onClick={() => void loadSettings()}
+                title="Reload settings"
+                type="button"
+              >
+                {isLoadingSettings ? (
+                  <LoaderCircle
+                    aria-hidden="true"
+                    className="size-4 animate-spin"
+                  />
+                ) : (
+                  <RefreshCw aria-hidden="true" className="size-4" />
+                )}
+              </button>
+            </div>
+            <div className="divide-y divide-zinc-100">
+              {providers.length ? (
+                providers.map((provider) => {
+                  const test = providerTests[provider.id];
+
+                  return (
+                    <div className="px-4 py-3" key={provider.id}>
+                      <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="truncate text-sm font-medium">
+                              {provider.name}
+                            </span>
+                            <CapabilityPill
+                              label={provider.enabled ? "enabled" : "disabled"}
+                              ok={provider.enabled}
+                            />
+                            <CapabilityPill
+                              label={provider.hasApiKey ? "key saved" : "key missing"}
+                              ok={provider.hasApiKey}
+                            />
+                          </div>
+                          <div className="mt-1 truncate text-xs text-zinc-500">
+                            {provider.id} / {provider.kindLabel}
+                          </div>
+                          {provider.baseUrl ? (
+                            <div className="mt-1 truncate text-xs text-zinc-500">
+                              {provider.baseUrl}
+                            </div>
+                          ) : null}
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            className="inline-flex h-8 items-center justify-center rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50"
+                            onClick={() => editConfiguredProvider(provider)}
+                            type="button"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            className="inline-flex h-8 items-center justify-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50 disabled:cursor-not-allowed disabled:bg-zinc-100"
+                            disabled={test?.status === "testing"}
+                            onClick={() => void testProvider(provider.id)}
+                            type="button"
+                          >
+                            {test?.status === "testing" ? (
+                              <LoaderCircle
+                                aria-hidden="true"
+                                className="size-4 animate-spin"
+                              />
+                            ) : (
+                              <PlugZap aria-hidden="true" className="size-4" />
+                            )}
+                            Test
+                          </button>
+                        </div>
+                      </div>
+                      {test ? (
+                        <div
+                          className={`mt-3 rounded-md border px-3 py-2 text-sm ${
+                            test.status === "ok"
+                              ? "border-teal-200 bg-teal-50 text-teal-800"
+                              : test.status === "testing"
+                                ? "border-zinc-200 bg-zinc-50 text-zinc-600"
+                                : "border-rose-200 bg-rose-50 text-rose-700"
+                          }`}
+                        >
+                          {test.message}
+                        </div>
+                      ) : null}
+                      <Warnings warnings={provider.warnings} />
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="px-4 py-6 text-sm text-zinc-500">
+                  No configured providers
+                </div>
+              )}
+            </div>
+          </section>
+        </section>
 
         <section className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(22rem,0.9fr)]">
           <div className="min-w-0 rounded-md border border-zinc-200 bg-white">
@@ -885,6 +1319,96 @@ function SettingsPanel() {
                   type="checkbox"
                 />
               </label>
+              <div className="rounded-md border border-zinc-200 px-3 py-3">
+                <div className="mb-2 text-xs font-medium text-zinc-600">
+                  Providers
+                </div>
+                <div className="space-y-2">
+                  {providers.length ? (
+                    providers.map((provider) => (
+                      <label
+                        className="flex items-center justify-between gap-3 rounded-md bg-zinc-50 px-3 py-2"
+                        key={provider.id}
+                      >
+                        <span className="min-w-0">
+                          <span className="block truncate text-sm font-medium text-zinc-700">
+                            {provider.name}
+                          </span>
+                          <span className="block truncate text-xs text-zinc-500">
+                            {provider.kindLabel}
+                          </span>
+                        </span>
+                        <input
+                          checked={selectedProviderIds.has(provider.id)}
+                          className="size-4 accent-teal-700"
+                          onChange={(event) =>
+                            toggleModelProvider(
+                              provider.id,
+                              event.target.checked,
+                            )
+                          }
+                          type="checkbox"
+                        />
+                      </label>
+                    ))
+                  ) : (
+                    <div className="rounded-md bg-zinc-50 px-3 py-2 text-sm text-zinc-500">
+                      No providers
+                    </div>
+                  )}
+                </div>
+              </div>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-zinc-600">
+                  Active Provider
+                </span>
+                <select
+                  className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  disabled={!form.providerIds.length}
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      activeProviderId: event.target.value,
+                    }))
+                  }
+                  value={form.activeProviderId}
+                >
+                  <option value="">None</option>
+                  {form.providerIds.map((providerId) => {
+                    const provider = providers.find(
+                      (item) => item.id === providerId,
+                    );
+
+                    return (
+                      <option key={providerId} value={providerId}>
+                        {provider?.name ?? providerId}
+                      </option>
+                    );
+                  })}
+                </select>
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-medium text-zinc-600">
+                  Thinking Level
+                </span>
+                <select
+                  className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      thinkingLevel: event.target.value,
+                    }))
+                  }
+                  value={form.thinkingLevel}
+                >
+                  <option value="">None</option>
+                  {thinkingLevels.map((level) => (
+                    <option key={level.value} value={level.value}>
+                      {level.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
               {enabledNeedsLimits ? (
                 <div className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
                   <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
@@ -930,8 +1454,8 @@ function SettingsPanel() {
             <h3 className="text-sm font-semibold">Configured Models</h3>
           </div>
           <div className="divide-y divide-zinc-100">
-            {metadata?.configuredModels.length ? (
-              metadata.configuredModels.map((model) => (
+            {configuredModels.length ? (
+              configuredModels.map((model) => (
                 <div
                   className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(0,1fr)_auto]"
                   key={model.id}
@@ -949,6 +1473,10 @@ function SettingsPanel() {
                         label={model.canEnable ? "limits ok" : "limits missing"}
                         ok={model.canEnable}
                       />
+                      <CapabilityPill
+                        label={model.supportsThinking ? "thinking ready" : "thinking unknown"}
+                        ok={model.supportsThinking}
+                      />
                     </div>
                     <div className="mt-1 truncate text-xs text-zinc-500">
                       {model.id}
@@ -962,7 +1490,28 @@ function SettingsPanel() {
                         label={formatLimit(model.maxOutputTokens, "out")}
                         ok={model.maxOutputTokens !== null}
                       />
+                      <CapabilityPill
+                        label={`providers ${model.providerIds.length}`}
+                        ok={model.providerIds.length > 0}
+                      />
+                      <CapabilityPill
+                        label={
+                          model.activeProviderId
+                            ? `active ${model.activeProviderId}`
+                            : "active missing"
+                        }
+                        ok={model.activeProviderId !== null}
+                      />
+                      <CapabilityPill
+                        label={
+                          model.thinkingLevel
+                            ? `thinking ${model.thinkingLevel}`
+                            : "thinking none"
+                        }
+                        ok={model.thinkingLevel !== null}
+                      />
                     </div>
+                    <Warnings warnings={model.warnings} />
                   </div>
                   <button
                     className="inline-flex h-8 items-center justify-center rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50"
@@ -1071,6 +1620,26 @@ function CapabilityPill({ label, ok }: { label: string; ok: boolean }) {
   );
 }
 
+function Warnings({ warnings }: { warnings: string[] }) {
+  if (!warnings.length) {
+    return null;
+  }
+
+  return (
+    <div className="mt-3 space-y-1">
+      {warnings.map((warning) => (
+        <div
+          className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
+          key={warning}
+        >
+          <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
+          <span className="min-w-0 break-words">{warning}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function emptyModelForm(): ModelFormState {
   return {
     displayName: "",
@@ -1078,7 +1647,26 @@ function emptyModelForm(): ModelFormState {
     maxOutputTokens: "",
     modelId: "",
     contextWindow: "",
+    providerIds: [],
+    activeProviderId: "",
+    thinkingLevel: "",
   };
+}
+
+function emptyProviderForm(): ProviderFormState {
+  return {
+    apiKey: "",
+    baseUrl: "",
+    clearApiKey: false,
+    enabled: true,
+    id: "",
+    kind: "",
+    name: "",
+  };
+}
+
+function uniqueString(value: string, index: number, values: string[]) {
+  return values.indexOf(value) === index;
 }
 
 function numberInputValue(value: number | null) {
