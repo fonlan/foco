@@ -308,6 +308,117 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn insert_tool_call(
+        &mut self,
+        tool_call: NewToolCall<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let input_json = redact_audit_json(tool_call.input_json, "tool_call.input_json")?;
+
+        self.connection
+            .execute(
+                "INSERT INTO tool_calls
+                    (
+                        id, chat_id, run_id, message_id, tool_name,
+                        input_json, status, started_at, completed_at
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    tool_call.id,
+                    tool_call.chat_id,
+                    tool_call.run_id,
+                    tool_call.message_id,
+                    tool_call.tool_name,
+                    input_json,
+                    tool_call.status,
+                    tool_call.started_at,
+                    tool_call.completed_at
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn insert_tool_result(
+        &mut self,
+        tool_result: NewToolResult<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let output_json = redact_audit_json(tool_result.output_json, "tool_result.output_json")?;
+
+        self.connection
+            .execute(
+                "INSERT INTO tool_results
+                    (id, tool_call_id, output_json, is_error, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    tool_result.id,
+                    tool_result.tool_call_id,
+                    output_json,
+                    if tool_result.is_error { 1_i64 } else { 0_i64 },
+                    tool_result.created_at
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn tool_calls_for_message(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<ToolCallWithResultRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    tool_calls.id,
+                    tool_calls.chat_id,
+                    tool_calls.run_id,
+                    tool_calls.message_id,
+                    tool_calls.tool_name,
+                    tool_calls.input_json,
+                    tool_calls.status,
+                    tool_calls.started_at,
+                    tool_calls.completed_at,
+                    tool_results.id,
+                    tool_results.output_json,
+                    tool_results.is_error,
+                    tool_results.created_at
+                 FROM tool_calls
+                 LEFT JOIN tool_results ON tool_results.tool_call_id = tool_calls.id
+                 WHERE tool_calls.message_id = ?1
+                 ORDER BY tool_calls.started_at ASC, tool_calls.id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![message_id], |row| {
+                Ok(ToolCallWithResultRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    message_id: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    input_json: row.get(5)?,
+                    status: row.get(6)?,
+                    started_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                    result: match row.get::<_, Option<String>>(9)? {
+                        Some(id) => Some(ToolResultRecord {
+                            id,
+                            tool_call_id: row.get(0)?,
+                            output_json: row.get(10)?,
+                            is_error: row.get::<_, i64>(11)? != 0,
+                            created_at: row.get(12)?,
+                        }),
+                        None => None,
+                    },
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn insert_llm_request(
         &mut self,
         request: NewLlmRequest<'_>,
@@ -521,6 +632,51 @@ pub struct RunEventRecord {
     pub sequence: i64,
     pub event_type: String,
     pub payload_json: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewToolCall<'a> {
+    pub id: &'a str,
+    pub chat_id: &'a str,
+    pub run_id: &'a str,
+    pub message_id: Option<&'a str>,
+    pub tool_name: &'a str,
+    pub input_json: &'a str,
+    pub status: &'a str,
+    pub started_at: &'a str,
+    pub completed_at: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewToolResult<'a> {
+    pub id: &'a str,
+    pub tool_call_id: &'a str,
+    pub output_json: &'a str,
+    pub is_error: bool,
+    pub created_at: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallWithResultRecord {
+    pub id: String,
+    pub chat_id: String,
+    pub run_id: String,
+    pub message_id: Option<String>,
+    pub tool_name: String,
+    pub input_json: String,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub result: Option<ToolResultRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolResultRecord {
+    pub id: String,
+    pub tool_call_id: String,
+    pub output_json: String,
+    pub is_error: bool,
     pub created_at: String,
 }
 

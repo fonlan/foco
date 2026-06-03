@@ -5,7 +5,8 @@ use genai::{
     Client,
     adapter::AdapterKind,
     chat::{
-        ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ReasoningEffort, StreamEnd, Usage,
+        ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ReasoningEffort, StreamEnd, Tool,
+        ToolCall as GenaiToolCall, Usage,
     },
     resolver::{AuthData, Endpoint, ProviderConfig},
 };
@@ -97,10 +98,12 @@ pub async fn test_provider_connection(
     Ok(models.len())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NeutralChatRequest {
     pub model_id: String,
     pub messages: Vec<NeutralChatMessage>,
+    #[serde(default)]
+    pub tools: Vec<NeutralToolDefinition>,
     pub thinking_level: Option<String>,
     pub max_output_tokens: Option<u32>,
 }
@@ -129,12 +132,19 @@ pub enum NeutralChatStreamEvent {
     ReasoningDelta {
         delta: String,
     },
+    ThoughtSignatureDelta {
+        delta: String,
+    },
+    ToolCall {
+        tool_call: NeutralToolCall,
+    },
     Usage {
         usage: NeutralUsage,
     },
     Complete {
         text: String,
         reasoning: Option<String>,
+        tool_calls: Vec<NeutralToolCall>,
         usage: Option<NeutralUsage>,
         stop_reason: Option<String>,
         response_id: Option<String>,
@@ -142,6 +152,25 @@ pub enum NeutralChatStreamEvent {
     Error {
         message: String,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeutralToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub strict: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeutralToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signatures: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,7 +284,12 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
         });
     }
 
-    Ok(ChatRequest::from_messages(messages))
+    let mut chat_request = ChatRequest::from_messages(messages);
+    if !request.tools.is_empty() {
+        chat_request = chat_request.with_tools(request.tools.iter().map(genai_tool));
+    }
+
+    Ok(chat_request)
 }
 
 fn genai_chat_options(request: &NeutralChatRequest) -> Result<ChatOptions, ProviderConfigError> {
@@ -292,25 +326,26 @@ fn normalize_stream_event(
         ChatStreamEvent::ReasoningChunk(chunk) => Ok(NeutralChatStreamEvent::ReasoningDelta {
             delta: chunk.content,
         }),
-        ChatStreamEvent::ThoughtSignatureChunk(_) | ChatStreamEvent::ToolCallChunk(_) => {
-            Err(ProviderConfigError::MissingRequiredField(
-                "minimal streaming chat requires text completion; tool and thought-signature chunks belong to TODO step 09"
-                    .to_string(),
-            ))
+        ChatStreamEvent::ThoughtSignatureChunk(chunk) => {
+            Ok(NeutralChatStreamEvent::ThoughtSignatureDelta {
+                delta: chunk.content,
+            })
         }
+        ChatStreamEvent::ToolCallChunk(chunk) => Ok(NeutralChatStreamEvent::ToolCall {
+            tool_call: neutral_tool_call(&chunk.tool_call),
+        }),
         ChatStreamEvent::End(end) => normalize_stream_end(end),
     }
 }
 
 fn normalize_stream_end(end: StreamEnd) -> Result<NeutralChatStreamEvent, ProviderConfigError> {
-    let text = end
-        .captured_first_text()
-        .ok_or_else(|| {
-            ProviderConfigError::MissingRequiredField(
-                "provider stream ended without captured assistant text".to_string(),
-            )
-        })?
-        .to_string();
+    let text = end.captured_first_text().unwrap_or_default().to_string();
+    let tool_calls = end
+        .captured_tool_calls()
+        .unwrap_or_default()
+        .into_iter()
+        .map(neutral_tool_call)
+        .collect();
     let usage = end.captured_usage.as_ref().map(neutral_usage);
     let stop_reason = end
         .captured_stop_reason
@@ -320,10 +355,27 @@ fn normalize_stream_end(end: StreamEnd) -> Result<NeutralChatStreamEvent, Provid
     Ok(NeutralChatStreamEvent::Complete {
         text,
         reasoning: end.captured_reasoning_content,
+        tool_calls,
         usage,
         stop_reason,
         response_id: end.captured_response_id,
     })
+}
+
+fn genai_tool(tool: &NeutralToolDefinition) -> Tool {
+    Tool::new(tool.name.clone())
+        .with_description(tool.description.clone())
+        .with_schema(tool.input_schema.clone())
+        .with_strict(tool.strict)
+}
+
+fn neutral_tool_call(tool_call: &GenaiToolCall) -> NeutralToolCall {
+    NeutralToolCall {
+        call_id: tool_call.call_id.clone(),
+        name: tool_call.fn_name.clone(),
+        arguments: tool_call.fn_arguments.clone(),
+        thought_signatures: tool_call.thought_signatures.clone(),
+    }
 }
 
 fn neutral_usage(usage: &Usage) -> NeutralUsage {

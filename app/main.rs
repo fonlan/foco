@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     convert::Infallible,
     env, fs,
     net::{Ipv4Addr, SocketAddr},
@@ -23,9 +24,9 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use foco_providers::{
     DEFAULT_OPENAI_BASE_URL, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
-    NeutralChatStreamEvent, NeutralUsage, OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND,
-    ProviderConnectionConfig, normalized_base_url, parse_provider_kind, stream_chat,
-    test_provider_connection,
+    NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
+    OPENAI_RESPONSES_KIND, ProviderConnectionConfig, normalized_base_url, parse_provider_kind,
+    stream_chat, test_provider_connection,
 };
 use foco_store::{
     config::{
@@ -37,12 +38,13 @@ use foco_store::{
         parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
     },
     workspace::{
-        ChatRecord, MessageRecord, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-        WorkspaceDatabase, initialize_workspace_databases,
+        ChatRecord, MessageRecord, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewToolCall,
+        NewToolResult, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
     },
 };
+use foco_tools::{ToolExecution, builtin_tool_definitions, execute_builtin_tool};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 
@@ -509,13 +511,17 @@ async fn chat_messages(
         )));
     }
 
-    let messages = database
+    let mut messages = Vec::new();
+    for message in database
         .messages_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?
-        .into_iter()
-        .filter(|message| message.role == "user" || message.role == "assistant")
-        .map(chat_message_summary)
-        .collect();
+    {
+        if message.role != "user" && message.role != "assistant" {
+            continue;
+        }
+
+        messages.push(chat_message_summary(&database, message)?);
+    }
 
     Ok(Json(ChatMessagesResponse { messages }))
 }
@@ -681,6 +687,18 @@ struct ChatMessageSummary {
     id: String,
     role: String,
     content: String,
+    tool_calls: Vec<ChatToolCallSummary>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatToolCallSummary {
+    id: String,
+    name: String,
+    status: String,
+    input: Value,
+    output: Option<Value>,
+    is_error: bool,
 }
 
 #[derive(Serialize)]
@@ -697,6 +715,16 @@ enum ChatSseEvent {
     },
     ReasoningDelta {
         delta: String,
+    },
+    ToolCall {
+        assistant_message_id: String,
+        tool_call: ChatToolCallSummary,
+    },
+    ToolResult {
+        assistant_message_id: String,
+        tool_call_id: String,
+        output: Value,
+        is_error: bool,
     },
     Usage {
         usage: NeutralUsage,
@@ -732,6 +760,18 @@ struct CapturedAuditEvent {
     event_at: String,
     event_type: String,
     normalized_event_json: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutedToolCall {
+    id: String,
+    name: String,
+    input: Value,
+    output: Value,
+    is_error: bool,
+    started_at: String,
+    completed_at: String,
 }
 
 struct ChatAuditOutcome {
@@ -772,7 +812,7 @@ impl PreparedChatContext {
                     events.push(captured_event(&event));
                     let outcome = failed_audit_outcome(started_at, &message);
 
-                    if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+                    if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
                         let event = ChatSseEvent::Error {
                             message: persist_error.message,
                         };
@@ -788,6 +828,7 @@ impl PreparedChatContext {
             let mut assistant_text = String::new();
             let mut first_token_at = None;
             let mut first_token_latency_ms = None;
+            let mut seen_tool_call_ids = HashSet::new();
 
             while let Some(event_result) = provider_stream.next_event().await {
                 let provider_event = match event_result {
@@ -800,7 +841,7 @@ impl PreparedChatContext {
                         events.push(captured_event(&event));
                         let outcome = failed_audit_outcome(started_at, &message);
 
-                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
@@ -828,6 +869,20 @@ impl PreparedChatContext {
                         let event = ChatSseEvent::ReasoningDelta { delta };
                         yield Ok(sse_event(&event));
                     }
+                    NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
+                        capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                    }
+                    NeutralChatStreamEvent::ToolCall { tool_call } => {
+                        capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                        if seen_tool_call_ids.insert(tool_call.call_id.clone()) {
+                            let event = ChatSseEvent::ToolCall {
+                                assistant_message_id: self.assistant_message_id.clone(),
+                                tool_call: pending_tool_call_summary(&tool_call),
+                            };
+                            events.push(captured_event(&event));
+                            yield Ok(sse_event(&event));
+                        }
+                    }
                     NeutralChatStreamEvent::Usage { usage } => {
                         let event = ChatSseEvent::Usage { usage };
                         yield Ok(sse_event(&event));
@@ -835,6 +890,7 @@ impl PreparedChatContext {
                     NeutralChatStreamEvent::Complete {
                         text,
                         reasoning,
+                        tool_calls,
                         usage,
                         stop_reason,
                         response_id,
@@ -847,7 +903,7 @@ impl PreparedChatContext {
                             events.push(captured_event(&event));
                             let outcome = failed_audit_outcome(started_at, &message);
 
-                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
                                 let event = ChatSseEvent::Error {
                                     message: persist_error.message,
                                 };
@@ -859,6 +915,64 @@ impl PreparedChatContext {
                             return;
                         }
 
+                        if assistant_text.is_empty() && tool_calls.is_empty() {
+                            let message = "provider completed without assistant text or tool calls".to_string();
+                            let event = ChatSseEvent::Error {
+                                message: message.clone(),
+                            };
+                            events.push(captured_event(&event));
+                            let outcome = failed_audit_outcome(started_at, &message);
+
+                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                                let event = ChatSseEvent::Error {
+                                    message: persist_error.message,
+                                };
+                                yield Ok(sse_event(&event));
+                            } else {
+                                yield Ok(sse_event(&event));
+                            }
+
+                            return;
+                        }
+
+                        let mut executed_tool_calls = Vec::new();
+                        for tool_call in tool_calls {
+                            capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            if seen_tool_call_ids.insert(tool_call.call_id.clone()) {
+                                let event = ChatSseEvent::ToolCall {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    tool_call: pending_tool_call_summary(&tool_call),
+                                };
+                                events.push(captured_event(&event));
+                                yield Ok(sse_event(&event));
+                            }
+
+                            let started_at_text = utc_timestamp();
+                            let tool_execution = execute_builtin_tool(
+                                &self.workspace_path,
+                                &tool_call.name,
+                                tool_call.arguments.clone(),
+                            );
+                            let completed_at_text = utc_timestamp();
+                            let executed_tool_call = executed_tool_call(
+                                tool_call,
+                                tool_execution,
+                                started_at_text,
+                                completed_at_text,
+                            );
+                            let result_event = ChatSseEvent::ToolResult {
+                                assistant_message_id: self.assistant_message_id.clone(),
+                                tool_call_id: executed_tool_call.id.clone(),
+                                output: executed_tool_call.output.clone(),
+                                is_error: executed_tool_call.is_error,
+                            };
+                            events.push(captured_event(&result_event));
+                            yield Ok(sse_event(&result_event));
+                            executed_tool_calls.push(executed_tool_call);
+                        }
+
+                        let assistant_message_text =
+                            assistant_message_text(&assistant_text, &executed_tool_calls);
                         let completed_at = utc_timestamp();
                         let outcome = ChatAuditOutcome {
                             first_token_at,
@@ -873,18 +987,19 @@ impl PreparedChatContext {
                             response_body_json: Some(json!({
                                 "text": text,
                                 "reasoning": reasoning,
+                                "toolCalls": executed_tool_calls,
                                 "usage": usage,
                                 "stopReason": stop_reason,
                                 "responseId": response_id
                             }).to_string()),
                         };
 
-                        match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_text)) {
+                        match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), &executed_tool_calls) {
                             Ok(()) => {
                                 let event = ChatSseEvent::Complete {
                                     chat_id: self.chat_id.clone(),
                                     assistant_message_id: self.assistant_message_id.clone(),
-                                    text: assistant_text.clone(),
+                                    text: assistant_message_text,
                                     usage,
                                     stop_reason,
                                 };
@@ -907,7 +1022,7 @@ impl PreparedChatContext {
                         events.push(captured_event(&event));
                         let outcome = failed_audit_outcome(started_at, &message);
 
-                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
@@ -928,7 +1043,7 @@ impl PreparedChatContext {
             events.push(captured_event(&event));
             let outcome = failed_audit_outcome(started_at, &message);
 
-            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
                 let event = ChatSseEvent::Error {
                     message: persist_error.message,
                 };
@@ -1082,6 +1197,10 @@ fn prepare_chat_context(
     let provider_request = NeutralChatRequest {
         model_id: model.id.clone(),
         messages: neutral_messages,
+        tools: builtin_tool_definitions()
+            .into_iter()
+            .map(neutral_tool_definition)
+            .collect(),
         thinking_level: thinking_level.or_else(|| model.thinking_level.clone()),
         max_output_tokens: Some(max_output_tokens),
     };
@@ -1114,7 +1233,7 @@ fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMess
         "assistant" => NeutralChatRole::Assistant,
         "tool" => {
             return Err(ApiError::bad_request(
-                "chat contains tool messages; tool replay belongs to TODO step 09",
+                "chat contains tool-role messages; tool replay belongs to TODO step 10",
             ));
         }
         other => {
@@ -1136,6 +1255,7 @@ fn persist_chat_result(
     outcome: ChatAuditOutcome,
     events: &[CapturedAuditEvent],
     assistant_text: Option<&str>,
+    tool_calls: &[ExecutedToolCall],
 ) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
@@ -1195,6 +1315,43 @@ fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
+    for tool_call in tool_calls {
+        let input_json = serde_json::to_string(&tool_call.input).map_err(|source| {
+            ApiError::internal(format!("failed to serialize tool input: {source}"))
+        })?;
+        let output_json = serde_json::to_string(&tool_call.output).map_err(|source| {
+            ApiError::internal(format!("failed to serialize tool output: {source}"))
+        })?;
+        let result_id = format!("{}-result", tool_call.id);
+
+        database
+            .insert_tool_call(NewToolCall {
+                id: &tool_call.id,
+                chat_id: &context.chat_id,
+                run_id: &context.llm_request_id,
+                message_id: Some(&context.assistant_message_id),
+                tool_name: &tool_call.name,
+                input_json: &input_json,
+                status: if tool_call.is_error {
+                    "error"
+                } else {
+                    "completed"
+                },
+                started_at: &tool_call.started_at,
+                completed_at: Some(&tool_call.completed_at),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .insert_tool_result(NewToolResult {
+                id: &result_id,
+                tool_call_id: &tool_call.id,
+                output_json: &output_json,
+                is_error: tool_call.is_error,
+                created_at: &tool_call.completed_at,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
+
     Ok(())
 }
 
@@ -1218,6 +1375,8 @@ fn captured_provider_event(event: &NeutralChatStreamEvent) -> CapturedAuditEvent
         NeutralChatStreamEvent::Start => "start",
         NeutralChatStreamEvent::TextDelta { .. } => "text_delta",
         NeutralChatStreamEvent::ReasoningDelta { .. } => "reasoning_delta",
+        NeutralChatStreamEvent::ThoughtSignatureDelta { .. } => "thought_signature_delta",
+        NeutralChatStreamEvent::ToolCall { .. } => "tool_call",
         NeutralChatStreamEvent::Usage { .. } => "usage",
         NeutralChatStreamEvent::Complete { .. } => "completion",
         NeutralChatStreamEvent::Error { .. } => "error",
@@ -1236,6 +1395,8 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::Start { .. } => "start",
         ChatSseEvent::TextDelta { .. } => "text_delta",
         ChatSseEvent::ReasoningDelta { .. } => "reasoning_delta",
+        ChatSseEvent::ToolCall { .. } => "tool_call",
+        ChatSseEvent::ToolResult { .. } => "tool_result",
         ChatSseEvent::Usage { .. } => "usage",
         ChatSseEvent::Complete { .. } => "completion",
         ChatSseEvent::Error { .. } => "error",
@@ -1768,12 +1929,95 @@ fn chat_summary(chat: ChatRecord) -> ChatSummary {
     }
 }
 
-fn chat_message_summary(message: MessageRecord) -> ChatMessageSummary {
-    ChatMessageSummary {
+fn neutral_tool_definition(definition: foco_tools::ToolDefinition) -> NeutralToolDefinition {
+    NeutralToolDefinition {
+        name: definition.name.to_string(),
+        description: definition.description.to_string(),
+        input_schema: definition.input_schema,
+        strict: definition.strict,
+    }
+}
+
+fn pending_tool_call_summary(tool_call: &NeutralToolCall) -> ChatToolCallSummary {
+    ChatToolCallSummary {
+        id: tool_call.call_id.clone(),
+        name: tool_call.name.clone(),
+        status: "pending".to_string(),
+        input: tool_call.arguments.clone(),
+        output: None,
+        is_error: false,
+    }
+}
+
+fn executed_tool_call(
+    tool_call: NeutralToolCall,
+    execution: ToolExecution,
+    started_at: String,
+    completed_at: String,
+) -> ExecutedToolCall {
+    ExecutedToolCall {
+        id: tool_call.call_id,
+        name: tool_call.name,
+        input: tool_call.arguments,
+        output: execution.output,
+        is_error: execution.is_error,
+        started_at,
+        completed_at,
+    }
+}
+
+fn assistant_message_text(assistant_text: &str, tool_calls: &[ExecutedToolCall]) -> String {
+    if assistant_text.is_empty() && !tool_calls.is_empty() {
+        "Tool calls completed.".to_string()
+    } else {
+        assistant_text.to_string()
+    }
+}
+
+fn chat_message_summary(
+    database: &WorkspaceDatabase,
+    message: MessageRecord,
+) -> Result<ChatMessageSummary, ApiError> {
+    let tool_calls = database
+        .tool_calls_for_message(&message.id)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .map(chat_tool_call_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(ChatMessageSummary {
         id: message.id,
         role: message.role,
         content: message.content,
-    }
+        tool_calls,
+    })
+}
+
+fn chat_tool_call_summary(
+    record: ToolCallWithResultRecord,
+) -> Result<ChatToolCallSummary, ApiError> {
+    let input = parse_json_value(&record.input_json, "tool call input")?;
+    let (output, is_error) = match record.result {
+        Some(result) => (
+            Some(parse_json_value(&result.output_json, "tool result output")?),
+            result.is_error,
+        ),
+        None => (None, false),
+    };
+
+    Ok(ChatToolCallSummary {
+        id: record.id,
+        name: record.tool_name,
+        status: record.status,
+        input,
+        output,
+        is_error,
+    })
+}
+
+fn parse_json_value(value: &str, field: &str) -> Result<Value, ApiError> {
+    serde_json::from_str(value)
+        .map_err(|source| ApiError::internal(format!("failed to parse {field}: {source}")))
 }
 
 fn canonical_workspace_path(path: &Path) -> Result<PathBuf, ApiError> {

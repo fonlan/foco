@@ -3,8 +3,8 @@ use std::fs;
 use foco_store::{
     config::WorkspaceConfig,
     workspace::{
-        LlmRequestRecord, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
-        WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, initialize_workspace_databases,
+        LlmRequestRecord, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, NewToolCall,
+        NewToolResult, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, initialize_workspace_databases,
         workspace_database_path,
     },
 };
@@ -203,6 +203,68 @@ fn repository_helpers_round_trip_core_records() {
     assert_eq!(request.provider_id, "openai");
     assert_eq!(request.input_tokens, Some(3));
     assert_eq!(request.final_state, "completed");
+}
+
+#[test]
+fn repository_helpers_round_trip_tool_calls_and_results() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Tool chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Tool calls completed.",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("assistant message insert");
+    database
+        .insert_tool_call(NewToolCall {
+            id: "tool-call-1",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md","apiKey":"secret-value"}"#,
+            status: "completed",
+            started_at: "2026-06-03T10:00:00.000Z",
+            completed_at: Some("2026-06-03T10:00:00.100Z"),
+        })
+        .expect("tool call insert");
+    database
+        .insert_tool_result(NewToolResult {
+            id: "tool-result-1",
+            tool_call_id: "tool-call-1",
+            output_json: r#"{"content":"hello","authorization":"Bearer secret"}"#,
+            is_error: false,
+            created_at: "2026-06-03T10:00:00.100Z",
+        })
+        .expect("tool result insert");
+
+    let records = database
+        .tool_calls_for_message("assistant-1")
+        .expect("tool calls for message");
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, "tool-call-1");
+    assert_eq!(records[0].tool_name, "read_file");
+    assert_eq!(records[0].status, "completed");
+    assert_eq!(records[0].message_id.as_deref(), Some("assistant-1"));
+    let input: Value = serde_json::from_str(&records[0].input_json).expect("input json");
+    assert_eq!(input["path"], "README.md");
+    assert_eq!(input["apiKey"], "[REDACTED]");
+
+    let result = records[0].result.as_ref().expect("tool result");
+    assert!(!result.is_error);
+    let output: Value = serde_json::from_str(&result.output_json).expect("output json");
+    assert_eq!(output["content"], "hello");
+    assert_eq!(output["authorization"], "[REDACTED]");
 }
 
 #[test]

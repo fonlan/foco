@@ -20,6 +20,7 @@ import {
   SlidersHorizontal,
   Terminal,
   User,
+  Wrench,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
@@ -154,10 +155,28 @@ type ProviderTestState = {
   status: "error" | "ok" | "testing";
 };
 
+type JsonValue =
+  | boolean
+  | null
+  | number
+  | string
+  | JsonValue[]
+  | { [key: string]: JsonValue };
+
+type ChatToolCallSummary = {
+  id: string;
+  name: string;
+  status: string;
+  input: JsonValue;
+  output: JsonValue | null;
+  isError: boolean;
+};
+
 type ChatMessageSummary = {
   id: string;
   role: "assistant" | "user";
   content: string;
+  toolCalls: ChatToolCallSummary[];
 };
 
 type ChatMessagesResponse = {
@@ -190,6 +209,18 @@ type ChatStreamEvent =
       usage: ChatUsage | null;
       stopReason: string | null;
     }
+  | {
+      type: "toolCall";
+      assistantMessageId: string;
+      toolCall: ChatToolCallSummary;
+    }
+  | {
+      type: "toolResult";
+      assistantMessageId: string;
+      toolCallId: string;
+      output: JsonValue;
+      isError: boolean;
+    }
   | { type: "error"; message: string };
 
 type WorkspaceFormMode = "add" | "create";
@@ -200,6 +231,7 @@ type ShellMessage = {
   role: "assistant" | "user";
   content: string;
   status?: "error" | "streaming";
+  toolCalls: ChatToolCallSummary[];
 };
 
 export function App() {
@@ -385,12 +417,14 @@ export function App() {
         id: localUserId,
         role: "user",
         content,
+        toolCalls: [],
       },
       {
         id: assistantMessageId,
         role: "assistant",
         content: "",
         status: "streaming",
+        toolCalls: [],
       },
     ]);
     setDraftMessage("");
@@ -457,6 +491,42 @@ export function App() {
                     ...message,
                     content: streamEvent.text,
                     status: undefined,
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "toolCall") {
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === streamEvent.assistantMessageId
+                ? {
+                    ...message,
+                    toolCalls: upsertToolCall(
+                      message.toolCalls,
+                      streamEvent.toolCall,
+                    ),
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "toolResult") {
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === streamEvent.assistantMessageId
+                ? {
+                    ...message,
+                    toolCalls: applyToolResult(
+                      message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                    ),
                   }
                 : message,
             ),
@@ -810,19 +880,24 @@ function ChatPanel({
                       <Bot aria-hidden="true" className="size-4" />
                     )}
                   </div>
-                  <p
-                    className={`min-w-0 whitespace-pre-wrap break-words text-sm leading-6 ${
-                      message.status === "error" ? "text-rose-700" : ""
-                    }`}
-                  >
-                    {message.content ||
-                      (message.status === "streaming" ? (
-                        <LoaderCircle
-                          aria-hidden="true"
-                          className="size-4 animate-spin"
-                        />
-                      ) : null)}
-                  </p>
+                  <div className="min-w-0 flex-1 space-y-3">
+                    <div
+                      className={`min-w-0 whitespace-pre-wrap break-words text-sm leading-6 ${
+                        message.status === "error" ? "text-rose-700" : ""
+                      }`}
+                    >
+                      {message.content ||
+                        (message.status === "streaming" ? (
+                          <LoaderCircle
+                            aria-hidden="true"
+                            className="size-4 animate-spin"
+                          />
+                        ) : null)}
+                    </div>
+                    {!isUser && message.toolCalls.length > 0 ? (
+                      <ToolCallList toolCalls={message.toolCalls} />
+                    ) : null}
+                  </div>
                 </div>
               </div>
             );
@@ -920,6 +995,52 @@ function ChatPanel({
           <ChevronRight aria-hidden="true" className="size-4" />
         </button>
       </div>
+    </div>
+  );
+}
+
+function ToolCallList({ toolCalls }: { toolCalls: ChatToolCallSummary[] }) {
+  return (
+    <div className="space-y-2 border-t border-zinc-200 pt-2">
+      {toolCalls.map((toolCall) => (
+        <details className="group min-w-0" key={toolCall.id}>
+          <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-zinc-700 marker:hidden">
+            <Wrench aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+            <span className="min-w-0 flex-1 truncate">{toolCall.name}</span>
+            <span
+              className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] ${
+                toolCall.isError
+                  ? "bg-rose-50 text-rose-700"
+                  : "bg-zinc-100 text-zinc-600"
+              }`}
+            >
+              {toolStatusText(toolCall)}
+            </span>
+          </summary>
+          <div className="mt-2 grid gap-2 text-xs text-zinc-600">
+            <div className="min-w-0">
+              <div className="mb-1 font-medium text-zinc-500">Input</div>
+              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-zinc-200 pl-3 font-mono text-[11px] leading-5">
+                {formatJsonValue(toolCall.input)}
+              </pre>
+            </div>
+            {toolCall.output !== null ? (
+              <div className="min-w-0">
+                <div className="mb-1 font-medium text-zinc-500">Output</div>
+                <pre
+                  className={`max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
+                    toolCall.isError
+                      ? "border-rose-200 text-rose-700"
+                      : "border-zinc-200"
+                  }`}
+                >
+                  {formatJsonValue(toolCall.output)}
+                </pre>
+              </div>
+            ) : null}
+          </div>
+        </details>
+      ))}
     </div>
   );
 }
@@ -2007,6 +2128,53 @@ function optionalPositiveInteger(value: string, label: string) {
   }
 
   return numberValue;
+}
+
+function upsertToolCall(
+  toolCalls: ChatToolCallSummary[],
+  nextToolCall: ChatToolCallSummary,
+) {
+  const existingIndex = toolCalls.findIndex(
+    (toolCall) => toolCall.id === nextToolCall.id,
+  );
+
+  if (existingIndex === -1) {
+    return [...toolCalls, nextToolCall];
+  }
+
+  return toolCalls.map((toolCall, index) =>
+    index === existingIndex ? nextToolCall : toolCall,
+  );
+}
+
+function applyToolResult(
+  toolCalls: ChatToolCallSummary[],
+  toolCallId: string,
+  output: JsonValue,
+  isError: boolean,
+) {
+  return toolCalls.map((toolCall) =>
+    toolCall.id === toolCallId
+      ? {
+          ...toolCall,
+          output,
+          isError,
+          status: isError ? "error" : "completed",
+        }
+      : toolCall,
+  );
+}
+
+function toolStatusText(toolCall: ChatToolCallSummary) {
+  if (toolCall.isError) {
+    return "error";
+  }
+
+  return toolCall.status;
+}
+
+function formatJsonValue(value: JsonValue) {
+  return JSON.stringify(value, null, 2);
 }
 
 function formatLimit(value: number | null, label: string) {
