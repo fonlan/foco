@@ -157,6 +157,30 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn chats(&self) -> Result<Vec<ChatRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, title, created_at, updated_at, archived_at
+                 FROM chats
+                 ORDER BY updated_at DESC, created_at DESC, id DESC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ChatRecord {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                    archived_at: row.get(4)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn insert_message(
         &mut self,
         message: NewMessage<'_>,

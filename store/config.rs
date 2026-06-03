@@ -90,6 +90,39 @@ pub fn load_global_config(path: impl AsRef<Path>) -> Result<GlobalConfig, Config
     Ok(config)
 }
 
+pub fn save_global_config(
+    path: impl AsRef<Path>,
+    config: &GlobalConfig,
+) -> Result<(), ConfigError> {
+    let path = path.as_ref();
+
+    config.validate(Some(path))?;
+    validate_workspace_directories(config, path)?;
+
+    let content = serde_json::to_string_pretty(config).map_err(|source| ConfigError::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let temp_file = path.with_extension("json.tmp");
+
+    fs::write(&temp_file, content).map_err(|source| ConfigError::Io {
+        path: temp_file.clone(),
+        source,
+    })?;
+    if path.exists() {
+        fs::remove_file(path).map_err(|source| ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::rename(&temp_file, path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalConfig {
@@ -587,5 +620,19 @@ mod tests {
 
         assert!(!log_json.contains("sk-test-secret"));
         assert!(log_json.contains(REDACTED_SECRET));
+    }
+
+    #[test]
+    fn save_global_config_updates_existing_file() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.workspaces[0].name = "Renamed Workspace".to_string();
+        save_global_config(&loaded.paths.config_file, &loaded.config).expect("config save");
+
+        let reloaded = load_global_config(&loaded.paths.config_file).expect("config reload");
+
+        assert_eq!(reloaded.workspaces[0].name, "Renamed Workspace");
     }
 }

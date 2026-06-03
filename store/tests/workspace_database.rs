@@ -123,6 +123,9 @@ fn repository_helpers_round_trip_core_records() {
     database
         .insert_chat("chat-1", "First chat")
         .expect("chat insert");
+    database
+        .insert_chat("chat-2", "Second chat")
+        .expect("second chat insert");
     assert_eq!(
         database
             .chat("chat-1")
@@ -131,6 +134,10 @@ fn repository_helpers_round_trip_core_records() {
             .title,
         "First chat"
     );
+    let chats = database.chats().expect("chat list");
+    assert_eq!(chats.len(), 2);
+    assert_eq!(chats[0].title, "Second chat");
+    assert_eq!(chats[1].title, "First chat");
 
     database
         .insert_message(NewMessage {

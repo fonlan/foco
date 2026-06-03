@@ -26,6 +26,13 @@ On first startup, Foco creates `%USERPROFILE%\.foco`, writes
 `%USERPROFILE%\.foco\workspace\.foco\foco.sqlite`, and writes daily logs to
 `%USERPROFILE%\.foco\logs\foco-YYYY-MM-DD.log`.
 
+The browser UI starts as a three-column product shell. The left sidebar reads
+registered workspaces from `GET /api/workspaces`, can create a new workspace
+directory with `POST /api/workspaces/create`, and can add an existing directory
+with `POST /api/workspaces/add`. Both workspace write APIs update
+`%USERPROFILE%\.foco\config.json` and initialize the workspace-local SQLite
+database before returning the refreshed workspace list.
+
 For live frontend development, run the Vite dev server alongside the backend:
 
 ```bash

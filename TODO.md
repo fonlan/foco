@@ -54,19 +54,19 @@
 
 ## 04. Minimal Product Shell UI
 
-- [ ] Build the main three-column layout.
-- [ ] Build the left workspace sidebar.
-- [ ] Show the `Default Workspace` in the sidebar.
-- [ ] Allow creating a new workspace from the sidebar.
-- [ ] Allow adding an existing directory as a workspace from the sidebar.
-- [ ] Show expandable chat history under each workspace.
-- [ ] Build the center chat panel.
-- [ ] Render assistant messages on the left.
-- [ ] Render user messages on the right.
-- [ ] Add the send box layout.
-- [ ] Add top-level navigation for chat, settings, and AI statistics.
-- [ ] Add a placeholder collapsed terminal panel below the send box.
-- [ ] Add a placeholder collapsed right git diff panel.
+- [x] Build the main three-column layout.
+- [x] Build the left workspace sidebar.
+- [x] Show the `Default Workspace` in the sidebar.
+- [x] Allow creating a new workspace from the sidebar.
+- [x] Allow adding an existing directory as a workspace from the sidebar.
+- [x] Show expandable chat history under each workspace.
+- [x] Build the center chat panel.
+- [x] Render assistant messages on the left.
+- [x] Render user messages on the right.
+- [x] Add the send box layout.
+- [x] Add top-level navigation for chat, settings, and AI statistics.
+- [x] Add a placeholder collapsed terminal panel below the send box.
+- [x] Add a placeholder collapsed right git diff panel.
 
 ## 05. Model Metadata
 
