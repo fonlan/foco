@@ -33,6 +33,14 @@ with `POST /api/workspaces/add`. Both workspace write APIs update
 `%USERPROFILE%\.foco\config.json` and initialize the workspace-local SQLite
 database before returning the refreshed workspace list.
 
+Settings can refresh model metadata from `https://models.dev/api.json` through
+`POST /api/model-metadata/refresh`. Foco normalizes the fetched model metadata
+and caches it at `%USERPROFILE%\.foco\models.dev.json`, including per-model
+source URL, refresh time, limits, pricing, modalities, tool support, and cache
+support. The settings page also saves manually filled model limits through
+`POST /api/models/manual`; enabled models must have both context window and max
+output tokens, or config validation fails with an explicit error.
+
 For live frontend development, run the Vite dev server alongside the backend:
 
 ```bash

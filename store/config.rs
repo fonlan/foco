@@ -237,6 +237,50 @@ impl GlobalConfig {
             validate_id(config_path, "model.id", &model.id)?;
             require_non_empty(config_path, "model.display_name", &model.display_name)?;
 
+            if let Some(metadata_key) = &model.metadata_key {
+                validate_id(config_path, "model.metadata_key", metadata_key)?;
+                require_non_empty(
+                    config_path,
+                    "model.metadata_source_url",
+                    model.metadata_source_url.as_deref().unwrap_or_default(),
+                )?;
+                require_non_empty(
+                    config_path,
+                    "model.metadata_refreshed_at",
+                    model.metadata_refreshed_at.as_deref().unwrap_or_default(),
+                )?;
+            }
+
+            if model.enabled {
+                let limits = model
+                    .limits
+                    .as_ref()
+                    .ok_or_else(|| ConfigError::Validation {
+                        path: config_path.map(Path::to_path_buf),
+                        message: format!("enabled model '{}' is missing limits", model.id),
+                    })?;
+
+                if limits.context_window == 0 {
+                    return invalid_config(
+                        config_path,
+                        format!(
+                            "enabled model '{}' context_window must be greater than 0",
+                            model.id
+                        ),
+                    );
+                }
+
+                if limits.max_output_tokens == 0 {
+                    return invalid_config(
+                        config_path,
+                        format!(
+                            "enabled model '{}' max_output_tokens must be greater than 0",
+                            model.id
+                        ),
+                    );
+                }
+            }
+
             if let Some(active_provider_id) = &model.active_provider_id {
                 if !model.provider_ids.iter().any(|id| id == active_provider_id) {
                     return invalid_config(
@@ -316,9 +360,21 @@ pub struct ProviderSettings {
 pub struct ModelSettings {
     pub id: String,
     pub display_name: String,
+    pub enabled: bool,
     pub provider_ids: Vec<String>,
     pub active_provider_id: Option<String>,
     pub thinking_level: Option<String>,
+    pub metadata_key: Option<String>,
+    pub metadata_source_url: Option<String>,
+    pub metadata_refreshed_at: Option<String>,
+    pub limits: Option<ModelLimits>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelLimits {
+    pub context_window: u64,
+    pub max_output_tokens: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -634,5 +690,53 @@ mod tests {
         let reloaded = load_global_config(&loaded.paths.config_file).expect("config reload");
 
         assert_eq!(reloaded.workspaces[0].name, "Renamed Workspace");
+    }
+
+    #[test]
+    fn disabled_model_can_be_saved_without_limits() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.models.push(ModelSettings {
+            id: "manual-model".to_string(),
+            display_name: "Manual Model".to_string(),
+            enabled: false,
+            provider_ids: Vec::new(),
+            active_provider_id: None,
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: None,
+        });
+
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("disabled model without limits should save");
+    }
+
+    #[test]
+    fn enabled_model_requires_limits() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.models.push(ModelSettings {
+            id: "manual-model".to_string(),
+            display_name: "Manual Model".to_string(),
+            enabled: true,
+            provider_ids: Vec::new(),
+            active_provider_id: None,
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: None,
+        });
+
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("enabled model without limits should fail");
+
+        assert!(error.to_string().contains("is missing limits"));
     }
 }

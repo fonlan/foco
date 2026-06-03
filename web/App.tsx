@@ -2,8 +2,10 @@ import {
   Activity,
   BarChart3,
   Bot,
+  CheckCircle2,
   ChevronDown,
   ChevronRight,
+  CircleAlert,
   Folder,
   FolderPlus,
   GitCompare,
@@ -13,6 +15,7 @@ import {
   RefreshCw,
   Send,
   Settings,
+  SlidersHorizontal,
   Terminal,
   User,
 } from "lucide-react";
@@ -35,6 +38,60 @@ type WorkspaceSummary = {
 type WorkspacesResponse = {
   activeWorkspaceId: string;
   workspaces: WorkspaceSummary[];
+};
+
+type ModelPricing = {
+  input: number | null;
+  output: number | null;
+  reasoning: number | null;
+  cacheRead: number | null;
+  cacheWrite: number | null;
+};
+
+type ModelMetadataRecord = {
+  key: string;
+  providerId: string;
+  providerName: string;
+  modelId: string;
+  name: string;
+  contextWindow: number | null;
+  maxOutputTokens: number | null;
+  pricing: ModelPricing;
+  inputModalities: string[];
+  outputModalities: string[];
+  supportsTools: boolean;
+  supportsCache: boolean;
+  sourceUrl: string;
+  refreshedAt: string;
+};
+
+type ConfiguredModelSummary = {
+  id: string;
+  displayName: string;
+  enabled: boolean;
+  metadataKey: string | null;
+  metadataSourceUrl: string | null;
+  metadataRefreshedAt: string | null;
+  contextWindow: number | null;
+  maxOutputTokens: number | null;
+  canEnable: boolean;
+  missingLimits: string[];
+};
+
+type ModelMetadataResponse = {
+  sourceUrl: string | null;
+  fetchedAt: string | null;
+  cachePath: string;
+  models: ModelMetadataRecord[];
+  configuredModels: ConfiguredModelSummary[];
+};
+
+type ModelFormState = {
+  displayName: string;
+  enabled: boolean;
+  maxOutputTokens: string;
+  modelId: string;
+  contextWindow: string;
 };
 
 type WorkspaceFormMode = "add" | "create";
@@ -383,7 +440,7 @@ export function App() {
               onSubmit={handleSendMessage}
             />
           ) : viewMode === "settings" ? (
-            <PlaceholderPanel icon={Settings} title="Settings" />
+            <SettingsPanel />
           ) : (
             <PlaceholderPanel icon={BarChart3} title="AI Statistics" />
           )}
@@ -508,6 +565,426 @@ function PlaceholderPanel({
   );
 }
 
+function SettingsPanel() {
+  const [metadata, setMetadata] = useState<ModelMetadataResponse | null>(null);
+  const [selectedMetadataKey, setSelectedMetadataKey] = useState("");
+  const [modelSearch, setModelSearch] = useState("");
+  const [form, setForm] = useState<ModelFormState>(() => emptyModelForm());
+  const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const selectedMetadata = useMemo(
+    () =>
+      metadata?.models.find((model) => model.key === selectedMetadataKey) ??
+      null,
+    [metadata, selectedMetadataKey],
+  );
+  const filteredModels = useMemo(() => {
+    const query = modelSearch.trim().toLowerCase();
+    const models = metadata?.models ?? [];
+
+    if (!query) {
+      return models.slice(0, 80);
+    }
+
+    return models
+      .filter((model) =>
+        [
+          model.providerName,
+          model.providerId,
+          model.name,
+          model.modelId,
+          model.key,
+        ]
+          .join(" ")
+          .toLowerCase()
+          .includes(query),
+      )
+      .slice(0, 80);
+  }, [metadata, modelSearch]);
+  const enabledNeedsLimits =
+    form.enabled &&
+    (!form.contextWindow.trim() || !form.maxOutputTokens.trim());
+
+  const loadMetadata = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<ModelMetadataResponse>(
+        "/api/model-metadata",
+      );
+      setMetadata(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadMetadata();
+  }, [loadMetadata]);
+
+  function selectMetadataModel(key: string) {
+    setSelectedMetadataKey(key);
+    const model = metadata?.models.find((item) => item.key === key);
+
+    if (!model) {
+      return;
+    }
+
+    setForm({
+      displayName: model.name,
+      enabled: model.contextWindow !== null && model.maxOutputTokens !== null,
+      modelId: model.key,
+      contextWindow: numberInputValue(model.contextWindow),
+      maxOutputTokens: numberInputValue(model.maxOutputTokens),
+    });
+  }
+
+  function editConfiguredModel(model: ConfiguredModelSummary) {
+    setSelectedMetadataKey(model.metadataKey ?? "");
+    setForm({
+      displayName: model.displayName,
+      enabled: model.enabled,
+      modelId: model.id,
+      contextWindow: numberInputValue(model.contextWindow),
+      maxOutputTokens: numberInputValue(model.maxOutputTokens),
+    });
+  }
+
+  async function refreshMetadata() {
+    setIsRefreshing(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<ModelMetadataResponse>(
+        "/api/model-metadata/refresh",
+        { method: "POST" },
+      );
+      setMetadata(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsRefreshing(false);
+    }
+  }
+
+  async function saveModel(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSaving(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<ModelMetadataResponse>(
+        "/api/models/manual",
+        {
+          body: JSON.stringify({
+            displayName: form.displayName,
+            enabled: form.enabled,
+            metadataKey: selectedMetadataKey || null,
+            modelId: form.modelId,
+            contextWindow: optionalPositiveInteger(
+              form.contextWindow,
+              "Context window",
+            ),
+            maxOutputTokens: optionalPositiveInteger(
+              form.maxOutputTokens,
+              "Max output tokens",
+            ),
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setMetadata(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
+      <div className="mx-auto flex max-w-6xl flex-col gap-4">
+        <section className="border-b border-zinc-200 pb-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h2 className="text-base font-semibold">Model Metadata</h2>
+              <p className="mt-1 truncate text-xs text-zinc-500">
+                {metadata?.fetchedAt
+                  ? `Fetched ${metadata.fetchedAt} from ${metadata.sourceUrl}`
+                  : `Cache path: ${metadata?.cachePath ?? ""}`}
+              </p>
+            </div>
+            <button
+              className="inline-flex h-9 items-center gap-2 rounded-md bg-teal-700 px-3 text-sm font-medium text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
+              disabled={isRefreshing}
+              onClick={() => void refreshMetadata()}
+              type="button"
+            >
+              {isRefreshing ? (
+                <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+              ) : (
+                <RefreshCw aria-hidden="true" className="size-4" />
+              )}
+              Refresh
+            </button>
+          </div>
+        </section>
+
+        {error ? (
+          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+            {error}
+          </div>
+        ) : null}
+
+        <section className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(22rem,0.9fr)]">
+          <div className="min-w-0 rounded-md border border-zinc-200 bg-white">
+            <div className="border-b border-zinc-200 px-4 py-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  className="h-9 min-w-0 flex-1 rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) => setModelSearch(event.target.value)}
+                  placeholder="Search provider or model"
+                  value={modelSearch}
+                />
+                <button
+                  className="inline-flex size-9 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-700 transition hover:bg-zinc-50"
+                  disabled={isLoading}
+                  onClick={() => void loadMetadata()}
+                  title="Reload cache"
+                  type="button"
+                >
+                  {isLoading ? (
+                    <LoaderCircle
+                      aria-hidden="true"
+                      className="size-4 animate-spin"
+                    />
+                  ) : (
+                    <RefreshCw aria-hidden="true" className="size-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+            <div className="max-h-[34rem] overflow-y-auto">
+              {filteredModels.length > 0 ? (
+                filteredModels.map((model) => (
+                  <button
+                    className={`grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 border-b border-zinc-100 px-4 py-3 text-left transition hover:bg-zinc-50 ${
+                      selectedMetadataKey === model.key ? "bg-teal-50" : "bg-white"
+                    }`}
+                    key={model.key}
+                    onClick={() => selectMetadataModel(model.key)}
+                    type="button"
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-medium text-zinc-950">
+                        {model.name}
+                      </span>
+                      <span className="mt-1 block truncate text-xs text-zinc-500">
+                        {model.providerName} / {model.modelId}
+                      </span>
+                      <span className="mt-2 flex flex-wrap gap-1.5">
+                        <CapabilityPill
+                          label={formatLimit(model.contextWindow, "ctx")}
+                          ok={model.contextWindow !== null}
+                        />
+                        <CapabilityPill
+                          label={formatLimit(model.maxOutputTokens, "out")}
+                          ok={model.maxOutputTokens !== null}
+                        />
+                        <CapabilityPill label="tools" ok={model.supportsTools} />
+                        <CapabilityPill label="cache" ok={model.supportsCache} />
+                      </span>
+                    </span>
+                    <span className="text-right text-xs text-zinc-500">
+                      {model.inputModalities.join(", ") || "input n/a"}
+                    </span>
+                  </button>
+                ))
+              ) : (
+                <div className="px-4 py-8 text-sm text-zinc-500">
+                  {isLoading ? "Loading models..." : "No cached models"}
+                </div>
+              )}
+            </div>
+          </div>
+
+          <form
+            className="rounded-md border border-zinc-200 bg-white px-4 py-4"
+            onSubmit={(event) => void saveModel(event)}
+          >
+            <div className="mb-4 flex items-center gap-2">
+              <SlidersHorizontal
+                aria-hidden="true"
+                className="size-5 text-teal-700"
+              />
+              <h3 className="text-sm font-semibold">Model Limits</h3>
+            </div>
+            <div className="space-y-3">
+              <TextField
+                label="Model ID"
+                onChange={(value) =>
+                  setForm((current) => ({ ...current, modelId: value }))
+                }
+                placeholder="openai/gpt-4.1"
+                value={form.modelId}
+              />
+              <TextField
+                label="Display Name"
+                onChange={(value) =>
+                  setForm((current) => ({ ...current, displayName: value }))
+                }
+                placeholder="GPT 4.1"
+                value={form.displayName}
+              />
+              <div className="grid gap-3 sm:grid-cols-2">
+                <TextField
+                  inputMode="numeric"
+                  label="Context Window"
+                  onChange={(value) =>
+                    setForm((current) => ({
+                      ...current,
+                      contextWindow: value,
+                    }))
+                  }
+                  placeholder="128000"
+                  value={form.contextWindow}
+                />
+                <TextField
+                  inputMode="numeric"
+                  label="Max Output Tokens"
+                  onChange={(value) =>
+                    setForm((current) => ({
+                      ...current,
+                      maxOutputTokens: value,
+                    }))
+                  }
+                  placeholder="16384"
+                  value={form.maxOutputTokens}
+                />
+              </div>
+              <label className="flex items-center justify-between gap-3 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2">
+                <span className="text-sm font-medium text-zinc-700">
+                  Enable model
+                </span>
+                <input
+                  checked={form.enabled}
+                  className="size-4 accent-teal-700"
+                  onChange={(event) =>
+                    setForm((current) => ({
+                      ...current,
+                      enabled: event.target.checked,
+                    }))
+                  }
+                  type="checkbox"
+                />
+              </label>
+              {enabledNeedsLimits ? (
+                <div className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                  <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
+                  Fill both limits before enabling.
+                </div>
+              ) : null}
+              <button
+                className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-zinc-900 px-3 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
+                disabled={
+                  isSaving ||
+                  enabledNeedsLimits ||
+                  !form.modelId.trim() ||
+                  !form.displayName.trim()
+                }
+                type="submit"
+              >
+                {isSaving ? (
+                  <LoaderCircle
+                    aria-hidden="true"
+                    className="size-4 animate-spin"
+                  />
+                ) : (
+                  <CheckCircle2 aria-hidden="true" className="size-4" />
+                )}
+                Save Model
+              </button>
+            </div>
+
+            {selectedMetadata ? (
+              <div className="mt-4 border-t border-zinc-200 pt-4 text-xs text-zinc-500">
+                <div className="truncate">{selectedMetadata.key}</div>
+                <div className="mt-1">
+                  pricing in/out: {priceText(selectedMetadata.pricing.input)} /{" "}
+                  {priceText(selectedMetadata.pricing.output)}
+                </div>
+              </div>
+            ) : null}
+          </form>
+        </section>
+
+        <section className="rounded-md border border-zinc-200 bg-white">
+          <div className="border-b border-zinc-200 px-4 py-3">
+            <h3 className="text-sm font-semibold">Configured Models</h3>
+          </div>
+          <div className="divide-y divide-zinc-100">
+            {metadata?.configuredModels.length ? (
+              metadata.configuredModels.map((model) => (
+                <div
+                  className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(0,1fr)_auto]"
+                  key={model.id}
+                >
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="truncate text-sm font-medium">
+                        {model.displayName}
+                      </span>
+                      <CapabilityPill
+                        label={model.enabled ? "enabled" : "disabled"}
+                        ok={model.enabled}
+                      />
+                      <CapabilityPill
+                        label={model.canEnable ? "limits ok" : "limits missing"}
+                        ok={model.canEnable}
+                      />
+                    </div>
+                    <div className="mt-1 truncate text-xs text-zinc-500">
+                      {model.id}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      <CapabilityPill
+                        label={formatLimit(model.contextWindow, "ctx")}
+                        ok={model.contextWindow !== null}
+                      />
+                      <CapabilityPill
+                        label={formatLimit(model.maxOutputTokens, "out")}
+                        ok={model.maxOutputTokens !== null}
+                      />
+                    </div>
+                  </div>
+                  <button
+                    className="inline-flex h-8 items-center justify-center rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50"
+                    onClick={() => editConfiguredModel(model)}
+                    type="button"
+                  >
+                    Edit
+                  </button>
+                </div>
+              ))
+            ) : (
+              <div className="px-4 py-6 text-sm text-zinc-500">
+                No configured models
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
 function NavButton({
   active,
   icon: Icon,
@@ -549,6 +1026,95 @@ function workspaceItemClass(active: boolean) {
       ? "bg-zinc-900 text-white"
       : "text-zinc-700 hover:bg-zinc-100 hover:text-zinc-950"
   }`;
+}
+
+function TextField({
+  inputMode,
+  label,
+  onChange,
+  placeholder,
+  value,
+}: {
+  inputMode?: "numeric";
+  label: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  value: string;
+}) {
+  return (
+    <label className="block">
+      <span className="mb-1 block text-xs font-medium text-zinc-600">
+        {label}
+      </span>
+      <input
+        className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+        inputMode={inputMode}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        value={value}
+      />
+    </label>
+  );
+}
+
+function CapabilityPill({ label, ok }: { label: string; ok: boolean }) {
+  return (
+    <span
+      className={`inline-flex h-6 items-center rounded-md border px-2 text-xs font-medium ${
+        ok
+          ? "border-teal-200 bg-teal-50 text-teal-800"
+          : "border-zinc-200 bg-zinc-50 text-zinc-500"
+      }`}
+    >
+      {label}
+    </span>
+  );
+}
+
+function emptyModelForm(): ModelFormState {
+  return {
+    displayName: "",
+    enabled: false,
+    maxOutputTokens: "",
+    modelId: "",
+    contextWindow: "",
+  };
+}
+
+function numberInputValue(value: number | null) {
+  return value === null ? "" : String(value);
+}
+
+function optionalPositiveInteger(value: string, label: string) {
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    return null;
+  }
+
+  if (!/^\d+$/.test(trimmed)) {
+    throw new Error(`${label} must be a positive whole number`);
+  }
+
+  const numberValue = Number(trimmed);
+
+  if (!Number.isSafeInteger(numberValue) || numberValue <= 0) {
+    throw new Error(`${label} must be a positive whole number`);
+  }
+
+  return numberValue;
+}
+
+function formatLimit(value: number | null, label: string) {
+  return value === null ? `${label} missing` : `${label} ${formatNumber(value)}`;
+}
+
+function formatNumber(value: number) {
+  return new Intl.NumberFormat("en-US").format(value);
+}
+
+function priceText(value: number | null) {
+  return value === null ? "n/a" : `$${value}`;
 }
 
 async function requestJson<T>(

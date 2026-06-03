@@ -12,8 +12,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{SecondsFormat, Utc};
 use foco_store::{
-    config::{GlobalConfig, WorkspaceConfig, load_or_create_global_config, save_global_config},
+    config::{
+        GlobalConfig, ModelLimits, ModelSettings, WorkspaceConfig, load_or_create_global_config,
+        save_global_config,
+    },
+    model_metadata::{
+        MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
+        parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
+    },
     workspace::{ChatRecord, WorkspaceDatabase, initialize_workspace_databases},
 };
 use serde::{Deserialize, Serialize};
@@ -31,6 +39,7 @@ type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 struct AppState {
     config: Arc<Mutex<GlobalConfig>>,
     config_file: PathBuf,
+    model_metadata_file: PathBuf,
 }
 
 #[tokio::main]
@@ -61,12 +70,16 @@ async fn run() -> AppResult<()> {
     let state = AppState {
         config: Arc::new(Mutex::new(loaded_config.config)),
         config_file: loaded_config.paths.config_file,
+        model_metadata_file: loaded_config.paths.root_dir.join("models.dev.json"),
     };
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/workspaces", get(workspaces))
         .route("/api/workspaces/create", post(create_workspace))
         .route("/api/workspaces/add", post(add_workspace))
+        .route("/api/model-metadata", get(model_metadata))
+        .route("/api/model-metadata/refresh", post(refresh_model_metadata))
+        .route("/api/models/manual", post(save_manual_model))
         .fallback_service(ServeDir::new(frontend_dir))
         .with_state(state);
     let listener = TcpListener::bind(addr).await?;
@@ -156,6 +169,162 @@ async fn add_workspace(
     workspace_response_from_config(&config)
 }
 
+async fn model_metadata(
+    State(state): State<AppState>,
+) -> Result<Json<ModelMetadataResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let cache = read_model_metadata_cache(&state.model_metadata_file)
+        .map_err(ApiError::from_model_metadata_error)?;
+
+    Ok(Json(model_metadata_response(
+        cache,
+        &config,
+        &state.model_metadata_file,
+    )))
+}
+
+async fn refresh_model_metadata(
+    State(state): State<AppState>,
+) -> Result<Json<ModelMetadataResponse>, ApiError> {
+    let fetched_at = utc_timestamp();
+    let content = reqwest::get(MODELS_DEV_API_URL)
+        .await
+        .map_err(|source| {
+            ApiError::internal(format!("failed to fetch models.dev metadata: {source}"))
+        })?
+        .error_for_status()
+        .map_err(|source| {
+            ApiError::internal(format!("models.dev metadata request failed: {source}"))
+        })?
+        .text()
+        .await
+        .map_err(|source| {
+            ApiError::internal(format!("failed to read models.dev metadata: {source}"))
+        })?;
+    let cache = parse_models_dev_metadata(&content, MODELS_DEV_API_URL, &fetched_at)
+        .map_err(ApiError::from_model_metadata_error)?;
+
+    write_model_metadata_cache(&state.model_metadata_file, &cache)
+        .map_err(ApiError::from_model_metadata_error)?;
+
+    let config = config_snapshot(&state)?;
+
+    Ok(Json(model_metadata_response(
+        Some(cache),
+        &config,
+        &state.model_metadata_file,
+    )))
+}
+
+async fn save_manual_model(
+    State(state): State<AppState>,
+    Json(request): Json<ManualModelRequest>,
+) -> Result<Json<ModelMetadataResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let model_id = request.model_id.trim();
+    let display_name = request.display_name.trim();
+    let context_window = request.context_window;
+    let max_output_tokens = request.max_output_tokens;
+    let metadata_key = request
+        .metadata_key
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let metadata_record = match metadata_key.as_deref() {
+        Some(key) => cached_model_record(&state.model_metadata_file, key)
+            .map_err(ApiError::from_model_metadata_error)?,
+        None => None,
+    };
+
+    if model_id.is_empty() {
+        return Err(ApiError::bad_request("model id must not be empty"));
+    }
+
+    if display_name.is_empty() {
+        return Err(ApiError::bad_request("display name must not be empty"));
+    }
+
+    if metadata_key.is_some() && metadata_record.is_none() {
+        return Err(ApiError::bad_request(format!(
+            "model metadata key was not found in cache: {}",
+            metadata_key.as_deref().unwrap_or_default()
+        )));
+    }
+
+    if request.enabled && (context_window.is_none() || max_output_tokens.is_none()) {
+        return Err(ApiError::bad_request(
+            "enabled model requires context window and max output tokens",
+        ));
+    }
+
+    let limits = match (context_window, max_output_tokens) {
+        (Some(context_window), Some(max_output_tokens)) => {
+            if context_window == 0 {
+                return Err(ApiError::bad_request(
+                    "context window must be greater than 0",
+                ));
+            }
+
+            if max_output_tokens == 0 {
+                return Err(ApiError::bad_request(
+                    "max output tokens must be greater than 0",
+                ));
+            }
+
+            Some(ModelLimits {
+                context_window,
+                max_output_tokens,
+            })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(ApiError::bad_request(
+                "context window and max output tokens must be saved together",
+            ));
+        }
+    };
+
+    let existing_model = config.models.iter().find(|model| model.id == model_id);
+    let model = ModelSettings {
+        id: model_id.to_string(),
+        display_name: display_name.to_string(),
+        enabled: request.enabled,
+        provider_ids: existing_model
+            .map(|model| model.provider_ids.clone())
+            .unwrap_or_default(),
+        active_provider_id: existing_model.and_then(|model| model.active_provider_id.clone()),
+        thinking_level: existing_model.and_then(|model| model.thinking_level.clone()),
+        metadata_key: metadata_key
+            .clone()
+            .or_else(|| metadata_record.as_ref().map(|record| record.key.clone())),
+        metadata_source_url: metadata_record
+            .as_ref()
+            .map(|record| record.source_url.clone()),
+        metadata_refreshed_at: metadata_record
+            .as_ref()
+            .map(|record| record.refreshed_at.clone()),
+        limits,
+    };
+
+    if let Some(stored_model) = config.models.iter_mut().find(|model| model.id == model_id) {
+        *stored_model = model;
+    } else {
+        config.models.push(model);
+    }
+
+    save_config(&state, config.clone())?;
+
+    let cache = read_model_metadata_cache(&state.model_metadata_file)
+        .map_err(ApiError::from_model_metadata_error)?;
+
+    Ok(Json(model_metadata_response(
+        cache,
+        &config,
+        &state.model_metadata_file,
+    )))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspacePathRequest {
@@ -163,11 +332,47 @@ struct WorkspacePathRequest {
     path: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualModelRequest {
+    model_id: String,
+    display_name: String,
+    enabled: bool,
+    metadata_key: Option<String>,
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspacesResponse {
     active_workspace_id: String,
     workspaces: Vec<WorkspaceSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelMetadataResponse {
+    source_url: Option<String>,
+    fetched_at: Option<String>,
+    cache_path: String,
+    models: Vec<ModelMetadataRecord>,
+    configured_models: Vec<ConfiguredModelSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfiguredModelSummary {
+    id: String,
+    display_name: String,
+    enabled: bool,
+    metadata_key: Option<String>,
+    metadata_source_url: Option<String>,
+    metadata_refreshed_at: Option<String>,
+    context_window: Option<u64>,
+    max_output_tokens: Option<u64>,
+    can_enable: bool,
+    missing_limits: Vec<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -219,6 +424,10 @@ impl ApiError {
     }
 
     fn from_workspace_error(error: foco_store::workspace::WorkspaceDatabaseError) -> Self {
+        Self::internal(error.to_string())
+    }
+
+    fn from_model_metadata_error(error: ModelMetadataError) -> Self {
         Self::internal(error.to_string())
     }
 }
@@ -307,6 +516,65 @@ fn workspace_response_from_config(
         active_workspace_id: config.app.active_workspace_id.clone(),
         workspaces,
     }))
+}
+
+fn model_metadata_response(
+    cache: Option<ModelMetadataCache>,
+    config: &GlobalConfig,
+    cache_path: &Path,
+) -> ModelMetadataResponse {
+    let (source_url, fetched_at, models) = match cache {
+        Some(cache) => (Some(cache.source_url), Some(cache.fetched_at), cache.models),
+        None => (None, None, Vec::new()),
+    };
+
+    ModelMetadataResponse {
+        source_url,
+        fetched_at,
+        cache_path: cache_path.display().to_string(),
+        models,
+        configured_models: config.models.iter().map(configured_model_summary).collect(),
+    }
+}
+
+fn configured_model_summary(model: &ModelSettings) -> ConfiguredModelSummary {
+    let context_window = model.limits.as_ref().map(|limits| limits.context_window);
+    let max_output_tokens = model.limits.as_ref().map(|limits| limits.max_output_tokens);
+    let mut missing_limits = Vec::new();
+
+    if context_window.is_none() {
+        missing_limits.push("contextWindow");
+    }
+
+    if max_output_tokens.is_none() {
+        missing_limits.push("maxOutputTokens");
+    }
+
+    ConfiguredModelSummary {
+        id: model.id.clone(),
+        display_name: model.display_name.clone(),
+        enabled: model.enabled,
+        metadata_key: model.metadata_key.clone(),
+        metadata_source_url: model.metadata_source_url.clone(),
+        metadata_refreshed_at: model.metadata_refreshed_at.clone(),
+        context_window,
+        max_output_tokens,
+        can_enable: missing_limits.is_empty(),
+        missing_limits,
+    }
+}
+
+fn cached_model_record(
+    cache_path: &Path,
+    key: &str,
+) -> Result<Option<ModelMetadataRecord>, ModelMetadataError> {
+    let cache = read_model_metadata_cache(cache_path)?;
+
+    Ok(cache.and_then(|cache| cache.models.into_iter().find(|model| model.key == key)))
+}
+
+fn utc_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn chat_summary(chat: ChatRecord) -> ChatSummary {

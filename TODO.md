@@ -70,14 +70,14 @@
 
 ## 05. Model Metadata
 
-- [ ] Fetch model metadata from `https://models.dev/api.json`.
-- [ ] Cache fetched metadata at `%USERPROFILE%\.foco\models.dev.json`.
-- [ ] Track metadata source and refresh time for every model.
-- [ ] Extract context window, max output tokens, pricing, modality, tool support, and cache support where available.
-- [ ] Add manual metadata refresh in settings.
-- [ ] Block enabling a model when required limits are missing.
-- [ ] Let users manually fill missing model limits in settings.
-- [ ] Add unit tests for model metadata parsing.
+- [x] Fetch model metadata from `https://models.dev/api.json`.
+- [x] Cache fetched metadata at `%USERPROFILE%\.foco\models.dev.json`.
+- [x] Track metadata source and refresh time for every model.
+- [x] Extract context window, max output tokens, pricing, modality, tool support, and cache support where available.
+- [x] Add manual metadata refresh in settings.
+- [x] Block enabling a model when required limits are missing.
+- [x] Let users manually fill missing model limits in settings.
+- [x] Add unit tests for model metadata parsing.
 
 ## 06. Provider And Model Settings
 
