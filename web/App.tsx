@@ -154,6 +154,44 @@ type ProviderTestState = {
   status: "error" | "ok" | "testing";
 };
 
+type ChatMessageSummary = {
+  id: string;
+  role: "assistant" | "user";
+  content: string;
+};
+
+type ChatMessagesResponse = {
+  messages: ChatMessageSummary[];
+};
+
+type ChatUsage = {
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+};
+
+type ChatStreamEvent =
+  | {
+      type: "start";
+      chatId: string;
+      userMessageId: string;
+      assistantMessageId: string;
+      llmRequestId: string;
+    }
+  | { type: "textDelta"; delta: string }
+  | { type: "reasoningDelta"; delta: string }
+  | { type: "usage"; usage: ChatUsage }
+  | {
+      type: "complete";
+      chatId: string;
+      assistantMessageId: string;
+      text: string;
+      usage: ChatUsage | null;
+      stopReason: string | null;
+    }
+  | { type: "error"; message: string };
+
 type WorkspaceFormMode = "add" | "create";
 type ViewMode = "chat" | "settings" | "stats";
 
@@ -161,20 +199,8 @@ type ShellMessage = {
   id: string;
   role: "assistant" | "user";
   content: string;
+  status?: "error" | "streaming";
 };
-
-const starterMessages: ShellMessage[] = [
-  {
-    id: "assistant-ready",
-    role: "assistant",
-    content: "Workspace shell is ready.",
-  },
-  {
-    id: "user-example",
-    role: "user",
-    content: "Start from TODO.md step 4.",
-  },
-];
 
 export function App() {
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
@@ -187,8 +213,14 @@ export function App() {
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
   const [draftMessage, setDraftMessage] = useState("");
-  const [messages, setMessages] = useState<ShellMessage[]>(starterMessages);
+  const [messages, setMessages] = useState<ShellMessage[]>([]);
+  const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [selectedModelId, setSelectedModelId] = useState("");
+  const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
+  const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -198,6 +230,18 @@ export function App() {
       workspaces[0],
     [activeWorkspaceId, workspaces],
   );
+  const availableModels = useMemo(
+    () =>
+      (settings?.configuredModels ?? []).filter(
+        (model) =>
+          model.enabled &&
+          model.canEnable &&
+          model.activeProviderId !== null &&
+          model.providerIds.length > 0,
+      ),
+    [settings],
+  );
+  const thinkingLevels = settings?.thinkingLevels ?? [];
 
   const refreshWorkspaces = useCallback(async () => {
     setIsLoading(true);
@@ -221,9 +265,42 @@ export function App() {
     }
   }, []);
 
+  const loadSettings = useCallback(async () => {
+    setIsLoadingSettings(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings");
+      setSettings(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsLoadingSettings(false);
+    }
+  }, []);
+
   useEffect(() => {
     void refreshWorkspaces();
   }, [refreshWorkspaces]);
+
+  useEffect(() => {
+    void loadSettings();
+  }, [loadSettings]);
+
+  useEffect(() => {
+    setSelectedModelId((current) =>
+      availableModels.some((model) => model.id === current)
+        ? current
+        : (availableModels[0]?.id ?? ""),
+    );
+  }, [availableModels]);
+
+  useEffect(() => {
+    const selectedModel = availableModels.find(
+      (model) => model.id === selectedModelId,
+    );
+    setSelectedThinkingLevel(selectedModel?.thinkingLevel ?? "");
+  }, [availableModels, selectedModelId]);
 
   async function handleWorkspaceSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -259,23 +336,164 @@ export function App() {
     }
   }
 
-  function handleSendMessage(event: FormEvent<HTMLFormElement>) {
+  async function loadChatMessages(workspaceId: string, chatId: string) {
+    setError(null);
+
+    try {
+      const data = await requestJson<ChatMessagesResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages`,
+      );
+      setActiveWorkspaceId(workspaceId);
+      setActiveChatId(chatId);
+      setMessages(data.messages);
+      setViewMode("chat");
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
+  }
+
+  function selectWorkspace(workspaceId: string) {
+    setActiveWorkspaceId(workspaceId);
+    setActiveChatId(null);
+    setMessages([]);
+  }
+
+  async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     const content = draftMessage.trim();
-    if (!content) {
+    if (!content || isSendingMessage) {
       return;
     }
+
+    if (!activeWorkspace) {
+      setError("Select a workspace before sending.");
+      return;
+    }
+
+    if (!selectedModelId) {
+      setError("Select an enabled model before sending.");
+      return;
+    }
+
+    const localUserId = `local-user-${Date.now()}`;
+    let assistantMessageId = `local-assistant-${Date.now()}`;
 
     setMessages((current) => [
       ...current,
       {
-        id: `local-user-${Date.now()}`,
+        id: localUserId,
         role: "user",
         content,
       },
+      {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        status: "streaming",
+      },
     ]);
     setDraftMessage("");
+    setIsSendingMessage(true);
+    setError(null);
+
+    try {
+      const response = await fetch(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/chat/stream`,
+        {
+          body: JSON.stringify({
+            chatId: activeChatId,
+            message: content,
+            modelId: selectedModelId,
+            thinkingLevel: selectedThinkingLevel || null,
+          }),
+          cache: "no-store",
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error(await responseErrorMessage(response));
+      }
+
+      await readChatStream(response, (streamEvent) => {
+        if (streamEvent.type === "start") {
+          assistantMessageId = streamEvent.assistantMessageId;
+          setActiveChatId(streamEvent.chatId);
+          setMessages((current) =>
+            current.map((message) => {
+              if (message.id === localUserId) {
+                return { ...message, id: streamEvent.userMessageId };
+              }
+
+              if (message.id === assistantMessageId || message.id.startsWith("local-assistant-")) {
+                return { ...message, id: streamEvent.assistantMessageId };
+              }
+
+              return message;
+            }),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "textDelta") {
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantMessageId
+                ? { ...message, content: message.content + streamEvent.delta }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "complete") {
+          setActiveChatId(streamEvent.chatId);
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantMessageId
+                ? {
+                    ...message,
+                    content: streamEvent.text,
+                    status: undefined,
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "error") {
+          setError(streamEvent.message);
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantMessageId
+                ? {
+                    ...message,
+                    content: streamEvent.message,
+                    status: "error",
+                  }
+                : message,
+            ),
+          );
+        }
+      });
+
+      await refreshWorkspaces();
+    } catch (requestError) {
+      const message = errorMessage(requestError);
+      setError(message);
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === assistantMessageId
+            ? { ...item, content: message, status: "error" }
+            : item,
+        ),
+      );
+    } finally {
+      setIsSendingMessage(false);
+    }
   }
 
   function toggleWorkspace(workspaceId: string) {
@@ -419,7 +637,7 @@ export function App() {
                       </button>
                       <button
                         className={workspaceItemClass(isActive)}
-                        onClick={() => setActiveWorkspaceId(workspace.id)}
+                        onClick={() => selectWorkspace(workspace.id)}
                         type="button"
                       >
                         <Folder aria-hidden="true" className="size-4 shrink-0" />
@@ -435,6 +653,9 @@ export function App() {
                             <button
                               className="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-950"
                               key={chat.id}
+                              onClick={() =>
+                                void loadChatMessages(workspace.id, chat.id)
+                              }
                               type="button"
                             >
                               <MessageSquare
@@ -494,10 +715,18 @@ export function App() {
 
           {viewMode === "chat" ? (
             <ChatPanel
+              availableModels={availableModels}
               draftMessage={draftMessage}
+              isLoadingSettings={isLoadingSettings}
+              isSendingMessage={isSendingMessage}
               messages={messages}
               onDraftMessageChange={setDraftMessage}
+              onModelChange={setSelectedModelId}
               onSubmit={handleSendMessage}
+              onThinkingLevelChange={setSelectedThinkingLevel}
+              selectedModelId={selectedModelId}
+              selectedThinkingLevel={selectedThinkingLevel}
+              thinkingLevels={thinkingLevels}
             />
           ) : viewMode === "settings" ? (
             <SettingsPanel />
@@ -522,21 +751,38 @@ export function App() {
 }
 
 function ChatPanel({
+  availableModels,
   draftMessage,
+  isLoadingSettings,
+  isSendingMessage,
   messages,
   onDraftMessageChange,
+  onModelChange,
   onSubmit,
+  onThinkingLevelChange,
+  selectedModelId,
+  selectedThinkingLevel,
+  thinkingLevels,
 }: {
+  availableModels: ConfiguredModelSummary[];
   draftMessage: string;
+  isLoadingSettings: boolean;
+  isSendingMessage: boolean;
   messages: ShellMessage[];
   onDraftMessageChange: (value: string) => void;
+  onModelChange: (value: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onThinkingLevelChange: (value: string) => void;
+  selectedModelId: string;
+  selectedThinkingLevel: string;
+  thinkingLevels: ThinkingLevelSummary[];
 }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
         <div className="mx-auto flex max-w-4xl flex-col gap-3">
-          {messages.map((message) => {
+          {messages.length ? (
+            messages.map((message) => {
             const isUser = message.role === "user";
 
             return (
@@ -564,32 +810,102 @@ function ChatPanel({
                       <Bot aria-hidden="true" className="size-4" />
                     )}
                   </div>
-                  <p className="min-w-0 whitespace-pre-wrap break-words text-sm leading-6">
-                    {message.content}
+                  <p
+                    className={`min-w-0 whitespace-pre-wrap break-words text-sm leading-6 ${
+                      message.status === "error" ? "text-rose-700" : ""
+                    }`}
+                  >
+                    {message.content ||
+                      (message.status === "streaming" ? (
+                        <LoaderCircle
+                          aria-hidden="true"
+                          className="size-4 animate-spin"
+                        />
+                      ) : null)}
                   </p>
                 </div>
               </div>
             );
-          })}
+            })
+          ) : (
+            <div className="flex justify-start">
+              <div className="flex max-w-[78%] gap-3 rounded-md border border-zinc-200 bg-white px-4 py-3 text-zinc-600 shadow-sm">
+                <div className="mt-0.5 inline-flex size-7 shrink-0 items-center justify-center rounded-md bg-zinc-100 text-zinc-700">
+                  <Bot aria-hidden="true" className="size-4" />
+                </div>
+                <p className="min-w-0 whitespace-pre-wrap break-words text-sm leading-6">
+                  Workspace shell is ready.
+                </p>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
       <div className="border-t border-zinc-200 bg-white px-5 py-3">
         <form className="mx-auto max-w-4xl" onSubmit={onSubmit}>
+          <div className="mb-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_12rem]">
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-zinc-600">
+                Model
+              </span>
+              <select
+                className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                disabled={isLoadingSettings || isSendingMessage}
+                onChange={(event) => onModelChange(event.target.value)}
+                value={selectedModelId}
+              >
+                {availableModels.length ? (
+                  availableModels.map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.displayName}
+                    </option>
+                  ))
+                ) : (
+                  <option value="">No enabled models</option>
+                )}
+              </select>
+            </label>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium text-zinc-600">
+                Thinking
+              </span>
+              <select
+                className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                disabled={isSendingMessage}
+                onChange={(event) => onThinkingLevelChange(event.target.value)}
+                value={selectedThinkingLevel}
+              >
+                <option value="">Model default</option>
+                {thinkingLevels.map((level) => (
+                  <option key={level.value} value={level.value}>
+                    {level.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <div className="flex gap-2">
             <textarea
               className="min-h-20 flex-1 resize-none rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm leading-6 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+              disabled={isSendingMessage}
               onChange={(event) => onDraftMessageChange(event.target.value)}
               placeholder="Message Foco"
               value={draftMessage}
             />
             <button
               className="inline-flex h-20 w-12 items-center justify-center rounded-md bg-teal-700 text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
-              disabled={!draftMessage.trim()}
+              disabled={
+                isSendingMessage || !draftMessage.trim() || !selectedModelId
+              }
               title="Send"
               type="submit"
             >
-              <Send aria-hidden="true" className="size-5" />
+              {isSendingMessage ? (
+                <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+              ) : (
+                <Send aria-hidden="true" className="size-5" />
+              )}
             </button>
           </div>
         </form>
@@ -1703,6 +2019,87 @@ function formatNumber(value: number) {
 
 function priceText(value: number | null) {
   return value === null ? "n/a" : `$${value}`;
+}
+
+async function readChatStream(
+  response: Response,
+  onEvent: (event: ChatStreamEvent) => void,
+) {
+  if (!response.body) {
+    throw new Error("chat stream response has no body");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    buffer = readSseFrames(buffer, onEvent);
+  }
+
+  buffer += decoder.decode();
+  readSseFrames(`${buffer}\n\n`, onEvent);
+}
+
+function readSseFrames(
+  buffer: string,
+  onEvent: (event: ChatStreamEvent) => void,
+) {
+  const normalized = buffer.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const frames = normalized.split("\n\n");
+  const remaining = frames.pop() ?? "";
+
+  for (const frame of frames) {
+    const data = frame
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trimStart())
+      .join("\n");
+
+    if (!data) {
+      continue;
+    }
+
+    const parsed = JSON.parse(data) as unknown;
+    if (!isChatStreamEvent(parsed)) {
+      throw new Error("chat stream returned an unknown event");
+    }
+
+    onEvent(parsed);
+  }
+
+  return remaining;
+}
+
+function isChatStreamEvent(value: unknown): value is ChatStreamEvent {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    typeof value.type === "string"
+  );
+}
+
+async function responseErrorMessage(response: Response) {
+  const contentType = response.headers.get("content-type") ?? "";
+
+  if (contentType.includes("application/json")) {
+    const data = (await response.json()) as unknown;
+
+    if (isErrorResponse(data)) {
+      return data.error;
+    }
+  }
+
+  const text = await response.text();
+  return text || `request returned ${response.status}`;
 }
 
 async function requestJson<T>(

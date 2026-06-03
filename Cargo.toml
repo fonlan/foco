@@ -16,6 +16,7 @@ license = "MIT"
 version = "0.1.0"
 
 [workspace.dependencies]
+async-stream = "0.3.6"
 axum = "0.8.9"
 chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 foco-agent = { path = "agent" }
@@ -24,6 +25,7 @@ foco-mcp = { path = "mcp" }
 foco-providers = { path = "providers" }
 foco-store = { path = "store" }
 foco-tools = { path = "tools" }
+futures-util = "0.3.31"
 genai = { version = "0.6.4", default-features = true }
 reqwest = { version = "0.12.25", default-features = false, features = ["rustls-tls"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }

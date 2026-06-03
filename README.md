@@ -55,6 +55,15 @@ non-secret request/response JSON. Authorization headers and API-key fields are
 redacted before persistence, and cache ratio is calculated from normalized input
 and cache-read token counts.
 
+The chat panel sends real model requests through
+`POST /api/workspaces/{workspace_id}/chat/stream`, which returns server-sent
+events. The backend builds provider-neutral `genai` chat requests, supports both
+OpenAI Chat and OpenAI Responses providers, streams text deltas into the current
+assistant bubble, persists user and assistant messages in the workspace
+database, and writes real LLM audit records for the request. The send box lists
+enabled models with complete limits and an active provider, plus a thinking
+level selector.
+
 For live frontend development, run the Vite dev server alongside the backend:
 
 ```bash

@@ -1,21 +1,31 @@
 use std::{
+    convert::Infallible,
     env, fs,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use chrono::{SecondsFormat, Utc};
 use foco_providers::{
-    DEFAULT_OPENAI_BASE_URL, OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND, ProviderConnectionConfig,
-    normalized_base_url, parse_provider_kind, test_provider_connection,
+    DEFAULT_OPENAI_BASE_URL, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
+    NeutralChatStreamEvent, NeutralUsage, OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND,
+    ProviderConnectionConfig, normalized_base_url, parse_provider_kind, stream_chat,
+    test_provider_connection,
 };
 use foco_store::{
     config::{
@@ -26,9 +36,13 @@ use foco_store::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
         parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
     },
-    workspace::{ChatRecord, WorkspaceDatabase, initialize_workspace_databases},
+    workspace::{
+        ChatRecord, MessageRecord, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+        WorkspaceDatabase, initialize_workspace_databases,
+    },
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 
@@ -36,6 +50,7 @@ mod logging;
 
 const DEFAULT_PORT: u16 = 3210;
 const PORT_ENV: &str = "FOCO_PORT";
+static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -87,6 +102,14 @@ async fn run() -> AppResult<()> {
         .route("/api/model-metadata", get(model_metadata))
         .route("/api/model-metadata/refresh", post(refresh_model_metadata))
         .route("/api/models/manual", post(save_manual_model))
+        .route(
+            "/api/workspaces/{workspace_id}/chat/stream",
+            post(stream_chat_response),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/messages",
+            get(chat_messages),
+        )
         .fallback_service(ServeDir::new(frontend_dir))
         .with_state(state);
     let listener = TcpListener::bind(addr).await?;
@@ -446,6 +469,57 @@ async fn save_manual_model(
     )))
 }
 
+async fn stream_chat_response(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<ChatStreamRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let chat_context = prepare_chat_context(&config, &workspace_id, request)?;
+
+    Ok(Sse::new(chat_context.into_sse_stream()).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(10))
+            .text("keep-alive"),
+    ))
+}
+
+async fn chat_messages(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
+) -> Result<Json<ChatMessagesResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace_id = workspace_id.trim();
+    let chat_id = chat_id.trim();
+    let workspace = config
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+
+    if database
+        .chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+        .is_none()
+    {
+        return Err(ApiError::bad_request(format!(
+            "chat was not found: {chat_id}"
+        )));
+    }
+
+    let messages = database
+        .messages_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .filter(|message| message.role == "user" || message.role == "assistant")
+        .map(chat_message_summary)
+        .collect();
+
+    Ok(Json(ChatMessagesResponse { messages }))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspacePathRequest {
@@ -484,6 +558,15 @@ struct ManualProviderRequest {
 #[serde(rename_all = "camelCase")]
 struct TestProviderRequest {
     provider_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatStreamRequest {
+    chat_id: Option<String>,
+    model_id: String,
+    thinking_level: Option<String>,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -584,6 +667,639 @@ struct ChatSummary {
     title: String,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatMessagesResponse {
+    messages: Vec<ChatMessageSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatMessageSummary {
+    id: String,
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+enum ChatSseEvent {
+    Start {
+        chat_id: String,
+        user_message_id: String,
+        assistant_message_id: String,
+        llm_request_id: String,
+    },
+    TextDelta {
+        delta: String,
+    },
+    ReasoningDelta {
+        delta: String,
+    },
+    Usage {
+        usage: NeutralUsage,
+    },
+    Complete {
+        chat_id: String,
+        assistant_message_id: String,
+        text: String,
+        usage: Option<NeutralUsage>,
+        stop_reason: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+}
+
+struct PreparedChatContext {
+    workspace_id: String,
+    workspace_path: PathBuf,
+    chat_id: String,
+    provider_id: String,
+    model_id: String,
+    user_message_id: String,
+    assistant_message_id: String,
+    llm_request_id: String,
+    assistant_sequence: i64,
+    provider_config: ProviderConnectionConfig,
+    provider_request: NeutralChatRequest,
+    request_body_json: String,
+}
+
+struct CapturedAuditEvent {
+    event_at: String,
+    event_type: String,
+    normalized_event_json: String,
+}
+
+struct ChatAuditOutcome {
+    first_token_at: Option<String>,
+    completed_at: String,
+    first_token_latency_ms: Option<i64>,
+    total_latency_ms: i64,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    final_state: &'static str,
+    response_body_json: Option<String>,
+}
+
+impl PreparedChatContext {
+    fn into_sse_stream(self) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+        async_stream::stream! {
+            let request_started_at = utc_timestamp();
+            let started_at = Instant::now();
+            let start_event = ChatSseEvent::Start {
+                chat_id: self.chat_id.clone(),
+                user_message_id: self.user_message_id.clone(),
+                assistant_message_id: self.assistant_message_id.clone(),
+                llm_request_id: self.llm_request_id.clone(),
+            };
+            let mut events = vec![captured_event(&start_event)];
+
+            yield Ok(sse_event(&start_event));
+
+            let mut provider_stream = match stream_chat(&self.provider_config, self.provider_request.clone()).await {
+                Ok(provider_stream) => provider_stream,
+                Err(error) => {
+                    let message = error.to_string();
+                    let event = ChatSseEvent::Error {
+                        message: message.clone(),
+                    };
+                    events.push(captured_event(&event));
+                    let outcome = failed_audit_outcome(started_at, &message);
+
+                    if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+                        let event = ChatSseEvent::Error {
+                            message: persist_error.message,
+                        };
+                        yield Ok(sse_event(&event));
+                    } else {
+                        yield Ok(sse_event(&event));
+                    }
+
+                    return;
+                }
+            };
+
+            let mut assistant_text = String::new();
+            let mut first_token_at = None;
+            let mut first_token_latency_ms = None;
+
+            while let Some(event_result) = provider_stream.next_event().await {
+                let provider_event = match event_result {
+                    Ok(provider_event) => provider_event,
+                    Err(error) => {
+                        let message = error.to_string();
+                        let event = ChatSseEvent::Error {
+                            message: message.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        let outcome = failed_audit_outcome(started_at, &message);
+
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+                            let event = ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                            yield Ok(sse_event(&event));
+                        } else {
+                            yield Ok(sse_event(&event));
+                        }
+
+                        return;
+                    }
+                };
+
+                events.push(captured_provider_event(&provider_event));
+
+                match provider_event {
+                    NeutralChatStreamEvent::Start => {}
+                    NeutralChatStreamEvent::TextDelta { delta } => {
+                        capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                        assistant_text.push_str(&delta);
+                        let event = ChatSseEvent::TextDelta { delta };
+                        yield Ok(sse_event(&event));
+                    }
+                    NeutralChatStreamEvent::ReasoningDelta { delta } => {
+                        capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                        let event = ChatSseEvent::ReasoningDelta { delta };
+                        yield Ok(sse_event(&event));
+                    }
+                    NeutralChatStreamEvent::Usage { usage } => {
+                        let event = ChatSseEvent::Usage { usage };
+                        yield Ok(sse_event(&event));
+                    }
+                    NeutralChatStreamEvent::Complete {
+                        text,
+                        reasoning,
+                        usage,
+                        stop_reason,
+                        response_id,
+                    } => {
+                        if assistant_text.is_empty() && !text.is_empty() {
+                            let message = "provider completed without streaming assistant text deltas".to_string();
+                            let event = ChatSseEvent::Error {
+                                message: message.clone(),
+                            };
+                            events.push(captured_event(&event));
+                            let outcome = failed_audit_outcome(started_at, &message);
+
+                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+                                let event = ChatSseEvent::Error {
+                                    message: persist_error.message,
+                                };
+                                yield Ok(sse_event(&event));
+                            } else {
+                                yield Ok(sse_event(&event));
+                            }
+
+                            return;
+                        }
+
+                        let completed_at = utc_timestamp();
+                        let outcome = ChatAuditOutcome {
+                            first_token_at,
+                            completed_at,
+                            first_token_latency_ms,
+                            total_latency_ms: elapsed_millis(started_at),
+                            input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
+                            output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
+                            cache_read_tokens: usage.as_ref().and_then(|usage| usage.cache_read_tokens),
+                            cache_write_tokens: usage.as_ref().and_then(|usage| usage.cache_write_tokens),
+                            final_state: "succeeded",
+                            response_body_json: Some(json!({
+                                "text": text,
+                                "reasoning": reasoning,
+                                "usage": usage,
+                                "stopReason": stop_reason,
+                                "responseId": response_id
+                            }).to_string()),
+                        };
+
+                        match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_text)) {
+                            Ok(()) => {
+                                let event = ChatSseEvent::Complete {
+                                    chat_id: self.chat_id.clone(),
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    text: assistant_text.clone(),
+                                    usage,
+                                    stop_reason,
+                                };
+                                yield Ok(sse_event(&event));
+                            }
+                            Err(error) => {
+                                let event = ChatSseEvent::Error {
+                                    message: error.message,
+                                };
+                                yield Ok(sse_event(&event));
+                            }
+                        }
+
+                        return;
+                    }
+                    NeutralChatStreamEvent::Error { message } => {
+                        let event = ChatSseEvent::Error {
+                            message: message.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        let outcome = failed_audit_outcome(started_at, &message);
+
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+                            let event = ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                            yield Ok(sse_event(&event));
+                        } else {
+                            yield Ok(sse_event(&event));
+                        }
+
+                        return;
+                    }
+                }
+            }
+
+            let message = "provider stream ended without a completion event".to_string();
+            let event = ChatSseEvent::Error {
+                message: message.clone(),
+            };
+            events.push(captured_event(&event));
+            let outcome = failed_audit_outcome(started_at, &message);
+
+            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None) {
+                let event = ChatSseEvent::Error {
+                    message: persist_error.message,
+                };
+                yield Ok(sse_event(&event));
+            } else {
+                yield Ok(sse_event(&event));
+            }
+        }
+    }
+}
+
+fn prepare_chat_context(
+    config: &GlobalConfig,
+    workspace_id: &str,
+    request: ChatStreamRequest,
+) -> Result<PreparedChatContext, ApiError> {
+    let workspace_id = workspace_id.trim();
+    let message = request.message.trim();
+    let model_id = request.model_id.trim();
+    let thinking_level = optional_trimmed_string(request.thinking_level);
+
+    if workspace_id.is_empty() {
+        return Err(ApiError::bad_request("workspace id must not be empty"));
+    }
+
+    if message.is_empty() {
+        return Err(ApiError::bad_request("message must not be empty"));
+    }
+
+    if model_id.is_empty() {
+        return Err(ApiError::bad_request("model id must not be empty"));
+    }
+
+    let workspace = config
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
+
+    if !model.enabled {
+        return Err(ApiError::bad_request(format!(
+            "model '{}' is disabled",
+            model.id
+        )));
+    }
+
+    let limits = model.limits.as_ref().ok_or_else(|| {
+        ApiError::bad_request(format!("enabled model '{}' is missing limits", model.id))
+    })?;
+    let max_output_tokens = u32::try_from(limits.max_output_tokens).map_err(|_| {
+        ApiError::bad_request(format!(
+            "model '{}' max output tokens exceed u32: {}",
+            model.id, limits.max_output_tokens
+        ))
+    })?;
+    let active_provider_id = model.active_provider_id.as_deref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "model '{}' has no active provider selected",
+            model.id
+        ))
+    })?;
+
+    if !model
+        .provider_ids
+        .iter()
+        .any(|provider_id| provider_id == active_provider_id)
+    {
+        return Err(ApiError::bad_request(format!(
+            "active provider '{}' is not associated with model '{}'",
+            active_provider_id, model.id
+        )));
+    }
+
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == active_provider_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "active provider '{}' was not found",
+                active_provider_id
+            ))
+        })?;
+
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "provider '{}' is disabled",
+            provider.id
+        )));
+    }
+
+    let provider_config = provider_connection_config(provider)?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let chat_id = optional_trimmed_string(request.chat_id);
+    let chat_id = match chat_id {
+        Some(chat_id) => {
+            if database
+                .chat(&chat_id)
+                .map_err(ApiError::from_workspace_error)?
+                .is_none()
+            {
+                return Err(ApiError::bad_request(format!(
+                    "chat was not found: {chat_id}"
+                )));
+            }
+            chat_id
+        }
+        None => {
+            let chat_id = unique_id("chat");
+            database
+                .insert_chat(&chat_id, &chat_title(message))
+                .map_err(ApiError::from_workspace_error)?;
+            chat_id
+        }
+    };
+    let existing_messages = database
+        .messages_for_chat(&chat_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let user_sequence = next_message_sequence(&existing_messages);
+    let assistant_sequence = user_sequence + 1;
+    let user_message_id = unique_id("msg-user");
+    let assistant_message_id = unique_id("msg-assistant");
+    let llm_request_id = unique_id("llm");
+
+    database
+        .insert_message(NewMessage {
+            id: &user_message_id,
+            chat_id: &chat_id,
+            role: "user",
+            content: message,
+            sequence: user_sequence,
+            metadata_json: Some("{}"),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    let mut neutral_messages = Vec::with_capacity(existing_messages.len() + 1);
+    for existing_message in existing_messages {
+        neutral_messages.push(neutral_message_from_record(existing_message)?);
+    }
+    neutral_messages.push(NeutralChatMessage {
+        role: NeutralChatRole::User,
+        content: message.to_string(),
+    });
+
+    let provider_request = NeutralChatRequest {
+        model_id: model.id.clone(),
+        messages: neutral_messages,
+        thinking_level: thinking_level.or_else(|| model.thinking_level.clone()),
+        max_output_tokens: Some(max_output_tokens),
+    };
+    let request_body_json = serde_json::to_string(&provider_request).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize provider-neutral chat request: {source}"
+        ))
+    })?;
+
+    Ok(PreparedChatContext {
+        workspace_id: workspace.id.clone(),
+        workspace_path: workspace.path.clone(),
+        chat_id,
+        provider_id: provider.id.clone(),
+        model_id: model.id.clone(),
+        user_message_id,
+        assistant_message_id,
+        llm_request_id,
+        assistant_sequence,
+        provider_config,
+        provider_request,
+        request_body_json,
+    })
+}
+
+fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMessage, ApiError> {
+    let role = match message.role.as_str() {
+        "system" => NeutralChatRole::System,
+        "user" => NeutralChatRole::User,
+        "assistant" => NeutralChatRole::Assistant,
+        "tool" => {
+            return Err(ApiError::bad_request(
+                "chat contains tool messages; tool replay belongs to TODO step 09",
+            ));
+        }
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "chat contains unsupported message role '{other}'"
+            )));
+        }
+    };
+
+    Ok(NeutralChatMessage {
+        role,
+        content: message.content,
+    })
+}
+
+fn persist_chat_result(
+    context: &PreparedChatContext,
+    request_started_at: &str,
+    outcome: ChatAuditOutcome,
+    events: &[CapturedAuditEvent],
+    assistant_text: Option<&str>,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: &context.llm_request_id,
+            workspace_id: &context.workspace_id,
+            chat_id: Some(&context.chat_id),
+            provider_id: &context.provider_id,
+            model_id: &context.model_id,
+            request_started_at,
+            first_token_at: outcome.first_token_at.as_deref(),
+            completed_at: Some(&outcome.completed_at),
+            input_tokens: outcome.input_tokens,
+            output_tokens: outcome.output_tokens,
+            cache_read_tokens: outcome.cache_read_tokens,
+            cache_write_tokens: outcome.cache_write_tokens,
+            first_token_latency_ms: outcome.first_token_latency_ms,
+            total_latency_ms: Some(outcome.total_latency_ms),
+            status_code: None,
+            final_state: outcome.final_state,
+            request_body_json: Some(&context.request_body_json),
+            response_body_json: outcome.response_body_json.as_deref(),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    for (index, event) in events.iter().enumerate() {
+        let sequence = i64::try_from(index).map_err(|_| {
+            ApiError::internal("too many LLM request events to fit SQLite sequence")
+        })?;
+        let id = format!("{}-event-{sequence}", context.llm_request_id);
+
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: &id,
+                llm_request_id: &context.llm_request_id,
+                sequence,
+                event_at: &event.event_at,
+                event_type: &event.event_type,
+                raw_chunk_json: None,
+                normalized_event_json: &event.normalized_event_json,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
+
+    if let Some(assistant_text) = assistant_text {
+        database
+            .insert_message(NewMessage {
+                id: &context.assistant_message_id,
+                chat_id: &context.chat_id,
+                role: "assistant",
+                content: assistant_text,
+                sequence: context.assistant_sequence,
+                metadata_json: Some("{}"),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
+
+    Ok(())
+}
+
+fn failed_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome {
+    ChatAuditOutcome {
+        first_token_at: None,
+        completed_at: utc_timestamp(),
+        first_token_latency_ms: None,
+        total_latency_ms: elapsed_millis(started_at),
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        final_state: "failed",
+        response_body_json: Some(json!({ "error": message }).to_string()),
+    }
+}
+
+fn captured_provider_event(event: &NeutralChatStreamEvent) -> CapturedAuditEvent {
+    let event_type = match event {
+        NeutralChatStreamEvent::Start => "start",
+        NeutralChatStreamEvent::TextDelta { .. } => "text_delta",
+        NeutralChatStreamEvent::ReasoningDelta { .. } => "reasoning_delta",
+        NeutralChatStreamEvent::Usage { .. } => "usage",
+        NeutralChatStreamEvent::Complete { .. } => "completion",
+        NeutralChatStreamEvent::Error { .. } => "error",
+    };
+
+    CapturedAuditEvent {
+        event_at: utc_timestamp(),
+        event_type: event_type.to_string(),
+        normalized_event_json: serde_json::to_string(event)
+            .expect("provider-neutral chat stream events are always serializable"),
+    }
+}
+
+fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
+    let event_type = match event {
+        ChatSseEvent::Start { .. } => "start",
+        ChatSseEvent::TextDelta { .. } => "text_delta",
+        ChatSseEvent::ReasoningDelta { .. } => "reasoning_delta",
+        ChatSseEvent::Usage { .. } => "usage",
+        ChatSseEvent::Complete { .. } => "completion",
+        ChatSseEvent::Error { .. } => "error",
+    };
+
+    CapturedAuditEvent {
+        event_at: utc_timestamp(),
+        event_type: event_type.to_string(),
+        normalized_event_json: serde_json::to_string(event)
+            .expect("chat SSE events are always serializable"),
+    }
+}
+
+fn sse_event(event: &ChatSseEvent) -> Event {
+    let data = serde_json::to_string(event).expect("chat SSE events are always serializable");
+
+    Event::default().data(data)
+}
+
+fn capture_first_token(
+    started_at: Instant,
+    first_token_at: &mut Option<String>,
+    first_token_latency_ms: &mut Option<i64>,
+) {
+    if first_token_at.is_none() {
+        *first_token_at = Some(utc_timestamp());
+        *first_token_latency_ms = Some(elapsed_millis(started_at));
+    }
+}
+
+fn elapsed_millis(started_at: Instant) -> i64 {
+    i64::try_from(started_at.elapsed().as_millis())
+        .expect("request latency should fit in i64 milliseconds")
+}
+
+fn next_message_sequence(messages: &[MessageRecord]) -> i64 {
+    messages
+        .iter()
+        .map(|message| message.sequence)
+        .max()
+        .map(|sequence| sequence + 1)
+        .unwrap_or(0)
+}
+
+fn chat_title(message: &str) -> String {
+    let first_line = message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("New Chat")
+        .trim();
+    let mut title = first_line.chars().take(60).collect::<String>();
+
+    if title.is_empty() {
+        title = "New Chat".to_string();
+    }
+
+    title
+}
+
+fn unique_id(prefix: &str) -> String {
+    let timestamp = Utc::now().timestamp_millis();
+    let suffix = NEXT_ID_SUFFIX.fetch_add(1, Ordering::Relaxed);
+
+    format!("{prefix}-{timestamp}-{suffix}")
 }
 
 #[derive(Serialize)]
@@ -1049,6 +1765,14 @@ fn chat_summary(chat: ChatRecord) -> ChatSummary {
         title: chat.title,
         created_at: chat.created_at,
         updated_at: chat.updated_at,
+    }
+}
+
+fn chat_message_summary(message: MessageRecord) -> ChatMessageSummary {
+    ChatMessageSummary {
+        id: message.id,
+        role: message.role,
+        content: message.content,
     }
 }
 
