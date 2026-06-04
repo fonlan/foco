@@ -112,6 +112,8 @@ pub struct NeutralChatRequest {
 pub struct NeutralChatMessage {
     pub role: NeutralChatRole,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<NeutralToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -318,7 +320,16 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
                     ));
                 }
 
-                return Ok(ChatMessage::assistant(message.content.clone()));
+                let mut chat_message = ChatMessage::assistant(message.content.clone());
+                if let Some(reasoning) = message
+                    .reasoning
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                {
+                    chat_message = chat_message.with_reasoning_content(Some(reasoning.to_string()));
+                }
+
+                return Ok(chat_message);
             }
 
             let tool_calls = message
@@ -326,11 +337,26 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
                 .iter()
                 .map(genai_tool_call)
                 .collect::<Vec<_>>();
-            if message.content.trim().is_empty() {
+            if message.content.trim().is_empty()
+                && message
+                    .reasoning
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+            {
                 return Ok(ChatMessage::from(tool_calls));
             }
 
-            let mut parts = vec![ContentPart::Text(message.content.clone())];
+            let mut parts = Vec::new();
+            if !message.content.trim().is_empty() {
+                parts.push(ContentPart::Text(message.content.clone()));
+            }
+            if let Some(reasoning) = message
+                .reasoning
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                parts.push(ContentPart::ReasoningContent(reasoning.to_string()));
+            }
             if let Some(thought_signatures) = tool_calls
                 .first()
                 .and_then(|tool_call| tool_call.thought_signatures.clone())
@@ -562,6 +588,7 @@ mod tests {
                 NeutralChatMessage {
                     role: NeutralChatRole::User,
                     content: "Read the note.".to_string(),
+                    reasoning: None,
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                     tool_name: None,
@@ -569,6 +596,7 @@ mod tests {
                 NeutralChatMessage {
                     role: NeutralChatRole::Assistant,
                     content: String::new(),
+                    reasoning: None,
                     tool_calls: vec![NeutralToolCall {
                         call_id: "call-1".to_string(),
                         name: "read_file".to_string(),
@@ -581,6 +609,7 @@ mod tests {
                 NeutralChatMessage {
                     role: NeutralChatRole::Tool,
                     content: r#"{"content":"hello"}"#.to_string(),
+                    reasoning: None,
                     tool_calls: Vec::new(),
                     tool_call_id: Some("call-1".to_string()),
                     tool_name: Some("read_file".to_string()),

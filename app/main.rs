@@ -1296,6 +1296,7 @@ struct ChatMessageSummary {
     id: String,
     role: String,
     content: String,
+    reasoning: Option<String>,
     tool_calls: Vec<ChatToolCallSummary>,
 }
 
@@ -1320,9 +1321,11 @@ enum ChatSseEvent {
         llm_request_id: String,
     },
     TextDelta {
+        assistant_message_id: String,
         delta: String,
     },
     ReasoningDelta {
+        assistant_message_id: String,
         delta: String,
     },
     ToolCall {
@@ -1345,6 +1348,7 @@ enum ChatSseEvent {
         chat_id: String,
         assistant_message_id: String,
         text: String,
+        reasoning: Option<String>,
         usage: Option<NeutralUsage>,
         stop_reason: Option<String>,
     },
@@ -1417,6 +1421,7 @@ impl PreparedChatContext {
             };
             let mut events = vec![captured_event(&start_event)];
             let mut assistant_text = String::new();
+            let mut assistant_reasoning = String::new();
             let mut first_token_at = None;
             let mut first_token_latency_ms = None;
             let mut seen_tool_call_ids = HashSet::new();
@@ -1438,7 +1443,7 @@ impl PreparedChatContext {
                         events.push(captured_event(&event));
                         let outcome = failed_audit_outcome(started_at, &message);
 
-                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
@@ -1465,7 +1470,7 @@ impl PreparedChatContext {
                         events.push(captured_event(&event));
                         let outcome = failed_audit_outcome(started_at, &message);
 
-                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
@@ -1491,7 +1496,7 @@ impl PreparedChatContext {
                         events.push(captured_event(&event));
                         let outcome = failed_audit_outcome(started_at, &message);
 
-                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
@@ -1513,7 +1518,7 @@ impl PreparedChatContext {
                         events.push(captured_event(&event));
                         let outcome = failed_audit_outcome(started_at, &message);
 
-                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
@@ -1526,6 +1531,7 @@ impl PreparedChatContext {
                     }
                 };
                 let mut turn_text = String::new();
+                let mut turn_reasoning = String::new();
                 let mut completed_turn = false;
 
                 while let Some(event_result) = provider_stream.next_event().await {
@@ -1539,7 +1545,7 @@ impl PreparedChatContext {
                             events.push(captured_event(&event));
                             let outcome = failed_audit_outcome(started_at, &message);
 
-                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                 let event = ChatSseEvent::Error {
                                     message: persist_error.message,
                                 };
@@ -1560,12 +1566,20 @@ impl PreparedChatContext {
                             capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
                             assistant_text.push_str(&delta);
                             turn_text.push_str(&delta);
-                            let event = ChatSseEvent::TextDelta { delta };
+                            let event = ChatSseEvent::TextDelta {
+                                assistant_message_id: self.assistant_message_id.clone(),
+                                delta,
+                            };
                             yield Ok(sse_event(&event));
                         }
                         NeutralChatStreamEvent::ReasoningDelta { delta } => {
                             capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                            let event = ChatSseEvent::ReasoningDelta { delta };
+                            assistant_reasoning.push_str(&delta);
+                            turn_reasoning.push_str(&delta);
+                            let event = ChatSseEvent::ReasoningDelta {
+                                assistant_message_id: self.assistant_message_id.clone(),
+                                delta,
+                            };
                             yield Ok(sse_event(&event));
                         }
                         NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
@@ -1604,7 +1618,7 @@ impl PreparedChatContext {
                                 events.push(captured_event(&event));
                                 let outcome = failed_audit_outcome(started_at, &message);
 
-                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                     let event = ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
@@ -1624,7 +1638,7 @@ impl PreparedChatContext {
                                 events.push(captured_event(&event));
                                 let outcome = failed_audit_outcome(started_at, &message);
 
-                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                     let event = ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
@@ -1645,6 +1659,12 @@ impl PreparedChatContext {
                                 "stopReason": stop_reason.clone(),
                                 "responseId": response_id.clone()
                             }));
+                            if turn_reasoning.is_empty() {
+                                if let Some(reasoning) = reasoning.as_deref() {
+                                    assistant_reasoning.push_str(reasoning);
+                                    turn_reasoning.push_str(reasoning);
+                                }
+                            }
 
                             if let Some(usage) = &usage {
                                 merge_usage(&mut total_usage, usage);
@@ -1658,6 +1678,7 @@ impl PreparedChatContext {
                                     chat_id: self.chat_id.clone(),
                                     assistant_message_id: self.assistant_message_id.clone(),
                                     text: assistant_message_text.clone(),
+                                    reasoning: non_empty_string(&assistant_reasoning),
                                     usage: final_usage.clone(),
                                     stop_reason: stop_reason.clone(),
                                 };
@@ -1675,6 +1696,7 @@ impl PreparedChatContext {
                                     final_state: "succeeded",
                                     response_body_json: Some(json!({
                                         "text": assistant_message_text.clone(),
+                                        "reasoning": non_empty_string(&assistant_reasoning),
                                         "providerCompletions": provider_completions.clone(),
                                         "toolCalls": executed_tool_calls.clone(),
                                         "usage": final_usage.clone(),
@@ -1682,7 +1704,7 @@ impl PreparedChatContext {
                                     }).to_string()),
                                 };
 
-                                match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), &executed_tool_calls) {
+                                match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), non_empty_string(&assistant_reasoning).as_deref(), &executed_tool_calls) {
                                     Ok(()) => {
                                         yield Ok(sse_event(&complete_event));
                                     }
@@ -1707,7 +1729,7 @@ impl PreparedChatContext {
                                 events.push(captured_event(&event));
                                 let outcome = failed_audit_outcome(started_at, &message);
 
-                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                     let event = ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
@@ -1728,7 +1750,7 @@ impl PreparedChatContext {
                                 events.push(captured_event(&event));
                                 let outcome = failed_audit_outcome(started_at, &message);
 
-                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                     let event = ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
@@ -1767,7 +1789,7 @@ impl PreparedChatContext {
                                     events.push(captured_event(&event));
                                     let outcome = failed_audit_outcome(started_at, &message);
 
-                                    if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                                    if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                         let event = ChatSseEvent::Error {
                                             message: persist_error.message,
                                         };
@@ -1803,6 +1825,7 @@ impl PreparedChatContext {
                                 tool_calls,
                                 &next_tool_results,
                                 turn_text,
+                                non_empty_string(&turn_reasoning),
                             );
                             executed_tool_calls.extend(next_tool_results);
 
@@ -1815,7 +1838,7 @@ impl PreparedChatContext {
                             events.push(captured_event(&event));
                             let outcome = failed_audit_outcome(started_at, &message);
 
-                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                            if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                 let event = ChatSseEvent::Error {
                                     message: persist_error.message,
                                 };
@@ -1840,7 +1863,7 @@ impl PreparedChatContext {
                 events.push(captured_event(&event));
                 let outcome = failed_audit_outcome(started_at, &message);
 
-                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &executed_tool_calls) {
+                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                     let event = ChatSseEvent::Error {
                         message: persist_error.message,
                     };
@@ -2113,7 +2136,20 @@ fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMess
     };
 
     if role != NeutralChatRole::Tool {
-        return Ok(neutral_text_message(role, message.content));
+        let reasoning = if role == NeutralChatRole::Assistant {
+            assistant_reasoning_from_metadata(&message.metadata_json)?
+        } else {
+            None
+        };
+
+        return Ok(NeutralChatMessage {
+            role,
+            content: message.content,
+            reasoning,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        });
     }
 
     let metadata = parse_json_value(&message.metadata_json, "tool message metadata")?;
@@ -2135,6 +2171,7 @@ fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMess
     Ok(NeutralChatMessage {
         role,
         content: message.content,
+        reasoning: None,
         tool_calls: Vec::new(),
         tool_call_id: Some(tool_call_id),
         tool_name,
@@ -2533,6 +2570,7 @@ fn persist_chat_result(
     outcome: ChatAuditOutcome,
     events: &[CapturedAuditEvent],
     assistant_text: Option<&str>,
+    assistant_reasoning: Option<&str>,
     tool_calls: &[ExecutedToolCall],
 ) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
@@ -2581,6 +2619,7 @@ fn persist_chat_result(
     }
 
     if let Some(assistant_text) = assistant_text {
+        let metadata_json = assistant_message_metadata_json(assistant_reasoning)?;
         database
             .insert_message(NewMessage {
                 id: &context.assistant_message_id,
@@ -2588,7 +2627,7 @@ fn persist_chat_result(
                 role: "assistant",
                 content: assistant_text,
                 sequence: context.assistant_sequence,
-                metadata_json: Some("{}"),
+                metadata_json: Some(&metadata_json),
             })
             .map_err(ApiError::from_workspace_error)?;
     }
@@ -2637,6 +2676,7 @@ fn neutral_text_message(role: NeutralChatRole, content: String) -> NeutralChatMe
     NeutralChatMessage {
         role,
         content,
+        reasoning: None,
         tool_calls: Vec::new(),
         tool_call_id: None,
         tool_name: None,
@@ -2828,10 +2868,12 @@ fn append_tool_state_messages(
     tool_calls: Vec<NeutralToolCall>,
     tool_results: &[ExecutedToolCall],
     assistant_text: String,
+    assistant_reasoning: Option<String>,
 ) {
     messages.push(NeutralChatMessage {
         role: NeutralChatRole::Assistant,
         content: assistant_text,
+        reasoning: assistant_reasoning,
         tool_calls,
         tool_call_id: None,
         tool_name: None,
@@ -2843,6 +2885,7 @@ fn append_tool_state_messages(
             role: NeutralChatRole::Tool,
             content: serde_json::to_string(&tool_result.output)
                 .expect("tool outputs are always JSON serializable"),
+            reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_result.id.clone()),
             tool_name: Some(tool_result.name.clone()),
@@ -4209,6 +4252,43 @@ fn assistant_message_text(assistant_text: &str, tool_calls: &[ExecutedToolCall])
     }
 }
 
+fn assistant_reasoning_from_metadata(metadata_json: &str) -> Result<Option<String>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
+    let Some(reasoning) = metadata.get("reasoning") else {
+        return Ok(None);
+    };
+
+    if reasoning.is_null() {
+        return Ok(None);
+    }
+
+    let reasoning = reasoning.as_str().ok_or_else(|| {
+        ApiError::internal("assistant message metadata.reasoning must be a string")
+    })?;
+
+    Ok(non_empty_string(reasoning))
+}
+
+fn assistant_message_metadata_json(reasoning: Option<&str>) -> Result<String, ApiError> {
+    let Some(reasoning) = reasoning else {
+        return Ok("{}".to_string());
+    };
+
+    serde_json::to_string(&json!({ "reasoning": reasoning })).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize assistant message metadata: {source}"
+        ))
+    })
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
 fn chat_message_summary(
     database: &WorkspaceDatabase,
     message: MessageRecord,
@@ -4222,6 +4302,11 @@ fn chat_message_summary(
 
     Ok(ChatMessageSummary {
         id: message.id,
+        reasoning: if message.role == "assistant" {
+            assistant_reasoning_from_metadata(&message.metadata_json)?
+        } else {
+            None
+        },
         role: message.role,
         content: message.content,
         tool_calls,

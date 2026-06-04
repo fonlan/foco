@@ -40,6 +40,8 @@ import {
   useRef,
   useState,
 } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type ChatSummary = {
   id: string;
@@ -246,6 +248,7 @@ type ChatMessageSummary = {
   id: string;
   role: "assistant" | "user";
   content: string;
+  reasoning: string | null;
   toolCalls: ChatToolCallSummary[];
 };
 
@@ -266,18 +269,19 @@ type ChatStreamEvent =
       chatId: string;
       userMessageId: string;
       assistantMessageId: string;
-      llmRequestId: string;
+      llmRequestId?: string;
     }
-  | { type: "textDelta"; delta: string }
-  | { type: "reasoningDelta"; delta: string }
-  | { type: "usage"; usage: ChatUsage }
+  | { type: "textDelta"; assistantMessageId?: string; delta: string }
+  | { type: "reasoningDelta"; assistantMessageId?: string; delta: string }
+  | { type: "usage"; usage?: ChatUsage }
   | {
       type: "complete";
       chatId: string;
       assistantMessageId: string;
       text: string;
-      usage: ChatUsage | null;
-      stopReason: string | null;
+      reasoning?: string | null;
+      usage?: ChatUsage | null;
+      stopReason?: string | null;
     }
   | {
       type: "toolCall";
@@ -332,6 +336,7 @@ type ShellMessage = {
   id: string;
   role: "assistant" | "user";
   content: string;
+  reasoning: string | null;
   status?: "error" | "streaming";
   toolCalls: ChatToolCallSummary[];
 };
@@ -720,8 +725,12 @@ export function App() {
   }
 
   async function runChatMessage(request: RetryRunRequest) {
-    const localUserId = `local-user-${Date.now()}`;
-    let assistantMessageId = `local-assistant-${Date.now()}`;
+    const runKey =
+      globalThis.crypto?.randomUUID?.() ??
+      `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const localUserId = `local-user-${runKey}`;
+    const localAssistantId = `local-assistant-${runKey}`;
+    let assistantMessageId = localAssistantId;
     let requestChatId = request.chatId;
     const abortController = new AbortController();
 
@@ -731,12 +740,14 @@ export function App() {
         id: localUserId,
         role: "user",
         content: request.content,
+        reasoning: null,
         toolCalls: [],
       },
       {
-        id: assistantMessageId,
+        id: localAssistantId,
         role: "assistant",
         content: "",
+        reasoning: null,
         status: "streaming",
         toolCalls: [],
       },
@@ -746,6 +757,15 @@ export function App() {
     setRetryRunRequest(null);
     setError(null);
     activeRunAbortRef.current = abortController;
+
+    const isCurrentAssistantMessage = (
+      message: ShellMessage,
+      eventAssistantMessageId?: string,
+    ) =>
+      message.role === "assistant" &&
+      (message.id === assistantMessageId ||
+        message.id === localAssistantId ||
+        message.id === eventAssistantMessageId);
 
     try {
       const response = await fetch(
@@ -779,7 +799,7 @@ export function App() {
                 return { ...message, id: streamEvent.userMessageId };
               }
 
-              if (message.id === assistantMessageId || message.id.startsWith("local-assistant-")) {
+              if (message.role === "assistant" && message.id === localAssistantId) {
                 return { ...message, id: streamEvent.assistantMessageId };
               }
 
@@ -792,8 +812,22 @@ export function App() {
         if (streamEvent.type === "textDelta") {
           setMessages((current) =>
             current.map((message) =>
-              message.id === assistantMessageId
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? { ...message, content: message.content + streamEvent.delta }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "reasoningDelta") {
+          setMessages((current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? {
+                    ...message,
+                    reasoning: `${message.reasoning ?? ""}${streamEvent.delta}`,
+                  }
                 : message,
             ),
           );
@@ -805,13 +839,14 @@ export function App() {
           setRetryRunRequest(null);
           setMessages((current) =>
             current.map((message) =>
-              message.id === assistantMessageId
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? {
                     ...message,
                     content: streamEvent.text,
+                    reasoning: streamEvent.reasoning ?? null,
                     status: undefined,
                   }
-                : message,
+                  : message,
             ),
           );
           return;
@@ -820,7 +855,7 @@ export function App() {
         if (streamEvent.type === "toolCall") {
           setMessages((current) =>
             current.map((message) =>
-              message.id === streamEvent.assistantMessageId
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? {
                     ...message,
                     toolCalls: upsertToolCall(
@@ -837,7 +872,7 @@ export function App() {
         if (streamEvent.type === "toolResult") {
           setMessages((current) =>
             current.map((message) =>
-              message.id === streamEvent.assistantMessageId
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? {
                     ...message,
                     toolCalls: applyToolResult(
@@ -862,7 +897,7 @@ export function App() {
           setError(streamEvent.message);
           setMessages((current) =>
             current.map((message) =>
-              message.id === assistantMessageId
+              isCurrentAssistantMessage(message)
                 ? {
                     ...message,
                     content: streamEvent.message,
@@ -886,7 +921,7 @@ export function App() {
       });
       setMessages((current) =>
         current.map((item) =>
-          item.id === assistantMessageId
+          isCurrentAssistantMessage(item)
             ? { ...item, content: message, status: "error" }
             : item,
         ),
@@ -1466,19 +1501,21 @@ function ChatPanel({
                     )}
                   </div>
                   <div className="min-w-0 flex-1 space-y-3">
-                    <div
-                      className={`min-w-0 whitespace-pre-wrap break-words text-sm leading-6 ${
-                        message.status === "error" ? "text-rose-700" : ""
-                      }`}
-                    >
-                      {message.content ||
-                        (message.status === "streaming" ? (
-                          <LoaderCircle
-                            aria-hidden="true"
-                            className="size-4 animate-spin"
-                          />
-                        ) : null)}
-                    </div>
+                    {!isUser && message.reasoning ? (
+                      <ReasoningBlock reasoning={message.reasoning} />
+                    ) : null}
+                    {message.content ? (
+                      <MarkdownContent
+                        content={message.content}
+                        isError={message.status === "error"}
+                        isUser={isUser}
+                      />
+                    ) : message.status === "streaming" && !message.reasoning ? (
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="size-4 animate-spin"
+                      />
+                    ) : null}
                     {!isUser && message.toolCalls.length > 0 ? (
                       <ToolCallList toolCalls={message.toolCalls} />
                     ) : null}
@@ -1602,6 +1639,41 @@ function ChatPanel({
           </div>
         </form>
       </div>
+    </div>
+  );
+}
+
+function ReasoningBlock({ reasoning }: { reasoning: string }) {
+  return (
+    <div className="reasoning-block min-w-0 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+      <div className="mb-1.5 text-xs font-semibold text-stone-500">
+        Thinking
+      </div>
+      <MarkdownContent content={reasoning} isUser={false} variant="reasoning" />
+    </div>
+  );
+}
+
+function MarkdownContent({
+  content,
+  isError = false,
+  isUser,
+  variant = "message",
+}: {
+  content: string;
+  isError?: boolean;
+  isUser: boolean;
+  variant?: "message" | "reasoning";
+}) {
+  return (
+    <div
+      className={`markdown-content min-w-0 break-words text-sm leading-6 ${
+        isUser ? "markdown-content-user" : "markdown-content-assistant"
+      } ${variant === "reasoning" ? "markdown-content-reasoning" : ""} ${
+        isError ? "text-rose-700" : ""
+      }`}
+    >
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
     </div>
   );
 }
@@ -4291,23 +4363,341 @@ function readSseFrames(
     }
 
     const parsed = JSON.parse(data) as unknown;
-    if (!isChatStreamEvent(parsed)) {
-      throw new Error("chat stream returned an unknown event");
+    const event = parseChatStreamEvent(parsed);
+    if (!event) {
+      throw new Error(
+        `chat stream returned an unknown event: ${describeChatStreamEvent(parsed)}`,
+      );
     }
 
-    onEvent(parsed);
+    onEvent(event);
   }
 
   return remaining;
 }
 
-function isChatStreamEvent(value: unknown): value is ChatStreamEvent {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "type" in value &&
-    typeof value.type === "string"
+function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
+  if (!isObjectRecord(value) || typeof value.type !== "string") {
+    return null;
+  }
+
+  if (value.type === "start") {
+    const chatId = stringField(value, "chatId", "chat_id");
+    const userMessageId = stringField(value, "userMessageId", "user_message_id");
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const llmRequestId = optionalStringField(
+      value,
+      "llmRequestId",
+      "llm_request_id",
+    );
+
+    if (!chatId || !userMessageId || !assistantMessageId || llmRequestId === null) {
+      return null;
+    }
+
+    return {
+      type: "start",
+      chatId,
+      userMessageId,
+      assistantMessageId,
+      llmRequestId,
+    };
+  }
+
+  if (value.type === "textDelta" || value.type === "text_delta") {
+    const assistantMessageId = optionalStringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const delta = stringField(value, "delta");
+
+    if (assistantMessageId === null || delta === null) {
+      return null;
+    }
+
+    return { type: "textDelta", assistantMessageId, delta };
+  }
+
+  if (value.type === "reasoningDelta" || value.type === "reasoning_delta") {
+    const assistantMessageId = optionalStringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const delta = stringField(value, "delta");
+
+    if (assistantMessageId === null || delta === null) {
+      return null;
+    }
+
+    return { type: "reasoningDelta", assistantMessageId, delta };
+  }
+
+  if (value.type === "usage") {
+    const usage = parseChatUsage(value.usage);
+
+    if (usage === false) {
+      return null;
+    }
+
+    return { type: "usage", usage };
+  }
+
+  if (value.type === "complete") {
+    const chatId = stringField(value, "chatId", "chat_id");
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const text = stringField(value, "text");
+    const reasoning = optionalNullableStringField(value, "reasoning");
+    const usage = parseNullableChatUsage(fieldValue(value, "usage"));
+    const stopReason = optionalNullableStringField(
+      value,
+      "stopReason",
+      "stop_reason",
+    );
+
+    if (!chatId || !assistantMessageId || text === null) {
+      return null;
+    }
+
+    if (reasoning === false || usage === false || stopReason === false) {
+      return null;
+    }
+
+    return {
+      type: "complete",
+      chatId,
+      assistantMessageId,
+      text,
+      reasoning,
+      usage,
+      stopReason,
+    };
+  }
+
+  if (value.type === "toolCall" || value.type === "tool_call") {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const toolCall = parseChatToolCallSummary(
+      fieldValue(value, "toolCall", "tool_call"),
+    );
+
+    if (!assistantMessageId || !toolCall) {
+      return null;
+    }
+
+    return { type: "toolCall", assistantMessageId, toolCall };
+  }
+
+  if (value.type === "toolResult" || value.type === "tool_result") {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const toolCallId = stringField(value, "toolCallId", "tool_call_id");
+    const output = fieldValue(value, "output");
+    const isError = fieldValue(value, "isError", "is_error");
+
+    if (
+      !assistantMessageId ||
+      !toolCallId ||
+      !isJsonValue(output) ||
+      typeof isError !== "boolean"
+    ) {
+      return null;
+    }
+
+    return { type: "toolResult", assistantMessageId, toolCallId, output, isError };
+  }
+
+  if (value.type === "gitDiffRefresh" || value.type === "git_diff_refresh") {
+    const workspaceId = stringField(value, "workspaceId", "workspace_id");
+
+    if (!workspaceId) {
+      return null;
+    }
+
+    return { type: "gitDiffRefresh", workspaceId };
+  }
+
+  if (value.type === "error") {
+    const message = stringField(value, "message");
+
+    if (!message) {
+      return null;
+    }
+
+    return { type: "error", message };
+  }
+
+  return null;
+}
+
+function describeChatStreamEvent(value: unknown) {
+  const summary = isObjectRecord(value) ? { type: value.type, value } : value;
+
+  try {
+    return JSON.stringify(summary).slice(0, 600);
+  } catch {
+    return String(value);
+  }
+}
+
+function parseChatToolCallSummary(value: unknown): ChatToolCallSummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const id = stringField(value, "id");
+  const name = stringField(value, "name");
+  const status = stringField(value, "status");
+  const input = fieldValue(value, "input");
+  const output = fieldValue(value, "output");
+  const isError = fieldValue(value, "isError", "is_error");
+
+  if (
+    !id ||
+    !name ||
+    !status ||
+    !isJsonValue(input) ||
+    !isJsonValue(output) ||
+    typeof isError !== "boolean"
+  ) {
+    return null;
+  }
+
+  return { id, name, status, input, output, isError };
+}
+
+function parseNullableChatUsage(value: unknown): ChatUsage | null | undefined | false {
+  if (value === null) {
+    return null;
+  }
+
+  return parseChatUsage(value);
+}
+
+function parseChatUsage(value: unknown): ChatUsage | undefined | false {
+  if (typeof value === "undefined") {
+    return undefined;
+  }
+
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+
+  const inputTokens = fieldValue(value, "inputTokens", "input_tokens");
+  const outputTokens = fieldValue(value, "outputTokens", "output_tokens");
+  const cacheReadTokens = fieldValue(value, "cacheReadTokens", "cache_read_tokens");
+  const cacheWriteTokens = fieldValue(
+    value,
+    "cacheWriteTokens",
+    "cache_write_tokens",
   );
+
+  if (
+    !isNullableNumber(inputTokens) ||
+    !isNullableNumber(outputTokens) ||
+    !isNullableNumber(cacheReadTokens) ||
+    !isNullableNumber(cacheWriteTokens)
+  ) {
+    return false;
+  }
+
+  return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+}
+
+function isNullableNumber(value: unknown) {
+  return typeof value === "number" || value === null;
+}
+
+function stringField(
+  value: Record<string, unknown>,
+  camelName: string,
+  snakeName?: string,
+) {
+  const field = fieldValue(value, camelName, snakeName);
+  return typeof field === "string" ? field : null;
+}
+
+function optionalStringField(
+  value: Record<string, unknown>,
+  camelName: string,
+  snakeName?: string,
+) {
+  const field = fieldValue(value, camelName, snakeName);
+  return typeof field === "undefined" || typeof field === "string" ? field : null;
+}
+
+function optionalNullableStringField(
+  value: Record<string, unknown>,
+  camelName: string,
+  snakeName?: string,
+) {
+  const field = fieldValue(value, camelName, snakeName);
+
+  if (
+    typeof field === "undefined" ||
+    field === null ||
+    typeof field === "string"
+  ) {
+    return field;
+  }
+
+  return false;
+}
+
+function fieldValue(
+  value: Record<string, unknown>,
+  camelName: string,
+  snakeName?: string,
+) {
+  if (typeof value[camelName] !== "undefined") {
+    return value[camelName];
+  }
+
+  if (snakeName && typeof value[snakeName] !== "undefined") {
+    return value[snakeName];
+  }
+
+  return undefined;
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (
+    value === null ||
+    typeof value === "boolean" ||
+    typeof value === "number" ||
+    typeof value === "string"
+  ) {
+    return true;
+  }
+
+  if (Array.isArray(value)) {
+    return value.every(isJsonValue);
+  }
+
+  if (isObjectRecord(value)) {
+    return Object.values(value).every(isJsonValue);
+  }
+
+  return false;
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isTerminalServerEvent(value: unknown): value is TerminalServerEvent {
