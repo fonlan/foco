@@ -3,9 +3,9 @@ use std::fs;
 use foco_store::{
     config::WorkspaceConfig,
     workspace::{
-        LlmRequestRecord, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, NewToolCall,
-        NewToolResult, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, initialize_workspace_databases,
-        workspace_database_path,
+        LlmRequestRecord, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
+        NewMessage, NewRunEvent, NewToolCall, NewToolResult, WORKSPACE_SCHEMA_VERSION,
+        WorkspaceDatabase, initialize_workspace_databases, workspace_database_path,
     },
 };
 use rusqlite::Connection;
@@ -35,6 +35,7 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "terminal_sessions",
         "llm_requests",
         "llm_request_events",
+        "context_compression_snapshots",
         "code_graph_files",
         "code_graph_symbols",
         "code_graph_edges",
@@ -203,6 +204,28 @@ fn repository_helpers_round_trip_core_records() {
     assert_eq!(request.provider_id, "openai");
     assert_eq!(request.input_tokens, Some(3));
     assert_eq!(request.final_state, "completed");
+
+    database
+        .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+            id: "snapshot-1",
+            chat_id: "chat-1",
+            run_id: "request-1",
+            sequence: 0,
+            summary: "Earlier conversation summary.",
+            source_message_start_sequence: 0,
+            source_message_end_sequence: 0,
+            original_token_count: 120,
+            summary_token_count: 8,
+            metadata_json: Some(r#"{"reason":"test"}"#),
+        })
+        .expect("context compression snapshot insert");
+    let snapshots = database
+        .context_compression_snapshots_for_chat("chat-1")
+        .expect("context compression snapshots");
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].summary, "Earlier conversation summary.");
+    assert_eq!(snapshots[0].original_token_count, 120);
+    assert_eq!(snapshots[0].summary_token_count, 8);
 }
 
 #[test]

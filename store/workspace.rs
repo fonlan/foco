@@ -11,7 +11,7 @@ use crate::config::WorkspaceConfig;
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 2;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 3;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -21,6 +21,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 2,
         sql: MIGRATION_002,
+    },
+    Migration {
+        version: 3,
+        sql: MIGRATION_003,
     },
 ];
 
@@ -576,6 +580,78 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn insert_context_compression_snapshot(
+        &mut self,
+        snapshot: NewContextCompressionSnapshot<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let metadata_json = snapshot.metadata_json.unwrap_or("{}");
+        let created_at = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO context_compression_snapshots
+                    (
+                        id, chat_id, run_id, sequence, summary,
+                        source_message_start_sequence, source_message_end_sequence,
+                        original_token_count, summary_token_count, created_at, metadata_json
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    snapshot.id,
+                    snapshot.chat_id,
+                    snapshot.run_id,
+                    snapshot.sequence,
+                    snapshot.summary,
+                    snapshot.source_message_start_sequence,
+                    snapshot.source_message_end_sequence,
+                    snapshot.original_token_count,
+                    snapshot.summary_token_count,
+                    created_at,
+                    metadata_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn context_compression_snapshots_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<ContextCompressionSnapshotRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    id, chat_id, run_id, sequence, summary,
+                    source_message_start_sequence, source_message_end_sequence,
+                    original_token_count, summary_token_count, created_at, metadata_json
+                 FROM context_compression_snapshots
+                 WHERE chat_id = ?1
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(ContextCompressionSnapshotRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    sequence: row.get(3)?,
+                    summary: row.get(4)?,
+                    source_message_start_sequence: row.get(5)?,
+                    source_message_end_sequence: row.get(6)?,
+                    original_token_count: row.get(7)?,
+                    summary_token_count: row.get(8)?,
+                    created_at: row.get(9)?,
+                    metadata_json: row.get(10)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     fn sqlite_error(&self, source: rusqlite::Error) -> WorkspaceDatabaseError {
         WorkspaceDatabaseError::Sqlite {
             path: self.database_path.clone(),
@@ -745,6 +821,35 @@ pub struct LlmRequestEventRecord {
     pub event_type: String,
     pub raw_chunk_json: Option<String>,
     pub normalized_event_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewContextCompressionSnapshot<'a> {
+    pub id: &'a str,
+    pub chat_id: &'a str,
+    pub run_id: &'a str,
+    pub sequence: i64,
+    pub summary: &'a str,
+    pub source_message_start_sequence: i64,
+    pub source_message_end_sequence: i64,
+    pub original_token_count: i64,
+    pub summary_token_count: i64,
+    pub metadata_json: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextCompressionSnapshotRecord {
+    pub id: String,
+    pub chat_id: String,
+    pub run_id: String,
+    pub sequence: i64,
+    pub summary: String,
+    pub source_message_start_sequence: i64,
+    pub source_message_end_sequence: i64,
+    pub original_token_count: i64,
+    pub summary_token_count: i64,
+    pub created_at: String,
+    pub metadata_json: String,
 }
 
 #[derive(Debug)]
@@ -1330,4 +1435,26 @@ CREATE TABLE llm_request_events (
 
 CREATE INDEX llm_request_events_request_sequence_idx ON llm_request_events (llm_request_id, sequence);
 CREATE INDEX llm_request_events_type_idx ON llm_request_events (event_type);
+"#;
+
+const MIGRATION_003: &str = r#"
+CREATE TABLE context_compression_snapshots (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL CHECK (length(run_id) > 0),
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    summary TEXT NOT NULL CHECK (length(summary) > 0),
+    source_message_start_sequence INTEGER NOT NULL CHECK (source_message_start_sequence >= 0),
+    source_message_end_sequence INTEGER NOT NULL CHECK (source_message_end_sequence >= source_message_start_sequence),
+    original_token_count INTEGER NOT NULL CHECK (original_token_count > 0),
+    summary_token_count INTEGER NOT NULL CHECK (summary_token_count > 0),
+    created_at TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    UNIQUE (chat_id, sequence)
+);
+
+CREATE INDEX context_compression_snapshots_chat_sequence_idx
+    ON context_compression_snapshots (chat_id, sequence);
+CREATE INDEX context_compression_snapshots_run_idx
+    ON context_compression_snapshots (run_id);
 "#;

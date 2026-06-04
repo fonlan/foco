@@ -4,6 +4,8 @@ use serde_json::Value;
 
 const ESTIMATED_CHARS_PER_TOKEN: u64 = 4;
 const DEFAULT_CONTEXT_SAFETY_TOKENS: u64 = 256;
+const CONTEXT_COMPRESSION_TRIGGER_NUMERATOR: u64 = 4;
+const CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR: u64 = 5;
 pub const WRITE_FILE_TOOL_NAME: &str = "write_file";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +44,13 @@ pub struct PackedContext {
     pub selected_indices: Vec<usize>,
     pub dropped_ids: Vec<String>,
     pub used_message_tokens: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextCompressionPlan {
+    pub covered_indices: Vec<usize>,
+    pub original_tokens: u64,
+    pub trigger_tokens: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,6 +242,60 @@ pub fn pack_context(
     })
 }
 
+pub fn plan_context_compression(
+    messages: &[ContextPackItem],
+    available_tokens: u64,
+    active_tool_start_index: usize,
+    preserve_recent_messages: usize,
+) -> Option<ContextCompressionPlan> {
+    if available_tokens == 0 {
+        return None;
+    }
+
+    let used_tokens = messages
+        .iter()
+        .map(|message| message.estimated_tokens)
+        .sum::<u64>();
+    let trigger_tokens = context_compression_trigger_tokens(available_tokens);
+
+    if used_tokens <= trigger_tokens {
+        return None;
+    }
+
+    let compressible_indices = messages
+        .iter()
+        .enumerate()
+        .filter(|(index, message)| {
+            *index < active_tool_start_index && !message.must_keep && message.estimated_tokens > 0
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+
+    if compressible_indices.len() <= preserve_recent_messages {
+        return None;
+    }
+
+    let covered_count = compressible_indices.len() - preserve_recent_messages;
+    let covered_indices = compressible_indices
+        .into_iter()
+        .take(covered_count)
+        .collect::<Vec<_>>();
+    let original_tokens = covered_indices
+        .iter()
+        .map(|index| messages[*index].estimated_tokens)
+        .sum::<u64>();
+
+    if original_tokens == 0 {
+        return None;
+    }
+
+    Some(ContextCompressionPlan {
+        covered_indices,
+        original_tokens,
+        trigger_tokens,
+    })
+}
+
 pub fn detect_same_file_write_conflicts(
     tool_calls: &[PendingToolCall],
 ) -> Result<(), ToolConflictError> {
@@ -270,6 +333,11 @@ fn normalize_workspace_path(path: &str) -> String {
         .collect::<Vec<_>>()
         .join("/")
         .to_ascii_lowercase()
+}
+
+fn context_compression_trigger_tokens(available_tokens: u64) -> u64 {
+    available_tokens.saturating_mul(CONTEXT_COMPRESSION_TRIGGER_NUMERATOR)
+        / CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR
 }
 
 impl fmt::Display for ContextBudgetError {
@@ -389,6 +457,59 @@ mod tests {
         assert_eq!(packed.selected_indices, vec![0, 2, 3]);
         assert_eq!(packed.dropped_ids, vec!["old"]);
         assert_eq!(packed.used_message_tokens, 55);
+    }
+
+    #[test]
+    fn plans_compression_for_old_optional_messages_before_active_tools() {
+        let messages = vec![
+            ContextPackItem {
+                id: "system".to_string(),
+                estimated_tokens: 0,
+                must_keep: true,
+            },
+            ContextPackItem {
+                id: "old-user".to_string(),
+                estimated_tokens: 70,
+                must_keep: false,
+            },
+            ContextPackItem {
+                id: "old-assistant".to_string(),
+                estimated_tokens: 70,
+                must_keep: false,
+            },
+            ContextPackItem {
+                id: "recent-user".to_string(),
+                estimated_tokens: 70,
+                must_keep: false,
+            },
+            ContextPackItem {
+                id: "latest-user".to_string(),
+                estimated_tokens: 30,
+                must_keep: true,
+            },
+            ContextPackItem {
+                id: "tool-call".to_string(),
+                estimated_tokens: 120,
+                must_keep: true,
+            },
+        ];
+
+        let plan = plan_context_compression(&messages, 300, 5, 1).expect("compression plan");
+
+        assert_eq!(plan.covered_indices, vec![1, 2]);
+        assert_eq!(plan.original_tokens, 140);
+        assert_eq!(plan.trigger_tokens, 240);
+    }
+
+    #[test]
+    fn skips_compression_before_trigger_threshold() {
+        let messages = vec![ContextPackItem {
+            id: "message".to_string(),
+            estimated_tokens: 50,
+            must_keep: false,
+        }];
+
+        assert_eq!(plan_context_compression(&messages, 300, 1, 1), None);
     }
 
     #[test]

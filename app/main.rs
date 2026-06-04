@@ -26,7 +26,7 @@ use chrono::{SecondsFormat, Utc};
 use foco_agent::{
     ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo, build_system_prompt,
     calculate_context_budget, detect_same_file_write_conflicts, estimate_json_tokens,
-    estimate_text_tokens, pack_context,
+    estimate_text_tokens, pack_context, plan_context_compression,
 };
 use foco_providers::{
     DEFAULT_OPENAI_BASE_URL, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
@@ -44,8 +44,9 @@ use foco_store::{
         parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
     },
     workspace::{
-        ChatRecord, MessageRecord, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewToolCall,
-        NewToolResult, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
+        ChatRecord, ContextCompressionSnapshotRecord, MessageRecord, NewContextCompressionSnapshot,
+        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewToolCall, NewToolResult,
+        ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
     },
 };
 use foco_tools::{
@@ -63,6 +64,10 @@ mod logging;
 const DEFAULT_PORT: u16 = 3210;
 const PORT_ENV: &str = "FOCO_PORT";
 const MAX_AGENT_TOOL_ROUNDS: usize = 8;
+const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
+const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
+const CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES: usize = 16;
+const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -857,6 +862,9 @@ struct PreparedChatContext {
     provider_request: NeutralChatRequest,
     context_budget: foco_agent::ContextBudget,
     request_body_json: String,
+    compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
+    message_source_sequences: Vec<Option<i64>>,
+    active_tool_start_index: usize,
 }
 
 struct CapturedAuditEvent {
@@ -902,7 +910,6 @@ impl PreparedChatContext {
                 llm_request_id: self.llm_request_id.clone(),
             };
             let mut events = vec![captured_event(&start_event)];
-            let active_tool_start_index = self.provider_request.messages.len();
             let mut assistant_text = String::new();
             let mut first_token_at = None;
             let mut first_token_latency_ms = None;
@@ -915,10 +922,33 @@ impl PreparedChatContext {
             yield Ok(sse_event(&start_event));
 
             for turn_index in 0..=MAX_AGENT_TOOL_ROUNDS {
+                let turn_active_tool_start_index = match ensure_context_compression(&mut self) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        let message = error.message;
+                        let event = ChatSseEvent::Error {
+                            message: message.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        let outcome = failed_audit_outcome(started_at, &message);
+
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                            let event = ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                            yield Ok(sse_event(&event));
+                        } else {
+                            yield Ok(sse_event(&event));
+                        }
+
+                        return;
+                    }
+                };
                 let packed_messages = match pack_neutral_messages(
                     self.provider_request.messages.clone(),
+                    &self.message_source_sequences,
                     &self.context_budget,
-                    active_tool_start_index,
+                    turn_active_tool_start_index,
                 ) {
                     Ok(messages) => messages,
                     Err(error) => {
@@ -943,6 +973,30 @@ impl PreparedChatContext {
                 };
                 let mut turn_request = self.provider_request.clone();
                 turn_request.messages = packed_messages;
+                match serialize_provider_request(&turn_request) {
+                    Ok(request_body_json) => {
+                        self.request_body_json = request_body_json;
+                    }
+                    Err(error) => {
+                        let message = error.message;
+                        let event = ChatSseEvent::Error {
+                            message: message.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        let outcome = failed_audit_outcome(started_at, &message);
+
+                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, &[]) {
+                            let event = ChatSseEvent::Error {
+                                message: persist_error.message,
+                            };
+                            yield Ok(sse_event(&event));
+                        } else {
+                            yield Ok(sse_event(&event));
+                        }
+
+                        return;
+                    }
+                }
                 let mut provider_stream = match stream_chat(&self.provider_config, turn_request).await {
                     Ok(provider_stream) => provider_stream,
                     Err(error) => {
@@ -1234,6 +1288,7 @@ impl PreparedChatContext {
 
                             append_tool_state_messages(
                                 &mut self.provider_request.messages,
+                                &mut self.message_source_sequences,
                                 tool_calls,
                                 &next_tool_results,
                                 turn_text,
@@ -1402,6 +1457,9 @@ fn prepare_chat_context(
     let existing_messages = database
         .messages_for_chat(&chat_id)
         .map_err(ApiError::from_workspace_error)?;
+    let compression_snapshots = database
+        .context_compression_snapshots_for_chat(&chat_id)
+        .map_err(ApiError::from_workspace_error)?;
     let user_sequence = next_message_sequence(&existing_messages);
     let assistant_sequence = user_sequence + 1;
     let user_message_id = unique_id("msg-user");
@@ -1445,18 +1503,31 @@ fn prepare_chat_context(
     )
     .map_err(|source| ApiError::bad_request(source.to_string()))?;
 
-    let mut neutral_messages = Vec::with_capacity(existing_messages.len() + 2);
+    let covered_sequences = snapshot_covered_sequences(&compression_snapshots);
+    let mut neutral_messages =
+        Vec::with_capacity(existing_messages.len() + compression_snapshots.len() + 2);
+    let mut message_source_sequences = Vec::with_capacity(neutral_messages.capacity());
     neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
+    message_source_sequences.push(None);
+    for snapshot in &compression_snapshots {
+        neutral_messages.push(compression_snapshot_message(snapshot));
+        message_source_sequences.push(None);
+    }
     for existing_message in existing_messages {
+        if covered_sequences.contains(&existing_message.sequence) {
+            continue;
+        }
+
+        let sequence = existing_message.sequence;
         neutral_messages.push(neutral_message_from_record(existing_message)?);
+        message_source_sequences.push(Some(sequence));
     }
     neutral_messages.push(neutral_text_message(
         NeutralChatRole::User,
         message.to_string(),
     ));
+    message_source_sequences.push(Some(user_sequence));
     let active_tool_start_index = neutral_messages.len();
-    let neutral_messages =
-        pack_neutral_messages(neutral_messages, &context_budget, active_tool_start_index)?;
 
     let provider_request = NeutralChatRequest {
         model_id: model.id.clone(),
@@ -1485,6 +1556,9 @@ fn prepare_chat_context(
         provider_request,
         context_budget,
         request_body_json,
+        compression_snapshots,
+        message_source_sequences,
+        active_tool_start_index,
     })
 }
 
@@ -1528,6 +1602,392 @@ fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMess
         tool_call_id: Some(tool_call_id),
         tool_name,
     })
+}
+
+fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize, ApiError> {
+    if context.provider_request.messages.len() != context.message_source_sequences.len() {
+        return Err(ApiError::internal(
+            "context message source sequence count does not match prompt message count",
+        ));
+    }
+
+    let latest_user_index = context
+        .provider_request
+        .messages
+        .iter()
+        .rposition(|message| message.role == NeutralChatRole::User);
+    let pack_items = context
+        .provider_request
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(index, message)| ContextPackItem {
+            id: format!("message-{index}"),
+            estimated_tokens: if index == 0 {
+                0
+            } else {
+                neutral_message_estimated_tokens(message)
+            },
+            must_keep: message.role == NeutralChatRole::System
+                || context.message_source_sequences[index].is_none()
+                || Some(index) == latest_user_index
+                || index >= context.active_tool_start_index,
+        })
+        .collect::<Vec<_>>();
+
+    let Some(plan) = plan_context_compression(
+        &pack_items,
+        context.context_budget.available_message_tokens,
+        context.active_tool_start_index,
+        CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES,
+    ) else {
+        return Ok(context.active_tool_start_index);
+    };
+
+    let summary = context_compression_summary(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &plan.covered_indices,
+    )?;
+    let summary_token_count = estimate_text_tokens(&summary);
+
+    if summary_token_count >= plan.original_tokens {
+        return Ok(context.active_tool_start_index);
+    }
+
+    let covered_sequences =
+        compression_covered_sequences(&context.message_source_sequences, &plan.covered_indices)?;
+    let snapshot_id = unique_id("ctx");
+    let snapshot_sequence = next_context_snapshot_sequence(&context.compression_snapshots)?;
+    let metadata_json = json!({
+        "coveredSequences": covered_sequences,
+        "triggerTokens": plan.trigger_tokens,
+        "availableMessageTokens": context.context_budget.available_message_tokens
+    })
+    .to_string();
+    let original_token_count = i64::try_from(plan.original_tokens)
+        .map_err(|_| ApiError::internal("context compression original token count exceeds i64"))?;
+    let summary_token_count_i64 = i64::try_from(summary_token_count)
+        .map_err(|_| ApiError::internal("context compression summary token count exceeds i64"))?;
+    let source_message_start_sequence = covered_sequences
+        .first()
+        .copied()
+        .ok_or_else(|| ApiError::internal("context compression has no source message sequence"))?;
+    let source_message_end_sequence = covered_sequences
+        .last()
+        .copied()
+        .ok_or_else(|| ApiError::internal("context compression has no source message sequence"))?;
+
+    let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+            id: &snapshot_id,
+            chat_id: &context.chat_id,
+            run_id: &context.llm_request_id,
+            sequence: snapshot_sequence,
+            summary: &summary,
+            source_message_start_sequence,
+            source_message_end_sequence,
+            original_token_count,
+            summary_token_count: summary_token_count_i64,
+            metadata_json: Some(&metadata_json),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    let created_at = utc_timestamp();
+    let snapshot = ContextCompressionSnapshotRecord {
+        id: snapshot_id,
+        chat_id: context.chat_id.clone(),
+        run_id: context.llm_request_id.clone(),
+        sequence: snapshot_sequence,
+        summary: summary.clone(),
+        source_message_start_sequence,
+        source_message_end_sequence,
+        original_token_count,
+        summary_token_count: summary_token_count_i64,
+        created_at,
+        metadata_json,
+    };
+
+    context.provider_request.messages = replace_covered_messages_with_snapshot(
+        &context.provider_request.messages,
+        &plan.covered_indices,
+        compression_snapshot_message(&snapshot),
+    );
+    context.message_source_sequences = replace_covered_sequences_with_snapshot(
+        &context.message_source_sequences,
+        &plan.covered_indices,
+    );
+    context.active_tool_start_index =
+        compressed_active_tool_start_index(context.active_tool_start_index, &plan.covered_indices);
+    context.compression_snapshots.push(snapshot);
+
+    Ok(context.active_tool_start_index)
+}
+
+fn snapshot_covered_sequences(snapshots: &[ContextCompressionSnapshotRecord]) -> HashSet<i64> {
+    let mut sequences = HashSet::new();
+
+    for snapshot in snapshots {
+        if let Ok(metadata) = serde_json::from_str::<Value>(&snapshot.metadata_json) {
+            if let Some(covered_sequences) =
+                metadata.get("coveredSequences").and_then(Value::as_array)
+            {
+                for sequence in covered_sequences.iter().filter_map(Value::as_i64) {
+                    sequences.insert(sequence);
+                }
+                continue;
+            }
+        }
+
+        for sequence in
+            snapshot.source_message_start_sequence..=snapshot.source_message_end_sequence
+        {
+            sequences.insert(sequence);
+        }
+    }
+
+    sequences
+}
+
+fn compression_snapshot_message(snapshot: &ContextCompressionSnapshotRecord) -> NeutralChatMessage {
+    neutral_text_message(
+        NeutralChatRole::System,
+        format!(
+            "{CONTEXT_COMPRESSION_PROMPT_PREFIX}\n\
+             - snapshot id: {}\n\
+             - source message sequence range: {}..={}\n\
+             - original tokens: {}\n\
+             - summary tokens: {}\n\n{}",
+            snapshot.id,
+            snapshot.source_message_start_sequence,
+            snapshot.source_message_end_sequence,
+            snapshot.original_token_count,
+            snapshot.summary_token_count,
+            snapshot.summary
+        ),
+    )
+}
+
+fn context_compression_summary(
+    messages: &[NeutralChatMessage],
+    message_source_sequences: &[Option<i64>],
+    covered_indices: &[usize],
+) -> Result<String, ApiError> {
+    if messages.len() != message_source_sequences.len() {
+        return Err(ApiError::internal(
+            "context message source sequence count does not match prompt message count",
+        ));
+    }
+
+    let mut lines = vec![
+        "Structured summary of earlier chat messages that were removed from the live prompt."
+            .to_string(),
+    ];
+
+    for index in covered_indices
+        .iter()
+        .copied()
+        .take(CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES)
+    {
+        let message = messages.get(index).ok_or_else(|| {
+            ApiError::internal("context compression covered message index is out of bounds")
+        })?;
+        let sequence = message_source_sequences
+            .get(index)
+            .and_then(|sequence| *sequence)
+            .ok_or_else(|| {
+                ApiError::internal(
+                    "context compression can only cover messages with database sequences",
+                )
+            })?;
+
+        lines.push(format!(
+            "- sequence {sequence}, role {}: {}",
+            neutral_role_label(&message.role),
+            compact_message_for_compression(message)
+        ));
+    }
+
+    if covered_indices.len() > CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES {
+        lines.push(format!(
+            "- {} additional older messages were omitted from this snapshot.",
+            covered_indices.len() - CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES
+        ));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn compact_message_for_compression(message: &NeutralChatMessage) -> String {
+    let mut content = truncate_for_context_snapshot(&message.content);
+
+    if !message.tool_calls.is_empty() {
+        let names = message
+            .tool_calls
+            .iter()
+            .map(|tool_call| tool_call.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if content.is_empty() {
+            content = format!("tool calls: {names}");
+        } else {
+            content.push_str("; tool calls: ");
+            content.push_str(&names);
+        }
+    }
+
+    if let Some(tool_name) = message.tool_name.as_deref() {
+        if content.is_empty() {
+            content = format!("tool result for {tool_name}");
+        } else {
+            content.push_str("; tool result for ");
+            content.push_str(tool_name);
+        }
+    }
+
+    if content.is_empty() {
+        "(empty message content)".to_string()
+    } else {
+        content
+    }
+}
+
+fn truncate_for_context_snapshot(value: &str) -> String {
+    let trimmed = value.trim();
+    let mut output = String::new();
+
+    for (index, character) in trimmed.chars().enumerate() {
+        if index >= CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS {
+            output.push_str("...");
+            return output;
+        }
+
+        if character.is_control() && character != '\n' && character != '\t' {
+            output.push(' ');
+        } else {
+            output.push(character);
+        }
+    }
+
+    output
+}
+
+fn compression_covered_sequences(
+    message_source_sequences: &[Option<i64>],
+    covered_indices: &[usize],
+) -> Result<Vec<i64>, ApiError> {
+    let mut sequences = Vec::with_capacity(covered_indices.len());
+
+    for index in covered_indices {
+        let sequence = message_source_sequences
+            .get(*index)
+            .and_then(|sequence| *sequence)
+            .ok_or_else(|| {
+                ApiError::internal(
+                    "context compression can only cover messages with database sequences",
+                )
+            })?;
+        sequences.push(sequence);
+    }
+
+    Ok(sequences)
+}
+
+fn replace_covered_messages_with_snapshot(
+    messages: &[NeutralChatMessage],
+    covered_indices: &[usize],
+    snapshot_message: NeutralChatMessage,
+) -> Vec<NeutralChatMessage> {
+    let covered = covered_indices.iter().copied().collect::<HashSet<_>>();
+    let first_covered = covered_indices.first().copied();
+    let mut next_messages = Vec::with_capacity(messages.len() - covered.len() + 1);
+
+    for (index, message) in messages.iter().enumerate() {
+        if Some(index) == first_covered {
+            next_messages.push(snapshot_message.clone());
+        }
+
+        if covered.contains(&index) {
+            continue;
+        }
+
+        next_messages.push(message.clone());
+    }
+
+    next_messages
+}
+
+fn replace_covered_sequences_with_snapshot(
+    message_source_sequences: &[Option<i64>],
+    covered_indices: &[usize],
+) -> Vec<Option<i64>> {
+    let covered = covered_indices.iter().copied().collect::<HashSet<_>>();
+    let first_covered = covered_indices.first().copied();
+    let mut next_sequences = Vec::with_capacity(message_source_sequences.len() - covered.len() + 1);
+
+    for (index, sequence) in message_source_sequences.iter().enumerate() {
+        if Some(index) == first_covered {
+            next_sequences.push(None);
+        }
+
+        if covered.contains(&index) {
+            continue;
+        }
+
+        next_sequences.push(*sequence);
+    }
+
+    next_sequences
+}
+
+fn compressed_active_tool_start_index(
+    active_tool_start_index: usize,
+    covered_indices: &[usize],
+) -> usize {
+    let removed_before_active_tool = covered_indices
+        .iter()
+        .filter(|index| **index < active_tool_start_index)
+        .count();
+
+    active_tool_start_index - removed_before_active_tool + 1
+}
+
+fn next_context_snapshot_sequence(
+    snapshots: &[ContextCompressionSnapshotRecord],
+) -> Result<i64, ApiError> {
+    let next = snapshots
+        .iter()
+        .map(|snapshot| snapshot.sequence)
+        .max()
+        .unwrap_or(-1)
+        + 1;
+
+    if next < 0 {
+        return Err(ApiError::internal(
+            "context compression snapshot sequence overflowed",
+        ));
+    }
+
+    Ok(next)
+}
+
+fn serialize_provider_request(request: &NeutralChatRequest) -> Result<String, ApiError> {
+    serde_json::to_string(request).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize provider-neutral chat request: {source}"
+        ))
+    })
+}
+
+fn neutral_role_label(role: &NeutralChatRole) -> &'static str {
+    match role {
+        NeutralChatRole::System => "system",
+        NeutralChatRole::User => "user",
+        NeutralChatRole::Assistant => "assistant",
+        NeutralChatRole::Tool => "tool",
+    }
 }
 
 fn persist_chat_result(
@@ -1659,9 +2119,16 @@ fn estimate_tool_schema_tokens(tools: &[NeutralToolDefinition]) -> u64 {
 
 fn pack_neutral_messages(
     messages: Vec<NeutralChatMessage>,
+    message_source_sequences: &[Option<i64>],
     budget: &foco_agent::ContextBudget,
     active_tool_start_index: usize,
 ) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    if messages.len() != message_source_sequences.len() {
+        return Err(ApiError::internal(
+            "context message source sequence count does not match prompt message count",
+        ));
+    }
+
     let latest_user_index = messages
         .iter()
         .rposition(|message| message.role == NeutralChatRole::User);
@@ -1675,7 +2142,7 @@ fn pack_neutral_messages(
             } else {
                 neutral_message_estimated_tokens(message)
             },
-            must_keep: index == 0
+            must_keep: message.role == NeutralChatRole::System
                 || Some(index) == latest_user_index
                 || index >= active_tool_start_index,
         })
@@ -1775,6 +2242,7 @@ async fn execute_tool_calls_parallel(
 
 fn append_tool_state_messages(
     messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
     tool_calls: Vec<NeutralToolCall>,
     tool_results: &[ExecutedToolCall],
     assistant_text: String,
@@ -1786,6 +2254,7 @@ fn append_tool_state_messages(
         tool_call_id: None,
         tool_name: None,
     });
+    message_source_sequences.push(None);
 
     for tool_result in tool_results {
         messages.push(NeutralChatMessage {
@@ -1796,6 +2265,7 @@ fn append_tool_state_messages(
             tool_call_id: Some(tool_result.id.clone()),
             tool_name: Some(tool_result.name.clone()),
         });
+        message_source_sequences.push(None);
     }
 }
 
