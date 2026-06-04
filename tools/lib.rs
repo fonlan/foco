@@ -120,15 +120,28 @@ fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunti
         });
     }
 
-    let content = fs::read_to_string(&path).map_err(|source| ToolRuntimeError::Io {
+    let bytes = fs::read(&path).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
         source,
     })?;
+    let (content, _) = decode_text_file(&path, &bytes)?;
+    let line_range = resolve_optional_line_range(
+        request.start_line,
+        request.end_line,
+        count_text_lines(&content),
+    )?;
+    let content = if let Some(range) = &line_range {
+        read_line_range(&content, range)
+    } else {
+        content
+    };
 
     Ok(json!({
         "path": request.path,
         "content": content,
-        "bytes": metadata.len()
+        "bytes": metadata.len(),
+        "startLine": line_range.as_ref().map(|range| range.start),
+        "endLine": line_range.as_ref().map(|range| range.end)
     }))
 }
 
@@ -380,21 +393,61 @@ fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
 fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: WriteFileInput = parse_arguments(arguments)?;
     let path = resolve_workspace_write_path(workspace_path, &request.path)?;
+    let line_range = match (request.start_line, request.end_line) {
+        (None, None) => None,
+        (Some(start), Some(end)) => Some(LineRange::new(start, end)?),
+        _ => {
+            return Err(ToolRuntimeError::InvalidArguments(
+                "startLine and endLine must both be null for complete writes or both be integers for line-range writes".to_string(),
+            ));
+        }
+    };
 
-    if let Ok(metadata) = fs::metadata(&path)
-        && !metadata.is_file()
-    {
-        return Err(ToolRuntimeError::NotFile(path));
-    }
+    let (content, encoding) = match fs::metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return Err(ToolRuntimeError::NotFile(path));
+            }
 
-    fs::write(&path, &request.content).map_err(|source| ToolRuntimeError::Io {
+            let bytes = fs::read(&path).map_err(|source| ToolRuntimeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let (existing_content, encoding) = decode_text_file(&path, &bytes)?;
+            let content = if let Some(range) = line_range {
+                replace_line_range(&existing_content, range, &request.content)?
+            } else {
+                request.content
+            };
+
+            (content, encoding)
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            if line_range.is_some() {
+                return Err(ToolRuntimeError::InvalidArguments(
+                    "line-range writes require an existing file".to_string(),
+                ));
+            }
+
+            (request.content, TextEncoding::Utf8)
+        }
+        Err(source) => {
+            return Err(ToolRuntimeError::Io {
+                path: path.clone(),
+                source,
+            });
+        }
+    };
+    let encoded = encode_text_file(&content, encoding);
+
+    fs::write(&path, &encoded).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
         source,
     })?;
 
     Ok(json!({
         "path": normalize_workspace_path_text(&request.path)?,
-        "bytes": request.content.len()
+        "bytes": encoded.len()
     }))
 }
 
@@ -642,6 +695,217 @@ where
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TextEncoding {
+    Utf8,
+    Utf8Bom,
+    Utf16LeBom,
+    Utf16BeBom,
+}
+
+fn decode_text_file(path: &Path, bytes: &[u8]) -> Result<(String, TextEncoding), ToolRuntimeError> {
+    if let Some(content) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        let content = std::str::from_utf8(content)
+            .map_err(|_| ToolRuntimeError::UnsupportedEncoding(path.to_path_buf()))?;
+        return Ok((content.to_string(), TextEncoding::Utf8Bom));
+    }
+
+    if let Some(content) = bytes.strip_prefix(&[0xFF, 0xFE]) {
+        return decode_utf16_file(path, content, TextEncoding::Utf16LeBom);
+    }
+
+    if let Some(content) = bytes.strip_prefix(&[0xFE, 0xFF]) {
+        return decode_utf16_file(path, content, TextEncoding::Utf16BeBom);
+    }
+
+    let content = std::str::from_utf8(bytes)
+        .map_err(|_| ToolRuntimeError::UnsupportedEncoding(path.to_path_buf()))?;
+    Ok((content.to_string(), TextEncoding::Utf8))
+}
+
+fn decode_utf16_file(
+    path: &Path,
+    bytes: &[u8],
+    encoding: TextEncoding,
+) -> Result<(String, TextEncoding), ToolRuntimeError> {
+    if bytes.len() % 2 != 0 {
+        return Err(ToolRuntimeError::UnsupportedEncoding(path.to_path_buf()));
+    }
+
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| match encoding {
+            TextEncoding::Utf16LeBom => u16::from_le_bytes([chunk[0], chunk[1]]),
+            TextEncoding::Utf16BeBom => u16::from_be_bytes([chunk[0], chunk[1]]),
+            TextEncoding::Utf8 | TextEncoding::Utf8Bom => unreachable!("utf16 decoder encoding"),
+        })
+        .collect::<Vec<_>>();
+    let content = String::from_utf16(&units)
+        .map_err(|_| ToolRuntimeError::UnsupportedEncoding(path.to_path_buf()))?;
+
+    Ok((content, encoding))
+}
+
+fn encode_text_file(content: &str, encoding: TextEncoding) -> Vec<u8> {
+    match encoding {
+        TextEncoding::Utf8 => content.as_bytes().to_vec(),
+        TextEncoding::Utf8Bom => {
+            let mut bytes = vec![0xEF, 0xBB, 0xBF];
+            bytes.extend_from_slice(content.as_bytes());
+            bytes
+        }
+        TextEncoding::Utf16LeBom => {
+            let mut bytes = vec![0xFF, 0xFE];
+            for unit in content.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            bytes
+        }
+        TextEncoding::Utf16BeBom => {
+            let mut bytes = vec![0xFE, 0xFF];
+            for unit in content.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+            bytes
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LineRange {
+    start: usize,
+    end: usize,
+}
+
+impl LineRange {
+    fn new(start: usize, end: usize) -> Result<Self, ToolRuntimeError> {
+        if start == 0 || end == 0 || end < start {
+            return Err(ToolRuntimeError::InvalidArguments(
+                "line ranges are 1-based inclusive ranges and must satisfy startLine <= endLine"
+                    .to_string(),
+            ));
+        }
+
+        Ok(Self { start, end })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LineSpan {
+    start_byte: usize,
+    end_byte: usize,
+    line_ending: Option<&'static str>,
+}
+
+fn resolve_optional_line_range(
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    line_count: usize,
+) -> Result<Option<LineRange>, ToolRuntimeError> {
+    let range = match (start_line, end_line) {
+        (None, None) => return Ok(None),
+        (Some(start), Some(end)) => LineRange::new(start, end)?,
+        _ => {
+            return Err(ToolRuntimeError::InvalidArguments(
+                "startLine and endLine must both be null for full-file reads or both be integers for line-range reads".to_string(),
+            ));
+        }
+    };
+
+    validate_line_range(range, line_count)?;
+    Ok(Some(range))
+}
+
+fn validate_line_range(range: LineRange, line_count: usize) -> Result<(), ToolRuntimeError> {
+    if range.end > line_count {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "line range {}-{} is outside the file; file has {line_count} lines",
+            range.start, range.end
+        )));
+    }
+
+    Ok(())
+}
+
+fn count_text_lines(content: &str) -> usize {
+    line_spans(content).len()
+}
+
+fn read_line_range(content: &str, range: &LineRange) -> String {
+    let spans = line_spans(content);
+    let start = spans[range.start - 1].start_byte;
+    let end = spans[range.end - 1].end_byte;
+    content[start..end].to_string()
+}
+
+fn replace_line_range(
+    existing_content: &str,
+    range: LineRange,
+    replacement: &str,
+) -> Result<String, ToolRuntimeError> {
+    let spans = line_spans(existing_content);
+    validate_line_range(range, spans.len())?;
+
+    let start = spans[range.start - 1].start_byte;
+    let replaced_end = spans[range.end - 1].end_byte;
+    let mut replacement = replacement.to_string();
+
+    if let Some(line_ending) = spans[range.end - 1].line_ending
+        && !ends_with_line_ending(&replacement)
+    {
+        replacement.push_str(line_ending);
+    }
+
+    let mut content =
+        String::with_capacity(existing_content.len() - (replaced_end - start) + replacement.len());
+    content.push_str(&existing_content[..start]);
+    content.push_str(&replacement);
+    content.push_str(&existing_content[replaced_end..]);
+
+    Ok(content)
+}
+
+fn line_spans(content: &str) -> Vec<LineSpan> {
+    let bytes = content.as_bytes();
+    let mut spans = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let (end, line_ending) = match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => (index + 2, Some("\r\n")),
+            b'\r' => (index + 1, Some("\r")),
+            b'\n' => (index + 1, Some("\n")),
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+
+        spans.push(LineSpan {
+            start_byte: start,
+            end_byte: end,
+            line_ending,
+        });
+        start = end;
+        index = end;
+    }
+
+    if start < bytes.len() {
+        spans.push(LineSpan {
+            start_byte: start,
+            end_byte: bytes.len(),
+            line_ending: None,
+        });
+    }
+
+    spans
+}
+
+fn ends_with_line_ending(content: &str) -> bool {
+    content.ends_with('\n') || content.ends_with('\r')
+}
+
 fn resolve_workspace_file(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
     let path = resolve_workspace_path(workspace_path, input)?;
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
@@ -831,7 +1095,7 @@ fn limited_output_text(output: &[u8]) -> (String, bool) {
 fn read_file_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_FILE_TOOL,
-        description: "Read a UTF-8 text file inside the active workspace.",
+        description: "Read a text file inside the active workspace, optionally restricted to a 1-based inclusive line range.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -839,9 +1103,17 @@ fn read_file_definition() -> ToolDefinition {
                 "path": {
                     "type": "string",
                     "description": "Workspace-relative file path."
+                },
+                "startLine": {
+                    "type": ["integer", "null"],
+                    "description": "Optional 1-based first line to read. Must be null when endLine is null."
+                },
+                "endLine": {
+                    "type": ["integer", "null"],
+                    "description": "Optional 1-based last line to read, inclusive. Must be null when startLine is null."
                 }
             },
-            "required": ["path"]
+            "required": ["path", "startLine", "endLine"]
         }),
         strict: true,
     }
@@ -1039,7 +1311,7 @@ fn search_text_definition() -> ToolDefinition {
 fn write_file_definition() -> ToolDefinition {
     ToolDefinition {
         name: WRITE_FILE_TOOL,
-        description: "Write a complete UTF-8 text file inside the active workspace.",
+        description: "Write a complete text file or replace a 1-based inclusive line range inside an existing workspace file.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1050,10 +1322,18 @@ fn write_file_definition() -> ToolDefinition {
                 },
                 "content": {
                     "type": "string",
-                    "description": "Complete file content to write."
+                    "description": "Complete file content for full writes, or replacement content for line-range writes."
+                },
+                "startLine": {
+                    "type": ["integer", "null"],
+                    "description": "Optional 1-based first line to replace. Must be null when endLine is null."
+                },
+                "endLine": {
+                    "type": ["integer", "null"],
+                    "description": "Optional 1-based last line to replace, inclusive. Must be null when startLine is null."
                 }
             },
-            "required": ["path", "content"]
+            "required": ["path", "content", "startLine", "endLine"]
         }),
         strict: true,
     }
@@ -1107,8 +1387,11 @@ fn git_diff_definition() -> ToolDefinition {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReadFileInput {
     path: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1147,9 +1430,12 @@ struct GraphRelatedFilesInput {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WriteFileInput {
     path: String,
     content: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1196,6 +1482,7 @@ enum ToolRuntimeError {
     },
     NotDirectory(PathBuf),
     NotFile(PathBuf),
+    UnsupportedEncoding(PathBuf),
     UnknownTool(String),
     WorkspaceDatabase(WorkspaceDatabaseError),
 }
@@ -1247,6 +1534,11 @@ impl fmt::Display for ToolRuntimeError {
             }
             Self::NotDirectory(path) => write!(formatter, "{} is not a directory", path.display()),
             Self::NotFile(path) => write!(formatter, "{} is not a file", path.display()),
+            Self::UnsupportedEncoding(path) => write!(
+                formatter,
+                "{} uses an unsupported text encoding; supported encodings are UTF-8, UTF-8 BOM, UTF-16 LE BOM, and UTF-16 BE BOM",
+                path.display()
+            ),
             Self::UnknownTool(tool) => write!(formatter, "unknown built-in tool '{tool}'"),
             Self::WorkspaceDatabase(source) => {
                 write!(formatter, "code graph database error: {source}")
@@ -1269,6 +1561,7 @@ impl std::error::Error for ToolRuntimeError {
             | Self::NotGitRepository { .. }
             | Self::NotDirectory(_)
             | Self::NotFile(_)
+            | Self::UnsupportedEncoding(_)
             | Self::UnknownTool(_) => None,
         }
     }
@@ -1296,7 +1589,7 @@ mod tests {
         let result = execute_builtin_tool(
             workspace.path(),
             READ_FILE_TOOL,
-            json!({ "path": "../outside.txt" }),
+            json!({ "path": "../outside.txt", "startLine": null, "endLine": null }),
         );
 
         assert!(result.is_error);
@@ -1318,11 +1611,72 @@ mod tests {
         let result = execute_builtin_tool(
             workspace.path(),
             READ_FILE_TOOL,
-            json!({ "path": "note.txt" }),
+            json!({ "path": "note.txt", "startLine": null, "endLine": null }),
         );
 
         assert!(!result.is_error);
         assert_eq!(result.output["content"], "hello");
+    }
+
+    #[test]
+    fn reads_workspace_file_line_range() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "one\ntwo\nthree\n").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "note.txt", "startLine": 2, "endLine": 3 }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["content"], "two\nthree\n");
+        assert_eq!(result.output["startLine"], 2);
+        assert_eq!(result.output["endLine"], 3);
+    }
+
+    #[test]
+    fn rejects_read_line_range_outside_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "one\n").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "note.txt", "startLine": 1, "endLine": 2 }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("file has 1 lines")
+        );
+    }
+
+    #[test]
+    fn rejects_partial_read_line_range() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "one\n").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "note.txt", "startLine": 1, "endLine": null }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("startLine and endLine must both be null")
+        );
     }
 
     #[test]
@@ -1397,6 +1751,16 @@ mod tests {
 
     #[test]
     fn accepts_null_for_optional_tool_arguments() {
+        let read_file: ReadFileInput = parse_arguments(json!({
+            "path": "note.txt",
+            "startLine": null,
+            "endLine": null
+        }))
+        .expect("read file input");
+        assert_eq!(read_file.path, "note.txt");
+        assert_eq!(read_file.start_line, None);
+        assert_eq!(read_file.end_line, None);
+
         let graph_symbols: GraphFindSymbolsInput = parse_arguments(json!({
             "query": "helper",
             "kind": null,
@@ -1434,6 +1798,18 @@ mod tests {
         let git_diff: GitDiffInput =
             parse_arguments(json!({ "path": null })).expect("git diff input");
         assert_eq!(git_diff.path, None);
+
+        let write_file: WriteFileInput = parse_arguments(json!({
+            "path": "note.txt",
+            "content": "hello",
+            "startLine": null,
+            "endLine": null
+        }))
+        .expect("write file input");
+        assert_eq!(write_file.path, "note.txt");
+        assert_eq!(write_file.content, "hello");
+        assert_eq!(write_file.start_line, None);
+        assert_eq!(write_file.end_line, None);
     }
 
     #[test]
@@ -1520,7 +1896,7 @@ mod tests {
         let result = execute_builtin_tool(
             workspace.path(),
             WRITE_FILE_TOOL,
-            json!({ "path": "note.txt", "content": "hello" }),
+            json!({ "path": "note.txt", "content": "hello", "startLine": null, "endLine": null }),
         );
 
         assert!(!result.is_error);
@@ -1532,13 +1908,115 @@ mod tests {
     }
 
     #[test]
+    fn writes_workspace_file_line_range() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "one\r\ntwo\r\nthree\r\n")
+            .expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            WRITE_FILE_TOOL,
+            json!({ "path": "note.txt", "content": "TWO", "startLine": 2, "endLine": 2 }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("note.txt")).expect("read note"),
+            "one\r\nTWO\r\nthree\r\n"
+        );
+    }
+
+    #[test]
+    fn writes_existing_file_with_same_utf16le_bom_encoding() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("note.txt");
+        fs::write(
+            &path,
+            encode_text_file("one\ntwo\n", TextEncoding::Utf16LeBom),
+        )
+        .expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            WRITE_FILE_TOOL,
+            json!({ "path": "note.txt", "content": "TWO", "startLine": 2, "endLine": 2 }),
+        );
+
+        assert!(!result.is_error);
+        let bytes = fs::read(&path).expect("read note bytes");
+        assert!(bytes.starts_with(&[0xFF, 0xFE]));
+        let (content, encoding) = decode_text_file(&path, &bytes).expect("decode note");
+        assert_eq!(encoding, TextEncoding::Utf16LeBom);
+        assert_eq!(content, "one\nTWO\n");
+    }
+
+    #[test]
+    fn writes_new_file_as_utf8() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("note.txt");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            WRITE_FILE_TOOL,
+            json!({ "path": "note.txt", "content": "你好", "startLine": null, "endLine": null }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(fs::read(&path).expect("read note bytes"), "你好".as_bytes());
+    }
+
+    #[test]
+    fn rejects_existing_file_with_unsupported_encoding() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("note.txt");
+        fs::write(&path, [0xFF, 0x00, 0xFF]).expect("write invalid text");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            WRITE_FILE_TOOL,
+            json!({ "path": "note.txt", "content": "hello", "startLine": null, "endLine": null }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("unsupported text encoding")
+        );
+    }
+
+    #[test]
+    fn rejects_line_range_write_for_new_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            WRITE_FILE_TOOL,
+            json!({ "path": "note.txt", "content": "hello", "startLine": 1, "endLine": 1 }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("line-range writes require an existing file")
+        );
+    }
+
+    #[test]
     fn rejects_write_path_outside_workspace() {
         let workspace = tempfile::tempdir().expect("workspace");
 
         let result = execute_builtin_tool(
             workspace.path(),
             WRITE_FILE_TOOL,
-            json!({ "path": "../note.txt", "content": "hello" }),
+            json!({ "path": "../note.txt", "content": "hello", "startLine": null, "endLine": null }),
         );
 
         assert!(result.is_error);
