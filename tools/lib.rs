@@ -879,19 +879,19 @@ fn graph_find_symbols_definition() -> ToolDefinition {
                     "description": "Symbol name or partial text to find."
                 },
                 "kind": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Optional symbol kind such as function, method, struct, class, enum, trait, variable, or constant."
                 },
                 "path": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Optional workspace-relative file or directory path to restrict the query."
                 },
                 "limit": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
                 }
             },
-            "required": ["query"]
+            "required": ["query", "kind", "path", "limit"]
         }),
         strict: true,
     }
@@ -906,23 +906,23 @@ fn graph_find_callers_definition() -> ToolDefinition {
             "additionalProperties": false,
             "properties": {
                 "symbolId": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "description": "Exact code graph symbol id returned by graph_find_symbols."
                 },
                 "symbol": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Symbol name to resolve when it is unique."
                 },
                 "path": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Optional workspace-relative file or directory path used only with symbol."
                 },
                 "limit": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
                 }
             },
-            "required": []
+            "required": ["symbolId", "symbol", "path", "limit"]
         }),
         strict: true,
     }
@@ -937,23 +937,23 @@ fn graph_find_callees_definition() -> ToolDefinition {
             "additionalProperties": false,
             "properties": {
                 "symbolId": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "description": "Exact code graph symbol id returned by graph_find_symbols."
                 },
                 "symbol": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Symbol name to resolve when it is unique."
                 },
                 "path": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Optional workspace-relative file or directory path used only with symbol."
                 },
                 "limit": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
                 }
             },
-            "required": []
+            "required": ["symbolId", "symbol", "path", "limit"]
         }),
         strict: true,
     }
@@ -968,23 +968,23 @@ fn graph_find_references_definition() -> ToolDefinition {
             "additionalProperties": false,
             "properties": {
                 "symbolId": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "description": "Exact code graph symbol id returned by graph_find_symbols."
                 },
                 "symbol": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Symbol name to resolve when it is unique."
                 },
                 "path": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Optional workspace-relative file or directory path used only with symbol."
                 },
                 "limit": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
                 }
             },
-            "required": []
+            "required": ["symbolId", "symbol", "path", "limit"]
         }),
         strict: true,
     }
@@ -1003,11 +1003,11 @@ fn graph_related_files_definition() -> ToolDefinition {
                     "description": "Workspace-relative indexed file path."
                 },
                 "limit": {
-                    "type": "integer",
+                    "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
                 }
             },
-            "required": ["path"]
+            "required": ["path", "limit"]
         }),
         strict: true,
     }
@@ -1072,16 +1072,16 @@ fn run_command_definition() -> ToolDefinition {
                     "description": "Executable name or path. Do not include arguments here."
                 },
                 "args": {
-                    "type": "array",
+                    "type": ["array", "null"],
                     "items": { "type": "string" },
                     "description": "Command arguments."
                 },
                 "cwd": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Optional workspace-relative working directory. Defaults to the workspace root."
                 }
             },
-            "required": ["command"]
+            "required": ["command", "args", "cwd"]
         }),
         strict: true,
     }
@@ -1096,11 +1096,11 @@ fn git_diff_definition() -> ToolDefinition {
             "additionalProperties": false,
             "properties": {
                 "path": {
-                    "type": "string",
+                    "type": ["string", "null"],
                     "description": "Optional workspace-relative path to diff."
                 }
             },
-            "required": []
+            "required": ["path"]
         }),
         strict: true,
     }
@@ -1287,6 +1287,7 @@ mod tests {
         NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
         NewCodeGraphSymbol, WorkspaceDatabase,
     };
+    use std::collections::BTreeSet;
 
     #[test]
     fn rejects_paths_outside_workspace() {
@@ -1352,6 +1353,87 @@ mod tests {
                 .expect("error")
                 .contains("missing field `path`")
         );
+    }
+
+    #[test]
+    fn strict_tool_schemas_require_every_property() {
+        for tool in builtin_tool_definitions() {
+            if !tool.strict {
+                continue;
+            }
+
+            let schema = tool.input_schema.as_object().expect("schema object");
+            assert_eq!(
+                schema.get("additionalProperties"),
+                Some(&Value::Bool(false)),
+                "{} schema must reject unknown properties",
+                tool.name
+            );
+
+            let properties = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("properties object");
+            let required = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .expect("required array");
+            let property_names = properties
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let required_names = required
+                .iter()
+                .map(|name| name.as_str().expect("required name"))
+                .collect::<BTreeSet<_>>();
+
+            assert_eq!(
+                required_names, property_names,
+                "{} schema required keys must match properties",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_null_for_optional_tool_arguments() {
+        let graph_symbols: GraphFindSymbolsInput = parse_arguments(json!({
+            "query": "helper",
+            "kind": null,
+            "path": null,
+            "limit": null
+        }))
+        .expect("graph symbols input");
+        assert_eq!(graph_symbols.query, "helper");
+        assert_eq!(graph_symbols.kind, None);
+        assert_eq!(graph_symbols.path, None);
+        assert_eq!(graph_symbols.limit, None);
+
+        let graph_lookup: GraphSymbolLookupInput = parse_arguments(json!({
+            "symbolId": null,
+            "symbol": "helper",
+            "path": null,
+            "limit": null
+        }))
+        .expect("graph lookup input");
+        assert_eq!(graph_lookup.symbol_id, None);
+        assert_eq!(graph_lookup.symbol.as_deref(), Some("helper"));
+        assert_eq!(graph_lookup.path, None);
+        assert_eq!(graph_lookup.limit, None);
+
+        let run_command: RunCommandInput = parse_arguments(json!({
+            "command": "git",
+            "args": null,
+            "cwd": null
+        }))
+        .expect("run command input");
+        assert_eq!(run_command.command, "git");
+        assert_eq!(run_command.args, None);
+        assert_eq!(run_command.cwd, None);
+
+        let git_diff: GitDiffInput =
+            parse_arguments(json!({ "path": null })).expect("git diff input");
+        assert_eq!(git_diff.path, None);
     }
 
     #[test]
