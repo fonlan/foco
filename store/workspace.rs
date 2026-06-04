@@ -173,6 +173,15 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn delete_chat(&mut self, id: &str) -> Result<bool, WorkspaceDatabaseError> {
+        let deleted = self
+            .connection
+            .execute("DELETE FROM chats WHERE id = ?1", params![id])
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(deleted > 0)
+    }
+
     pub fn chats(&self) -> Result<Vec<ChatRecord>, WorkspaceDatabaseError> {
         let mut statement = self
             .connection

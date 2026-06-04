@@ -28,8 +28,9 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import {
-  FormEvent,
   CSSProperties,
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -566,6 +567,40 @@ export function App() {
     setViewMode("chat");
   }
 
+  async function deleteWorkspaceChat(workspaceId: string, chatId: string) {
+    if (isSendingMessage && activeChatId === chatId) {
+      setError("Cancel the current run before deleting this chat.");
+      return;
+    }
+
+    setError(null);
+
+    try {
+      const data = await requestJson<WorkspacesResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/delete`,
+        { method: "POST" },
+      );
+      setWorkspaces(data.workspaces);
+      setActiveWorkspaceId((current) =>
+        data.workspaces.some((workspace) => workspace.id === current)
+          ? current
+          : data.activeWorkspaceId,
+      );
+
+      if (activeChatId === chatId) {
+        setActiveWorkspaceId(workspaceId);
+        setActiveChatId(null);
+        setMessages([]);
+      }
+
+      setRetryRunRequest((current) =>
+        current?.chatId === chatId ? null : current,
+      );
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
+  }
+
   function toggleWorkspaceTerminal() {
     if (!activeWorkspace) {
       return;
@@ -970,20 +1005,43 @@ export function App() {
                       <div className="ml-9 mt-1 space-y-1">
                         {workspace.chats.length > 0 ? (
                           workspace.chats.map((chat) => (
-                            <button
-                              className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-stone-600 hover:bg-white/80 hover:text-stone-950"
+                            <div
+                              className="group flex min-w-0 items-center gap-1"
                               key={chat.id}
-                              onClick={() =>
-                                void loadChatMessages(workspace.id, chat.id)
-                              }
-                              type="button"
                             >
-                              <MessageSquare
-                                aria-hidden="true"
-                                className="size-3.5 shrink-0"
-                              />
-                              <span className="truncate">{chat.title}</span>
-                            </button>
+                              <button
+                                className={`flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium ${
+                                  activeWorkspace?.id === workspace.id &&
+                                  activeChatId === chat.id
+                                    ? "bg-white text-stone-950 shadow-sm"
+                                    : "text-stone-600 hover:bg-white/80 hover:text-stone-950"
+                                }`}
+                                onClick={() =>
+                                  void loadChatMessages(workspace.id, chat.id)
+                                }
+                                type="button"
+                              >
+                                <MessageSquare
+                                  aria-hidden="true"
+                                  className="size-3.5 shrink-0"
+                                />
+                                <span className="truncate">{chat.title}</span>
+                              </button>
+                              <button
+                                aria-label={`Delete chat ${chat.title}`}
+                                className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
+                                onClick={() =>
+                                  void deleteWorkspaceChat(workspace.id, chat.id)
+                                }
+                                title="Delete chat"
+                                type="button"
+                              >
+                                <Trash2
+                                  aria-hidden="true"
+                                  className="size-3.5"
+                                />
+                              </button>
+                            </div>
                           ))
                         ) : (
                           <div className="rounded-lg px-2 py-1.5 text-xs text-stone-500">
@@ -1084,7 +1142,7 @@ export function App() {
               thinkingLevels={thinkingLevels}
             />
           ) : viewMode === "settings" ? (
-            <SettingsPanel />
+            <SettingsPanel onSettingsChange={setSettings} />
           ) : (
             <ApiStatsPanel
               activeWorkspace={activeWorkspace}
@@ -1391,7 +1449,50 @@ function ChatPanel({
 
       <div className="border-t border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-5">
         <form className="mx-auto max-w-5xl" onSubmit={onSubmit}>
-          <div className="mb-2 flex flex-wrap items-center gap-2">
+          <div className="relative">
+            <textarea
+              className="min-h-20 w-full resize-none rounded-xl border border-stone-300 bg-white px-3 py-2 pb-10 pr-14 text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+              disabled={isSendingMessage}
+              name="message"
+              onChange={(event) => onDraftMessageChange(event.target.value)}
+              onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+                if (
+                  event.key !== "Enter" ||
+                  event.ctrlKey ||
+                  event.nativeEvent.isComposing
+                ) {
+                  return;
+                }
+
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }}
+              placeholder="Message Foco"
+              value={draftMessage}
+            />
+            {isSendingMessage ? (
+              <button
+                aria-label="Cancel run"
+                className="absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                onClick={onCancelRun}
+                title="Cancel run"
+                type="button"
+              >
+                <X aria-hidden="true" className="size-5" />
+              </button>
+            ) : (
+              <button
+                aria-label="Send message"
+                className="absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                disabled={!draftMessage.trim() || !selectedModelId}
+                title="Send"
+                type="submit"
+              >
+                <Send aria-hidden="true" className="size-5" />
+              </button>
+            )}
+          </div>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
             <label className="min-w-0 flex-1 sm:max-w-64">
               <span className="sr-only">
                 Model
@@ -1442,37 +1543,6 @@ function ChatPanel({
                 <RefreshCw aria-hidden="true" className="size-4" />
               </button>
             ) : null}
-          </div>
-          <div className="relative">
-            <textarea
-              className="min-h-20 w-full resize-none rounded-xl border border-stone-300 bg-white px-3 py-2 pb-10 pr-14 text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-              disabled={isSendingMessage}
-              name="message"
-              onChange={(event) => onDraftMessageChange(event.target.value)}
-              placeholder="Message Foco"
-              value={draftMessage}
-            />
-            {isSendingMessage ? (
-              <button
-                aria-label="Cancel run"
-                className="absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
-                onClick={onCancelRun}
-                title="Cancel run"
-                type="button"
-              >
-                <X aria-hidden="true" className="size-5" />
-              </button>
-            ) : (
-              <button
-                aria-label="Send message"
-                className="absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-                disabled={!draftMessage.trim() || !selectedModelId}
-                title="Send"
-                type="submit"
-              >
-                <Send aria-hidden="true" className="size-5" />
-              </button>
-            )}
           </div>
         </form>
       </div>
@@ -1951,7 +2021,11 @@ function GitDiffPanel({
   );
 }
 
-function SettingsPanel() {
+function SettingsPanel({
+  onSettingsChange,
+}: {
+  onSettingsChange: (settings: SettingsResponse) => void;
+}) {
   const [activeSection, setActiveSection] =
     useState<SettingsSection>("providers");
   const [isProviderDialogOpen, setIsProviderDialogOpen] = useState(false);
@@ -2044,6 +2118,7 @@ function SettingsPanel() {
     try {
       const data = await requestJson<SettingsResponse>("/api/settings");
       setSettings(data);
+      onSettingsChange(data);
       setProviderForm((current) => ({
         ...current,
         kind: current.kind || data.providerKinds[0]?.kind || "openai-responses",
@@ -2053,7 +2128,7 @@ function SettingsPanel() {
     } finally {
       setIsLoadingSettings(false);
     }
-  }, []);
+  }, [onSettingsChange]);
 
   useEffect(() => {
     void loadMetadata();
@@ -2251,6 +2326,7 @@ function SettingsPanel() {
         },
       );
       setSettings(data);
+      onSettingsChange(data);
       setProviderForm((current) => ({
         ...current,
         apiKey: "",
@@ -2275,6 +2351,7 @@ function SettingsPanel() {
         method: "POST",
       });
       setSettings(data);
+      onSettingsChange(data);
       setProviderForm({
         ...emptyProviderForm(),
         kind: data.providerKinds[0]?.kind || "openai-responses",

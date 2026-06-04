@@ -141,6 +141,10 @@ async fn run() -> AppResult<()> {
             "/api/workspaces/{workspace_id}/chats/{chat_id}/messages",
             get(chat_messages),
         )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/delete",
+            post(delete_chat),
+        )
         .route("/api/workspaces/{workspace_id}/git/status", get(git_status))
         .route("/api/workspaces/{workspace_id}/git/diff", get(git_diff))
         .route(
@@ -667,6 +671,34 @@ async fn chat_messages(
     }
 
     Ok(Json(ChatMessagesResponse { messages }))
+}
+
+async fn delete_chat(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
+) -> Result<Json<WorkspacesResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace_id = workspace_id.trim();
+    let chat_id = chat_id.trim();
+    let workspace = workspace_by_id(&config, workspace_id)?;
+
+    if chat_id.is_empty() {
+        return Err(ApiError::bad_request("chat id must not be empty"));
+    }
+
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+
+    if !database
+        .delete_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+    {
+        return Err(ApiError::bad_request(format!(
+            "chat was not found: {chat_id}"
+        )));
+    }
+
+    workspace_response_from_config(&config)
 }
 
 async fn git_status(

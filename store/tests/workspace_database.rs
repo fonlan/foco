@@ -232,6 +232,143 @@ fn repository_helpers_round_trip_core_records() {
 }
 
 #[test]
+fn repository_helpers_delete_chat_cascades_chat_state_and_preserves_audit() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Deleted chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "message-1",
+            chat_id: "chat-1",
+            role: "user",
+            content: "Hello",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("message insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Tool calls completed.",
+            sequence: 1,
+            metadata_json: None,
+        })
+        .expect("assistant message insert");
+    database
+        .insert_run_event(NewRunEvent {
+            id: "event-1",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            sequence: 0,
+            event_type: "started",
+            payload_json: "{}",
+        })
+        .expect("run event insert");
+    database
+        .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+            id: "snapshot-1",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            sequence: 0,
+            summary: "Earlier conversation summary.",
+            source_message_start_sequence: 0,
+            source_message_end_sequence: 0,
+            original_token_count: 120,
+            summary_token_count: 8,
+            metadata_json: None,
+        })
+        .expect("context compression snapshot insert");
+    database
+        .insert_tool_call(NewToolCall {
+            id: "tool-call-1",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md"}"#,
+            status: "completed",
+            started_at: "2026-06-03T10:00:00.000Z",
+            completed_at: Some("2026-06-03T10:00:00.100Z"),
+        })
+        .expect("tool call insert");
+    database
+        .insert_tool_result(NewToolResult {
+            id: "tool-result-1",
+            tool_call_id: "tool-call-1",
+            output_json: r#"{"content":"hello"}"#,
+            is_error: false,
+            created_at: "2026-06-03T10:00:00.100Z",
+        })
+        .expect("tool result insert");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-1",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-1"),
+            provider_id: "openai",
+            model_id: "gpt-test",
+            request_started_at: "2026-06-03T10:00:00.000Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: Some(3),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: Some(200),
+            final_state: "completed",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("llm request insert");
+
+    assert!(database.delete_chat("chat-1").expect("chat delete"));
+    assert_eq!(database.chat("chat-1").expect("chat read"), None);
+    assert!(
+        database
+            .messages_for_chat("chat-1")
+            .expect("messages for chat")
+            .is_empty()
+    );
+    assert!(
+        database
+            .run_events_for_run("run-1")
+            .expect("run events for run")
+            .is_empty()
+    );
+    assert!(
+        database
+            .context_compression_snapshots_for_chat("chat-1")
+            .expect("context compression snapshots")
+            .is_empty()
+    );
+    assert!(
+        database
+            .tool_calls_for_message("assistant-1")
+            .expect("tool calls for message")
+            .is_empty()
+    );
+    let connection = Connection::open(database.database_path()).expect("open database");
+    let remaining_tool_results: i64 = connection
+        .query_row("SELECT COUNT(*) FROM tool_results", [], |row| row.get(0))
+        .expect("tool result count");
+    assert_eq!(remaining_tool_results, 0);
+    let request = database
+        .llm_request("request-1")
+        .expect("llm request read")
+        .expect("llm request");
+    assert_eq!(request.chat_id, None);
+    assert!(!database.delete_chat("chat-1").expect("second delete"));
+}
+
+#[test]
 fn repository_helpers_persist_terminal_working_directory() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

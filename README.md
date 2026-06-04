@@ -10,8 +10,9 @@ Install frontend dependencies once:
 npm install
 ```
 
-Run the backend. This builds the frontend once, then serves it from the Rust
-HTTP server:
+Run the backend. This builds `web/dist` once so the Rust server can start, then
+watches Rust backend files and restarts `cargo run -p foco-app` when they
+change:
 
 ```bash
 npm run backend
@@ -64,7 +65,9 @@ database, and writes real LLM audit records for the request. The send box lists
 enabled models with complete limits and an active provider, plus a thinking
 level selector.
 
-For live frontend development, run the Vite dev server alongside the backend:
+For live frontend development, run the Vite dev server alongside the backend.
+Frontend edits use Vite HMR, and backend Rust/Cargo edits trigger a browser full
+reload while `npm run backend` restarts the Rust server:
 
 ```bash
 npm run frontend
