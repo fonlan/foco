@@ -151,6 +151,7 @@ type SettingsResponse = {
   configuredModels: ConfiguredModelSummary[];
   mcpTransports: McpTransportSummary[];
   mcpServers: ConfiguredMcpServerSummary[];
+  skills: SkillsSettingsSummary;
 };
 
 type ProviderFormState = {
@@ -191,6 +192,26 @@ type McpServerFormState = {
   name: string;
   transport: string;
   url: string;
+};
+
+type SkillsSettingsSummary = {
+  directories: string[];
+  detected: ConfiguredSkillSummary[];
+  errors: SkillDiscoveryErrorSummary[];
+};
+
+type ConfiguredSkillSummary = {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  enabled: boolean;
+  warnings: string[];
+};
+
+type SkillDiscoveryErrorSummary = {
+  path: string;
+  message: string;
 };
 
 type ProviderTestResponse = {
@@ -277,7 +298,7 @@ type ChatStreamEvent =
   | { type: "error"; message: string };
 
 type WorkspaceFormMode = "add" | "create";
-type SettingsSection = "mcp" | "models" | "providers";
+type SettingsSection = "mcp" | "models" | "providers" | "skills";
 type ViewMode = "chat" | "settings" | "stats";
 
 type GitStatusFileSummary = {
@@ -2077,12 +2098,18 @@ function SettingsPanel({
   const [mcpForm, setMcpForm] = useState<McpServerFormState>(() =>
     emptyMcpServerForm(),
   );
+  const [skillDirectoriesText, setSkillDirectoriesText] = useState("");
+  const [enabledSkillIds, setEnabledSkillIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isSavingProvider, setIsSavingProvider] = useState(false);
   const [isSavingMcpServer, setIsSavingMcpServer] = useState(false);
+  const [isSavingSkills, setIsSavingSkills] = useState(false);
+  const [isRefreshingSkills, setIsRefreshingSkills] = useState(false);
   const [providerTests, setProviderTests] = useState<
     Record<string, ProviderTestState>
   >({});
@@ -2124,6 +2151,7 @@ function SettingsPanel({
   const providers = settings?.providers ?? [];
   const mcpTransports = settings?.mcpTransports ?? [];
   const mcpServers = settings?.mcpServers ?? [];
+  const skills = settings?.skills;
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const configuredModels =
     settings?.configuredModels ?? metadata?.configuredModels ?? [];
@@ -2136,6 +2164,17 @@ function SettingsPanel({
     providers.find((provider) => provider.id === providerForm.id) ?? null;
   const hasSavedProviderKey = editingProvider?.hasApiKey ?? false;
   const selectedProviderIds = new Set(form.providerIds);
+
+  function syncSkillsForm(data: SettingsResponse) {
+    setSkillDirectoriesText(data.skills.directories.join("\n"));
+    setEnabledSkillIds(
+      new Set(
+        data.skills.detected
+          .filter((skill) => skill.enabled)
+          .map((skill) => skill.id),
+      ),
+    );
+  }
 
   const loadMetadata = useCallback(async () => {
     setIsLoading(true);
@@ -2169,6 +2208,7 @@ function SettingsPanel({
         ...current,
         transport: current.transport || data.mcpTransports[0]?.transport || "stdio",
       }));
+      syncSkillsForm(data);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -2525,6 +2565,54 @@ function SettingsPanel({
     }
   }
 
+  async function saveSkills() {
+    setIsSavingSkills(true);
+    setError(null);
+
+    try {
+      const disabledSkillIds = (skills?.detected ?? [])
+        .filter((skill) => !enabledSkillIds.has(skill.id))
+        .map((skill) => skill.id);
+      const data = await requestJson<SettingsResponse>("/api/skills/manual", {
+        body: JSON.stringify({
+          directories: skillDirectoriesText
+            .split(/\r?\n/)
+            .map((directory) => directory.trim())
+            .filter(Boolean),
+          disabled: disabledSkillIds,
+          enabled: Array.from(enabledSkillIds),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncSkillsForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingSkills(false);
+    }
+  }
+
+  async function refreshSkills() {
+    setIsRefreshingSkills(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/skills/refresh", {
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncSkillsForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsRefreshingSkills(false);
+    }
+  }
+
   async function testProvider(providerId: string) {
     setProviderTests((current) => ({
       ...current,
@@ -2573,6 +2661,20 @@ function SettingsPanel({
     });
   }
 
+  function toggleSkill(skillId: string, checked: boolean) {
+    setEnabledSkillIds((current) => {
+      const next = new Set(current);
+
+      if (checked) {
+        next.add(skillId);
+      } else {
+        next.delete(skillId);
+      }
+
+      return next;
+    });
+  }
+
   return (
     <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
       <div className="mx-auto grid max-w-7xl gap-4 lg:grid-cols-[4.5rem_minmax(0,1fr)]">
@@ -2595,6 +2697,12 @@ function SettingsPanel({
             label="MCP"
             onClick={() => setActiveSection("mcp")}
           />
+          <SettingsNavButton
+            active={activeSection === "skills"}
+            icon={Wrench}
+            label="Skills"
+            onClick={() => setActiveSection("skills")}
+          />
         </aside>
 
         <div className="min-w-0 flex flex-col gap-5">
@@ -2602,7 +2710,7 @@ function SettingsPanel({
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
               <h2 className="text-lg font-semibold text-stone-950">
-                Provider and model settings
+                {settingsSectionTitle(activeSection)}
               </h2>
               <p className="mt-1 truncate text-xs font-medium text-stone-500">
                 {metadata?.fetchedAt
@@ -3203,6 +3311,139 @@ function SettingsPanel({
         </section>
         ) : null}
 
+        {activeSection === "skills" ? (
+        <section className="grid gap-4 xl:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+          <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center gap-2">
+              <Wrench aria-hidden="true" className="size-5 text-teal-700" />
+              <h3 className="text-sm font-semibold text-stone-950">
+                Skill directories
+              </h3>
+            </div>
+            <label className="mt-4 block">
+              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                Directories
+              </span>
+              <textarea
+                className="min-h-36 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                onChange={(event) => setSkillDirectoriesText(event.target.value)}
+                placeholder={
+                  "C:/Users/name/.agents/skills\nC:/Users/name/.claude/skills\n.agents/skills\n.claude/skills"
+                }
+                value={skillDirectoriesText}
+              />
+            </label>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                aria-label="Save skills"
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                disabled={isSavingSkills}
+                onClick={() => void saveSkills()}
+                title="Save skills"
+                type="button"
+              >
+                {isSavingSkills ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 aria-hidden="true" className="size-4" />
+                )}
+                Save
+              </button>
+              <button
+                aria-label="Refresh skill discovery"
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                disabled={isRefreshingSkills}
+                onClick={() => void refreshSkills()}
+                title="Refresh skill discovery"
+                type="button"
+              >
+                {isRefreshingSkills ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <RefreshCw aria-hidden="true" className="size-4" />
+                )}
+                Refresh
+              </button>
+            </div>
+            {skills?.errors.length ? (
+              <div className="mt-4 space-y-2">
+                {skills.errors.map((skillError) => (
+                  <div
+                    className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
+                    key={`${skillError.path}-${skillError.message}`}
+                  >
+                    <div className="break-all font-medium">{skillError.path}</div>
+                    <div className="mt-1 break-words">{skillError.message}</div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </section>
+
+          <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-stone-950">Detected skills</h3>
+              <CapabilityPill
+                label={`skills ${skills?.detected.length ?? 0}`}
+                ok={(skills?.detected.length ?? 0) > 0}
+              />
+            </div>
+            <div className="divide-y divide-stone-100">
+              {skills?.detected.length ? (
+                skills.detected.map((skill) => {
+                  const enabled = enabledSkillIds.has(skill.id);
+
+                  return (
+                    <div className="px-4 py-3" key={skill.id}>
+                      <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="truncate text-sm font-medium">
+                              {skill.name}
+                            </span>
+                            <CapabilityPill
+                              label={enabled ? "enabled" : "disabled"}
+                              ok={enabled}
+                            />
+                          </div>
+                          <div className="mt-1 truncate text-xs font-medium text-stone-500">
+                            {skill.id}
+                          </div>
+                          <div className="mt-1 break-words text-xs text-stone-500">
+                            {skill.description}
+                          </div>
+                          <div className="mt-1 break-all text-xs text-stone-400">
+                            {skill.path}
+                          </div>
+                        </div>
+                        <label className="relative inline-flex cursor-pointer items-center justify-self-start md:justify-self-end">
+                          <input
+                            aria-label={`Enable skill ${skill.name}`}
+                            checked={enabled}
+                            className="peer sr-only"
+                            onChange={(event) =>
+                              toggleSkill(skill.id, event.target.checked)
+                            }
+                            type="checkbox"
+                          />
+                          <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
+                          <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                        </label>
+                      </div>
+                      <Warnings warnings={skill.warnings} />
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="px-4 py-6 text-sm text-stone-500">
+                  No detected skills
+                </div>
+              )}
+            </div>
+          </section>
+        </section>
+        ) : null}
+
         {activeSection === "models" ? (
         <section className="grid gap-4">
           <div className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
@@ -3660,6 +3901,22 @@ function diffFileButtonClass(active: boolean) {
       ? "bg-teal-50 text-teal-950 shadow-sm"
       : "text-stone-700 hover:bg-stone-50 hover:text-stone-950"
   }`;
+}
+
+function settingsSectionTitle(section: SettingsSection) {
+  if (section === "providers") {
+    return "Provider settings";
+  }
+
+  if (section === "models") {
+    return "Model settings";
+  }
+
+  if (section === "mcp") {
+    return "MCP settings";
+  }
+
+  return "Skill settings";
 }
 
 function SettingsNavButton({

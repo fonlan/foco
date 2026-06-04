@@ -24,11 +24,20 @@ pub struct CodeGraphPromptContext {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillPromptInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub instructions: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemPromptInput {
     pub workspace_id: String,
     pub workspace_name: String,
     pub workspace_path: String,
     pub code_graph: CodeGraphPromptContext,
+    pub skills: Vec<SkillPromptInfo>,
     pub tools: Vec<ToolPromptInfo>,
 }
 
@@ -145,6 +154,20 @@ pub fn build_system_prompt(input: SystemPromptInput) -> String {
             prompt.push_str(&tool.name);
             prompt.push_str(": ");
             prompt.push_str(&tool.description);
+        }
+    }
+
+    if !input.skills.is_empty() {
+        prompt.push_str("\n\nEnabled skills:");
+        for skill in input.skills {
+            prompt.push_str("\n\n## ");
+            prompt.push_str(&skill.name);
+            prompt.push_str(" (");
+            prompt.push_str(&skill.id);
+            prompt.push_str(")\nDescription: ");
+            prompt.push_str(&skill.description);
+            prompt.push_str("\nInstructions:\n");
+            prompt.push_str(skill.instructions.trim());
         }
     }
 
@@ -449,6 +472,12 @@ mod tests {
                 edges: 11,
                 languages: vec!["rust".to_string(), "typescript".to_string()],
             },
+            skills: vec![SkillPromptInfo {
+                id: "gitmemo".to_string(),
+                name: "gitmemo".to_string(),
+                description: "Project memory.".to_string(),
+                instructions: "Search memory before repo work.".to_string(),
+            }],
             tools: vec![ToolPromptInfo {
                 name: "graph_find_symbols".to_string(),
                 description: "Find symbols.".to_string(),
@@ -460,6 +489,8 @@ mod tests {
         assert!(prompt.contains("- languages: rust, typescript"));
         assert!(prompt.contains("Prefer code graph tools before full-text search"));
         assert!(prompt.contains("graph_find_symbols"));
+        assert!(prompt.contains("Enabled skills:"));
+        assert!(prompt.contains("Search memory before repo work."));
     }
 
     #[test]

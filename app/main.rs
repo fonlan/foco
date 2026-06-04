@@ -24,9 +24,10 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    CodeGraphPromptContext, ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo,
-    build_system_prompt, calculate_context_budget, detect_same_file_write_conflicts,
-    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
+    CodeGraphPromptContext, ContextPackItem, PendingToolCall, SkillPromptInfo, SystemPromptInput,
+    ToolPromptInfo, build_system_prompt, calculate_context_budget,
+    detect_same_file_write_conflicts, estimate_json_tokens, estimate_text_tokens, pack_context,
+    plan_context_compression,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{
@@ -40,8 +41,9 @@ use foco_providers::{
 };
 use foco_store::{
     config::{
-        GlobalConfig, McpServerConfig, ModelLimits, ModelSettings, ProviderSettings,
-        WorkspaceConfig, load_or_create_global_config, save_global_config,
+        GlobalConfig, McpServerConfig, ModelLimits, ModelSettings, ProviderSettings, SkillSettings,
+        WorkspaceConfig, default_skill_directories_for_profile, load_or_create_global_config,
+        save_global_config,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
@@ -83,6 +85,7 @@ struct AppState {
     config: Arc<Mutex<GlobalConfig>>,
     config_file: PathBuf,
     model_metadata_file: PathBuf,
+    user_profile_dir: PathBuf,
     terminal_registry: terminal::TerminalRegistry,
     terminal_shutdown_tx: broadcast::Sender<()>,
     mcp_registry: Arc<McpRegistry>,
@@ -122,6 +125,7 @@ async fn run() -> AppResult<()> {
         config: Arc::new(Mutex::new(loaded_config.config)),
         config_file: loaded_config.paths.config_file,
         model_metadata_file: loaded_config.paths.root_dir.join("models.dev.json"),
+        user_profile_dir: loaded_config.paths.user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
         mcp_registry: mcp_registry.clone(),
@@ -142,6 +146,8 @@ async fn run() -> AppResult<()> {
         .route("/api/models/delete", post(delete_model))
         .route("/api/mcp/servers/manual", post(save_mcp_server))
         .route("/api/mcp/servers/delete", post(delete_mcp_server))
+        .route("/api/skills/manual", post(save_skills))
+        .route("/api/skills/refresh", post(refresh_skills))
         .route(
             "/api/workspaces/{workspace_id}/chat/stream",
             post(stream_chat_response),
@@ -509,6 +515,45 @@ async fn delete_mcp_server(
     sync_all_mcp_workspaces(&state.mcp_registry, &config)
         .await
         .map_err(ApiError::from_mcp_error)?;
+
+    settings_response(&state, &config).await
+}
+
+async fn save_skills(
+    State(state): State<AppState>,
+    Json(request): Json<ManualSkillsRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let mut directories = normalize_skill_directories(request.directories)?;
+    if directories.is_empty() {
+        directories = default_skill_directories_for_profile(&state.user_profile_dir);
+    }
+    let discovery = discover_skills(&config.workspaces, &directories);
+    let disabled = normalize_manual_disabled_skill_ids(
+        request.disabled,
+        request.enabled,
+        &discovery.skills,
+        &config.skills.disabled,
+    )?;
+
+    config.skills.directories = directories;
+    config.skills.detected = discovery.skills;
+    config.skills.disabled = disabled;
+    refresh_derived_enabled_skills(&mut config);
+
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
+async fn refresh_skills(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let discovery = discover_skills(&config.workspaces, &config.skills.directories);
+
+    config.skills.detected = discovery.skills;
+    refresh_derived_enabled_skills(&mut config);
+
+    save_config(&state, config.clone())?;
 
     settings_response(&state, &config).await
 }
@@ -1012,6 +1057,14 @@ struct ManualMcpServerRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ManualSkillsRequest {
+    directories: Vec<String>,
+    disabled: Option<Vec<String>>,
+    enabled: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TestProviderRequest {
     provider_id: String,
 }
@@ -1053,6 +1106,7 @@ struct SettingsResponse {
     configured_models: Vec<ConfiguredModelSummary>,
     mcp_transports: Vec<McpTransportSummary>,
     mcp_servers: Vec<ConfiguredMcpServerSummary>,
+    skills: SkillsSettingsSummary,
 }
 
 #[derive(Serialize)]
@@ -1105,6 +1159,32 @@ struct ConfiguredMcpServerSummary {
     error: Option<String>,
     tool_count: usize,
     warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillsSettingsSummary {
+    directories: Vec<String>,
+    detected: Vec<ConfiguredSkillSummary>,
+    errors: Vec<SkillDiscoveryErrorSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfiguredSkillSummary {
+    id: String,
+    name: String,
+    description: String,
+    path: String,
+    enabled: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SkillDiscoveryErrorSummary {
+    path: String,
+    message: String,
 }
 
 #[derive(Serialize)]
@@ -1948,6 +2028,7 @@ async fn prepare_chat_context(
             edges: code_graph_context.edges,
             languages: code_graph_context.languages,
         },
+        skills: enabled_skill_prompts(&config)?,
         tools: tool_prompt_infos,
     });
     let context_budget = calculate_context_budget(
@@ -3073,6 +3154,7 @@ async fn settings_response(
             .iter()
             .map(|server| configured_mcp_server_summary(server, &mcp_statuses))
             .collect(),
+        skills: skills_settings_summary(config),
     }))
 }
 
@@ -3138,6 +3220,495 @@ fn mcp_server_warnings(server: &McpServerConfig) -> Vec<String> {
     }
 
     warnings
+}
+
+fn skills_settings_summary(config: &GlobalConfig) -> SkillsSettingsSummary {
+    let disabled_skill_ids = config
+        .skills
+        .disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let discovery = discover_skills(&config.workspaces, &config.skills.directories);
+
+    SkillsSettingsSummary {
+        directories: config
+            .skills
+            .directories
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect(),
+        detected: discovery
+            .skills
+            .iter()
+            .map(|skill| {
+                configured_skill_summary(skill, !disabled_skill_ids.contains(skill.id.as_str()))
+            })
+            .collect(),
+        errors: discovery.errors,
+    }
+}
+
+fn configured_skill_summary(skill: &SkillSettings, enabled: bool) -> ConfiguredSkillSummary {
+    ConfiguredSkillSummary {
+        id: skill.id.clone(),
+        name: skill.name.clone(),
+        description: skill.description.clone(),
+        path: skill.path.display().to_string(),
+        enabled,
+        warnings: skill_warnings(skill, enabled),
+    }
+}
+
+fn skill_warnings(skill: &SkillSettings, enabled: bool) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if !enabled {
+        warnings.push("Skill is disabled.".to_string());
+    }
+
+    if let Err(message) = parse_skill_file(&skill.path) {
+        warnings.push(message);
+    }
+
+    warnings
+}
+
+struct SkillDiscovery {
+    skills: Vec<SkillSettings>,
+    errors: Vec<SkillDiscoveryErrorSummary>,
+}
+
+#[derive(Debug)]
+struct ParsedSkillFile {
+    id: String,
+    name: String,
+    description: String,
+    instructions: String,
+}
+
+fn normalize_skill_directories(values: Vec<String>) -> Result<Vec<PathBuf>, ApiError> {
+    let mut directories = Vec::new();
+    let mut seen = HashSet::new();
+
+    for value in values {
+        let trimmed = value.trim();
+
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let path = PathBuf::from(trimmed);
+        validate_skill_directory_input(&path)?;
+
+        if seen.insert(path.clone()) {
+            directories.push(path);
+        }
+    }
+
+    Ok(directories)
+}
+
+fn validate_skill_directory_input(path: &Path) -> Result<(), ApiError> {
+    if path.as_os_str().is_empty() {
+        return Err(ApiError::bad_request(
+            "skill directory path must not be empty",
+        ));
+    }
+
+    if path.is_absolute() {
+        return Ok(());
+    }
+
+    for component in path.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(ApiError::bad_request(format!(
+                "relative skill directory path must stay inside each workspace: {}",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_skill_ids(values: Vec<String>) -> Result<Vec<String>, ApiError> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+
+    for value in values {
+        let id = value.trim();
+
+        if id.is_empty() {
+            continue;
+        }
+
+        validate_skill_id(id).map_err(ApiError::bad_request)?;
+        if seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    }
+
+    Ok(ids)
+}
+
+fn normalize_manual_disabled_skill_ids(
+    requested_disabled: Option<Vec<String>>,
+    requested_enabled: Option<Vec<String>>,
+    discovered_skills: &[SkillSettings],
+    existing_disabled: &[String],
+) -> Result<Vec<String>, ApiError> {
+    if let Some(values) = requested_disabled {
+        let mut disabled = normalize_skill_ids(values)?;
+
+        if let Some(enabled_values) = requested_enabled {
+            let enabled = normalize_skill_ids(enabled_values)?;
+            let form_ids = disabled
+                .iter()
+                .chain(enabled.iter())
+                .cloned()
+                .collect::<HashSet<_>>();
+            let mut seen = disabled.iter().cloned().collect::<HashSet<_>>();
+
+            for id in existing_disabled {
+                let trimmed = id.trim();
+
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                validate_skill_id(trimmed).map_err(ApiError::bad_request)?;
+                if !form_ids.contains(trimmed) && seen.insert(trimmed.to_string()) {
+                    disabled.push(trimmed.to_string());
+                }
+            }
+        }
+
+        return Ok(disabled);
+    }
+
+    if let Some(values) = requested_enabled {
+        let enabled = normalize_skill_ids(values)?;
+        let enabled_ids = enabled.iter().map(String::as_str).collect::<HashSet<_>>();
+
+        return Ok(discovered_skills
+            .iter()
+            .filter(|skill| !enabled_ids.contains(skill.id.as_str()))
+            .map(|skill| skill.id.clone())
+            .collect());
+    }
+
+    normalize_skill_ids(existing_disabled.to_vec())
+}
+
+fn refresh_derived_enabled_skills(config: &mut GlobalConfig) {
+    let disabled_ids = config
+        .skills
+        .disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+
+    config.skills.enabled = config
+        .skills
+        .detected
+        .iter()
+        .filter(|skill| !disabled_ids.contains(skill.id.as_str()))
+        .map(|skill| skill.id.clone())
+        .collect();
+}
+
+fn discover_skills(workspaces: &[WorkspaceConfig], directories: &[PathBuf]) -> SkillDiscovery {
+    let mut skills = Vec::new();
+    let mut errors = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for directory in resolved_skill_directories(workspaces, directories) {
+        let candidates = match skill_file_candidates(&directory) {
+            Ok(candidates) => candidates,
+            Err(message) => {
+                errors.push(SkillDiscoveryErrorSummary {
+                    path: directory.display().to_string(),
+                    message,
+                });
+                continue;
+            }
+        };
+
+        for path in candidates {
+            match parse_skill_file(&path) {
+                Ok(parsed) => {
+                    if !seen_ids.insert(parsed.id.clone()) {
+                        errors.push(SkillDiscoveryErrorSummary {
+                            path: path.display().to_string(),
+                            message: format!("duplicate skill id '{}'", parsed.id),
+                        });
+                        continue;
+                    }
+
+                    skills.push(SkillSettings {
+                        id: parsed.id,
+                        name: parsed.name,
+                        description: parsed.description,
+                        path,
+                    });
+                }
+                Err(message) => errors.push(SkillDiscoveryErrorSummary {
+                    path: path.display().to_string(),
+                    message,
+                }),
+            }
+        }
+    }
+
+    skills.sort_by(|left, right| left.id.cmp(&right.id));
+
+    SkillDiscovery { skills, errors }
+}
+
+fn resolved_skill_directories(
+    workspaces: &[WorkspaceConfig],
+    directories: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut resolved = Vec::new();
+
+    for directory in directories {
+        if directory.is_absolute() {
+            resolved.push(directory.clone());
+            continue;
+        }
+
+        for workspace in workspaces {
+            resolved.push(workspace.path.join(directory));
+        }
+    }
+
+    resolved
+}
+
+fn skill_file_candidates(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let metadata = match fs::metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(format!(
+                "failed to inspect skill directory {}: {}",
+                directory.display(),
+                source
+            ));
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(format!(
+            "skill path is not a directory: {}",
+            directory.display()
+        ));
+    }
+
+    let mut candidates = Vec::new();
+    let direct_skill = directory.join("SKILL.md");
+    if direct_skill.is_file() {
+        candidates.push(direct_skill);
+    }
+
+    let entries = fs::read_dir(directory).map_err(|source| {
+        format!(
+            "failed to read skill directory {}: {}",
+            directory.display(),
+            source
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            format!(
+                "failed to read skill directory entry under {}: {}",
+                directory.display(),
+                source
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|source| {
+            format!(
+                "failed to read skill directory entry type under {}: {}",
+                directory.display(),
+                source
+            )
+        })?;
+
+        if file_type.is_dir() {
+            let nested_skill = entry.path().join("SKILL.md");
+            if nested_skill.is_file() {
+                candidates.push(nested_skill);
+            }
+        }
+    }
+
+    candidates.sort();
+
+    Ok(candidates)
+}
+
+fn parse_skill_file(path: &Path) -> Result<ParsedSkillFile, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|source| format!("failed to read skill file {}: {}", path.display(), source))?;
+
+    parse_skill_markdown(path, &content)
+}
+
+fn parse_skill_markdown(path: &Path, content: &str) -> Result<ParsedSkillFile, String> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut lines = content.lines();
+
+    if lines.next().map(str::trim) != Some("---") {
+        return Err(format!(
+            "skill file {} must start with YAML frontmatter delimiter '---'",
+            path.display()
+        ));
+    }
+
+    let mut frontmatter = Vec::new();
+    let mut has_closing_delimiter = false;
+    for line in lines.by_ref() {
+        if line.trim() == "---" {
+            has_closing_delimiter = true;
+            break;
+        }
+
+        frontmatter.push(line);
+    }
+
+    if !has_closing_delimiter {
+        return Err(format!(
+            "skill file {} is missing closing YAML frontmatter delimiter '---'",
+            path.display()
+        ));
+    }
+
+    let body = lines.collect::<Vec<_>>().join("\n").trim().to_string();
+    if body.is_empty() {
+        return Err(format!(
+            "skill file {} must contain instructions after frontmatter",
+            path.display()
+        ));
+    }
+
+    let id = skill_frontmatter_field(path, &frontmatter, "name")?;
+    validate_skill_id(&id).map_err(|error| format!("skill file {}: {}", path.display(), error))?;
+    let description = skill_frontmatter_field(path, &frontmatter, "description")?;
+
+    Ok(ParsedSkillFile {
+        id: id.clone(),
+        name: id,
+        description,
+        instructions: body,
+    })
+}
+
+fn skill_frontmatter_field(
+    path: &Path,
+    frontmatter: &[&str],
+    field: &str,
+) -> Result<String, String> {
+    for line in frontmatter {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+
+        if key.trim() != field {
+            continue;
+        }
+
+        let value = unquote_frontmatter_value(value.trim());
+        if value.trim().is_empty() {
+            return Err(format!(
+                "skill file {} frontmatter field '{}' must not be empty",
+                path.display(),
+                field
+            ));
+        }
+
+        return Ok(value.trim().to_string());
+    }
+
+    Err(format!(
+        "skill file {} frontmatter is missing required field '{}'",
+        path.display(),
+        field
+    ))
+}
+
+fn unquote_frontmatter_value(value: &str) -> String {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let quote = bytes[0];
+
+        if (quote == b'"' || quote == b'\'') && bytes[value.len() - 1] == quote {
+            return value[1..value.len() - 1].to_string();
+        }
+    }
+
+    value.to_string()
+}
+
+fn validate_skill_id(id: &str) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("skill id must not be empty".to_string());
+    }
+
+    if id.chars().any(char::is_whitespace) {
+        return Err(format!("skill id '{}' must not contain whitespace", id));
+    }
+
+    Ok(())
+}
+
+fn enabled_skill_prompts(config: &GlobalConfig) -> Result<Vec<SkillPromptInfo>, ApiError> {
+    let mut skills = Vec::new();
+    let disabled_ids = config
+        .skills
+        .disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let discovery = discover_skills(&config.workspaces, &config.skills.directories);
+    if let Some(error) = discovery.errors.first() {
+        return Err(ApiError::bad_request(format!(
+            "skill discovery failed for {}: {}",
+            error.path, error.message
+        )));
+    }
+
+    for skill in discovery
+        .skills
+        .iter()
+        .filter(|skill| !disabled_ids.contains(skill.id.as_str()))
+    {
+        let parsed = parse_skill_file(&skill.path).map_err(ApiError::bad_request)?;
+
+        if parsed.id != skill.id {
+            return Err(ApiError::bad_request(format!(
+                "enabled skill '{}' file now declares skill id '{}'",
+                skill.id, parsed.id
+            )));
+        }
+
+        skills.push(SkillPromptInfo {
+            id: parsed.id,
+            name: parsed.name,
+            description: parsed.description,
+            instructions: parsed.instructions,
+        });
+    }
+
+    Ok(skills)
 }
 
 fn mcp_server_state_name(state: McpServerState) -> &'static str {
@@ -3797,4 +4368,204 @@ fn frontend_dist_dir() -> Result<PathBuf, String> {
     }
 
     Ok(dist_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_skill_markdown_requires_description() {
+        let error = parse_skill_markdown(
+            Path::new("SKILL.md"),
+            "---
+name: gitmemo
+---
+
+# GitMemo
+",
+        )
+        .expect_err("missing description should fail");
+
+        assert!(error.contains("description"));
+    }
+
+    #[test]
+    fn enabled_skill_prompts_read_skill_instructions() {
+        let skill_dir = env::temp_dir().join(unique_id("foco-skill-test"));
+        let skill_file = skill_dir.join("SKILL.md");
+
+        fs::create_dir_all(&skill_dir).expect("skill test directory");
+        fs::write(
+            &skill_file,
+            "---
+name: gitmemo
+description: Project memory.
+---
+
+# GitMemo
+
+Search memory before repo work.
+",
+        )
+        .expect("skill file write");
+
+        let mut config = GlobalConfig::first_run(env::temp_dir());
+        config.skills.directories = vec![skill_dir.clone()];
+
+        let skills = enabled_skill_prompts(&config).expect("enabled skill prompts");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].id, "gitmemo");
+        assert!(skills[0].instructions.contains("Search memory"));
+
+        fs::remove_dir_all(skill_dir).expect("remove skill test directory");
+    }
+
+    #[test]
+    fn enabled_skill_prompts_skip_disabled_discovered_skills() {
+        let skill_dir = env::temp_dir().join(unique_id("foco-disabled-skill-test"));
+        let skill_file = skill_dir.join("SKILL.md");
+
+        fs::create_dir_all(&skill_dir).expect("skill test directory");
+        fs::write(
+            &skill_file,
+            "---
+name: gitmemo
+description: Project memory.
+---
+
+# GitMemo
+",
+        )
+        .expect("skill file write");
+
+        let mut config = GlobalConfig::first_run(env::temp_dir());
+        config.skills.directories = vec![skill_dir.clone()];
+        config.skills.disabled.push("gitmemo".to_string());
+
+        let skills = enabled_skill_prompts(&config).expect("enabled skill prompts");
+
+        assert!(skills.is_empty());
+
+        fs::remove_dir_all(skill_dir).expect("remove skill test directory");
+    }
+
+    #[test]
+    fn discover_skills_ignores_missing_directories() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-missing-skill-test"));
+        let missing_absolute = workspace_dir.join("missing-skills");
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let workspaces = vec![WorkspaceConfig {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            path: workspace_dir.clone(),
+        }];
+        let discovery = discover_skills(
+            &workspaces,
+            &[
+                missing_absolute,
+                PathBuf::from(".agents").join("skills"),
+                PathBuf::from(".claude").join("skills"),
+            ],
+        );
+
+        assert!(discovery.errors.is_empty());
+        assert!(discovery.skills.is_empty());
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn discover_skills_reports_non_directory_paths() {
+        let profile_dir = env::temp_dir().join(unique_id("foco-skill-file-path-test"));
+        let skill_path = profile_dir.join("skills");
+
+        fs::create_dir_all(&profile_dir).expect("profile directory");
+        fs::write(&skill_path, "not a directory").expect("skill path file write");
+
+        let discovery = discover_skills(&[], &[skill_path]);
+
+        assert_eq!(discovery.errors.len(), 1);
+        assert!(discovery.errors[0].message.contains("not a directory"));
+        assert!(discovery.skills.is_empty());
+
+        fs::remove_dir_all(profile_dir).expect("remove profile directory");
+    }
+
+    #[test]
+    fn manual_skill_save_keeps_hidden_disabled_ids() {
+        let discovered = vec![
+            test_skill_settings("gitmemo"),
+            test_skill_settings("newskill"),
+        ];
+        let disabled = normalize_manual_disabled_skill_ids(
+            Some(Vec::new()),
+            Some(vec!["newskill".to_string()]),
+            &discovered,
+            &["gitmemo".to_string()],
+        )
+        .expect("disabled skill ids");
+
+        assert_eq!(disabled, vec!["gitmemo"]);
+    }
+
+    #[test]
+    fn manual_skill_save_reenables_visible_disabled_ids() {
+        let discovered = vec![test_skill_settings("gitmemo")];
+        let disabled = normalize_manual_disabled_skill_ids(
+            Some(Vec::new()),
+            Some(vec!["gitmemo".to_string()]),
+            &discovered,
+            &["gitmemo".to_string()],
+        )
+        .expect("disabled skill ids");
+
+        assert!(disabled.is_empty());
+    }
+
+    #[test]
+    fn discover_skills_expands_workspace_relative_directories() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-skill-test"));
+        let skill_dir = workspace_dir.join(".agents").join("skills").join("gitmemo");
+        let skill_file = skill_dir.join("SKILL.md");
+
+        fs::create_dir_all(&skill_dir).expect("skill test directory");
+        fs::write(
+            &skill_file,
+            "---
+name: gitmemo
+description: Project memory.
+---
+
+# GitMemo
+",
+        )
+        .expect("skill file write");
+
+        let workspaces = vec![WorkspaceConfig {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            path: workspace_dir.clone(),
+        }];
+        let discovery = discover_skills(&workspaces, &[PathBuf::from(".agents").join("skills")]);
+
+        assert!(discovery.errors.is_empty());
+        assert_eq!(discovery.skills.len(), 1);
+        assert_eq!(discovery.skills[0].id, "gitmemo");
+        assert_eq!(discovery.skills[0].path, skill_file);
+
+        fs::remove_dir_all(workspace_dir).expect("remove skill test directory");
+    }
+
+    fn test_skill_settings(id: &str) -> SkillSettings {
+        SkillSettings {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: "Test skill.".to_string(),
+            path: env::temp_dir().join(id).join("SKILL.md"),
+        }
+    }
 }
