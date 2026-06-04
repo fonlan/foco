@@ -3,7 +3,9 @@ TODO.md
 
 .mem/
 .codegraph/
+.agents/
 target/
 node_modules/
 web/dist/
 *.tsbuildinfo
+skills-lock.json

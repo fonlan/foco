@@ -127,10 +127,12 @@ async fn run() -> AppResult<()> {
         .route("/api/workspaces/add", post(add_workspace))
         .route("/api/settings", get(settings))
         .route("/api/providers/manual", post(save_manual_provider))
+        .route("/api/providers/delete", post(delete_provider))
         .route("/api/providers/test", post(test_provider))
         .route("/api/model-metadata", get(model_metadata))
         .route("/api/model-metadata/refresh", post(refresh_model_metadata))
         .route("/api/models/manual", post(save_manual_model))
+        .route("/api/models/delete", post(delete_model))
         .route(
             "/api/workspaces/{workspace_id}/chat/stream",
             post(stream_chat_response),
@@ -343,6 +345,38 @@ async fn save_manual_provider(
     Ok(Json(settings_response(&config)))
 }
 
+async fn delete_provider(
+    State(state): State<AppState>,
+    Json(request): Json<DeleteSettingsItemRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let id = request.id.trim();
+
+    if id.is_empty() {
+        return Err(ApiError::bad_request("provider id must not be empty"));
+    }
+
+    let provider_count = config.providers.len();
+    config.providers.retain(|provider| provider.id != id);
+
+    if config.providers.len() == provider_count {
+        return Err(ApiError::bad_request(format!(
+            "provider was not found: {id}"
+        )));
+    }
+
+    for model in &mut config.models {
+        model.provider_ids.retain(|provider_id| provider_id != id);
+        if model.active_provider_id.as_deref() == Some(id) {
+            model.active_provider_id = model.provider_ids.first().cloned();
+        }
+    }
+
+    save_config(&state, config.clone())?;
+
+    Ok(Json(settings_response(&config)))
+}
+
 async fn test_provider(
     State(state): State<AppState>,
     Json(request): Json<TestProviderRequest>,
@@ -536,6 +570,36 @@ async fn save_manual_model(
         *stored_model = model;
     } else {
         config.models.push(model);
+    }
+
+    save_config(&state, config.clone())?;
+
+    let cache = read_model_metadata_cache(&state.model_metadata_file)
+        .map_err(ApiError::from_model_metadata_error)?;
+
+    Ok(Json(model_metadata_response(
+        cache,
+        &config,
+        &state.model_metadata_file,
+    )))
+}
+
+async fn delete_model(
+    State(state): State<AppState>,
+    Json(request): Json<DeleteSettingsItemRequest>,
+) -> Result<Json<ModelMetadataResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let id = request.id.trim();
+
+    if id.is_empty() {
+        return Err(ApiError::bad_request("model id must not be empty"));
+    }
+
+    let model_count = config.models.len();
+    config.models.retain(|model| model.id != id);
+
+    if config.models.len() == model_count {
+        return Err(ApiError::bad_request(format!("model was not found: {id}")));
     }
 
     save_config(&state, config.clone())?;
@@ -774,6 +838,12 @@ struct ManualProviderRequest {
 #[serde(rename_all = "camelCase")]
 struct TestProviderRequest {
     provider_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteSettingsItemRequest {
+    id: String,
 }
 
 #[derive(Deserialize)]

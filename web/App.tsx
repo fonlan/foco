@@ -19,6 +19,7 @@ import {
   Settings,
   SlidersHorizontal,
   Terminal,
+  Trash2,
   User,
   Wrench,
   X,
@@ -28,6 +29,7 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import {
   FormEvent,
+  CSSProperties,
   useCallback,
   useEffect,
   useMemo,
@@ -239,6 +241,7 @@ type ChatStreamEvent =
   | { type: "error"; message: string };
 
 type WorkspaceFormMode = "add" | "create";
+type SettingsSection = "models" | "providers";
 type ViewMode = "chat" | "settings" | "stats";
 
 type GitStatusFileSummary = {
@@ -292,6 +295,7 @@ export function App() {
   );
   const [viewMode, setViewMode] = useState<ViewMode>("chat");
   const [formMode, setFormMode] = useState<WorkspaceFormMode>("create");
+  const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
   const [draftMessage, setDraftMessage] = useState("");
@@ -300,6 +304,14 @@ export function App() {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
+  const [isDiffPanelOpen, setIsDiffPanelOpen] = useState(false);
+  const [diffPanelWidth, setDiffPanelWidth] = useState(400);
+  const [isResizingDiffPanel, setIsResizingDiffPanel] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(288);
+  const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+  const [terminalOpenWorkspaceIds, setTerminalOpenWorkspaceIds] = useState<
+    Set<string>
+  >(() => new Set());
   const [gitDiff, setGitDiff] = useState<GitDiffResponse | null>(null);
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
@@ -332,6 +344,9 @@ export function App() {
   );
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const selectedDiffText = formatDiffText(gitDiff);
+  const isTerminalOpen = activeWorkspace
+    ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
+    : false;
 
   const refreshWorkspaces = useCallback(async () => {
     setIsLoading(true);
@@ -414,8 +429,61 @@ export function App() {
       return;
     }
 
+    if (!isDiffPanelOpen) {
+      return;
+    }
+
     void loadGitDiff(activeWorkspace.id, selectedDiffPath);
-  }, [activeWorkspace?.id, loadGitDiff, selectedDiffPath]);
+  }, [activeWorkspace?.id, isDiffPanelOpen, loadGitDiff, selectedDiffPath]);
+
+  useEffect(() => {
+    if (!isResizingDiffPanel) {
+      return;
+    }
+
+    function handlePointerMove(event: PointerEvent) {
+      const nextWidth = window.innerWidth - event.clientX;
+      setDiffPanelWidth(Math.min(Math.max(nextWidth, 280), 720));
+    }
+
+    function handlePointerUp() {
+      setIsResizingDiffPanel(false);
+    }
+
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      document.body.style.cursor = "";
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [isResizingDiffPanel]);
+
+  useEffect(() => {
+    if (!isResizingSidebar) {
+      return;
+    }
+
+    function handlePointerMove(event: PointerEvent) {
+      setSidebarWidth(Math.min(Math.max(event.clientX, 232), 420));
+    }
+
+    function handlePointerUp() {
+      setIsResizingSidebar(false);
+    }
+
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      document.body.style.cursor = "";
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [isResizingSidebar]);
 
   useEffect(() => {
     setSelectedModelId((current) =>
@@ -459,6 +527,7 @@ export function App() {
       );
       setWorkspaceName("");
       setWorkspacePath("");
+      setIsWorkspaceDialogOpen(false);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -487,6 +556,32 @@ export function App() {
     setActiveChatId(null);
     setMessages([]);
     setSelectedDiffPath(null);
+  }
+
+  function startNewWorkspaceChat(workspaceId: string) {
+    setActiveWorkspaceId(workspaceId);
+    setActiveChatId(null);
+    setMessages([]);
+    setSelectedDiffPath(null);
+    setViewMode("chat");
+  }
+
+  function toggleWorkspaceTerminal() {
+    if (!activeWorkspace) {
+      return;
+    }
+
+    setTerminalOpenWorkspaceIds((current) => {
+      const next = new Set(current);
+
+      if (next.has(activeWorkspace.id)) {
+        next.delete(activeWorkspace.id);
+      } else {
+        next.add(activeWorkspace.id);
+      }
+
+      return next;
+    });
   }
 
   async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
@@ -727,18 +822,63 @@ export function App() {
     });
   }
 
+  function openWorkspaceDialog(mode: WorkspaceFormMode) {
+    setFormMode(mode);
+    setWorkspaceName("");
+    setWorkspacePath("");
+    setError(null);
+    setIsWorkspaceDialogOpen(true);
+  }
+
   return (
-    <main className="min-h-screen bg-zinc-100 text-zinc-950">
-      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[18rem_minmax(0,1fr)_24rem]">
-        <aside className="border-b border-zinc-200 bg-white lg:border-b-0 lg:border-r">
-          <div className="flex h-full flex-col">
-            <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3">
-              <div className="flex min-w-0 items-center gap-2">
-                <Activity aria-hidden="true" className="size-5 text-teal-700" />
-                <span className="truncate text-base font-semibold">Foco</span>
+    <main className="app-root text-stone-950">
+      <div
+        className={`app-shell ${isDiffPanelOpen ? "app-shell-with-diff" : ""}`}
+        style={
+          {
+            "--diff-panel-width": `${diffPanelWidth}px`,
+            "--sidebar-width": `${sidebarWidth}px`,
+          } as CSSProperties
+        }
+      >
+        <aside className="workspace-sidebar relative border-stone-200/80 lg:border-r">
+          <div
+            aria-label="Resize workspace sidebar"
+            aria-orientation="vertical"
+            className="absolute bottom-0 right-0 top-0 z-10 hidden w-1 cursor-col-resize bg-transparent hover:bg-teal-500/40 lg:block"
+            onKeyDown={(event) => {
+              if (event.key === "ArrowLeft") {
+                event.preventDefault();
+                setSidebarWidth((current) => Math.max(current - 24, 232));
+              }
+
+              if (event.key === "ArrowRight") {
+                event.preventDefault();
+                setSidebarWidth((current) => Math.min(current + 24, 420));
+              }
+            }}
+            onPointerDown={() => setIsResizingSidebar(true)}
+            role="separator"
+            tabIndex={0}
+          />
+          <div className="flex h-full min-h-0 flex-col">
+            <div className="flex items-center justify-between border-b border-stone-200/80 px-4 py-3">
+              <div className="flex min-w-0 items-center gap-3">
+                <span className="inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_10px_24px_rgba(15,118,110,0.24)]">
+                  <Activity aria-hidden="true" className="size-5" />
+                </span>
+                <div className="min-w-0">
+                  <span className="block truncate text-lg font-semibold">
+                    Foco
+                  </span>
+                  <span className="block truncate text-xs text-stone-500">
+                    Local workspace
+                  </span>
+                </div>
               </div>
               <button
-                className="inline-flex size-8 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-700 transition hover:bg-zinc-50"
+                aria-label="Refresh workspaces"
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
                 disabled={isLoading}
                 onClick={() => void refreshWorkspaces()}
                 title="Refresh workspaces"
@@ -755,69 +895,17 @@ export function App() {
               </button>
             </div>
 
-            <div className="flex gap-2 border-b border-zinc-200 px-4 py-3">
+            <div className="border-b border-stone-200/80 px-4 py-2">
               <button
-                className={workspaceModeClass(formMode === "create")}
-                onClick={() => setFormMode("create")}
-                type="button"
-              >
-                <Plus aria-hidden="true" className="size-4" />
-                New
-              </button>
-              <button
-                className={workspaceModeClass(formMode === "add")}
-                onClick={() => setFormMode("add")}
+                aria-label="Create or add workspace"
+                className={`${workspaceActionClass()} w-full`}
+                onClick={() => openWorkspaceDialog("create")}
+                title="Create or add workspace"
                 type="button"
               >
                 <FolderPlus aria-hidden="true" className="size-4" />
-                Add
               </button>
             </div>
-
-            <form
-              className="space-y-2 border-b border-zinc-200 px-4 py-3"
-              onSubmit={(event) => void handleWorkspaceSubmit(event)}
-            >
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-zinc-600">
-                  Name
-                </span>
-                <input
-                  className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) => setWorkspaceName(event.target.value)}
-                  placeholder="Workspace name"
-                  value={workspaceName}
-                />
-              </label>
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-zinc-600">
-                  Path
-                </span>
-                <input
-                  className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) => setWorkspacePath(event.target.value)}
-                  placeholder="C:\\Users\\name\\workspace"
-                  value={workspacePath}
-                />
-              </label>
-              <button
-                className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-teal-700 px-3 text-sm font-medium text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
-                disabled={isSavingWorkspace}
-                type="submit"
-              >
-                {isSavingWorkspace ? (
-                  <LoaderCircle
-                    aria-hidden="true"
-                    className="size-4 animate-spin"
-                  />
-                ) : formMode === "create" ? (
-                  <Plus aria-hidden="true" className="size-4" />
-                ) : (
-                  <FolderPlus aria-hidden="true" className="size-4" />
-                )}
-                {formMode === "create" ? "Create Workspace" : "Add Workspace"}
-              </button>
-            </form>
 
             {error ? (
               <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
@@ -825,16 +913,22 @@ export function App() {
               </div>
             ) : null}
 
-            <nav className="min-h-0 flex-1 overflow-y-auto px-2 py-3">
-              {workspaces.map((workspace) => {
+            <nav className="panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3">
+              {workspaces.length ? (
+                workspaces.map((workspace) => {
                 const isExpanded = expandedWorkspaceIds.has(workspace.id);
                 const isActive = workspace.id === activeWorkspace?.id;
 
                 return (
-                  <div className="mb-1" key={workspace.id}>
+                  <div className="mb-1.5" key={workspace.id}>
                     <div className="flex items-center gap-1">
                       <button
-                        className="inline-flex size-8 items-center justify-center rounded-md text-zinc-500 transition hover:bg-zinc-100"
+                        aria-label={
+                          isExpanded
+                            ? "Collapse chat history"
+                            : "Expand chat history"
+                        }
+                        className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 hover:bg-stone-100 hover:text-stone-900"
                         onClick={() => toggleWorkspace(workspace.id)}
                         title={
                           isExpanded
@@ -862,13 +956,22 @@ export function App() {
                           {workspace.name}
                         </span>
                       </button>
+                      <button
+                        aria-label={`New chat in ${workspace.name}`}
+                        className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 hover:bg-teal-50 hover:text-teal-800"
+                        onClick={() => startNewWorkspaceChat(workspace.id)}
+                        title="New chat"
+                        type="button"
+                      >
+                        <Plus aria-hidden="true" className="size-4" />
+                      </button>
                     </div>
                     {isExpanded ? (
                       <div className="ml-9 mt-1 space-y-1">
                         {workspace.chats.length > 0 ? (
                           workspace.chats.map((chat) => (
                             <button
-                              className="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-950"
+                              className="flex w-full min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-stone-600 hover:bg-white/80 hover:text-stone-950"
                               key={chat.id}
                               onClick={() =>
                                 void loadChatMessages(workspace.id, chat.id)
@@ -883,7 +986,7 @@ export function App() {
                             </button>
                           ))
                         ) : (
-                          <div className="rounded-md px-2 py-1.5 text-xs text-zinc-500">
+                          <div className="rounded-lg px-2 py-1.5 text-xs text-stone-500">
                             No chats
                           </div>
                         )}
@@ -891,23 +994,28 @@ export function App() {
                     ) : null}
                   </div>
                 );
-              })}
+                })
+              ) : (
+                <div className="mx-2 rounded-lg border border-dashed border-stone-300 bg-white/60 px-3 py-4 text-sm text-stone-500">
+                  {isLoading ? "Loading workspaces..." : "No workspaces"}
+                </div>
+              )}
             </nav>
           </div>
         </aside>
 
-        <section className="flex min-h-screen min-w-0 flex-col bg-zinc-50">
-          <header className="border-b border-zinc-200 bg-white px-5 py-3">
+        <section className="app-main-panel flex min-w-0 flex-col">
+          <header className="border-b border-stone-200/80 bg-white/80 px-4 py-2 backdrop-blur sm:px-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
-                <h1 className="truncate text-base font-semibold">
+                <h1 className="truncate text-lg font-semibold text-stone-950">
                   {activeWorkspace?.name ?? "Workspace"}
                 </h1>
-                <p className="mt-1 truncate text-xs text-zinc-500">
+                <p className="mt-1 truncate text-xs font-medium text-stone-500">
                   {activeWorkspace?.path ?? ""}
                 </p>
               </div>
-              <div className="flex rounded-md border border-zinc-200 bg-zinc-50 p-1">
+              <div className="flex overflow-x-auto rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
                 <NavButton
                   active={viewMode === "chat"}
                   icon={MessageSquare}
@@ -923,16 +1031,42 @@ export function App() {
                 <NavButton
                   active={viewMode === "stats"}
                   icon={BarChart3}
-                  label="AI Stats"
+                  label="Stats"
                   onClick={() => setViewMode("stats")}
                 />
+                <button
+                  aria-label={isTerminalOpen ? "Close terminal" : "Open terminal"}
+                  className={`inline-flex size-9 items-center justify-center rounded-lg ${
+                    isTerminalOpen
+                      ? "bg-white text-teal-900 shadow-sm"
+                      : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
+                  } disabled:cursor-not-allowed disabled:text-stone-400`}
+                  disabled={!activeWorkspace}
+                  onClick={toggleWorkspaceTerminal}
+                  title={isTerminalOpen ? "Close terminal" : "Open terminal"}
+                  type="button"
+                >
+                  <Terminal aria-hidden="true" className="size-4" />
+                </button>
+                <button
+                  aria-label={isDiffPanelOpen ? "Close git diff" : "Open git diff"}
+                  className={`inline-flex size-9 items-center justify-center rounded-lg ${
+                    isDiffPanelOpen
+                      ? "bg-white text-teal-900 shadow-sm"
+                      : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
+                  }`}
+                  onClick={() => setIsDiffPanelOpen((current) => !current)}
+                  title={isDiffPanelOpen ? "Close git diff" : "Open git diff"}
+                  type="button"
+                >
+                  <GitCompare aria-hidden="true" className="size-4" />
+                </button>
               </div>
             </div>
           </header>
 
           {viewMode === "chat" ? (
             <ChatPanel
-              activeWorkspace={activeWorkspace}
               availableModels={availableModels}
               draftMessage={draftMessage}
               isLoadingSettings={isLoadingSettings}
@@ -952,32 +1086,206 @@ export function App() {
           ) : viewMode === "settings" ? (
             <SettingsPanel />
           ) : (
-            <PlaceholderPanel icon={BarChart3} title="AI Statistics" />
+            <ApiStatsPanel
+              activeWorkspace={activeWorkspace}
+              availableModels={availableModels}
+              settings={settings}
+            />
           )}
+          {isTerminalOpen ? (
+            <TerminalPanel workspace={activeWorkspace} />
+          ) : null}
         </section>
 
-        <aside className="min-h-96 min-w-0 border-t border-zinc-200 bg-white lg:min-h-screen lg:border-l lg:border-t-0">
+        {isDiffPanelOpen ? (
+        <aside className="diff-sidebar min-w-0 border-stone-200/80 lg:border-l">
           <GitDiffPanel
             diffError={diffError}
             diffText={selectedDiffText}
             files={gitDiff?.files ?? []}
             isLoading={isLoadingDiff}
+            onClose={() => setIsDiffPanelOpen(false)}
             onRefresh={() => {
               if (activeWorkspace?.id) {
                 void loadGitDiff(activeWorkspace.id, selectedDiffPath);
               }
             }}
+            onResizeBy={(delta) =>
+              setDiffPanelWidth((current) =>
+                Math.min(Math.max(current + delta, 280), 720),
+              )
+            }
+            onResizeStart={() => setIsResizingDiffPanel(true)}
             onSelectFile={setSelectedDiffPath}
             selectedPath={selectedDiffPath}
           />
         </aside>
+        ) : null}
       </div>
+      {isWorkspaceDialogOpen ? (
+        <WorkspaceDialog
+          formMode={formMode}
+          isSaving={isSavingWorkspace}
+          name={workspaceName}
+          onClose={() => setIsWorkspaceDialogOpen(false)}
+          onModeChange={setFormMode}
+          onNameChange={setWorkspaceName}
+          onPathChange={setWorkspacePath}
+          onSubmit={handleWorkspaceSubmit}
+          path={workspacePath}
+        />
+      ) : null}
     </main>
   );
 }
 
+function WorkspaceDialog({
+  formMode,
+  isSaving,
+  name,
+  onClose,
+  onModeChange,
+  onNameChange,
+  onPathChange,
+  onSubmit,
+  path,
+}: {
+  formMode: WorkspaceFormMode;
+  isSaving: boolean;
+  name: string;
+  onClose: () => void;
+  onModeChange: (mode: WorkspaceFormMode) => void;
+  onNameChange: (value: string) => void;
+  onPathChange: (value: string) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  path: string;
+}) {
+  const title =
+    formMode === "create" ? "Create workspace" : "Add existing workspace";
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
+      role="presentation"
+    >
+      <section
+        aria-labelledby="workspace-dialog-title"
+        aria-modal="true"
+        className="w-full max-w-lg overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        role="dialog"
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+          <div className="min-w-0">
+            <h2
+              className="truncate text-base font-semibold text-stone-950"
+              id="workspace-dialog-title"
+            >
+              {title}
+            </h2>
+            <p className="mt-1 truncate text-xs font-medium text-stone-500">
+              {formMode === "create"
+                ? "Create and register a new local folder."
+                : "Register an existing local folder."}
+            </p>
+          </div>
+          <button
+            aria-label="Close workspace dialog"
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            onClick={onClose}
+            title="Close"
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2 border-b border-stone-200 bg-stone-50/80 px-4 py-3">
+          <button
+            aria-label="Switch to create workspace"
+            className={workspaceModeClass(formMode === "create")}
+            onClick={() => onModeChange("create")}
+            title="Create workspace"
+            type="button"
+          >
+            <Plus aria-hidden="true" className="size-4" />
+          </button>
+          <button
+            aria-label="Switch to add workspace"
+            className={workspaceModeClass(formMode === "add")}
+            onClick={() => onModeChange("add")}
+            title="Add workspace"
+            type="button"
+          >
+            <FolderPlus aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+
+        <form
+          className="space-y-4 px-4 py-4"
+          onSubmit={(event) => void onSubmit(event)}
+        >
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+              Name
+            </span>
+            <input
+              autoComplete="off"
+              className="h-11 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+              name="workspace-name"
+              onChange={(event) => onNameChange(event.target.value)}
+              placeholder="Workspace name"
+              value={name}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+              Path
+            </span>
+            <input
+              autoComplete="off"
+              className="h-11 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+              name="workspace-path"
+              onChange={(event) => onPathChange(event.target.value)}
+              placeholder="C:\\Users\\name\\workspace"
+              value={path}
+            />
+          </label>
+          <div className="flex justify-end gap-2">
+            <button
+              aria-label="Cancel workspace dialog"
+              className="inline-flex size-11 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+              onClick={onClose}
+              title="Cancel"
+              type="button"
+            >
+              <X aria-hidden="true" className="size-4" />
+            </button>
+            <button
+              aria-label={title}
+              className="inline-flex size-11 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+              disabled={isSaving}
+              title={title}
+              type="submit"
+            >
+              {isSaving ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="size-4 animate-spin"
+                />
+              ) : formMode === "create" ? (
+                <Plus aria-hidden="true" className="size-4" />
+              ) : (
+                <FolderPlus aria-hidden="true" className="size-4" />
+              )}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function ChatPanel({
-  activeWorkspace,
   availableModels,
   canRetryRun,
   draftMessage,
@@ -994,7 +1302,6 @@ function ChatPanel({
   selectedThinkingLevel,
   thinkingLevels,
 }: {
-  activeWorkspace: WorkspaceSummary | undefined;
   availableModels: ConfiguredModelSummary[];
   canRetryRun: boolean;
   draftMessage: string;
@@ -1013,8 +1320,8 @@ function ChatPanel({
 }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
-        <div className="mx-auto flex max-w-4xl flex-col gap-3">
+      <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4">
+        <div className="mx-auto flex w-full max-w-5xl flex-col gap-4">
           {messages.length ? (
             messages.map((message) => {
             const isUser = message.role === "user";
@@ -1025,17 +1332,17 @@ function ChatPanel({
                 key={message.id}
               >
                 <div
-                  className={`flex max-w-[78%] gap-3 rounded-md border px-4 py-3 shadow-sm ${
+                  className={`flex max-w-[min(42rem,92%)] gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
                     isUser
-                      ? "border-teal-200 bg-teal-700 text-white"
-                      : "border-zinc-200 bg-white text-zinc-900"
+                      ? "rounded-tr-md border-teal-700 bg-teal-800 text-white"
+                      : "rounded-tl-md border-stone-200 bg-white/90 text-stone-900"
                   }`}
                 >
                   <div
-                    className={`mt-0.5 inline-flex size-7 shrink-0 items-center justify-center rounded-md ${
+                    className={`mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${
                       isUser
-                        ? "bg-teal-800 text-white"
-                        : "bg-zinc-100 text-zinc-700"
+                        ? "bg-teal-950/45 text-white"
+                        : "bg-stone-100 text-stone-700"
                     }`}
                   >
                     {isUser ? (
@@ -1067,29 +1374,30 @@ function ChatPanel({
             );
             })
           ) : (
-            <div className="flex justify-start">
-              <div className="flex max-w-[78%] gap-3 rounded-md border border-zinc-200 bg-white px-4 py-3 text-zinc-600 shadow-sm">
-                <div className="mt-0.5 inline-flex size-7 shrink-0 items-center justify-center rounded-md bg-zinc-100 text-zinc-700">
-                  <Bot aria-hidden="true" className="size-4" />
-                </div>
-                <p className="min-w-0 whitespace-pre-wrap break-words text-sm leading-6">
-                  Workspace shell is ready.
-                </p>
+            <div className="mx-auto flex min-h-[22rem] w-full max-w-xl flex-col items-center justify-center rounded-2xl border border-dashed border-stone-300 bg-white/60 px-6 py-10 text-center shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <div className="inline-flex size-11 items-center justify-center rounded-2xl bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]">
+                <Bot aria-hidden="true" className="size-5" />
               </div>
+              <h2 className="mt-4 text-base font-semibold text-stone-950">
+                Workspace shell is ready
+              </h2>
+              <p className="mt-2 max-w-sm text-sm leading-6 text-stone-600">
+                Pick an enabled model and start the current workspace chat.
+              </p>
             </div>
           )}
         </div>
       </div>
 
-      <div className="border-t border-zinc-200 bg-white px-5 py-3">
-        <form className="mx-auto max-w-4xl" onSubmit={onSubmit}>
-          <div className="mb-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_12rem]">
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-zinc-600">
+      <div className="border-t border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-5">
+        <form className="mx-auto max-w-5xl" onSubmit={onSubmit}>
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <label className="min-w-0 flex-1 sm:max-w-64">
+              <span className="sr-only">
                 Model
               </span>
               <select
-                className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                className="h-8 w-full rounded-lg border border-stone-300 bg-white px-2 text-xs font-medium text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                 disabled={isLoadingSettings || isSendingMessage}
                 onChange={(event) => onModelChange(event.target.value)}
                 value={selectedModelId}
@@ -1105,12 +1413,12 @@ function ChatPanel({
                 )}
               </select>
             </label>
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-zinc-600">
+            <label className="w-36 max-w-full">
+              <span className="sr-only">
                 Thinking
               </span>
               <select
-                className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                className="h-8 w-full rounded-lg border border-stone-300 bg-white px-2 text-xs font-medium text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                 disabled={isSendingMessage}
                 onChange={(event) => onThinkingLevelChange(event.target.value)}
                 value={selectedThinkingLevel}
@@ -1123,51 +1431,50 @@ function ChatPanel({
                 ))}
               </select>
             </label>
+            {canRetryRun ? (
+              <button
+                aria-label="Retry last run"
+                className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                onClick={onRetryRun}
+                title="Retry last run"
+                type="button"
+              >
+                <RefreshCw aria-hidden="true" className="size-4" />
+              </button>
+            ) : null}
           </div>
-          <div className="flex gap-2">
+          <div className="relative">
             <textarea
-              className="min-h-20 flex-1 resize-none rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm leading-6 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+              className="min-h-20 w-full resize-none rounded-xl border border-stone-300 bg-white px-3 py-2 pb-10 pr-14 text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
               disabled={isSendingMessage}
+              name="message"
               onChange={(event) => onDraftMessageChange(event.target.value)}
               placeholder="Message Foco"
               value={draftMessage}
             />
-            <button
-              className="inline-flex h-20 w-12 items-center justify-center rounded-md border border-rose-200 bg-white text-rose-700 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:border-zinc-200 disabled:text-zinc-400"
-              disabled={!isSendingMessage}
-              onClick={onCancelRun}
-              title="Cancel run"
-              type="button"
-            >
-              <X aria-hidden="true" className="size-5" />
-            </button>
-            <button
-              className="inline-flex h-20 w-12 items-center justify-center rounded-md bg-teal-700 text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
-              disabled={
-                isSendingMessage || !draftMessage.trim() || !selectedModelId
-              }
-              title="Send"
-              type="submit"
-            >
-              {isSendingMessage ? (
-                <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
-              ) : (
+            {isSendingMessage ? (
+              <button
+                aria-label="Cancel run"
+                className="absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                onClick={onCancelRun}
+                title="Cancel run"
+                type="button"
+              >
+                <X aria-hidden="true" className="size-5" />
+              </button>
+            ) : (
+              <button
+                aria-label="Send message"
+                className="absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                disabled={!draftMessage.trim() || !selectedModelId}
+                title="Send"
+                type="submit"
+              >
                 <Send aria-hidden="true" className="size-5" />
-              )}
-            </button>
+              </button>
+            )}
           </div>
-          {canRetryRun ? (
-            <button
-              className="mt-2 inline-flex h-8 items-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-xs font-medium text-zinc-700 transition hover:bg-zinc-50"
-              onClick={onRetryRun}
-              type="button"
-            >
-              <RefreshCw aria-hidden="true" className="size-3.5" />
-              Retry last run
-            </button>
-          ) : null}
         </form>
-        <TerminalPanel workspace={activeWorkspace} />
       </div>
     </div>
   );
@@ -1175,37 +1482,37 @@ function ChatPanel({
 
 function ToolCallList({ toolCalls }: { toolCalls: ChatToolCallSummary[] }) {
   return (
-    <div className="space-y-2 border-t border-zinc-200 pt-2">
+    <div className="space-y-2 border-t border-stone-200 pt-2">
       {toolCalls.map((toolCall) => (
         <details className="group min-w-0" key={toolCall.id}>
-          <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-zinc-700 marker:hidden">
+          <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-semibold text-stone-700 marker:hidden">
             <Wrench aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
             <span className="min-w-0 flex-1 truncate">{toolCall.name}</span>
             <span
-              className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] ${
+              className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] ${
                 toolCall.isError
                   ? "bg-rose-50 text-rose-700"
-                  : "bg-zinc-100 text-zinc-600"
+                  : "bg-stone-100 text-stone-600"
               }`}
             >
               {toolStatusText(toolCall)}
             </span>
           </summary>
-          <div className="mt-2 grid gap-2 text-xs text-zinc-600">
+          <div className="mt-2 grid gap-2 text-xs text-stone-600">
             <div className="min-w-0">
-              <div className="mb-1 font-medium text-zinc-500">Input</div>
-              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-zinc-200 pl-3 font-mono text-[11px] leading-5">
+              <div className="mb-1 font-semibold text-stone-500">Input</div>
+              <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
                 {formatJsonValue(toolCall.input)}
               </pre>
             </div>
             {toolCall.output !== null ? (
               <div className="min-w-0">
-                <div className="mb-1 font-medium text-zinc-500">Output</div>
+                <div className="mb-1 font-semibold text-stone-500">Output</div>
                 <pre
-                  className={`max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
+                  className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
                     toolCall.isError
                       ? "border-rose-200 text-rose-700"
-                      : "border-zinc-200"
+                      : "border-stone-200"
                   }`}
                 >
                   {formatJsonValue(toolCall.output)}
@@ -1220,7 +1527,6 @@ function ToolCallList({ toolCalls }: { toolCalls: ChatToolCallSummary[] }) {
 }
 
 function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined }) {
-  const [isOpen, setIsOpen] = useState(false);
   const [cwd, setCwd] = useState("");
   const [status, setStatus] = useState<"closed" | "connected" | "connecting" | "error">(
     "closed",
@@ -1235,7 +1541,7 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
   const workspacePath = workspace?.path ?? "";
 
   useEffect(() => {
-    if (!isOpen || !workspaceId) {
+    if (!workspaceId) {
       return;
     }
 
@@ -1248,9 +1554,9 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
       fontSize: 13,
       rows: 12,
       theme: {
-        background: "#18181b",
-        foreground: "#f4f4f5",
-        cursor: "#2dd4bf",
+        background: "#16130f",
+        foreground: "#f7f3ea",
+        cursor: "#14b8a6",
       },
     });
     const fitAddon = new FitAddon();
@@ -1385,70 +1691,131 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
       fitAddonRef.current = null;
       resizeObserverRef.current = null;
     };
-  }, [isOpen, workspaceId]);
-
-  useEffect(() => {
-    if (!isOpen) {
-      setStatus("closed");
-      setError(null);
-      setCwd("");
-    }
-  }, [isOpen]);
-
-  useEffect(() => {
-    setIsOpen(false);
   }, [workspaceId]);
 
-  const isDisabled = !workspace;
-
   return (
-    <section className="mx-auto mt-3 w-full max-w-4xl overflow-hidden rounded-md border border-zinc-200 bg-zinc-50">
-      <button
-        className="flex h-9 w-full items-center justify-between px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-400"
-        disabled={isDisabled}
-        onClick={() => setIsOpen((current) => !current)}
-        type="button"
-      >
-        <span className="inline-flex min-w-0 items-center gap-2">
-          <Terminal aria-hidden="true" className="size-4 shrink-0" />
-          <span className="truncate">Terminal</span>
-          <span className={terminalStatusClass(status)}>{terminalStatusText(status)}</span>
-        </span>
-        {isOpen ? (
-          <ChevronDown aria-hidden="true" className="size-4" />
-        ) : (
-          <ChevronRight aria-hidden="true" className="size-4" />
-        )}
-      </button>
-      {isOpen ? (
-        <div className="border-t border-zinc-200 bg-zinc-950">
-          <div className="flex h-8 items-center justify-between gap-3 border-b border-zinc-800 px-3 text-xs text-zinc-400">
+    <section className="border-t border-stone-800 bg-[#16130f]">
+      <div className="mx-auto w-full max-w-5xl">
+        <div className="flex h-8 items-center justify-between gap-3 px-3 text-xs text-stone-400">
+          <span className="inline-flex min-w-0 items-center gap-2">
+            <Terminal aria-hidden="true" className="size-4 shrink-0" />
+            <span className={terminalStatusClass(status)}>
+              {terminalStatusText(status)}
+            </span>
             <span className="min-w-0 truncate">{cwd || workspacePath}</span>
-            {error ? (
-              <span className="shrink-0 text-rose-300">{error}</span>
-            ) : null}
-          </div>
-          <div ref={containerRef} className="h-56 min-w-0 p-2" />
+          </span>
+          {error ? (
+            <span className="shrink-0 text-rose-300">{error}</span>
+          ) : null}
         </div>
-      ) : null}
+        <div ref={containerRef} className="h-56 min-w-0 p-2" />
+      </div>
     </section>
   );
 }
 
-function PlaceholderPanel({
-  icon: Icon,
-  title,
+function ApiStatsPanel({
+  activeWorkspace,
+  availableModels,
+  settings,
 }: {
-  icon: typeof Settings;
-  title: string;
+  activeWorkspace: WorkspaceSummary | undefined;
+  availableModels: ConfiguredModelSummary[];
+  settings: SettingsResponse | null;
 }) {
+  const enabledProviders =
+    settings?.providers.filter((provider) => provider.enabled).length ?? 0;
+  const configuredModels = settings?.configuredModels.length ?? 0;
+  const chatCount = activeWorkspace?.chats.length ?? 0;
+
   return (
-    <div className="grid min-h-0 flex-1 place-items-center p-6">
-      <div className="flex items-center gap-3 rounded-md border border-zinc-200 bg-white px-4 py-3 text-zinc-700 shadow-sm">
-        <Icon aria-hidden="true" className="size-5 text-teal-700" />
-        <span className="text-sm font-medium">{title}</span>
+    <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
+      <div className="mx-auto flex max-w-6xl flex-col gap-5">
+        <section className="rounded-2xl border border-stone-200 bg-white/80 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="inline-flex size-10 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
+              <BarChart3 aria-hidden="true" className="size-5" />
+            </span>
+            <div className="min-w-0">
+              <h2 className="truncate text-lg font-semibold text-stone-950">
+                API statistics
+              </h2>
+              <p className="mt-1 truncate text-xs font-medium text-stone-500">
+                {activeWorkspace?.name ?? "No workspace selected"}
+              </p>
+            </div>
+          </div>
+        </section>
+
+        <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+          <StatsCard
+            icon={Activity}
+            label="Workspace chats"
+            value={formatNumber(chatCount)}
+          />
+          <StatsCard
+            icon={PlugZap}
+            label="Enabled providers"
+            value={formatNumber(enabledProviders)}
+          />
+          <StatsCard
+            icon={Bot}
+            label="Runnable models"
+            value={formatNumber(availableModels.length)}
+          />
+          <StatsCard
+            icon={SlidersHorizontal}
+            label="Configured models"
+            value={formatNumber(configuredModels)}
+          />
+        </section>
+
+        <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+          <div className="border-b border-stone-200 px-4 py-3">
+            <h3 className="text-sm font-semibold text-stone-950">
+              Request audit
+            </h3>
+          </div>
+          <div className="grid gap-3 px-4 py-8 text-sm text-stone-600 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+            <div className="min-w-0">
+              <div className="font-semibold text-stone-900">
+                No API request table is exposed yet
+              </div>
+              <p className="mt-1 max-w-2xl leading-6">
+                The app records LLM request audit rows in the workspace
+                database. This page now has a dedicated surface ready for the
+                request-summary API when it is added.
+              </p>
+            </div>
+            <span className="inline-flex h-9 items-center rounded-lg border border-dashed border-stone-300 px-3 text-xs font-semibold text-stone-500">
+              audit data pending
+            </span>
+          </div>
+        </section>
       </div>
     </div>
+  );
+}
+
+function StatsCard({
+  icon: Icon,
+  label,
+  value,
+}: {
+  icon: typeof Settings;
+  label: string;
+  value: string;
+}) {
+  return (
+    <article className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-sm font-semibold text-stone-600">{label}</span>
+        <Icon aria-hidden="true" className="size-4 text-teal-700" />
+      </div>
+      <div className="mt-4 font-mono text-3xl font-semibold text-stone-950">
+        {value}
+      </div>
+    </article>
   );
 }
 
@@ -1457,7 +1824,10 @@ function GitDiffPanel({
   diffText,
   files,
   isLoading,
+  onClose,
   onRefresh,
+  onResizeBy,
+  onResizeStart,
   onSelectFile,
   selectedPath,
 }: {
@@ -1465,35 +1835,71 @@ function GitDiffPanel({
   diffText: string;
   files: GitStatusFileSummary[];
   isLoading: boolean;
+  onClose: () => void;
   onRefresh: () => void;
+  onResizeBy: (delta: number) => void;
+  onResizeStart: () => void;
   onSelectFile: (path: string | null) => void;
   selectedPath: string | null;
 }) {
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div className="flex items-center justify-between gap-3 border-b border-zinc-200 px-4 py-3">
+    <div className="relative flex h-full min-h-0 min-w-0 flex-col">
+      <div
+        aria-label="Resize git diff panel"
+        aria-orientation="vertical"
+        className="absolute bottom-0 left-0 top-0 hidden w-1 cursor-col-resize bg-transparent hover:bg-teal-500/40 lg:block"
+        onKeyDown={(event) => {
+          if (event.key === "ArrowLeft") {
+            event.preventDefault();
+            onResizeBy(24);
+          }
+
+          if (event.key === "ArrowRight") {
+            event.preventDefault();
+            onResizeBy(-24);
+          }
+        }}
+        onPointerDown={onResizeStart}
+        role="separator"
+        tabIndex={0}
+      />
+      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-4">
         <div className="flex min-w-0 items-center gap-2">
-          <GitCompare aria-hidden="true" className="size-5 shrink-0 text-teal-700" />
+          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
+            <GitCompare aria-hidden="true" className="size-5" />
+          </span>
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold">Git Diff</h2>
-            <p className="truncate text-xs text-zinc-500">
+            <h2 className="truncate text-sm font-semibold">Git diff</h2>
+            <p className="truncate text-xs font-medium text-stone-500">
               {selectedPath ?? "Workspace changes"}
             </p>
           </div>
         </div>
-        <button
-          className="inline-flex size-8 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-700 transition hover:bg-zinc-50 disabled:cursor-not-allowed disabled:bg-zinc-100"
-          disabled={isLoading}
-          onClick={onRefresh}
-          title="Refresh diff"
-          type="button"
-        >
-          {isLoading ? (
-            <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-          ) : (
-            <RefreshCw aria-hidden="true" className="size-4" />
-          )}
-        </button>
+        <div className="flex shrink-0 gap-2">
+          <button
+            aria-label="Refresh diff"
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+            disabled={isLoading}
+            onClick={onRefresh}
+            title="Refresh diff"
+            type="button"
+          >
+            {isLoading ? (
+              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+            ) : (
+              <RefreshCw aria-hidden="true" className="size-4" />
+            )}
+          </button>
+          <button
+            aria-label="Close git diff"
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            onClick={onClose}
+            title="Close git diff"
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </div>
       </div>
 
       {diffError ? (
@@ -1502,16 +1908,16 @@ function GitDiffPanel({
         </div>
       ) : null}
 
-      <div className="border-b border-zinc-200 px-3 py-3">
+      <div className="border-b border-stone-200/80 px-3 py-3">
         <button
           className={diffFileButtonClass(selectedPath === null)}
           onClick={() => onSelectFile(null)}
           type="button"
         >
           <span className="truncate">All changed files</span>
-          <span className="text-xs text-zinc-500">{files.length}</span>
+          <span className="text-xs text-stone-500">{files.length}</span>
         </button>
-        <div className="mt-2 max-h-56 space-y-1 overflow-y-auto">
+        <div className="panel-scroll mt-2 max-h-56 space-y-1 overflow-y-auto">
           {files.length ? (
             files.map((file) => (
               <button
@@ -1523,21 +1929,21 @@ function GitDiffPanel({
                 <span className="min-w-0 flex-1 truncate text-left">
                   {file.path}
                 </span>
-                <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 font-mono text-[11px] text-zinc-600">
+                <span className="shrink-0 rounded-md bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600">
                   {statusLabel(file)}
                 </span>
               </button>
             ))
           ) : (
-            <div className="rounded-md bg-zinc-50 px-3 py-2 text-sm text-zinc-500">
+            <div className="rounded-lg border border-dashed border-stone-300 bg-stone-50/80 px-3 py-3 text-sm text-stone-500">
               No changes
             </div>
           )}
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto bg-zinc-950">
-        <pre className="min-h-full whitespace-pre-wrap break-words px-4 py-4 font-mono text-[11px] leading-5 text-zinc-100">
+      <div className="panel-scroll min-h-0 flex-1 overflow-auto bg-[#16130f]">
+        <pre className="min-h-full whitespace-pre-wrap break-words px-4 py-4 font-mono text-[11px] leading-5 text-stone-100">
           {diffText || "No diff"}
         </pre>
       </div>
@@ -1546,6 +1952,10 @@ function GitDiffPanel({
 }
 
 function SettingsPanel() {
+  const [activeSection, setActiveSection] =
+    useState<SettingsSection>("providers");
+  const [isProviderDialogOpen, setIsProviderDialogOpen] = useState(false);
+  const [isModelDialogOpen, setIsModelDialogOpen] = useState(false);
   const [metadata, setMetadata] = useState<ModelMetadataResponse | null>(null);
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedMetadataKey, setSelectedMetadataKey] = useState("");
@@ -1601,9 +2011,14 @@ function SettingsPanel() {
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const configuredModels =
     settings?.configuredModels ?? metadata?.configuredModels ?? [];
+  const editingModel =
+    configuredModels.find((model) => model.id === form.modelId) ?? null;
   const selectedProviderKind = providerKinds.find(
     (kind) => kind.kind === providerForm.kind,
   );
+  const editingProvider =
+    providers.find((provider) => provider.id === providerForm.id) ?? null;
+  const hasSavedProviderKey = editingProvider?.hasApiKey ?? false;
   const selectedProviderIds = new Set(form.providerIds);
 
   const loadMetadata = useCallback(async () => {
@@ -1656,13 +2071,14 @@ function SettingsPanel() {
     setForm({
       displayName: model.name,
       enabled: model.contextWindow !== null && model.maxOutputTokens !== null,
-      modelId: model.key,
+      modelId: model.modelId,
       contextWindow: numberInputValue(model.contextWindow),
       maxOutputTokens: numberInputValue(model.maxOutputTokens),
       providerIds: [],
       activeProviderId: "",
       thinkingLevel: "",
     });
+    setIsModelDialogOpen(true);
   }
 
   function editConfiguredModel(model: ConfiguredModelSummary) {
@@ -1677,6 +2093,19 @@ function SettingsPanel() {
       activeProviderId: model.activeProviderId ?? "",
       thinkingLevel: model.thinkingLevel ?? "",
     });
+    setIsModelDialogOpen(true);
+  }
+
+  function startAddingModel() {
+    setSelectedMetadataKey("");
+    setForm(emptyModelForm());
+    setIsModelDialogOpen(true);
+  }
+
+  function startAddingProviderFromModel() {
+    setIsModelDialogOpen(false);
+    setActiveSection("providers");
+    startAddingProvider();
   }
 
   function editConfiguredProvider(provider: ConfiguredProviderSummary) {
@@ -1689,6 +2118,15 @@ function SettingsPanel() {
       kind: provider.kind,
       name: provider.name,
     });
+    setIsProviderDialogOpen(true);
+  }
+
+  function startAddingProvider() {
+    setProviderForm({
+      ...emptyProviderForm(),
+      kind: providerKinds[0]?.kind || "openai-responses",
+    });
+    setIsProviderDialogOpen(true);
   }
 
   async function refreshMetadata() {
@@ -1741,6 +2179,7 @@ function SettingsPanel() {
       );
       setMetadata(data);
       await loadSettings();
+      setIsModelDialogOpen(false);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -1762,7 +2201,9 @@ function SettingsPanel() {
             baseUrl: providerForm.baseUrl || null,
             clearApiKey: providerForm.clearApiKey,
             enabled: providerForm.enabled,
-            id: providerForm.id,
+            id:
+              providerForm.id ||
+              nextProviderId(providerForm.name, providerForm.kind, providers),
             kind: providerForm.kind,
             name: providerForm.name,
           }),
@@ -1776,10 +2217,64 @@ function SettingsPanel() {
         apiKey: "",
         clearApiKey: false,
       }));
+      setIsProviderDialogOpen(false);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
       setIsSavingProvider(false);
+    }
+  }
+
+  async function deleteProvider(providerId: string) {
+    setIsSavingProvider(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/providers/delete", {
+        body: JSON.stringify({ id: providerId }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      setProviderForm({
+        ...emptyProviderForm(),
+        kind: data.providerKinds[0]?.kind || "openai-responses",
+      });
+      setIsProviderDialogOpen(false);
+      setForm((current) => ({
+        ...current,
+        activeProviderId:
+          current.activeProviderId === providerId
+            ? ""
+            : current.activeProviderId,
+        providerIds: current.providerIds.filter((id) => id !== providerId),
+      }));
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingProvider(false);
+    }
+  }
+
+  async function deleteModel(modelId: string) {
+    setIsSaving(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<ModelMetadataResponse>("/api/models/delete", {
+        body: JSON.stringify({ id: modelId }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setMetadata(data);
+      await loadSettings();
+      setSelectedMetadataKey("");
+      setForm(emptyModelForm());
+      setIsModelDialogOpen(false);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSaving(false);
     }
   }
 
@@ -1832,24 +2327,42 @@ function SettingsPanel() {
   }
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
-      <div className="mx-auto flex max-w-6xl flex-col gap-4">
-        <section className="border-b border-zinc-200 pb-4">
+    <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
+      <div className="mx-auto grid max-w-7xl gap-4 lg:grid-cols-[4.5rem_minmax(0,1fr)]">
+        <aside className="flex gap-2 rounded-2xl border border-stone-200 bg-white/85 p-2 shadow-[0_18px_42px_rgba(75,63,42,0.07)] lg:flex-col lg:self-start">
+          <SettingsNavButton
+            active={activeSection === "providers"}
+            icon={PlugZap}
+            label="Providers"
+            onClick={() => setActiveSection("providers")}
+          />
+          <SettingsNavButton
+            active={activeSection === "models"}
+            icon={SlidersHorizontal}
+            label="Models"
+            onClick={() => setActiveSection("models")}
+          />
+        </aside>
+
+        <div className="min-w-0 flex flex-col gap-5">
+        <section className="rounded-2xl border border-stone-200 bg-white/75 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0">
-              <h2 className="text-base font-semibold">
-                Provider And Model Settings
+              <h2 className="text-lg font-semibold text-stone-950">
+                Provider and model settings
               </h2>
-              <p className="mt-1 truncate text-xs text-zinc-500">
+              <p className="mt-1 truncate text-xs font-medium text-stone-500">
                 {metadata?.fetchedAt
                   ? `Fetched ${metadata.fetchedAt} from ${metadata.sourceUrl}`
-                  : `Cache path: ${metadata?.cachePath ?? ""}`}
+                  : "Model metadata has not been refreshed"}
               </p>
             </div>
             <button
-              className="inline-flex h-9 items-center gap-2 rounded-md bg-teal-700 px-3 text-sm font-medium text-white transition hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
+              aria-label="Refresh model metadata"
+              className="inline-flex size-10 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
               disabled={isRefreshing}
               onClick={() => void refreshMetadata()}
+              title="Refresh model metadata"
               type="button"
             >
               {isRefreshing ? (
@@ -1857,54 +2370,98 @@ function SettingsPanel() {
               ) : (
                 <RefreshCw aria-hidden="true" className="size-4" />
               )}
-              Refresh
             </button>
           </div>
         </section>
 
         {error ? (
-          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+          <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
             {error}
           </div>
         ) : null}
 
+        {activeSection === "providers" ? (
         <section className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+          {isProviderDialogOpen ? (
+          <>
+          <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
           <form
-            className="rounded-md border border-zinc-200 bg-white px-4 py-4"
+            aria-label="Provider configuration"
+            className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
             onSubmit={(event) => void saveProvider(event)}
           >
-            <div className="mb-4 flex items-center gap-2">
-              <PlugZap aria-hidden="true" className="size-5 text-teal-700" />
-              <h3 className="text-sm font-semibold">Provider</h3>
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <PlugZap aria-hidden="true" className="size-5 text-teal-700" />
+                  <h3 className="text-sm font-semibold text-stone-950">
+                    {providerForm.id ? "Edit provider" : "Add provider"}
+                  </h3>
+                </div>
+                {providerForm.id ? (
+                  <div className="mt-1 truncate text-xs text-stone-500">
+                    {providerForm.id}
+                  </div>
+                ) : null}
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <label className="relative inline-flex cursor-pointer items-center">
+                  <input
+                    aria-label="Enable provider"
+                    checked={providerForm.enabled}
+                    className="peer sr-only"
+                    onChange={(event) =>
+                      setProviderForm((current) => ({
+                        ...current,
+                        enabled: event.target.checked,
+                      }))
+                    }
+                    type="checkbox"
+                  />
+                  <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
+                  <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                </label>
+                {providerForm.id ? (
+                <button
+                  aria-label="Delete provider"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                  disabled={isSavingProvider}
+                  onClick={() => void deleteProvider(providerForm.id)}
+                  title="Delete provider"
+                  type="button"
+                >
+                  <Trash2 aria-hidden="true" className="size-4" />
+                </button>
+                ) : null}
+                <button
+                  aria-label="Close provider configuration"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                  onClick={() => setIsProviderDialogOpen(false)}
+                  title="Close"
+                  type="button"
+                >
+                  <X aria-hidden="true" className="size-4" />
+                </button>
+              </div>
             </div>
             <div className="space-y-3">
-              <div className="grid gap-3 sm:grid-cols-2">
-                <TextField
-                  label="Provider ID"
-                  onChange={(value) =>
-                    setProviderForm((current) => ({ ...current, id: value }))
-                  }
-                  placeholder="openai"
-                  value={providerForm.id}
-                />
-                <TextField
-                  label="Name"
-                  onChange={(value) =>
-                    setProviderForm((current) => ({
-                      ...current,
-                      name: value,
-                    }))
-                  }
-                  placeholder="OpenAI"
-                  value={providerForm.name}
-                />
-              </div>
+              <TextField
+                label="Name"
+                onChange={(value) =>
+                  setProviderForm((current) => ({
+                    ...current,
+                    name: value,
+                  }))
+                }
+                placeholder="OpenAI"
+                value={providerForm.name}
+              />
               <label className="block">
-                <span className="mb-1 block text-xs font-medium text-zinc-600">
-                  Kind
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  Protocol
                 </span>
                 <select
-                  className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                   onChange={(event) =>
                     setProviderForm((current) => ({
                       ...current,
@@ -1931,54 +2488,62 @@ function SettingsPanel() {
                 placeholder={selectedProviderKind?.defaultBaseUrl ?? ""}
                 value={providerForm.baseUrl}
               />
-              <TextField
-                label="API Key"
-                onChange={(value) =>
-                  setProviderForm((current) => ({ ...current, apiKey: value }))
-                }
-                placeholder="Leave blank to keep saved key"
-                value={providerForm.apiKey}
-              />
-              <label className="flex items-center justify-between gap-3 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2">
-                <span className="text-sm font-medium text-zinc-700">
-                  Enable provider
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  API key
                 </span>
+                <span className="relative block">
                 <input
-                  checked={providerForm.enabled}
-                  className="size-4 accent-teal-700"
+                  autoComplete="off"
+                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 pr-11 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  name="api-key"
                   onChange={(event) =>
                     setProviderForm((current) => ({
                       ...current,
-                      enabled: event.target.checked,
+                      apiKey: event.target.value,
+                      clearApiKey: false,
                     }))
                   }
-                  type="checkbox"
+                  placeholder={
+                    hasSavedProviderKey
+                      ? "Saved key is kept unless replaced"
+                      : "API key"
+                  }
+                  type="password"
+                  value={providerForm.apiKey}
                 />
-              </label>
-              <label className="flex items-center justify-between gap-3 rounded-md border border-zinc-200 bg-white px-3 py-2">
-                <span className="text-sm font-medium text-zinc-700">
-                  Clear saved API key
+                {hasSavedProviderKey || providerForm.clearApiKey ? (
+                  <button
+                    aria-label="Clear saved API key"
+                    className={`absolute right-1 top-1 inline-flex size-8 items-center justify-center rounded-md ${
+                      providerForm.clearApiKey
+                        ? "bg-rose-50 text-rose-700"
+                        : "text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+                    }`}
+                    onClick={() =>
+                      setProviderForm((current) => ({
+                        ...current,
+                        apiKey: "",
+                        clearApiKey: true,
+                      }))
+                    }
+                    title="Clear saved API key"
+                    type="button"
+                  >
+                    <X aria-hidden="true" className="size-4" />
+                  </button>
+                ) : null}
                 </span>
-                <input
-                  checked={providerForm.clearApiKey}
-                  className="size-4 accent-teal-700"
-                  onChange={(event) =>
-                    setProviderForm((current) => ({
-                      ...current,
-                      clearApiKey: event.target.checked,
-                    }))
-                  }
-                  type="checkbox"
-                />
               </label>
               <button
-                className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-zinc-900 px-3 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
+                aria-label="Save provider"
+                className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
                 disabled={
                   isSavingProvider ||
-                  !providerForm.id.trim() ||
                   !providerForm.name.trim() ||
                   !providerForm.kind.trim()
                 }
+                title="Save provider"
                 type="submit"
               >
                 {isSavingProvider ? (
@@ -1989,32 +2554,47 @@ function SettingsPanel() {
                 ) : (
                   <KeyRound aria-hidden="true" className="size-4" />
                 )}
-                Save Provider
               </button>
             </div>
           </form>
+          </>
+          ) : null}
 
-          <section className="rounded-md border border-zinc-200 bg-white">
-            <div className="flex items-center justify-between gap-3 border-b border-zinc-200 px-4 py-3">
-              <h3 className="text-sm font-semibold">Configured Providers</h3>
-              <button
-                className="inline-flex size-8 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-700 transition hover:bg-zinc-50"
-                disabled={isLoadingSettings}
-                onClick={() => void loadSettings()}
-                title="Reload settings"
-                type="button"
-              >
-                {isLoadingSettings ? (
-                  <LoaderCircle
-                    aria-hidden="true"
-                    className="size-4 animate-spin"
-                  />
-                ) : (
-                  <RefreshCw aria-hidden="true" className="size-4" />
-                )}
-              </button>
+          <section className="order-1 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-stone-950">
+                Configured providers
+              </h3>
+              <div className="flex gap-2">
+                <button
+                  aria-label="Add provider"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  onClick={startAddingProvider}
+                  title="Add provider"
+                  type="button"
+                >
+                  <Plus aria-hidden="true" className="size-4" />
+                </button>
+                <button
+                  aria-label="Reload settings"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  disabled={isLoadingSettings}
+                  onClick={() => void loadSettings()}
+                  title="Reload settings"
+                  type="button"
+                >
+                  {isLoadingSettings ? (
+                    <LoaderCircle
+                      aria-hidden="true"
+                      className="size-4 animate-spin"
+                    />
+                  ) : (
+                    <RefreshCw aria-hidden="true" className="size-4" />
+                  )}
+                </button>
+              </div>
             </div>
-            <div className="divide-y divide-zinc-100">
+            <div className="divide-y divide-stone-100">
               {providers.length ? (
                 providers.map((provider) => {
                   const test = providerTests[provider.id];
@@ -2036,27 +2616,31 @@ function SettingsPanel() {
                               ok={provider.hasApiKey}
                             />
                           </div>
-                          <div className="mt-1 truncate text-xs text-zinc-500">
+                          <div className="mt-1 truncate text-xs font-medium text-stone-500">
                             {provider.id} / {provider.kindLabel}
                           </div>
                           {provider.baseUrl ? (
-                            <div className="mt-1 truncate text-xs text-zinc-500">
+                            <div className="mt-1 truncate text-xs text-stone-500">
                               {provider.baseUrl}
                             </div>
                           ) : null}
                         </div>
                         <div className="flex flex-wrap gap-2">
                           <button
-                            className="inline-flex h-8 items-center justify-center rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50"
+                            aria-label={`Edit provider ${provider.name}`}
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                             onClick={() => editConfiguredProvider(provider)}
+                            title="Edit provider"
                             type="button"
                           >
-                            Edit
+                            <SlidersHorizontal aria-hidden="true" className="size-4" />
                           </button>
                           <button
-                            className="inline-flex h-8 items-center justify-center gap-2 rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50 disabled:cursor-not-allowed disabled:bg-zinc-100"
+                            aria-label={`Test provider ${provider.name}`}
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
                             disabled={test?.status === "testing"}
                             onClick={() => void testProvider(provider.id)}
+                            title="Test provider"
                             type="button"
                           >
                             {test?.status === "testing" ? (
@@ -2067,17 +2651,16 @@ function SettingsPanel() {
                             ) : (
                               <PlugZap aria-hidden="true" className="size-4" />
                             )}
-                            Test
                           </button>
                         </div>
                       </div>
                       {test ? (
                         <div
-                          className={`mt-3 rounded-md border px-3 py-2 text-sm ${
+                          className={`mt-3 rounded-lg border px-3 py-2 text-sm ${
                             test.status === "ok"
                               ? "border-teal-200 bg-teal-50 text-teal-800"
                               : test.status === "testing"
-                                ? "border-zinc-200 bg-zinc-50 text-zinc-600"
+                                ? "border-stone-200 bg-stone-50 text-stone-600"
                                 : "border-rose-200 bg-rose-50 text-rose-700"
                           }`}
                         >
@@ -2089,26 +2672,365 @@ function SettingsPanel() {
                   );
                 })
               ) : (
-                <div className="px-4 py-6 text-sm text-zinc-500">
+                <div className="px-4 py-6 text-sm text-stone-500">
                   No configured providers
                 </div>
               )}
             </div>
           </section>
         </section>
+        ) : null}
 
-        <section className="grid gap-4 xl:grid-cols-[minmax(0,1.1fr)_minmax(22rem,0.9fr)]">
-          <div className="min-w-0 rounded-md border border-zinc-200 bg-white">
-            <div className="border-b border-zinc-200 px-4 py-3">
+        {activeSection === "models" ? (
+        <section className="grid gap-4">
+          <div className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-stone-950">Models</h3>
+              <div className="flex gap-2">
+                <button
+                  aria-label="Add model"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  onClick={startAddingModel}
+                  title="Add model"
+                  type="button"
+                >
+                  <Plus aria-hidden="true" className="size-4" />
+                </button>
+              </div>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {configuredModels.length ? (
+                configuredModels.map((model) => (
+                <div
+                  className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(0,1fr)_auto]"
+                  key={model.id}
+                >
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="truncate text-sm font-semibold">
+                        {model.displayName}
+                      </span>
+                      <CapabilityPill
+                        label={model.enabled ? "enabled" : "disabled"}
+                        ok={model.enabled}
+                      />
+                      <CapabilityPill
+                        label={model.canEnable ? "limits ok" : "limits missing"}
+                        ok={model.canEnable}
+                      />
+                    </div>
+                    <div className="mt-1 truncate text-xs font-medium text-stone-500">
+                      {model.id}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      <CapabilityPill
+                        label={`providers ${model.providerIds.length}`}
+                        ok={model.providerIds.length > 0}
+                      />
+                      <CapabilityPill
+                        label={
+                          model.activeProviderId
+                            ? `active ${model.activeProviderId}`
+                            : "active missing"
+                        }
+                        ok={model.activeProviderId !== null}
+                      />
+                    </div>
+                  </div>
+                  <button
+                    aria-label={`Edit model ${model.displayName}`}
+                    className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                    onClick={() => editConfiguredModel(model)}
+                    title="Edit model"
+                    type="button"
+                  >
+                    <SlidersHorizontal aria-hidden="true" className="size-4" />
+                  </button>
+                </div>
+                ))
+              ) : (
+                <div className="px-4 py-6 text-sm text-stone-500">
+                  No configured models
+                </div>
+              )}
+            </div>
+          </div>
+
+          {isModelDialogOpen ? (
+            <>
+              <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+              <form
+                aria-label="Model configuration"
+                className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,38rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                onSubmit={(event) => void saveModel(event)}
+              >
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <SlidersHorizontal
+                        aria-hidden="true"
+                        className="size-5 text-teal-700"
+                      />
+                      <h3 className="text-sm font-semibold text-stone-950">
+                        {editingModel ? "Edit model" : "Add model"}
+                      </h3>
+                    </div>
+                    {selectedMetadata ? (
+                      <div className="mt-1 truncate text-xs text-stone-500">
+                        {selectedMetadata.key}
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="flex shrink-0 gap-2">
+                    {editingModel ? (
+                      <button
+                        aria-label="Delete model"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                        disabled={isSaving}
+                        onClick={() => void deleteModel(editingModel.id)}
+                        title="Delete model"
+                        type="button"
+                      >
+                        <Trash2 aria-hidden="true" className="size-4" />
+                      </button>
+                    ) : null}
+                    <button
+                      aria-label="Close model configuration"
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                      onClick={() => setIsModelDialogOpen(false)}
+                      title="Close"
+                      type="button"
+                    >
+                      <X aria-hidden="true" className="size-4" />
+                    </button>
+                  </div>
+                </div>
+                <div className="space-y-3">
+                  <TextField
+                    label="Model id"
+                    onChange={(value) =>
+                      setForm((current) => ({ ...current, modelId: value }))
+                    }
+                    placeholder="gpt-5.5"
+                    value={form.modelId}
+                  />
+                  <TextField
+                    label="Display name"
+                    onChange={(value) =>
+                      setForm((current) => ({
+                        ...current,
+                        displayName: value,
+                      }))
+                    }
+                    placeholder="GPT 5.5"
+                    value={form.displayName}
+                  />
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <TextField
+                      inputMode="numeric"
+                      label="Context window"
+                      onChange={(value) =>
+                        setForm((current) => ({
+                          ...current,
+                          contextWindow: value,
+                        }))
+                      }
+                      placeholder="128000"
+                      value={form.contextWindow}
+                    />
+                    <TextField
+                      inputMode="numeric"
+                      label="Max output tokens"
+                      onChange={(value) =>
+                        setForm((current) => ({
+                          ...current,
+                          maxOutputTokens: value,
+                        }))
+                      }
+                      placeholder="16384"
+                      value={form.maxOutputTokens}
+                    />
+                  </div>
+                  <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+                    <span className="text-sm font-semibold text-stone-700">
+                      Enable model
+                    </span>
+                    <input
+                      checked={form.enabled}
+                      className="size-4 accent-teal-700"
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          enabled: event.target.checked,
+                        }))
+                      }
+                      type="checkbox"
+                    />
+                  </label>
+                  <div className="rounded-xl border border-stone-200 px-3 py-3">
+                    <div className="mb-2 flex items-center justify-between gap-2">
+                      <div className="text-xs font-semibold text-stone-600">
+                        Providers
+                      </div>
+                      <button
+                        aria-label="Add provider"
+                        className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                        onClick={startAddingProviderFromModel}
+                        title="Add provider"
+                        type="button"
+                      >
+                        <Plus aria-hidden="true" className="size-4" />
+                      </button>
+                    </div>
+                    <div className="space-y-2">
+                      {providers.length ? (
+                        providers.map((provider) => (
+                          <label
+                            className="flex items-center justify-between gap-3 rounded-lg bg-stone-50/80 px-3 py-2"
+                            key={provider.id}
+                          >
+                            <span className="min-w-0">
+                              <span className="block truncate text-sm font-semibold text-stone-700">
+                                {provider.name}
+                              </span>
+                              <span className="block truncate text-xs text-stone-500">
+                                {provider.kindLabel}
+                              </span>
+                            </span>
+                            <input
+                              checked={selectedProviderIds.has(provider.id)}
+                              className="size-4 accent-teal-700"
+                              onChange={(event) =>
+                                toggleModelProvider(
+                                  provider.id,
+                                  event.target.checked,
+                                )
+                              }
+                              type="checkbox"
+                            />
+                          </label>
+                        ))
+                      ) : (
+                        <button
+                          className="flex w-full items-center justify-between rounded-lg border border-dashed border-stone-300 bg-stone-50 px-3 py-3 text-left text-sm text-stone-500 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                          onClick={startAddingProviderFromModel}
+                          type="button"
+                        >
+                          <span>No providers</span>
+                          <Plus aria-hidden="true" className="size-4" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      Active provider
+                    </span>
+                    <select
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      disabled={!form.providerIds.length}
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          activeProviderId: event.target.value,
+                        }))
+                      }
+                      value={form.activeProviderId}
+                    >
+                      <option value="">None</option>
+                      {form.providerIds.map((providerId) => {
+                        const provider = providers.find(
+                          (item) => item.id === providerId,
+                        );
+
+                        return (
+                          <option key={providerId} value={providerId}>
+                            {provider?.name ?? providerId}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </label>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      Thinking level
+                    </span>
+                    <select
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          thinkingLevel: event.target.value,
+                        }))
+                      }
+                      value={form.thinkingLevel}
+                    >
+                      <option value="">None</option>
+                      {thinkingLevels.map((level) => (
+                        <option key={level.value} value={level.value}>
+                          {level.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {enabledNeedsLimits ? (
+                    <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                      <CircleAlert
+                        aria-hidden="true"
+                        className="size-4 shrink-0"
+                      />
+                      Fill both limits before enabling.
+                    </div>
+                  ) : null}
+                  <button
+                    aria-label="Save model"
+                    className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    disabled={
+                      isSaving ||
+                      enabledNeedsLimits ||
+                      !form.modelId.trim() ||
+                      !form.displayName.trim()
+                    }
+                    title="Save model"
+                    type="submit"
+                  >
+                    {isSaving ? (
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="size-4 animate-spin"
+                      />
+                    ) : (
+                      <CheckCircle2 aria-hidden="true" className="size-4" />
+                    )}
+                  </button>
+                </div>
+
+                {selectedMetadata ? (
+                  <div className="mt-4 border-t border-stone-200 pt-4 text-xs text-stone-500">
+                    <div className="truncate">{selectedMetadata.key}</div>
+                    <div className="mt-1">
+                      pricing in/out:{" "}
+                      {priceText(selectedMetadata.pricing.input)} /{" "}
+                      {priceText(selectedMetadata.pricing.output)}
+                    </div>
+                  </div>
+                ) : null}
+              </form>
+            </>
+          ) : null}
+
+          <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="border-b border-stone-200 px-4 py-3">
               <div className="flex flex-wrap items-center gap-2">
                 <input
-                  className="h-9 min-w-0 flex-1 rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                   onChange={(event) => setModelSearch(event.target.value)}
-                  placeholder="Search provider or model"
+                  placeholder="Search model metadata"
                   value={modelSearch}
                 />
                 <button
-                  className="inline-flex size-9 items-center justify-center rounded-md border border-zinc-200 bg-white text-zinc-700 transition hover:bg-zinc-50"
+                  aria-label="Reload model metadata cache"
+                  className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                   disabled={isLoading}
                   onClick={() => void loadMetadata()}
                   title="Reload cache"
@@ -2125,330 +3047,40 @@ function SettingsPanel() {
                 </button>
               </div>
             </div>
-            <div className="max-h-[34rem] overflow-y-auto">
+            <div className="panel-scroll max-h-80 overflow-y-auto">
               {filteredModels.length > 0 ? (
                 filteredModels.map((model) => (
                   <button
-                    className={`grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 border-b border-zinc-100 px-4 py-3 text-left transition hover:bg-zinc-50 ${
-                      selectedMetadataKey === model.key ? "bg-teal-50" : "bg-white"
+                    className={`grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 border-b border-stone-100 px-4 py-3 text-left hover:bg-stone-50 ${
+                      selectedMetadataKey === model.key ? "bg-teal-50" : "bg-white/70"
                     }`}
                     key={model.key}
                     onClick={() => selectMetadataModel(model.key)}
                     type="button"
                   >
                     <span className="min-w-0">
-                      <span className="block truncate text-sm font-medium text-zinc-950">
+                      <span className="block truncate text-sm font-semibold text-stone-950">
                         {model.name}
                       </span>
-                      <span className="mt-1 block truncate text-xs text-zinc-500">
+                      <span className="mt-1 block truncate text-xs font-medium text-stone-500">
                         {model.providerName} / {model.modelId}
                       </span>
-                      <span className="mt-2 flex flex-wrap gap-1.5">
-                        <CapabilityPill
-                          label={formatLimit(model.contextWindow, "ctx")}
-                          ok={model.contextWindow !== null}
-                        />
-                        <CapabilityPill
-                          label={formatLimit(model.maxOutputTokens, "out")}
-                          ok={model.maxOutputTokens !== null}
-                        />
-                        <CapabilityPill label="tools" ok={model.supportsTools} />
-                        <CapabilityPill label="cache" ok={model.supportsCache} />
-                      </span>
                     </span>
-                    <span className="text-right text-xs text-zinc-500">
+                    <span className="text-right text-xs font-medium text-stone-500">
                       {model.inputModalities.join(", ") || "input n/a"}
                     </span>
                   </button>
                 ))
               ) : (
-                <div className="px-4 py-8 text-sm text-zinc-500">
+                <div className="px-4 py-8 text-sm text-stone-500">
                   {isLoading ? "Loading models..." : "No cached models"}
                 </div>
               )}
             </div>
-          </div>
-
-          <form
-            className="rounded-md border border-zinc-200 bg-white px-4 py-4"
-            onSubmit={(event) => void saveModel(event)}
-          >
-            <div className="mb-4 flex items-center gap-2">
-              <SlidersHorizontal
-                aria-hidden="true"
-                className="size-5 text-teal-700"
-              />
-              <h3 className="text-sm font-semibold">Model Limits</h3>
-            </div>
-            <div className="space-y-3">
-              <TextField
-                label="Model ID"
-                onChange={(value) =>
-                  setForm((current) => ({ ...current, modelId: value }))
-                }
-                placeholder="openai/gpt-4.1"
-                value={form.modelId}
-              />
-              <TextField
-                label="Display Name"
-                onChange={(value) =>
-                  setForm((current) => ({ ...current, displayName: value }))
-                }
-                placeholder="GPT 4.1"
-                value={form.displayName}
-              />
-              <div className="grid gap-3 sm:grid-cols-2">
-                <TextField
-                  inputMode="numeric"
-                  label="Context Window"
-                  onChange={(value) =>
-                    setForm((current) => ({
-                      ...current,
-                      contextWindow: value,
-                    }))
-                  }
-                  placeholder="128000"
-                  value={form.contextWindow}
-                />
-                <TextField
-                  inputMode="numeric"
-                  label="Max Output Tokens"
-                  onChange={(value) =>
-                    setForm((current) => ({
-                      ...current,
-                      maxOutputTokens: value,
-                    }))
-                  }
-                  placeholder="16384"
-                  value={form.maxOutputTokens}
-                />
-              </div>
-              <label className="flex items-center justify-between gap-3 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2">
-                <span className="text-sm font-medium text-zinc-700">
-                  Enable model
-                </span>
-                <input
-                  checked={form.enabled}
-                  className="size-4 accent-teal-700"
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      enabled: event.target.checked,
-                    }))
-                  }
-                  type="checkbox"
-                />
-              </label>
-              <div className="rounded-md border border-zinc-200 px-3 py-3">
-                <div className="mb-2 text-xs font-medium text-zinc-600">
-                  Providers
-                </div>
-                <div className="space-y-2">
-                  {providers.length ? (
-                    providers.map((provider) => (
-                      <label
-                        className="flex items-center justify-between gap-3 rounded-md bg-zinc-50 px-3 py-2"
-                        key={provider.id}
-                      >
-                        <span className="min-w-0">
-                          <span className="block truncate text-sm font-medium text-zinc-700">
-                            {provider.name}
-                          </span>
-                          <span className="block truncate text-xs text-zinc-500">
-                            {provider.kindLabel}
-                          </span>
-                        </span>
-                        <input
-                          checked={selectedProviderIds.has(provider.id)}
-                          className="size-4 accent-teal-700"
-                          onChange={(event) =>
-                            toggleModelProvider(
-                              provider.id,
-                              event.target.checked,
-                            )
-                          }
-                          type="checkbox"
-                        />
-                      </label>
-                    ))
-                  ) : (
-                    <div className="rounded-md bg-zinc-50 px-3 py-2 text-sm text-zinc-500">
-                      No providers
-                    </div>
-                  )}
-                </div>
-              </div>
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-zinc-600">
-                  Active Provider
-                </span>
-                <select
-                  className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  disabled={!form.providerIds.length}
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      activeProviderId: event.target.value,
-                    }))
-                  }
-                  value={form.activeProviderId}
-                >
-                  <option value="">None</option>
-                  {form.providerIds.map((providerId) => {
-                    const provider = providers.find(
-                      (item) => item.id === providerId,
-                    );
-
-                    return (
-                      <option key={providerId} value={providerId}>
-                        {provider?.name ?? providerId}
-                      </option>
-                    );
-                  })}
-                </select>
-              </label>
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-zinc-600">
-                  Thinking Level
-                </span>
-                <select
-                  className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) =>
-                    setForm((current) => ({
-                      ...current,
-                      thinkingLevel: event.target.value,
-                    }))
-                  }
-                  value={form.thinkingLevel}
-                >
-                  <option value="">None</option>
-                  {thinkingLevels.map((level) => (
-                    <option key={level.value} value={level.value}>
-                      {level.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {enabledNeedsLimits ? (
-                <div className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                  <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
-                  Fill both limits before enabling.
-                </div>
-              ) : null}
-              <button
-                className="inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-zinc-900 px-3 text-sm font-medium text-white transition hover:bg-zinc-800 disabled:cursor-not-allowed disabled:bg-zinc-400"
-                disabled={
-                  isSaving ||
-                  enabledNeedsLimits ||
-                  !form.modelId.trim() ||
-                  !form.displayName.trim()
-                }
-                type="submit"
-              >
-                {isSaving ? (
-                  <LoaderCircle
-                    aria-hidden="true"
-                    className="size-4 animate-spin"
-                  />
-                ) : (
-                  <CheckCircle2 aria-hidden="true" className="size-4" />
-                )}
-                Save Model
-              </button>
-            </div>
-
-            {selectedMetadata ? (
-              <div className="mt-4 border-t border-zinc-200 pt-4 text-xs text-zinc-500">
-                <div className="truncate">{selectedMetadata.key}</div>
-                <div className="mt-1">
-                  pricing in/out: {priceText(selectedMetadata.pricing.input)} /{" "}
-                  {priceText(selectedMetadata.pricing.output)}
-                </div>
-              </div>
-            ) : null}
-          </form>
+          </section>
         </section>
-
-        <section className="rounded-md border border-zinc-200 bg-white">
-          <div className="border-b border-zinc-200 px-4 py-3">
-            <h3 className="text-sm font-semibold">Configured Models</h3>
-          </div>
-          <div className="divide-y divide-zinc-100">
-            {configuredModels.length ? (
-              configuredModels.map((model) => (
-                <div
-                  className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(0,1fr)_auto]"
-                  key={model.id}
-                >
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="truncate text-sm font-medium">
-                        {model.displayName}
-                      </span>
-                      <CapabilityPill
-                        label={model.enabled ? "enabled" : "disabled"}
-                        ok={model.enabled}
-                      />
-                      <CapabilityPill
-                        label={model.canEnable ? "limits ok" : "limits missing"}
-                        ok={model.canEnable}
-                      />
-                      <CapabilityPill
-                        label={model.supportsThinking ? "thinking ready" : "thinking unknown"}
-                        ok={model.supportsThinking}
-                      />
-                    </div>
-                    <div className="mt-1 truncate text-xs text-zinc-500">
-                      {model.id}
-                    </div>
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      <CapabilityPill
-                        label={formatLimit(model.contextWindow, "ctx")}
-                        ok={model.contextWindow !== null}
-                      />
-                      <CapabilityPill
-                        label={formatLimit(model.maxOutputTokens, "out")}
-                        ok={model.maxOutputTokens !== null}
-                      />
-                      <CapabilityPill
-                        label={`providers ${model.providerIds.length}`}
-                        ok={model.providerIds.length > 0}
-                      />
-                      <CapabilityPill
-                        label={
-                          model.activeProviderId
-                            ? `active ${model.activeProviderId}`
-                            : "active missing"
-                        }
-                        ok={model.activeProviderId !== null}
-                      />
-                      <CapabilityPill
-                        label={
-                          model.thinkingLevel
-                            ? `thinking ${model.thinkingLevel}`
-                            : "thinking none"
-                        }
-                        ok={model.thinkingLevel !== null}
-                      />
-                    </div>
-                    <Warnings warnings={model.warnings} />
-                  </div>
-                  <button
-                    className="inline-flex h-8 items-center justify-center rounded-md border border-zinc-200 bg-white px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-50"
-                    onClick={() => editConfiguredModel(model)}
-                    type="button"
-                  >
-                    Edit
-                  </button>
-                </div>
-              ))
-            ) : (
-              <div className="px-4 py-6 text-sm text-zinc-500">
-                No configured models
-              </div>
-            )}
-          </div>
-        </section>
+        ) : null}
+        </div>
       </div>
     </div>
   );
@@ -2467,42 +3099,75 @@ function NavButton({
 }) {
   return (
     <button
-      className={`inline-flex h-8 items-center gap-2 rounded-md px-3 text-sm font-medium transition ${
+      aria-label={label}
+      className={`inline-flex size-9 items-center justify-center rounded-lg ${
         active
-          ? "bg-white text-teal-800 shadow-sm"
-          : "text-zinc-600 hover:text-zinc-950"
+          ? "bg-white text-teal-900 shadow-sm"
+          : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
       }`}
       onClick={onClick}
+      title={label}
       type="button"
     >
       <Icon aria-hidden="true" className="size-4" />
-      <span className="hidden sm:inline">{label}</span>
     </button>
   );
 }
 
 function workspaceModeClass(active: boolean) {
-  return `inline-flex h-8 flex-1 items-center justify-center gap-2 rounded-md border px-2 text-sm font-medium transition ${
+  return `inline-flex h-9 items-center justify-center gap-2 rounded-lg border px-2 text-sm font-semibold ${
     active
-      ? "border-teal-200 bg-teal-50 text-teal-800"
-      : "border-zinc-200 bg-white text-zinc-600 hover:bg-zinc-50 hover:text-zinc-950"
+      ? "border-teal-200 bg-teal-50 text-teal-900 shadow-sm"
+      : "border-stone-200 bg-white/80 text-stone-600 hover:border-stone-300 hover:bg-white hover:text-stone-950"
   }`;
 }
 
+function workspaceActionClass() {
+  return "inline-flex h-10 items-center justify-center rounded-lg border border-stone-200 bg-white/85 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800";
+}
+
 function workspaceItemClass(active: boolean) {
-  return `flex h-8 min-w-0 flex-1 items-center gap-2 rounded-md px-2 text-sm font-medium transition ${
+  return `flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-sm font-semibold ${
     active
-      ? "bg-zinc-900 text-white"
-      : "text-zinc-700 hover:bg-zinc-100 hover:text-zinc-950"
+      ? "bg-stone-950 text-white shadow-[0_10px_24px_rgba(33,31,28,0.16)]"
+      : "text-stone-700 hover:bg-white/80 hover:text-stone-950"
   }`;
 }
 
 function diffFileButtonClass(active: boolean) {
-  return `flex h-8 w-full min-w-0 items-center justify-between gap-2 rounded-md px-2 text-sm transition ${
+  return `flex min-h-9 w-full min-w-0 items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-sm ${
     active
-      ? "bg-teal-50 text-teal-900"
-      : "text-zinc-700 hover:bg-zinc-50 hover:text-zinc-950"
+      ? "bg-teal-50 text-teal-950 shadow-sm"
+      : "text-stone-700 hover:bg-stone-50 hover:text-stone-950"
   }`;
+}
+
+function SettingsNavButton({
+  active,
+  icon: Icon,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  icon: typeof Settings;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      aria-label={label}
+      className={`inline-flex size-10 items-center justify-center rounded-xl ${
+        active
+          ? "bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]"
+          : "text-stone-600 hover:bg-stone-100 hover:text-stone-950"
+      }`}
+      onClick={onClick}
+      title={label}
+      type="button"
+    >
+      <Icon aria-hidden="true" className="size-4" />
+    </button>
+  );
 }
 
 function TextField({
@@ -2520,12 +3185,14 @@ function TextField({
 }) {
   return (
     <label className="block">
-      <span className="mb-1 block text-xs font-medium text-zinc-600">
+      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
         {label}
       </span>
       <input
-        className="h-9 w-full rounded-md border border-zinc-300 bg-white px-3 text-sm outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+        autoComplete="off"
+        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
         inputMode={inputMode}
+        name={label.toLowerCase().replace(/\s+/g, "-")}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         value={value}
@@ -2537,10 +3204,10 @@ function TextField({
 function CapabilityPill({ label, ok }: { label: string; ok: boolean }) {
   return (
     <span
-      className={`inline-flex h-6 items-center rounded-md border px-2 text-xs font-medium ${
+      className={`inline-flex min-h-6 items-center rounded-md border px-2 py-0.5 text-xs font-semibold ${
         ok
           ? "border-teal-200 bg-teal-50 text-teal-800"
-          : "border-zinc-200 bg-zinc-50 text-zinc-500"
+          : "border-stone-200 bg-stone-50 text-stone-500"
       }`}
     >
       {label}
@@ -2557,7 +3224,7 @@ function Warnings({ warnings }: { warnings: string[] }) {
     <div className="mt-3 space-y-1">
       {warnings.map((warning) => (
         <div
-          className="flex items-center gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
+          className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
           key={warning}
         >
           <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
@@ -2591,6 +3258,34 @@ function emptyProviderForm(): ProviderFormState {
     kind: "",
     name: "",
   };
+}
+
+function nextProviderId(
+  name: string,
+  kind: string,
+  providers: ConfiguredProviderSummary[],
+) {
+  const base = slugId(name) || slugId(kind);
+  const existingIds = new Set(providers.map((provider) => provider.id));
+
+  if (!existingIds.has(base)) {
+    return base;
+  }
+
+  let index = 2;
+  while (existingIds.has(`${base}-${index}`)) {
+    index += 1;
+  }
+
+  return `${base}-${index}`;
+}
+
+function slugId(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 function uniqueString(value: string, index: number, values: string[]) {
@@ -2723,21 +3418,21 @@ function terminalStatusText(status: "closed" | "connected" | "connecting" | "err
 }
 
 function terminalStatusClass(status: "closed" | "connected" | "connecting" | "error") {
-  const base = "rounded px-1.5 py-0.5 text-[11px]";
+  const base = "rounded-md px-1.5 py-0.5 text-[11px] font-semibold";
 
   if (status === "connected") {
     return `${base} bg-teal-100 text-teal-800`;
   }
 
   if (status === "connecting") {
-    return `${base} bg-zinc-200 text-zinc-700`;
+    return `${base} bg-stone-200 text-stone-700`;
   }
 
   if (status === "error") {
     return `${base} bg-rose-100 text-rose-700`;
   }
 
-  return `${base} bg-zinc-100 text-zinc-500`;
+  return `${base} bg-stone-100 text-stone-500`;
 }
 
 async function readChatStream(
