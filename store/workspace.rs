@@ -1,17 +1,18 @@
 use std::{
+    collections::HashSet,
     fmt, fs, io,
     path::{Path, PathBuf},
 };
 
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::Value;
 
 use crate::config::WorkspaceConfig;
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 3;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 4;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -25,6 +26,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 3,
         sql: MIGRATION_003,
+    },
+    Migration {
+        version: 4,
+        sql: MIGRATION_004,
     },
 ];
 
@@ -652,6 +657,296 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn code_graph_file_hash(
+        &self,
+        path: &str,
+    ) -> Result<Option<String>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT code_graph_file_hashes.content_hash
+                 FROM code_graph_file_hashes
+                 JOIN code_graph_files
+                    ON code_graph_files.id = code_graph_file_hashes.file_id
+                 WHERE code_graph_files.path = ?1",
+                params![path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn replace_code_graph_file_index(
+        &mut self,
+        index: NewCodeGraphFileIndex<'_>,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction =
+            self.connection
+                .transaction()
+                .map_err(|source| WorkspaceDatabaseError::Sqlite {
+                    path: database_path.clone(),
+                    source,
+                })?;
+        let now = now_timestamp();
+
+        transaction
+            .execute(
+                "INSERT INTO code_graph_files
+                    (path, language, size_bytes, modified_at, discovered_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(path) DO UPDATE SET
+                    language = excluded.language,
+                    size_bytes = excluded.size_bytes,
+                    modified_at = excluded.modified_at",
+                params![
+                    index.path,
+                    index.language,
+                    index.size_bytes,
+                    index.modified_at,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let file_id = code_graph_file_id(&transaction, &database_path, index.path)?;
+
+        clear_code_graph_file_index(&transaction, &database_path, file_id, index.path)?;
+        transaction
+            .execute(
+                "INSERT INTO code_graph_file_hashes (file_id, content_hash, hashed_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(file_id) DO UPDATE SET
+                    content_hash = excluded.content_hash,
+                    hashed_at = excluded.hashed_at",
+                params![file_id, index.content_hash, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO code_graph_parse_status
+                    (file_id, status, parsed_at, error_message)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(file_id) DO UPDATE SET
+                    status = excluded.status,
+                    parsed_at = excluded.parsed_at,
+                    error_message = excluded.error_message",
+                params![file_id, index.parse_status, now, index.parse_error_message],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let mut symbol_ids = Vec::with_capacity(index.symbols.len());
+        for symbol in index.symbols {
+            transaction
+                .execute(
+                    "INSERT INTO code_graph_symbols
+                        (
+                            file_id, name, kind, start_line, start_column,
+                            end_line, end_column, signature, documentation
+                        )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        file_id,
+                        symbol.name,
+                        symbol.kind,
+                        symbol.start_line,
+                        symbol.start_column,
+                        symbol.end_line,
+                        symbol.end_column,
+                        symbol.signature,
+                        symbol.documentation
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let symbol_id = transaction.last_insert_rowid();
+            symbol_ids.push(symbol_id);
+            upsert_code_graph_fts_entry(
+                &transaction,
+                &database_path,
+                "symbol",
+                &symbol_id.to_string(),
+                symbol.name,
+                symbol
+                    .documentation
+                    .or(symbol.signature)
+                    .unwrap_or(symbol.name),
+                &now,
+            )?;
+        }
+
+        for import in index.imports {
+            transaction
+                .execute(
+                    "INSERT INTO code_graph_imports
+                        (
+                            file_id, module, imported_symbol, alias,
+                            start_line, start_column
+                        )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        file_id,
+                        import.module,
+                        import.imported_symbol,
+                        import.alias,
+                        import.start_line,
+                        import.start_column
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+
+        for reference in index.references {
+            let symbol_id = match reference.symbol_index {
+                Some(symbol_index) => Some(*symbol_ids.get(symbol_index).ok_or_else(|| {
+                    WorkspaceDatabaseError::InvalidCodeGraphInput {
+                        message: format!("reference points to missing symbol index {symbol_index}"),
+                    }
+                })?),
+                None => None,
+            };
+            transaction
+                .execute(
+                    "INSERT INTO code_graph_references
+                        (
+                            file_id, symbol_id, name, start_line, start_column,
+                            end_line, end_column
+                        )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        file_id,
+                        symbol_id,
+                        reference.name,
+                        reference.start_line,
+                        reference.start_column,
+                        reference.end_line,
+                        reference.end_column
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+
+        for edge in index.edges {
+            let source_symbol_id = *symbol_ids.get(edge.source_symbol_index).ok_or_else(|| {
+                WorkspaceDatabaseError::InvalidCodeGraphInput {
+                    message: format!(
+                        "edge source points to missing symbol index {}",
+                        edge.source_symbol_index
+                    ),
+                }
+            })?;
+            let target_symbol_id = *symbol_ids.get(edge.target_symbol_index).ok_or_else(|| {
+                WorkspaceDatabaseError::InvalidCodeGraphInput {
+                    message: format!(
+                        "edge target points to missing symbol index {}",
+                        edge.target_symbol_index
+                    ),
+                }
+            })?;
+            transaction
+                .execute(
+                    "INSERT INTO code_graph_edges
+                        (
+                            source_symbol_id, target_symbol_id,
+                            edge_kind, metadata_json
+                        )
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        source_symbol_id,
+                        target_symbol_id,
+                        edge.edge_kind,
+                        edge.metadata_json.unwrap_or("{}")
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+
+        upsert_code_graph_fts_entry(
+            &transaction,
+            &database_path,
+            "file",
+            index.path,
+            index.path,
+            index.fts_body,
+            &now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(file_id)
+    }
+
+    pub fn delete_code_graph_file(&mut self, path: &str) -> Result<bool, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction =
+            self.connection
+                .transaction()
+                .map_err(|source| WorkspaceDatabaseError::Sqlite {
+                    path: database_path.clone(),
+                    source,
+                })?;
+        let Some(file_id) = optional_code_graph_file_id(&transaction, &database_path, path)? else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        };
+
+        clear_code_graph_file_index(&transaction, &database_path, file_id, path)?;
+        transaction
+            .execute(
+                "DELETE FROM code_graph_parse_status WHERE file_id = ?1",
+                params![file_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "DELETE FROM code_graph_file_hashes WHERE file_id = ?1",
+                params![file_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "DELETE FROM code_graph_files WHERE id = ?1",
+                params![file_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(true)
+    }
+
+    pub fn remove_stale_code_graph_files(
+        &mut self,
+        live_paths: &[String],
+    ) -> Result<Vec<String>, WorkspaceDatabaseError> {
+        let live_paths = live_paths
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let indexed_paths = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT path FROM code_graph_files ORDER BY path ASC")
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|source| self.sqlite_error(source))?;
+
+            collect_rows(rows, &self.database_path)?
+        };
+        let stale_paths = indexed_paths
+            .into_iter()
+            .filter(|path| !live_paths.contains(path.as_str()))
+            .collect::<Vec<_>>();
+
+        for path in &stale_paths {
+            self.delete_code_graph_file(path)?;
+        }
+
+        Ok(stale_paths)
+    }
+
     pub fn upsert_terminal_session(
         &mut self,
         session: NewTerminalSession<'_>,
@@ -1012,8 +1307,66 @@ pub struct TerminalSessionRecord {
     pub metadata_json: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewCodeGraphFileIndex<'a> {
+    pub path: &'a str,
+    pub language: Option<&'a str>,
+    pub size_bytes: Option<i64>,
+    pub modified_at: Option<&'a str>,
+    pub content_hash: &'a str,
+    pub parse_status: &'a str,
+    pub parse_error_message: Option<&'a str>,
+    pub symbols: &'a [NewCodeGraphSymbol<'a>],
+    pub imports: &'a [NewCodeGraphImport<'a>],
+    pub references: &'a [NewCodeGraphReference<'a>],
+    pub edges: &'a [NewCodeGraphEdge<'a>],
+    pub fts_body: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewCodeGraphSymbol<'a> {
+    pub name: &'a str,
+    pub kind: &'a str,
+    pub start_line: Option<i64>,
+    pub start_column: Option<i64>,
+    pub end_line: Option<i64>,
+    pub end_column: Option<i64>,
+    pub signature: Option<&'a str>,
+    pub documentation: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewCodeGraphImport<'a> {
+    pub module: &'a str,
+    pub imported_symbol: Option<&'a str>,
+    pub alias: Option<&'a str>,
+    pub start_line: Option<i64>,
+    pub start_column: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewCodeGraphReference<'a> {
+    pub name: &'a str,
+    pub symbol_index: Option<usize>,
+    pub start_line: Option<i64>,
+    pub start_column: Option<i64>,
+    pub end_line: Option<i64>,
+    pub end_column: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewCodeGraphEdge<'a> {
+    pub source_symbol_index: usize,
+    pub target_symbol_index: usize,
+    pub edge_kind: &'a str,
+    pub metadata_json: Option<&'a str>,
+}
+
 #[derive(Debug)]
 pub enum WorkspaceDatabaseError {
+    InvalidCodeGraphInput {
+        message: String,
+    },
     InvalidAuditJson {
         field: &'static str,
         source: serde_json::Error,
@@ -1051,6 +1404,9 @@ pub enum WorkspaceDatabaseError {
 impl fmt::Display for WorkspaceDatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidCodeGraphInput { message } => {
+                write!(formatter, "invalid code graph index data: {message}")
+            }
             Self::InvalidAuditJson { field, source } => {
                 write!(formatter, "invalid LLM audit JSON in {field}: {source}")
             }
@@ -1099,6 +1455,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             Self::Io { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
             Self::InvalidAuditTokens { .. }
+            | Self::InvalidCodeGraphInput { .. }
             | Self::MissingDatabaseParent { .. }
             | Self::MissingTerminalSession { .. }
             | Self::NonUtf8Path { .. }
@@ -1111,6 +1468,143 @@ impl std::error::Error for WorkspaceDatabaseError {
 struct Migration {
     version: u32,
     sql: &'static str,
+}
+
+fn code_graph_file_id(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    path: &str,
+) -> Result<i64, WorkspaceDatabaseError> {
+    transaction
+        .query_row(
+            "SELECT id FROM code_graph_files WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))
+}
+
+fn optional_code_graph_file_id(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    path: &str,
+) -> Result<Option<i64>, WorkspaceDatabaseError> {
+    transaction
+        .query_row(
+            "SELECT id FROM code_graph_files WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))
+}
+
+fn clear_code_graph_file_index(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    file_id: i64,
+    path: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    let symbol_ids = {
+        let mut statement = transaction
+            .prepare("SELECT id FROM code_graph_symbols WHERE file_id = ?1")
+            .map_err(|source| sqlite_error(database_path, source))?;
+        let rows = statement
+            .query_map(params![file_id], |row| row.get::<_, i64>(0))
+            .map_err(|source| sqlite_error(database_path, source))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(database_path, source))?
+    };
+
+    for symbol_id in symbol_ids {
+        delete_code_graph_fts_entry(transaction, database_path, "symbol", &symbol_id.to_string())?;
+    }
+    delete_code_graph_fts_entry(transaction, database_path, "file", path)?;
+    transaction
+        .execute(
+            "DELETE FROM code_graph_references WHERE file_id = ?1",
+            params![file_id],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "DELETE FROM code_graph_imports WHERE file_id = ?1",
+            params![file_id],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "DELETE FROM code_graph_symbols WHERE file_id = ?1",
+            params![file_id],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    Ok(())
+}
+
+fn upsert_code_graph_fts_entry(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    entity_kind: &str,
+    entity_id: &str,
+    title: &str,
+    body: &str,
+    updated_at: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    delete_code_graph_fts_entry(transaction, database_path, entity_kind, entity_id)?;
+    transaction
+        .execute(
+            "INSERT INTO code_graph_fts_data
+                (entity_kind, entity_id, title, body, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(entity_kind, entity_id) DO UPDATE SET
+                title = excluded.title,
+                body = excluded.body,
+                updated_at = excluded.updated_at",
+            params![entity_kind, entity_id, title, body, updated_at],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "INSERT INTO code_graph_fts_index (entity_kind, entity_id, title, body)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![entity_kind, entity_id, title, body],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    Ok(())
+}
+
+fn delete_code_graph_fts_entry(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    entity_kind: &str,
+    entity_id: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    transaction
+        .execute(
+            "DELETE FROM code_graph_fts_index
+             WHERE entity_kind = ?1 AND entity_id = ?2",
+            params![entity_kind, entity_id],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "DELETE FROM code_graph_fts_data
+             WHERE entity_kind = ?1 AND entity_id = ?2",
+            params![entity_kind, entity_id],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    Ok(())
+}
+
+fn sqlite_error(database_path: &Path, source: rusqlite::Error) -> WorkspaceDatabaseError {
+    WorkspaceDatabaseError::Sqlite {
+        path: database_path.to_path_buf(),
+        source,
+    }
 }
 
 fn open_connection(database_path: &Path) -> Result<Connection, WorkspaceDatabaseError> {
@@ -1624,4 +2118,17 @@ CREATE INDEX context_compression_snapshots_chat_sequence_idx
     ON context_compression_snapshots (chat_id, sequence);
 CREATE INDEX context_compression_snapshots_run_idx
     ON context_compression_snapshots (run_id);
+"#;
+
+const MIGRATION_004: &str = r#"
+CREATE VIRTUAL TABLE code_graph_fts_index USING fts5(
+    entity_kind UNINDEXED,
+    entity_id UNINDEXED,
+    title,
+    body
+);
+
+INSERT INTO code_graph_fts_index (entity_kind, entity_id, title, body)
+    SELECT entity_kind, entity_id, title, body
+    FROM code_graph_fts_data;
 "#;

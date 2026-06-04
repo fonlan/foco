@@ -28,6 +28,7 @@ use foco_agent::{
     calculate_context_budget, detect_same_file_write_conflicts, estimate_json_tokens,
     estimate_text_tokens, pack_context, plan_context_compression,
 };
+use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_providers::{
     DEFAULT_OPENAI_BASE_URL, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
@@ -81,6 +82,7 @@ struct AppState {
     model_metadata_file: PathBuf,
     terminal_registry: terminal::TerminalRegistry,
     terminal_shutdown_tx: broadcast::Sender<()>,
+    _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
 }
 
 #[tokio::main]
@@ -105,6 +107,7 @@ async fn run() -> AppResult<()> {
         count = workspace_databases.len(),
         "initialized workspace databases"
     );
+    let code_graph_watchers = initialize_code_graph_indexes(&loaded_config.config.workspaces)?;
 
     let addr = local_addr()?;
     let frontend_dir = frontend_dist_dir()?;
@@ -115,6 +118,7 @@ async fn run() -> AppResult<()> {
         model_metadata_file: loaded_config.paths.root_dir.join("models.dev.json"),
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
+        _code_graph_watchers: Arc::new(code_graph_watchers),
     };
     let app = Router::new()
         .route("/api/health", get(health))
@@ -166,6 +170,36 @@ async fn shutdown_signal(terminal_shutdown_tx: broadcast::Sender<()>) {
 
     tracing::info!("shutdown requested; closing terminal sessions");
     let _ = terminal_shutdown_tx.send(());
+}
+
+fn initialize_code_graph_indexes(
+    workspaces: &[WorkspaceConfig],
+) -> AppResult<Vec<CodeGraphWatcher>> {
+    let mut watchers = Vec::with_capacity(workspaces.len());
+
+    for workspace in workspaces {
+        let report = index_workspace(&workspace.path)?;
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            scanned_files = report.scanned_files,
+            indexed_files = report.indexed_files,
+            unchanged_files = report.unchanged_files,
+            skipped_files = report.skipped_files,
+            deleted_files = report.deleted_files,
+            parse_errors = report.parse_errors,
+            "initialized code graph index"
+        );
+        let watcher = start_code_graph_watcher(&workspace.path)?;
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            "started code graph filesystem watcher"
+        );
+        watchers.push(watcher);
+    }
+
+    Ok(watchers)
 }
 
 async fn health() -> Json<HealthResponse> {

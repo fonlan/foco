@@ -43,6 +43,7 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "code_graph_references",
         "code_graph_imports",
         "code_graph_fts_data",
+        "code_graph_fts_index",
         "code_graph_file_hashes",
         "code_graph_parse_status",
     ] {
