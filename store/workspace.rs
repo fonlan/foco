@@ -947,6 +947,284 @@ impl WorkspaceDatabase {
         Ok(stale_paths)
     }
 
+    pub fn code_graph_context(&self) -> Result<CodeGraphContextRecord, WorkspaceDatabaseError> {
+        let indexed_files = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM code_graph_files", [], |row| {
+                row.get(0)
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        let symbols = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM code_graph_symbols", [], |row| {
+                row.get(0)
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        let references = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM code_graph_references", [], |row| {
+                row.get(0)
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        let edges = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM code_graph_edges", [], |row| {
+                row.get(0)
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT language
+                 FROM code_graph_files
+                 WHERE language IS NOT NULL
+                 GROUP BY language
+                 ORDER BY language ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(CodeGraphContextRecord {
+            indexed_files,
+            symbols,
+            references,
+            edges,
+            languages: collect_rows(rows, &self.database_path)?,
+        })
+    }
+
+    pub fn find_code_graph_symbols(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        path: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<CodeGraphSymbolRecord>, WorkspaceDatabaseError> {
+        let query_like = format!("%{}%", query.trim().to_ascii_lowercase());
+        let kind = kind.map(str::trim).filter(|value| !value.is_empty());
+        let path = path.map(str::trim).filter(|value| !value.is_empty());
+        let path_prefix = path.map(|value| format!("{value}/%"));
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    s.id, f.path, f.language, s.name, s.kind,
+                    s.start_line, s.start_column, s.end_line, s.end_column,
+                    s.signature, s.documentation
+                 FROM code_graph_symbols s
+                 JOIN code_graph_files f ON f.id = s.file_id
+                 WHERE
+                    (
+                        lower(s.name) LIKE ?1
+                        OR lower(COALESCE(s.signature, '')) LIKE ?1
+                        OR lower(COALESCE(s.documentation, '')) LIKE ?1
+                    )
+                    AND (?2 IS NULL OR s.kind = ?2)
+                    AND (?3 IS NULL OR f.path = ?3 OR f.path LIKE ?4)
+                 ORDER BY
+                    CASE WHEN lower(s.name) = lower(?5) THEN 0 ELSE 1 END,
+                    f.path ASC,
+                    s.start_line ASC,
+                    s.name ASC
+                 LIMIT ?6",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(
+                params![query_like, kind, path, path_prefix, query.trim(), limit],
+                code_graph_symbol_from_row,
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn code_graph_symbol(
+        &self,
+        symbol_id: i64,
+    ) -> Result<Option<CodeGraphSymbolRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT
+                    s.id, f.path, f.language, s.name, s.kind,
+                    s.start_line, s.start_column, s.end_line, s.end_column,
+                    s.signature, s.documentation
+                 FROM code_graph_symbols s
+                 JOIN code_graph_files f ON f.id = s.file_id
+                 WHERE s.id = ?1",
+                params![symbol_id],
+                code_graph_symbol_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn code_graph_callers(
+        &self,
+        symbol_id: i64,
+        limit: i64,
+    ) -> Result<Vec<CodeGraphSymbolRelationRecord>, WorkspaceDatabaseError> {
+        self.code_graph_symbol_relations(
+            "WHERE edge.target_symbol_id = ?1",
+            params![symbol_id, limit],
+        )
+    }
+
+    pub fn code_graph_callees(
+        &self,
+        symbol_id: i64,
+        limit: i64,
+    ) -> Result<Vec<CodeGraphSymbolRelationRecord>, WorkspaceDatabaseError> {
+        self.code_graph_symbol_relations(
+            "WHERE edge.source_symbol_id = ?1",
+            params![symbol_id, limit],
+        )
+    }
+
+    pub fn code_graph_references(
+        &self,
+        symbol_id: i64,
+        limit: i64,
+    ) -> Result<Vec<CodeGraphReferenceRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    reference.id, file.path, file.language, reference.name,
+                    reference.start_line, reference.start_column,
+                    reference.end_line, reference.end_column,
+                    symbol.id, symbol_file.path, symbol_file.language,
+                    symbol.name, symbol.kind, symbol.start_line, symbol.start_column,
+                    symbol.end_line, symbol.end_column, symbol.signature,
+                    symbol.documentation
+                 FROM code_graph_references reference
+                 JOIN code_graph_files file ON file.id = reference.file_id
+                 LEFT JOIN code_graph_symbols symbol ON symbol.id = reference.symbol_id
+                 LEFT JOIN code_graph_files symbol_file ON symbol_file.id = symbol.file_id
+                 WHERE reference.symbol_id = ?1
+                 ORDER BY file.path ASC, reference.start_line ASC, reference.start_column ASC
+                 LIMIT ?2",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![symbol_id, limit], code_graph_reference_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn code_graph_related_files(
+        &self,
+        path: &str,
+        limit: i64,
+    ) -> Result<Vec<CodeGraphRelatedFileRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "WITH related AS (
+                    SELECT target_file.path AS path, target_file.language AS language,
+                           'callee' AS relation, COUNT(*) AS score
+                    FROM code_graph_edges edge
+                    JOIN code_graph_symbols source_symbol
+                        ON source_symbol.id = edge.source_symbol_id
+                    JOIN code_graph_files source_file
+                        ON source_file.id = source_symbol.file_id
+                    JOIN code_graph_symbols target_symbol
+                        ON target_symbol.id = edge.target_symbol_id
+                    JOIN code_graph_files target_file
+                        ON target_file.id = target_symbol.file_id
+                    WHERE source_file.path = ?1 AND target_file.path <> ?1
+                    GROUP BY target_file.path, target_file.language
+
+                    UNION ALL
+
+                    SELECT source_file.path AS path, source_file.language AS language,
+                           'caller' AS relation, COUNT(*) AS score
+                    FROM code_graph_edges edge
+                    JOIN code_graph_symbols source_symbol
+                        ON source_symbol.id = edge.source_symbol_id
+                    JOIN code_graph_files source_file
+                        ON source_file.id = source_symbol.file_id
+                    JOIN code_graph_symbols target_symbol
+                        ON target_symbol.id = edge.target_symbol_id
+                    JOIN code_graph_files target_file
+                        ON target_file.id = target_symbol.file_id
+                    WHERE target_file.path = ?1 AND source_file.path <> ?1
+                    GROUP BY source_file.path, source_file.language
+
+                    UNION ALL
+
+                    SELECT other_file.path AS path, other_file.language AS language,
+                           'shared_import' AS relation, COUNT(*) AS score
+                    FROM code_graph_imports import
+                    JOIN code_graph_files file ON file.id = import.file_id
+                    JOIN code_graph_imports other_import
+                        ON other_import.module = import.module
+                    JOIN code_graph_files other_file
+                        ON other_file.id = other_import.file_id
+                    WHERE file.path = ?1 AND other_file.path <> ?1
+                    GROUP BY other_file.path, other_file.language
+                 )
+                 SELECT path, language, relation, score
+                 FROM related
+                 ORDER BY score DESC, path ASC, relation ASC
+                 LIMIT ?2",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![path, limit], |row| {
+                Ok(CodeGraphRelatedFileRecord {
+                    path: row.get(0)?,
+                    language: row.get(1)?,
+                    relation: row.get(2)?,
+                    score: row.get(3)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    fn code_graph_symbol_relations<P>(
+        &self,
+        where_clause: &str,
+        params: P,
+    ) -> Result<Vec<CodeGraphSymbolRelationRecord>, WorkspaceDatabaseError>
+    where
+        P: rusqlite::Params,
+    {
+        let sql = format!(
+            "SELECT
+                edge.id, edge.edge_kind, edge.metadata_json,
+                source.id, source_file.path, source_file.language,
+                source.name, source.kind, source.start_line, source.start_column,
+                source.end_line, source.end_column, source.signature, source.documentation,
+                target.id, target_file.path, target_file.language,
+                target.name, target.kind, target.start_line, target.start_column,
+                target.end_line, target.end_column, target.signature, target.documentation
+             FROM code_graph_edges edge
+             JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+             JOIN code_graph_files source_file ON source_file.id = source.file_id
+             JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+             JOIN code_graph_files target_file ON target_file.id = target.file_id
+             {where_clause}
+             ORDER BY source_file.path ASC, source.start_line ASC,
+                      target_file.path ASC, target.start_line ASC
+             LIMIT ?2"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params, code_graph_relation_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn upsert_terminal_session(
         &mut self,
         session: NewTerminalSession<'_>,
@@ -1362,6 +1640,60 @@ pub struct NewCodeGraphEdge<'a> {
     pub metadata_json: Option<&'a str>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphContextRecord {
+    pub indexed_files: i64,
+    pub symbols: i64,
+    pub references: i64,
+    pub edges: i64,
+    pub languages: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphSymbolRecord {
+    pub id: i64,
+    pub path: String,
+    pub language: Option<String>,
+    pub name: String,
+    pub kind: String,
+    pub start_line: Option<i64>,
+    pub start_column: Option<i64>,
+    pub end_line: Option<i64>,
+    pub end_column: Option<i64>,
+    pub signature: Option<String>,
+    pub documentation: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphSymbolRelationRecord {
+    pub edge_id: i64,
+    pub edge_kind: String,
+    pub metadata_json: String,
+    pub source: CodeGraphSymbolRecord,
+    pub target: CodeGraphSymbolRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphReferenceRecord {
+    pub id: i64,
+    pub path: String,
+    pub language: Option<String>,
+    pub name: String,
+    pub start_line: Option<i64>,
+    pub start_column: Option<i64>,
+    pub end_line: Option<i64>,
+    pub end_column: Option<i64>,
+    pub symbol: Option<CodeGraphSymbolRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphRelatedFileRecord {
+    pub path: String,
+    pub language: Option<String>,
+    pub relation: String,
+    pub score: i64,
+}
+
 #[derive(Debug)]
 pub enum WorkspaceDatabaseError {
     InvalidCodeGraphInput {
@@ -1463,6 +1795,70 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::WorkspaceNotDirectory { .. } => None,
         }
     }
+}
+
+fn code_graph_symbol_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeGraphSymbolRecord> {
+    code_graph_symbol_from_row_offset(row, 0)
+}
+
+fn code_graph_symbol_from_row_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<CodeGraphSymbolRecord> {
+    Ok(CodeGraphSymbolRecord {
+        id: row.get(offset)?,
+        path: row.get(offset + 1)?,
+        language: row.get(offset + 2)?,
+        name: row.get(offset + 3)?,
+        kind: row.get(offset + 4)?,
+        start_line: row.get(offset + 5)?,
+        start_column: row.get(offset + 6)?,
+        end_line: row.get(offset + 7)?,
+        end_column: row.get(offset + 8)?,
+        signature: row.get(offset + 9)?,
+        documentation: row.get(offset + 10)?,
+    })
+}
+
+fn optional_code_graph_symbol_from_row_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<Option<CodeGraphSymbolRecord>> {
+    let id = row.get::<_, Option<i64>>(offset)?;
+
+    if id.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(code_graph_symbol_from_row_offset(row, offset)?))
+}
+
+fn code_graph_relation_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CodeGraphSymbolRelationRecord> {
+    Ok(CodeGraphSymbolRelationRecord {
+        edge_id: row.get(0)?,
+        edge_kind: row.get(1)?,
+        metadata_json: row.get(2)?,
+        source: code_graph_symbol_from_row_offset(row, 3)?,
+        target: code_graph_symbol_from_row_offset(row, 14)?,
+    })
+}
+
+fn code_graph_reference_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CodeGraphReferenceRecord> {
+    Ok(CodeGraphReferenceRecord {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        language: row.get(2)?,
+        name: row.get(3)?,
+        start_line: row.get(4)?,
+        start_column: row.get(5)?,
+        end_line: row.get(6)?,
+        end_column: row.get(7)?,
+        symbol: optional_code_graph_symbol_from_row_offset(row, 8)?,
+    })
 }
 
 struct Migration {

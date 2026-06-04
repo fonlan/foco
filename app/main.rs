@@ -24,9 +24,9 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo, build_system_prompt,
-    calculate_context_budget, detect_same_file_write_conflicts, estimate_json_tokens,
-    estimate_text_tokens, pack_context, plan_context_compression,
+    CodeGraphPromptContext, ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo,
+    build_system_prompt, calculate_context_budget, detect_same_file_write_conflicts,
+    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_providers::{
@@ -1636,10 +1636,20 @@ fn prepare_chat_context(
         .cloned()
         .map(neutral_tool_definition)
         .collect::<Vec<_>>();
+    let code_graph_context = database
+        .code_graph_context()
+        .map_err(ApiError::from_workspace_error)?;
     let system_prompt = build_system_prompt(SystemPromptInput {
         workspace_id: workspace.id.clone(),
         workspace_name: workspace.name.clone(),
         workspace_path: workspace.path.display().to_string(),
+        code_graph: CodeGraphPromptContext {
+            indexed_files: code_graph_context.indexed_files,
+            symbols: code_graph_context.symbols,
+            references: code_graph_context.references,
+            edges: code_graph_context.edges,
+            languages: code_graph_context.languages,
+        },
         tools: tool_definitions
             .iter()
             .map(|tool| ToolPromptInfo {

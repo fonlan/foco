@@ -4,6 +4,10 @@ use std::{
     process::Command,
 };
 
+use foco_store::workspace::{
+    CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
+    CodeGraphSymbolRelationRecord, WorkspaceDatabase, WorkspaceDatabaseError,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -13,11 +17,18 @@ pub const SEARCH_TEXT_TOOL: &str = "search_text";
 pub const WRITE_FILE_TOOL: &str = "write_file";
 pub const RUN_COMMAND_TOOL: &str = "run_command";
 pub const GIT_DIFF_TOOL: &str = "git_diff";
+pub const GRAPH_FIND_SYMBOLS_TOOL: &str = "graph_find_symbols";
+pub const GRAPH_FIND_CALLERS_TOOL: &str = "graph_find_callers";
+pub const GRAPH_FIND_CALLEES_TOOL: &str = "graph_find_callees";
+pub const GRAPH_FIND_REFERENCES_TOOL: &str = "graph_find_references";
+pub const GRAPH_RELATED_FILES_TOOL: &str = "graph_related_files";
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
 const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+const DEFAULT_GRAPH_RESULT_LIMIT: usize = 20;
+const MAX_GRAPH_RESULT_LIMIT: usize = 50;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +50,11 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         read_file_definition(),
         list_files_definition(),
+        graph_find_symbols_definition(),
+        graph_find_callers_definition(),
+        graph_find_callees_definition(),
+        graph_find_references_definition(),
+        graph_related_files_definition(),
         search_text_definition(),
         write_file_definition(),
         run_command_definition(),
@@ -71,6 +87,11 @@ fn execute_builtin_tool_inner(
     match tool_name {
         READ_FILE_TOOL => read_file(workspace_path, arguments),
         LIST_FILES_TOOL => list_files(workspace_path, arguments),
+        GRAPH_FIND_SYMBOLS_TOOL => graph_find_symbols(workspace_path, arguments),
+        GRAPH_FIND_CALLERS_TOOL => graph_find_callers(workspace_path, arguments),
+        GRAPH_FIND_CALLEES_TOOL => graph_find_callees(workspace_path, arguments),
+        GRAPH_FIND_REFERENCES_TOOL => graph_find_references(workspace_path, arguments),
+        GRAPH_RELATED_FILES_TOOL => graph_related_files(workspace_path, arguments),
         SEARCH_TEXT_TOOL => search_text(workspace_path, arguments),
         WRITE_FILE_TOOL => write_file(workspace_path, arguments),
         RUN_COMMAND_TOOL => run_command(workspace_path, arguments),
@@ -166,6 +187,96 @@ fn list_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
     Ok(json!({
         "path": input_path,
         "entries": entries,
+        "truncated": truncated
+    }))
+}
+
+fn graph_find_symbols(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+    let request: GraphFindSymbolsInput = parse_arguments(arguments)?;
+    let query = non_empty_argument("query", &request.query)?;
+    let path = request
+        .path
+        .as_deref()
+        .map(normalize_workspace_path_text)
+        .transpose()?;
+    let limit = graph_limit(request.limit)?;
+    let database = open_code_graph_database(workspace_path)?;
+    let mut symbols = database.find_code_graph_symbols(
+        query,
+        request.kind.as_deref(),
+        path.as_deref(),
+        graph_query_limit(limit)?,
+    )?;
+    let truncated = truncate_records(&mut symbols, limit);
+
+    Ok(json!({
+        "query": query,
+        "kind": request.kind,
+        "path": path,
+        "symbols": symbols.into_iter().map(symbol_json).collect::<Vec<_>>(),
+        "truncated": truncated
+    }))
+}
+
+fn graph_find_callers(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+    let request: GraphSymbolLookupInput = parse_arguments(arguments)?;
+    let database = open_code_graph_database(workspace_path)?;
+    let symbol = resolve_graph_symbol(&database, &request)?;
+    let limit = graph_limit(request.limit)?;
+    let mut callers = database.code_graph_callers(symbol.id, graph_query_limit(limit)?)?;
+    let truncated = truncate_records(&mut callers, limit);
+
+    Ok(json!({
+        "symbol": symbol_json(symbol),
+        "callers": callers.into_iter().map(relation_json).collect::<Vec<_>>(),
+        "truncated": truncated
+    }))
+}
+
+fn graph_find_callees(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+    let request: GraphSymbolLookupInput = parse_arguments(arguments)?;
+    let database = open_code_graph_database(workspace_path)?;
+    let symbol = resolve_graph_symbol(&database, &request)?;
+    let limit = graph_limit(request.limit)?;
+    let mut callees = database.code_graph_callees(symbol.id, graph_query_limit(limit)?)?;
+    let truncated = truncate_records(&mut callees, limit);
+
+    Ok(json!({
+        "symbol": symbol_json(symbol),
+        "callees": callees.into_iter().map(relation_json).collect::<Vec<_>>(),
+        "truncated": truncated
+    }))
+}
+
+fn graph_find_references(
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: GraphSymbolLookupInput = parse_arguments(arguments)?;
+    let database = open_code_graph_database(workspace_path)?;
+    let symbol = resolve_graph_symbol(&database, &request)?;
+    let limit = graph_limit(request.limit)?;
+    let mut references = database.code_graph_references(symbol.id, graph_query_limit(limit)?)?;
+    let truncated = truncate_records(&mut references, limit);
+
+    Ok(json!({
+        "symbol": symbol_json(symbol),
+        "references": references.into_iter().map(reference_json).collect::<Vec<_>>(),
+        "truncated": truncated
+    }))
+}
+
+fn graph_related_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+    let request: GraphRelatedFilesInput = parse_arguments(arguments)?;
+    let path = normalize_workspace_path_text(&request.path)?;
+    let limit = graph_limit(request.limit)?;
+    let database = open_code_graph_database(workspace_path)?;
+    let mut files = database.code_graph_related_files(&path, graph_query_limit(limit)?)?;
+    let truncated = truncate_records(&mut files, limit);
+
+    Ok(json!({
+        "path": path,
+        "files": files.into_iter().map(related_file_json).collect::<Vec<_>>(),
         "truncated": truncated
     }))
 }
@@ -371,6 +482,155 @@ fn git_diff(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntim
         "diff": run_git_text(&workspace, &diff_args)?,
         "stagedDiff": run_git_text(&workspace, &staged_diff_args)?
     }))
+}
+
+fn open_code_graph_database(workspace_path: &Path) -> Result<WorkspaceDatabase, ToolRuntimeError> {
+    WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
+}
+
+fn resolve_graph_symbol(
+    database: &WorkspaceDatabase,
+    request: &GraphSymbolLookupInput,
+) -> Result<CodeGraphSymbolRecord, ToolRuntimeError> {
+    let symbol = request
+        .symbol
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (request.symbol_id, symbol) {
+        (Some(_), Some(_)) => Err(ToolRuntimeError::InvalidArguments(
+            "provide exactly one of symbolId or symbol".to_string(),
+        )),
+        (None, None) => Err(ToolRuntimeError::InvalidArguments(
+            "provide exactly one of symbolId or symbol".to_string(),
+        )),
+        (Some(symbol_id), None) => {
+            if request.path.is_some() {
+                return Err(ToolRuntimeError::InvalidArguments(
+                    "path can only be used when resolving by symbol name".to_string(),
+                ));
+            }
+
+            database.code_graph_symbol(symbol_id)?.ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(format!(
+                    "code graph symbol was not found: {symbol_id}"
+                ))
+            })
+        }
+        (None, Some(symbol)) => {
+            let path = request
+                .path
+                .as_deref()
+                .map(normalize_workspace_path_text)
+                .transpose()?;
+            let matches = database.find_code_graph_symbols(symbol, None, path.as_deref(), 3)?;
+
+            match matches.len() {
+                0 => Err(ToolRuntimeError::InvalidArguments(format!(
+                    "code graph symbol was not found: {symbol}"
+                ))),
+                1 => Ok(matches.into_iter().next().expect("one symbol")),
+                _ => {
+                    let candidates = matches
+                        .into_iter()
+                        .map(|candidate| {
+                            format!("{}:{}:{}", candidate.id, candidate.path, candidate.name)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Err(ToolRuntimeError::InvalidArguments(format!(
+                        "symbol name is ambiguous; call graph_find_symbols first and pass symbolId. Candidates: {candidates}"
+                    )))
+                }
+            }
+        }
+    }
+}
+
+fn non_empty_argument<'a>(name: &str, value: &'a str) -> Result<&'a str, ToolRuntimeError> {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        Err(ToolRuntimeError::InvalidArguments(format!(
+            "{name} must not be empty"
+        )))
+    } else {
+        Ok(trimmed)
+    }
+}
+
+fn graph_limit(limit: Option<usize>) -> Result<usize, ToolRuntimeError> {
+    let limit = limit.unwrap_or(DEFAULT_GRAPH_RESULT_LIMIT);
+
+    if limit == 0 || limit > MAX_GRAPH_RESULT_LIMIT {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "limit must be between 1 and {MAX_GRAPH_RESULT_LIMIT}"
+        )));
+    }
+
+    Ok(limit)
+}
+
+fn graph_query_limit(limit: usize) -> Result<i64, ToolRuntimeError> {
+    i64::try_from(limit + 1).map_err(|_| {
+        ToolRuntimeError::InvalidArguments("limit is too large for SQLite".to_string())
+    })
+}
+
+fn truncate_records<T>(records: &mut Vec<T>, limit: usize) -> bool {
+    let truncated = records.len() > limit;
+    records.truncate(limit);
+    truncated
+}
+
+fn symbol_json(symbol: CodeGraphSymbolRecord) -> Value {
+    json!({
+        "symbolId": symbol.id,
+        "path": symbol.path,
+        "language": symbol.language,
+        "name": symbol.name,
+        "kind": symbol.kind,
+        "startLine": symbol.start_line,
+        "startColumn": symbol.start_column,
+        "endLine": symbol.end_line,
+        "endColumn": symbol.end_column,
+        "signature": symbol.signature,
+        "documentation": symbol.documentation
+    })
+}
+
+fn relation_json(relation: CodeGraphSymbolRelationRecord) -> Value {
+    json!({
+        "edgeId": relation.edge_id,
+        "edgeKind": relation.edge_kind,
+        "metadata": relation.metadata_json,
+        "source": symbol_json(relation.source),
+        "target": symbol_json(relation.target)
+    })
+}
+
+fn reference_json(reference: CodeGraphReferenceRecord) -> Value {
+    json!({
+        "referenceId": reference.id,
+        "path": reference.path,
+        "language": reference.language,
+        "name": reference.name,
+        "startLine": reference.start_line,
+        "startColumn": reference.start_column,
+        "endLine": reference.end_line,
+        "endColumn": reference.end_column,
+        "symbol": reference.symbol.map(symbol_json)
+    })
+}
+
+fn related_file_json(file: CodeGraphRelatedFileRecord) -> Value {
+    json!({
+        "path": file.path,
+        "language": file.language,
+        "relation": file.relation,
+        "score": file.score
+    })
 }
 
 fn parse_arguments<T>(arguments: Value) -> Result<T, ToolRuntimeError>
@@ -606,6 +866,153 @@ fn list_files_definition() -> ToolDefinition {
     }
 }
 
+fn graph_find_symbols_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GRAPH_FIND_SYMBOLS_TOOL,
+        description: "Find indexed code graph symbols by name, signature, or documentation. Prefer this before full-text search when locating code.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Symbol name or partial text to find."
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "Optional symbol kind such as function, method, struct, class, enum, trait, variable, or constant."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional workspace-relative file or directory path to restrict the query."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional result limit from 1 to 50. Defaults to 20."
+                }
+            },
+            "required": ["query"]
+        }),
+        strict: true,
+    }
+}
+
+fn graph_find_callers_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GRAPH_FIND_CALLERS_TOOL,
+        description: "Find code graph symbols that reference the requested symbol. Use symbolId from graph_find_symbols when names are ambiguous.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbolId": {
+                    "type": "integer",
+                    "description": "Exact code graph symbol id returned by graph_find_symbols."
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Symbol name to resolve when it is unique."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional workspace-relative file or directory path used only with symbol."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional result limit from 1 to 50. Defaults to 20."
+                }
+            },
+            "required": []
+        }),
+        strict: true,
+    }
+}
+
+fn graph_find_callees_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GRAPH_FIND_CALLEES_TOOL,
+        description: "Find code graph symbols referenced by the requested symbol. Use symbolId from graph_find_symbols when names are ambiguous.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbolId": {
+                    "type": "integer",
+                    "description": "Exact code graph symbol id returned by graph_find_symbols."
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Symbol name to resolve when it is unique."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional workspace-relative file or directory path used only with symbol."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional result limit from 1 to 50. Defaults to 20."
+                }
+            },
+            "required": []
+        }),
+        strict: true,
+    }
+}
+
+fn graph_find_references_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GRAPH_FIND_REFERENCES_TOOL,
+        description: "Find indexed reference locations for the requested symbol. Use symbolId from graph_find_symbols when names are ambiguous.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbolId": {
+                    "type": "integer",
+                    "description": "Exact code graph symbol id returned by graph_find_symbols."
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Symbol name to resolve when it is unique."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional workspace-relative file or directory path used only with symbol."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional result limit from 1 to 50. Defaults to 20."
+                }
+            },
+            "required": []
+        }),
+        strict: true,
+    }
+}
+
+fn graph_related_files_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GRAPH_RELATED_FILES_TOOL,
+        description: "Find files related to an indexed workspace file through code graph edges or shared imports.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative indexed file path."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional result limit from 1 to 50. Defaults to 20."
+                }
+            },
+            "required": ["path"]
+        }),
+        strict: true,
+    }
+}
+
 fn search_text_definition() -> ToolDefinition {
     ToolDefinition {
         name: SEARCH_TEXT_TOOL,
@@ -716,6 +1123,30 @@ struct SearchTextInput {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphFindSymbolsInput {
+    query: String,
+    kind: Option<String>,
+    path: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphSymbolLookupInput {
+    symbol_id: Option<i64>,
+    symbol: Option<String>,
+    path: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct GraphRelatedFilesInput {
+    path: String,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
 struct WriteFileInput {
     path: String,
     content: String,
@@ -766,6 +1197,7 @@ enum ToolRuntimeError {
     NotDirectory(PathBuf),
     NotFile(PathBuf),
     UnknownTool(String),
+    WorkspaceDatabase(WorkspaceDatabaseError),
 }
 
 impl fmt::Display for ToolRuntimeError {
@@ -816,15 +1248,45 @@ impl fmt::Display for ToolRuntimeError {
             Self::NotDirectory(path) => write!(formatter, "{} is not a directory", path.display()),
             Self::NotFile(path) => write!(formatter, "{} is not a file", path.display()),
             Self::UnknownTool(tool) => write!(formatter, "unknown built-in tool '{tool}'"),
+            Self::WorkspaceDatabase(source) => {
+                write!(formatter, "code graph database error: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for ToolRuntimeError {}
+impl std::error::Error for ToolRuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WorkspaceDatabase(source) => Some(source),
+            Self::Command { .. }
+            | Self::CommandFailed { .. }
+            | Self::FileTooLarge { .. }
+            | Self::InvalidArguments(_)
+            | Self::InvalidPath(_)
+            | Self::InvalidToolOutput { .. }
+            | Self::Io { .. }
+            | Self::NotGitRepository { .. }
+            | Self::NotDirectory(_)
+            | Self::NotFile(_)
+            | Self::UnknownTool(_) => None,
+        }
+    }
+}
+
+impl From<WorkspaceDatabaseError> for ToolRuntimeError {
+    fn from(source: WorkspaceDatabaseError) -> Self {
+        Self::WorkspaceDatabase(source)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use foco_store::workspace::{
+        NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
+        NewCodeGraphSymbol, WorkspaceDatabase,
+    };
 
     #[test]
     fn rejects_paths_outside_workspace() {
@@ -909,6 +1371,64 @@ mod tests {
         assert_eq!(matches[0]["path"], "note.txt");
         assert_eq!(matches[0]["line"], 2);
         assert_eq!(matches[0]["text"], "beta");
+    }
+
+    #[test]
+    fn graph_tools_return_symbols_and_relationships() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        insert_graph_fixture(workspace.path());
+
+        let symbols = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_FIND_SYMBOLS_TOOL,
+            json!({ "query": "helper", "limit": 5 }),
+        );
+
+        assert!(!symbols.is_error);
+        let symbol_id = symbols.output["symbols"][0]["symbolId"]
+            .as_i64()
+            .expect("symbol id");
+        assert_eq!(symbols.output["symbols"][0]["path"], "lib.rs");
+
+        let references = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_FIND_REFERENCES_TOOL,
+            json!({ "symbolId": symbol_id, "limit": 5 }),
+        );
+
+        assert!(!references.is_error);
+        assert_eq!(references.output["references"][0]["path"], "lib.rs");
+        assert_eq!(references.output["references"][0]["name"], "helper");
+
+        let public_api = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_FIND_SYMBOLS_TOOL,
+            json!({ "query": "public_api", "path": "lib.rs", "limit": 5 }),
+        );
+        let public_api_id = public_api.output["symbols"][0]["symbolId"]
+            .as_i64()
+            .expect("public api id");
+        let callees = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_FIND_CALLEES_TOOL,
+            json!({ "symbolId": public_api_id, "limit": 5 }),
+        );
+
+        assert!(!callees.is_error);
+        assert_eq!(callees.output["callees"][0]["target"]["name"], "helper");
+
+        let related_files = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_RELATED_FILES_TOOL,
+            json!({ "path": "lib.rs", "limit": 5 }),
+        );
+
+        assert!(!related_files.is_error);
+        assert_eq!(related_files.output["files"][0]["path"], "caller.rs");
+        assert_eq!(
+            related_files.output["files"][0]["relation"],
+            "shared_import"
+        );
     }
 
     #[test]
@@ -1047,5 +1567,101 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn insert_graph_fixture(workspace_path: &Path) {
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path).expect("database");
+        let lib_symbols = [
+            NewCodeGraphSymbol {
+                name: "public_api",
+                kind: "function",
+                start_line: Some(1),
+                start_column: Some(1),
+                end_line: Some(5),
+                end_column: Some(1),
+                signature: Some("fn public_api()"),
+                documentation: None,
+            },
+            NewCodeGraphSymbol {
+                name: "helper",
+                kind: "function",
+                start_line: Some(7),
+                start_column: Some(1),
+                end_line: Some(9),
+                end_column: Some(1),
+                signature: Some("fn helper()"),
+                documentation: None,
+            },
+        ];
+        let lib_imports = [NewCodeGraphImport {
+            module: "crate::shared",
+            imported_symbol: None,
+            alias: None,
+            start_line: Some(0),
+            start_column: Some(0),
+        }];
+        let lib_references = [NewCodeGraphReference {
+            name: "helper",
+            symbol_index: Some(1),
+            start_line: Some(3),
+            start_column: Some(5),
+            end_line: Some(3),
+            end_column: Some(11),
+        }];
+        let lib_edges = [NewCodeGraphEdge {
+            source_symbol_index: 0,
+            target_symbol_index: 1,
+            edge_kind: "references",
+            metadata_json: None,
+        }];
+        database
+            .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                path: "lib.rs",
+                language: Some("rust"),
+                size_bytes: Some(64),
+                modified_at: Some("2026-06-04T00:00:00.000Z"),
+                content_hash: "lib-hash",
+                parse_status: "parsed",
+                parse_error_message: None,
+                symbols: &lib_symbols,
+                imports: &lib_imports,
+                references: &lib_references,
+                edges: &lib_edges,
+                fts_body: "fn public_api() { helper(); } fn helper() {}",
+            })
+            .expect("lib graph index");
+        let caller_symbols = [NewCodeGraphSymbol {
+            name: "caller_entry",
+            kind: "function",
+            start_line: Some(1),
+            start_column: Some(1),
+            end_line: Some(3),
+            end_column: Some(1),
+            signature: Some("fn caller_entry()"),
+            documentation: None,
+        }];
+        let caller_imports = [NewCodeGraphImport {
+            module: "crate::shared",
+            imported_symbol: None,
+            alias: None,
+            start_line: Some(0),
+            start_column: Some(0),
+        }];
+        database
+            .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                path: "caller.rs",
+                language: Some("rust"),
+                size_bytes: Some(32),
+                modified_at: Some("2026-06-04T00:00:00.000Z"),
+                content_hash: "caller-hash",
+                parse_status: "parsed",
+                parse_error_message: None,
+                symbols: &caller_symbols,
+                imports: &caller_imports,
+                references: &[],
+                edges: &[],
+                fts_body: "fn caller_entry() {}",
+            })
+            .expect("caller graph index");
     }
 }

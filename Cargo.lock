@@ -666,6 +666,7 @@ dependencies = [
 name = "foco-tools"
 version = "0.1.0"
 dependencies = [
+ "foco-store",
  "serde",
  "serde_json",
  "tempfile",

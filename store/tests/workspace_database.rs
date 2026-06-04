@@ -3,9 +3,10 @@ use std::fs;
 use foco_store::{
     config::WorkspaceConfig,
     workspace::{
-        LlmRequestRecord, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
-        NewMessage, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
-        WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, initialize_workspace_databases,
+        LlmRequestRecord, NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport,
+        NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot, NewLlmRequest,
+        NewLlmRequestEvent, NewMessage, NewRunEvent, NewTerminalSession, NewToolCall,
+        NewToolResult, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, initialize_workspace_databases,
         workspace_database_path,
     },
 };
@@ -335,6 +336,149 @@ fn repository_helpers_round_trip_tool_calls_and_results() {
     let output: Value = serde_json::from_str(&result.output_json).expect("output json");
     assert_eq!(output["content"], "hello");
     assert_eq!(output["authorization"], "[REDACTED]");
+}
+
+#[test]
+fn code_graph_query_helpers_return_compact_relationships() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let lib_symbols = [
+        NewCodeGraphSymbol {
+            name: "public_api",
+            kind: "function",
+            start_line: Some(1),
+            start_column: Some(1),
+            end_line: Some(5),
+            end_column: Some(1),
+            signature: Some("fn public_api()"),
+            documentation: None,
+        },
+        NewCodeGraphSymbol {
+            name: "helper",
+            kind: "function",
+            start_line: Some(7),
+            start_column: Some(1),
+            end_line: Some(9),
+            end_column: Some(1),
+            signature: Some("fn helper()"),
+            documentation: None,
+        },
+    ];
+    let lib_imports = [NewCodeGraphImport {
+        module: "crate::shared",
+        imported_symbol: None,
+        alias: None,
+        start_line: Some(0),
+        start_column: Some(0),
+    }];
+    let lib_references = [NewCodeGraphReference {
+        name: "helper",
+        symbol_index: Some(1),
+        start_line: Some(3),
+        start_column: Some(5),
+        end_line: Some(3),
+        end_column: Some(11),
+    }];
+    let lib_edges = [NewCodeGraphEdge {
+        source_symbol_index: 0,
+        target_symbol_index: 1,
+        edge_kind: "references",
+        metadata_json: None,
+    }];
+    database
+        .replace_code_graph_file_index(NewCodeGraphFileIndex {
+            path: "lib.rs",
+            language: Some("rust"),
+            size_bytes: Some(64),
+            modified_at: Some("2026-06-04T00:00:00.000Z"),
+            content_hash: "lib-hash",
+            parse_status: "parsed",
+            parse_error_message: None,
+            symbols: &lib_symbols,
+            imports: &lib_imports,
+            references: &lib_references,
+            edges: &lib_edges,
+            fts_body: "fn public_api() { helper(); } fn helper() {}",
+        })
+        .expect("lib graph index");
+    let caller_symbols = [NewCodeGraphSymbol {
+        name: "caller_entry",
+        kind: "function",
+        start_line: Some(1),
+        start_column: Some(1),
+        end_line: Some(3),
+        end_column: Some(1),
+        signature: Some("fn caller_entry()"),
+        documentation: None,
+    }];
+    let caller_imports = [NewCodeGraphImport {
+        module: "crate::shared",
+        imported_symbol: None,
+        alias: None,
+        start_line: Some(0),
+        start_column: Some(0),
+    }];
+    database
+        .replace_code_graph_file_index(NewCodeGraphFileIndex {
+            path: "caller.rs",
+            language: Some("rust"),
+            size_bytes: Some(32),
+            modified_at: Some("2026-06-04T00:00:00.000Z"),
+            content_hash: "caller-hash",
+            parse_status: "parsed",
+            parse_error_message: None,
+            symbols: &caller_symbols,
+            imports: &caller_imports,
+            references: &[],
+            edges: &[],
+            fts_body: "fn caller_entry() {}",
+        })
+        .expect("caller graph index");
+
+    let context = database.code_graph_context().expect("graph context");
+    assert_eq!(context.indexed_files, 2);
+    assert_eq!(context.symbols, 3);
+    assert_eq!(context.languages, vec!["rust"]);
+
+    let symbols = database
+        .find_code_graph_symbols("helper", Some("function"), None, 10)
+        .expect("find symbols");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].path, "lib.rs");
+    let helper_id = symbols[0].id;
+
+    let public_api = database
+        .find_code_graph_symbols("public_api", None, Some("lib.rs"), 10)
+        .expect("find public_api")
+        .pop()
+        .expect("public_api symbol");
+    let callees = database
+        .code_graph_callees(public_api.id, 10)
+        .expect("callees");
+    assert_eq!(callees.len(), 1);
+    assert_eq!(callees[0].target.name, "helper");
+
+    let callers = database.code_graph_callers(helper_id, 10).expect("callers");
+    assert_eq!(callers.len(), 1);
+    assert_eq!(callers[0].source.name, "public_api");
+
+    let references = database
+        .code_graph_references(helper_id, 10)
+        .expect("references");
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].path, "lib.rs");
+    assert_eq!(
+        references[0].symbol.as_ref().expect("target symbol").name,
+        "helper"
+    );
+
+    let related_files = database
+        .code_graph_related_files("lib.rs", 10)
+        .expect("related files");
+    assert_eq!(related_files.len(), 1);
+    assert_eq!(related_files[0].path, "caller.rs");
+    assert_eq!(related_files[0].relation, "shared_import");
 }
 
 #[test]

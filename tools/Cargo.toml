@@ -8,6 +8,7 @@ version.workspace = true
 path = "lib.rs"
 
 [dependencies]
+foco-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

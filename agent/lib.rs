@@ -15,10 +15,20 @@ pub struct ToolPromptInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphPromptContext {
+    pub indexed_files: i64,
+    pub symbols: i64,
+    pub references: i64,
+    pub edges: i64,
+    pub languages: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemPromptInput {
     pub workspace_id: String,
     pub workspace_name: String,
     pub workspace_path: String,
+    pub code_graph: CodeGraphPromptContext,
     pub tools: Vec<ToolPromptInfo>,
 }
 
@@ -103,9 +113,30 @@ pub fn build_system_prompt(input: SystemPromptInput) -> String {
          Tool rules:\n\
          - Use workspace-relative paths.\n\
          - Use tools when you need current file or workspace evidence.\n\
+         - Prefer code graph tools before full-text search when locating symbols, callers, callees, references, or related files.\n\
+         - Treat graph tool JSON outputs as compact structured code graph context; use returned symbolId values for follow-up graph queries.\n\
          - After tool results are returned, continue the same run and answer the user.",
         input.workspace_id, input.workspace_name, input.workspace_path
     );
+
+    let languages = if input.code_graph.languages.is_empty() {
+        "none".to_string()
+    } else {
+        input.code_graph.languages.join(", ")
+    };
+    prompt.push_str(&format!(
+        "\n\nCode graph context:\n\
+         - indexed files: {}\n\
+         - symbols: {}\n\
+         - references: {}\n\
+         - edges: {}\n\
+         - languages: {}",
+        input.code_graph.indexed_files,
+        input.code_graph.symbols,
+        input.code_graph.references,
+        input.code_graph.edges,
+        languages
+    ));
 
     if !input.tools.is_empty() {
         prompt.push_str("\n\nAvailable tools:");
@@ -404,6 +435,32 @@ impl std::error::Error for ToolConflictError {}
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn system_prompt_includes_code_graph_context_and_tool_rules() {
+        let prompt = build_system_prompt(SystemPromptInput {
+            workspace_id: "workspace-1".to_string(),
+            workspace_name: "Workspace".to_string(),
+            workspace_path: "C:/project".to_string(),
+            code_graph: CodeGraphPromptContext {
+                indexed_files: 12,
+                symbols: 42,
+                references: 30,
+                edges: 11,
+                languages: vec!["rust".to_string(), "typescript".to_string()],
+            },
+            tools: vec![ToolPromptInfo {
+                name: "graph_find_symbols".to_string(),
+                description: "Find symbols.".to_string(),
+            }],
+        });
+
+        assert!(prompt.contains("Code graph context:"));
+        assert!(prompt.contains("- indexed files: 12"));
+        assert!(prompt.contains("- languages: rust, typescript"));
+        assert!(prompt.contains("Prefer code graph tools before full-text search"));
+        assert!(prompt.contains("graph_find_symbols"));
+    }
 
     #[test]
     fn calculates_context_budget_from_model_limits() {
