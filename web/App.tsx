@@ -2081,6 +2081,45 @@ function SettingsPanel() {
     setIsModelDialogOpen(true);
   }
 
+  function modelMetadataForInput(modelId: string) {
+    const normalizedModelId = modelId.trim();
+
+    if (!normalizedModelId) {
+      return null;
+    }
+
+    const models = metadata?.models ?? [];
+
+    return (
+      models.find((model) => model.key === normalizedModelId) ??
+      models.find((model) => model.modelId === normalizedModelId) ??
+      null
+    );
+  }
+
+  function updateModelId(modelId: string) {
+    const model = modelMetadataForInput(modelId);
+    setSelectedMetadataKey(model?.key ?? "");
+
+    setForm((current) => {
+      if (!model) {
+        return {
+          ...current,
+          modelId,
+        };
+      }
+
+      return {
+        ...current,
+        displayName: model.name,
+        enabled: model.contextWindow !== null && model.maxOutputTokens !== null,
+        modelId: model.modelId,
+        contextWindow: numberInputValue(model.contextWindow),
+        maxOutputTokens: numberInputValue(model.maxOutputTokens),
+      };
+    });
+  }
+
   function editConfiguredModel(model: ConfiguredModelSummary) {
     setSelectedMetadataKey(model.metadataKey ?? "");
     setForm({
@@ -2808,9 +2847,7 @@ function SettingsPanel() {
                 <div className="space-y-3">
                   <TextField
                     label="Model id"
-                    onChange={(value) =>
-                      setForm((current) => ({ ...current, modelId: value }))
-                    }
+                    onChange={updateModelId}
                     placeholder="gpt-5.5"
                     value={form.modelId}
                   />
