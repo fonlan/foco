@@ -1154,7 +1154,7 @@ export function App() {
         </aside>
 
         <section className="app-main-panel flex min-w-0 flex-col">
-          <header className="border-b border-stone-200/80 bg-white/80 px-4 py-2 backdrop-blur sm:px-5">
+          <header className="shrink-0 border-b border-stone-200/80 bg-white/80 px-4 py-2 backdrop-blur sm:px-5">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
                 <h1 className="truncate text-lg font-semibold text-stone-950">
@@ -1468,7 +1468,7 @@ function ChatPanel({
   thinkingLevels: ThinkingLevelSummary[];
 }) {
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4">
         <div className="mx-auto flex w-full max-w-5xl flex-col gap-4">
           {messages.length ? (
@@ -1540,7 +1540,7 @@ function ChatPanel({
         </div>
       </div>
 
-      <div className="border-t border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-5">
+      <div className="shrink-0 border-t border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-5">
         <form className="mx-auto max-w-5xl" onSubmit={onSubmit}>
           <div className="relative">
             <textarea
@@ -1892,7 +1892,7 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
   }, [workspaceId]);
 
   return (
-    <section className="border-t border-stone-800 bg-[#16130f]">
+    <section className="shrink-0 border-t border-stone-800 bg-[#16130f]">
       <div className="mx-auto w-full max-w-5xl">
         <div className="flex h-8 items-center justify-between gap-3 px-3 text-xs text-stone-400">
           <span className="inline-flex min-w-0 items-center gap-2">

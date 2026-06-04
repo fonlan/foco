@@ -36,7 +36,7 @@ body {
 }
 
 #root {
-  min-height: 100dvh;
+  height: 100dvh;
 }
 
 button,
@@ -78,7 +78,8 @@ summary:focus-visible {
 }
 
 .app-root {
-  min-height: 100dvh;
+  height: 100dvh;
+  overflow: hidden;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.42), transparent 42%),
     rgba(243, 239, 230, 0.92);
@@ -86,9 +87,11 @@ summary:focus-visible {
 
 .app-shell {
   display: grid;
-  min-height: 100dvh;
+  height: 100dvh;
+  overflow: hidden;
   grid-template-areas: "sidebar main";
   grid-template-columns: minmax(14.5rem, var(--sidebar-width, 18rem)) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
 }
 
 .app-shell-with-diff {
@@ -100,6 +103,7 @@ summary:focus-visible {
 
 .workspace-sidebar {
   grid-area: sidebar;
+  height: 100%;
   min-height: 0;
   overflow: hidden;
   background: rgba(255, 252, 246, 0.92);
@@ -108,12 +112,15 @@ summary:focus-visible {
 
 .app-main-panel {
   grid-area: main;
+  height: 100%;
   min-height: 0;
+  overflow: hidden;
   background: rgba(250, 247, 240, 0.76);
 }
 
 .diff-sidebar {
   grid-area: diff;
+  height: 100%;
   min-height: 0;
   overflow: hidden;
   background: rgba(255, 252, 246, 0.94);
@@ -280,10 +287,11 @@ summary:focus-visible {
     grid-template-areas:
       "sidebar main"
       "sidebar diff";
+    grid-template-rows: minmax(0, 1fr) minmax(16rem, 32dvh);
   }
 
   .diff-sidebar {
-    min-height: 28rem;
+    min-height: 0;
     border-top: 1px solid rgba(214, 211, 209, 0.9);
   }
 }
@@ -294,6 +302,7 @@ summary:focus-visible {
       "sidebar"
       "main";
     grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, auto) minmax(0, 1fr);
   }
 
   .app-shell-with-diff {
@@ -301,20 +310,24 @@ summary:focus-visible {
       "sidebar"
       "main"
       "diff";
+    grid-template-rows: minmax(0, auto) minmax(0, 1fr) minmax(14rem, 30dvh);
   }
 
   .workspace-sidebar {
+    height: auto;
     max-height: 52dvh;
     border-right: 0;
     border-bottom: 1px solid rgba(214, 211, 209, 0.9);
   }
 
   .app-main-panel {
+    height: 100%;
     min-height: 78dvh;
   }
 
   .diff-sidebar {
-    min-height: 64dvh;
+    height: 100%;
+    min-height: 0;
     box-shadow: none;
   }
 
