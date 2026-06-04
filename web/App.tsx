@@ -9,6 +9,7 @@ import {
   Folder,
   FolderPlus,
   GitCompare,
+  Globe,
   KeyRound,
   LoaderCircle,
   MessageSquare,
@@ -16,6 +17,7 @@ import {
   Plus,
   RefreshCw,
   Send,
+  Server,
   Settings,
   SlidersHorizontal,
   Terminal,
@@ -23,6 +25,7 @@ import {
   User,
   Wrench,
   X,
+  type LucideIcon,
 } from "lucide-react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
@@ -146,6 +149,8 @@ type SettingsResponse = {
   thinkingLevels: ThinkingLevelSummary[];
   providers: ConfiguredProviderSummary[];
   configuredModels: ConfiguredModelSummary[];
+  mcpTransports: McpTransportSummary[];
+  mcpServers: ConfiguredMcpServerSummary[];
 };
 
 type ProviderFormState = {
@@ -156,6 +161,36 @@ type ProviderFormState = {
   id: string;
   kind: string;
   name: string;
+};
+
+type McpTransportSummary = {
+  transport: string;
+  label: string;
+};
+
+type ConfiguredMcpServerSummary = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  transport: string;
+  transportLabel: string;
+  command: string | null;
+  args: string[];
+  url: string | null;
+  state: string;
+  error: string | null;
+  toolCount: number;
+  warnings: string[];
+};
+
+type McpServerFormState = {
+  argsText: string;
+  command: string;
+  enabled: boolean;
+  id: string;
+  name: string;
+  transport: string;
+  url: string;
 };
 
 type ProviderTestResponse = {
@@ -242,7 +277,7 @@ type ChatStreamEvent =
   | { type: "error"; message: string };
 
 type WorkspaceFormMode = "add" | "create";
-type SettingsSection = "models" | "providers";
+type SettingsSection = "mcp" | "models" | "providers";
 type ViewMode = "chat" | "settings" | "stats";
 
 type GitStatusFileSummary = {
@@ -2030,6 +2065,7 @@ function SettingsPanel({
     useState<SettingsSection>("providers");
   const [isProviderDialogOpen, setIsProviderDialogOpen] = useState(false);
   const [isModelDialogOpen, setIsModelDialogOpen] = useState(false);
+  const [isMcpDialogOpen, setIsMcpDialogOpen] = useState(false);
   const [metadata, setMetadata] = useState<ModelMetadataResponse | null>(null);
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedMetadataKey, setSelectedMetadataKey] = useState("");
@@ -2038,11 +2074,15 @@ function SettingsPanel({
   const [providerForm, setProviderForm] = useState<ProviderFormState>(() =>
     emptyProviderForm(),
   );
+  const [mcpForm, setMcpForm] = useState<McpServerFormState>(() =>
+    emptyMcpServerForm(),
+  );
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isSavingProvider, setIsSavingProvider] = useState(false);
+  const [isSavingMcpServer, setIsSavingMcpServer] = useState(false);
   const [providerTests, setProviderTests] = useState<
     Record<string, ProviderTestState>
   >({});
@@ -2082,6 +2122,8 @@ function SettingsPanel({
     (!form.contextWindow.trim() || !form.maxOutputTokens.trim());
   const providerKinds = settings?.providerKinds ?? [];
   const providers = settings?.providers ?? [];
+  const mcpTransports = settings?.mcpTransports ?? [];
+  const mcpServers = settings?.mcpServers ?? [];
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const configuredModels =
     settings?.configuredModels ?? metadata?.configuredModels ?? [];
@@ -2122,6 +2164,10 @@ function SettingsPanel({
       setProviderForm((current) => ({
         ...current,
         kind: current.kind || data.providerKinds[0]?.kind || "openai-responses",
+      }));
+      setMcpForm((current) => ({
+        ...current,
+        transport: current.transport || data.mcpTransports[0]?.transport || "stdio",
       }));
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -2243,6 +2289,27 @@ function SettingsPanel({
     setIsProviderDialogOpen(true);
   }
 
+  function editConfiguredMcpServer(server: ConfiguredMcpServerSummary) {
+    setMcpForm({
+      argsText: server.args.join("\n"),
+      command: server.command ?? "",
+      enabled: server.enabled,
+      id: server.id,
+      name: server.name,
+      transport: server.transport,
+      url: server.url ?? "",
+    });
+    setIsMcpDialogOpen(true);
+  }
+
+  function startAddingMcpServer() {
+    setMcpForm({
+      ...emptyMcpServerForm(),
+      transport: mcpTransports[0]?.transport || "stdio",
+    });
+    setIsMcpDialogOpen(true);
+  }
+
   async function refreshMetadata() {
     setIsRefreshing(true);
     setError(null);
@@ -2340,6 +2407,43 @@ function SettingsPanel({
     }
   }
 
+  async function saveMcpServer(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSavingMcpServer(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>(
+        "/api/mcp/servers/manual",
+        {
+          body: JSON.stringify({
+            args: mcpForm.argsText
+              .split(/\r?\n/)
+              .map((arg) => arg.trim())
+              .filter(Boolean),
+            command: mcpForm.command || null,
+            enabled: mcpForm.enabled,
+            id:
+              mcpForm.id ||
+              nextMcpServerId(mcpForm.name, mcpForm.transport, mcpServers),
+            name: mcpForm.name,
+            transport: mcpForm.transport,
+            url: mcpForm.url || null,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setSettings(data);
+      onSettingsChange(data);
+      setIsMcpDialogOpen(false);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingMcpServer(false);
+    }
+  }
+
   async function deleteProvider(providerId: string) {
     setIsSavingProvider(true);
     setError(null);
@@ -2369,6 +2473,33 @@ function SettingsPanel({
       setError(errorMessage(requestError));
     } finally {
       setIsSavingProvider(false);
+    }
+  }
+
+  async function deleteMcpServer(serverId: string) {
+    setIsSavingMcpServer(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>(
+        "/api/mcp/servers/delete",
+        {
+          body: JSON.stringify({ id: serverId }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setSettings(data);
+      onSettingsChange(data);
+      setMcpForm({
+        ...emptyMcpServerForm(),
+        transport: data.mcpTransports[0]?.transport || "stdio",
+      });
+      setIsMcpDialogOpen(false);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingMcpServer(false);
     }
   }
 
@@ -2457,6 +2588,12 @@ function SettingsPanel({
             icon={SlidersHorizontal}
             label="Models"
             onClick={() => setActiveSection("models")}
+          />
+          <SettingsNavButton
+            active={activeSection === "mcp"}
+            icon={Server}
+            label="MCP"
+            onClick={() => setActiveSection("mcp")}
           />
         </aside>
 
@@ -2790,6 +2927,275 @@ function SettingsPanel({
               ) : (
                 <div className="px-4 py-6 text-sm text-stone-500">
                   No configured providers
+                </div>
+              )}
+            </div>
+          </section>
+        </section>
+        ) : null}
+
+        {activeSection === "mcp" ? (
+        <section className="grid gap-4">
+          {isMcpDialogOpen ? (
+          <>
+          <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+          <form
+            aria-label="MCP server configuration"
+            className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+            onSubmit={(event) => void saveMcpServer(event)}
+          >
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <Server aria-hidden="true" className="size-5 text-teal-700" />
+                  <h3 className="text-sm font-semibold text-stone-950">
+                    {mcpForm.id ? "Edit MCP server" : "Add MCP server"}
+                  </h3>
+                </div>
+                {mcpForm.id ? (
+                  <div className="mt-1 truncate text-xs text-stone-500">
+                    {mcpForm.id}
+                  </div>
+                ) : null}
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <label className="relative inline-flex cursor-pointer items-center">
+                  <input
+                    aria-label="Enable MCP server"
+                    checked={mcpForm.enabled}
+                    className="peer sr-only"
+                    onChange={(event) =>
+                      setMcpForm((current) => ({
+                        ...current,
+                        enabled: event.target.checked,
+                      }))
+                    }
+                    type="checkbox"
+                  />
+                  <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
+                  <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                </label>
+                {mcpForm.id ? (
+                <button
+                  aria-label="Delete MCP server"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                  disabled={isSavingMcpServer}
+                  onClick={() => void deleteMcpServer(mcpForm.id)}
+                  title="Delete MCP server"
+                  type="button"
+                >
+                  <Trash2 aria-hidden="true" className="size-4" />
+                </button>
+                ) : null}
+                <button
+                  aria-label="Close MCP server configuration"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                  onClick={() => setIsMcpDialogOpen(false)}
+                  title="Close"
+                  type="button"
+                >
+                  <X aria-hidden="true" className="size-4" />
+                </button>
+              </div>
+            </div>
+            <div className="space-y-3">
+              <TextField
+                label="Name"
+                onChange={(value) =>
+                  setMcpForm((current) => ({
+                    ...current,
+                    name: value,
+                  }))
+                }
+                placeholder="CodeGraph"
+                value={mcpForm.name}
+              />
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  Transport
+                </span>
+                <select
+                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) =>
+                    setMcpForm((current) => ({
+                      ...current,
+                      transport: event.target.value,
+                    }))
+                  }
+                  value={mcpForm.transport || mcpTransports[0]?.transport || ""}
+                >
+                  {mcpTransports.map((transport) => (
+                    <option
+                      key={transport.transport}
+                      value={transport.transport}
+                    >
+                      {transport.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {mcpForm.transport === "streamable-http" ? (
+                <TextField
+                  label="URL"
+                  onChange={(value) =>
+                    setMcpForm((current) => ({
+                      ...current,
+                      url: value,
+                    }))
+                  }
+                  placeholder="http://127.0.0.1:8000/mcp"
+                  value={mcpForm.url}
+                />
+              ) : (
+                <>
+                  <TextField
+                    label="Command"
+                    onChange={(value) =>
+                      setMcpForm((current) => ({
+                        ...current,
+                        command: value,
+                      }))
+                    }
+                    placeholder="codegraph"
+                    value={mcpForm.command}
+                  />
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      Args
+                    </span>
+                    <textarea
+                      className="min-h-24 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setMcpForm((current) => ({
+                          ...current,
+                          argsText: event.target.value,
+                        }))
+                      }
+                      placeholder={"serve\n--stdio"}
+                      value={mcpForm.argsText}
+                    />
+                  </label>
+                </>
+              )}
+              <button
+                aria-label="Save MCP server"
+                className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                disabled={
+                  isSavingMcpServer ||
+                  !mcpForm.name.trim() ||
+                  !mcpForm.transport.trim() ||
+                  (mcpForm.transport === "streamable-http"
+                    ? !mcpForm.url.trim()
+                    : !mcpForm.command.trim())
+                }
+                title="Save MCP server"
+                type="submit"
+              >
+                {isSavingMcpServer ? (
+                  <LoaderCircle
+                    aria-hidden="true"
+                    className="size-4 animate-spin"
+                  />
+                ) : mcpForm.transport === "streamable-http" ? (
+                  <Globe aria-hidden="true" className="size-4" />
+                ) : (
+                  <Terminal aria-hidden="true" className="size-4" />
+                )}
+              </button>
+            </div>
+          </form>
+          </>
+          ) : null}
+
+          <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-stone-950">
+                MCP servers
+              </h3>
+              <div className="flex gap-2">
+                <button
+                  aria-label="Add MCP server"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  onClick={startAddingMcpServer}
+                  title="Add MCP server"
+                  type="button"
+                >
+                  <Plus aria-hidden="true" className="size-4" />
+                </button>
+                <button
+                  aria-label="Reload MCP settings"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  disabled={isLoadingSettings}
+                  onClick={() => void loadSettings()}
+                  title="Reload settings"
+                  type="button"
+                >
+                  {isLoadingSettings ? (
+                    <LoaderCircle
+                      aria-hidden="true"
+                      className="size-4 animate-spin"
+                    />
+                  ) : (
+                    <RefreshCw aria-hidden="true" className="size-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {mcpServers.length ? (
+                mcpServers.map((server) => (
+                  <div className="px-4 py-3" key={server.id}>
+                    <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="truncate text-sm font-medium">
+                            {server.name}
+                          </span>
+                          <CapabilityPill
+                            label={server.enabled ? "enabled" : "disabled"}
+                            ok={server.enabled}
+                          />
+                          <CapabilityPill
+                            label={server.state}
+                            ok={server.state === "connected"}
+                          />
+                          <CapabilityPill
+                            label={`tools ${server.toolCount}`}
+                            ok={server.toolCount > 0}
+                          />
+                        </div>
+                        <div className="mt-1 truncate text-xs font-medium text-stone-500">
+                          {server.id} / {server.transportLabel}
+                        </div>
+                        <div className="mt-1 truncate text-xs text-stone-500">
+                          {server.transport === "streamable-http"
+                            ? server.url
+                            : [server.command, ...server.args].filter(Boolean).join(" ")}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          aria-label={`Edit MCP server ${server.name}`}
+                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                          onClick={() => editConfiguredMcpServer(server)}
+                          title="Edit MCP server"
+                          type="button"
+                        >
+                          <SlidersHorizontal aria-hidden="true" className="size-4" />
+                        </button>
+                      </div>
+                    </div>
+                    {server.error ? (
+                      <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                        {server.error}
+                      </div>
+                    ) : null}
+                    <Warnings warnings={server.warnings} />
+                  </div>
+                ))
+              ) : (
+                <div className="px-4 py-6 text-sm text-stone-500">
+                  No configured MCP servers
                 </div>
               )}
             </div>
@@ -3207,7 +3613,7 @@ function NavButton({
   onClick,
 }: {
   active: boolean;
-  icon: typeof MessageSquare;
+  icon: LucideIcon;
   label: string;
   onClick: () => void;
 }) {
@@ -3263,7 +3669,7 @@ function SettingsNavButton({
   onClick,
 }: {
   active: boolean;
-  icon: typeof Settings;
+  icon: LucideIcon;
   label: string;
   onClick: () => void;
 }) {
@@ -3374,6 +3780,18 @@ function emptyProviderForm(): ProviderFormState {
   };
 }
 
+function emptyMcpServerForm(): McpServerFormState {
+  return {
+    argsText: "",
+    command: "",
+    enabled: true,
+    id: "",
+    name: "",
+    transport: "",
+    url: "",
+  };
+}
+
 function nextProviderId(
   name: string,
   kind: string,
@@ -3381,6 +3799,26 @@ function nextProviderId(
 ) {
   const base = slugId(name) || slugId(kind);
   const existingIds = new Set(providers.map((provider) => provider.id));
+
+  if (!existingIds.has(base)) {
+    return base;
+  }
+
+  let index = 2;
+  while (existingIds.has(`${base}-${index}`)) {
+    index += 1;
+  }
+
+  return `${base}-${index}`;
+}
+
+function nextMcpServerId(
+  name: string,
+  transport: string,
+  servers: ConfiguredMcpServerSummary[],
+) {
+  const base = slugId(name) || slugId(transport);
+  const existingIds = new Set(servers.map((server) => server.id));
 
   if (!existingIds.has(base)) {
     return base;

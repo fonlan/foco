@@ -6,3 +6,11 @@ version.workspace = true
 
 [lib]
 path = "lib.rs"
+
+[dependencies]
+reqwest.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

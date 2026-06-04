@@ -29,6 +29,9 @@ use foco_agent::{
     estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
+use foco_mcp::{
+    McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition, is_mcp_tool_name,
+};
 use foco_providers::{
     DEFAULT_OPENAI_BASE_URL, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
@@ -37,8 +40,8 @@ use foco_providers::{
 };
 use foco_store::{
     config::{
-        GlobalConfig, ModelLimits, ModelSettings, ProviderSettings, WorkspaceConfig,
-        load_or_create_global_config, save_global_config,
+        GlobalConfig, McpServerConfig, ModelLimits, ModelSettings, ProviderSettings,
+        WorkspaceConfig, load_or_create_global_config, save_global_config,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
@@ -82,6 +85,7 @@ struct AppState {
     model_metadata_file: PathBuf,
     terminal_registry: terminal::TerminalRegistry,
     terminal_shutdown_tx: broadcast::Sender<()>,
+    mcp_registry: Arc<McpRegistry>,
     _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
 }
 
@@ -108,6 +112,8 @@ async fn run() -> AppResult<()> {
         "initialized workspace databases"
     );
     let code_graph_watchers = initialize_code_graph_indexes(&loaded_config.config.workspaces)?;
+    let mcp_registry = Arc::new(McpRegistry::default());
+    sync_all_mcp_workspaces(&mcp_registry, &loaded_config.config).await?;
 
     let addr = local_addr()?;
     let frontend_dir = frontend_dist_dir()?;
@@ -118,6 +124,7 @@ async fn run() -> AppResult<()> {
         model_metadata_file: loaded_config.paths.root_dir.join("models.dev.json"),
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
+        mcp_registry: mcp_registry.clone(),
         _code_graph_watchers: Arc::new(code_graph_watchers),
     };
     let app = Router::new()
@@ -133,6 +140,8 @@ async fn run() -> AppResult<()> {
         .route("/api/model-metadata/refresh", post(refresh_model_metadata))
         .route("/api/models/manual", post(save_manual_model))
         .route("/api/models/delete", post(delete_model))
+        .route("/api/mcp/servers/manual", post(save_mcp_server))
+        .route("/api/mcp/servers/delete", post(delete_mcp_server))
         .route(
             "/api/workspaces/{workspace_id}/chat/stream",
             post(stream_chat_response),
@@ -162,13 +171,50 @@ async fn run() -> AppResult<()> {
     tracing::info!(%addr, "starting local HTTP server");
     println!("Foco is running at http://{addr}");
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(terminal_shutdown_tx))
+        .with_graceful_shutdown(shutdown_signal(terminal_shutdown_tx, mcp_registry))
         .await?;
 
     Ok(())
 }
 
-async fn shutdown_signal(terminal_shutdown_tx: broadcast::Sender<()>) {
+async fn sync_all_mcp_workspaces(
+    registry: &Arc<McpRegistry>,
+    config: &GlobalConfig,
+) -> Result<(), foco_mcp::McpError> {
+    for workspace in &config.workspaces {
+        sync_mcp_workspace(registry, workspace, config).await?;
+    }
+
+    Ok(())
+}
+
+async fn sync_mcp_workspace(
+    registry: &Arc<McpRegistry>,
+    workspace: &WorkspaceConfig,
+    config: &GlobalConfig,
+) -> Result<(), foco_mcp::McpError> {
+    let definitions = mcp_server_definitions(config)?;
+
+    registry
+        .sync_workspace_servers(&workspace.id, &workspace.path, &definitions)
+        .await
+}
+
+fn mcp_server_definitions(
+    config: &GlobalConfig,
+) -> Result<Vec<McpServerDefinition>, foco_mcp::McpError> {
+    config
+        .mcp
+        .servers
+        .iter()
+        .map(McpServerConfig::to_definition)
+        .collect()
+}
+
+async fn shutdown_signal(
+    terminal_shutdown_tx: broadcast::Sender<()>,
+    mcp_registry: Arc<McpRegistry>,
+) {
     if let Err(source) = tokio::signal::ctrl_c().await {
         tracing::warn!(error = %source, "failed to listen for Ctrl+C shutdown");
         return;
@@ -176,6 +222,9 @@ async fn shutdown_signal(terminal_shutdown_tx: broadcast::Sender<()>) {
 
     tracing::info!("shutdown requested; closing terminal sessions");
     let _ = terminal_shutdown_tx.send(());
+    if let Err(error) = mcp_registry.stop_all().await {
+        tracing::warn!(error = %error, "failed to stop MCP servers");
+    }
 }
 
 fn initialize_code_graph_indexes(
@@ -256,6 +305,9 @@ async fn create_workspace(
     let id = unique_workspace_id(&config, &name);
     config.workspaces.push(WorkspaceConfig { id, name, path });
     save_config(&state, config.clone())?;
+    sync_all_mcp_workspaces(&state.mcp_registry, &config)
+        .await
+        .map_err(ApiError::from_mcp_error)?;
 
     workspace_response_from_config(&config)
 }
@@ -282,6 +334,9 @@ async fn add_workspace(
     let id = unique_workspace_id(&config, &name);
     config.workspaces.push(WorkspaceConfig { id, name, path });
     save_config(&state, config.clone())?;
+    sync_all_mcp_workspaces(&state.mcp_registry, &config)
+        .await
+        .map_err(ApiError::from_mcp_error)?;
 
     workspace_response_from_config(&config)
 }
@@ -289,7 +344,7 @@ async fn add_workspace(
 async fn settings(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
     let config = config_snapshot(&state)?;
 
-    Ok(Json(settings_response(&config)))
+    settings_response(&state, &config).await
 }
 
 async fn save_manual_provider(
@@ -346,7 +401,7 @@ async fn save_manual_provider(
 
     save_config(&state, config.clone())?;
 
-    Ok(Json(settings_response(&config)))
+    settings_response(&state, &config).await
 }
 
 async fn delete_provider(
@@ -378,7 +433,84 @@ async fn delete_provider(
 
     save_config(&state, config.clone())?;
 
-    Ok(Json(settings_response(&config)))
+    settings_response(&state, &config).await
+}
+
+async fn save_mcp_server(
+    State(state): State<AppState>,
+    Json(request): Json<ManualMcpServerRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let id = request.id.trim();
+    let name = request.name.trim();
+    let transport = request.transport.trim();
+
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id must not be empty"));
+    }
+
+    if name.is_empty() {
+        return Err(ApiError::bad_request("MCP server name must not be empty"));
+    }
+
+    foco_mcp::McpTransportKind::parse(transport)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+
+    let server = McpServerConfig {
+        id: id.to_string(),
+        name: name.to_string(),
+        enabled: request.enabled,
+        transport: transport.to_string(),
+        command: optional_trimmed_string(request.command),
+        args: request.args.unwrap_or_default(),
+        url: optional_trimmed_string(request.url),
+    };
+    let definition = server
+        .to_definition()
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    foco_mcp::validate_server_definitions(&[definition])
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
+
+    if let Some(stored_server) = config.mcp.servers.iter_mut().find(|server| server.id == id) {
+        *stored_server = server;
+    } else {
+        config.mcp.servers.push(server);
+    }
+
+    save_config(&state, config.clone())?;
+    sync_all_mcp_workspaces(&state.mcp_registry, &config)
+        .await
+        .map_err(ApiError::from_mcp_error)?;
+
+    settings_response(&state, &config).await
+}
+
+async fn delete_mcp_server(
+    State(state): State<AppState>,
+    Json(request): Json<DeleteSettingsItemRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let id = request.id.trim();
+
+    if id.is_empty() {
+        return Err(ApiError::bad_request("MCP server id must not be empty"));
+    }
+
+    let server_count = config.mcp.servers.len();
+    config.mcp.servers.retain(|server| server.id != id);
+
+    if config.mcp.servers.len() == server_count {
+        return Err(ApiError::bad_request(format!(
+            "MCP server was not found: {id}"
+        )));
+    }
+
+    save_config(&state, config.clone())?;
+    sync_all_mcp_workspaces(&state.mcp_registry, &config)
+        .await
+        .map_err(ApiError::from_mcp_error)?;
+
+    settings_response(&state, &config).await
 }
 
 async fn test_provider(
@@ -624,7 +756,7 @@ async fn stream_chat_response(
     Json(request): Json<ChatStreamRequest>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let config = config_snapshot(&state)?;
-    let chat_context = prepare_chat_context(&config, &workspace_id, request)?;
+    let chat_context = prepare_chat_context(&state, &config, &workspace_id, request).await?;
 
     Ok(Sse::new(chat_context.into_sse_stream()).keep_alive(
         KeepAlive::new()
@@ -868,6 +1000,18 @@ struct ManualProviderRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ManualMcpServerRequest {
+    id: String,
+    name: String,
+    enabled: bool,
+    transport: String,
+    command: Option<String>,
+    args: Option<Vec<String>>,
+    url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct TestProviderRequest {
     provider_id: String,
 }
@@ -907,6 +1051,8 @@ struct SettingsResponse {
     thinking_levels: Vec<ThinkingLevelSummary>,
     providers: Vec<ConfiguredProviderSummary>,
     configured_models: Vec<ConfiguredModelSummary>,
+    mcp_transports: Vec<McpTransportSummary>,
+    mcp_servers: Vec<ConfiguredMcpServerSummary>,
 }
 
 #[derive(Serialize)]
@@ -926,6 +1072,13 @@ struct ThinkingLevelSummary {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct McpTransportSummary {
+    transport: &'static str,
+    label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ConfiguredProviderSummary {
     id: String,
     name: String,
@@ -934,6 +1087,23 @@ struct ConfiguredProviderSummary {
     enabled: bool,
     base_url: Option<String>,
     has_api_key: bool,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfiguredMcpServerSummary {
+    id: String,
+    name: String,
+    enabled: bool,
+    transport: String,
+    transport_label: &'static str,
+    command: Option<String>,
+    args: Vec<String>,
+    url: Option<String>,
+    state: String,
+    error: Option<String>,
+    tool_count: usize,
     warnings: Vec<String>,
 }
 
@@ -1115,6 +1285,7 @@ struct PreparedChatContext {
     assistant_sequence: i64,
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
+    mcp_registry: Arc<McpRegistry>,
     context_budget: foco_agent::ContextBudget,
     request_body_json: String,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
@@ -1501,7 +1672,12 @@ impl PreparedChatContext {
                                 }
                             }
 
-                            let next_tool_results = match execute_tool_calls_parallel(&self.workspace_path, tool_calls.clone()).await {
+                            let next_tool_results = match execute_tool_calls_parallel(
+                                self.mcp_registry.clone(),
+                                &self.workspace_id,
+                                &self.workspace_path,
+                                tool_calls.clone(),
+                            ).await {
                                 Ok(tool_results) => tool_results,
                                 Err(error) => {
                                     let message = error.message;
@@ -1599,7 +1775,8 @@ impl PreparedChatContext {
     }
 }
 
-fn prepare_chat_context(
+async fn prepare_chat_context(
+    state: &AppState,
     config: &GlobalConfig,
     workspace_id: &str,
     request: ChatStreamRequest,
@@ -1685,6 +1862,10 @@ fn prepare_chat_context(
     }
 
     let provider_config = provider_connection_config(provider)?;
+    sync_mcp_workspace(&state.mcp_registry, workspace, config)
+        .await
+        .map_err(ApiError::from_mcp_error)?;
+    let mcp_tools = state.mcp_registry.tool_definitions(&workspace.id).await;
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
     let chat_id = optional_trimmed_string(request.chat_id);
@@ -1732,15 +1913,30 @@ fn prepare_chat_context(
         })
         .map_err(ApiError::from_workspace_error)?;
 
-    let tool_definitions = builtin_tool_definitions();
-    let neutral_tools = tool_definitions
+    let builtin_tool_definitions = builtin_tool_definitions();
+    let mut neutral_tools = builtin_tool_definitions
         .iter()
         .cloned()
         .map(neutral_tool_definition)
         .collect::<Vec<_>>();
+    neutral_tools.extend(mcp_tools.iter().map(neutral_mcp_tool_definition));
     let code_graph_context = database
         .code_graph_context()
         .map_err(ApiError::from_workspace_error)?;
+    let tool_prompt_infos = builtin_tool_definitions
+        .iter()
+        .map(|tool| ToolPromptInfo {
+            name: tool.name.to_string(),
+            description: tool.description.to_string(),
+        })
+        .chain(mcp_tools.iter().map(|tool| ToolPromptInfo {
+            name: tool.name.clone(),
+            description: format!(
+                "{} MCP server '{}': {}",
+                tool.original_name, tool.server_name, tool.description
+            ),
+        }))
+        .collect();
     let system_prompt = build_system_prompt(SystemPromptInput {
         workspace_id: workspace.id.clone(),
         workspace_name: workspace.name.clone(),
@@ -1752,13 +1948,7 @@ fn prepare_chat_context(
             edges: code_graph_context.edges,
             languages: code_graph_context.languages,
         },
-        tools: tool_definitions
-            .iter()
-            .map(|tool| ToolPromptInfo {
-                name: tool.name.to_string(),
-                description: tool.description.to_string(),
-            })
-            .collect(),
+        tools: tool_prompt_infos,
     });
     let context_budget = calculate_context_budget(
         limits.context_window,
@@ -1819,6 +2009,7 @@ fn prepare_chat_context(
         assistant_sequence,
         provider_config,
         provider_request,
+        mcp_registry: state.mcp_registry.clone(),
         context_budget,
         request_body_json,
         compression_snapshots,
@@ -2470,19 +2661,26 @@ fn pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingToolCall> {
 }
 
 async fn execute_tool_calls_parallel(
+    mcp_registry: Arc<McpRegistry>,
+    workspace_id: &str,
     workspace_path: &Path,
     tool_calls: Vec<NeutralToolCall>,
 ) -> Result<Vec<ExecutedToolCall>, ApiError> {
     let tasks = tool_calls.into_iter().map(|tool_call| {
         let workspace_path = workspace_path.to_path_buf();
+        let workspace_id = workspace_id.to_string();
+        let mcp_registry = mcp_registry.clone();
 
-        tokio::task::spawn_blocking(move || {
+        tokio::spawn(async move {
             let started_at_text = utc_timestamp();
-            let tool_execution = execute_builtin_tool(
+            let tool_execution = execute_tool(
+                mcp_registry,
+                &workspace_id,
                 &workspace_path,
                 &tool_call.name,
                 tool_call.arguments.clone(),
-            );
+            )
+            .await;
             let completed_at_text = utc_timestamp();
 
             executed_tool_call(
@@ -2503,6 +2701,44 @@ async fn execute_tool_calls_parallel(
     }
 
     Ok(executed_tool_calls)
+}
+
+async fn execute_tool(
+    mcp_registry: Arc<McpRegistry>,
+    workspace_id: &str,
+    workspace_path: &Path,
+    tool_name: &str,
+    arguments: Value,
+) -> ToolExecution {
+    if is_mcp_tool_name(tool_name) {
+        match mcp_registry
+            .execute_tool(workspace_id, tool_name, arguments)
+            .await
+        {
+            Ok(execution) => ToolExecution {
+                output: execution.output,
+                is_error: execution.is_error,
+            },
+            Err(error) => ToolExecution {
+                output: json!({ "error": error.to_string() }),
+                is_error: true,
+            },
+        }
+    } else {
+        match tokio::task::spawn_blocking({
+            let workspace_path = workspace_path.to_path_buf();
+            let tool_name = tool_name.to_string();
+            move || execute_builtin_tool(&workspace_path, &tool_name, arguments)
+        })
+        .await
+        {
+            Ok(execution) => execution,
+            Err(source) => ToolExecution {
+                output: json!({ "error": format!("tool execution worker failed: {source}") }),
+                is_error: true,
+            },
+        }
+    }
 }
 
 fn append_tool_state_messages(
@@ -2706,6 +2942,10 @@ impl ApiError {
     fn from_provider_config_error(error: foco_providers::ProviderConfigError) -> Self {
         Self::bad_request(error.to_string())
     }
+
+    fn from_mcp_error(error: foco_mcp::McpError) -> Self {
+        Self::bad_request(error.to_string())
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -2765,8 +3005,14 @@ fn save_config(state: &AppState, config: GlobalConfig) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn settings_response(config: &GlobalConfig) -> SettingsResponse {
-    SettingsResponse {
+async fn settings_response(
+    state: &AppState,
+    config: &GlobalConfig,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let active_workspace_id = config.app.active_workspace_id.clone();
+    let mcp_statuses = state.mcp_registry.statuses(&active_workspace_id).await;
+
+    Ok(Json(SettingsResponse {
         provider_kinds: vec![
             ProviderKindSummary {
                 kind: OPENAI_CHAT_KIND,
@@ -2801,6 +3047,16 @@ fn settings_response(config: &GlobalConfig) -> SettingsResponse {
                 label: "Extra High",
             },
         ],
+        mcp_transports: vec![
+            McpTransportSummary {
+                transport: "stdio",
+                label: "Stdio",
+            },
+            McpTransportSummary {
+                transport: "streamable-http",
+                label: "Streamable HTTP",
+            },
+        ],
         providers: config
             .providers
             .iter()
@@ -2811,7 +3067,13 @@ fn settings_response(config: &GlobalConfig) -> SettingsResponse {
             .iter()
             .map(|model| configured_model_summary_for_config(model, config))
             .collect(),
-    }
+        mcp_servers: config
+            .mcp
+            .servers
+            .iter()
+            .map(|server| configured_mcp_server_summary(server, &mcp_statuses))
+            .collect(),
+    }))
 }
 
 fn configured_provider_summary(provider: &ProviderSettings) -> ConfiguredProviderSummary {
@@ -2828,6 +3090,70 @@ fn configured_provider_summary(provider: &ProviderSettings) -> ConfiguredProvide
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false),
         warnings: provider_warnings(provider),
+    }
+}
+
+fn configured_mcp_server_summary(
+    server: &McpServerConfig,
+    statuses: &[foco_mcp::McpServerStatus],
+) -> ConfiguredMcpServerSummary {
+    let status = statuses.iter().find(|status| status.id == server.id);
+    let state = status
+        .map(|status| mcp_server_state_name(status.state).to_string())
+        .unwrap_or_else(|| {
+            if server.enabled {
+                "stopped".to_string()
+            } else {
+                "disabled".to_string()
+            }
+        });
+    let error = status.and_then(|status| status.error.clone());
+    let tool_count = status.map(|status| status.tool_count).unwrap_or(0);
+
+    ConfiguredMcpServerSummary {
+        id: server.id.clone(),
+        name: server.name.clone(),
+        enabled: server.enabled,
+        transport: server.transport.clone(),
+        transport_label: mcp_transport_label(&server.transport),
+        command: server.command.clone(),
+        args: server.args.clone(),
+        url: server.url.clone(),
+        state,
+        error,
+        tool_count,
+        warnings: mcp_server_warnings(server),
+    }
+}
+
+fn mcp_server_warnings(server: &McpServerConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if !server.enabled {
+        warnings.push("MCP server is disabled.".to_string());
+    }
+
+    if let Err(error) = server.to_definition() {
+        warnings.push(error.to_string());
+    }
+
+    warnings
+}
+
+fn mcp_server_state_name(state: McpServerState) -> &'static str {
+    match state {
+        McpServerState::Disabled => "disabled",
+        McpServerState::Connected => "connected",
+        McpServerState::Error => "error",
+        McpServerState::Stopped => "stopped",
+    }
+}
+
+fn mcp_transport_label(transport: &str) -> &'static str {
+    match transport {
+        "stdio" => "Stdio",
+        "streamable-http" => "Streamable HTTP",
+        _ => "Unsupported",
     }
 }
 
@@ -3261,6 +3587,18 @@ fn neutral_tool_definition(definition: foco_tools::ToolDefinition) -> NeutralToo
         description: definition.description.to_string(),
         input_schema: definition.input_schema,
         strict: definition.strict,
+    }
+}
+
+fn neutral_mcp_tool_definition(definition: &McpToolDefinition) -> NeutralToolDefinition {
+    NeutralToolDefinition {
+        name: definition.name.clone(),
+        description: format!(
+            "MCP server '{}', tool '{}': {}",
+            definition.server_name, definition.original_name, definition.description
+        ),
+        input_schema: definition.input_schema.clone(),
+        strict: false,
     }
 }
 

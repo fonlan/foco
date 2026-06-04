@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use foco_mcp::{McpServerDefinition, McpTransportKind, validate_server_definitions};
 use foco_providers::{normalized_base_url, parse_provider_kind};
 use serde::{Deserialize, Serialize};
 
@@ -333,7 +334,24 @@ impl GlobalConfig {
         for server in &self.mcp.servers {
             validate_id(config_path, "mcp.server.id", &server.id)?;
             require_non_empty(config_path, "mcp.server.name", &server.name)?;
+            require_non_empty(config_path, "mcp.server.transport", &server.transport)?;
         }
+        let mcp_definitions = self
+            .mcp
+            .servers
+            .iter()
+            .map(McpServerConfig::to_definition)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| ConfigError::Validation {
+                path: config_path.map(Path::to_path_buf),
+                message: source.to_string(),
+            })?;
+        validate_server_definitions(&mcp_definitions).map_err(|source| {
+            ConfigError::Validation {
+                path: config_path.map(Path::to_path_buf),
+                message: source.to_string(),
+            }
+        })?;
 
         for skill_id in &self.skills.enabled {
             validate_id(config_path, "skills.enabled", skill_id)?;
@@ -406,9 +424,24 @@ pub struct McpServerConfig {
     pub id: String,
     pub name: String,
     pub enabled: bool,
+    pub transport: String,
     pub command: Option<String>,
     pub args: Vec<String>,
     pub url: Option<String>,
+}
+
+impl McpServerConfig {
+    pub fn to_definition(&self) -> Result<McpServerDefinition, foco_mcp::McpError> {
+        Ok(McpServerDefinition {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            enabled: self.enabled,
+            transport: McpTransportKind::parse(&self.transport)?,
+            command: self.command.clone(),
+            args: self.args.clone(),
+            url: self.url.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
