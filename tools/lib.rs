@@ -1,7 +1,10 @@
 use std::{
     fmt, fs, io,
+    io::Read,
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use foco_store::workspace::{
@@ -16,7 +19,6 @@ pub const LIST_FILES_TOOL: &str = "list_files";
 pub const SEARCH_TEXT_TOOL: &str = "search_text";
 pub const WRITE_FILE_TOOL: &str = "write_file";
 pub const RUN_COMMAND_TOOL: &str = "run_command";
-pub const GIT_DIFF_TOOL: &str = "git_diff";
 pub const GRAPH_FIND_SYMBOLS_TOOL: &str = "graph_find_symbols";
 pub const GRAPH_FIND_CALLERS_TOOL: &str = "graph_find_callers";
 pub const GRAPH_FIND_CALLEES_TOOL: &str = "graph_find_callees";
@@ -29,6 +31,13 @@ const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_GRAPH_RESULT_LIMIT: usize = 20;
 const MAX_GRAPH_RESULT_LIMIT: usize = 50;
+const DEFAULT_FILE_TOOL_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_GRAPH_TOOL_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_SEARCH_TEXT_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
+const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
+const COMMAND_WAIT_POLL_MS: u64 = 25;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,7 +67,6 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         search_text_definition(),
         write_file_definition(),
         run_command_definition(),
-        git_diff_definition(),
     ]
 }
 
@@ -79,6 +87,23 @@ pub fn execute_builtin_tool(
     }
 }
 
+pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64, String> {
+    let default_timeout_ms = match tool_name {
+        READ_FILE_TOOL | LIST_FILES_TOOL => DEFAULT_FILE_TOOL_TIMEOUT_MS,
+        GRAPH_FIND_SYMBOLS_TOOL
+        | GRAPH_FIND_CALLERS_TOOL
+        | GRAPH_FIND_CALLEES_TOOL
+        | GRAPH_FIND_REFERENCES_TOOL
+        | GRAPH_RELATED_FILES_TOOL => DEFAULT_GRAPH_TOOL_TIMEOUT_MS,
+        SEARCH_TEXT_TOOL => DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
+        WRITE_FILE_TOOL => DEFAULT_WRITE_FILE_TIMEOUT_MS,
+        RUN_COMMAND_TOOL => DEFAULT_RUN_COMMAND_TIMEOUT_MS,
+        other => return Err(ToolRuntimeError::UnknownTool(other.to_string()).to_string()),
+    };
+
+    argument_timeout_ms(arguments, default_timeout_ms).map_err(|error| error.to_string())
+}
+
 fn execute_builtin_tool_inner(
     workspace_path: &Path,
     tool_name: &str,
@@ -95,13 +120,13 @@ fn execute_builtin_tool_inner(
         SEARCH_TEXT_TOOL => search_text(workspace_path, arguments),
         WRITE_FILE_TOOL => write_file(workspace_path, arguments),
         RUN_COMMAND_TOOL => run_command(workspace_path, arguments),
-        GIT_DIFF_TOOL => git_diff(workspace_path, arguments),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
     }
 }
 
 fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: ReadFileInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
     let path = resolve_workspace_file(workspace_path, &request.path)?;
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
@@ -141,12 +166,14 @@ fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunti
         "content": content,
         "bytes": metadata.len(),
         "startLine": line_range.as_ref().map(|range| range.start),
-        "endLine": line_range.as_ref().map(|range| range.end)
+        "endLine": line_range.as_ref().map(|range| range.end),
+        "timeoutMs": timeout_ms
     }))
 }
 
 fn list_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: ListFilesInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
     let input_path = request.path;
     let path = resolve_workspace_path(workspace_path, &input_path)?;
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
@@ -200,12 +227,14 @@ fn list_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
     Ok(json!({
         "path": input_path,
         "entries": entries,
-        "truncated": truncated
+        "truncated": truncated,
+        "timeoutMs": timeout_ms
     }))
 }
 
 fn graph_find_symbols(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: GraphFindSymbolsInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
     let query = non_empty_argument("query", &request.query)?;
     let path = request
         .path
@@ -227,12 +256,14 @@ fn graph_find_symbols(workspace_path: &Path, arguments: Value) -> Result<Value, 
         "kind": request.kind,
         "path": path,
         "symbols": symbols.into_iter().map(symbol_json).collect::<Vec<_>>(),
-        "truncated": truncated
+        "truncated": truncated,
+        "timeoutMs": timeout_ms
     }))
 }
 
 fn graph_find_callers(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: GraphSymbolLookupInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
     let database = open_code_graph_database(workspace_path)?;
     let symbol = resolve_graph_symbol(&database, &request)?;
     let limit = graph_limit(request.limit)?;
@@ -242,12 +273,14 @@ fn graph_find_callers(workspace_path: &Path, arguments: Value) -> Result<Value, 
     Ok(json!({
         "symbol": symbol_json(symbol),
         "callers": callers.into_iter().map(relation_json).collect::<Vec<_>>(),
-        "truncated": truncated
+        "truncated": truncated,
+        "timeoutMs": timeout_ms
     }))
 }
 
 fn graph_find_callees(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: GraphSymbolLookupInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
     let database = open_code_graph_database(workspace_path)?;
     let symbol = resolve_graph_symbol(&database, &request)?;
     let limit = graph_limit(request.limit)?;
@@ -257,7 +290,8 @@ fn graph_find_callees(workspace_path: &Path, arguments: Value) -> Result<Value, 
     Ok(json!({
         "symbol": symbol_json(symbol),
         "callees": callees.into_iter().map(relation_json).collect::<Vec<_>>(),
-        "truncated": truncated
+        "truncated": truncated,
+        "timeoutMs": timeout_ms
     }))
 }
 
@@ -266,6 +300,7 @@ fn graph_find_references(
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
     let request: GraphSymbolLookupInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
     let database = open_code_graph_database(workspace_path)?;
     let symbol = resolve_graph_symbol(&database, &request)?;
     let limit = graph_limit(request.limit)?;
@@ -275,12 +310,14 @@ fn graph_find_references(
     Ok(json!({
         "symbol": symbol_json(symbol),
         "references": references.into_iter().map(reference_json).collect::<Vec<_>>(),
-        "truncated": truncated
+        "truncated": truncated,
+        "timeoutMs": timeout_ms
     }))
 }
 
 fn graph_related_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: GraphRelatedFilesInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
     let path = normalize_workspace_path_text(&request.path)?;
     let limit = graph_limit(request.limit)?;
     let database = open_code_graph_database(workspace_path)?;
@@ -290,12 +327,14 @@ fn graph_related_files(workspace_path: &Path, arguments: Value) -> Result<Value,
     Ok(json!({
         "path": path,
         "files": files.into_iter().map(related_file_json).collect::<Vec<_>>(),
-        "truncated": truncated
+        "truncated": truncated,
+        "timeoutMs": timeout_ms
     }))
 }
 
 fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: SearchTextInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_SEARCH_TEXT_TIMEOUT_MS)?;
     let input_path = request.path;
     let path = resolve_workspace_path(workspace_path, &input_path)?;
     let pattern = request.query.trim();
@@ -306,19 +345,20 @@ fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         ));
     }
 
-    let output = Command::new("rg")
-        .arg("--json")
-        .arg("--line-number")
-        .arg("--max-count")
-        .arg(MAX_SEARCH_MATCHES.to_string())
-        .arg(pattern)
-        .arg(&path)
-        .current_dir(workspace_path)
-        .output()
-        .map_err(|source| ToolRuntimeError::Command {
-            command: "rg".to_string(),
-            source,
-        })?;
+    let rg_args = vec![
+        "--json".to_string(),
+        "--line-number".to_string(),
+        "--max-count".to_string(),
+        MAX_SEARCH_MATCHES.to_string(),
+        pattern.to_string(),
+        path.to_string_lossy().to_string(),
+    ];
+    let output = run_command_with_timeout(
+        "rg",
+        &rg_args,
+        workspace_path,
+        Duration::from_millis(timeout_ms),
+    )?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -327,7 +367,8 @@ fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
                 "query": pattern,
                 "path": input_path,
                 "matches": [],
-                "truncated": false
+                "truncated": false,
+                "timeoutMs": timeout_ms
             }));
         }
 
@@ -386,12 +427,14 @@ fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         "query": pattern,
         "path": input_path,
         "matches": matches,
-        "truncated": truncated
+        "truncated": truncated,
+        "timeoutMs": timeout_ms
     }))
 }
 
 fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: WriteFileInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_WRITE_FILE_TIMEOUT_MS)?;
     let path = resolve_workspace_write_path(workspace_path, &request.path)?;
     let line_range = match (request.start_line, request.end_line) {
         (None, None) => None,
@@ -447,12 +490,14 @@ fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
 
     Ok(json!({
         "path": normalize_workspace_path_text(&request.path)?,
-        "bytes": encoded.len()
+        "bytes": encoded.len(),
+        "timeoutMs": timeout_ms
     }))
 }
 
 fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: RunCommandInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_RUN_COMMAND_TIMEOUT_MS)?;
     let command = request.command.trim();
     let args = request.args.unwrap_or_default();
     let cwd = match request.cwd.as_deref() {
@@ -479,14 +524,7 @@ fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         return Err(ToolRuntimeError::NotDirectory(cwd));
     }
 
-    let output = Command::new(command)
-        .args(&args)
-        .current_dir(&cwd)
-        .output()
-        .map_err(|source| ToolRuntimeError::Command {
-            command: command.to_string(),
-            source,
-        })?;
+    let output = run_command_with_timeout(command, &args, &cwd, Duration::from_millis(timeout_ms))?;
     let (stdout, stdout_truncated) = limited_output_text(&output.stdout);
     let (stderr, stderr_truncated) = limited_output_text(&output.stderr);
 
@@ -499,41 +537,8 @@ fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         "stdout": stdout,
         "stderr": stderr,
         "stdoutTruncated": stdout_truncated,
-        "stderrTruncated": stderr_truncated
-    }))
-}
-
-fn git_diff(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: GitDiffInput = parse_arguments(arguments)?;
-    let workspace = fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
-        path: workspace_path.to_path_buf(),
-        source,
-    })?;
-    ensure_git_repository(&workspace)?;
-
-    let path = request
-        .path
-        .as_deref()
-        .map(normalize_workspace_path_text)
-        .transpose()?;
-    let mut status_args = vec!["status".to_string(), "--short".to_string()];
-    let mut diff_args = vec!["diff".to_string()];
-    let mut staged_diff_args = vec!["diff".to_string(), "--cached".to_string()];
-
-    if let Some(path) = &path {
-        status_args.push("--".to_string());
-        status_args.push(path.clone());
-        diff_args.push("--".to_string());
-        diff_args.push(path.clone());
-        staged_diff_args.push("--".to_string());
-        staged_diff_args.push(path.clone());
-    }
-
-    Ok(json!({
-        "path": path,
-        "status": run_git_text(&workspace, &status_args)?,
-        "diff": run_git_text(&workspace, &diff_args)?,
-        "stagedDiff": run_git_text(&workspace, &staged_diff_args)?
+        "stderrTruncated": stderr_truncated,
+        "timeoutMs": timeout_ms
     }))
 }
 
@@ -1036,49 +1041,135 @@ fn relative_workspace_path(workspace_path: &Path, path: &Path) -> Result<String,
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
-fn ensure_git_repository(workspace_path: &Path) -> Result<(), ToolRuntimeError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace_path)
-        .arg("rev-parse")
-        .arg("--is-inside-work-tree")
-        .output()
-        .map_err(|source| ToolRuntimeError::Command {
-            command: "git".to_string(),
-            source,
-        })?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+fn tool_timeout_ms(
+    timeout_ms: Option<u64>,
+    default_timeout_ms: u64,
+) -> Result<u64, ToolRuntimeError> {
+    let timeout_ms = timeout_ms.unwrap_or(default_timeout_ms);
 
-    if output.status.success() && stdout.trim() == "true" {
-        return Ok(());
+    if timeout_ms == 0 || timeout_ms > MAX_TOOL_TIMEOUT_MS {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "timeoutMs must be between 1 and {MAX_TOOL_TIMEOUT_MS} milliseconds"
+        )));
     }
 
-    Err(ToolRuntimeError::NotGitRepository {
-        path: workspace_path.to_path_buf(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    Ok(timeout_ms)
+}
+
+fn argument_timeout_ms(
+    arguments: &Value,
+    default_timeout_ms: u64,
+) -> Result<u64, ToolRuntimeError> {
+    match arguments.get("timeoutMs") {
+        Some(Value::Null) | None => tool_timeout_ms(None, default_timeout_ms),
+        Some(Value::Number(timeout_ms)) => {
+            let timeout_ms = timeout_ms.as_u64().ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(
+                    "timeoutMs must be an integer or null".to_string(),
+                )
+            })?;
+
+            tool_timeout_ms(Some(timeout_ms), default_timeout_ms)
+        }
+        Some(_) => Err(ToolRuntimeError::InvalidArguments(
+            "timeoutMs must be an integer or null".to_string(),
+        )),
+    }
+}
+
+fn run_command_with_timeout(
+    command: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<Output, ToolRuntimeError> {
+    let command_label = command_label(command, args);
+    let mut child = Command::new(command)
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| ToolRuntimeError::Command {
+            command: command_label.clone(),
+            source,
+        })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ToolRuntimeError::InvalidArguments("failed to capture stdout".to_string())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        ToolRuntimeError::InvalidArguments("failed to capture stderr".to_string())
+    })?;
+    let stdout_handle = read_command_pipe(stdout);
+    let stderr_handle = read_command_pipe(stderr);
+    let started = Instant::now();
+
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|source| ToolRuntimeError::Command {
+                command: command_label.clone(),
+                source,
+            })?
+        {
+            return Ok(Output {
+                status,
+                stdout: join_command_reader(&command_label, stdout_handle)?,
+                stderr: join_command_reader(&command_label, stderr_handle)?,
+            });
+        }
+
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(stdout_handle);
+            drop(stderr_handle);
+            let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+
+            return Err(ToolRuntimeError::CommandTimedOut {
+                command: command_label,
+                timeout_ms,
+            });
+        }
+
+        thread::sleep(Duration::from_millis(COMMAND_WAIT_POLL_MS));
+    }
+}
+
+fn read_command_pipe<T>(mut pipe: T) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    T: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        pipe.read_to_end(&mut output)?;
+        Ok(output)
     })
 }
 
-fn run_git_text(workspace_path: &Path, args: &[String]) -> Result<String, ToolRuntimeError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace_path)
-        .args(args)
-        .output()
-        .map_err(|source| ToolRuntimeError::Command {
-            command: "git".to_string(),
+fn join_command_reader(
+    command: &str,
+    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, ToolRuntimeError> {
+    match handle.join() {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(source)) => Err(ToolRuntimeError::Command {
+            command: command.to_string(),
             source,
-        })?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        }),
+        Err(_) => Err(ToolRuntimeError::Command {
+            command: command.to_string(),
+            source: io::Error::other("output reader thread panicked"),
+        }),
     }
+}
 
-    Err(ToolRuntimeError::CommandFailed {
-        command: format!("git {}", args.join(" ")),
-        status: output.status.code(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+fn command_label(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{} {}", command, args.join(" "))
+    }
 }
 
 fn limited_output_text(output: &[u8]) -> (String, bool) {
@@ -1111,9 +1202,13 @@ fn read_file_definition() -> ToolDefinition {
                 "endLine": {
                     "type": ["integer", "null"],
                     "description": "Optional 1-based last line to read, inclusive. Must be null when startLine is null."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 5000."
                 }
             },
-            "required": ["path", "startLine", "endLine"]
+            "required": ["path", "startLine", "endLine", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1130,9 +1225,13 @@ fn list_files_definition() -> ToolDefinition {
                 "path": {
                     "type": "string",
                     "description": "Workspace-relative directory path. Use . for the workspace root."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 5000."
                 }
             },
-            "required": ["path"]
+            "required": ["path", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1161,9 +1260,13 @@ fn graph_find_symbols_definition() -> ToolDefinition {
                 "limit": {
                     "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["query", "kind", "path", "limit"]
+            "required": ["query", "kind", "path", "limit", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1192,9 +1295,13 @@ fn graph_find_callers_definition() -> ToolDefinition {
                 "limit": {
                     "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["symbolId", "symbol", "path", "limit"]
+            "required": ["symbolId", "symbol", "path", "limit", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1223,9 +1330,13 @@ fn graph_find_callees_definition() -> ToolDefinition {
                 "limit": {
                     "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["symbolId", "symbol", "path", "limit"]
+            "required": ["symbolId", "symbol", "path", "limit", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1254,9 +1365,13 @@ fn graph_find_references_definition() -> ToolDefinition {
                 "limit": {
                     "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["symbolId", "symbol", "path", "limit"]
+            "required": ["symbolId", "symbol", "path", "limit", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1277,9 +1392,13 @@ fn graph_related_files_definition() -> ToolDefinition {
                 "limit": {
                     "type": ["integer", "null"],
                     "description": "Optional result limit from 1 to 50. Defaults to 20."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["path", "limit"]
+            "required": ["path", "limit", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1300,9 +1419,13 @@ fn search_text_definition() -> ToolDefinition {
                 "path": {
                     "type": "string",
                     "description": "Workspace-relative path to search. Use . for the workspace root."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["query", "path"]
+            "required": ["query", "path", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1331,9 +1454,13 @@ fn write_file_definition() -> ToolDefinition {
                 "endLine": {
                     "type": ["integer", "null"],
                     "description": "Optional 1-based last line to replace, inclusive. Must be null when startLine is null."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["path", "content", "startLine", "endLine"]
+            "required": ["path", "content", "startLine", "endLine", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1359,28 +1486,13 @@ fn run_command_definition() -> ToolDefinition {
                 "cwd": {
                     "type": ["string", "null"],
                     "description": "Optional workspace-relative working directory. Defaults to the workspace root."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional command timeout in milliseconds. Defaults to 60000."
                 }
             },
-            "required": ["command", "args", "cwd"]
-        }),
-        strict: true,
-    }
-}
-
-fn git_diff_definition() -> ToolDefinition {
-    ToolDefinition {
-        name: GIT_DIFF_TOOL,
-        description: "Return git status plus unstaged and staged diffs for the active workspace.",
-        input_schema: json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "path": {
-                    "type": ["string", "null"],
-                    "description": "Optional workspace-relative path to diff."
-                }
-            },
-            "required": ["path"]
+            "required": ["command", "args", "cwd", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1392,17 +1504,22 @@ struct ReadFileInput {
     path: String,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListFilesInput {
     path: String,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchTextInput {
     query: String,
     path: String,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1412,6 +1529,7 @@ struct GraphFindSymbolsInput {
     kind: Option<String>,
     path: Option<String>,
     limit: Option<usize>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1421,12 +1539,15 @@ struct GraphSymbolLookupInput {
     symbol: Option<String>,
     path: Option<String>,
     limit: Option<usize>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GraphRelatedFilesInput {
     path: String,
     limit: Option<usize>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1436,18 +1557,16 @@ struct WriteFileInput {
     content: String,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RunCommandInput {
     command: String,
     args: Option<Vec<String>>,
     cwd: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GitDiffInput {
-    path: Option<String>,
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1455,6 +1574,10 @@ enum ToolRuntimeError {
     Command {
         command: String,
         source: io::Error,
+    },
+    CommandTimedOut {
+        command: String,
+        timeout_ms: u64,
     },
     CommandFailed {
         command: String,
@@ -1476,10 +1599,6 @@ enum ToolRuntimeError {
         path: PathBuf,
         source: io::Error,
     },
-    NotGitRepository {
-        path: PathBuf,
-        stderr: String,
-    },
     NotDirectory(PathBuf),
     NotFile(PathBuf),
     UnsupportedEncoding(PathBuf),
@@ -1493,6 +1612,10 @@ impl fmt::Display for ToolRuntimeError {
             Self::Command { command, source } => {
                 write!(formatter, "failed to run {command}: {source}")
             }
+            Self::CommandTimedOut {
+                command,
+                timeout_ms,
+            } => write!(formatter, "{command} timed out after {timeout_ms} ms"),
             Self::CommandFailed {
                 command,
                 status,
@@ -1517,21 +1640,6 @@ impl fmt::Display for ToolRuntimeError {
                 write!(formatter, "{command} returned invalid JSON: {source}")
             }
             Self::Io { path, source } => write!(formatter, "{}: {}", path.display(), source),
-            Self::NotGitRepository { path, stderr } => {
-                if stderr.is_empty() {
-                    write!(
-                        formatter,
-                        "workspace is not a git repository: {}",
-                        path.display()
-                    )
-                } else {
-                    write!(
-                        formatter,
-                        "workspace is not a git repository: {} ({stderr})",
-                        path.display()
-                    )
-                }
-            }
             Self::NotDirectory(path) => write!(formatter, "{} is not a directory", path.display()),
             Self::NotFile(path) => write!(formatter, "{} is not a file", path.display()),
             Self::UnsupportedEncoding(path) => write!(
@@ -1552,13 +1660,13 @@ impl std::error::Error for ToolRuntimeError {
         match self {
             Self::WorkspaceDatabase(source) => Some(source),
             Self::Command { .. }
+            | Self::CommandTimedOut { .. }
             | Self::CommandFailed { .. }
             | Self::FileTooLarge { .. }
             | Self::InvalidArguments(_)
             | Self::InvalidPath(_)
             | Self::InvalidToolOutput { .. }
             | Self::Io { .. }
-            | Self::NotGitRepository { .. }
             | Self::NotDirectory(_)
             | Self::NotFile(_)
             | Self::UnsupportedEncoding(_)
@@ -1754,62 +1862,68 @@ mod tests {
         let read_file: ReadFileInput = parse_arguments(json!({
             "path": "note.txt",
             "startLine": null,
-            "endLine": null
+            "endLine": null,
+            "timeoutMs": null
         }))
         .expect("read file input");
         assert_eq!(read_file.path, "note.txt");
         assert_eq!(read_file.start_line, None);
         assert_eq!(read_file.end_line, None);
+        assert_eq!(read_file.timeout_ms, None);
 
         let graph_symbols: GraphFindSymbolsInput = parse_arguments(json!({
             "query": "helper",
             "kind": null,
             "path": null,
-            "limit": null
+            "limit": null,
+            "timeoutMs": null
         }))
         .expect("graph symbols input");
         assert_eq!(graph_symbols.query, "helper");
         assert_eq!(graph_symbols.kind, None);
         assert_eq!(graph_symbols.path, None);
         assert_eq!(graph_symbols.limit, None);
+        assert_eq!(graph_symbols.timeout_ms, None);
 
         let graph_lookup: GraphSymbolLookupInput = parse_arguments(json!({
             "symbolId": null,
             "symbol": "helper",
             "path": null,
-            "limit": null
+            "limit": null,
+            "timeoutMs": null
         }))
         .expect("graph lookup input");
         assert_eq!(graph_lookup.symbol_id, None);
         assert_eq!(graph_lookup.symbol.as_deref(), Some("helper"));
         assert_eq!(graph_lookup.path, None);
         assert_eq!(graph_lookup.limit, None);
+        assert_eq!(graph_lookup.timeout_ms, None);
 
         let run_command: RunCommandInput = parse_arguments(json!({
             "command": "git",
             "args": null,
-            "cwd": null
+            "cwd": null,
+            "timeoutMs": null
         }))
         .expect("run command input");
         assert_eq!(run_command.command, "git");
         assert_eq!(run_command.args, None);
         assert_eq!(run_command.cwd, None);
-
-        let git_diff: GitDiffInput =
-            parse_arguments(json!({ "path": null })).expect("git diff input");
-        assert_eq!(git_diff.path, None);
+        assert_eq!(run_command.timeout_ms, None);
 
         let write_file: WriteFileInput = parse_arguments(json!({
             "path": "note.txt",
             "content": "hello",
             "startLine": null,
-            "endLine": null
+            "endLine": null,
+            "timeoutMs": null
         }))
         .expect("write file input");
         assert_eq!(write_file.path, "note.txt");
         assert_eq!(write_file.content, "hello");
         assert_eq!(write_file.start_line, None);
         assert_eq!(write_file.end_line, None);
+        assert_eq!(write_file.timeout_ms, None);
     }
 
     #[test]
@@ -2055,10 +2169,20 @@ mod tests {
     }
 
     #[test]
-    fn git_diff_reports_non_git_workspace() {
+    fn builtin_tools_do_not_include_git_diff() {
+        let tool_names = builtin_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(!tool_names.contains(&"git_diff"));
+    }
+
+    #[test]
+    fn removed_git_diff_tool_reports_unknown_tool() {
         let workspace = tempfile::tempdir().expect("workspace");
 
-        let result = execute_builtin_tool(workspace.path(), GIT_DIFF_TOOL, json!({}));
+        let result = execute_builtin_tool(workspace.path(), "git_diff", json!({}));
 
         assert!(result.is_error);
         assert!(
@@ -2067,12 +2191,12 @@ mod tests {
                 .get("error")
                 .and_then(Value::as_str)
                 .expect("error")
-                .contains("workspace is not a git repository")
+                .contains("unknown built-in tool")
         );
     }
 
     #[test]
-    fn git_diff_returns_workspace_diff() {
+    fn run_command_can_return_workspace_git_diff() {
         let workspace = tempfile::tempdir().expect("workspace");
         run_test_command(workspace.path(), "git", &["init"]);
         run_test_command(
@@ -2090,27 +2214,83 @@ mod tests {
         run_test_command(workspace.path(), "git", &["commit", "-m", "initial"]);
         fs::write(workspace.path().join("note.txt"), "after\n").expect("rewrite note");
 
-        let result = execute_builtin_tool(workspace.path(), GIT_DIFF_TOOL, json!({}));
+        let status = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "git",
+                "args": ["status", "--short"],
+                "cwd": null,
+                "timeoutMs": null
+            }),
+        );
+        let diff = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "git",
+                "args": ["diff"],
+                "cwd": null,
+                "timeoutMs": null
+            }),
+        );
 
-        assert!(!result.is_error);
+        assert!(!status.is_error);
+        assert!(!diff.is_error);
         assert!(
-            result.output["status"]
+            status.output["stdout"]
                 .as_str()
                 .expect("status")
                 .contains("M note.txt")
         );
         assert!(
-            result.output["diff"]
+            diff.output["stdout"]
                 .as_str()
                 .expect("diff")
                 .contains("-before")
         );
         assert!(
-            result.output["diff"]
+            diff.output["stdout"]
                 .as_str()
                 .expect("diff")
                 .contains("+after")
         );
+    }
+
+    #[test]
+    fn run_command_times_out() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .to_string();
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": command,
+                "args": ["--ignored", "--exact", "tests::timeout_child_process"],
+                "cwd": null,
+                "timeoutMs": 1
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("timed out")
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn timeout_child_process() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
     fn run_test_command(workspace_path: &Path, command: &str, args: &[&str]) {

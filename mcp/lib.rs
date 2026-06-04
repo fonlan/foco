@@ -14,10 +14,12 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 const MCP_TOOL_PREFIX: &str = "mcp__";
 const MCP_TOOL_SEPARATOR: &str = "__";
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -176,9 +178,12 @@ impl McpRegistry {
         };
         let request =
             CallToolRequestParams::new(original_name).with_arguments(json_object(arguments)?);
-        let result = peer
-            .call_tool(request)
+        let result = timeout(DEFAULT_TOOL_CALL_TIMEOUT, peer.call_tool(request))
             .await
+            .map_err(|_| McpError::ToolTimedOut {
+                tool_name: tool_name.to_string(),
+                timeout_ms: duration_millis(DEFAULT_TOOL_CALL_TIMEOUT),
+            })?
             .map_err(|source| McpError::Runtime(source.to_string()))?;
         let is_error = result.is_error.unwrap_or(false);
         let output = serde_json::to_value(result).map_err(|source| {
@@ -611,6 +616,7 @@ pub enum McpError {
     Runtime(String),
     ServerNotFound(String),
     ServerNotRunning(String),
+    ToolTimedOut { tool_name: String, timeout_ms: u64 },
     Io(std::io::Error),
 }
 
@@ -627,6 +633,13 @@ impl fmt::Display for McpError {
             Self::ServerNotRunning(server_id) => {
                 write!(formatter, "MCP server is not running: {server_id}")
             }
+            Self::ToolTimedOut {
+                tool_name,
+                timeout_ms,
+            } => write!(
+                formatter,
+                "MCP tool '{tool_name}' timed out after {timeout_ms} ms"
+            ),
             Self::Io(source) => write!(formatter, "{source}"),
         }
     }
@@ -641,7 +654,8 @@ impl std::error::Error for McpError {
             | Self::InvalidToolName(_)
             | Self::Runtime(_)
             | Self::ServerNotFound(_)
-            | Self::ServerNotRunning(_) => None,
+            | Self::ServerNotRunning(_)
+            | Self::ToolTimedOut { .. } => None,
         }
     }
 }
@@ -660,4 +674,8 @@ impl From<reqwest::Error> for McpError {
 
 pub fn crate_name() -> &'static str {
     "foco-mcp"
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }

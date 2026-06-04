@@ -124,6 +124,7 @@ pub fn build_system_prompt(input: SystemPromptInput) -> String {
          - Use tools when you need current file or workspace evidence.\n\
          - Prefer code graph tools before full-text search when locating symbols, callers, callees, references, or related files.\n\
          - Treat graph tool JSON outputs as compact structured code graph context; use returned symbolId values for follow-up graph queries.\n\
+         - Use run_command for git commands such as status and diff; there is no dedicated git_diff tool.\n\
          - After tool results are returned, continue the same run and answer the user.",
         input.workspace_id, input.workspace_name, input.workspace_path
     );

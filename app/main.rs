@@ -56,14 +56,15 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    RUN_COMMAND_TOOL, ToolExecution, WRITE_FILE_TOOL, builtin_tool_definitions,
-    execute_builtin_tool,
+    RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, ToolExecution, WRITE_FILE_TOOL, builtin_tool_definitions,
+    builtin_tool_timeout_ms, execute_builtin_tool,
 };
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
+use tokio::time::timeout;
 use tower_http::services::ServeDir;
 
 mod logging;
@@ -2846,16 +2847,39 @@ async fn execute_tool(
             },
         }
     } else {
-        match tokio::task::spawn_blocking({
+        let timeout_ms = match builtin_tool_timeout_ms(tool_name, &arguments) {
+            Ok(timeout_ms) => timeout_ms,
+            Err(error) => {
+                return ToolExecution {
+                    output: json!({ "error": error }),
+                    is_error: true,
+                };
+            }
+        };
+        let tool_name = tool_name.to_string();
+        let worker = tokio::task::spawn_blocking({
             let workspace_path = workspace_path.to_path_buf();
-            let tool_name = tool_name.to_string();
+            let tool_name = tool_name.clone();
             move || execute_builtin_tool(&workspace_path, &tool_name, arguments)
-        })
-        .await
-        {
+        });
+        let execution: Result<ToolExecution, String> =
+            if matches!(tool_name.as_str(), RUN_COMMAND_TOOL | SEARCH_TEXT_TOOL) {
+                worker
+                    .await
+                    .map_err(|source| format!("tool execution worker failed: {source}"))
+            } else {
+                timeout(Duration::from_millis(timeout_ms), worker)
+                    .await
+                    .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
+                    .and_then(|result| {
+                        result.map_err(|source| format!("tool execution worker failed: {source}"))
+                    })
+            };
+
+        match execution {
             Ok(execution) => execution,
-            Err(source) => ToolExecution {
-                output: json!({ "error": format!("tool execution worker failed: {source}") }),
+            Err(error) => ToolExecution {
+                output: json!({ "error": error }),
                 is_error: true,
             },
         }
