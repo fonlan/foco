@@ -23,6 +23,9 @@ import {
   Wrench,
   X,
 } from "lucide-react";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal as XTerm } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 import {
   FormEvent,
   useCallback,
@@ -251,6 +254,19 @@ type GitDiffResponse = {
   stagedDiff: string;
   files: GitStatusFileSummary[];
 };
+
+type TerminalSessionResponse = {
+  id: string;
+  name: string;
+  workingDirectory: string;
+};
+
+type TerminalServerEvent =
+  | { type: "started"; cwd: string }
+  | { type: "output"; data: string }
+  | { type: "cwd"; cwd: string }
+  | { type: "exit"; status: string }
+  | { type: "error"; message: string };
 
 type ShellMessage = {
   id: string;
@@ -916,6 +932,7 @@ export function App() {
 
           {viewMode === "chat" ? (
             <ChatPanel
+              activeWorkspace={activeWorkspace}
               availableModels={availableModels}
               draftMessage={draftMessage}
               isLoadingSettings={isLoadingSettings}
@@ -960,6 +977,7 @@ export function App() {
 }
 
 function ChatPanel({
+  activeWorkspace,
   availableModels,
   canRetryRun,
   draftMessage,
@@ -976,6 +994,7 @@ function ChatPanel({
   selectedThinkingLevel,
   thinkingLevels,
 }: {
+  activeWorkspace: WorkspaceSummary | undefined;
   availableModels: ConfiguredModelSummary[];
   canRetryRun: boolean;
   draftMessage: string;
@@ -1148,16 +1167,7 @@ function ChatPanel({
             </button>
           ) : null}
         </form>
-        <button
-          className="mx-auto mt-3 flex h-9 w-full max-w-4xl items-center justify-between rounded-md border border-zinc-200 bg-zinc-50 px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-100"
-          type="button"
-        >
-          <span className="inline-flex items-center gap-2">
-            <Terminal aria-hidden="true" className="size-4" />
-            Terminal
-          </span>
-          <ChevronRight aria-hidden="true" className="size-4" />
-        </button>
+        <TerminalPanel workspace={activeWorkspace} />
       </div>
     </div>
   );
@@ -1206,6 +1216,222 @@ function ToolCallList({ toolCalls }: { toolCalls: ChatToolCallSummary[] }) {
         </details>
       ))}
     </div>
+  );
+}
+
+function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const [cwd, setCwd] = useState("");
+  const [status, setStatus] = useState<"closed" | "connected" | "connecting" | "error">(
+    "closed",
+  );
+  const [error, setError] = useState<string | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const xtermRef = useRef<XTerm | null>(null);
+  const fitAddonRef = useRef<FitAddon | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const workspaceId = workspace?.id ?? "";
+  const workspacePath = workspace?.path ?? "";
+
+  useEffect(() => {
+    if (!isOpen || !workspaceId) {
+      return;
+    }
+
+    let cancelled = false;
+    const terminal = new XTerm({
+      allowProposedApi: false,
+      convertEol: true,
+      cursorBlink: true,
+      fontFamily: "Cascadia Mono, Consolas, monospace",
+      fontSize: 13,
+      rows: 12,
+      theme: {
+        background: "#18181b",
+        foreground: "#f4f4f5",
+        cursor: "#2dd4bf",
+      },
+    });
+    const fitAddon = new FitAddon();
+    let socket: WebSocket | null = null;
+
+    xtermRef.current = terminal;
+    fitAddonRef.current = fitAddon;
+    terminal.loadAddon(fitAddon);
+    setStatus("connecting");
+    setError(null);
+
+    if (!containerRef.current) {
+      setStatus("error");
+      setError("Terminal container was not mounted.");
+      terminal.dispose();
+      return;
+    }
+
+    terminal.open(containerRef.current);
+    fitAddon.fit();
+
+    const sendResize = () => {
+      if (socket?.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      socket.send(
+        JSON.stringify({
+          type: "resize",
+          cols: terminal.cols,
+          rows: terminal.rows,
+        }),
+      );
+    };
+
+    const observer = new ResizeObserver(() => {
+      fitAddon.fit();
+      sendResize();
+    });
+    observer.observe(containerRef.current);
+    resizeObserverRef.current = observer;
+
+    const inputDisposable = terminal.onData((data) => {
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "input", data }));
+      }
+    });
+
+    async function connectTerminal() {
+      if (!workspaceId) {
+        return;
+      }
+
+      try {
+        const session = await requestJson<TerminalSessionResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/terminal/session`,
+          { method: "POST" },
+        );
+        if (cancelled) {
+          return;
+        }
+
+        setCwd(session.workingDirectory);
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        socket = new WebSocket(
+          `${protocol}//${window.location.host}/api/workspaces/${encodeURIComponent(
+            workspaceId,
+          )}/terminal/${encodeURIComponent(session.id)}/ws?cols=${terminal.cols}&rows=${terminal.rows}`,
+        );
+        socketRef.current = socket;
+
+        socket.onopen = () => {
+          setStatus("connected");
+          sendResize();
+          terminal.focus();
+        };
+        socket.onmessage = (event) => {
+          const parsed = JSON.parse(event.data as string) as unknown;
+          if (!isTerminalServerEvent(parsed)) {
+            setStatus("error");
+            setError("Terminal returned an unknown event.");
+            return;
+          }
+
+          if (parsed.type === "started" || parsed.type === "cwd") {
+            setCwd(parsed.cwd);
+            return;
+          }
+
+          if (parsed.type === "output") {
+            terminal.write(parsed.data);
+            return;
+          }
+
+          if (parsed.type === "exit") {
+            setStatus("closed");
+            terminal.writeln(`\r\n[terminal exited: ${parsed.status}]`);
+            return;
+          }
+
+          setStatus("error");
+          setError(parsed.message);
+          terminal.writeln(`\r\n[terminal error: ${parsed.message}]`);
+        };
+        socket.onerror = () => {
+          setStatus("error");
+          setError("Terminal WebSocket failed.");
+        };
+        socket.onclose = () => {
+          setStatus((current) => (current === "error" ? current : "closed"));
+        };
+      } catch (requestError) {
+        if (!cancelled) {
+          const message = errorMessage(requestError);
+          setStatus("error");
+          setError(message);
+          terminal.writeln(`[terminal error: ${message}]`);
+        }
+      }
+    }
+
+    void connectTerminal();
+
+    return () => {
+      cancelled = true;
+      inputDisposable.dispose();
+      observer.disconnect();
+      socket?.close();
+      terminal.dispose();
+      socketRef.current = null;
+      xtermRef.current = null;
+      fitAddonRef.current = null;
+      resizeObserverRef.current = null;
+    };
+  }, [isOpen, workspaceId]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setStatus("closed");
+      setError(null);
+      setCwd("");
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    setIsOpen(false);
+  }, [workspaceId]);
+
+  const isDisabled = !workspace;
+
+  return (
+    <section className="mx-auto mt-3 w-full max-w-4xl overflow-hidden rounded-md border border-zinc-200 bg-zinc-50">
+      <button
+        className="flex h-9 w-full items-center justify-between px-3 text-sm font-medium text-zinc-700 transition hover:bg-zinc-100 disabled:cursor-not-allowed disabled:text-zinc-400"
+        disabled={isDisabled}
+        onClick={() => setIsOpen((current) => !current)}
+        type="button"
+      >
+        <span className="inline-flex min-w-0 items-center gap-2">
+          <Terminal aria-hidden="true" className="size-4 shrink-0" />
+          <span className="truncate">Terminal</span>
+          <span className={terminalStatusClass(status)}>{terminalStatusText(status)}</span>
+        </span>
+        {isOpen ? (
+          <ChevronDown aria-hidden="true" className="size-4" />
+        ) : (
+          <ChevronRight aria-hidden="true" className="size-4" />
+        )}
+      </button>
+      {isOpen ? (
+        <div className="border-t border-zinc-200 bg-zinc-950">
+          <div className="flex h-8 items-center justify-between gap-3 border-b border-zinc-800 px-3 text-xs text-zinc-400">
+            <span className="min-w-0 truncate">{cwd || workspacePath}</span>
+            {error ? (
+              <span className="shrink-0 text-rose-300">{error}</span>
+            ) : null}
+          </div>
+          <div ref={containerRef} className="h-56 min-w-0 p-2" />
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -2480,6 +2706,40 @@ function statusLabel(file: GitStatusFileSummary) {
   return `${file.indexStatus}${file.worktreeStatus}`.replaceAll(" ", ".");
 }
 
+function terminalStatusText(status: "closed" | "connected" | "connecting" | "error") {
+  if (status === "connected") {
+    return "connected";
+  }
+
+  if (status === "connecting") {
+    return "connecting";
+  }
+
+  if (status === "error") {
+    return "error";
+  }
+
+  return "closed";
+}
+
+function terminalStatusClass(status: "closed" | "connected" | "connecting" | "error") {
+  const base = "rounded px-1.5 py-0.5 text-[11px]";
+
+  if (status === "connected") {
+    return `${base} bg-teal-100 text-teal-800`;
+  }
+
+  if (status === "connecting") {
+    return `${base} bg-zinc-200 text-zinc-700`;
+  }
+
+  if (status === "error") {
+    return `${base} bg-rose-100 text-rose-700`;
+  }
+
+  return `${base} bg-zinc-100 text-zinc-500`;
+}
+
 async function readChatStream(
   response: Response,
   onEvent: (event: ChatStreamEvent) => void,
@@ -2544,6 +2804,35 @@ function isChatStreamEvent(value: unknown): value is ChatStreamEvent {
     "type" in value &&
     typeof value.type === "string"
   );
+}
+
+function isTerminalServerEvent(value: unknown): value is TerminalServerEvent {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("type" in value) ||
+    typeof value.type !== "string"
+  ) {
+    return false;
+  }
+
+  if (value.type === "started" || value.type === "cwd") {
+    return "cwd" in value && typeof value.cwd === "string";
+  }
+
+  if (value.type === "output") {
+    return "data" in value && typeof value.data === "string";
+  }
+
+  if (value.type === "exit") {
+    return "status" in value && typeof value.status === "string";
+  }
+
+  if (value.type === "error") {
+    return "message" in value && typeof value.message === "string";
+  }
+
+  return false;
 }
 
 async function responseErrorMessage(response: Response) {

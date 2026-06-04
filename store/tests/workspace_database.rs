@@ -4,8 +4,9 @@ use foco_store::{
     config::WorkspaceConfig,
     workspace::{
         LlmRequestRecord, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
-        NewMessage, NewRunEvent, NewToolCall, NewToolResult, WORKSPACE_SCHEMA_VERSION,
-        WorkspaceDatabase, initialize_workspace_databases, workspace_database_path,
+        NewMessage, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
+        WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, initialize_workspace_databases,
+        workspace_database_path,
     },
 };
 use rusqlite::Connection;
@@ -226,6 +227,51 @@ fn repository_helpers_round_trip_core_records() {
     assert_eq!(snapshots[0].summary, "Earlier conversation summary.");
     assert_eq!(snapshots[0].original_token_count, 120);
     assert_eq!(snapshots[0].summary_token_count, 8);
+}
+
+#[test]
+fn repository_helpers_persist_terminal_working_directory() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let first_directory = workspace.path().display().to_string();
+    let second_directory = workspace.path().join("nested").display().to_string();
+
+    database
+        .upsert_terminal_session(NewTerminalSession {
+            id: "terminal-1",
+            name: "Workspace Terminal",
+            working_directory: &first_directory,
+            metadata_json: None,
+        })
+        .expect("terminal session insert");
+
+    let session = database
+        .latest_terminal_session()
+        .expect("latest terminal session")
+        .expect("terminal session");
+    assert_eq!(session.id, "terminal-1");
+    assert_eq!(session.working_directory, first_directory);
+    assert_eq!(session.closed_at, None);
+
+    database
+        .update_terminal_working_directory("terminal-1", &second_directory)
+        .expect("terminal cwd update");
+    let session = database
+        .latest_terminal_session()
+        .expect("latest terminal session after cwd")
+        .expect("terminal session after cwd");
+    assert_eq!(session.working_directory, second_directory);
+
+    database
+        .close_terminal_session("terminal-1")
+        .expect("terminal close");
+    assert_eq!(
+        database
+            .latest_terminal_session()
+            .expect("latest terminal after close"),
+        None
+    );
 }
 
 #[test]

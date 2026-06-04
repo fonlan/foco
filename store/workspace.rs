@@ -652,6 +652,147 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn upsert_terminal_session(
+        &mut self,
+        session: NewTerminalSession<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let metadata_json = session.metadata_json.unwrap_or("{}");
+
+        self.connection
+            .execute(
+                "INSERT INTO terminal_sessions
+                    (id, name, working_directory, created_at, updated_at, closed_at, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?4, NULL, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name = excluded.name,
+                    working_directory = excluded.working_directory,
+                    updated_at = excluded.updated_at,
+                    closed_at = NULL,
+                    metadata_json = excluded.metadata_json",
+                params![
+                    session.id,
+                    session.name,
+                    session.working_directory,
+                    now,
+                    metadata_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn latest_terminal_session(
+        &self,
+    ) -> Result<Option<TerminalSessionRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, name, working_directory, created_at, updated_at, closed_at, metadata_json
+                 FROM terminal_sessions
+                 WHERE closed_at IS NULL
+                 ORDER BY updated_at DESC, created_at DESC, id DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(TerminalSessionRecord {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        working_directory: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        closed_at: row.get(5)?,
+                        metadata_json: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn latest_terminal_working_directory(
+        &self,
+    ) -> Result<Option<String>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT working_directory
+                 FROM terminal_sessions
+                 ORDER BY updated_at DESC, created_at DESC, id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn terminal_session(
+        &self,
+        id: &str,
+    ) -> Result<Option<TerminalSessionRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, name, working_directory, created_at, updated_at, closed_at, metadata_json
+                 FROM terminal_sessions
+                 WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(TerminalSessionRecord {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        working_directory: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        closed_at: row.get(5)?,
+                        metadata_json: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn update_terminal_working_directory(
+        &mut self,
+        id: &str,
+        working_directory: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE terminal_sessions
+                 SET working_directory = ?2, updated_at = ?3
+                 WHERE id = ?1",
+                params![id, working_directory, now_timestamp()],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        if updated == 0 {
+            return Err(WorkspaceDatabaseError::MissingTerminalSession { id: id.to_string() });
+        }
+
+        Ok(())
+    }
+
+    pub fn close_terminal_session(&mut self, id: &str) -> Result<(), WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE terminal_sessions
+                 SET updated_at = ?2, closed_at = ?2
+                 WHERE id = ?1",
+                params![id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        if updated == 0 {
+            return Err(WorkspaceDatabaseError::MissingTerminalSession { id: id.to_string() });
+        }
+
+        Ok(())
+    }
+
     fn sqlite_error(&self, source: rusqlite::Error) -> WorkspaceDatabaseError {
         WorkspaceDatabaseError::Sqlite {
             path: self.database_path.clone(),
@@ -852,6 +993,25 @@ pub struct ContextCompressionSnapshotRecord {
     pub metadata_json: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewTerminalSession<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub working_directory: &'a str,
+    pub metadata_json: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalSessionRecord {
+    pub id: String,
+    pub name: String,
+    pub working_directory: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub closed_at: Option<String>,
+    pub metadata_json: String,
+}
+
 #[derive(Debug)]
 pub enum WorkspaceDatabaseError {
     InvalidAuditJson {
@@ -867,6 +1027,9 @@ pub enum WorkspaceDatabaseError {
     },
     MissingDatabaseParent {
         path: PathBuf,
+    },
+    MissingTerminalSession {
+        id: String,
     },
     NonUtf8Path {
         path: PathBuf,
@@ -900,6 +1063,9 @@ impl fmt::Display for WorkspaceDatabaseError {
                 "workspace database path has no parent directory: {}",
                 path.display()
             ),
+            Self::MissingTerminalSession { id } => {
+                write!(formatter, "terminal session was not found: {id}")
+            }
             Self::NonUtf8Path { path } => {
                 write!(formatter, "path must be valid UTF-8: {}", path.display())
             }
@@ -934,6 +1100,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             Self::Sqlite { source, .. } => Some(source),
             Self::InvalidAuditTokens { .. }
             | Self::MissingDatabaseParent { .. }
+            | Self::MissingTerminalSession { .. }
             | Self::NonUtf8Path { .. }
             | Self::UnsupportedSchemaVersion { .. }
             | Self::WorkspaceNotDirectory { .. } => None,

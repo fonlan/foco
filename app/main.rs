@@ -14,7 +14,7 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, Query, State},
+    extract::{Path as AxumPath, Query, State, ws::WebSocketUpgrade},
     http::StatusCode,
     response::{
         IntoResponse, Response,
@@ -45,8 +45,8 @@ use foco_store::{
     },
     workspace::{
         ChatRecord, ContextCompressionSnapshotRecord, MessageRecord, NewContextCompressionSnapshot,
-        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewToolCall, NewToolResult,
-        ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
+        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewTerminalSession, NewToolCall,
+        NewToolResult, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
     },
 };
 use foco_tools::{
@@ -57,9 +57,11 @@ use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 use tower_http::services::ServeDir;
 
 mod logging;
+mod terminal;
 
 const DEFAULT_PORT: u16 = 3210;
 const PORT_ENV: &str = "FOCO_PORT";
@@ -77,6 +79,8 @@ struct AppState {
     config: Arc<Mutex<GlobalConfig>>,
     config_file: PathBuf,
     model_metadata_file: PathBuf,
+    terminal_registry: terminal::TerminalRegistry,
+    terminal_shutdown_tx: broadcast::Sender<()>,
 }
 
 #[tokio::main]
@@ -104,10 +108,13 @@ async fn run() -> AppResult<()> {
 
     let addr = local_addr()?;
     let frontend_dir = frontend_dist_dir()?;
+    let (terminal_shutdown_tx, _) = broadcast::channel(16);
     let state = AppState {
         config: Arc::new(Mutex::new(loaded_config.config)),
         config_file: loaded_config.paths.config_file,
         model_metadata_file: loaded_config.paths.root_dir.join("models.dev.json"),
+        terminal_registry: terminal::TerminalRegistry::default(),
+        terminal_shutdown_tx: terminal_shutdown_tx.clone(),
     };
     let app = Router::new()
         .route("/api/health", get(health))
@@ -130,15 +137,35 @@ async fn run() -> AppResult<()> {
         )
         .route("/api/workspaces/{workspace_id}/git/status", get(git_status))
         .route("/api/workspaces/{workspace_id}/git/diff", get(git_diff))
+        .route(
+            "/api/workspaces/{workspace_id}/terminal/session",
+            post(create_terminal_session),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/terminal/{session_id}/ws",
+            get(terminal_socket),
+        )
         .fallback_service(ServeDir::new(frontend_dir))
         .with_state(state);
     let listener = TcpListener::bind(addr).await?;
 
     tracing::info!(%addr, "starting local HTTP server");
     println!("Foco is running at http://{addr}");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(terminal_shutdown_tx))
+        .await?;
 
     Ok(())
+}
+
+async fn shutdown_signal(terminal_shutdown_tx: broadcast::Sender<()>) {
+    if let Err(source) = tokio::signal::ctrl_c().await {
+        tracing::warn!(error = %source, "failed to listen for Ctrl+C shutdown");
+        return;
+    }
+
+    tracing::info!("shutdown requested; closing terminal sessions");
+    let _ = terminal_shutdown_tx.send(());
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -598,6 +625,83 @@ async fn git_diff(
     }))
 }
 
+async fn create_terminal_session(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<TerminalSessionResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let working_directory = database
+        .latest_terminal_working_directory()
+        .map_err(ApiError::from_workspace_error)?
+        .map(|path| terminal::shell_path(Path::new(&path)).display().to_string())
+        .unwrap_or_else(|| terminal::shell_path(&workspace.path).display().to_string());
+
+    if !Path::new(&working_directory).is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "terminal working directory does not exist: {working_directory}"
+        )));
+    }
+
+    let session_id = unique_id("terminal");
+    database
+        .upsert_terminal_session(NewTerminalSession {
+            id: &session_id,
+            name: "Workspace Terminal",
+            working_directory: &working_directory,
+            metadata_json: None,
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    Ok(Json(TerminalSessionResponse {
+        id: session_id,
+        name: "Workspace Terminal".to_string(),
+        working_directory,
+    }))
+}
+
+async fn terminal_socket(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    AxumPath((workspace_id, session_id)): AxumPath<(String, String)>,
+    Query(query): Query<TerminalSocketQuery>,
+) -> Result<Response, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let session = database
+        .terminal_session(&session_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("terminal session was not found: {session_id}"))
+        })?;
+
+    if session.closed_at.is_some() {
+        return Err(ApiError::bad_request(format!(
+            "terminal session is closed: {session_id}"
+        )));
+    }
+
+    let shutdown_rx = state.terminal_shutdown_tx.subscribe();
+    let registry = state.terminal_registry.clone();
+    let workspace_path = workspace.path.clone();
+
+    Ok(ws.on_upgrade(move |socket| {
+        terminal::handle_terminal_socket(
+            socket,
+            shutdown_rx,
+            registry,
+            workspace_path,
+            session,
+            query.cols.unwrap_or(80),
+            query.rows.unwrap_or(24),
+        )
+    }))
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspacePathRequest {
@@ -651,6 +755,13 @@ struct ChatStreamRequest {
 #[serde(rename_all = "camelCase")]
 struct GitDiffQuery {
     path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSocketQuery {
+    cols: Option<u16>,
+    rows: Option<u16>,
 }
 
 #[derive(Serialize)]
@@ -783,6 +894,14 @@ struct GitDiffResponse {
     diff: String,
     staged_diff: String,
     files: Vec<GitStatusFileSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionResponse {
+    id: String,
+    name: String,
+    working_directory: String,
 }
 
 #[derive(Serialize)]
