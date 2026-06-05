@@ -2409,7 +2409,7 @@ function ChatPanel({
         <div aria-hidden="true" className="h-px" ref={messageScrollEndRef} />
       </div>
 
-      <div className="shrink-0 border-t border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-5">
+      <div className="shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
         <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
           <div className="relative rounded-xl border border-stone-300 bg-white">
             {selectedSkills.length ? (
@@ -2436,7 +2436,7 @@ function ChatPanel({
               </div>
             ) : null}
             <textarea
-              className="message-composer-textarea min-h-24 w-full resize-none border-0 bg-transparent px-3 py-2 text-sm leading-6 text-stone-900 outline-none placeholder:text-stone-400"
+              className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-stone-900 outline-none placeholder:text-stone-400"
               name="message"
               onChange={(event) => onDraftMessageChange(event.target.value)}
               onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
