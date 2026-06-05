@@ -16,29 +16,10 @@ pub struct ToolPromptInfo {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CodeGraphPromptContext {
-    pub indexed_files: i64,
-    pub symbols: i64,
-    pub references: i64,
-    pub edges: i64,
-    pub languages: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkillPromptInfo {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub instructions: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SystemPromptInput {
     pub workspace_id: String,
     pub workspace_name: String,
     pub workspace_path: String,
-    pub code_graph: CodeGraphPromptContext,
-    pub skills: Vec<SkillPromptInfo>,
     pub tools: Vec<ToolPromptInfo>,
 }
 
@@ -130,25 +111,6 @@ pub fn build_system_prompt(input: SystemPromptInput) -> String {
         input.workspace_id, input.workspace_name, input.workspace_path
     );
 
-    let languages = if input.code_graph.languages.is_empty() {
-        "none".to_string()
-    } else {
-        input.code_graph.languages.join(", ")
-    };
-    prompt.push_str(&format!(
-        "\n\nCode graph context:\n\
-         - indexed files: {}\n\
-         - symbols: {}\n\
-         - references: {}\n\
-         - edges: {}\n\
-         - languages: {}",
-        input.code_graph.indexed_files,
-        input.code_graph.symbols,
-        input.code_graph.references,
-        input.code_graph.edges,
-        languages
-    ));
-
     if !input.tools.is_empty() {
         prompt.push_str("\n\nAvailable tools:");
         for tool in input.tools {
@@ -156,20 +118,6 @@ pub fn build_system_prompt(input: SystemPromptInput) -> String {
             prompt.push_str(&tool.name);
             prompt.push_str(": ");
             prompt.push_str(&tool.description);
-        }
-    }
-
-    if !input.skills.is_empty() {
-        prompt.push_str("\n\nEnabled skills:");
-        for skill in input.skills {
-            prompt.push_str("\n\n## ");
-            prompt.push_str(&skill.name);
-            prompt.push_str(" (");
-            prompt.push_str(&skill.id);
-            prompt.push_str(")\nDescription: ");
-            prompt.push_str(&skill.description);
-            prompt.push_str("\nInstructions:\n");
-            prompt.push_str(skill.instructions.trim());
         }
     }
 
@@ -465,37 +413,23 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn system_prompt_includes_code_graph_context_and_tool_rules() {
+    fn system_prompt_includes_static_workspace_and_tool_rules() {
         let prompt = build_system_prompt(SystemPromptInput {
             workspace_id: "workspace-1".to_string(),
             workspace_name: "Workspace".to_string(),
             workspace_path: "C:/project".to_string(),
-            code_graph: CodeGraphPromptContext {
-                indexed_files: 12,
-                symbols: 42,
-                references: 30,
-                edges: 11,
-                languages: vec!["rust".to_string(), "typescript".to_string()],
-            },
-            skills: vec![SkillPromptInfo {
-                id: "gitmemo".to_string(),
-                name: "gitmemo".to_string(),
-                description: "Project memory.".to_string(),
-                instructions: "Search memory before repo work.".to_string(),
-            }],
             tools: vec![ToolPromptInfo {
                 name: "graph_find_symbols".to_string(),
                 description: "Find symbols.".to_string(),
             }],
         });
 
-        assert!(prompt.contains("Code graph context:"));
-        assert!(prompt.contains("- indexed files: 12"));
-        assert!(prompt.contains("- languages: rust, typescript"));
+        assert!(prompt.contains("- id: workspace-1"));
+        assert!(prompt.contains("- path: C:/project"));
         assert!(prompt.contains("Prefer code graph tools before full-text search"));
         assert!(prompt.contains("graph_find_symbols"));
-        assert!(prompt.contains("Enabled skills:"));
-        assert!(prompt.contains("Search memory before repo work."));
+        assert!(!prompt.contains("Code graph context:"));
+        assert!(!prompt.contains("Enabled skills:"));
     }
 
     #[test]

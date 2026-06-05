@@ -24,10 +24,9 @@ use axum::{
 };
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    CodeGraphPromptContext, ContextPackItem, PendingToolCall, SkillPromptInfo, SystemPromptInput,
-    ToolPromptInfo, build_system_prompt, calculate_context_budget,
-    detect_same_file_write_conflicts, estimate_json_tokens, estimate_text_tokens, pack_context,
-    plan_context_compression,
+    ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo, build_system_prompt,
+    calculate_context_budget, detect_same_file_write_conflicts, estimate_json_tokens,
+    estimate_text_tokens, pack_context, plan_context_compression,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{
@@ -79,6 +78,8 @@ const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES: usize = 16;
 const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
 const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
+const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
+    "Enabled skill front matter loaded from configured skills";
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -2075,7 +2076,7 @@ async fn prepare_chat_context(
     let message = request.message.trim();
     let model_id = request.model_id.trim();
     let thinking_level = optional_trimmed_string(request.thinking_level);
-    let requested_skill_ids = request.skill_ids;
+    let _requested_skill_ids = request.skill_ids;
 
     if workspace_id.is_empty() {
         return Err(ApiError::bad_request("workspace id must not be empty"));
@@ -2212,9 +2213,6 @@ async fn prepare_chat_context(
         .map(neutral_tool_definition)
         .collect::<Vec<_>>();
     neutral_tools.extend(mcp_tools.iter().map(neutral_mcp_tool_definition));
-    let code_graph_context = database
-        .code_graph_context()
-        .map_err(ApiError::from_workspace_error)?;
     let tool_prompt_infos = builtin_tool_definitions
         .iter()
         .map(|tool| ToolPromptInfo {
@@ -2233,14 +2231,6 @@ async fn prepare_chat_context(
         workspace_id: workspace.id.clone(),
         workspace_name: workspace.name.clone(),
         workspace_path: workspace.path.display().to_string(),
-        code_graph: CodeGraphPromptContext {
-            indexed_files: code_graph_context.indexed_files,
-            symbols: code_graph_context.symbols,
-            references: code_graph_context.references,
-            edges: code_graph_context.edges,
-            languages: code_graph_context.languages,
-        },
-        skills: enabled_skill_prompts(&config, requested_skill_ids)?,
         tools: tool_prompt_infos,
     });
     let context_budget = calculate_context_budget(
@@ -2257,8 +2247,17 @@ async fn prepare_chat_context(
     } else {
         Vec::new()
     };
+    let skill_messages = if is_new_chat {
+        enabled_skill_frontmatter_messages(&config)?
+    } else {
+        Vec::new()
+    };
     let mut neutral_messages = Vec::with_capacity(
-        existing_messages.len() + compression_snapshots.len() + agents_messages.len() + 2,
+        existing_messages.len()
+            + compression_snapshots.len()
+            + agents_messages.len()
+            + skill_messages.len()
+            + 2,
     );
     let mut message_source_sequences = Vec::with_capacity(neutral_messages.capacity());
     neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
@@ -2269,6 +2268,10 @@ async fn prepare_chat_context(
     }
     for agents_message in agents_messages {
         neutral_messages.push(agents_message);
+        message_source_sequences.push(None);
+    }
+    for skill_message in skill_messages {
+        neutral_messages.push(skill_message);
         message_source_sequences.push(None);
     }
     for existing_message in existing_messages {
@@ -3621,7 +3624,7 @@ struct ParsedSkillFile {
     id: String,
     name: String,
     description: String,
-    instructions: String,
+    frontmatter: String,
 }
 
 fn normalize_skill_directories(values: Vec<String>) -> Result<Vec<PathBuf>, ApiError> {
@@ -3939,7 +3942,7 @@ fn parse_skill_markdown(path: &Path, content: &str) -> Result<ParsedSkillFile, S
         id: id.clone(),
         name: id,
         description,
-        instructions: body,
+        frontmatter: frontmatter.join("\n"),
     })
 }
 
@@ -4007,21 +4010,15 @@ fn validate_skill_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn enabled_skill_prompts(
+fn enabled_skill_frontmatter_messages(
     config: &GlobalConfig,
-    requested_skill_ids: Option<Vec<String>>,
-) -> Result<Vec<SkillPromptInfo>, ApiError> {
-    let mut skills = Vec::new();
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
     let disabled_ids = config
         .skills
         .disabled
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let selected_ids = requested_skill_ids
-        .map(normalize_skill_ids)
-        .transpose()?
-        .map(|ids| ids.into_iter().collect::<HashSet<_>>());
     let discovery = discover_skills(&config.workspaces, &config.skills.directories);
     if let Some(error) = discovery.errors.first() {
         return Err(ApiError::bad_request(format!(
@@ -4030,33 +4027,12 @@ fn enabled_skill_prompts(
         )));
     }
 
-    if let Some(selected_ids) = selected_ids.as_ref() {
-        for skill_id in selected_ids {
-            let Some(skill) = discovery.skills.iter().find(|skill| skill.id == *skill_id) else {
-                return Err(ApiError::bad_request(format!(
-                    "selected skill was not found: {skill_id}"
-                )));
-            };
-
-            if disabled_ids.contains(skill.id.as_str()) {
-                return Err(ApiError::bad_request(format!(
-                    "selected skill '{}' is disabled",
-                    skill.id
-                )));
-            }
-        }
-    }
-
-    for skill in discovery.skills.iter().filter(|skill| {
-        if disabled_ids.contains(skill.id.as_str()) {
-            return false;
-        }
-
-        selected_ids
-            .as_ref()
-            .map(|ids| ids.contains(skill.id.as_str()))
-            .unwrap_or(true)
-    }) {
+    let mut entries = Vec::new();
+    for skill in discovery
+        .skills
+        .iter()
+        .filter(|skill| !disabled_ids.contains(skill.id.as_str()))
+    {
         let parsed = parse_skill_file(&skill.path).map_err(ApiError::bad_request)?;
 
         if parsed.id != skill.id {
@@ -4066,15 +4042,28 @@ fn enabled_skill_prompts(
             )));
         }
 
-        skills.push(SkillPromptInfo {
-            id: parsed.id,
-            name: parsed.name,
-            description: parsed.description,
-            instructions: parsed.instructions,
-        });
+        entries.push(skill_frontmatter_entry(&skill.path, parsed));
     }
 
-    Ok(skills)
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    Ok(vec![neutral_text_message(
+        NeutralChatRole::User,
+        format!(
+            "{ENABLED_SKILLS_MESSAGE_PREFIX}:\n\n{}",
+            entries.join("\n\n")
+        ),
+    )])
+}
+
+fn skill_frontmatter_entry(path: &Path, skill: ParsedSkillFile) -> String {
+    format!(
+        "path: {}\n---\n{}\n---",
+        path.display(),
+        skill.frontmatter.trim()
+    )
 }
 
 fn mcp_server_state_name(state: McpServerState) -> &'static str {
@@ -5060,8 +5049,8 @@ name: gitmemo
     }
 
     #[test]
-    fn enabled_skill_prompts_read_skill_instructions() {
-        let skill_dir = env::temp_dir().join(unique_id("foco-skill-test"));
+    fn enabled_skill_frontmatter_messages_list_enabled_skill_frontmatter() {
+        let skill_dir = env::temp_dir().join(unique_id("foco-skill-frontmatter-test"));
         let skill_file = skill_dir.join("SKILL.md");
 
         fs::create_dir_all(&skill_dir).expect("skill test directory");
@@ -5082,17 +5071,26 @@ Search memory before repo work.
         let mut config = GlobalConfig::first_run(env::temp_dir());
         config.skills.directories = vec![skill_dir.clone()];
 
-        let skills = enabled_skill_prompts(&config, None).expect("enabled skill prompts");
+        let messages = enabled_skill_frontmatter_messages(&config)
+            .expect("enabled skill frontmatter messages");
 
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].id, "gitmemo");
-        assert!(skills[0].instructions.contains("Search memory"));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, NeutralChatRole::User);
+        assert!(messages[0].content.contains(ENABLED_SKILLS_MESSAGE_PREFIX));
+        assert!(
+            messages[0]
+                .content
+                .contains(&skill_file.display().to_string())
+        );
+        assert!(messages[0].content.contains("name: gitmemo"));
+        assert!(messages[0].content.contains("description: Project memory."));
+        assert!(!messages[0].content.contains("Search memory"));
 
         fs::remove_dir_all(skill_dir).expect("remove skill test directory");
     }
 
     #[test]
-    fn enabled_skill_prompts_skip_disabled_discovered_skills() {
+    fn enabled_skill_frontmatter_messages_skip_disabled_skills() {
         let skill_dir = env::temp_dir().join(unique_id("foco-disabled-skill-test"));
         let skill_file = skill_dir.join("SKILL.md");
 
@@ -5113,9 +5111,10 @@ description: Project memory.
         config.skills.directories = vec![skill_dir.clone()];
         config.skills.disabled.push("gitmemo".to_string());
 
-        let skills = enabled_skill_prompts(&config, None).expect("enabled skill prompts");
+        let messages = enabled_skill_frontmatter_messages(&config)
+            .expect("enabled skill frontmatter messages");
 
-        assert!(skills.is_empty());
+        assert!(messages.is_empty());
 
         fs::remove_dir_all(skill_dir).expect("remove skill test directory");
     }
@@ -5175,13 +5174,16 @@ description: Project memory.
     }
 
     #[tokio::test]
-    async fn prepare_chat_context_injects_agents_only_for_new_chat() {
+    async fn prepare_chat_context_injects_initial_context_only_for_new_chat() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-chat-agents-workspace-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-chat-agents-profile-test"));
         let codex_dir = profile_dir.join(".codex");
+        let skill_root = profile_dir.join("skills");
+        let skill_dir = skill_root.join("gitmemo");
 
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
         fs::create_dir_all(&codex_dir).expect("codex directory");
+        fs::create_dir_all(&skill_dir).expect("skill directory");
         fs::write(
             workspace_dir.join("AGENTS.md"),
             "Workspace chat instructions.\n",
@@ -5189,8 +5191,22 @@ description: Project memory.
         .expect("workspace AGENTS write");
         fs::write(codex_dir.join("AGENTS.md"), "Codex chat instructions.\n")
             .expect("codex AGENTS write");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---
+name: gitmemo
+description: Project memory.
+---
+
+# GitMemo
+
+Search memory before repo work.
+",
+        )
+        .expect("skill file write");
 
         let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.skills.directories = vec![skill_root];
         config.providers.push(ProviderSettings {
             id: "provider".to_string(),
             name: "Provider".to_string(),
@@ -5248,6 +5264,21 @@ description: Project memory.
                 .content
                 .contains("Codex chat instructions.")
         );
+        let skill_messages = new_context
+            .provider_request
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(ENABLED_SKILLS_MESSAGE_PREFIX))
+            .collect::<Vec<_>>();
+
+        assert_eq!(skill_messages.len(), 1);
+        assert!(skill_messages[0].content.contains("name: gitmemo"));
+        assert!(
+            skill_messages[0]
+                .content
+                .contains("description: Project memory.")
+        );
+        assert!(!skill_messages[0].content.contains("Search memory"));
 
         {
             let database =
@@ -5280,6 +5311,13 @@ description: Project memory.
                 .messages
                 .iter()
                 .all(|message| !message.content.contains(AGENTS_MESSAGE_PREFIX))
+        );
+        assert!(
+            existing_context
+                .provider_request
+                .messages
+                .iter()
+                .all(|message| !message.content.contains(ENABLED_SKILLS_MESSAGE_PREFIX))
         );
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
