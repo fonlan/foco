@@ -11,6 +11,7 @@ use foco_store::workspace::{
     CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
     CodeGraphSymbolRelationRecord, WorkspaceDatabase, WorkspaceDatabaseError,
 };
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -18,7 +19,9 @@ pub const READ_FILE_TOOL: &str = "read_file";
 pub const LIST_FILES_TOOL: &str = "list_files";
 pub const SEARCH_TEXT_TOOL: &str = "search_text";
 pub const WRITE_FILE_TOOL: &str = "write_file";
+pub const PATCH_FILE_TOOL: &str = "patch_file";
 pub const RUN_COMMAND_TOOL: &str = "run_command";
+pub const SLEEP_TOOL: &str = "sleep";
 pub const GRAPH_FIND_SYMBOLS_TOOL: &str = "graph_find_symbols";
 pub const GRAPH_FIND_CALLERS_TOOL: &str = "graph_find_callers";
 pub const GRAPH_FIND_CALLEES_TOOL: &str = "graph_find_callees";
@@ -35,6 +38,7 @@ const DEFAULT_FILE_TOOL_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_GRAPH_TOOL_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SEARCH_TEXT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
@@ -66,7 +70,9 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         graph_related_files_definition(),
         search_text_definition(),
         write_file_definition(),
+        patch_file_definition(),
         run_command_definition(),
+        sleep_definition(),
     ]
 }
 
@@ -96,8 +102,9 @@ pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64
         | GRAPH_FIND_REFERENCES_TOOL
         | GRAPH_RELATED_FILES_TOOL => DEFAULT_GRAPH_TOOL_TIMEOUT_MS,
         SEARCH_TEXT_TOOL => DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
-        WRITE_FILE_TOOL => DEFAULT_WRITE_FILE_TIMEOUT_MS,
+        WRITE_FILE_TOOL | PATCH_FILE_TOOL => DEFAULT_WRITE_FILE_TIMEOUT_MS,
         RUN_COMMAND_TOOL => DEFAULT_RUN_COMMAND_TIMEOUT_MS,
+        SLEEP_TOOL => DEFAULT_SLEEP_TIMEOUT_MS,
         other => return Err(ToolRuntimeError::UnknownTool(other.to_string()).to_string()),
     };
 
@@ -119,7 +126,9 @@ fn execute_builtin_tool_inner(
         GRAPH_RELATED_FILES_TOOL => graph_related_files(workspace_path, arguments),
         SEARCH_TEXT_TOOL => search_text(workspace_path, arguments),
         WRITE_FILE_TOOL => write_file(workspace_path, arguments),
+        PATCH_FILE_TOOL => patch_file(workspace_path, arguments),
         RUN_COMMAND_TOOL => run_command(workspace_path, arguments),
+        SLEEP_TOOL => sleep_tool(arguments),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
     }
 }
@@ -176,6 +185,7 @@ fn list_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
     let input_path = request.path;
     let path = resolve_workspace_path(workspace_path, &input_path)?;
+    let filter = GlobFilter::new(request.include, request.exclude)?;
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
         source,
@@ -207,14 +217,21 @@ fn list_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
             } else {
                 "other"
             };
+            let relative_path = relative_workspace_path(workspace_path, &entry_path)?;
+            if !filter.matches(&relative_path) {
+                return Ok(None);
+            }
 
-            Ok(json!({
-                "path": relative_workspace_path(workspace_path, &entry_path)?,
+            Ok(Some(json!({
+                "path": relative_path,
                 "kind": kind,
                 "bytes": if metadata.is_file() { Some(metadata.len()) } else { None }
-            }))
+            })))
         })
-        .collect::<Result<Vec<_>, ToolRuntimeError>>()?;
+        .collect::<Result<Vec<_>, ToolRuntimeError>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
 
     entries.sort_by(|left, right| {
         left.get("path")
@@ -226,6 +243,8 @@ fn list_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
 
     Ok(json!({
         "path": input_path,
+        "include": filter.include_patterns(),
+        "exclude": filter.exclude_patterns(),
         "entries": entries,
         "truncated": truncated,
         "timeoutMs": timeout_ms
@@ -495,6 +514,31 @@ fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
     }))
 }
 
+fn patch_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+    let request: PatchFileInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_WRITE_FILE_TIMEOUT_MS)?;
+    let path = resolve_workspace_file(workspace_path, &request.path)?;
+    let bytes = fs::read(&path).map_err(|source| ToolRuntimeError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let (existing_content, encoding) = decode_text_file(&path, &bytes)?;
+    let (content, applied_hunks) = apply_file_diff(&existing_content, &request.diff)?;
+    let encoded = encode_text_file(&content, encoding);
+
+    fs::write(&path, &encoded).map_err(|source| ToolRuntimeError::Io {
+        path: path.clone(),
+        source,
+    })?;
+
+    Ok(json!({
+        "path": normalize_workspace_path_text(&request.path)?,
+        "bytes": encoded.len(),
+        "appliedHunks": applied_hunks,
+        "timeoutMs": timeout_ms
+    }))
+}
+
 fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: RunCommandInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_RUN_COMMAND_TIMEOUT_MS)?;
@@ -538,6 +582,24 @@ fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         "stderr": stderr,
         "stdoutTruncated": stdout_truncated,
         "stderrTruncated": stderr_truncated,
+        "timeoutMs": timeout_ms
+    }))
+}
+
+fn sleep_tool(arguments: Value) -> Result<Value, ToolRuntimeError> {
+    let request: SleepInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_SLEEP_TIMEOUT_MS)?;
+
+    if request.duration_ms == 0 || request.duration_ms > timeout_ms {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "durationMs must be between 1 and timeoutMs ({timeout_ms}) milliseconds"
+        )));
+    }
+
+    thread::sleep(Duration::from_millis(request.duration_ms));
+
+    Ok(json!({
+        "durationMs": request.duration_ms,
         "timeoutMs": timeout_ms
     }))
 }
@@ -640,6 +702,101 @@ fn truncate_records<T>(records: &mut Vec<T>, limit: usize) -> bool {
     let truncated = records.len() > limit;
     records.truncate(limit);
     truncated
+}
+
+struct GlobFilter {
+    include: Vec<String>,
+    exclude: Vec<String>,
+    include_set: Option<GlobSet>,
+    exclude_set: Option<GlobSet>,
+}
+
+impl GlobFilter {
+    fn new(
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> Result<Self, ToolRuntimeError> {
+        let include = normalize_glob_patterns("include", include)?;
+        let exclude = normalize_glob_patterns("exclude", exclude)?;
+        let include_set = compile_glob_set("include", &include)?;
+        let exclude_set = compile_glob_set("exclude", &exclude)?;
+
+        Ok(Self {
+            include,
+            exclude,
+            include_set,
+            exclude_set,
+        })
+    }
+
+    fn matches(&self, path: &str) -> bool {
+        if let Some(include_set) = &self.include_set
+            && !include_set.is_match(path)
+        {
+            return false;
+        }
+
+        if let Some(exclude_set) = &self.exclude_set
+            && exclude_set.is_match(path)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    fn include_patterns(&self) -> &[String] {
+        &self.include
+    }
+
+    fn exclude_patterns(&self) -> &[String] {
+        &self.exclude
+    }
+}
+
+fn normalize_glob_patterns(
+    field_name: &str,
+    patterns: Option<Vec<String>>,
+) -> Result<Vec<String>, ToolRuntimeError> {
+    patterns
+        .unwrap_or_default()
+        .into_iter()
+        .map(|pattern| {
+            let pattern = pattern.trim();
+            if pattern.is_empty() {
+                return Err(ToolRuntimeError::InvalidArguments(format!(
+                    "{field_name} glob patterns must not be empty"
+                )));
+            }
+
+            Ok(pattern.replace('\\', "/"))
+        })
+        .collect()
+}
+
+fn compile_glob_set(
+    field_name: &str,
+    patterns: &[String],
+) -> Result<Option<GlobSet>, ToolRuntimeError> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).map_err(|source| {
+            ToolRuntimeError::InvalidArguments(format!(
+                "{field_name} glob pattern '{pattern}' is invalid: {source}"
+            ))
+        })?;
+        builder.add(glob);
+    }
+
+    builder.build().map(Some).map_err(|source| {
+        ToolRuntimeError::InvalidArguments(format!(
+            "{field_name} glob patterns are invalid: {source}"
+        ))
+    })
 }
 
 fn symbol_json(symbol: CodeGraphSymbolRecord) -> Value {
@@ -909,6 +1066,320 @@ fn line_spans(content: &str) -> Vec<LineSpan> {
 
 fn ends_with_line_ending(content: &str) -> bool {
     content.ends_with('\n') || content.ends_with('\r')
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct FileLine {
+    body: String,
+    line_ending: Option<String>,
+}
+
+#[derive(Debug, PartialEq)]
+struct DiffHunk {
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    lines: Vec<DiffLine>,
+}
+
+#[derive(Debug, PartialEq)]
+enum DiffLine {
+    Context(String),
+    Remove(String),
+    Add { body: String, no_newline: bool },
+}
+
+fn apply_file_diff(content: &str, diff: &str) -> Result<(String, usize), ToolRuntimeError> {
+    let hunks = parse_file_diff(diff)?;
+    let mut lines = split_file_lines(content);
+    let default_line_ending = default_line_ending(&lines);
+    let mut line_delta = 0isize;
+
+    for hunk in &hunks {
+        let original_index = if hunk.old_count == 0 {
+            hunk.old_start
+        } else {
+            hunk.old_start.checked_sub(1).ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(
+                    "diff hunk old start must be 1-based".to_string(),
+                )
+            })?
+        };
+        let patched_index = original_index as isize + line_delta;
+        if patched_index < 0 {
+            return Err(ToolRuntimeError::InvalidArguments(format!(
+                "diff hunk starting at original line {} resolves before the file start",
+                hunk.old_start
+            )));
+        }
+        let start_index = usize::try_from(patched_index).map_err(|_| {
+            ToolRuntimeError::InvalidArguments("diff hunk line index is too large".to_string())
+        })?;
+        if start_index > lines.len() {
+            return Err(ToolRuntimeError::InvalidArguments(format!(
+                "diff hunk starting at original line {} is outside the file; file has {} lines",
+                hunk.old_start,
+                lines.len()
+            )));
+        }
+
+        let mut index = start_index;
+        let mut replacement = Vec::new();
+        for diff_line in &hunk.lines {
+            match diff_line {
+                DiffLine::Context(body) => {
+                    let existing = lines.get(index).ok_or_else(|| {
+                        ToolRuntimeError::InvalidArguments(format!(
+                            "diff context at original line {} extends past the file end",
+                            hunk.old_start
+                        ))
+                    })?;
+                    validate_patch_line("context", body, existing, index + 1)?;
+                    replacement.push(existing.clone());
+                    index += 1;
+                }
+                DiffLine::Remove(body) => {
+                    let existing = lines.get(index).ok_or_else(|| {
+                        ToolRuntimeError::InvalidArguments(format!(
+                            "diff removal at original line {} extends past the file end",
+                            hunk.old_start
+                        ))
+                    })?;
+                    validate_patch_line("removal", body, existing, index + 1)?;
+                    index += 1;
+                }
+                DiffLine::Add { body, no_newline } => {
+                    replacement.push(FileLine {
+                        body: body.clone(),
+                        line_ending: if *no_newline {
+                            None
+                        } else {
+                            Some(default_line_ending.clone())
+                        },
+                    });
+                }
+            }
+        }
+
+        let consumed = index - start_index;
+        lines.splice(start_index..index, replacement.iter().cloned());
+        line_delta += replacement.len() as isize - consumed as isize;
+    }
+
+    Ok((join_file_lines(&lines), hunks.len()))
+}
+
+fn parse_file_diff(diff: &str) -> Result<Vec<DiffHunk>, ToolRuntimeError> {
+    if diff.trim().is_empty() {
+        return Err(ToolRuntimeError::InvalidArguments(
+            "diff must not be empty".to_string(),
+        ));
+    }
+
+    let mut hunks = Vec::new();
+    let mut current_hunk: Option<DiffHunk> = None;
+
+    for line in diff.lines() {
+        if line.starts_with("@@ ") {
+            if let Some(hunk) = current_hunk.take() {
+                validate_diff_hunk(&hunk)?;
+                hunks.push(hunk);
+            }
+            current_hunk = Some(parse_hunk_header(line)?);
+            continue;
+        }
+
+        let Some(hunk) = current_hunk.as_mut() else {
+            continue;
+        };
+
+        if line == r"\ No newline at end of file" {
+            mark_previous_added_line_no_newline(hunk)?;
+            continue;
+        }
+
+        if line.is_empty() {
+            return Err(ToolRuntimeError::InvalidArguments(
+                "diff hunk lines must start with space, -, +, or a no-newline marker".to_string(),
+            ));
+        }
+        let (prefix, body) = line.split_at(1);
+
+        match prefix {
+            " " => hunk.lines.push(DiffLine::Context(body.to_string())),
+            "-" => hunk.lines.push(DiffLine::Remove(body.to_string())),
+            "+" => hunk.lines.push(DiffLine::Add {
+                body: body.to_string(),
+                no_newline: false,
+            }),
+            _ => {
+                return Err(ToolRuntimeError::InvalidArguments(format!(
+                    "invalid diff hunk line prefix: {prefix}"
+                )));
+            }
+        }
+    }
+
+    if let Some(hunk) = current_hunk {
+        validate_diff_hunk(&hunk)?;
+        hunks.push(hunk);
+    }
+
+    if hunks.is_empty() {
+        return Err(ToolRuntimeError::InvalidArguments(
+            "diff must contain at least one unified diff hunk".to_string(),
+        ));
+    }
+
+    Ok(hunks)
+}
+
+fn parse_hunk_header(line: &str) -> Result<DiffHunk, ToolRuntimeError> {
+    let header = line
+        .strip_prefix("@@ ")
+        .and_then(|value| value.split_once(" @@").map(|(header, _)| header))
+        .ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments(format!("invalid unified diff hunk header: {line}"))
+        })?;
+    let mut parts = header.split_whitespace();
+    let old_range = parts.next().ok_or_else(|| {
+        ToolRuntimeError::InvalidArguments(format!("missing old range in hunk header: {line}"))
+    })?;
+    let new_range = parts.next().ok_or_else(|| {
+        ToolRuntimeError::InvalidArguments(format!("missing new range in hunk header: {line}"))
+    })?;
+
+    if parts.next().is_some() {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "invalid unified diff hunk header: {line}"
+        )));
+    }
+
+    let (old_start, old_count) = parse_hunk_range(old_range, '-')?;
+    let (new_start, new_count) = parse_hunk_range(new_range, '+')?;
+
+    Ok(DiffHunk {
+        old_start,
+        old_count,
+        new_start,
+        new_count,
+        lines: Vec::new(),
+    })
+}
+
+fn parse_hunk_range(range: &str, prefix: char) -> Result<(usize, usize), ToolRuntimeError> {
+    let value = range.strip_prefix(prefix).ok_or_else(|| {
+        ToolRuntimeError::InvalidArguments(format!(
+            "diff hunk range must start with {prefix}: {range}"
+        ))
+    })?;
+    let (start, count) = match value.split_once(',') {
+        Some((start, count)) => (
+            start,
+            count.parse::<usize>().map_err(|_| {
+                ToolRuntimeError::InvalidArguments(format!("invalid diff hunk line count: {range}"))
+            })?,
+        ),
+        None => (value, 1),
+    };
+    let start = start.parse::<usize>().map_err(|_| {
+        ToolRuntimeError::InvalidArguments(format!("invalid diff hunk line start: {range}"))
+    })?;
+
+    if start == 0 && count != 0 {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "diff hunk range start may be 0 only when count is 0: {range}"
+        )));
+    }
+
+    Ok((start, count))
+}
+
+fn validate_diff_hunk(hunk: &DiffHunk) -> Result<(), ToolRuntimeError> {
+    let old_lines = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Remove(_)))
+        .count();
+    let new_lines = hunk
+        .lines
+        .iter()
+        .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Add { .. }))
+        .count();
+
+    if old_lines != hunk.old_count || new_lines != hunk.new_count {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "diff hunk line counts do not match header -{},{} +{},{}",
+            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+        )));
+    }
+
+    Ok(())
+}
+
+fn mark_previous_added_line_no_newline(hunk: &mut DiffHunk) -> Result<(), ToolRuntimeError> {
+    match hunk.lines.last_mut() {
+        Some(DiffLine::Add { no_newline, .. }) => {
+            *no_newline = true;
+            Ok(())
+        }
+        Some(DiffLine::Context(_) | DiffLine::Remove(_)) => Ok(()),
+        None => Err(ToolRuntimeError::InvalidArguments(
+            "no-newline marker must follow a diff line".to_string(),
+        )),
+    }
+}
+
+fn validate_patch_line(
+    line_kind: &str,
+    expected_body: &str,
+    existing: &FileLine,
+    line_number: usize,
+) -> Result<(), ToolRuntimeError> {
+    if existing.body == expected_body {
+        Ok(())
+    } else {
+        Err(ToolRuntimeError::InvalidArguments(format!(
+            "diff {line_kind} line does not match file line {line_number}"
+        )))
+    }
+}
+
+fn split_file_lines(content: &str) -> Vec<FileLine> {
+    line_spans(content)
+        .into_iter()
+        .map(|span| {
+            let raw_line = &content[span.start_byte..span.end_byte];
+            let body_end = span
+                .line_ending
+                .map(|line_ending| raw_line.len() - line_ending.len())
+                .unwrap_or(raw_line.len());
+
+            FileLine {
+                body: raw_line[..body_end].to_string(),
+                line_ending: span.line_ending.map(str::to_string),
+            }
+        })
+        .collect()
+}
+
+fn default_line_ending(lines: &[FileLine]) -> String {
+    lines
+        .iter()
+        .find_map(|line| line.line_ending.clone())
+        .unwrap_or_else(|| "\n".to_string())
+}
+
+fn join_file_lines(lines: &[FileLine]) -> String {
+    let mut content = String::new();
+    for line in lines {
+        content.push_str(&line.body);
+        if let Some(line_ending) = &line.line_ending {
+            content.push_str(line_ending);
+        }
+    }
+    content
 }
 
 fn resolve_workspace_file(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
@@ -1217,7 +1688,7 @@ fn read_file_definition() -> ToolDefinition {
 fn list_files_definition() -> ToolDefinition {
     ToolDefinition {
         name: LIST_FILES_TOOL,
-        description: "List files and directories in a workspace-relative directory.",
+        description: "List files and directories in a workspace-relative directory, optionally filtered by glob patterns.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1226,12 +1697,22 @@ fn list_files_definition() -> ToolDefinition {
                     "type": "string",
                     "description": "Workspace-relative directory path. Use . for the workspace root."
                 },
+                "include": {
+                    "type": ["array", "null"],
+                    "items": { "type": "string" },
+                    "description": "Optional glob patterns matched against returned workspace-relative paths. Null or an empty array includes everything not excluded."
+                },
+                "exclude": {
+                    "type": ["array", "null"],
+                    "items": { "type": "string" },
+                    "description": "Optional glob patterns matched against returned workspace-relative paths to omit."
+                },
                 "timeoutMs": {
                     "type": ["integer", "null"],
                     "description": "Optional tool timeout in milliseconds. Defaults to 5000."
                 }
             },
-            "required": ["path", "timeoutMs"]
+            "required": ["path", "include", "exclude", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1466,6 +1947,33 @@ fn write_file_definition() -> ToolDefinition {
     }
 }
 
+fn patch_file_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: PATCH_FILE_TOOL,
+        description: "Apply a single-file unified diff to an existing text file inside the active workspace.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative existing file path to patch."
+                },
+                "diff": {
+                    "type": "string",
+                    "description": "Unified diff text containing one or more @@ hunks for this file. Context and removed lines must exactly match the current file."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["path", "diff", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
 fn run_command_definition() -> ToolDefinition {
     ToolDefinition {
         name: RUN_COMMAND_TOOL,
@@ -1498,6 +2006,29 @@ fn run_command_definition() -> ToolDefinition {
     }
 }
 
+fn sleep_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: SLEEP_TOOL,
+        description: "Pause tool execution for the requested duration.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "durationMs": {
+                    "type": "integer",
+                    "description": "Pause duration in milliseconds."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 300000."
+                }
+            },
+            "required": ["durationMs", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReadFileInput {
@@ -1511,6 +2042,8 @@ struct ReadFileInput {
 #[serde(rename_all = "camelCase")]
 struct ListFilesInput {
     path: String,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
     timeout_ms: Option<u64>,
 }
 
@@ -1562,10 +2095,25 @@ struct WriteFileInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PatchFileInput {
+    path: String,
+    diff: String,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RunCommandInput {
     command: String,
     args: Option<Vec<String>>,
     cwd: Option<String>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SleepInput {
+    duration_ms: u64,
     timeout_ms: Option<u64>,
 }
 
@@ -1798,6 +2346,30 @@ mod tests {
         assert!(!result.is_error);
         let entries = result.output["entries"].as_array().expect("entries");
         assert_eq!(entries[0]["path"], "a.txt");
+    }
+
+    #[test]
+    fn lists_workspace_files_with_glob_filters() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("a.rs"), "a").expect("write a");
+        fs::write(workspace.path().join("b.txt"), "b").expect("write b");
+        fs::write(workspace.path().join("test.rs"), "test").expect("write test");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            LIST_FILES_TOOL,
+            json!({
+                "path": ".",
+                "include": ["*.rs"],
+                "exclude": ["test.rs"],
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!result.is_error);
+        let entries = result.output["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["path"], "a.rs");
     }
 
     #[test]
@@ -2077,6 +2649,69 @@ mod tests {
 
         assert!(!result.is_error);
         assert_eq!(fs::read(&path).expect("read note bytes"), "你好".as_bytes());
+    }
+
+    #[test]
+    fn patches_workspace_file_with_unified_diff() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "one\ntwo\nthree\n").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            PATCH_FILE_TOOL,
+            json!({
+                "path": "note.txt",
+                "diff": "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n",
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["appliedHunks"], 1);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("note.txt")).expect("read note"),
+            "one\nTWO\nthree\n"
+        );
+    }
+
+    #[test]
+    fn rejects_patch_file_when_context_does_not_match() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "one\ntwo\n").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            PATCH_FILE_TOOL,
+            json!({
+                "path": "note.txt",
+                "diff": "@@ -1,2 +1,2 @@\n one\n-three\n+THREE\n",
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("diff removal line does not match")
+        );
+    }
+
+    #[test]
+    fn sleeps_for_requested_duration() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            SLEEP_TOOL,
+            json!({ "durationMs": 1, "timeoutMs": null }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["durationMs"], 1);
     }
 
     #[test]

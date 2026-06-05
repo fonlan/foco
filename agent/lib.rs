@@ -7,6 +7,7 @@ const DEFAULT_CONTEXT_SAFETY_TOKENS: u64 = 256;
 const CONTEXT_COMPRESSION_TRIGGER_NUMERATOR: u64 = 4;
 const CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR: u64 = 5;
 pub const WRITE_FILE_TOOL_NAME: &str = "write_file";
+pub const PATCH_FILE_TOOL_NAME: &str = "patch_file";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolPromptInfo {
@@ -357,7 +358,10 @@ pub fn detect_same_file_write_conflicts(
     let mut writes_by_path = HashMap::new();
 
     for tool_call in tool_calls {
-        if tool_call.name != WRITE_FILE_TOOL_NAME {
+        if !matches!(
+            tool_call.name.as_str(),
+            WRITE_FILE_TOOL_NAME | PATCH_FILE_TOOL_NAME
+        ) {
             continue;
         }
 
@@ -439,7 +443,7 @@ impl fmt::Display for ToolConflictError {
         match self {
             Self::MissingWritePath { call_id } => write!(
                 formatter,
-                "write_file tool call '{call_id}' is missing a string path for conflict detection"
+                "file-writing tool call '{call_id}' is missing a string path for conflict detection"
             ),
             Self::SameFileWrite {
                 path,
@@ -616,7 +620,7 @@ mod tests {
             },
             PendingToolCall {
                 id: "call-c".to_string(),
-                name: WRITE_FILE_TOOL_NAME.to_string(),
+                name: PATCH_FILE_TOOL_NAME.to_string(),
                 arguments: json!({ "path": ".\\src\\main.rs" }),
             },
         ];

@@ -56,8 +56,8 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, ToolExecution, WRITE_FILE_TOOL, builtin_tool_definitions,
-    builtin_tool_timeout_ms, execute_builtin_tool,
+    PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolExecution,
+    WRITE_FILE_TOOL, builtin_tool_definitions, builtin_tool_timeout_ms, execute_builtin_tool,
 };
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -3006,19 +3006,21 @@ async fn execute_tool(
             let tool_name = tool_name.clone();
             move || execute_builtin_tool(&workspace_path, &tool_name, arguments)
         });
-        let execution: Result<ToolExecution, String> =
-            if matches!(tool_name.as_str(), RUN_COMMAND_TOOL | SEARCH_TEXT_TOOL) {
-                worker
-                    .await
-                    .map_err(|source| format!("tool execution worker failed: {source}"))
-            } else {
-                timeout(Duration::from_millis(timeout_ms), worker)
-                    .await
-                    .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
-                    .and_then(|result| {
-                        result.map_err(|source| format!("tool execution worker failed: {source}"))
-                    })
-            };
+        let execution: Result<ToolExecution, String> = if matches!(
+            tool_name.as_str(),
+            RUN_COMMAND_TOOL | SEARCH_TEXT_TOOL | SLEEP_TOOL
+        ) {
+            worker
+                .await
+                .map_err(|source| format!("tool execution worker failed: {source}"))
+        } else {
+            timeout(Duration::from_millis(timeout_ms), worker)
+                .await
+                .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
+                .and_then(|result| {
+                    result.map_err(|source| format!("tool execution worker failed: {source}"))
+                })
+        };
 
         match execution {
             Ok(execution) => execution,
@@ -3066,7 +3068,7 @@ fn tool_results_affect_git_diff(tool_results: &[ExecutedToolCall]) -> bool {
     tool_results.iter().any(|tool_result| {
         matches!(
             tool_result.name.as_str(),
-            WRITE_FILE_TOOL | RUN_COMMAND_TOOL
+            WRITE_FILE_TOOL | PATCH_FILE_TOOL | RUN_COMMAND_TOOL
         )
     })
 }
