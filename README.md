@@ -63,8 +63,8 @@ The top-level Stats view reads `GET /api/ai-statistics` to show recorded LLM
 requests across registered workspaces. It can filter by workspace, chat,
 provider, model, status, and time range, and uses `page` and `pageSize` for
 server-side pagination with total counts. Request details come from `GET
-/api/workspaces/{workspace_id}/ai-statistics/{request_id}` and include the stored
-request/response JSON plus streamed raw chunks and normalized events.
+/api/workspaces/{workspace_id}/ai-statistics/{request_id}` and show the stored
+request/response JSON.
 
 The chat panel sends real model requests through
 `POST /api/workspaces/{workspace_id}/chat/stream`, which returns server-sent

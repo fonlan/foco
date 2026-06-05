@@ -442,7 +442,7 @@ describe("App verification surfaces", () => {
     const dialog = await screen.findByRole("dialog", { name: "Request details" });
     expect(within(dialog).getByText("Request body")).toBeInTheDocument();
     expect(within(dialog).getByText("Response body")).toBeInTheDocument();
-    expect(within(dialog).getByText("Stream events")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Stream events")).not.toBeInTheDocument();
   });
 });
 

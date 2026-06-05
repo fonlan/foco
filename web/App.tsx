@@ -297,15 +297,6 @@ type AiRequestAuditDetail = AiRequestAuditSummary & {
   responseBody: JsonValue | null;
 };
 
-type AiRequestAuditEventSummary = {
-  id: string;
-  sequence: number;
-  eventAt: string;
-  eventType: string;
-  rawChunk: JsonValue | null;
-  normalizedEvent: JsonValue;
-};
-
 type AiStatisticsResponse = {
   page: number;
   pageSize: number;
@@ -316,7 +307,6 @@ type AiStatisticsResponse = {
 
 type AiRequestDetailResponse = {
   request: AiRequestAuditDetail;
-  events: AiRequestAuditEventSummary[];
 };
 
 type AiStatsFilterState = {
@@ -539,8 +529,6 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Close request details": "关闭请求详情",
     "Request body": "请求正文",
     "Response body": "响应正文",
-    "Stream events": "流事件",
-    "No stream events": "暂无流事件",
     Copy: "复制",
     Copied: "已复制",
     "Copy {label}": "复制 {label}",
@@ -3649,7 +3637,6 @@ function AiRequestDetailDialog({
 }) {
   const { language, t } = useI18n();
   const request = detail?.request ?? null;
-  const events = detail?.events ?? [];
 
   return (
     <div
@@ -3744,40 +3731,6 @@ function AiRequestDetailDialog({
                   value={request.responseBody}
                 />
               </div>
-              <section className="rounded-xl border border-stone-200 bg-white">
-                <div className="border-b border-stone-200 px-3 py-2">
-                  <h3 className="text-sm font-semibold text-stone-950">
-                    {t("Stream events")}
-                  </h3>
-                </div>
-                {events.length ? (
-                  <div className="divide-y divide-stone-100">
-                    {events.map((event) => (
-                      <div className="grid gap-3 px-3 py-3" key={event.id}>
-                        <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500">
-                          <span className="font-mono text-stone-900">
-                            #{event.sequence}
-                          </span>
-                          <span>{event.eventType}</span>
-                          <span>{formatAuditDate(event.eventAt, language)}</span>
-                        </div>
-                        <div className="grid gap-3 xl:grid-cols-2">
-                          <pre className="max-h-80 overflow-auto rounded-lg bg-stone-950 px-3 py-3 text-xs leading-5 text-stone-100">
-                            {auditJsonText(event.rawChunk)}
-                          </pre>
-                          <pre className="max-h-80 overflow-auto rounded-lg bg-stone-950 px-3 py-3 text-xs leading-5 text-stone-100">
-                            {auditJsonText(event.normalizedEvent)}
-                          </pre>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="px-3 py-6 text-sm text-stone-500">
-                    {t("No stream events")}
-                  </div>
-                )}
-              </section>
             </div>
           ) : null}
         </div>
@@ -3825,7 +3778,7 @@ function AuditJsonBlock({
           {copied ? t("Copied") : t("Copy")}
         </button>
       </div>
-      <pre className="max-h-[32rem] overflow-auto bg-stone-950 px-3 py-3 text-xs leading-5 text-stone-100">
+      <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words bg-white px-3 py-3 text-xs leading-5 text-stone-950">
         {auditJsonText(value)}
       </pre>
     </section>
