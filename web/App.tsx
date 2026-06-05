@@ -2237,10 +2237,10 @@ function ChatPanel({
                 key={message.id}
               >
                 <div
-                  className={`flex max-w-[min(42rem,92%)] gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
+                  className={`flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
                     isUser
-                      ? "rounded-tr-md border-teal-700 bg-teal-800 text-white"
-                      : "rounded-tl-md border-stone-200 bg-white/90 text-stone-900"
+                      ? "flex-row-reverse rounded-tr-md border-teal-700 bg-teal-800 text-white"
+                      : "flex-row rounded-tl-md border-stone-200 bg-white/90 text-stone-900"
                   }`}
                 >
                   <div
