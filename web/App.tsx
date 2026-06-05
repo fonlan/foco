@@ -363,6 +363,9 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No chats": "暂无聊天",
     "Loading workspaces...": "正在加载工作区...",
     "No workspaces": "暂无工作区",
+    Workspaces: "工作区",
+    "All workspaces": "全部工作区",
+    "All chats": "全部聊天",
     Workspace: "工作区",
     Chat: "聊天",
     Settings: "设置",
@@ -724,6 +727,8 @@ export function App() {
   const isTerminalOpen = activeWorkspace
     ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
     : false;
+  const isGlobalView = viewMode === "settings" || viewMode === "stats";
+  const showDiffPanel = !isGlobalView && isDiffPanelOpen;
   const language = settings?.general.language ?? "en";
   const t = useCallback<Translate>(
     (key, values) => translate(key, values, language),
@@ -997,6 +1002,7 @@ export function App() {
     setActiveChatId(null);
     setMessages([]);
     setSelectedDiffPath(null);
+    setViewMode("chat");
   }
 
   function startNewWorkspaceChat(workspaceId: string) {
@@ -1480,15 +1486,87 @@ export function App() {
   return (
     <I18nContext.Provider value={{ language, t }}>
     <main className="app-root text-stone-950">
-      <div
-        className={`app-shell ${isDiffPanelOpen ? "app-shell-with-diff" : ""}`}
-        style={
-          {
-            "--diff-panel-width": `${diffPanelWidth}px`,
-            "--sidebar-width": `${sidebarWidth}px`,
-          } as CSSProperties
-        }
-      >
+      {isGlobalView ? (
+        <section className="flex h-full min-h-0 flex-col">
+          <header className="shrink-0 border-b border-stone-200/80 bg-white/85 px-4 py-3 backdrop-blur">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-3">
+                <span className="inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_10px_24px_rgba(15,118,110,0.24)]">
+                  <Activity aria-hidden="true" className="size-5" />
+                </span>
+                <div className="min-w-0">
+                  <span className="block truncate text-lg font-semibold">
+                    Foco
+                  </span>
+                  <span className="block truncate text-xs text-stone-500">
+                    {t("Local workspace")}
+                  </span>
+                </div>
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                <button
+                  aria-label={t("Workspaces")}
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  onClick={() => setViewMode("chat")}
+                  title={t("Workspaces")}
+                  type="button"
+                >
+                  <Folder aria-hidden="true" className="size-4" />
+                </button>
+                <div className="flex rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
+                  <NavButton
+                    active={viewMode === "settings"}
+                    icon={Settings}
+                    label={t("Settings")}
+                    onClick={() => setViewMode("settings")}
+                  />
+                  <NavButton
+                    active={viewMode === "stats"}
+                    icon={BarChart3}
+                    label={t("Stats")}
+                    onClick={() => setViewMode("stats")}
+                  />
+                </div>
+                <button
+                  aria-label={t("Refresh workspaces")}
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={isLoading}
+                  onClick={() => void refreshWorkspaces()}
+                  title={t("Refresh workspaces")}
+                  type="button"
+                >
+                  {isLoading ? (
+                    <LoaderCircle
+                      aria-hidden="true"
+                      className="size-4 animate-spin"
+                    />
+                  ) : (
+                    <RefreshCw aria-hidden="true" className="size-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+          </header>
+          {viewMode === "settings" ? (
+            <SettingsPanel onSettingsChange={setSettings} />
+          ) : (
+            <ApiStatsPanel
+              availableModels={availableModels}
+              settings={settings}
+              workspaces={workspaces}
+            />
+          )}
+        </section>
+      ) : (
+        <div
+          className={`app-shell ${showDiffPanel ? "app-shell-with-diff" : ""}`}
+          style={
+            {
+              "--diff-panel-width": `${diffPanelWidth}px`,
+              "--sidebar-width": `${sidebarWidth}px`,
+            } as CSSProperties
+          }
+        >
         <aside className="workspace-sidebar relative border-stone-200/80 lg:border-r">
           <div
             aria-label={t("Resize workspace sidebar")}
@@ -1510,7 +1588,7 @@ export function App() {
             tabIndex={0}
           />
           <div className="flex h-full min-h-0 flex-col">
-            <div className="flex items-center justify-between border-b border-stone-200/80 px-4 py-3">
+            <div className="flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-3">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_10px_24px_rgba(15,118,110,0.24)]">
                   <Activity aria-hidden="true" className="size-5" />
@@ -1524,23 +1602,39 @@ export function App() {
                   </span>
                 </div>
               </div>
-              <button
-                aria-label={t("Refresh workspaces")}
-                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
-                disabled={isLoading}
-                onClick={() => void refreshWorkspaces()}
-                title={t("Refresh workspaces")}
-                type="button"
-              >
-                {isLoading ? (
-                  <LoaderCircle
-                    aria-hidden="true"
-                    className="size-4 animate-spin"
+              <div className="flex shrink-0 items-center gap-1.5">
+                <div className="flex rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
+                  <NavButton
+                    active={false}
+                    icon={Settings}
+                    label={t("Settings")}
+                    onClick={() => setViewMode("settings")}
                   />
-                ) : (
-                  <RefreshCw aria-hidden="true" className="size-4" />
-                )}
-              </button>
+                  <NavButton
+                    active={false}
+                    icon={BarChart3}
+                    label={t("Stats")}
+                    onClick={() => setViewMode("stats")}
+                  />
+                </div>
+                <button
+                  aria-label={t("Refresh workspaces")}
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={isLoading}
+                  onClick={() => void refreshWorkspaces()}
+                  title={t("Refresh workspaces")}
+                  type="button"
+                >
+                  {isLoading ? (
+                    <LoaderCircle
+                      aria-hidden="true"
+                      className="size-4 animate-spin"
+                    />
+                  ) : (
+                    <RefreshCw aria-hidden="true" className="size-4" />
+                  )}
+                </button>
+              </div>
             </div>
 
             <div className="border-b border-stone-200/80 px-4 py-2">
@@ -1699,72 +1793,68 @@ export function App() {
         </aside>
 
         <section className="app-main-panel flex min-w-0 flex-col">
-          <header className="shrink-0 border-b border-stone-200/80 bg-white/80 px-4 py-2 backdrop-blur sm:px-5">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="min-w-0">
-                <h1 className="truncate text-lg font-semibold text-stone-950">
-                  {activeWorkspace?.name ?? t("Workspace")}
-                </h1>
-                <p className="mt-1 truncate text-xs font-medium text-stone-500">
-                  {activeWorkspace?.path ?? ""}
-                </p>
-              </div>
-              <div className="flex overflow-x-auto rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
-                <NavButton
-                  active={viewMode === "chat"}
-                  icon={MessageSquare}
-                  label={t("Chat")}
-                  onClick={() => setViewMode("chat")}
-                />
-                <NavButton
-                  active={viewMode === "settings"}
-                  icon={Settings}
-                  label={t("Settings")}
-                  onClick={() => setViewMode("settings")}
-                />
-                <NavButton
-                  active={viewMode === "stats"}
-                  icon={BarChart3}
-                  label={t("Stats")}
-                  onClick={() => setViewMode("stats")}
-                />
-                <button
-                  aria-label={
-                    isTerminalOpen ? t("Close terminal") : t("Open terminal")
-                  }
-                  className={`inline-flex size-9 items-center justify-center rounded-lg ${
-                    isTerminalOpen
-                      ? "bg-white text-teal-900 shadow-sm"
-                      : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
-                  } disabled:cursor-not-allowed disabled:text-stone-400`}
-                  disabled={!activeWorkspace}
-                  onClick={toggleWorkspaceTerminal}
-                  title={isTerminalOpen ? t("Close terminal") : t("Open terminal")}
-                  type="button"
-                >
-                  <Terminal aria-hidden="true" className="size-4" />
-                </button>
-                <button
-                  aria-label={
-                    isDiffPanelOpen ? t("Close git diff") : t("Open git diff")
-                  }
-                  className={`inline-flex size-9 items-center justify-center rounded-lg ${
-                    isDiffPanelOpen
-                      ? "bg-white text-teal-900 shadow-sm"
-                      : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
-                  }`}
-                  onClick={() => setIsDiffPanelOpen((current) => !current)}
-                  title={isDiffPanelOpen ? t("Close git diff") : t("Open git diff")}
-                  type="button"
-                >
-                  <GitCompare aria-hidden="true" className="size-4" />
-                </button>
-              </div>
-            </div>
-          </header>
-
-          {viewMode === "chat" ? (
-            <ChatPanel
+              <header className="shrink-0 border-b border-stone-200/80 bg-white/80 px-4 py-2 backdrop-blur sm:px-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <h1 className="truncate text-lg font-semibold text-stone-950">
+                      {activeWorkspace?.name ?? t("Workspace")}
+                    </h1>
+                    <p className="mt-1 truncate text-xs font-medium text-stone-500">
+                      {activeWorkspace?.path ?? ""}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex overflow-x-auto rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
+                      <NavButton
+                        active={viewMode === "chat"}
+                        icon={MessageSquare}
+                        label={t("Chat")}
+                        onClick={() => setViewMode("chat")}
+                      />
+                      <button
+                        aria-label={
+                          isDiffPanelOpen ? t("Close git diff") : t("Open git diff")
+                        }
+                        className={`inline-flex size-9 items-center justify-center rounded-lg ${
+                          isDiffPanelOpen
+                            ? "bg-white text-teal-900 shadow-sm"
+                            : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
+                        }`}
+                        onClick={() => setIsDiffPanelOpen((current) => !current)}
+                        title={
+                          isDiffPanelOpen ? t("Close git diff") : t("Open git diff")
+                        }
+                        type="button"
+                      >
+                        <GitCompare aria-hidden="true" className="size-4" />
+                      </button>
+                    </div>
+                    <div className="flex rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
+                      <button
+                        aria-label={
+                          isTerminalOpen
+                            ? t("Close terminal")
+                            : t("Open terminal")
+                        }
+                        className={`inline-flex size-9 items-center justify-center rounded-lg ${
+                          isTerminalOpen
+                            ? "bg-white text-teal-900 shadow-sm"
+                            : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
+                        } disabled:cursor-not-allowed disabled:text-stone-400`}
+                        disabled={!activeWorkspace}
+                        onClick={toggleWorkspaceTerminal}
+                        title={
+                          isTerminalOpen ? t("Close terminal") : t("Open terminal")
+                        }
+                        type="button"
+                      >
+                        <Terminal aria-hidden="true" className="size-4" />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </header>
+          <ChatPanel
               availableModels={availableModels}
               branchError={branchError}
               chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
@@ -1791,21 +1881,12 @@ export function App() {
               skills={detectedSkills}
               thinkingLevels={thinkingLevels}
             />
-          ) : viewMode === "settings" ? (
-            <SettingsPanel onSettingsChange={setSettings} />
-          ) : (
-            <ApiStatsPanel
-              activeWorkspace={activeWorkspace}
-              availableModels={availableModels}
-              settings={settings}
-            />
-          )}
           {isTerminalOpen ? (
             <TerminalPanel workspace={activeWorkspace} />
           ) : null}
         </section>
 
-        {isDiffPanelOpen ? (
+        {showDiffPanel ? (
         <aside className="diff-sidebar min-w-0 border-stone-200/80 lg:border-l">
           <GitDiffPanel
             diffError={diffError}
@@ -1830,6 +1911,7 @@ export function App() {
         </aside>
         ) : null}
       </div>
+      )}
       {isWorkspaceDialogOpen ? (
         <WorkspaceDialog
           formMode={formMode}
@@ -2937,19 +3019,22 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
 }
 
 function ApiStatsPanel({
-  activeWorkspace,
   availableModels,
   settings,
+  workspaces,
 }: {
-  activeWorkspace: WorkspaceSummary | undefined;
   availableModels: ConfiguredModelSummary[];
   settings: SettingsResponse | null;
+  workspaces: WorkspaceSummary[];
 }) {
   const { language, t } = useI18n();
   const enabledProviders =
     settings?.providers.filter((provider) => provider.enabled).length ?? 0;
   const configuredModels = settings?.configuredModels.length ?? 0;
-  const chatCount = activeWorkspace?.chats.length ?? 0;
+  const chatCount = workspaces.reduce(
+    (total, workspace) => total + workspace.chats.length,
+    0,
+  );
 
   return (
     <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
@@ -2964,7 +3049,7 @@ function ApiStatsPanel({
                 {t("API statistics")}
               </h2>
               <p className="mt-1 truncate text-xs font-medium text-stone-500">
-                {activeWorkspace?.name ?? t("No workspace selected")}
+                {t("All workspaces")}
               </p>
             </div>
           </div>
@@ -2973,7 +3058,7 @@ function ApiStatsPanel({
         <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <StatsCard
             icon={Activity}
-            label={t("Workspace chats")}
+            label={t("All chats")}
             value={formatNumber(chatCount, language)}
           />
           <StatsCard
