@@ -1572,6 +1572,12 @@ struct CapturedAuditEvent {
     normalized_event_json: String,
 }
 
+struct ContextMessageGroup {
+    message_indices: Vec<usize>,
+    estimated_tokens: u64,
+    must_keep: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ExecutedToolCall {
@@ -2280,8 +2286,10 @@ async fn prepare_chat_context(
         }
 
         let sequence = existing_message.sequence;
-        neutral_messages.push(neutral_message_from_record(existing_message)?);
-        message_source_sequences.push(Some(sequence));
+        for neutral_message in neutral_messages_from_record(&database, existing_message)? {
+            neutral_messages.push(neutral_message);
+            message_source_sequences.push(Some(sequence));
+        }
     }
     neutral_messages.push(neutral_text_message(
         NeutralChatRole::User,
@@ -2324,7 +2332,10 @@ async fn prepare_chat_context(
     })
 }
 
-fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMessage, ApiError> {
+fn neutral_messages_from_record(
+    database: &WorkspaceDatabase,
+    message: MessageRecord,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
     let role = match message.role.as_str() {
         "system" => NeutralChatRole::System,
         "user" => NeutralChatRole::User,
@@ -2337,21 +2348,83 @@ fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMess
         }
     };
 
-    if role != NeutralChatRole::Tool {
+    if role != NeutralChatRole::Assistant && role != NeutralChatRole::Tool {
+        return Ok(vec![NeutralChatMessage {
+            role,
+            content: message.content,
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }]);
+    }
+
+    if role == NeutralChatRole::Assistant {
         let reasoning = if role == NeutralChatRole::Assistant {
             assistant_reasoning_from_metadata(&message.metadata_json)?
         } else {
             None
         };
+        let tool_calls = database
+            .tool_calls_for_message(&message.id)
+            .map_err(ApiError::from_workspace_error)?;
 
-        return Ok(NeutralChatMessage {
-            role,
-            content: message.content,
-            reasoning,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-        });
+        if tool_calls.is_empty() {
+            return Ok(vec![NeutralChatMessage {
+                role,
+                content: message.content,
+                reasoning,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+            }]);
+        }
+
+        let mut messages = Vec::with_capacity(tool_calls.len() * 2 + 1);
+        for tool_call in tool_calls {
+            let result = tool_call.result.clone().ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "assistant message '{}' tool call '{}' is missing a tool result",
+                    message.id, tool_call.id
+                ))
+            })?;
+
+            messages.push(NeutralChatMessage {
+                role: NeutralChatRole::Assistant,
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![neutral_tool_call_from_record(&tool_call)?],
+                tool_call_id: None,
+                tool_name: None,
+            });
+            messages.push(NeutralChatMessage {
+                role: NeutralChatRole::Tool,
+                content: result.output_json,
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some(tool_call.id),
+                tool_name: Some(tool_call.tool_name),
+            });
+        }
+
+        if !message.content.trim().is_empty() {
+            messages.push(NeutralChatMessage {
+                role: NeutralChatRole::Assistant,
+                content: message.content,
+                reasoning,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+            });
+        }
+
+        return Ok(messages);
+    }
+
+    if role != NeutralChatRole::Tool {
+        return Err(ApiError::internal(
+            "unsupported neutral message role while rebuilding chat history",
+        ));
     }
 
     let metadata = parse_json_value(&message.metadata_json, "tool message metadata")?;
@@ -2370,14 +2443,81 @@ fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMess
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    Ok(NeutralChatMessage {
+    Ok(vec![NeutralChatMessage {
         role,
         content: message.content,
         reasoning: None,
         tool_calls: Vec::new(),
         tool_call_id: Some(tool_call_id),
         tool_name,
+    }])
+}
+
+fn neutral_tool_call_from_record(
+    record: &ToolCallWithResultRecord,
+) -> Result<NeutralToolCall, ApiError> {
+    Ok(NeutralToolCall {
+        call_id: record.id.clone(),
+        name: record.tool_name.clone(),
+        arguments: parse_json_value(&record.input_json, "tool call input")?,
+        thought_signatures: None,
     })
+}
+
+fn neutral_tool_message_from_executed_tool_call(
+    tool_result: &ExecutedToolCall,
+) -> NeutralChatMessage {
+    NeutralChatMessage {
+        role: NeutralChatRole::Tool,
+        content: serde_json::to_string(&tool_result.output)
+            .expect("tool outputs are always JSON serializable"),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        tool_call_id: Some(tool_result.id.clone()),
+        tool_name: Some(tool_result.name.clone()),
+    }
+}
+
+fn neutral_assistant_tool_call_message(
+    tool_call: NeutralToolCall,
+    assistant_text: String,
+    assistant_reasoning: Option<String>,
+) -> NeutralChatMessage {
+    NeutralChatMessage {
+        role: NeutralChatRole::Assistant,
+        content: assistant_text,
+        reasoning: assistant_reasoning,
+        tool_calls: vec![tool_call],
+        tool_call_id: None,
+        tool_name: None,
+    }
+}
+
+fn interleaved_tool_state_messages(
+    tool_calls: Vec<NeutralToolCall>,
+    tool_results: &[ExecutedToolCall],
+    assistant_text: String,
+    assistant_reasoning: Option<String>,
+) -> Vec<NeutralChatMessage> {
+    let mut messages = Vec::with_capacity(tool_calls.len() * 2);
+    let mut assistant_text = Some(assistant_text);
+    let mut assistant_reasoning = assistant_reasoning;
+
+    for tool_call in tool_calls {
+        messages.push(neutral_assistant_tool_call_message(
+            tool_call.clone(),
+            assistant_text.take().unwrap_or_default(),
+            assistant_reasoning.take(),
+        ));
+
+        let tool_result = tool_results
+            .iter()
+            .find(|tool_result| tool_result.id == tool_call.call_id)
+            .expect("executed tool results must match completed tool calls");
+        messages.push(neutral_tool_message_from_executed_tool_call(tool_result));
+    }
+
+    messages
 }
 
 fn agents_prompt_messages(
@@ -2442,43 +2582,27 @@ fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize
         ));
     }
 
-    let latest_user_index = context
-        .provider_request
-        .messages
-        .iter()
-        .rposition(|message| message.role == NeutralChatRole::User);
-    let pack_items = context
-        .provider_request
-        .messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| ContextPackItem {
-            id: format!("message-{index}"),
-            estimated_tokens: if index == 0 {
-                0
-            } else {
-                neutral_message_estimated_tokens(message)
-            },
-            must_keep: message.role == NeutralChatRole::System
-                || context.message_source_sequences[index].is_none()
-                || Some(index) == latest_user_index
-                || index >= context.active_tool_start_index,
-        })
-        .collect::<Vec<_>>();
+    let message_groups = context_message_groups(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        context.active_tool_start_index,
+    )?;
+    let pack_items = pack_items_from_message_groups(&message_groups);
 
     let Some(plan) = plan_context_compression(
         &pack_items,
         context.context_budget.available_message_tokens,
-        context.active_tool_start_index,
+        active_tool_start_group_index(&message_groups, context.active_tool_start_index),
         CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES,
     ) else {
         return Ok(context.active_tool_start_index);
     };
+    let covered_indices = message_group_indices(&message_groups, &plan.covered_indices)?;
 
     let summary = context_compression_summary(
         &context.provider_request.messages,
         &context.message_source_sequences,
-        &plan.covered_indices,
+        &covered_indices,
     )?;
     let summary_token_count = estimate_text_tokens(&summary);
 
@@ -2487,7 +2611,7 @@ fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize
     }
 
     let covered_sequences =
-        compression_covered_sequences(&context.message_source_sequences, &plan.covered_indices)?;
+        compression_covered_sequences(&context.message_source_sequences, &covered_indices)?;
     let snapshot_id = unique_id("ctx");
     let snapshot_sequence = next_context_snapshot_sequence(&context.compression_snapshots)?;
     let metadata_json = json!({
@@ -2543,15 +2667,15 @@ fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize
 
     context.provider_request.messages = replace_covered_messages_with_snapshot(
         &context.provider_request.messages,
-        &plan.covered_indices,
+        &covered_indices,
         compression_snapshot_message(&snapshot),
     );
     context.message_source_sequences = replace_covered_sequences_with_snapshot(
         &context.message_source_sequences,
-        &plan.covered_indices,
+        &covered_indices,
     );
     context.active_tool_start_index =
-        compressed_active_tool_start_index(context.active_tool_start_index, &plan.covered_indices);
+        compressed_active_tool_start_index(context.active_tool_start_index, &covered_indices);
     context.compression_snapshots.push(snapshot);
 
     Ok(context.active_tool_start_index)
@@ -2951,6 +3075,105 @@ fn estimate_tool_schema_tokens(tools: &[NeutralToolDefinition]) -> u64 {
         .sum()
 }
 
+fn context_message_groups(
+    messages: &[NeutralChatMessage],
+    message_source_sequences: &[Option<i64>],
+    active_tool_start_index: usize,
+) -> Result<Vec<ContextMessageGroup>, ApiError> {
+    if messages.len() != message_source_sequences.len() {
+        return Err(ApiError::internal(
+            "context message source sequence count does not match prompt message count",
+        ));
+    }
+
+    let latest_user_index = messages
+        .iter()
+        .rposition(|message| message.role == NeutralChatRole::User);
+    let mut groups = Vec::new();
+    let mut index = 0;
+
+    while index < messages.len() {
+        let source_sequence = message_source_sequences[index];
+        let mut message_indices = vec![index];
+        index += 1;
+
+        if source_sequence.is_some() {
+            while index < messages.len() && message_source_sequences[index] == source_sequence {
+                message_indices.push(index);
+                index += 1;
+            }
+        }
+
+        let estimated_tokens = message_indices
+            .iter()
+            .map(|message_index| {
+                if *message_index == 0 {
+                    0
+                } else {
+                    neutral_message_estimated_tokens(&messages[*message_index])
+                }
+            })
+            .sum();
+        let must_keep = message_indices.iter().any(|message_index| {
+            messages[*message_index].role == NeutralChatRole::System
+                || message_source_sequences[*message_index].is_none()
+                || Some(*message_index) == latest_user_index
+                || *message_index >= active_tool_start_index
+        });
+
+        groups.push(ContextMessageGroup {
+            message_indices,
+            estimated_tokens,
+            must_keep,
+        });
+    }
+
+    Ok(groups)
+}
+
+fn pack_items_from_message_groups(groups: &[ContextMessageGroup]) -> Vec<ContextPackItem> {
+    groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| ContextPackItem {
+            id: format!("message-group-{index}"),
+            estimated_tokens: group.estimated_tokens,
+            must_keep: group.must_keep,
+        })
+        .collect()
+}
+
+fn active_tool_start_group_index(
+    groups: &[ContextMessageGroup],
+    active_tool_start_index: usize,
+) -> usize {
+    groups
+        .iter()
+        .position(|group| {
+            group
+                .message_indices
+                .iter()
+                .any(|message_index| *message_index >= active_tool_start_index)
+        })
+        .unwrap_or(groups.len())
+}
+
+fn message_group_indices(
+    groups: &[ContextMessageGroup],
+    group_indices: &[usize],
+) -> Result<Vec<usize>, ApiError> {
+    let mut message_indices = Vec::new();
+
+    for group_index in group_indices {
+        let group = groups.get(*group_index).ok_or_else(|| {
+            ApiError::internal("context compression covered group index is out of bounds")
+        })?;
+        message_indices.extend(group.message_indices.iter().copied());
+    }
+
+    Ok(message_indices)
+}
+
 fn pack_neutral_messages(
     messages: Vec<NeutralChatMessage>,
     message_source_sequences: &[Option<i64>],
@@ -2963,30 +3186,14 @@ fn pack_neutral_messages(
         ));
     }
 
-    let latest_user_index = messages
-        .iter()
-        .rposition(|message| message.role == NeutralChatRole::User);
-    let pack_items = messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| ContextPackItem {
-            id: format!("message-{index}"),
-            estimated_tokens: if index == 0 {
-                0
-            } else {
-                neutral_message_estimated_tokens(message)
-            },
-            must_keep: message.role == NeutralChatRole::System
-                || Some(index) == latest_user_index
-                || message_source_sequences[index].is_none()
-                || index >= active_tool_start_index,
-        })
-        .collect::<Vec<_>>();
+    let message_groups =
+        context_message_groups(&messages, message_source_sequences, active_tool_start_index)?;
+    let pack_items = pack_items_from_message_groups(&message_groups);
     let packed = pack_context(&pack_items, budget.available_message_tokens)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
 
-    Ok(packed
-        .selected_indices
+    let selected_indices = message_group_indices(&message_groups, &packed.selected_indices)?;
+    Ok(selected_indices
         .into_iter()
         .map(|index| messages[index].clone())
         .collect())
@@ -3153,26 +3360,13 @@ fn append_tool_state_messages(
     assistant_text: String,
     assistant_reasoning: Option<String>,
 ) {
-    messages.push(NeutralChatMessage {
-        role: NeutralChatRole::Assistant,
-        content: assistant_text,
-        reasoning: assistant_reasoning,
+    for message in interleaved_tool_state_messages(
         tool_calls,
-        tool_call_id: None,
-        tool_name: None,
-    });
-    message_source_sequences.push(None);
-
-    for tool_result in tool_results {
-        messages.push(NeutralChatMessage {
-            role: NeutralChatRole::Tool,
-            content: serde_json::to_string(&tool_result.output)
-                .expect("tool outputs are always JSON serializable"),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            tool_call_id: Some(tool_result.id.clone()),
-            tool_name: Some(tool_result.name.clone()),
-        });
+        tool_results,
+        assistant_text,
+        assistant_reasoning,
+    ) {
+        messages.push(message);
         message_source_sequences.push(None);
     }
 }
@@ -5171,6 +5365,252 @@ description: Project memory.
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
         fs::remove_dir_all(profile_dir).expect("remove profile directory");
+    }
+
+    #[test]
+    fn append_tool_state_messages_interleaves_each_tool_call_and_result() {
+        let mut messages = Vec::new();
+        let mut message_source_sequences = Vec::new();
+        let tool_calls = vec![
+            NeutralToolCall {
+                call_id: "call-1".to_string(),
+                name: "list_files".to_string(),
+                arguments: json!({ "path": "." }),
+                thought_signatures: None,
+            },
+            NeutralToolCall {
+                call_id: "call-2".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md" }),
+                thought_signatures: None,
+            },
+        ];
+        let tool_results = vec![
+            ExecutedToolCall {
+                id: "call-1".to_string(),
+                name: "list_files".to_string(),
+                input: json!({ "path": "." }),
+                output: json!({ "entries": [] }),
+                is_error: false,
+                started_at: "2026-06-05T07:00:00Z".to_string(),
+                completed_at: "2026-06-05T07:00:01Z".to_string(),
+            },
+            ExecutedToolCall {
+                id: "call-2".to_string(),
+                name: "read_file".to_string(),
+                input: json!({ "path": "README.md" }),
+                output: json!({ "content": "hello" }),
+                is_error: false,
+                started_at: "2026-06-05T07:00:01Z".to_string(),
+                completed_at: "2026-06-05T07:00:02Z".to_string(),
+            },
+        ];
+
+        append_tool_state_messages(
+            &mut messages,
+            &mut message_source_sequences,
+            tool_calls,
+            &tool_results,
+            "Checking files.".to_string(),
+            Some("Need workspace evidence.".to_string()),
+        );
+
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| &message.role)
+                .collect::<Vec<_>>(),
+            vec![
+                &NeutralChatRole::Assistant,
+                &NeutralChatRole::Tool,
+                &NeutralChatRole::Assistant,
+                &NeutralChatRole::Tool
+            ]
+        );
+        assert_eq!(messages[0].tool_calls[0].call_id, "call-1");
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(messages[2].tool_calls[0].call_id, "call-2");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call-2"));
+        assert_eq!(messages[0].content, "Checking files.");
+        assert_eq!(
+            messages[0].reasoning.as_deref(),
+            Some("Need workspace evidence.")
+        );
+        assert!(messages[2].content.is_empty());
+        assert_eq!(message_source_sequences, vec![None, None, None, None]);
+    }
+
+    #[test]
+    fn neutral_messages_from_record_replays_saved_tool_state_in_order() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-tool-state-replay-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+
+        database
+            .insert_chat("chat-1", "Tool chat")
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "Done.",
+                sequence: 0,
+                metadata_json: Some(r#"{"reasoning":"Used tools."}"#),
+            })
+            .expect("assistant message insert");
+        for (id, name, input, output, started_at) in [
+            (
+                "call-1",
+                "list_files",
+                r#"{"path":"."}"#,
+                r#"{"entries":[]}"#,
+                "2026-06-05T07:00:00Z",
+            ),
+            (
+                "call-2",
+                "read_file",
+                r#"{"path":"README.md"}"#,
+                r#"{"content":"hello"}"#,
+                "2026-06-05T07:00:01Z",
+            ),
+        ] {
+            database
+                .insert_tool_call(NewToolCall {
+                    id,
+                    chat_id: "chat-1",
+                    run_id: "run-1",
+                    message_id: Some("assistant-1"),
+                    tool_name: name,
+                    input_json: input,
+                    status: "completed",
+                    started_at,
+                    completed_at: Some(started_at),
+                })
+                .expect("tool call insert");
+            let result_id = format!("{id}-result");
+            database
+                .insert_tool_result(NewToolResult {
+                    id: &result_id,
+                    tool_call_id: id,
+                    output_json: output,
+                    is_error: false,
+                    created_at: started_at,
+                })
+                .expect("tool result insert");
+        }
+
+        let message = database
+            .messages_for_chat("chat-1")
+            .expect("messages")
+            .into_iter()
+            .next()
+            .expect("assistant message");
+        let messages =
+            neutral_messages_from_record(&database, message).expect("neutral message replay");
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0].role, NeutralChatRole::Assistant);
+        assert_eq!(messages[0].tool_calls[0].call_id, "call-1");
+        assert_eq!(messages[1].role, NeutralChatRole::Tool);
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(messages[2].role, NeutralChatRole::Assistant);
+        assert_eq!(messages[2].tool_calls[0].call_id, "call-2");
+        assert_eq!(messages[3].role, NeutralChatRole::Tool);
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call-2"));
+        assert_eq!(messages[4].role, NeutralChatRole::Assistant);
+        assert_eq!(messages[4].content, "Done.");
+        assert_eq!(messages[4].reasoning.as_deref(), Some("Used tools."));
+
+        drop(messages);
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn pack_neutral_messages_keeps_saved_tool_state_group_together() {
+        let messages = vec![
+            neutral_text_message(NeutralChatRole::System, "system".to_string()),
+            neutral_text_message(NeutralChatRole::User, "old question".to_string()),
+            neutral_assistant_tool_call_message(
+                NeutralToolCall {
+                    call_id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: json!({ "path": "README.md" }),
+                    thought_signatures: None,
+                },
+                String::new(),
+                None,
+            ),
+            NeutralChatMessage {
+                role: NeutralChatRole::Tool,
+                content: r#"{"content":"hello"}"#.to_string(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-1".to_string()),
+                tool_name: Some("read_file".to_string()),
+            },
+            neutral_text_message(NeutralChatRole::User, "latest".to_string()),
+        ];
+        let message_source_sequences = vec![None, Some(0), Some(1), Some(1), Some(2)];
+        let groups = context_message_groups(&messages, &message_source_sequences, messages.len())
+            .expect("message groups");
+        let required_tokens = groups
+            .iter()
+            .filter(|group| group.must_keep)
+            .map(|group| group.estimated_tokens)
+            .sum::<u64>();
+        let tool_group_tokens = groups
+            .iter()
+            .find(|group| group.message_indices == vec![2, 3])
+            .expect("tool state group")
+            .estimated_tokens;
+        let tight_budget = foco_agent::ContextBudget {
+            context_window: 1_000,
+            max_output_tokens: 1,
+            system_prompt_tokens: 0,
+            tool_schema_tokens: 0,
+            safety_tokens: 0,
+            available_message_tokens: required_tokens + tool_group_tokens - 1,
+        };
+
+        let packed = pack_neutral_messages(
+            messages.clone(),
+            &message_source_sequences,
+            &tight_budget,
+            messages.len(),
+        )
+        .expect("packed messages");
+
+        assert!(
+            packed
+                .iter()
+                .all(|message| message.role != NeutralChatRole::Tool)
+        );
+
+        let full_budget = foco_agent::ContextBudget {
+            available_message_tokens: required_tokens + tool_group_tokens,
+            ..tight_budget
+        };
+        let packed = pack_neutral_messages(
+            messages,
+            &message_source_sequences,
+            &full_budget,
+            message_source_sequences.len(),
+        )
+        .expect("packed messages");
+        let tool_position = packed
+            .iter()
+            .position(|message| message.role == NeutralChatRole::Tool)
+            .expect("tool message should be kept");
+
+        assert_eq!(packed[tool_position - 1].role, NeutralChatRole::Assistant);
+        assert_eq!(packed[tool_position - 1].tool_calls[0].call_id, "call-1");
+        assert_eq!(
+            packed[tool_position].tool_call_id.as_deref(),
+            Some("call-1")
+        );
     }
 
     #[tokio::test]
