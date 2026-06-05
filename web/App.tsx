@@ -1187,6 +1187,11 @@ export function App() {
       `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const localUserId = `local-user-${runKey}`;
     const localAssistantId = `local-assistant-${runKey}`;
+    const visibleUserContent = messageWithSelectedSkills(
+      detectedSkills,
+      request.skillIds,
+      request.content,
+    );
     let assistantMessageId = localAssistantId;
     let requestChatId = request.chatId;
     let currentRunningChatKey = requestChatId
@@ -1199,10 +1204,10 @@ export function App() {
       {
         id: localUserId,
         role: "user",
-        content: request.content,
+        content: visibleUserContent,
         reasoning: null,
         toolCalls: [],
-        parts: [{ type: "text", text: request.content }],
+        parts: [{ type: "text", text: visibleUserContent }],
       },
       {
         id: localAssistantId,
@@ -2603,6 +2608,9 @@ function MarkdownContent({
   isUser: boolean;
   variant?: "message" | "reasoning";
 }) {
+  const skillPrefix = selectedSkillPrefix(content, isUser);
+  const markdownContent = skillPrefix?.remaining ?? content;
+
   return (
     <div
       className={`markdown-content min-w-0 break-words text-sm leading-6 ${
@@ -2611,7 +2619,23 @@ function MarkdownContent({
         isError ? "text-rose-700" : ""
       }`}
     >
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+      {skillPrefix ? (
+        <div className="message-skill-chip-row">
+          {skillPrefix.skills.map((skill) => (
+            <span
+              aria-label={skill.path}
+              className="message-skill-chip"
+              key={`${skill.name}-${skill.path}`}
+              title={skill.path}
+            >
+              {skill.name}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {markdownContent ? (
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdownContent}</ReactMarkdown>
+      ) : null}
     </div>
   );
 }
@@ -5423,6 +5447,63 @@ function activeSkillQuery(value: string) {
 
 function removeActiveSkillToken(value: string) {
   return value.replace(/(^|\s)\/[^\s/]*$/, (_match, prefix: string) => prefix);
+}
+
+function selectedSkillPrefix(content: string, isUser: boolean) {
+  if (!isUser) {
+    return null;
+  }
+
+  let remaining = content.trimStart();
+  const skills: Array<{ name: string; path: string }> = [];
+
+  while (true) {
+    const match = /^\[\$([^\]\n]+)\]\(([^)\n]+)\)(?:\s+|$)/.exec(remaining);
+    if (!match) {
+      break;
+    }
+
+    const path = decodeMarkdownHref(match[2].trim());
+    if (!path.replaceAll("\\", "/").endsWith("SKILL.md")) {
+      break;
+    }
+
+    skills.push({
+      name: match[1].trim(),
+      path,
+    });
+    remaining = remaining.slice(match[0].length);
+  }
+
+  if (!skills.length) {
+    return null;
+  }
+
+  return {
+    remaining,
+    skills,
+  };
+}
+
+function decodeMarkdownHref(value: string) {
+  try {
+    return decodeURI(value);
+  } catch {
+    return value;
+  }
+}
+
+function messageWithSelectedSkills(
+  skills: ConfiguredSkillSummary[],
+  skillIds: string[],
+  message: string,
+) {
+  const links = skillIds
+    .map((skillId) => skills.find((skill) => skill.id === skillId))
+    .filter((skill): skill is ConfiguredSkillSummary => Boolean(skill))
+    .map((skill) => `[$${skill.name}](${skill.path})`);
+
+  return links.length ? `${links.join(" ")} ${message}` : message;
 }
 
 function uniqueString(value: string, index: number, values: string[]) {

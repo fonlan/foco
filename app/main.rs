@@ -2079,16 +2079,16 @@ async fn prepare_chat_context(
     request: ChatStreamRequest,
 ) -> Result<PreparedChatContext, ApiError> {
     let workspace_id = workspace_id.trim();
-    let message = request.message.trim();
+    let raw_message = request.message.trim();
     let model_id = request.model_id.trim();
     let thinking_level = optional_trimmed_string(request.thinking_level);
-    let _requested_skill_ids = request.skill_ids;
+    let requested_skill_ids = request.skill_ids;
 
     if workspace_id.is_empty() {
         return Err(ApiError::bad_request("workspace id must not be empty"));
     }
 
-    if message.is_empty() {
+    if raw_message.is_empty() {
         return Err(ApiError::bad_request("message must not be empty"));
     }
 
@@ -2166,6 +2166,7 @@ async fn prepare_chat_context(
     let mcp_tools = state.mcp_registry.tool_definitions(&workspace.id).await;
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
+    let message = message_with_selected_skills(config, requested_skill_ids, raw_message)?;
     let chat_id = optional_trimmed_string(request.chat_id);
     let is_new_chat = chat_id.is_none();
     let chat_id = match chat_id {
@@ -2184,7 +2185,7 @@ async fn prepare_chat_context(
         None => {
             let chat_id = unique_id("chat");
             database
-                .insert_chat(&chat_id, &chat_title(message))
+                .insert_chat(&chat_id, &chat_title(raw_message))
                 .map_err(ApiError::from_workspace_error)?;
             chat_id
         }
@@ -2206,7 +2207,7 @@ async fn prepare_chat_context(
             id: &user_message_id,
             chat_id: &chat_id,
             role: "user",
-            content: message,
+            content: &message,
             sequence: user_sequence,
             metadata_json: Some("{}"),
         })
@@ -2291,10 +2292,7 @@ async fn prepare_chat_context(
             message_source_sequences.push(Some(sequence));
         }
     }
-    neutral_messages.push(neutral_text_message(
-        NeutralChatRole::User,
-        message.to_string(),
-    ));
+    neutral_messages.push(neutral_text_message(NeutralChatRole::User, message.clone()));
     message_source_sequences.push(Some(user_sequence));
     let active_tool_start_index = neutral_messages.len();
 
@@ -3806,6 +3804,64 @@ fn skill_warnings(skill: &SkillSettings, enabled: bool) -> Vec<String> {
     }
 
     warnings
+}
+
+fn message_with_selected_skills(
+    config: &GlobalConfig,
+    requested_skill_ids: Option<Vec<String>>,
+    message: &str,
+) -> Result<String, ApiError> {
+    let Some(requested_skill_ids) = requested_skill_ids else {
+        return Ok(message.to_string());
+    };
+    let requested_skill_ids = normalize_skill_ids(requested_skill_ids)?;
+    if requested_skill_ids.is_empty() {
+        return Ok(message.to_string());
+    }
+
+    let disabled_ids = config
+        .skills
+        .disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let discovery = discover_skills(&config.workspaces, &config.skills.directories);
+    if let Some(error) = discovery.errors.first() {
+        return Err(ApiError::bad_request(format!(
+            "skill discovery failed for {}: {}",
+            error.path, error.message
+        )));
+    }
+
+    let skills_by_id = discovery
+        .skills
+        .iter()
+        .map(|skill| (skill.id.as_str(), skill))
+        .collect::<HashMap<_, _>>();
+    let mut links = Vec::with_capacity(requested_skill_ids.len());
+    for skill_id in requested_skill_ids {
+        let skill = skills_by_id.get(skill_id.as_str()).ok_or_else(|| {
+            ApiError::bad_request(format!("selected skill was not found: {skill_id}"))
+        })?;
+        if disabled_ids.contains(skill.id.as_str()) {
+            return Err(ApiError::bad_request(format!(
+                "selected skill '{}' is disabled",
+                skill.id
+            )));
+        }
+
+        let parsed = parse_skill_file(&skill.path).map_err(ApiError::bad_request)?;
+        if parsed.id != skill.id {
+            return Err(ApiError::bad_request(format!(
+                "selected skill '{}' file now declares skill id '{}'",
+                skill.id, parsed.id
+            )));
+        }
+
+        links.push(format!("[${}]({})", skill.name, skill.path.display()));
+    }
+
+    Ok(format!("{} {}", links.join(" "), message))
 }
 
 struct SkillDiscovery {
@@ -5759,6 +5815,99 @@ Search memory before repo work.
                 .iter()
                 .all(|message| !message.content.contains(ENABLED_SKILLS_MESSAGE_PREFIX))
         );
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        fs::remove_dir_all(profile_dir).expect("remove profile directory");
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_context_prefixes_selected_skills_in_user_message() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-selected-skill-workspace-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-selected-skill-profile-test"));
+        let skill_root = profile_dir.join("skills");
+        let skill_dir = skill_root.join("web-design-guidelines");
+        let skill_file = skill_dir.join("SKILL.md");
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&skill_dir).expect("skill directory");
+        fs::write(
+            &skill_file,
+            "---
+name: web-design-guidelines
+description: UI design guidance.
+---
+
+# Web Design Guidelines
+
+Use the existing product UI conventions.
+",
+        )
+        .expect("skill file write");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.skills.directories = vec![skill_root];
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 100_000,
+                max_output_tokens: 1_024,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        let expected_message = format!(
+            "[$web-design-guidelines]({}) Settings single-column layout.",
+            skill_file.display()
+        );
+
+        let context = prepare_chat_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            ChatStreamRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                thinking_level: None,
+                skill_ids: Some(vec!["web-design-guidelines".to_string()]),
+                message: "Settings single-column layout.".to_string(),
+            },
+        )
+        .await
+        .expect("selected skill chat context");
+
+        let latest_user_message = context
+            .provider_request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == NeutralChatRole::User)
+            .expect("latest user message");
+        assert_eq!(latest_user_message.content, expected_message);
+
+        {
+            let database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            let stored_messages = database
+                .messages_for_chat(&context.chat_id)
+                .expect("stored messages");
+            assert_eq!(stored_messages.len(), 1);
+            assert_eq!(stored_messages[0].content, expected_message);
+        }
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
         fs::remove_dir_all(profile_dir).expect("remove profile directory");
