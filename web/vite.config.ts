@@ -1,23 +1,24 @@
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 
-const backendPort = process.env.FOCO_PORT ?? "3210";
+const backendEndpoint = loadBackendEndpoint();
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), backendReloadPlugin()],
   server: {
     proxy: {
-      "/api": `http://127.0.0.1:${backendPort}`,
+      "/api": backendEndpoint.origin,
     },
   },
 });
 
 function backendReloadPlugin(): Plugin {
-  const backendHealthUrl = `http://127.0.0.1:${backendPort}/api/health`;
+  const backendHealthUrl = `${backendEndpoint.origin}/api/health`;
   let reloadSequence = 0;
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -67,6 +68,58 @@ function backendReloadPlugin(): Plugin {
       });
     },
   };
+}
+
+function loadBackendEndpoint() {
+  const saved = readSavedBackendEndpoint();
+  const host = process.env.FOCO_HOST ?? saved.host ?? "127.0.0.1";
+  const port = process.env.FOCO_PORT ?? saved.port ?? "3210";
+
+  return {
+    origin: `http://${formatHostForUrl(connectHostForListenHost(host))}:${port}`,
+  };
+}
+
+function readSavedBackendEndpoint() {
+  const userProfile = process.env.USERPROFILE ?? process.env.HOME;
+
+  if (!userProfile) {
+    return {};
+  }
+
+  const configPath = resolve(userProfile, ".foco", "config.json");
+
+  if (!existsSync(configPath)) {
+    return {};
+  }
+
+  const config = JSON.parse(readFileSync(configPath, "utf8"));
+  const webServer = config.app?.web_server;
+
+  return {
+    host: typeof webServer?.listen_host === "string" ? webServer.listen_host : undefined,
+    port: typeof webServer?.listen_port === "number" ? String(webServer.listen_port) : undefined,
+  };
+}
+
+function formatHostForUrl(host: string) {
+  if (host.includes(":") && !host.startsWith("[")) {
+    return `[${host}]`;
+  }
+
+  return host;
+}
+
+function connectHostForListenHost(host: string) {
+  if (host === "0.0.0.0") {
+    return "127.0.0.1";
+  }
+
+  if (host === "::" || host === "[::]") {
+    return "::1";
+  }
+
+  return host;
 }
 
 async function reloadWhenBackendIsHealthy(

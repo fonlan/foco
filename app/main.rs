@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     convert::Infallible,
     env, fs,
-    net::{Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{
@@ -42,8 +42,8 @@ use foco_providers::{
 use foco_store::{
     config::{
         GlobalConfig, McpServerConfig, ModelLimits, ModelSettings, ProviderSettings, SkillSettings,
-        WorkspaceConfig, default_skill_directories_for_profile, load_or_create_global_config,
-        save_global_config,
+        WebServerSettings, WorkspaceConfig, default_skill_directories_for_profile,
+        load_or_create_global_config, save_global_config,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
@@ -70,8 +70,8 @@ use tower_http::services::ServeDir;
 mod logging;
 mod terminal;
 
-const DEFAULT_PORT: u16 = 3210;
 const PORT_ENV: &str = "FOCO_PORT";
+const HOST_ENV: &str = "FOCO_HOST";
 const MAX_AGENT_TOOL_ROUNDS: usize = 8;
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
@@ -120,7 +120,7 @@ async fn run() -> AppResult<()> {
     let mcp_registry = Arc::new(McpRegistry::default());
     sync_all_mcp_workspaces(&mcp_registry, &loaded_config.config).await?;
 
-    let addr = local_addr()?;
+    let addr = local_addr(&loaded_config.config)?;
     let frontend_dir = frontend_dist_dir()?;
     let (terminal_shutdown_tx, _) = broadcast::channel(16);
     let state = AppState {
@@ -139,6 +139,7 @@ async fn run() -> AppResult<()> {
         .route("/api/workspaces/create", post(create_workspace))
         .route("/api/workspaces/add", post(add_workspace))
         .route("/api/settings", get(settings))
+        .route("/api/settings/general", post(save_general_settings))
         .route("/api/providers/manual", post(save_manual_provider))
         .route("/api/providers/delete", post(delete_provider))
         .route("/api/providers/test", post(test_provider))
@@ -361,8 +362,48 @@ async fn add_workspace(
     workspace_response_from_config(&config)
 }
 
+fn normalize_web_server_settings(
+    request: ManualGeneralSettingsRequest,
+) -> Result<WebServerSettings, ApiError> {
+    let listen_host = request.listen_host.trim();
+
+    if listen_host.is_empty() {
+        return Err(ApiError::bad_request(
+            "web server listen host must not be empty",
+        ));
+    }
+
+    listen_host
+        .parse::<IpAddr>()
+        .map_err(|_| ApiError::bad_request("web server listen host must be an IP address"))?;
+
+    if request.listen_port == 0 || request.listen_port > u16::MAX.into() {
+        return Err(ApiError::bad_request(
+            "web server listen port must be a number from 1 to 65535",
+        ));
+    }
+
+    Ok(WebServerSettings {
+        listen_host: listen_host.to_string(),
+        listen_port: request.listen_port as u16,
+    })
+}
+
 async fn settings(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
     let config = config_snapshot(&state)?;
+
+    settings_response(&state, &config).await
+}
+
+async fn save_general_settings(
+    State(state): State<AppState>,
+    Json(request): Json<ManualGeneralSettingsRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+
+    config.app.web_server = normalize_web_server_settings(request)?;
+
+    save_config(&state, config.clone())?;
 
     settings_response(&state, &config).await
 }
@@ -1080,6 +1121,13 @@ struct WorkspacePathRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ManualGeneralSettingsRequest {
+    listen_host: String,
+    listen_port: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ManualModelRequest {
     model_id: String,
     display_name: String,
@@ -1169,6 +1217,7 @@ struct TerminalSocketQuery {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsResponse {
+    general: GeneralSettingsSummary,
     provider_kinds: Vec<ProviderKindSummary>,
     thinking_levels: Vec<ThinkingLevelSummary>,
     providers: Vec<ConfiguredProviderSummary>,
@@ -1176,6 +1225,19 @@ struct SettingsResponse {
     mcp_transports: Vec<McpTransportSummary>,
     mcp_servers: Vec<ConfiguredMcpServerSummary>,
     skills: SkillsSettingsSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneralSettingsSummary {
+    web_server: WebServerSettingsSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebServerSettingsSummary {
+    listen_host: String,
+    listen_port: u16,
 }
 
 #[derive(Serialize)]
@@ -3307,6 +3369,12 @@ async fn settings_response(
     let mcp_statuses = state.mcp_registry.statuses(&active_workspace_id).await;
 
     Ok(Json(SettingsResponse {
+        general: GeneralSettingsSummary {
+            web_server: WebServerSettingsSummary {
+                listen_host: config.app.web_server.listen_host.clone(),
+                listen_port: config.app.web_server.listen_port,
+            },
+        },
         provider_kinds: vec![
             ProviderKindSummary {
                 kind: OPENAI_CHAT_KIND,
@@ -4667,16 +4735,37 @@ fn workspace_id_slug(name: &str) -> String {
     }
 }
 
-fn local_addr() -> Result<SocketAddr, String> {
+fn local_addr(config: &GlobalConfig) -> Result<SocketAddr, String> {
+    let host = match env::var(HOST_ENV) {
+        Ok(value) => parse_listen_host(HOST_ENV, &value)?,
+        Err(env::VarError::NotPresent) => parse_listen_host(
+            "app.web_server.listen_host",
+            &config.app.web_server.listen_host,
+        )?,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(format!("{HOST_ENV} must be valid Unicode"));
+        }
+    };
     let port = match env::var(PORT_ENV) {
         Ok(value) => parse_port(&value)?,
-        Err(env::VarError::NotPresent) => DEFAULT_PORT,
+        Err(env::VarError::NotPresent) => config.app.web_server.listen_port,
         Err(env::VarError::NotUnicode(_)) => {
             return Err(format!("{PORT_ENV} must be valid Unicode"));
         }
     };
 
-    Ok(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
+    Ok(SocketAddr::from((host, port)))
+}
+
+fn parse_listen_host(label: &str, value: &str) -> Result<IpAddr, String> {
+    let host = value.trim();
+
+    if host.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+
+    host.parse::<IpAddr>()
+        .map_err(|_| format!("{label} must be an IP address"))
 }
 
 fn parse_port(value: &str) -> Result<u16, String> {

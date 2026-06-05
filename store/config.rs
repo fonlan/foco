@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     env, fmt, fs, io,
+    net::IpAddr,
     path::{Path, PathBuf},
 };
 
@@ -12,6 +13,8 @@ pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_WORKSPACE_ID: &str = "default";
 pub const DEFAULT_WORKSPACE_NAME: &str = "Default Workspace";
 pub const REDACTED_SECRET: &str = "<redacted>";
+pub const DEFAULT_WEB_SERVER_HOST: &str = "127.0.0.1";
+pub const DEFAULT_WEB_SERVER_PORT: u16 = 3210;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FocoPaths {
@@ -154,6 +157,7 @@ impl GlobalConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             app: AppSettings {
                 active_workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
+                web_server: WebServerSettings::default(),
             },
             providers: Vec::new(),
             models: Vec::new(),
@@ -190,6 +194,7 @@ impl GlobalConfig {
             "app.active_workspace_id",
             &self.app.active_workspace_id,
         )?;
+        validate_web_server_settings(config_path, &self.app.web_server)?;
         require_non_empty_list(config_path, "workspaces", self.workspaces.len())?;
 
         let mut workspace_ids = HashSet::new();
@@ -420,6 +425,24 @@ impl GlobalConfig {
 #[serde(deny_unknown_fields)]
 pub struct AppSettings {
     pub active_workspace_id: String,
+    #[serde(default)]
+    pub web_server: WebServerSettings,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebServerSettings {
+    pub listen_host: String,
+    pub listen_port: u16,
+}
+
+impl Default for WebServerSettings {
+    fn default() -> Self {
+        Self {
+            listen_host: DEFAULT_WEB_SERVER_HOST.to_string(),
+            listen_port: DEFAULT_WEB_SERVER_PORT,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -692,6 +715,37 @@ fn require_non_empty(
     Ok(())
 }
 
+fn validate_web_server_settings(
+    config_path: Option<&Path>,
+    settings: &WebServerSettings,
+) -> Result<(), ConfigError> {
+    require_non_empty(
+        config_path,
+        "app.web_server.listen_host",
+        &settings.listen_host,
+    )?;
+
+    settings
+        .listen_host
+        .parse::<IpAddr>()
+        .map_err(|_| ConfigError::Validation {
+            path: config_path.map(Path::to_path_buf),
+            message: format!(
+                "app.web_server.listen_host must be an IP address: {}",
+                settings.listen_host
+            ),
+        })?;
+
+    if settings.listen_port == 0 {
+        return invalid_config(
+            config_path,
+            "app.web_server.listen_port must be a number from 1 to 65535",
+        );
+    }
+
+    Ok(())
+}
+
 fn require_non_empty_list(
     config_path: Option<&Path>,
     field: &str,
@@ -770,6 +824,7 @@ mod tests {
             loaded.config.app.active_workspace_id,
             DEFAULT_WORKSPACE_ID.to_string()
         );
+        assert_eq!(loaded.config.app.web_server, WebServerSettings::default());
         assert_eq!(loaded.config.workspaces.len(), 1);
         assert_eq!(loaded.config.workspaces[0].name, DEFAULT_WORKSPACE_NAME);
         assert_eq!(loaded.config.workspaces[0].path, loaded.paths.workspace_dir);
@@ -858,6 +913,37 @@ mod tests {
     }
 
     #[test]
+    fn load_accepts_legacy_app_settings_without_web_server() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        fs::write(
+            &paths.config_file,
+            format!(
+                r#"{{
+  "schema_version": 1,
+  "app": {{ "active_workspace_id": "default" }},
+  "providers": [],
+  "models": [],
+  "mcp": {{ "servers": [] }},
+  "skills": {{ "directories": [], "detected": [], "enabled": [] }},
+  "workspaces": [
+    {{ "id": "default", "name": "Default Workspace", "path": {:?} }}
+  ]
+}}"#,
+                paths.workspace_dir
+            ),
+        )
+        .expect("config write");
+
+        let loaded = load_global_config(&paths.config_file).expect("legacy config should load");
+
+        assert_eq!(loaded.app.web_server, WebServerSettings::default());
+    }
+
+    #[test]
     fn load_rejects_unknown_config_fields() {
         let profile = tempfile::tempdir().expect("temp profile");
         let paths = FocoPaths::from_user_profile(profile.path());
@@ -887,6 +973,33 @@ mod tests {
         let error = load_global_config(&paths.config_file).expect_err("unknown field should fail");
 
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn load_rejects_invalid_web_server_settings() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.app.web_server.listen_host = "localhost".to_string();
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("non-IP listen host should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("listen_host must be an IP address")
+        );
+
+        config.app.web_server.listen_host = DEFAULT_WEB_SERVER_HOST.to_string();
+        config.app.web_server.listen_port = 0;
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("zero listen port should fail");
+
+        assert!(error.to_string().contains("listen_port must be a number"));
     }
 
     #[test]

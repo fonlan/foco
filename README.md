@@ -18,8 +18,10 @@ change:
 npm run backend
 ```
 
-The backend binds to `127.0.0.1:3210` by default. Set `FOCO_PORT` to use a
-different local port.
+The backend binds to `127.0.0.1:3210` by default. The settings page General tab
+persists the web service listen host and port to `%USERPROFILE%\.foco\config.json`;
+restart the backend after changing them. Set `FOCO_HOST` or `FOCO_PORT` for a
+one-off startup override.
 
 On first startup, Foco creates `%USERPROFILE%\.foco`, writes
 `%USERPROFILE%\.foco\config.json`, registers a `Default Workspace` at

@@ -148,7 +148,17 @@ type ConfiguredProviderSummary = {
   warnings: string[];
 };
 
+type WebServerSettingsSummary = {
+  listenHost: string;
+  listenPort: number;
+};
+
+type GeneralSettingsSummary = {
+  webServer: WebServerSettingsSummary;
+};
+
 type SettingsResponse = {
+  general: GeneralSettingsSummary;
   providerKinds: ProviderKindSummary[];
   thinkingLevels: ThinkingLevelSummary[];
   providers: ConfiguredProviderSummary[];
@@ -166,6 +176,11 @@ type ProviderFormState = {
   id: string;
   kind: string;
   name: string;
+};
+
+type GeneralFormState = {
+  listenHost: string;
+  listenPort: string;
 };
 
 type McpTransportSummary = {
@@ -304,7 +319,7 @@ type ChatStreamEvent =
   | { type: "error"; message: string };
 
 type WorkspaceFormMode = "add" | "create";
-type SettingsSection = "mcp" | "models" | "providers" | "skills";
+type SettingsSection = "general" | "mcp" | "models" | "providers" | "skills";
 type ViewMode = "chat" | "settings" | "stats";
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
@@ -2667,7 +2682,7 @@ function SettingsPanel({
   onSettingsChange: (settings: SettingsResponse) => void;
 }) {
   const [activeSection, setActiveSection] =
-    useState<SettingsSection>("providers");
+    useState<SettingsSection>("general");
   const [isProviderDialogOpen, setIsProviderDialogOpen] = useState(false);
   const [isModelDialogOpen, setIsModelDialogOpen] = useState(false);
   const [isMcpDialogOpen, setIsMcpDialogOpen] = useState(false);
@@ -2678,6 +2693,9 @@ function SettingsPanel({
   const [form, setForm] = useState<ModelFormState>(() => emptyModelForm());
   const [providerForm, setProviderForm] = useState<ProviderFormState>(() =>
     emptyProviderForm(),
+  );
+  const [generalForm, setGeneralForm] = useState<GeneralFormState>(() =>
+    emptyGeneralForm(),
   );
   const [mcpForm, setMcpForm] = useState<McpServerFormState>(() =>
     emptyMcpServerForm(),
@@ -2690,6 +2708,7 @@ function SettingsPanel({
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isSavingGeneral, setIsSavingGeneral] = useState(false);
   const [isSavingProvider, setIsSavingProvider] = useState(false);
   const [isSavingMcpServer, setIsSavingMcpServer] = useState(false);
   const [isSavingSkills, setIsSavingSkills] = useState(false);
@@ -2760,6 +2779,13 @@ function SettingsPanel({
     );
   }
 
+  function syncGeneralForm(data: SettingsResponse) {
+    setGeneralForm({
+      listenHost: data.general.webServer.listenHost,
+      listenPort: String(data.general.webServer.listenPort),
+    });
+  }
+
   const loadMetadata = useCallback(async () => {
     setIsLoading(true);
     setError(null);
@@ -2784,6 +2810,7 @@ function SettingsPanel({
       const data = await requestJson<SettingsResponse>("/api/settings");
       setSettings(data);
       onSettingsChange(data);
+      syncGeneralForm(data);
       setProviderForm((current) => ({
         ...current,
         kind: current.kind || data.providerKinds[0]?.kind || "openai-responses",
@@ -2948,6 +2975,33 @@ function SettingsPanel({
       setError(errorMessage(requestError));
     } finally {
       setIsRefreshing(false);
+    }
+  }
+
+  async function saveGeneralSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSavingGeneral(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings/general", {
+        body: JSON.stringify({
+          listenHost: generalForm.listenHost,
+          listenPort: optionalPositiveInteger(
+            generalForm.listenPort,
+            "Listen port",
+          ),
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncGeneralForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingGeneral(false);
     }
   }
 
@@ -3264,6 +3318,12 @@ function SettingsPanel({
       <div className="mx-auto grid max-w-7xl gap-4 lg:grid-cols-[4.5rem_minmax(0,1fr)]">
         <aside className="flex gap-2 rounded-2xl border border-stone-200 bg-white/85 p-2 shadow-[0_18px_42px_rgba(75,63,42,0.07)] lg:flex-col lg:self-start">
           <SettingsNavButton
+            active={activeSection === "general"}
+            icon={Globe}
+            label="General"
+            onClick={() => setActiveSection("general")}
+          />
+          <SettingsNavButton
             active={activeSection === "providers"}
             icon={PlugZap}
             label="Providers"
@@ -3297,25 +3357,29 @@ function SettingsPanel({
                 {settingsSectionTitle(activeSection)}
               </h2>
               <p className="mt-1 truncate text-xs font-medium text-stone-500">
-                {metadata?.fetchedAt
+                {activeSection === "models"
+                  ? metadata?.fetchedAt
                   ? `Fetched ${metadata.fetchedAt} from ${metadata.sourceUrl}`
-                  : "Model metadata has not been refreshed"}
+                    : "Model metadata has not been refreshed"
+                  : settingsSectionSubtitle(activeSection)}
               </p>
             </div>
-            <button
-              aria-label="Refresh model metadata"
-              className="inline-flex size-10 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-              disabled={isRefreshing}
-              onClick={() => void refreshMetadata()}
-              title="Refresh model metadata"
-              type="button"
-            >
-              {isRefreshing ? (
-                <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-              ) : (
-                <RefreshCw aria-hidden="true" className="size-4" />
-              )}
-            </button>
+            {activeSection === "models" ? (
+              <button
+                aria-label="Refresh model metadata"
+                className="inline-flex size-10 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                disabled={isRefreshing}
+                onClick={() => void refreshMetadata()}
+                title="Refresh model metadata"
+                type="button"
+              >
+                {isRefreshing ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <RefreshCw aria-hidden="true" className="size-4" />
+                )}
+              </button>
+            ) : null}
           </div>
         </section>
 
@@ -3323,6 +3387,101 @@ function SettingsPanel({
           <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
             {error}
           </div>
+        ) : null}
+
+        {activeSection === "general" ? (
+        <section className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+          <form
+            className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+            onSubmit={(event) => void saveGeneralSettings(event)}
+          >
+            <div className="flex items-center gap-2">
+              <Globe aria-hidden="true" className="size-5 text-teal-700" />
+              <h3 className="text-sm font-semibold text-stone-950">
+                Web service
+              </h3>
+            </div>
+            <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem]">
+              <TextField
+                label="Listen host"
+                onChange={(value) =>
+                  setGeneralForm((current) => ({
+                    ...current,
+                    listenHost: value,
+                  }))
+                }
+                placeholder="127.0.0.1"
+                value={generalForm.listenHost}
+              />
+              <TextField
+                inputMode="numeric"
+                label="Listen port"
+                onChange={(value) =>
+                  setGeneralForm((current) => ({
+                    ...current,
+                    listenPort: value,
+                  }))
+                }
+                placeholder="3210"
+                value={generalForm.listenPort}
+              />
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                aria-label="Save general settings"
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                disabled={
+                  isSavingGeneral ||
+                  !generalForm.listenHost.trim() ||
+                  !generalForm.listenPort.trim()
+                }
+                title="Save general settings"
+                type="submit"
+              >
+                {isSavingGeneral ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 aria-hidden="true" className="size-4" />
+                )}
+                Save
+              </button>
+              <button
+                aria-label="Reload general settings"
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                disabled={isLoadingSettings}
+                onClick={() => void loadSettings()}
+                title="Reload settings"
+                type="button"
+              >
+                {isLoadingSettings ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <RefreshCw aria-hidden="true" className="size-4" />
+                )}
+                Reload
+              </button>
+            </div>
+          </form>
+
+          <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-sm font-semibold text-stone-950">
+                Saved bind
+              </h3>
+              <CapabilityPill label="restart required" ok={false} />
+            </div>
+            <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+              <div className="break-all text-sm font-semibold text-stone-950">
+                {settings
+                  ? `${settings.general.webServer.listenHost}:${settings.general.webServer.listenPort}`
+                  : "Loading..."}
+              </div>
+              <div className="mt-2 text-xs text-stone-500">
+                Saved host and port are used the next time the backend starts.
+              </div>
+            </div>
+          </section>
+        </section>
         ) : null}
 
         {activeSection === "providers" ? (
@@ -4488,6 +4647,10 @@ function diffFileButtonClass(active: boolean) {
 }
 
 function settingsSectionTitle(section: SettingsSection) {
+  if (section === "general") {
+    return "General settings";
+  }
+
   if (section === "providers") {
     return "Provider settings";
   }
@@ -4501,6 +4664,26 @@ function settingsSectionTitle(section: SettingsSection) {
   }
 
   return "Skill settings";
+}
+
+function settingsSectionSubtitle(section: SettingsSection) {
+  if (section === "general") {
+    return "Web service listen address";
+  }
+
+  if (section === "providers") {
+    return "Provider credentials and connection checks";
+  }
+
+  if (section === "mcp") {
+    return "Workspace-scoped MCP server runtimes";
+  }
+
+  if (section === "skills") {
+    return "Skill discovery and enablement";
+  }
+
+  return "Model metadata and runtime limits";
 }
 
 function SettingsNavButton({
@@ -4618,6 +4801,13 @@ function emptyProviderForm(): ProviderFormState {
     id: "",
     kind: "",
     name: "",
+  };
+}
+
+function emptyGeneralForm(): GeneralFormState {
+  return {
+    listenHost: "127.0.0.1",
+    listenPort: "3210",
   };
 }
 
