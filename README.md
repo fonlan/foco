@@ -91,7 +91,14 @@ Run verification:
 
 ```bash
 cargo check --workspace
+npm run test -w web
 npm run typecheck
+```
+
+Run the Windows release startup smoke test from Windows, not WSL:
+
+```powershell
+npm run test:release-smoke:windows
 ```
 
 ## Release Build

@@ -6939,6 +6939,7 @@ description: Project memory.
 
     fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         let (terminal_shutdown_tx, _) = broadcast::channel(1);
+        let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
         let mcp_registry = Arc::new(McpRegistry::default());
 
         AppState {
@@ -6948,6 +6949,7 @@ description: Project memory.
             user_profile_dir,
             terminal_registry: terminal::TerminalRegistry::default(),
             terminal_shutdown_tx,
+            app_shutdown_rx,
             mcp_registry,
             _code_graph_watchers: Arc::new(Vec::new()),
         }

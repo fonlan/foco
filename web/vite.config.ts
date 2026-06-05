@@ -3,7 +3,7 @@ import tailwindcss from "@tailwindcss/vite";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { defineConfig, type Plugin } from "vite";
+import { defineConfig, type Plugin } from "vitest/config";
 
 const backendEndpoint = loadBackendEndpoint();
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -14,6 +14,11 @@ export default defineConfig({
     proxy: {
       "/api": backendEndpoint.origin,
     },
+  },
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: "./test-setup.ts",
   },
 });
 
