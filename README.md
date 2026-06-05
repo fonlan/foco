@@ -83,6 +83,10 @@ reload while `npm run backend` restarts the Rust server:
 npm run frontend
 ```
 
+On Windows release builds, double-clicking `foco.exe` starts the local HTTP
+server in the background and keeps Foco in the system tray. Use the tray menu to
+open the local web UI in the browser or quit Foco cleanly.
+
 Run verification:
 
 ```bash
@@ -92,8 +96,12 @@ npm run typecheck
 
 ## Release Build
 
-Build the frontend assets and the optimized Rust workspace:
+Build the frontend assets and the optimized Foco executable:
 
 ```bash
 npm run build:release
 ```
+
+The release build embeds `web/dist` into the Rust executable. On Windows, the
+binary uses a tray entry point and `windows_subsystem = "windows"` so release
+startup does not open a GUI window.

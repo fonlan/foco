@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -14,8 +16,9 @@ use std::{
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path as AxumPath, Query, State, ws::WebSocketUpgrade},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -60,12 +63,12 @@ use foco_tools::{
     WRITE_FILE_TOOL, builtin_tool_definitions, builtin_tool_timeout_ms, execute_builtin_tool,
 };
 use futures_util::future::join_all;
+use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::time::timeout;
-use tower_http::services::ServeDir;
 
 mod logging;
 mod terminal;
@@ -81,9 +84,19 @@ const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
 const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
     "Enabled skill front matter loaded from configured skills";
 const ENVIRONMENT_CONTEXT_MESSAGE_PREFIX: &str = "Environment context for this chat";
+const SHUTDOWN_MESSAGE: &str = "app shutdown requested";
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Embed)]
+#[folder = "../web/dist"]
+struct WebAssets;
+
+#[cfg(all(windows, not(debug_assertions)))]
+const TRAY_OPEN_ITEM_ID: &str = "foco-open-ui";
+#[cfg(all(windows, not(debug_assertions)))]
+const TRAY_QUIT_ITEM_ID: &str = "foco-quit";
 
 #[derive(Clone)]
 struct AppState {
@@ -93,19 +106,32 @@ struct AppState {
     user_profile_dir: PathBuf,
     terminal_registry: terminal::TerminalRegistry,
     terminal_shutdown_tx: broadcast::Sender<()>,
+    app_shutdown_rx: watch::Receiver<bool>,
     mcp_registry: Arc<McpRegistry>,
     _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
 }
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
+    if let Err(error) = run_entrypoint().await {
         eprintln!("Foco startup failed: {error}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> AppResult<()> {
+async fn run_entrypoint() -> AppResult<()> {
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        return run_windows_tray_entrypoint();
+    }
+
+    #[cfg(any(not(windows), debug_assertions))]
+    {
+        run_server_until_shutdown(None).await
+    }
+}
+
+async fn run_server_until_shutdown(shutdown_rx: Option<watch::Receiver<bool>>) -> AppResult<()> {
     let loaded_config = load_or_create_global_config()?;
     logging::init(&loaded_config.paths.logs_dir)?;
 
@@ -124,8 +150,16 @@ async fn run() -> AppResult<()> {
     sync_all_mcp_workspaces(&mcp_registry, &loaded_config.config).await?;
 
     let addr = local_addr(&loaded_config.config)?;
-    let frontend_dir = frontend_dist_dir()?;
+    verify_frontend_assets()?;
     let (terminal_shutdown_tx, _) = broadcast::channel(16);
+    let (owned_shutdown_tx, owned_shutdown_rx);
+    let (shutdown_tx, app_shutdown_rx) = match shutdown_rx {
+        Some(shutdown_rx) => (None, shutdown_rx),
+        None => {
+            (owned_shutdown_tx, owned_shutdown_rx) = watch::channel(false);
+            (Some(owned_shutdown_tx), owned_shutdown_rx)
+        }
+    };
     let state = AppState {
         config: Arc::new(Mutex::new(loaded_config.config)),
         config_file: loaded_config.paths.config_file,
@@ -133,10 +167,29 @@ async fn run() -> AppResult<()> {
         user_profile_dir: loaded_config.paths.user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
+        app_shutdown_rx: app_shutdown_rx.clone(),
         mcp_registry: mcp_registry.clone(),
         _code_graph_watchers: Arc::new(code_graph_watchers),
     };
-    let app = Router::new()
+    let app = app_router(state);
+    let listener = TcpListener::bind(addr).await?;
+
+    tracing::info!(%addr, "starting local HTTP server");
+    println!("Foco is running at http://{addr}");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(
+            shutdown_tx,
+            app_shutdown_rx,
+            terminal_shutdown_tx,
+            mcp_registry,
+        ))
+        .await?;
+
+    Ok(())
+}
+
+fn app_router(state: AppState) -> Router {
+    Router::new()
         .route("/api/health", get(health))
         .route("/api/workspaces", get(workspaces))
         .route("/api/workspaces/create", post(create_workspace))
@@ -194,15 +247,33 @@ async fn run() -> AppResult<()> {
             "/api/workspaces/{workspace_id}/terminal/{session_id}/ws",
             get(terminal_socket),
         )
-        .fallback_service(ServeDir::new(frontend_dir))
-        .with_state(state);
-    let listener = TcpListener::bind(addr).await?;
+        .fallback(static_asset)
+        .with_state(state)
+}
 
-    tracing::info!(%addr, "starting local HTTP server");
-    println!("Foco is running at http://{addr}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(terminal_shutdown_tx, mcp_registry))
-        .await?;
+#[cfg(all(windows, not(debug_assertions)))]
+fn run_windows_tray_entrypoint() -> AppResult<()> {
+    let loaded_config = load_or_create_global_config()?;
+    let addr = local_addr(&loaded_config.config)?;
+    let ui_url = format!("http://{addr}");
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let runtime_thread = std::thread::Builder::new()
+        .name("foco-http-runtime".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build Foco HTTP runtime");
+            if let Err(error) = runtime.block_on(run_server_until_shutdown(Some(shutdown_rx))) {
+                eprintln!("Foco server failed: {error}");
+                std::process::exit(1);
+            }
+        })?;
+
+    run_windows_tray_loop(ui_url, shutdown_tx)?;
+    runtime_thread
+        .join()
+        .map_err(|_| "Foco HTTP runtime thread panicked")?;
 
     Ok(())
 }
@@ -242,18 +313,135 @@ fn mcp_server_definitions(
 }
 
 async fn shutdown_signal(
+    shutdown_tx: Option<watch::Sender<bool>>,
+    mut app_shutdown_rx: watch::Receiver<bool>,
     terminal_shutdown_tx: broadcast::Sender<()>,
     mcp_registry: Arc<McpRegistry>,
 ) {
-    if let Err(source) = tokio::signal::ctrl_c().await {
-        tracing::warn!(error = %source, "failed to listen for Ctrl+C shutdown");
-        return;
+    tokio::select! {
+        ctrl_c = tokio::signal::ctrl_c() => {
+            if let Err(source) = ctrl_c {
+                tracing::warn!(error = %source, "failed to listen for Ctrl+C shutdown");
+                return;
+            }
+            if let Some(shutdown_tx) = shutdown_tx {
+                let _ = shutdown_tx.send(true);
+            }
+        }
+        changed = app_shutdown_rx.changed() => {
+            if changed.is_err() || !*app_shutdown_rx.borrow() {
+                return;
+            }
+        }
     }
 
     tracing::info!("shutdown requested; closing terminal sessions");
     let _ = terminal_shutdown_tx.send(());
     if let Err(error) = mcp_registry.stop_all().await {
         tracing::warn!(error = %error, "failed to stop MCP servers");
+    }
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn run_windows_tray_loop(
+    ui_url: String,
+    shutdown_tx: watch::Sender<bool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use tray_icon::{
+        TrayIconBuilder,
+        menu::{Menu, MenuItem, PredefinedMenuItem},
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_QUIT,
+    };
+
+    let tray_menu = Menu::new();
+    let open_item = MenuItem::with_id(TRAY_OPEN_ITEM_ID, "Open Foco", true, None);
+    let quit_item = MenuItem::with_id(TRAY_QUIT_ITEM_ID, "Quit Foco", true, None);
+    let separator = PredefinedMenuItem::separator();
+    tray_menu.append_items(&[&open_item, &separator, &quit_item])?;
+    let _tray_icon = TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_tooltip("Foco")
+        .with_icon(foco_tray_icon()?)
+        .build()?;
+
+    loop {
+        drain_tray_events(&ui_url, &shutdown_tx);
+
+        let mut message = MSG::default();
+        let message_result = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };
+        if message_result == -1 {
+            return Err(Box::new(std::io::Error::last_os_error()));
+        }
+        if message_result == 0 || message.message == WM_QUIT {
+            break;
+        }
+
+        unsafe {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn drain_tray_events(ui_url: &str, shutdown_tx: &watch::Sender<bool>) {
+    use tray_icon::{TrayIconEvent, menu::MenuEvent};
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostQuitMessage;
+
+    while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+        if matches!(event, TrayIconEvent::DoubleClick { .. }) {
+            open_foco_ui(ui_url);
+        }
+    }
+
+    while let Ok(event) = MenuEvent::receiver().try_recv() {
+        if event.id == TRAY_OPEN_ITEM_ID {
+            open_foco_ui(ui_url);
+        } else if event.id == TRAY_QUIT_ITEM_ID {
+            let _ = shutdown_tx.send(true);
+            unsafe {
+                PostQuitMessage(0);
+            }
+        }
+    }
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn foco_tray_icon() -> Result<tray_icon::Icon, tray_icon::BadIcon> {
+    let size = 32_u32;
+    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
+
+    for y in 0..size {
+        for x in 0..size {
+            let center = size as f32 / 2.0 - 0.5;
+            let dx = x as f32 - center;
+            let dy = y as f32 - center;
+            let distance = (dx * dx + dy * dy).sqrt();
+            let inside_outer = distance <= 15.0;
+            let inside_inner = distance <= 9.0;
+            let on_cross = (x >= 14 && x <= 17) || (y >= 14 && y <= 17);
+
+            if !inside_outer {
+                rgba.extend_from_slice(&[0, 0, 0, 0]);
+            } else if inside_inner || on_cross {
+                rgba.extend_from_slice(&[37, 99, 235, 255]);
+            } else {
+                rgba.extend_from_slice(&[15, 23, 42, 255]);
+            }
+        }
+    }
+
+    tray_icon::Icon::from_rgba(rgba, size, size)
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn open_foco_ui(ui_url: &str) {
+    if let Err(error) = webbrowser::open(ui_url) {
+        tracing::warn!(%ui_url, error = %error, "failed to open Foco web UI");
     }
 }
 
@@ -292,6 +480,41 @@ async fn health() -> Json<HealthResponse> {
         service: "foco",
         status: "ok",
     })
+}
+
+async fn static_asset(uri: axum::http::Uri) -> Response {
+    let request_path = uri.path().trim_start_matches('/');
+    if request_path.starts_with("api/") {
+        return Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("API route not found"))
+            .expect("static asset response is valid");
+    }
+
+    let asset_path = if request_path.is_empty() {
+        "index.html"
+    } else {
+        request_path
+    };
+    let asset = WebAssets::get(asset_path).or_else(|| {
+        if asset_path.rsplit_once('.').is_none() {
+            WebAssets::get("index.html")
+        } else {
+            None
+        }
+    });
+
+    match asset {
+        Some(asset) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, asset.metadata.mimetype())
+            .body(Body::from(asset.data.into_owned()))
+            .expect("static asset response is valid"),
+        None => Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("frontend asset not found"))
+            .expect("static asset response is valid"),
+    }
 }
 
 #[derive(Serialize)]
@@ -1776,6 +1999,7 @@ struct PreparedChatContext {
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
     mcp_registry: Arc<McpRegistry>,
+    app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
     request_body_json: String,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
@@ -1854,10 +2078,23 @@ impl PreparedChatContext {
             let mut provider_completions = Vec::new();
             let mut total_usage = NeutralUsage::default();
             let mut final_usage = None;
+            let mut app_shutdown_rx = self.app_shutdown_rx.clone();
 
             yield Ok(sse_event(&start_event));
 
             for turn_index in 0..=MAX_AGENT_TOOL_ROUNDS {
+                if *app_shutdown_rx.borrow() {
+                    let event = finish_cancelled_chat_run(
+                        &self,
+                        &request_started_at,
+                        started_at,
+                        &mut events,
+                        &executed_tool_calls,
+                    );
+                    yield Ok(sse_event(&event));
+                    return;
+                }
+
                 let turn_active_tool_start_index = match ensure_context_compression(&mut self) {
                     Ok(index) => index,
                     Err(error) => {
@@ -1933,7 +2170,23 @@ impl PreparedChatContext {
                         return;
                     }
                 }
-                let mut provider_stream = match stream_chat(&self.provider_config, turn_request).await {
+                let mut provider_stream = match tokio::select! {
+                    changed = app_shutdown_rx.changed() => {
+                        if changed.is_err() || *app_shutdown_rx.borrow() {
+                            let event = finish_cancelled_chat_run(
+                                &self,
+                                &request_started_at,
+                                started_at,
+                                &mut events,
+                                &executed_tool_calls,
+                            );
+                            yield Ok(sse_event(&event));
+                            return;
+                        }
+                        continue;
+                    }
+                    provider_stream = stream_chat(&self.provider_config, turn_request) => provider_stream,
+                } {
                     Ok(provider_stream) => provider_stream,
                     Err(error) => {
                         let message = error.to_string();
@@ -1959,7 +2212,26 @@ impl PreparedChatContext {
                 let mut turn_reasoning = String::new();
                 let mut completed_turn = false;
 
-                while let Some(event_result) = provider_stream.next_event().await {
+                loop {
+                    let Some(event_result) = (tokio::select! {
+                        changed = app_shutdown_rx.changed() => {
+                            if changed.is_err() || *app_shutdown_rx.borrow() {
+                                let event = finish_cancelled_chat_run(
+                                    &self,
+                                    &request_started_at,
+                                    started_at,
+                                    &mut events,
+                                    &executed_tool_calls,
+                                );
+                                yield Ok(sse_event(&event));
+                                return;
+                            }
+                            continue;
+                        }
+                        event_result = provider_stream.next_event() => event_result,
+                    }) else {
+                        break;
+                    };
                     let provider_event = match event_result {
                         Ok(provider_event) => provider_event,
                         Err(error) => {
@@ -2198,12 +2470,28 @@ impl PreparedChatContext {
                                 yield Ok(sse_event(&event));
                             }
 
-                            let next_tool_results = match execute_tool_calls_parallel(
-                                self.mcp_registry.clone(),
-                                &self.workspace_id,
-                                &self.workspace_path,
-                                tool_calls.clone(),
-                            ).await {
+                            let next_tool_results = match tokio::select! {
+                                changed = app_shutdown_rx.changed() => {
+                                    if changed.is_err() || *app_shutdown_rx.borrow() {
+                                        let event = finish_cancelled_chat_run(
+                                            &self,
+                                            &request_started_at,
+                                            started_at,
+                                            &mut events,
+                                            &executed_tool_calls,
+                                        );
+                                        yield Ok(sse_event(&event));
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                tool_results = execute_tool_calls_parallel(
+                                    self.mcp_registry.clone(),
+                                    &self.workspace_id,
+                                    &self.workspace_path,
+                                    tool_calls.clone(),
+                                ) => tool_results,
+                            } {
                                 Ok(tool_results) => tool_results,
                                 Err(error) => {
                                     let message = error.message;
@@ -2562,6 +2850,7 @@ async fn prepare_chat_context(
         provider_config,
         provider_request,
         mcp_registry: state.mcp_registry.clone(),
+        app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget,
         request_body_json,
         compression_snapshots,
@@ -3720,6 +4009,51 @@ fn failed_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome 
         final_state: "failed",
         response_body_json: Some(json!({ "error": message }).to_string()),
     }
+}
+
+fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome {
+    ChatAuditOutcome {
+        first_token_at: None,
+        completed_at: utc_timestamp(),
+        first_token_latency_ms: None,
+        total_latency_ms: elapsed_millis(started_at),
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        final_state: "cancelled",
+        response_body_json: Some(json!({ "cancelled": message }).to_string()),
+    }
+}
+
+fn finish_cancelled_chat_run(
+    context: &PreparedChatContext,
+    request_started_at: &str,
+    started_at: Instant,
+    events: &mut Vec<CapturedAuditEvent>,
+    executed_tool_calls: &[ExecutedToolCall],
+) -> ChatSseEvent {
+    let event = ChatSseEvent::Error {
+        message: SHUTDOWN_MESSAGE.to_string(),
+    };
+    events.push(captured_event(&event));
+    let outcome = cancelled_audit_outcome(started_at, SHUTDOWN_MESSAGE);
+
+    if let Err(error) = persist_chat_result(
+        context,
+        request_started_at,
+        outcome,
+        events,
+        None,
+        None,
+        executed_tool_calls,
+    ) {
+        return ChatSseEvent::Error {
+            message: error.message,
+        };
+    }
+
+    event
 }
 
 fn captured_provider_event(event: &NeutralChatStreamEvent) -> CapturedAuditEvent {
@@ -5778,22 +6112,21 @@ fn parse_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
-fn frontend_dist_dir() -> Result<PathBuf, String> {
+fn verify_frontend_assets() -> Result<(), String> {
+    if WebAssets::get("index.html").is_some() {
+        return Ok(());
+    }
+
     let app_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_dir = app_dir
         .parent()
         .ok_or_else(|| "app crate must live inside the Foco repository".to_string())?;
-    let dist_dir = repo_dir.join("web").join("dist");
-    let index_file = dist_dir.join("index.html");
+    let index_file = repo_dir.join("web").join("dist").join("index.html");
 
-    if !index_file.is_file() {
-        return Err(format!(
-            "frontend build missing at {}. Run `npm run build -w web` before starting the backend.",
-            index_file.display()
-        ));
-    }
-
-    Ok(dist_dir)
+    Err(format!(
+        "frontend build missing at {}. Run `npm run build -w web` before starting the backend or release build.",
+        index_file.display()
+    ))
 }
 
 #[cfg(test)]

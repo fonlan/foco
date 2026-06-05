@@ -9,6 +9,6 @@
     "frontend": "npm run dev -w web",
     "test": "cargo test --workspace && npm run typecheck -w web",
     "typecheck": "npm run typecheck -w web",
-    "build:release": "npm run build -w web && cargo build --release --workspace"
+    "build:release": "npm run build -w web && cargo build --release -p foco-app"
   }
 }

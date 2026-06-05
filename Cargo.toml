@@ -35,7 +35,6 @@ serde_json = "1.0.145"
 globset = "0.4.18"
 tempfile = "3.23.0"
 tokio = { version = "1.48.0", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
-tower-http = { version = "0.6.11", features = ["fs"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 portable-pty = "0.9.0"
@@ -54,3 +53,12 @@ tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
+rust-embed = { version = "8.11.0", features = ["mime-guess"] }
+webbrowser = "1.2.1"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "z"
+panic = "abort"
+strip = "symbols"
