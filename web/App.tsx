@@ -1171,11 +1171,14 @@ export function App() {
       return;
     }
 
+    const skillIds = [...selectedSkillIds];
+    setSelectedSkillIds([]);
+
     await runChatMessage({
       chatId: activeChatId,
       content,
       modelId: selectedModelId,
-      skillIds: selectedSkillIds,
+      skillIds,
       thinkingLevel: selectedThinkingLevel,
       workspaceId: activeWorkspace.id,
     });
@@ -2160,6 +2163,7 @@ function ChatPanel({
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const messageScrollContentRef = useRef<HTMLDivElement>(null);
   const messageScrollEndRef = useRef<HTMLDivElement>(null);
+  const messageTextareaRef = useRef<HTMLTextAreaElement>(null);
   const shouldLockMessageScrollRef = useRef(true);
   const skillQuery = activeSkillQuery(draftMessage);
   const selectedSkillSet = new Set(selectedSkillIds);
@@ -2235,6 +2239,11 @@ function ChatPanel({
 
     onDraftMessageChange(removeActiveSkillToken(draftMessage));
     onToggleSkill(skill.id);
+  }
+
+  function handleComposerSubmit(event: FormEvent<HTMLFormElement>) {
+    onSubmit(event);
+    window.requestAnimationFrame(() => messageTextareaRef.current?.focus());
   }
 
   return (
@@ -2319,7 +2328,7 @@ function ChatPanel({
       </div>
 
       <div className="shrink-0 border-t border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-5">
-        <form className="mx-auto max-w-5xl" onSubmit={onSubmit}>
+        <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
           <div className="relative rounded-xl border border-stone-300 bg-white">
             {selectedSkills.length ? (
               <div className="flex flex-wrap gap-1.5 px-3 pt-2">
@@ -2334,7 +2343,6 @@ function ChatPanel({
                         name: skill.name,
                       })}
                       className="inline-flex size-4 items-center justify-center rounded-full text-teal-800 hover:bg-teal-100"
-                      disabled={isSendingMessage}
                       onClick={() => onRemoveSkill(skill.id)}
                       title={t("Remove skill")}
                       type="button"
@@ -2347,7 +2355,6 @@ function ChatPanel({
             ) : null}
             <textarea
               className="message-composer-textarea min-h-24 w-full resize-none border-0 bg-transparent px-3 py-2 text-sm leading-6 text-stone-900 outline-none placeholder:text-stone-400"
-              disabled={isSendingMessage}
               name="message"
               onChange={(event) => onDraftMessageChange(event.target.value)}
               onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
@@ -2360,9 +2367,14 @@ function ChatPanel({
                 }
 
                 event.preventDefault();
+                if (isSendingMessage) {
+                  return;
+                }
+
                 event.currentTarget.form?.requestSubmit();
               }}
               placeholder={t("Message Foco")}
+              ref={messageTextareaRef}
               value={draftMessage}
             />
             {skillQuery !== null ? (
@@ -2375,7 +2387,7 @@ function ChatPanel({
                           name: skill.name,
                         })}
                         className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-left hover:bg-stone-50 disabled:cursor-not-allowed disabled:bg-stone-50 disabled:text-stone-400"
-                        disabled={!skill.enabled || isSendingMessage}
+                        disabled={!skill.enabled}
                         key={skill.id}
                         onClick={() => handleSkillSelect(skill)}
                         title={
