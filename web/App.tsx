@@ -11,6 +11,7 @@ import {
   GitBranch,
   GitCompare,
   Globe,
+  GripVertical,
   KeyRound,
   LoaderCircle,
   MessageSquare,
@@ -33,6 +34,7 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import {
   CSSProperties,
+  DragEvent as ReactDragEvent,
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
@@ -530,6 +532,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Enable skill {name}": "启用技能 {name}",
     "No detected skills": "暂无已发现技能",
     "Edit model {name}": "编辑模型 {name}",
+    "Reorder model {name}": "调整模型顺序 {name}",
     "Add model": "添加模型",
     "Edit model": "编辑模型",
     "Delete model": "删除模型",
@@ -693,6 +696,7 @@ export function App() {
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeRunAbortRef = useRef<AbortController | null>(null);
+  const hasManuallySelectedModelRef = useRef(false);
 
   const activeWorkspace = useMemo(
     () =>
@@ -898,11 +902,25 @@ export function App() {
   }, [isResizingSidebar]);
 
   useEffect(() => {
-    setSelectedModelId((current) =>
-      availableModels.some((model) => model.id === current)
-        ? current
-        : (availableModels[0]?.id ?? ""),
-    );
+    setSelectedModelId((current) => {
+      const highestPriorityModelId = availableModels[0]?.id ?? "";
+
+      if (!highestPriorityModelId) {
+        hasManuallySelectedModelRef.current = false;
+        return "";
+      }
+
+      if (!hasManuallySelectedModelRef.current) {
+        return highestPriorityModelId;
+      }
+
+      if (availableModels.some((model) => model.id === current)) {
+        return current;
+      }
+
+      hasManuallySelectedModelRef.current = false;
+      return highestPriorityModelId;
+    });
   }, [availableModels]);
 
   useEffect(() => {
@@ -1171,10 +1189,16 @@ export function App() {
     const retryRequest = retryRunRequest;
     setActiveWorkspaceId(retryRequest.workspaceId);
     setActiveChatId(retryRequest.chatId);
+    hasManuallySelectedModelRef.current = true;
     setSelectedModelId(retryRequest.modelId);
     setSelectedSkillIds(retryRequest.skillIds);
     setSelectedThinkingLevel(retryRequest.thinkingLevel);
     await runChatMessage(retryRequest);
+  }
+
+  function handleChatModelChange(modelId: string) {
+    hasManuallySelectedModelRef.current = true;
+    setSelectedModelId(modelId);
   }
 
   function handleCancelRun() {
@@ -1750,7 +1774,7 @@ export function App() {
               onBranchChange={(branch) => void handleGitBranchChange(branch)}
               onDraftMessageChange={setDraftMessage}
               onCancelRun={handleCancelRun}
-              onModelChange={setSelectedModelId}
+              onModelChange={handleChatModelChange}
               onRemoveSkill={removeSelectedSkill}
               onRetryRun={() => void handleRetryRun()}
               onSubmit={handleSendMessage}
@@ -3177,8 +3201,13 @@ function SettingsPanel({
   const [isSavingLanguage, setIsSavingLanguage] = useState(false);
   const [isSavingProvider, setIsSavingProvider] = useState(false);
   const [isSavingMcpServer, setIsSavingMcpServer] = useState(false);
+  const [isSavingModelOrder, setIsSavingModelOrder] = useState(false);
   const [isSavingSkills, setIsSavingSkills] = useState(false);
   const [isRefreshingSkills, setIsRefreshingSkills] = useState(false);
+  const [draggedModelId, setDraggedModelId] = useState<string | null>(null);
+  const [modelOrderPreview, setModelOrderPreview] = useState<string[] | null>(
+    null,
+  );
   const [providerTests, setProviderTests] = useState<
     Record<string, ProviderTestState>
   >({});
@@ -3224,6 +3253,22 @@ function SettingsPanel({
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const configuredModels =
     settings?.configuredModels ?? metadata?.configuredModels ?? [];
+  const orderedConfiguredModels = useMemo(() => {
+    if (!modelOrderPreview) {
+      return configuredModels;
+    }
+
+    const modelsById = new Map(
+      configuredModels.map((model) => [model.id, model]),
+    );
+    const previewModels = modelOrderPreview
+      .map((modelId) => modelsById.get(modelId))
+      .filter((model): model is ConfiguredModelSummary => Boolean(model));
+
+    return previewModels.length === configuredModels.length
+      ? previewModels
+      : configuredModels;
+  }, [configuredModels, modelOrderPreview]);
   const editingModel =
     configuredModels.find((model) => model.id === form.modelId) ?? null;
   const selectedProviderKind = providerKinds.find(
@@ -3277,6 +3322,8 @@ function SettingsPanel({
       const data = await requestJson<SettingsResponse>("/api/settings");
       setSettings(data);
       onSettingsChange(data);
+      setDraggedModelId(null);
+      setModelOrderPreview(null);
       syncGeneralForm(data);
       setProviderForm((current) => ({
         ...current,
@@ -3554,6 +3601,28 @@ function SettingsPanel({
     }
   }
 
+  async function saveModelOrder(modelIds: string[]) {
+    setIsSavingModelOrder(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/models/order", {
+        body: JSON.stringify({ modelIds }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      setDraggedModelId(null);
+      setModelOrderPreview(null);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      await loadSettings();
+    } finally {
+      setIsSavingModelOrder(false);
+    }
+  }
+
   async function saveProvider(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsSavingProvider(true);
@@ -3819,6 +3888,54 @@ function SettingsPanel({
 
       return next;
     });
+  }
+
+  function handleModelDragStart(
+    event: ReactDragEvent<HTMLDivElement>,
+    modelId: string,
+  ) {
+    setDraggedModelId(modelId);
+    setModelOrderPreview(orderedConfiguredModels.map((model) => model.id));
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", modelId);
+  }
+
+  function handleModelDragOver(
+    event: ReactDragEvent<HTMLDivElement>,
+    targetModelId: string,
+  ) {
+    event.preventDefault();
+
+    const sourceModelId = draggedModelId;
+    if (!sourceModelId || sourceModelId === targetModelId) {
+      return;
+    }
+
+    const modelIds = moveModelId(
+      modelOrderPreview ?? orderedConfiguredModels.map((model) => model.id),
+      sourceModelId,
+      targetModelId,
+    );
+    setModelOrderPreview(modelIds);
+  }
+
+  async function handleModelDrop(event: ReactDragEvent<HTMLDivElement>) {
+    event.preventDefault();
+
+    const modelIds = modelOrderPreview;
+    setDraggedModelId(null);
+
+    if (!modelIds || sameStringList(modelIds, configuredModels.map((model) => model.id))) {
+      setModelOrderPreview(null);
+      return;
+    }
+
+    await saveModelOrder(modelIds);
+  }
+
+  function handleModelDragEnd() {
+    setDraggedModelId(null);
+    setModelOrderPreview(null);
   }
 
   return (
@@ -4763,12 +4880,45 @@ function SettingsPanel({
               </div>
             </div>
             <div className="divide-y divide-stone-100">
-              {configuredModels.length ? (
-                configuredModels.map((model) => (
+              {orderedConfiguredModels.length ? (
+                orderedConfiguredModels.map((model) => (
                 <div
-                  className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(0,1fr)_auto]"
+                  className={`grid gap-3 px-4 py-3 transition md:grid-cols-[auto_minmax(0,1fr)_auto] ${
+                    draggedModelId === model.id
+                      ? "bg-teal-50/70 opacity-80"
+                      : "bg-white/0"
+                  }`}
+                  draggable={!isSavingModelOrder}
                   key={model.id}
+                  onDragEnd={handleModelDragEnd}
+                  onDragOver={(event) => handleModelDragOver(event, model.id)}
+                  onDragStart={(event) => handleModelDragStart(event, model.id)}
+                  onDrop={(event) => void handleModelDrop(event)}
                 >
+                  <div className="flex items-start pt-1">
+                    <span
+                      aria-label={t("Reorder model {name}", {
+                        name: model.displayName,
+                      })}
+                      className={`inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-400 shadow-sm ${
+                        isSavingModelOrder
+                          ? "cursor-not-allowed opacity-60"
+                          : "cursor-grab hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      }`}
+                      title={t("Reorder model {name}", {
+                        name: model.displayName,
+                      })}
+                    >
+                      {isSavingModelOrder && draggedModelId === model.id ? (
+                        <LoaderCircle
+                          aria-hidden="true"
+                          className="size-4 animate-spin"
+                        />
+                      ) : (
+                        <GripVertical aria-hidden="true" className="size-4" />
+                      )}
+                    </span>
+                  </div>
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="truncate text-sm font-semibold">
@@ -5430,6 +5580,29 @@ function nextMcpServerId(
   }
 
   return `${base}-${index}`;
+}
+
+function moveModelId(
+  modelIds: string[],
+  sourceModelId: string,
+  targetModelId: string,
+) {
+  const sourceIndex = modelIds.indexOf(sourceModelId);
+  const targetIndex = modelIds.indexOf(targetModelId);
+
+  if (sourceIndex === -1 || targetIndex === -1 || sourceIndex === targetIndex) {
+    return modelIds;
+  }
+
+  const next = [...modelIds];
+  const [source] = next.splice(sourceIndex, 1);
+  next.splice(targetIndex, 0, source);
+
+  return next;
+}
+
+function sameStringList(left: string[], right: string[]) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function slugId(value: string) {

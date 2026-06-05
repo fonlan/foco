@@ -149,6 +149,7 @@ async fn run() -> AppResult<()> {
         .route("/api/model-metadata/refresh", post(refresh_model_metadata))
         .route("/api/models/manual", post(save_manual_model))
         .route("/api/models/delete", post(delete_model))
+        .route("/api/models/order", post(save_model_order))
         .route("/api/mcp/servers/manual", post(save_mcp_server))
         .route("/api/mcp/servers/delete", post(delete_mcp_server))
         .route("/api/skills/manual", post(save_skills))
@@ -874,6 +875,18 @@ async fn delete_model(
     )))
 }
 
+async fn save_model_order(
+    State(state): State<AppState>,
+    Json(request): Json<ModelOrderRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+
+    reorder_models(&mut config.models, request.model_ids)?;
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
 async fn stream_chat_response(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
@@ -1171,6 +1184,12 @@ struct ManualModelRequest {
     active_provider_id: Option<String>,
     thinking_level: Option<String>,
     clear_thinking_level: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelOrderRequest {
+    model_ids: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -4615,6 +4634,61 @@ fn normalize_model_provider_ids(
     Ok(provider_ids)
 }
 
+fn reorder_models(models: &mut Vec<ModelSettings>, model_ids: Vec<String>) -> Result<(), ApiError> {
+    if model_ids.len() != models.len() {
+        return Err(ApiError::bad_request(format!(
+            "model order must contain exactly {} model ids",
+            models.len()
+        )));
+    }
+
+    let mut seen = HashSet::new();
+    let stored_model_ids = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<HashSet<_>>();
+    let mut normalized_model_ids = Vec::with_capacity(model_ids.len());
+
+    for raw_model_id in model_ids {
+        let model_id = raw_model_id.trim().to_string();
+
+        if model_id.is_empty() {
+            return Err(ApiError::bad_request("model id must not be empty"));
+        }
+
+        if !seen.insert(model_id.clone()) {
+            return Err(ApiError::bad_request(format!(
+                "model order contains duplicate id: {model_id}"
+            )));
+        }
+
+        if !stored_model_ids.contains(&model_id) {
+            return Err(ApiError::bad_request(format!(
+                "model was not found: {model_id}"
+            )));
+        }
+
+        normalized_model_ids.push(model_id);
+    }
+
+    let mut stored_models = models
+        .drain(..)
+        .map(|model| (model.id.clone(), model))
+        .collect::<HashMap<_, _>>();
+    let reordered_models = normalized_model_ids
+        .into_iter()
+        .map(|model_id| {
+            stored_models
+                .remove(&model_id)
+                .expect("model id was validated before reorder")
+        })
+        .collect();
+
+    *models = reordered_models;
+
+    Ok(())
+}
+
 fn validate_model_provider_references(
     config: &GlobalConfig,
     provider_ids: &[String],
@@ -5370,6 +5444,40 @@ description: Project memory.
     }
 
     #[test]
+    fn reorder_models_requires_complete_unique_existing_ids() {
+        let mut models = vec![
+            test_model_settings("low"),
+            test_model_settings("high"),
+            test_model_settings("medium"),
+        ];
+
+        reorder_models(
+            &mut models,
+            vec!["high".to_string(), "medium".to_string(), "low".to_string()],
+        )
+        .expect("reordered models");
+        assert_eq!(model_ids(&models), vec!["high", "medium", "low"]);
+
+        let duplicate_error = reorder_models(
+            &mut models,
+            vec!["high".to_string(), "high".to_string(), "low".to_string()],
+        )
+        .expect_err("duplicate model ids should fail");
+        assert_eq!(duplicate_error.status, StatusCode::BAD_REQUEST);
+        assert!(duplicate_error.message.contains("duplicate"));
+        assert_eq!(model_ids(&models), vec!["high", "medium", "low"]);
+
+        let missing_error = reorder_models(
+            &mut models,
+            vec!["high".to_string(), "missing".to_string(), "low".to_string()],
+        )
+        .expect_err("unknown model ids should fail");
+        assert_eq!(missing_error.status, StatusCode::BAD_REQUEST);
+        assert!(missing_error.message.contains("not found"));
+        assert_eq!(model_ids(&models), vec!["high", "medium", "low"]);
+    }
+
+    #[test]
     fn discover_skills_ignores_missing_directories() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-missing-skill-test"));
         let missing_absolute = workspace_dir.join("missing-skills");
@@ -6002,6 +6110,25 @@ description: Project memory.
             description: "Test skill.".to_string(),
             path: env::temp_dir().join(id).join("SKILL.md"),
         }
+    }
+
+    fn test_model_settings(id: &str) -> ModelSettings {
+        ModelSettings {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            enabled: false,
+            provider_ids: Vec::new(),
+            active_provider_id: None,
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: None,
+        }
+    }
+
+    fn model_ids(models: &[ModelSettings]) -> Vec<&str> {
+        models.iter().map(|model| model.id.as_str()).collect()
     }
 
     fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
