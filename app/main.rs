@@ -77,6 +77,7 @@ const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES: usize = 16;
 const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
+const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -1973,6 +1974,7 @@ async fn prepare_chat_context(
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
     let chat_id = optional_trimmed_string(request.chat_id);
+    let is_new_chat = chat_id.is_none();
     let chat_id = match chat_id {
         Some(chat_id) => {
             if database
@@ -2064,13 +2066,23 @@ async fn prepare_chat_context(
     .map_err(|source| ApiError::bad_request(source.to_string()))?;
 
     let covered_sequences = snapshot_covered_sequences(&compression_snapshots);
-    let mut neutral_messages =
-        Vec::with_capacity(existing_messages.len() + compression_snapshots.len() + 2);
+    let agents_messages = if is_new_chat {
+        agents_prompt_messages(&workspace.path, &state.user_profile_dir)?
+    } else {
+        Vec::new()
+    };
+    let mut neutral_messages = Vec::with_capacity(
+        existing_messages.len() + compression_snapshots.len() + agents_messages.len() + 2,
+    );
     let mut message_source_sequences = Vec::with_capacity(neutral_messages.capacity());
     neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
     message_source_sequences.push(None);
     for snapshot in &compression_snapshots {
         neutral_messages.push(compression_snapshot_message(snapshot));
+        message_source_sequences.push(None);
+    }
+    for agents_message in agents_messages {
+        neutral_messages.push(agents_message);
         message_source_sequences.push(None);
     }
     for existing_message in existing_messages {
@@ -2177,6 +2189,61 @@ fn neutral_message_from_record(message: MessageRecord) -> Result<NeutralChatMess
         tool_call_id: Some(tool_call_id),
         tool_name,
     })
+}
+
+fn agents_prompt_messages(
+    workspace_path: &Path,
+    user_profile_dir: &Path,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    let mut messages = Vec::new();
+
+    for path in [
+        workspace_path.join("AGENTS.md"),
+        user_profile_dir.join(".codex").join("AGENTS.md"),
+    ] {
+        if let Some(message) = agents_prompt_message(&path)? {
+            messages.push(message);
+        }
+    }
+
+    Ok(messages)
+}
+
+fn agents_prompt_message(path: &Path) -> Result<Option<NeutralChatMessage>, ApiError> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(ApiError::internal(format!(
+                "failed to inspect {}: {source}",
+                path.display()
+            )));
+        }
+    };
+
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "AGENTS.md path is not a file: {}",
+            path.display()
+        )));
+    }
+
+    let content = fs::read_to_string(path).map_err(|source| {
+        ApiError::internal(format!("failed to read {}: {source}", path.display()))
+    })?;
+
+    if content.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(neutral_text_message(
+        NeutralChatRole::User,
+        format!(
+            "{AGENTS_MESSAGE_PREFIX} {}:\n\n{}",
+            path.display(),
+            content.trim()
+        ),
+    )))
 }
 
 fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize, ApiError> {
@@ -2722,6 +2789,7 @@ fn pack_neutral_messages(
             },
             must_keep: message.role == NeutralChatRole::System
                 || Some(index) == latest_user_index
+                || message_source_sequences[index].is_none()
                 || index >= active_tool_start_index,
         })
         .collect::<Vec<_>>();
@@ -4588,6 +4656,143 @@ description: Project memory.
     }
 
     #[test]
+    fn agents_prompt_messages_read_workspace_and_codex_agents_files() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-agents-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-profile-agents-test"));
+        let codex_dir = profile_dir.join(".codex");
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&codex_dir).expect("codex directory");
+        fs::write(workspace_dir.join("AGENTS.md"), "Workspace instructions.\n")
+            .expect("workspace AGENTS write");
+        fs::write(codex_dir.join("AGENTS.md"), "Codex instructions.\n")
+            .expect("codex AGENTS write");
+
+        let messages =
+            agents_prompt_messages(&workspace_dir, &profile_dir).expect("agents messages");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, NeutralChatRole::User);
+        assert!(messages[0].content.contains(AGENTS_MESSAGE_PREFIX));
+        assert!(messages[0].content.contains("Workspace instructions."));
+        assert_eq!(messages[1].role, NeutralChatRole::User);
+        assert!(messages[1].content.contains("Codex instructions."));
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        fs::remove_dir_all(profile_dir).expect("remove profile directory");
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_context_injects_agents_only_for_new_chat() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-chat-agents-workspace-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-chat-agents-profile-test"));
+        let codex_dir = profile_dir.join(".codex");
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&codex_dir).expect("codex directory");
+        fs::write(
+            workspace_dir.join("AGENTS.md"),
+            "Workspace chat instructions.\n",
+        )
+        .expect("workspace AGENTS write");
+        fs::write(codex_dir.join("AGENTS.md"), "Codex chat instructions.\n")
+            .expect("codex AGENTS write");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 100_000,
+                max_output_tokens: 1_024,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+
+        let new_context = prepare_chat_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            ChatStreamRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                thinking_level: None,
+                message: "Hello".to_string(),
+            },
+        )
+        .await
+        .expect("new chat context");
+        let injected_messages = new_context
+            .provider_request
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(AGENTS_MESSAGE_PREFIX))
+            .collect::<Vec<_>>();
+
+        assert_eq!(injected_messages.len(), 2);
+        assert!(
+            injected_messages[0]
+                .content
+                .contains("Workspace chat instructions.")
+        );
+        assert!(
+            injected_messages[1]
+                .content
+                .contains("Codex chat instructions.")
+        );
+
+        {
+            let database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            let stored_messages = database
+                .messages_for_chat(&new_context.chat_id)
+                .expect("stored messages");
+            assert_eq!(stored_messages.len(), 1);
+            assert_eq!(stored_messages[0].content, "Hello");
+        }
+
+        let existing_context = prepare_chat_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            ChatStreamRequest {
+                chat_id: Some(new_context.chat_id.clone()),
+                model_id: "model".to_string(),
+                thinking_level: None,
+                message: "Next".to_string(),
+            },
+        )
+        .await
+        .expect("existing chat context");
+
+        assert!(
+            existing_context
+                .provider_request
+                .messages
+                .iter()
+                .all(|message| !message.content.contains(AGENTS_MESSAGE_PREFIX))
+        );
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        fs::remove_dir_all(profile_dir).expect("remove profile directory");
+    }
+
+    #[test]
     fn discover_skills_reports_non_directory_paths() {
         let profile_dir = env::temp_dir().join(unique_id("foco-skill-file-path-test"));
         let skill_path = profile_dir.join("skills");
@@ -4675,6 +4880,22 @@ description: Project memory.
             name: id.to_string(),
             description: "Test skill.".to_string(),
             path: env::temp_dir().join(id).join("SKILL.md"),
+        }
+    }
+
+    fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
+        let (terminal_shutdown_tx, _) = broadcast::channel(1);
+        let mcp_registry = Arc::new(McpRegistry::default());
+
+        AppState {
+            config: Arc::new(Mutex::new(config)),
+            config_file: user_profile_dir.join(".foco").join("config.json"),
+            model_metadata_file: user_profile_dir.join(".foco").join("models.dev.json"),
+            user_profile_dir,
+            terminal_registry: terminal::TerminalRegistry::default(),
+            terminal_shutdown_tx,
+            mcp_registry,
+            _code_graph_watchers: Arc::new(Vec::new()),
         }
     }
 }
