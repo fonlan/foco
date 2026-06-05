@@ -40,6 +40,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -335,6 +336,7 @@ type SettingsSection = "general" | "mcp" | "models" | "providers" | "skills";
 type ViewMode = "chat" | "settings" | "stats";
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
+const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
 
 type Translate = (key: string, values?: Record<string, string | number>) => string;
 
@@ -1708,6 +1710,7 @@ export function App() {
             <ChatPanel
               availableModels={availableModels}
               branchError={branchError}
+              chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
               draftMessage={draftMessage}
               gitBranches={gitBranches}
               isLoadingSettings={isLoadingSettings}
@@ -2049,6 +2052,7 @@ function GitBranchDialog({
 function ChatPanel({
   availableModels,
   branchError,
+  chatScrollKey,
   canRetryRun,
   draftMessage,
   gitBranches,
@@ -2074,6 +2078,7 @@ function ChatPanel({
 }: {
   availableModels: ConfiguredModelSummary[];
   branchError: string | null;
+  chatScrollKey: string;
   canRetryRun: boolean;
   draftMessage: string;
   gitBranches: GitBranchesResponse | null;
@@ -2098,6 +2103,10 @@ function ChatPanel({
   thinkingLevels: ThinkingLevelSummary[];
 }) {
   const { t } = useI18n();
+  const messageScrollRef = useRef<HTMLDivElement>(null);
+  const messageScrollContentRef = useRef<HTMLDivElement>(null);
+  const messageScrollEndRef = useRef<HTMLDivElement>(null);
+  const shouldLockMessageScrollRef = useRef(true);
   const skillQuery = activeSkillQuery(draftMessage);
   const selectedSkillSet = new Set(selectedSkillIds);
   const selectedSkills = selectedSkillIds
@@ -2116,6 +2125,55 @@ function ChatPanel({
           );
         });
 
+  function scrollMessageListToBottom() {
+    messageScrollEndRef.current?.scrollIntoView({
+      block: "end",
+      inline: "nearest",
+    });
+  }
+
+  useLayoutEffect(() => {
+    shouldLockMessageScrollRef.current = true;
+    scrollMessageListToBottom();
+  }, [chatScrollKey]);
+
+  useLayoutEffect(() => {
+    if (!shouldLockMessageScrollRef.current) {
+      return;
+    }
+
+    scrollMessageListToBottom();
+  }, [messages]);
+
+  useLayoutEffect(() => {
+    const container = messageScrollRef.current;
+    const content = messageScrollContentRef.current;
+    if (!container || !content) {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      if (shouldLockMessageScrollRef.current) {
+        scrollMessageListToBottom();
+      }
+    });
+    observer.observe(container);
+    observer.observe(content);
+
+    return () => observer.disconnect();
+  }, []);
+
+  function handleMessageScroll() {
+    const element = messageScrollRef.current;
+    if (!element) {
+      return;
+    }
+
+    shouldLockMessageScrollRef.current =
+      element.scrollHeight - element.scrollTop - element.clientHeight <=
+      CHAT_BOTTOM_LOCK_THRESHOLD_PX;
+  }
+
   function handleSkillSelect(skill: ConfiguredSkillSummary) {
     if (!skill.enabled) {
       return;
@@ -2127,8 +2185,15 @@ function ChatPanel({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-      <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4">
-        <div className="mx-auto flex w-full max-w-5xl flex-col gap-4">
+      <div
+        className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4"
+        onScroll={handleMessageScroll}
+        ref={messageScrollRef}
+      >
+        <div
+          className="mx-auto flex w-full max-w-5xl flex-col gap-4"
+          ref={messageScrollContentRef}
+        >
           {messages.length ? (
             messages.map((message) => {
             const isUser = message.role === "user";
@@ -2196,6 +2261,7 @@ function ChatPanel({
             </div>
           )}
         </div>
+        <div aria-hidden="true" className="h-px" ref={messageScrollEndRef} />
       </div>
 
       <div className="shrink-0 border-t border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-5">
