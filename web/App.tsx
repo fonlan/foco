@@ -2574,47 +2574,59 @@ function ToolCallList({ toolCalls }: { toolCalls: ChatToolCallSummary[] }) {
 
   return (
     <div className="space-y-2 border-t border-stone-200 pt-2">
-      {toolCalls.map((toolCall) => (
-        <details className="group min-w-0" key={toolCall.id}>
-          <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-semibold text-stone-700 marker:hidden">
-            <Wrench aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-            <span className="min-w-0 flex-1 truncate">{toolCall.name}</span>
-            <span
-              className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] ${
-                toolCall.isError
-                  ? "bg-rose-50 text-rose-700"
-                  : "bg-stone-100 text-stone-600"
-              }`}
-            >
-              {toolStatusText(toolCall, t)}
-            </span>
-          </summary>
-          <div className="mt-2 grid gap-2 text-xs text-stone-600">
-            <div className="min-w-0">
-              <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
-              <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
-                {formatJsonValue(toolCall.input)}
-              </pre>
-            </div>
-            {toolCall.output !== null ? (
-              <div className="min-w-0">
-                <div className="mb-1 font-semibold text-stone-500">
-                  {t("Output")}
-                </div>
-                <pre
-                  className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
-                    toolCall.isError
-                      ? "border-rose-200 text-rose-700"
-                      : "border-stone-200"
-                  }`}
+      {toolCalls.map((toolCall) => {
+        const detailText = toolCallDetailText(toolCall);
+
+        return (
+          <details className="group min-w-0" key={toolCall.id}>
+            <summary className="flex cursor-pointer list-none items-start gap-2 text-xs font-semibold text-stone-700 marker:hidden">
+              <Wrench aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-teal-700" />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate">{toolCall.name}</span>
+                <span
+                  className="mt-0.5 block truncate font-mono text-[11px] font-medium leading-4 text-stone-500"
+                  title={detailText}
                 >
-                  {formatJsonValue(toolCall.output)}
+                  {detailText}
+                </span>
+              </span>
+              <span
+                className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] ${
+                  toolCall.isError
+                    ? "bg-rose-50 text-rose-700"
+                    : "bg-stone-100 text-stone-600"
+                }`}
+              >
+                {toolStatusText(toolCall, t)}
+              </span>
+            </summary>
+            <div className="mt-2 grid gap-2 text-xs text-stone-600">
+              <div className="min-w-0">
+                <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
+                <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
+                  {formatJsonValue(toolCall.input)}
                 </pre>
               </div>
-            ) : null}
-          </div>
-        </details>
-      ))}
+              {toolCall.output !== null ? (
+                <div className="min-w-0">
+                  <div className="mb-1 font-semibold text-stone-500">
+                    {t("Output")}
+                  </div>
+                  <pre
+                    className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
+                      toolCall.isError
+                        ? "border-rose-200 text-rose-700"
+                        : "border-stone-200"
+                    }`}
+                  >
+                    {formatJsonValue(toolCall.output)}
+                  </pre>
+                </div>
+              ) : null}
+            </div>
+          </details>
+        );
+      })}
     </div>
   );
 }
@@ -5434,6 +5446,81 @@ function toolStatusText(toolCall: ChatToolCallSummary, t: Translate) {
   }
 
   return toolCall.status;
+}
+
+function toolCallDetailText(toolCall: ChatToolCallSummary) {
+  const input = toolCall.input;
+
+  if (!isObjectRecord(input)) {
+    return compactToolJson(input);
+  }
+
+  if (toolCall.name === "run_command") {
+    const command = textField(input, "command");
+    const args = stringArrayField(input, "args") ?? [];
+    const cwd = textField(input, "cwd");
+
+    if (command) {
+      const fullCommand = [command, ...args].map(formatCommandPart).join(" ");
+      return compactToolText(cwd && cwd !== "." ? `${fullCommand} | cwd: ${cwd}` : fullCommand);
+    }
+  }
+
+  const parts = [
+    textField(input, "path"),
+    textField(input, "query"),
+    textField(input, "symbol"),
+    numberTextField(input, "symbolId", "symbol_id"),
+    numberTextField(input, "durationMs", "duration_ms"),
+  ].filter(Boolean);
+  const pathIndex = parts.findIndex((part) => part === textField(input, "path"));
+  const startLine = numberTextField(input, "startLine", "start_line");
+  const endLine = numberTextField(input, "endLine", "end_line");
+
+  if (pathIndex !== -1 && startLine && endLine) {
+    parts[pathIndex] = `${parts[pathIndex]}:${startLine}-${endLine}`;
+  }
+
+  return parts.length ? compactToolText(parts.join(" | ")) : compactToolJson(input);
+}
+
+function textField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
+  const field = fieldValue(value, camelName, snakeName);
+  return typeof field === "string" ? field : null;
+}
+
+function numberTextField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
+  const field = fieldValue(value, camelName, snakeName);
+  return typeof field === "number" ? String(field) : null;
+}
+
+function stringArrayField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
+  const field = fieldValue(value, camelName, snakeName);
+
+  if (field === null || typeof field === "undefined") {
+    return null;
+  }
+
+  return Array.isArray(field) && field.every((item) => typeof item === "string")
+    ? field
+    : null;
+}
+
+function formatCommandPart(value: string) {
+  if (value === "") {
+    return '""';
+  }
+
+  return /^[A-Za-z0-9_./:=@%+,\-\\]+$/.test(value) ? value : JSON.stringify(value);
+}
+
+function compactToolJson(value: JsonValue) {
+  return compactToolText(JSON.stringify(value));
+}
+
+function compactToolText(value: string) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
 }
 
 function formatJsonValue(value: JsonValue) {
