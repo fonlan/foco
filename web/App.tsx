@@ -3799,8 +3799,12 @@ function SettingsPanel({
 
   return (
     <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
-      <div className="mx-auto grid max-w-7xl gap-4 lg:grid-cols-[4.5rem_minmax(0,1fr)]">
-        <aside className="flex gap-2 rounded-2xl border border-stone-200 bg-white/85 p-2 shadow-[0_18px_42px_rgba(75,63,42,0.07)] lg:flex-col lg:self-start">
+      <div className="mx-auto grid max-w-7xl gap-4 lg:grid-cols-[13rem_minmax(0,1fr)]">
+        <aside className="rounded-2xl border border-stone-200 bg-white/85 p-2 shadow-[0_18px_42px_rgba(75,63,42,0.07)] lg:self-start">
+          <nav
+            aria-label={t("Settings")}
+            className="flex flex-col gap-1.5"
+          >
           <SettingsNavButton
             active={activeSection === "general"}
             icon={Globe}
@@ -3831,6 +3835,7 @@ function SettingsPanel({
             label={t("Skills")}
             onClick={() => setActiveSection("skills")}
           />
+          </nav>
         </aside>
 
         <div className="min-w-0 flex flex-col gap-5">
@@ -3877,7 +3882,7 @@ function SettingsPanel({
         ) : null}
 
         {activeSection === "general" ? (
-        <section className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <section className="grid gap-4">
           <form
             className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
             onSubmit={(event) => void saveGeneralSettings(event)}
@@ -3888,7 +3893,7 @@ function SettingsPanel({
                 {t("Web service")}
               </h3>
             </div>
-            <div className="mt-4 grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem]">
+            <div className="mt-4 grid gap-3">
               <TextField
                 label={t("Listen host")}
                 onChange={(value) =>
@@ -3992,7 +3997,7 @@ function SettingsPanel({
         ) : null}
 
         {activeSection === "providers" ? (
-        <section className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <section className="grid gap-4">
           {isProviderDialogOpen ? (
           <>
           <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
@@ -4576,7 +4581,7 @@ function SettingsPanel({
         ) : null}
 
         {activeSection === "skills" ? (
-        <section className="grid gap-4 xl:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+        <section className="grid gap-4">
           <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
             <div className="flex items-center gap-2">
               <Wrench aria-hidden="true" className="size-5 text-teal-700" />
@@ -5237,7 +5242,8 @@ function SettingsNavButton({
   return (
     <button
       aria-label={label}
-      className={`inline-flex size-10 items-center justify-center rounded-xl ${
+      aria-current={active ? "page" : undefined}
+      className={`inline-flex h-10 w-full min-w-0 items-center gap-2 rounded-lg px-3 text-left text-sm font-semibold ${
         active
           ? "bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]"
           : "text-stone-600 hover:bg-stone-100 hover:text-stone-950"
@@ -5246,7 +5252,8 @@ function SettingsNavButton({
       title={label}
       type="button"
     >
-      <Icon aria-hidden="true" className="size-4" />
+      <Icon aria-hidden="true" className="size-4 shrink-0" />
+      <span className="min-w-0 truncate">{label}</span>
     </button>
   );
 }
