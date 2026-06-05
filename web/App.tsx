@@ -8,6 +8,7 @@ import {
   CircleAlert,
   Folder,
   FolderPlus,
+  GitBranch,
   GitCompare,
   Globe,
   KeyRound,
@@ -34,6 +35,7 @@ import {
   CSSProperties,
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -305,6 +307,8 @@ type WorkspaceFormMode = "add" | "create";
 type SettingsSection = "mcp" | "models" | "providers" | "skills";
 type ViewMode = "chat" | "settings" | "stats";
 
+const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
+
 type GitStatusFileSummary = {
   path: string;
   indexStatus: string;
@@ -317,6 +321,12 @@ type GitDiffResponse = {
   diff: string;
   stagedDiff: string;
   files: GitStatusFileSummary[];
+};
+
+type GitBranchesResponse = {
+  isGitRepository: boolean;
+  currentBranch: string | null;
+  branches: string[];
 };
 
 type TerminalSessionResponse = {
@@ -347,6 +357,7 @@ type RetryRunRequest = {
   content: string;
   modelId: string;
   thinkingLevel: string;
+  skillIds: string[];
 };
 
 export function App() {
@@ -366,6 +377,14 @@ export function App() {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
+  const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
+  const [gitBranches, setGitBranches] = useState<GitBranchesResponse | null>(null);
+  const [selectedGitBranch, setSelectedGitBranch] = useState("");
+  const [isLoadingBranches, setIsLoadingBranches] = useState(false);
+  const [branchError, setBranchError] = useState<string | null>(null);
+  const [isBranchDialogOpen, setIsBranchDialogOpen] = useState(false);
+  const [newBranchName, setNewBranchName] = useState("");
+  const [isSavingBranch, setIsSavingBranch] = useState(false);
   const [isDiffPanelOpen, setIsDiffPanelOpen] = useState(false);
   const [diffPanelWidth, setDiffPanelWidth] = useState(400);
   const [isResizingDiffPanel, setIsResizingDiffPanel] = useState(false);
@@ -403,6 +422,10 @@ export function App() {
           model.activeProviderId !== null &&
           model.providerIds.length > 0,
       ),
+    [settings],
+  );
+  const detectedSkills = useMemo(
+    () => settings?.skills.detected ?? [],
     [settings],
   );
   const thinkingLevels = settings?.thinkingLevels ?? [];
@@ -476,6 +499,25 @@ export function App() {
     }
   }, []);
 
+  const loadGitBranches = useCallback(async (workspaceId: string) => {
+    setIsLoadingBranches(true);
+    setBranchError(null);
+
+    try {
+      const data = await requestJson<GitBranchesResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/git/branches`,
+      );
+      setGitBranches(data);
+      setSelectedGitBranch(data.currentBranch ?? "");
+    } catch (requestError) {
+      setGitBranches(null);
+      setSelectedGitBranch("");
+      setBranchError(errorMessage(requestError));
+    } finally {
+      setIsLoadingBranches(false);
+    }
+  }, []);
+
   useEffect(() => {
     void refreshWorkspaces();
   }, [refreshWorkspaces]);
@@ -498,6 +540,17 @@ export function App() {
 
     void loadGitDiff(activeWorkspace.id, selectedDiffPath);
   }, [activeWorkspace?.id, isDiffPanelOpen, loadGitDiff, selectedDiffPath]);
+
+  useEffect(() => {
+    if (!activeWorkspace?.id) {
+      setGitBranches(null);
+      setSelectedGitBranch("");
+      setBranchError(null);
+      return;
+    }
+
+    void loadGitBranches(activeWorkspace.id);
+  }, [activeWorkspace?.id, loadGitBranches]);
 
   useEffect(() => {
     if (!isResizingDiffPanel) {
@@ -562,6 +615,17 @@ export function App() {
     );
     setSelectedThinkingLevel(selectedModel?.thinkingLevel ?? "");
   }, [availableModels, selectedModelId]);
+
+  useEffect(() => {
+    const enabledSkillIds = new Set(
+      detectedSkills.filter((skill) => skill.enabled).map((skill) => skill.id),
+    );
+
+    setSelectedSkillIds((current) => {
+      const next = current.filter((skillId) => enabledSkillIds.has(skillId));
+      return next.length === current.length ? current : next;
+    });
+  }, [detectedSkills]);
 
   async function handleWorkspaceSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -681,6 +745,100 @@ export function App() {
     });
   }
 
+  function toggleSelectedSkill(skillId: string) {
+    setSelectedSkillIds((current) =>
+      current.includes(skillId)
+        ? current.filter((id) => id !== skillId)
+        : [...current, skillId],
+    );
+  }
+
+  function removeSelectedSkill(skillId: string) {
+    setSelectedSkillIds((current) => current.filter((id) => id !== skillId));
+  }
+
+  async function handleGitBranchChange(branch: string) {
+    if (branch === CREATE_BRANCH_OPTION_VALUE) {
+      setNewBranchName("");
+      setBranchError(null);
+      setIsBranchDialogOpen(true);
+      return;
+    }
+
+    if (!activeWorkspace || !gitBranches?.isGitRepository || !branch) {
+      return;
+    }
+
+    if (branch === selectedGitBranch) {
+      return;
+    }
+
+    setIsLoadingBranches(true);
+    setBranchError(null);
+
+    try {
+      const data = await requestJson<GitBranchesResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/branches/switch`,
+        {
+          body: JSON.stringify({ name: branch }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setGitBranches(data);
+      setSelectedGitBranch(data.currentBranch ?? "");
+
+      if (isDiffPanelOpen) {
+        void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+      }
+    } catch (requestError) {
+      setBranchError(errorMessage(requestError));
+    } finally {
+      setIsLoadingBranches(false);
+    }
+  }
+
+  async function handleCreateGitBranch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!activeWorkspace) {
+      setBranchError("Select a workspace before creating a branch.");
+      return;
+    }
+
+    const branch = newBranchName.trim();
+    if (!branch) {
+      setBranchError("Git branch name must not be empty.");
+      return;
+    }
+
+    setIsSavingBranch(true);
+    setBranchError(null);
+
+    try {
+      const data = await requestJson<GitBranchesResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/branches/create`,
+        {
+          body: JSON.stringify({ name: branch }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setGitBranches(data);
+      setSelectedGitBranch(data.currentBranch ?? "");
+      setNewBranchName("");
+      setIsBranchDialogOpen(false);
+
+      if (isDiffPanelOpen) {
+        void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+      }
+    } catch (requestError) {
+      setBranchError(errorMessage(requestError));
+    } finally {
+      setIsSavingBranch(false);
+    }
+  }
+
   async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -703,6 +861,7 @@ export function App() {
       chatId: activeChatId,
       content,
       modelId: selectedModelId,
+      skillIds: selectedSkillIds,
       thinkingLevel: selectedThinkingLevel,
       workspaceId: activeWorkspace.id,
     });
@@ -717,6 +876,7 @@ export function App() {
     setActiveWorkspaceId(retryRequest.workspaceId);
     setActiveChatId(retryRequest.chatId);
     setSelectedModelId(retryRequest.modelId);
+    setSelectedSkillIds(retryRequest.skillIds);
     setSelectedThinkingLevel(retryRequest.thinkingLevel);
     await runChatMessage(retryRequest);
   }
@@ -780,6 +940,7 @@ export function App() {
             chatId: request.chatId,
             message: request.content,
             modelId: request.modelId,
+            skillIds: request.skillIds.length ? request.skillIds : null,
             thinkingLevel: request.thinkingLevel || null,
           }),
           cache: "no-store",
@@ -1250,19 +1411,28 @@ export function App() {
           {viewMode === "chat" ? (
             <ChatPanel
               availableModels={availableModels}
+              branchError={branchError}
               draftMessage={draftMessage}
+              gitBranches={gitBranches}
               isLoadingSettings={isLoadingSettings}
+              isLoadingBranches={isLoadingBranches}
               isSendingMessage={isSendingMessage}
               messages={messages}
+              onBranchChange={(branch) => void handleGitBranchChange(branch)}
               onDraftMessageChange={setDraftMessage}
               onCancelRun={handleCancelRun}
               onModelChange={setSelectedModelId}
+              onRemoveSkill={removeSelectedSkill}
               onRetryRun={() => void handleRetryRun()}
               onSubmit={handleSendMessage}
               onThinkingLevelChange={setSelectedThinkingLevel}
+              onToggleSkill={toggleSelectedSkill}
               canRetryRun={retryRunRequest !== null && !isSendingMessage}
+              selectedGitBranch={selectedGitBranch}
               selectedModelId={selectedModelId}
+              selectedSkillIds={selectedSkillIds}
               selectedThinkingLevel={selectedThinkingLevel}
+              skills={detectedSkills}
               thinkingLevels={thinkingLevels}
             />
           ) : viewMode === "settings" ? (
@@ -1315,6 +1485,16 @@ export function App() {
           onPathChange={setWorkspacePath}
           onSubmit={handleWorkspaceSubmit}
           path={workspacePath}
+        />
+      ) : null}
+      {isBranchDialogOpen ? (
+        <GitBranchDialog
+          branchName={newBranchName}
+          error={branchError}
+          isSaving={isSavingBranch}
+          onBranchNameChange={setNewBranchName}
+          onClose={() => setIsBranchDialogOpen(false)}
+          onSubmit={handleCreateGitBranch}
         />
       ) : null}
     </main>
@@ -1467,39 +1647,182 @@ function WorkspaceDialog({
   );
 }
 
+function GitBranchDialog({
+  branchName,
+  error,
+  isSaving,
+  onBranchNameChange,
+  onClose,
+  onSubmit,
+}: {
+  branchName: string;
+  error: string | null;
+  isSaving: boolean;
+  onBranchNameChange: (value: string) => void;
+  onClose: () => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
+      role="presentation"
+    >
+      <section
+        aria-labelledby="git-branch-dialog-title"
+        aria-modal="true"
+        className="w-full max-w-md overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        role="dialog"
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <GitBranch aria-hidden="true" className="size-5 text-teal-700" />
+            <h2
+              className="truncate text-base font-semibold text-stone-950"
+              id="git-branch-dialog-title"
+            >
+              New branch
+            </h2>
+          </div>
+          <button
+            aria-label="Close branch dialog"
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            onClick={onClose}
+            title="Close"
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+        <form className="space-y-4 px-4 py-4" onSubmit={onSubmit}>
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+              Branch name
+            </span>
+            <input
+              autoComplete="off"
+              className="h-11 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+              name="git-branch-name"
+              onChange={(event) => onBranchNameChange(event.target.value)}
+              placeholder="feature/name"
+              value={branchName}
+            />
+          </label>
+          {error ? (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              {error}
+            </div>
+          ) : null}
+          <div className="flex justify-end gap-2">
+            <button
+              aria-label="Cancel branch creation"
+              className="inline-flex size-11 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+              onClick={onClose}
+              title="Cancel"
+              type="button"
+            >
+              <X aria-hidden="true" className="size-4" />
+            </button>
+            <button
+              aria-label="Create branch"
+              className="inline-flex size-11 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+              disabled={isSaving || !branchName.trim()}
+              title="Create branch"
+              type="submit"
+            >
+              {isSaving ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="size-4 animate-spin"
+                />
+              ) : (
+                <Plus aria-hidden="true" className="size-4" />
+              )}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
 function ChatPanel({
   availableModels,
+  branchError,
   canRetryRun,
   draftMessage,
+  gitBranches,
+  isLoadingBranches,
   isLoadingSettings,
   isSendingMessage,
   messages,
+  onBranchChange,
   onCancelRun,
   onDraftMessageChange,
   onModelChange,
+  onRemoveSkill,
   onRetryRun,
   onSubmit,
   onThinkingLevelChange,
+  onToggleSkill,
+  selectedGitBranch,
   selectedModelId,
+  selectedSkillIds,
   selectedThinkingLevel,
+  skills,
   thinkingLevels,
 }: {
   availableModels: ConfiguredModelSummary[];
+  branchError: string | null;
   canRetryRun: boolean;
   draftMessage: string;
+  gitBranches: GitBranchesResponse | null;
+  isLoadingBranches: boolean;
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
   messages: ShellMessage[];
+  onBranchChange: (value: string) => void;
   onCancelRun: () => void;
   onDraftMessageChange: (value: string) => void;
   onModelChange: (value: string) => void;
+  onRemoveSkill: (skillId: string) => void;
   onRetryRun: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onThinkingLevelChange: (value: string) => void;
+  onToggleSkill: (skillId: string) => void;
+  selectedGitBranch: string;
   selectedModelId: string;
+  selectedSkillIds: string[];
   selectedThinkingLevel: string;
+  skills: ConfiguredSkillSummary[];
   thinkingLevels: ThinkingLevelSummary[];
 }) {
+  const skillQuery = activeSkillQuery(draftMessage);
+  const selectedSkillSet = new Set(selectedSkillIds);
+  const selectedSkills = selectedSkillIds
+    .map((skillId) => skills.find((skill) => skill.id === skillId))
+    .filter((skill): skill is ConfiguredSkillSummary => Boolean(skill));
+  const visibleSkills =
+    skillQuery === null
+      ? []
+      : skills.filter((skill) => {
+          const query = skillQuery.toLowerCase();
+          return (
+            !selectedSkillSet.has(skill.id) &&
+            (skill.name.toLowerCase().includes(query) ||
+              skill.id.toLowerCase().includes(query) ||
+              skill.description.toLowerCase().includes(query))
+          );
+        });
+
+  function handleSkillSelect(skill: ConfiguredSkillSummary) {
+    if (!skill.enabled) {
+      return;
+    }
+
+    onDraftMessageChange(removeActiveSkillToken(draftMessage));
+    onToggleSkill(skill.id);
+  }
+
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4">
@@ -1575,9 +1898,31 @@ function ChatPanel({
 
       <div className="shrink-0 border-t border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-5">
         <form className="mx-auto max-w-5xl" onSubmit={onSubmit}>
-          <div className="relative">
+          <div className="relative rounded-xl border border-stone-300 bg-white">
+            {selectedSkills.length ? (
+              <div className="flex flex-wrap gap-1.5 px-3 pt-2">
+                {selectedSkills.map((skill) => (
+                  <span
+                    className="inline-flex max-w-full items-center gap-1 rounded-full border border-teal-200 bg-teal-50 px-2 py-1 text-xs font-semibold text-teal-900"
+                    key={skill.id}
+                  >
+                    <span className="max-w-44 truncate">{skill.name}</span>
+                    <button
+                      aria-label={`Remove skill ${skill.name}`}
+                      className="inline-flex size-4 items-center justify-center rounded-full text-teal-800 hover:bg-teal-100"
+                      disabled={isSendingMessage}
+                      onClick={() => onRemoveSkill(skill.id)}
+                      title="Remove skill"
+                      type="button"
+                    >
+                      <X aria-hidden="true" className="size-3" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            ) : null}
             <textarea
-              className="min-h-20 w-full resize-none rounded-xl border border-stone-300 bg-white px-3 py-2 pb-10 pr-14 text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+              className="message-composer-textarea min-h-24 w-full resize-none border-0 bg-transparent px-3 py-2 text-sm leading-6 text-stone-900 outline-none placeholder:text-stone-400"
               disabled={isSendingMessage}
               name="message"
               onChange={(event) => onDraftMessageChange(event.target.value)}
@@ -1596,68 +1941,85 @@ function ChatPanel({
               placeholder="Message Foco"
               value={draftMessage}
             />
-            {isSendingMessage ? (
-              <button
-                aria-label="Cancel run"
-                className="absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
-                onClick={onCancelRun}
-                title="Cancel run"
-                type="button"
-              >
-                <X aria-hidden="true" className="size-5" />
-              </button>
-            ) : (
-              <button
-                aria-label="Send message"
-                className="absolute bottom-2 right-2 inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-                disabled={!draftMessage.trim() || !selectedModelId}
-                title="Send"
-                type="submit"
-              >
-                <Send aria-hidden="true" className="size-5" />
-              </button>
-            )}
-          </div>
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            <label className="min-w-0 flex-1 sm:max-w-64">
-              <span className="sr-only">
-                Model
-              </span>
-              <select
-                className="h-8 w-full rounded-lg border border-stone-300 bg-white px-2 text-xs font-medium text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                disabled={isLoadingSettings || isSendingMessage}
-                onChange={(event) => onModelChange(event.target.value)}
-                value={selectedModelId}
-              >
-                {availableModels.length ? (
-                  availableModels.map((model) => (
-                    <option key={model.id} value={model.id}>
-                      {model.displayName}
+            {skillQuery !== null ? (
+              <div className="absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
+                <div className="panel-scroll max-h-64 overflow-y-auto py-1">
+                  {visibleSkills.length ? (
+                    visibleSkills.map((skill) => (
+                      <button
+                        aria-label={`Select skill ${skill.name}`}
+                        className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-left hover:bg-stone-50 disabled:cursor-not-allowed disabled:bg-stone-50 disabled:text-stone-400"
+                        disabled={!skill.enabled || isSendingMessage}
+                        key={skill.id}
+                        onClick={() => handleSkillSelect(skill)}
+                        title={skill.enabled ? skill.description : "Skill is disabled"}
+                        type="button"
+                      >
+                        <span className="min-w-0">
+                          <span className="block truncate text-sm font-semibold text-stone-900">
+                            {skill.name}
+                          </span>
+                          <span className="mt-0.5 block truncate text-xs text-stone-500">
+                            {skill.description}
+                          </span>
+                        </span>
+                        <span className="self-center rounded-md border border-stone-200 px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
+                          {skill.enabled ? skill.id : "disabled"}
+                        </span>
+                      </button>
+                    ))
+                  ) : (
+                    <div className="px-3 py-3 text-sm text-stone-500">
+                      No matching skills
+                    </div>
+                  )}
+                </div>
+              </div>
+            ) : null}
+            <div className="flex flex-wrap items-center gap-2 border-t border-stone-100 px-2 py-2">
+              <label className="min-w-36 flex-1 sm:max-w-64">
+                <span className="sr-only">Model</span>
+                <select
+                  className="h-8 w-full rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  disabled={isLoadingSettings || isSendingMessage}
+                  onChange={(event) => onModelChange(event.target.value)}
+                  value={selectedModelId}
+                >
+                  {availableModels.length ? (
+                    availableModels.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.displayName}
+                      </option>
+                    ))
+                  ) : (
+                    <option value="">No enabled models</option>
+                  )}
+                </select>
+              </label>
+              <label className="w-36 max-w-full">
+                <span className="sr-only">Thinking</span>
+                <select
+                  className="h-8 w-full rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  disabled={isSendingMessage}
+                  onChange={(event) => onThinkingLevelChange(event.target.value)}
+                  value={selectedThinkingLevel}
+                >
+                  <option value="">Model default</option>
+                  {thinkingLevels.map((level) => (
+                    <option key={level.value} value={level.value}>
+                      {level.label}
                     </option>
-                  ))
-                ) : (
-                  <option value="">No enabled models</option>
-                )}
-              </select>
-            </label>
-            <label className="w-36 max-w-full">
-              <span className="sr-only">
-                Thinking
-              </span>
-              <select
-                className="h-8 w-full rounded-lg border border-stone-300 bg-white px-2 text-xs font-medium text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                disabled={isSendingMessage}
-                onChange={(event) => onThinkingLevelChange(event.target.value)}
-                value={selectedThinkingLevel}
-              >
-                <option value="">Model default</option>
-                {thinkingLevels.map((level) => (
-                  <option key={level.value} value={level.value}>
-                    {level.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+                  ))}
+                </select>
+              </label>
+              <BranchSelector
+                branches={gitBranches?.branches ?? []}
+                currentBranch={selectedGitBranch}
+                disabled={isSendingMessage || isLoadingBranches}
+                isGitRepository={gitBranches?.isGitRepository ?? false}
+                isLoading={isLoadingBranches}
+                onChange={onBranchChange}
+              />
             {canRetryRun ? (
               <button
                 aria-label="Retry last run"
@@ -1669,10 +2031,127 @@ function ChatPanel({
                 <RefreshCw aria-hidden="true" className="size-4" />
               </button>
             ) : null}
+              {isSendingMessage ? (
+                <button
+                  aria-label="Cancel run"
+                  className="ml-auto inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                  onClick={onCancelRun}
+                  title="Cancel run"
+                  type="button"
+                >
+                  <X aria-hidden="true" className="size-4" />
+                </button>
+              ) : (
+                <button
+                  aria-label="Send message"
+                  className="ml-auto inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                  disabled={!draftMessage.trim() || !selectedModelId}
+                  title="Send"
+                  type="submit"
+                >
+                  <Send aria-hidden="true" className="size-4" />
+                </button>
+              )}
           </div>
+          </div>
+          {branchError ? (
+            <div className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              {branchError}
+            </div>
+          ) : null}
         </form>
       </div>
     </div>
+  );
+}
+
+function BranchSelector({
+  branches,
+  currentBranch,
+  disabled,
+  isGitRepository,
+  isLoading,
+  onChange,
+}: {
+  branches: string[];
+  currentBranch: string;
+  disabled: boolean;
+  isGitRepository: boolean;
+  isLoading: boolean;
+  onChange: (value: string) => void;
+}) {
+  if (!isGitRepository) {
+    return (
+      <div
+        aria-label="Git branch"
+        className="inline-flex h-8 w-44 max-w-full items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-400"
+      >
+        <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
+        <span className="min-w-0 flex-1 truncate" />
+      </div>
+    );
+  }
+
+  function handleSelect(value: string, event: ReactMouseEvent<HTMLButtonElement>) {
+    event.currentTarget.closest("details")?.removeAttribute("open");
+    onChange(value);
+  }
+
+  return (
+    <details className="group relative">
+      <summary
+        className={`flex h-8 w-44 max-w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${
+          disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
+        }`}
+        title="Git branch"
+      >
+        <GitBranch aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <span className="min-w-0 flex-1 truncate">{currentBranch}</span>
+        {isLoading ? (
+          <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+        ) : (
+          <ChevronDown aria-hidden="true" className="size-3.5" />
+        )}
+      </summary>
+      <div className="absolute bottom-full left-0 z-20 mb-2 w-64 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
+        <div className="panel-scroll max-h-52 overflow-y-auto py-1">
+          {branches.length ? (
+            branches.map((branch) => (
+              <button
+                aria-label={`Switch to branch ${branch}`}
+                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 ${
+                  branch === currentBranch
+                    ? "font-semibold text-teal-900"
+                    : "text-stone-700"
+                }`}
+                key={branch}
+                onClick={(event) => handleSelect(branch, event)}
+                type="button"
+              >
+                <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
+                <span className="min-w-0 flex-1 truncate">{branch}</span>
+                {branch === currentBranch ? (
+                  <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
+                ) : null}
+              </button>
+            ))
+          ) : (
+            <div className="px-3 py-3 text-sm text-stone-500">No branches</div>
+          )}
+        </div>
+        <div className="border-t border-stone-100 bg-white p-1.5">
+          <button
+            aria-label="Create git branch"
+            className="flex h-9 w-full items-center gap-2 rounded-lg px-2 text-sm font-semibold text-teal-800 hover:bg-teal-50"
+            onClick={(event) => handleSelect(CREATE_BRANCH_OPTION_VALUE, event)}
+            type="button"
+          >
+            <Plus aria-hidden="true" className="size-4" />
+            <span className="min-w-0 flex-1 text-left">New branch</span>
+          </button>
+        </div>
+      </div>
+    </details>
   );
 }
 
@@ -4200,6 +4679,15 @@ function slugId(value: string) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+function activeSkillQuery(value: string) {
+  const match = /(^|\s)\/([^\s/]*)$/.exec(value);
+  return match ? match[2] : null;
+}
+
+function removeActiveSkillToken(value: string) {
+  return value.replace(/(^|\s)\/[^\s/]*$/, (_match, prefix: string) => prefix);
 }
 
 function uniqueString(value: string, index: number, values: string[]) {

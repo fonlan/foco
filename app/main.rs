@@ -165,6 +165,18 @@ async fn run() -> AppResult<()> {
         .route("/api/workspaces/{workspace_id}/git/status", get(git_status))
         .route("/api/workspaces/{workspace_id}/git/diff", get(git_diff))
         .route(
+            "/api/workspaces/{workspace_id}/git/branches",
+            get(git_branches),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/git/branches/switch",
+            post(switch_git_branch),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/git/branches/create",
+            post(create_git_branch),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/terminal/session",
             post(create_terminal_session),
         )
@@ -934,6 +946,54 @@ async fn git_diff(
     }))
 }
 
+async fn git_branches(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<GitBranchesResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+
+    if !is_git_workspace(&workspace.path)? {
+        return Ok(Json(GitBranchesResponse {
+            is_git_repository: false,
+            current_branch: None,
+            branches: Vec::new(),
+        }));
+    }
+
+    Ok(Json(git_branches_response(&workspace.path)?))
+}
+
+async fn switch_git_branch(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<GitBranchRequest>,
+) -> Result<Json<GitBranchesResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let branch = validate_git_branch_name(&workspace.path, request.name)?;
+
+    ensure_git_workspace(&workspace.path)?;
+    run_git_command(&workspace.path, &["switch", &branch])?;
+
+    Ok(Json(git_branches_response(&workspace.path)?))
+}
+
+async fn create_git_branch(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<GitBranchRequest>,
+) -> Result<Json<GitBranchesResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let branch = validate_git_branch_name(&workspace.path, request.name)?;
+
+    ensure_git_workspace(&workspace.path)?;
+    run_git_command(&workspace.path, &["switch", "-c", &branch])?;
+
+    Ok(Json(git_branches_response(&workspace.path)?))
+}
+
 async fn create_terminal_session(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
@@ -1083,6 +1143,7 @@ struct ChatStreamRequest {
     chat_id: Option<String>,
     model_id: String,
     thinking_level: Option<String>,
+    skill_ids: Option<Vec<String>>,
     message: String,
 }
 
@@ -1090,6 +1151,12 @@ struct ChatStreamRequest {
 #[serde(rename_all = "camelCase")]
 struct GitDiffQuery {
     path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitBranchRequest {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -1282,6 +1349,14 @@ struct GitDiffResponse {
     diff: String,
     staged_diff: String,
     files: Vec<GitStatusFileSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitBranchesResponse {
+    is_git_repository: bool,
+    current_branch: Option<String>,
+    branches: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1890,6 +1965,7 @@ async fn prepare_chat_context(
     let message = request.message.trim();
     let model_id = request.model_id.trim();
     let thinking_level = optional_trimmed_string(request.thinking_level);
+    let requested_skill_ids = request.skill_ids;
 
     if workspace_id.is_empty() {
         return Err(ApiError::bad_request("workspace id must not be empty"));
@@ -2054,7 +2130,7 @@ async fn prepare_chat_context(
             edges: code_graph_context.edges,
             languages: code_graph_context.languages,
         },
-        skills: enabled_skill_prompts(&config)?,
+        skills: enabled_skill_prompts(&config, requested_skill_ids)?,
         tools: tool_prompt_infos,
     });
     let context_budget = calculate_context_budget(
@@ -3805,7 +3881,10 @@ fn validate_skill_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn enabled_skill_prompts(config: &GlobalConfig) -> Result<Vec<SkillPromptInfo>, ApiError> {
+fn enabled_skill_prompts(
+    config: &GlobalConfig,
+    requested_skill_ids: Option<Vec<String>>,
+) -> Result<Vec<SkillPromptInfo>, ApiError> {
     let mut skills = Vec::new();
     let disabled_ids = config
         .skills
@@ -3813,6 +3892,10 @@ fn enabled_skill_prompts(config: &GlobalConfig) -> Result<Vec<SkillPromptInfo>, 
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    let selected_ids = requested_skill_ids
+        .map(normalize_skill_ids)
+        .transpose()?
+        .map(|ids| ids.into_iter().collect::<HashSet<_>>());
     let discovery = discover_skills(&config.workspaces, &config.skills.directories);
     if let Some(error) = discovery.errors.first() {
         return Err(ApiError::bad_request(format!(
@@ -3821,11 +3904,33 @@ fn enabled_skill_prompts(config: &GlobalConfig) -> Result<Vec<SkillPromptInfo>, 
         )));
     }
 
-    for skill in discovery
-        .skills
-        .iter()
-        .filter(|skill| !disabled_ids.contains(skill.id.as_str()))
-    {
+    if let Some(selected_ids) = selected_ids.as_ref() {
+        for skill_id in selected_ids {
+            let Some(skill) = discovery.skills.iter().find(|skill| skill.id == *skill_id) else {
+                return Err(ApiError::bad_request(format!(
+                    "selected skill was not found: {skill_id}"
+                )));
+            };
+
+            if disabled_ids.contains(skill.id.as_str()) {
+                return Err(ApiError::bad_request(format!(
+                    "selected skill '{}' is disabled",
+                    skill.id
+                )));
+            }
+        }
+    }
+
+    for skill in discovery.skills.iter().filter(|skill| {
+        if disabled_ids.contains(skill.id.as_str()) {
+            return false;
+        }
+
+        selected_ids
+            .as_ref()
+            .map(|ids| ids.contains(skill.id.as_str()))
+            .unwrap_or(true)
+    }) {
         let parsed = parse_skill_file(&skill.path).map_err(ApiError::bad_request)?;
 
         if parsed.id != skill.id {
@@ -4480,6 +4585,61 @@ fn workspace_id_exists(config: &GlobalConfig, id: &str) -> bool {
     config.workspaces.iter().any(|workspace| workspace.id == id)
 }
 
+fn git_branches_response(workspace_path: &Path) -> Result<GitBranchesResponse, ApiError> {
+    let current_branch =
+        non_empty_string(run_git_command(workspace_path, &["branch", "--show-current"])?.trim());
+    let branches = run_git_command(workspace_path, &["branch", "--format=%(refname:short)"])?
+        .lines()
+        .filter_map(non_empty_string)
+        .collect::<Vec<_>>();
+
+    Ok(GitBranchesResponse {
+        is_git_repository: true,
+        current_branch,
+        branches,
+    })
+}
+
+fn validate_git_branch_name(workspace_path: &Path, name: String) -> Result<String, ApiError> {
+    let branch = name.trim();
+
+    if branch.is_empty() {
+        return Err(ApiError::bad_request("git branch name must not be empty"));
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .arg("check-ref-format")
+        .arg("--branch")
+        .arg(branch)
+        .output()
+        .map_err(|source| ApiError::internal(format!("failed to run git: {source}")))?;
+
+    if output.status.success() {
+        return Ok(branch.to_string());
+    }
+
+    Err(ApiError::bad_request(format!(
+        "invalid git branch name '{}': {}",
+        branch,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+fn is_git_workspace(workspace_path: &Path) -> Result<bool, ApiError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .map_err(|source| ApiError::internal(format!("failed to run git: {source}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    Ok(output.status.success() && stdout.trim() == "true")
+}
+
 fn workspace_id_slug(name: &str) -> String {
     let mut slug = String::new();
     let mut last_was_separator = false;
@@ -4590,7 +4750,7 @@ Search memory before repo work.
         let mut config = GlobalConfig::first_run(env::temp_dir());
         config.skills.directories = vec![skill_dir.clone()];
 
-        let skills = enabled_skill_prompts(&config).expect("enabled skill prompts");
+        let skills = enabled_skill_prompts(&config, None).expect("enabled skill prompts");
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].id, "gitmemo");
@@ -4621,7 +4781,7 @@ description: Project memory.
         config.skills.directories = vec![skill_dir.clone()];
         config.skills.disabled.push("gitmemo".to_string());
 
-        let skills = enabled_skill_prompts(&config).expect("enabled skill prompts");
+        let skills = enabled_skill_prompts(&config, None).expect("enabled skill prompts");
 
         assert!(skills.is_empty());
 
@@ -4732,6 +4892,7 @@ description: Project memory.
                 chat_id: None,
                 model_id: "model".to_string(),
                 thinking_level: None,
+                skill_ids: None,
                 message: "Hello".to_string(),
             },
         )
@@ -4774,6 +4935,7 @@ description: Project memory.
                 chat_id: Some(new_context.chat_id.clone()),
                 model_id: "model".to_string(),
                 thinking_level: None,
+                skill_ids: None,
                 message: "Next".to_string(),
             },
         )

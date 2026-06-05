@@ -276,6 +276,10 @@ summary:focus-visible {
   line-height: 1.55;
 }
 
+.message-composer-textarea:focus-visible {
+  outline: none;
+}
+
 @media (max-width: 1199px) {
   .app-shell {
     grid-template-areas:
