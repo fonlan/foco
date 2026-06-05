@@ -22,7 +22,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use chrono::{SecondsFormat, Utc};
+use chrono::{Local, SecondsFormat, Utc};
 use foco_agent::{
     ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo, build_system_prompt,
     calculate_context_budget, detect_same_file_write_conflicts, estimate_json_tokens,
@@ -80,6 +80,7 @@ const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
 const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
 const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
     "Enabled skill front matter loaded from configured skills";
+const ENVIRONMENT_CONTEXT_MESSAGE_PREFIX: &str = "Environment context for this chat";
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -2273,6 +2274,11 @@ async fn prepare_chat_context(
     } else {
         Vec::new()
     };
+    let environment_messages = if is_new_chat {
+        vec![environment_context_message(&workspace.path)?]
+    } else {
+        Vec::new()
+    };
     let skill_messages = if is_new_chat {
         enabled_skill_frontmatter_messages(&config)?
     } else {
@@ -2282,6 +2288,7 @@ async fn prepare_chat_context(
         existing_messages.len()
             + compression_snapshots.len()
             + agents_messages.len()
+            + environment_messages.len()
             + skill_messages.len()
             + 2,
     );
@@ -2294,6 +2301,10 @@ async fn prepare_chat_context(
     }
     for agents_message in agents_messages {
         neutral_messages.push(agents_message);
+        message_source_sequences.push(None);
+    }
+    for environment_message in environment_messages {
+        neutral_messages.push(environment_message);
         message_source_sequences.push(None);
     }
     for skill_message in skill_messages {
@@ -2590,6 +2601,82 @@ fn agents_prompt_message(path: &Path) -> Result<Option<NeutralChatMessage>, ApiE
             content.trim()
         ),
     )))
+}
+
+fn environment_context_message(workspace_path: &Path) -> Result<NeutralChatMessage, ApiError> {
+    let now = Local::now();
+    let shell = detected_shell()?;
+    let wsl = is_wsl_environment();
+
+    Ok(neutral_text_message(
+        NeutralChatRole::User,
+        format!(
+            "{ENVIRONMENT_CONTEXT_MESSAGE_PREFIX}:\n\
+             - workspace directory: {}\n\
+             - shell type: {}\n\
+             - shell executable: {}\n\
+             - current date: {}\n\
+             - local timestamp: {}\n\
+             - time zone: {}\n\
+             - wsl: {}",
+            workspace_path.display(),
+            shell.kind,
+            shell.executable,
+            now.format("%Y-%m-%d"),
+            now.to_rfc3339_opts(SecondsFormat::Secs, false),
+            now.offset(),
+            wsl
+        ),
+    ))
+}
+
+struct DetectedShell {
+    kind: String,
+    executable: String,
+}
+
+fn detected_shell() -> Result<DetectedShell, ApiError> {
+    if cfg!(windows) {
+        return Ok(DetectedShell {
+            kind: "powershell".to_string(),
+            executable: "powershell.exe".to_string(),
+        });
+    }
+
+    let shell = env::var("SHELL").map_err(|source| {
+        ApiError::internal(format!(
+            "failed to detect shell from SHELL environment: {source}"
+        ))
+    })?;
+    let shell = non_empty_string(shell.trim()).ok_or_else(|| {
+        ApiError::bad_request("SHELL environment variable is empty; cannot detect shell type")
+    })?;
+    let kind = Path::new(&shell)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(non_empty_string)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("failed to detect shell type from SHELL={shell}"))
+        })?;
+
+    Ok(DetectedShell {
+        kind,
+        executable: shell,
+    })
+}
+
+fn is_wsl_environment() -> bool {
+    if env::var_os("WSL_DISTRO_NAME").is_some() || env::var_os("WSL_INTEROP").is_some() {
+        return true;
+    }
+
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+
+    fs::read_to_string("/proc/version")
+        .map(|version| version.to_ascii_lowercase().contains("microsoft"))
+        .unwrap_or(false)
 }
 
 fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize, ApiError> {
@@ -5883,6 +5970,28 @@ Search memory before repo work.
                 .contains("description: Project memory.")
         );
         assert!(!skill_messages[0].content.contains("Search memory"));
+        let environment_messages = new_context
+            .provider_request
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX))
+            .collect::<Vec<_>>();
+
+        assert_eq!(environment_messages.len(), 1);
+        assert_eq!(environment_messages[0].role, NeutralChatRole::User);
+        assert!(environment_messages[0].content.contains(&format!(
+            "- workspace directory: {}",
+            workspace_dir.display()
+        )));
+        assert!(environment_messages[0].content.contains("- shell type: "));
+        assert!(
+            environment_messages[0]
+                .content
+                .contains("- shell executable: ")
+        );
+        assert!(environment_messages[0].content.contains("- current date: "));
+        assert!(environment_messages[0].content.contains("- time zone: "));
+        assert!(environment_messages[0].content.contains("- wsl: "));
 
         {
             let database =
@@ -5922,6 +6031,13 @@ Search memory before repo work.
                 .messages
                 .iter()
                 .all(|message| !message.content.contains(ENABLED_SKILLS_MESSAGE_PREFIX))
+        );
+        assert!(
+            existing_context
+                .provider_request
+                .messages
+                .iter()
+                .all(|message| !message.content.contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX))
         );
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
