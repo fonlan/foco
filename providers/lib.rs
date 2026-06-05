@@ -478,9 +478,35 @@ fn neutral_tool_call(tool_call: &GenaiToolCall) -> NeutralToolCall {
     NeutralToolCall {
         call_id: tool_call.call_id.clone(),
         name: tool_call.fn_name.clone(),
-        arguments: tool_call.fn_arguments.clone(),
+        arguments: normalized_tool_arguments(&tool_call.fn_arguments),
         thought_signatures: tool_call.thought_signatures.clone(),
     }
+}
+
+fn normalized_tool_arguments(arguments: &serde_json::Value) -> serde_json::Value {
+    let mut current = arguments.clone();
+
+    for _ in 0..4 {
+        let serde_json::Value::String(text) = &current else {
+            return current;
+        };
+
+        let trimmed = text.trim();
+        let looks_like_json = trimmed.starts_with('{')
+            || trimmed.starts_with('[')
+            || trimmed.starts_with("\"{")
+            || trimmed.starts_with("\"[");
+        if !looks_like_json {
+            return current;
+        }
+
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            return current;
+        };
+        current = parsed;
+    }
+
+    current
 }
 
 fn genai_tool_call(tool_call: &NeutralToolCall) -> GenaiToolCall {
@@ -577,6 +603,28 @@ mod tests {
         assert_eq!(
             normalized_base_url("https://api.openai.com/v1").expect("base url"),
             DEFAULT_OPENAI_BASE_URL
+        );
+    }
+
+    #[test]
+    fn normalizes_json_string_tool_arguments() {
+        assert_eq!(
+            normalized_tool_arguments(&serde_json::Value::String(
+                r#"{"path":"note.txt"}"#.to_string()
+            )),
+            serde_json::json!({ "path": "note.txt" })
+        );
+
+        let double_encoded =
+            serde_json::to_string(r#"{"path":"note.txt"}"#).expect("double encoded JSON argument");
+        assert_eq!(
+            normalized_tool_arguments(&serde_json::Value::String(double_encoded)),
+            serde_json::json!({ "path": "note.txt" })
+        );
+
+        assert_eq!(
+            normalized_tool_arguments(&serde_json::Value::String("plain text".to_string())),
+            serde_json::Value::String("plain text".to_string())
         );
     }
 

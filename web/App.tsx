@@ -274,12 +274,18 @@ type ChatToolCallSummary = {
   isError: boolean;
 };
 
+type ChatMessagePart =
+  | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
+  | { type: "toolCall"; toolCall: ChatToolCallSummary };
+
 type ChatMessageSummary = {
   id: string;
   role: "assistant" | "user";
   content: string;
   reasoning: string | null;
   toolCalls: ChatToolCallSummary[];
+  parts: ChatMessagePart[];
 };
 
 type ChatMessagesResponse = {
@@ -629,6 +635,7 @@ type ShellMessage = {
   reasoning: string | null;
   status?: "error" | "streaming";
   toolCalls: ChatToolCallSummary[];
+  parts: ChatMessagePart[];
 };
 
 type RetryRunRequest = {
@@ -960,7 +967,7 @@ export function App() {
       );
       setActiveWorkspaceId(workspaceId);
       setActiveChatId(chatId);
-      setMessages(data.messages);
+      setMessages(data.messages.map(normalizeChatMessageSummary));
       setViewMode("chat");
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -1195,6 +1202,7 @@ export function App() {
         content: request.content,
         reasoning: null,
         toolCalls: [],
+        parts: [{ type: "text", text: request.content }],
       },
       {
         id: localAssistantId,
@@ -1203,6 +1211,7 @@ export function App() {
         reasoning: null,
         status: "streaming",
         toolCalls: [],
+        parts: [],
       },
     ]);
     setDraftMessage("");
@@ -1274,7 +1283,11 @@ export function App() {
           setMessages((current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? { ...message, content: message.content + streamEvent.delta }
+                ? {
+                    ...message,
+                    content: message.content + streamEvent.delta,
+                    parts: appendTextPart(message.parts, streamEvent.delta),
+                  }
                 : message,
             ),
           );
@@ -1285,12 +1298,16 @@ export function App() {
           setMessages((current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? {
-                    ...message,
-                    reasoning: `${message.reasoning ?? ""}${streamEvent.delta}`,
-                  }
-                : message,
-            ),
+                  ? {
+                      ...message,
+                      reasoning: `${message.reasoning ?? ""}${streamEvent.delta}`,
+                      parts: appendReasoningPart(
+                        message.parts,
+                        streamEvent.delta,
+                      ),
+                    }
+                  : message,
+              ),
           );
           return;
         }
@@ -1301,13 +1318,8 @@ export function App() {
           setMessages((current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? {
-                    ...message,
-                    content: streamEvent.text,
-                    reasoning: streamEvent.reasoning ?? null,
-                    status: undefined,
-                  }
-                  : message,
+                ? completedAssistantMessage(message, streamEvent)
+                : message,
             ),
           );
           return;
@@ -1323,6 +1335,7 @@ export function App() {
                       message.toolCalls,
                       streamEvent.toolCall,
                     ),
+                    parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
                   }
                 : message,
             ),
@@ -1338,6 +1351,12 @@ export function App() {
                     ...message,
                     toolCalls: applyToolResult(
                       message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                    ),
+                    parts: applyToolResultToParts(
+                      message.parts,
                       streamEvent.toolCallId,
                       streamEvent.output,
                       streamEvent.isError,
@@ -1362,6 +1381,7 @@ export function App() {
                 ? {
                     ...message,
                     content: streamEvent.message,
+                    parts: [{ type: "text", text: streamEvent.message }],
                     status: "error",
                   }
                 : message,
@@ -1383,7 +1403,12 @@ export function App() {
       setMessages((current) =>
         current.map((item) =>
           isCurrentAssistantMessage(item)
-            ? { ...item, content: message, status: "error" }
+            ? {
+                ...item,
+                content: message,
+                parts: [{ type: "text", text: message }],
+                status: "error",
+              }
             : item,
         ),
       );
@@ -2197,6 +2222,9 @@ function ChatPanel({
           {messages.length ? (
             messages.map((message) => {
             const isUser = message.role === "user";
+            const parts = message.parts.length
+              ? message.parts
+              : fallbackMessageParts(message);
 
             return (
               <div
@@ -2224,23 +2252,20 @@ function ChatPanel({
                     )}
                   </div>
                   <div className="min-w-0 flex-1 space-y-3">
-                    {!isUser && message.reasoning ? (
-                      <ReasoningBlock reasoning={message.reasoning} />
-                    ) : null}
-                    {message.content ? (
-                      <MarkdownContent
-                        content={message.content}
-                        isError={message.status === "error"}
-                        isUser={isUser}
-                      />
-                    ) : message.status === "streaming" && !message.reasoning ? (
+                    {parts.length ? (
+                      parts.map((part, partIndex) => (
+                        <MessagePartBlock
+                          isError={message.status === "error"}
+                          isUser={isUser}
+                          key={`${message.id}-part-${partIndex}`}
+                          part={part}
+                        />
+                      ))
+                    ) : message.status === "streaming" ? (
                       <LoaderCircle
                         aria-hidden="true"
                         className="size-4 animate-spin"
                       />
-                    ) : null}
-                    {!isUser && message.toolCalls.length > 0 ? (
-                      <ToolCallList toolCalls={message.toolCalls} />
                     ) : null}
                   </div>
                 </div>
@@ -2545,6 +2570,28 @@ function ReasoningBlock({ reasoning }: { reasoning: string }) {
   );
 }
 
+function MessagePartBlock({
+  isError,
+  isUser,
+  part,
+}: {
+  isError: boolean;
+  isUser: boolean;
+  part: ChatMessagePart;
+}) {
+  if (part.type === "reasoning") {
+    return <ReasoningBlock reasoning={part.text} />;
+  }
+
+  if (part.type === "toolCall") {
+    return <ToolCallBlock toolCall={part.toolCall} />;
+  }
+
+  return (
+    <MarkdownContent content={part.text} isError={isError} isUser={isUser} />
+  );
+}
+
 function MarkdownContent({
   content,
   isError = false,
@@ -2569,64 +2616,58 @@ function MarkdownContent({
   );
 }
 
-function ToolCallList({ toolCalls }: { toolCalls: ChatToolCallSummary[] }) {
+function ToolCallBlock({ toolCall }: { toolCall: ChatToolCallSummary }) {
   const { t } = useI18n();
+  const input = normalizedToolInput(toolCall.input);
+  const detailText = toolCallDetailText(toolCall);
 
   return (
-    <div className="space-y-2 border-t border-stone-200 pt-2">
-      {toolCalls.map((toolCall) => {
-        const detailText = toolCallDetailText(toolCall);
-
-        return (
-          <details className="group min-w-0" key={toolCall.id}>
-            <summary className="flex cursor-pointer list-none items-start gap-2 text-xs font-semibold text-stone-700 marker:hidden">
-              <Wrench aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-teal-700" />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate">{toolCall.name}</span>
-                <span
-                  className="mt-0.5 block truncate font-mono text-[11px] font-medium leading-4 text-stone-500"
-                  title={detailText}
-                >
-                  {detailText}
-                </span>
-              </span>
-              <span
-                className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] ${
+    <div className="min-w-0 border-t border-stone-200 pt-2">
+      <details className="group min-w-0">
+        <summary className="flex cursor-pointer list-none items-start gap-2 text-xs font-semibold text-stone-700 marker:hidden">
+          <Wrench aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-teal-700" />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate">{toolCall.name}</span>
+            <span
+              className="mt-0.5 block truncate font-mono text-[11px] font-medium leading-4 text-stone-500"
+              title={detailText}
+            >
+              {detailText}
+            </span>
+          </span>
+          <span
+            className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] ${
+              toolCall.isError
+                ? "bg-rose-50 text-rose-700"
+                : "bg-stone-100 text-stone-600"
+            }`}
+          >
+            {toolStatusText(toolCall, t)}
+          </span>
+        </summary>
+        <div className="mt-2 grid gap-2 text-xs text-stone-600">
+          <div className="min-w-0">
+            <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
+            <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
+              {formatJsonValue(input)}
+            </pre>
+          </div>
+          {toolCall.output !== null ? (
+            <div className="min-w-0">
+              <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
+              <pre
+                className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
                   toolCall.isError
-                    ? "bg-rose-50 text-rose-700"
-                    : "bg-stone-100 text-stone-600"
+                    ? "border-rose-200 text-rose-700"
+                    : "border-stone-200"
                 }`}
               >
-                {toolStatusText(toolCall, t)}
-              </span>
-            </summary>
-            <div className="mt-2 grid gap-2 text-xs text-stone-600">
-              <div className="min-w-0">
-                <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
-                <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
-                  {formatJsonValue(toolCall.input)}
-                </pre>
-              </div>
-              {toolCall.output !== null ? (
-                <div className="min-w-0">
-                  <div className="mb-1 font-semibold text-stone-500">
-                    {t("Output")}
-                  </div>
-                  <pre
-                    className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
-                      toolCall.isError
-                        ? "border-rose-200 text-rose-700"
-                        : "border-stone-200"
-                    }`}
-                  >
-                    {formatJsonValue(toolCall.output)}
-                  </pre>
-                </div>
-              ) : null}
+                {formatJsonValue(toolCall.output)}
+              </pre>
             </div>
-          </details>
-        );
-      })}
+          ) : null}
+        </div>
+      </details>
     </div>
   );
 }
@@ -5409,16 +5450,17 @@ function upsertToolCall(
   toolCalls: ChatToolCallSummary[],
   nextToolCall: ChatToolCallSummary,
 ) {
+  const normalizedToolCall = normalizedToolCallSummary(nextToolCall);
   const existingIndex = toolCalls.findIndex(
-    (toolCall) => toolCall.id === nextToolCall.id,
+    (toolCall) => toolCall.id === normalizedToolCall.id,
   );
 
   if (existingIndex === -1) {
-    return [...toolCalls, nextToolCall];
+    return [...toolCalls, normalizedToolCall];
   }
 
   return toolCalls.map((toolCall, index) =>
-    index === existingIndex ? nextToolCall : toolCall,
+    index === existingIndex ? normalizedToolCall : toolCall,
   );
 }
 
@@ -5436,8 +5478,162 @@ function applyToolResult(
           isError,
           status: isError ? "error" : "completed",
         }
-      : toolCall,
+    : toolCall,
   );
+}
+
+function completedAssistantMessage(
+  message: ShellMessage,
+  streamEvent: Extract<ChatStreamEvent, { type: "complete" }>,
+): ShellMessage {
+  let parts = message.parts;
+  const nextReasoning = streamEvent.reasoning ?? null;
+  const reasoningDelta = missingFinalSuffix(message.reasoning ?? "", nextReasoning ?? "");
+  if (reasoningDelta) {
+    parts = appendReasoningPart(parts, reasoningDelta);
+  }
+  const textDelta = missingFinalSuffix(message.content, streamEvent.text);
+  if (textDelta) {
+    parts = appendTextPart(parts, textDelta);
+  }
+
+  return {
+    ...message,
+    content: streamEvent.text,
+    reasoning: nextReasoning,
+    status: undefined,
+    parts: parts.length
+      ? parts
+      : fallbackMessageParts({
+          ...message,
+          content: streamEvent.text,
+          reasoning: nextReasoning,
+          status: undefined,
+        }),
+  };
+}
+
+function missingFinalSuffix(current: string, next: string) {
+  if (!next || current === next) {
+    return "";
+  }
+
+  return next.startsWith(current) ? next.slice(current.length) : "";
+}
+
+function appendTextPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
+  if (!text) {
+    return parts;
+  }
+
+  const lastPart = parts[parts.length - 1];
+  if (lastPart?.type !== "text") {
+    return [...parts, { type: "text", text }];
+  }
+
+  return [
+    ...parts.slice(0, -1),
+    {
+      ...lastPart,
+      text: lastPart.text + text,
+    },
+  ];
+}
+
+function appendReasoningPart(
+  parts: ChatMessagePart[],
+  text: string,
+): ChatMessagePart[] {
+  if (!text) {
+    return parts;
+  }
+
+  const lastPart = parts[parts.length - 1];
+  if (lastPart?.type !== "reasoning") {
+    return [...parts, { type: "reasoning", text }];
+  }
+
+  return [
+    ...parts.slice(0, -1),
+    {
+      ...lastPart,
+      text: lastPart.text + text,
+    },
+  ];
+}
+
+function upsertToolCallPart(
+  parts: ChatMessagePart[],
+  nextToolCall: ChatToolCallSummary,
+): ChatMessagePart[] {
+  const normalizedToolCall = normalizedToolCallSummary(nextToolCall);
+  const nextPart: ChatMessagePart = {
+    type: "toolCall",
+    toolCall: normalizedToolCall,
+  };
+  const existingIndex = parts.findIndex(
+    (part) =>
+      part.type === "toolCall" && part.toolCall.id === normalizedToolCall.id,
+  );
+
+  if (existingIndex === -1) {
+    return [...parts, nextPart];
+  }
+
+  return parts.map((part, index) =>
+    index === existingIndex ? nextPart : part,
+  );
+}
+
+function applyToolResultToParts(
+  parts: ChatMessagePart[],
+  toolCallId: string,
+  output: JsonValue,
+  isError: boolean,
+): ChatMessagePart[] {
+  return parts.map((part) =>
+    part.type === "toolCall" && part.toolCall.id === toolCallId
+      ? ({
+          type: "toolCall",
+          toolCall: {
+            ...part.toolCall,
+            output,
+            isError,
+            status: isError ? "error" : "completed",
+          },
+        } satisfies ChatMessagePart)
+      : part,
+  );
+}
+
+function fallbackMessageParts(
+  message: ShellMessage | ChatMessageSummary,
+): ChatMessagePart[] {
+  const parts: ChatMessagePart[] = [];
+  if (message.reasoning) {
+    parts.push({ type: "reasoning", text: message.reasoning });
+  }
+  if (message.content) {
+    parts.push({ type: "text", text: message.content });
+  }
+  parts.push(
+    ...message.toolCalls.map((toolCall) => ({
+      type: "toolCall" as const,
+      toolCall: normalizedToolCallSummary(toolCall),
+    })),
+  );
+  return parts;
+}
+
+function normalizedToolCallSummary(
+  toolCall: ChatToolCallSummary,
+): ChatToolCallSummary {
+  return {
+    ...toolCall,
+    input: normalizedToolInput(toolCall.input),
+    output:
+      toolCall.output === null ? null : normalizedJsonValue(toolCall.output),
+  };
 }
 
 function toolStatusText(toolCall: ChatToolCallSummary, t: Translate) {
@@ -5449,7 +5645,7 @@ function toolStatusText(toolCall: ChatToolCallSummary, t: Translate) {
 }
 
 function toolCallDetailText(toolCall: ChatToolCallSummary) {
-  const input = toolCall.input;
+  const input = normalizedToolInput(toolCall.input);
 
   if (!isObjectRecord(input)) {
     return compactToolJson(input);
@@ -5482,6 +5678,27 @@ function toolCallDetailText(toolCall: ChatToolCallSummary) {
   }
 
   return parts.length ? compactToolText(parts.join(" | ")) : compactToolJson(input);
+}
+
+function normalizedToolInput(value: JsonValue): JsonValue {
+  const normalized = normalizedJsonValue(value);
+  if (!isObjectRecord(normalized)) {
+    return normalized;
+  }
+
+  for (const fieldName of ["arguments", "args", "input"]) {
+    const nested = normalized[fieldName];
+    if (!isJsonValue(nested)) {
+      continue;
+    }
+
+    const normalizedNested = normalizedJsonValue(nested);
+    if (isObjectRecord(normalizedNested)) {
+      return normalizedNested;
+    }
+  }
+
+  return normalized;
 }
 
 function textField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
@@ -5524,7 +5741,39 @@ function compactToolText(value: string) {
 }
 
 function formatJsonValue(value: JsonValue) {
-  return JSON.stringify(value, null, 2);
+  return JSON.stringify(normalizedJsonValue(value), null, 2);
+}
+
+function normalizedJsonValue(value: JsonValue): JsonValue {
+  let current = value;
+
+  for (let index = 0; index < 4; index += 1) {
+    if (typeof current !== "string") {
+      return current;
+    }
+
+    const trimmed = current.trim();
+    const looksLikeJson =
+      trimmed.startsWith("{") ||
+      trimmed.startsWith("[") ||
+      trimmed.startsWith('"{') ||
+      trimmed.startsWith('"[');
+    if (!looksLikeJson) {
+      return current;
+    }
+
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!isJsonValue(parsed)) {
+        return current;
+      }
+      current = parsed;
+    } catch {
+      return current;
+    }
+  }
+
+  return current;
 }
 
 function formatLimit(value: number | null, label: string, language: AppLanguageId = "en") {
@@ -5886,7 +6135,54 @@ function parseChatToolCallSummary(value: unknown): ChatToolCallSummary | null {
     return null;
   }
 
-  return { id, name, status, input, output, isError };
+  return normalizedToolCallSummary({ id, name, status, input, output, isError });
+}
+
+function normalizeChatMessageSummary(
+  message: ChatMessageSummary,
+): ChatMessageSummary {
+  const toolCalls = Array.isArray(message.toolCalls)
+    ? message.toolCalls.map(normalizedToolCallSummary)
+    : [];
+  const partsSource = Array.isArray(message.parts) ? message.parts : [];
+  const parts = partsSource
+    .map((part) => normalizeChatMessagePart(part))
+    .filter((part): part is ChatMessagePart => part !== null);
+  const normalizedMessage = {
+    ...message,
+    toolCalls,
+    parts,
+  };
+
+  return {
+    ...normalizedMessage,
+    parts: parts.length ? parts : fallbackMessageParts(normalizedMessage),
+  };
+}
+
+function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
+  if (!isObjectRecord(part)) {
+    return null;
+  }
+
+  if (part.type === "text") {
+    const text = fieldValue(part, "text");
+    return typeof text === "string" ? { type: "text", text } : null;
+  }
+
+  if (part.type === "reasoning") {
+    const text = fieldValue(part, "text");
+    return typeof text === "string" ? { type: "reasoning", text } : null;
+  }
+
+  if (part.type === "toolCall" || part.type === "tool_call") {
+    const toolCall = parseChatToolCallSummary(
+      fieldValue(part, "toolCall", "tool_call"),
+    );
+    return toolCall ? { type: "toolCall", toolCall } : null;
+  }
+
+  return null;
 }
 
 function parseNullableChatUsage(value: unknown): ChatUsage | null | undefined | false {

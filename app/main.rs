@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     env, fs,
     net::{IpAddr, SocketAddr},
@@ -41,8 +41,8 @@ use foco_providers::{
 };
 use foco_store::{
     config::{
-        GlobalConfig, McpServerConfig, ModelLimits, ModelSettings, ProviderSettings, SkillSettings,
-        SUPPORTED_APP_LANGUAGES, WebServerSettings, WorkspaceConfig,
+        GlobalConfig, McpServerConfig, ModelLimits, ModelSettings, ProviderSettings,
+        SUPPORTED_APP_LANGUAGES, SkillSettings, WebServerSettings, WorkspaceConfig,
         default_skill_directories_for_profile, load_or_create_global_config, save_global_config,
     },
     model_metadata::{
@@ -50,9 +50,10 @@ use foco_store::{
         parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
     },
     workspace::{
-        ChatRecord, ContextCompressionSnapshotRecord, MessageRecord, NewContextCompressionSnapshot,
-        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewTerminalSession, NewToolCall,
-        NewToolResult, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
+        ChatRecord, ContextCompressionSnapshotRecord, LlmRequestEventRecord, MessageRecord,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+        NewTerminalSession, NewToolCall, NewToolResult, ToolCallWithResultRecord,
+        WorkspaceDatabase, initialize_workspace_databases,
     },
 };
 use foco_tools::{
@@ -912,6 +913,9 @@ async fn chat_messages(
         )));
     }
 
+    let llm_request_events = database
+        .llm_request_events_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?;
     let mut messages = Vec::new();
     for message in database
         .messages_for_chat(chat_id)
@@ -921,7 +925,11 @@ async fn chat_messages(
             continue;
         }
 
-        messages.push(chat_message_summary(&database, message)?);
+        messages.push(chat_message_summary(
+            &database,
+            message,
+            &llm_request_events,
+        )?);
     }
 
     Ok(Json(ChatMessagesResponse { messages }))
@@ -1469,6 +1477,7 @@ struct ChatMessageSummary {
     content: String,
     reasoning: Option<String>,
     tool_calls: Vec<ChatToolCallSummary>,
+    parts: Vec<ChatMessagePart>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1480,6 +1489,14 @@ struct ChatToolCallSummary {
     input: Value,
     output: Option<Value>,
     is_error: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+enum ChatMessagePart {
+    Text { text: String },
+    Reasoning { text: String },
+    ToolCall { tool_call: ChatToolCallSummary },
 }
 
 #[derive(Serialize)]
@@ -1935,14 +1952,13 @@ impl PreparedChatContext {
 
                             for tool_call in &tool_calls {
                                 capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
-                                if seen_tool_call_ids.insert(tool_call.call_id.clone()) {
-                                    let event = ChatSseEvent::ToolCall {
-                                        assistant_message_id: self.assistant_message_id.clone(),
-                                        tool_call: pending_tool_call_summary(tool_call),
-                                    };
-                                    events.push(captured_event(&event));
-                                    yield Ok(sse_event(&event));
-                                }
+                                seen_tool_call_ids.insert(tool_call.call_id.clone());
+                                let event = ChatSseEvent::ToolCall {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    tool_call: pending_tool_call_summary(tool_call),
+                                };
+                                events.push(captured_event(&event));
+                                yield Ok(sse_event(&event));
                             }
 
                             let next_tool_results = match execute_tool_calls_parallel(
@@ -4527,7 +4543,7 @@ fn pending_tool_call_summary(tool_call: &NeutralToolCall) -> ChatToolCallSummary
     ChatToolCallSummary {
         id: tool_call.call_id.clone(),
         name: tool_call.name.clone(),
-        status: "pending".to_string(),
+        status: "running".to_string(),
         input: tool_call.arguments.clone(),
         output: None,
         is_error: false,
@@ -4599,6 +4615,7 @@ fn non_empty_string(value: &str) -> Option<String> {
 fn chat_message_summary(
     database: &WorkspaceDatabase,
     message: MessageRecord,
+    llm_request_events: &[LlmRequestEventRecord],
 ) -> Result<ChatMessageSummary, ApiError> {
     let tool_calls = database
         .tool_calls_for_message(&message.id)
@@ -4606,18 +4623,202 @@ fn chat_message_summary(
         .into_iter()
         .map(chat_tool_call_summary)
         .collect::<Result<Vec<_>, _>>()?;
+    let reasoning = if message.role == "assistant" {
+        assistant_reasoning_from_metadata(&message.metadata_json)?
+    } else {
+        None
+    };
+    let parts = chat_message_parts(
+        &message,
+        reasoning.as_deref(),
+        &tool_calls,
+        llm_request_events,
+    )?;
 
     Ok(ChatMessageSummary {
         id: message.id,
-        reasoning: if message.role == "assistant" {
-            assistant_reasoning_from_metadata(&message.metadata_json)?
-        } else {
-            None
-        },
+        reasoning,
         role: message.role,
         content: message.content,
         tool_calls,
+        parts,
     })
+}
+
+fn chat_message_parts(
+    message: &MessageRecord,
+    reasoning: Option<&str>,
+    tool_calls: &[ChatToolCallSummary],
+    llm_request_events: &[LlmRequestEventRecord],
+) -> Result<Vec<ChatMessagePart>, ApiError> {
+    if message.role != "assistant" {
+        return Ok(fallback_chat_message_parts(&message.content, None, &[]));
+    }
+
+    let request_ids = assistant_message_request_ids(&message.id, llm_request_events)?;
+    if request_ids.is_empty() {
+        return Ok(fallback_chat_message_parts(
+            &message.content,
+            reasoning,
+            tool_calls,
+        ));
+    }
+
+    let tool_calls_by_id = tool_calls
+        .iter()
+        .map(|tool_call| (tool_call.id.as_str(), tool_call))
+        .collect::<HashMap<_, _>>();
+    let request_ids = request_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut seen_tool_call_ids = HashSet::new();
+    let mut parts = Vec::new();
+
+    for event in llm_request_events
+        .iter()
+        .filter(|event| request_ids.contains(event.llm_request_id.as_str()))
+    {
+        match event.event_type.as_str() {
+            "text_delta" => {
+                let value = parse_json_value(&event.normalized_event_json, "LLM text event")?;
+                if event_matches_assistant_message(&value, &message.id) {
+                    if let Some(delta) = string_json_field(&value, "delta", "delta") {
+                        push_text_part(&mut parts, delta);
+                    }
+                }
+            }
+            "reasoning_delta" => {
+                let value = parse_json_value(&event.normalized_event_json, "LLM reasoning event")?;
+                if event_matches_assistant_message(&value, &message.id) {
+                    if let Some(delta) = string_json_field(&value, "delta", "delta") {
+                        push_reasoning_part(&mut parts, delta);
+                    }
+                }
+            }
+            "tool_call" => {
+                let value = parse_json_value(&event.normalized_event_json, "LLM tool call event")?;
+                if !event_matches_assistant_message(&value, &message.id) {
+                    continue;
+                }
+
+                let Some(tool_call_value) =
+                    value.get("toolCall").or_else(|| value.get("tool_call"))
+                else {
+                    continue;
+                };
+                let Some(tool_call_id) = string_json_field(tool_call_value, "id", "callId")
+                    .or_else(|| string_json_field(tool_call_value, "call_id", "callId"))
+                else {
+                    continue;
+                };
+
+                if !seen_tool_call_ids.insert(tool_call_id.to_string()) {
+                    continue;
+                }
+
+                let Some(tool_call) = tool_calls_by_id.get(tool_call_id) else {
+                    return Err(ApiError::internal(format!(
+                        "tool call event referenced unknown tool call id: {tool_call_id}"
+                    )));
+                };
+
+                parts.push(ChatMessagePart::ToolCall {
+                    tool_call: (*tool_call).clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    if parts.is_empty() {
+        Ok(fallback_chat_message_parts(
+            &message.content,
+            reasoning,
+            tool_calls,
+        ))
+    } else {
+        Ok(parts)
+    }
+}
+
+fn assistant_message_request_ids(
+    message_id: &str,
+    llm_request_events: &[LlmRequestEventRecord],
+) -> Result<Vec<String>, ApiError> {
+    let mut request_ids = Vec::new();
+    for event in llm_request_events
+        .iter()
+        .filter(|event| event.event_type == "start")
+    {
+        let value = parse_json_value(&event.normalized_event_json, "LLM start event")?;
+        if string_json_field(&value, "assistantMessageId", "assistant_message_id")
+            == Some(message_id)
+        {
+            request_ids.push(event.llm_request_id.clone());
+        }
+    }
+
+    Ok(request_ids)
+}
+
+fn event_matches_assistant_message(value: &Value, message_id: &str) -> bool {
+    match string_json_field(value, "assistantMessageId", "assistant_message_id") {
+        Some(assistant_message_id) => assistant_message_id == message_id,
+        None => true,
+    }
+}
+
+fn string_json_field<'a>(value: &'a Value, primary: &str, alternate: &str) -> Option<&'a str> {
+    value
+        .get(primary)
+        .or_else(|| value.get(alternate))
+        .and_then(Value::as_str)
+}
+
+fn fallback_chat_message_parts(
+    content: &str,
+    reasoning: Option<&str>,
+    tool_calls: &[ChatToolCallSummary],
+) -> Vec<ChatMessagePart> {
+    let mut parts = Vec::new();
+    if let Some(reasoning) = reasoning {
+        push_reasoning_part(&mut parts, reasoning);
+    }
+    push_text_part(&mut parts, content);
+    parts.extend(
+        tool_calls
+            .iter()
+            .cloned()
+            .map(|tool_call| ChatMessagePart::ToolCall { tool_call }),
+    );
+    parts
+}
+
+fn push_text_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+
+    match parts.last_mut() {
+        Some(ChatMessagePart::Text { text: existing }) => existing.push_str(text),
+        _ => parts.push(ChatMessagePart::Text {
+            text: text.to_string(),
+        }),
+    }
+}
+
+fn push_reasoning_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+
+    match parts.last_mut() {
+        Some(ChatMessagePart::Reasoning { text: existing }) => existing.push_str(text),
+        _ => parts.push(ChatMessagePart::Reasoning {
+            text: text.to_string(),
+        }),
+    }
 }
 
 fn chat_tool_call_summary(
