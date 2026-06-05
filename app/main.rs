@@ -42,8 +42,8 @@ use foco_providers::{
 use foco_store::{
     config::{
         GlobalConfig, McpServerConfig, ModelLimits, ModelSettings, ProviderSettings, SkillSettings,
-        WebServerSettings, WorkspaceConfig, default_skill_directories_for_profile,
-        load_or_create_global_config, save_global_config,
+        SUPPORTED_APP_LANGUAGES, WebServerSettings, WorkspaceConfig,
+        default_skill_directories_for_profile, load_or_create_global_config, save_global_config,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
@@ -363,7 +363,7 @@ async fn add_workspace(
 }
 
 fn normalize_web_server_settings(
-    request: ManualGeneralSettingsRequest,
+    request: &ManualGeneralSettingsRequest,
 ) -> Result<WebServerSettings, ApiError> {
     let listen_host = request.listen_host.trim();
 
@@ -389,6 +389,27 @@ fn normalize_web_server_settings(
     })
 }
 
+fn normalize_app_language(language: &str) -> Result<String, ApiError> {
+    let language = language.trim();
+
+    if SUPPORTED_APP_LANGUAGES.contains(&language) {
+        return Ok(language.to_string());
+    }
+
+    Err(ApiError::bad_request(format!(
+        "app language '{language}' is unsupported; expected one of {}",
+        SUPPORTED_APP_LANGUAGES.join(", ")
+    )))
+}
+
+fn app_language_name(language: &str) -> &'static str {
+    match language {
+        "zh-CN" => "简体中文",
+        "en" => "English",
+        _ => "Unknown",
+    }
+}
+
 async fn settings(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
     let config = config_snapshot(&state)?;
 
@@ -401,7 +422,8 @@ async fn save_general_settings(
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
 
-    config.app.web_server = normalize_web_server_settings(request)?;
+    config.app.web_server = normalize_web_server_settings(&request)?;
+    config.app.language = normalize_app_language(&request.language)?;
 
     save_config(&state, config.clone())?;
 
@@ -1124,6 +1146,7 @@ struct WorkspacePathRequest {
 struct ManualGeneralSettingsRequest {
     listen_host: String,
     listen_port: u32,
+    language: String,
 }
 
 #[derive(Deserialize)]
@@ -1231,6 +1254,8 @@ struct SettingsResponse {
 #[serde(rename_all = "camelCase")]
 struct GeneralSettingsSummary {
     web_server: WebServerSettingsSummary,
+    language: String,
+    supported_languages: Vec<AppLanguageSummary>,
 }
 
 #[derive(Serialize)]
@@ -1238,6 +1263,13 @@ struct GeneralSettingsSummary {
 struct WebServerSettingsSummary {
     listen_host: String,
     listen_port: u16,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppLanguageSummary {
+    id: &'static str,
+    name: &'static str,
 }
 
 #[derive(Serialize)]
@@ -3374,6 +3406,14 @@ async fn settings_response(
                 listen_host: config.app.web_server.listen_host.clone(),
                 listen_port: config.app.web_server.listen_port,
             },
+            language: config.app.language.clone(),
+            supported_languages: SUPPORTED_APP_LANGUAGES
+                .iter()
+                .map(|language| AppLanguageSummary {
+                    id: *language,
+                    name: app_language_name(*language),
+                })
+                .collect(),
         },
         provider_kinds: vec![
             ProviderKindSummary {

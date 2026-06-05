@@ -15,6 +15,8 @@ pub const DEFAULT_WORKSPACE_NAME: &str = "Default Workspace";
 pub const REDACTED_SECRET: &str = "<redacted>";
 pub const DEFAULT_WEB_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_WEB_SERVER_PORT: u16 = 3210;
+pub const DEFAULT_APP_LANGUAGE: &str = "en";
+pub const SUPPORTED_APP_LANGUAGES: &[&str] = &["zh-CN", "en"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FocoPaths {
@@ -157,6 +159,7 @@ impl GlobalConfig {
             schema_version: CONFIG_SCHEMA_VERSION,
             app: AppSettings {
                 active_workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
+                language: DEFAULT_APP_LANGUAGE.to_string(),
                 web_server: WebServerSettings::default(),
             },
             providers: Vec::new(),
@@ -194,6 +197,7 @@ impl GlobalConfig {
             "app.active_workspace_id",
             &self.app.active_workspace_id,
         )?;
+        validate_app_language(config_path, &self.app.language)?;
         validate_web_server_settings(config_path, &self.app.web_server)?;
         require_non_empty_list(config_path, "workspaces", self.workspaces.len())?;
 
@@ -425,8 +429,14 @@ impl GlobalConfig {
 #[serde(deny_unknown_fields)]
 pub struct AppSettings {
     pub active_workspace_id: String,
+    #[serde(default = "default_app_language")]
+    pub language: String,
     #[serde(default)]
     pub web_server: WebServerSettings,
+}
+
+fn default_app_language() -> String {
+    DEFAULT_APP_LANGUAGE.to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -746,6 +756,20 @@ fn validate_web_server_settings(
     Ok(())
 }
 
+fn validate_app_language(config_path: Option<&Path>, language: &str) -> Result<(), ConfigError> {
+    if SUPPORTED_APP_LANGUAGES.contains(&language) {
+        return Ok(());
+    }
+
+    invalid_config(
+        config_path,
+        format!(
+            "app.language '{language}' is unsupported; expected one of {}",
+            SUPPORTED_APP_LANGUAGES.join(", ")
+        ),
+    )
+}
+
 fn require_non_empty_list(
     config_path: Option<&Path>,
     field: &str,
@@ -824,6 +848,7 @@ mod tests {
             loaded.config.app.active_workspace_id,
             DEFAULT_WORKSPACE_ID.to_string()
         );
+        assert_eq!(loaded.config.app.language, DEFAULT_APP_LANGUAGE);
         assert_eq!(loaded.config.app.web_server, WebServerSettings::default());
         assert_eq!(loaded.config.workspaces.len(), 1);
         assert_eq!(loaded.config.workspaces[0].name, DEFAULT_WORKSPACE_NAME);
@@ -940,6 +965,7 @@ mod tests {
 
         let loaded = load_global_config(&paths.config_file).expect("legacy config should load");
 
+        assert_eq!(loaded.app.language, DEFAULT_APP_LANGUAGE);
         assert_eq!(loaded.app.web_server, WebServerSettings::default());
     }
 
@@ -1000,6 +1026,22 @@ mod tests {
             .expect_err("zero listen port should fail");
 
         assert!(error.to_string().contains("listen_port must be a number"));
+    }
+
+    #[test]
+    fn load_rejects_unsupported_app_language() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.app.language = "fr".to_string();
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("unsupported language should fail");
+
+        assert!(error.to_string().contains("app.language 'fr' is unsupported"));
     }
 
     #[test]
