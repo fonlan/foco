@@ -379,6 +379,7 @@ export function App() {
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
+  const [runningChatKey, setRunningChatKey] = useState<string | null>(null);
   const [retryRunRequest, setRetryRunRequest] =
     useState<RetryRunRequest | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -732,6 +733,9 @@ export function App() {
     const localAssistantId = `local-assistant-${runKey}`;
     let assistantMessageId = localAssistantId;
     let requestChatId = request.chatId;
+    let currentRunningChatKey = requestChatId
+      ? chatRunKey(request.workspaceId, requestChatId)
+      : null;
     const abortController = new AbortController();
 
     setMessages((current) => [
@@ -754,6 +758,7 @@ export function App() {
     ]);
     setDraftMessage("");
     setIsSendingMessage(true);
+    setRunningChatKey(currentRunningChatKey);
     setRetryRunRequest(null);
     setError(null);
     activeRunAbortRef.current = abortController;
@@ -792,7 +797,13 @@ export function App() {
         if (streamEvent.type === "start") {
           assistantMessageId = streamEvent.assistantMessageId;
           requestChatId = streamEvent.chatId;
+          currentRunningChatKey = chatRunKey(
+            request.workspaceId,
+            streamEvent.chatId,
+          );
           setActiveChatId(streamEvent.chatId);
+          setRunningChatKey(currentRunningChatKey);
+          void refreshWorkspaces();
           setMessages((current) =>
             current.map((message) => {
               if (message.id === localUserId) {
@@ -930,6 +941,9 @@ export function App() {
       if (activeRunAbortRef.current === abortController) {
         activeRunAbortRef.current = null;
       }
+      setRunningChatKey((current) =>
+        current === currentRunningChatKey ? null : current,
+      );
       setIsSendingMessage(false);
     }
   }
@@ -1095,45 +1109,64 @@ export function App() {
                     {isExpanded ? (
                       <div className="ml-9 mt-1 space-y-1">
                         {workspace.chats.length > 0 ? (
-                          workspace.chats.map((chat) => (
-                            <div
-                              className="group flex min-w-0 items-center gap-1"
-                              key={chat.id}
-                            >
-                              <button
-                                className={`flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium ${
-                                  activeWorkspace?.id === workspace.id &&
-                                  activeChatId === chat.id
-                                    ? "bg-white text-stone-950 shadow-sm"
-                                    : "text-stone-600 hover:bg-white/80 hover:text-stone-950"
-                                }`}
-                                onClick={() =>
-                                  void loadChatMessages(workspace.id, chat.id)
-                                }
-                                type="button"
+                          workspace.chats.map((chat) => {
+                            const isChatRunning =
+                              runningChatKey === chatRunKey(workspace.id, chat.id);
+
+                            return (
+                              <div
+                                className="group flex min-w-0 items-center gap-1"
+                                key={chat.id}
                               >
-                                <MessageSquare
-                                  aria-hidden="true"
-                                  className="size-3.5 shrink-0"
-                                />
-                                <span className="truncate">{chat.title}</span>
-                              </button>
-                              <button
-                                aria-label={`Delete chat ${chat.title}`}
-                                className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
-                                onClick={() =>
-                                  void deleteWorkspaceChat(workspace.id, chat.id)
-                                }
-                                title="Delete chat"
-                                type="button"
-                              >
-                                <Trash2
-                                  aria-hidden="true"
-                                  className="size-3.5"
-                                />
-                              </button>
-                            </div>
-                          ))
+                                <button
+                                  className={`flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium ${
+                                    activeWorkspace?.id === workspace.id &&
+                                    activeChatId === chat.id
+                                      ? "bg-white text-stone-950 shadow-sm"
+                                      : "text-stone-600 hover:bg-white/80 hover:text-stone-950"
+                                  }`}
+                                  onClick={() =>
+                                    void loadChatMessages(workspace.id, chat.id)
+                                  }
+                                  type="button"
+                                >
+                                  {isChatRunning ? (
+                                    <LoaderCircle
+                                      aria-hidden="true"
+                                      className="size-3.5 shrink-0 animate-spin text-teal-700"
+                                    />
+                                  ) : (
+                                    <MessageSquare
+                                      aria-hidden="true"
+                                      className="size-3.5 shrink-0"
+                                    />
+                                  )}
+                                  <span className="min-w-0 flex-1">
+                                    <span className="block truncate">
+                                      {chat.title}
+                                    </span>
+                                    <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-stone-400">
+                                      {formatChatCreatedAt(chat.createdAt)}
+                                    </span>
+                                  </span>
+                                </button>
+                                <button
+                                  aria-label={`Delete chat ${chat.title}`}
+                                  className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
+                                  onClick={() =>
+                                    void deleteWorkspaceChat(workspace.id, chat.id)
+                                  }
+                                  title="Delete chat"
+                                  type="button"
+                                >
+                                  <Trash2
+                                    aria-hidden="true"
+                                    className="size-3.5"
+                                  />
+                                </button>
+                              </div>
+                            );
+                          })
                         ) : (
                           <div className="rounded-lg px-2 py-1.5 text-xs text-stone-500">
                             No chats
@@ -4250,6 +4283,26 @@ function formatLimit(value: number | null, label: string) {
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
+}
+
+function formatChatCreatedAt(value: string) {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "short",
+    year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
+  }).format(date);
+}
+
+function chatRunKey(workspaceId: string, chatId: string) {
+  return `${workspaceId}:${chatId}`;
 }
 
 function priceText(value: number | null) {
