@@ -4,8 +4,11 @@ import {
   Bot,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   CircleAlert,
+  Copy,
+  Eye,
   Folder,
   FolderPlus,
   GitBranch,
@@ -267,6 +270,67 @@ type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
+type AiRequestAuditSummary = {
+  id: string;
+  workspaceId: string;
+  workspaceName: string;
+  chatId: string | null;
+  chatTitle: string | null;
+  providerId: string;
+  modelId: string;
+  requestStartedAt: string;
+  firstTokenAt: string | null;
+  completedAt: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
+  cacheRatio: number | null;
+  firstTokenLatencyMs: number | null;
+  totalLatencyMs: number | null;
+  statusCode: number | null;
+  finalState: string;
+};
+
+type AiRequestAuditDetail = AiRequestAuditSummary & {
+  requestBody: JsonValue | null;
+  responseBody: JsonValue | null;
+};
+
+type AiRequestAuditEventSummary = {
+  id: string;
+  sequence: number;
+  eventAt: string;
+  eventType: string;
+  rawChunk: JsonValue | null;
+  normalizedEvent: JsonValue;
+};
+
+type AiStatisticsResponse = {
+  page: number;
+  pageSize: number;
+  requests: AiRequestAuditSummary[];
+  totalCount: number;
+  totalPages: number;
+};
+
+type AiRequestDetailResponse = {
+  request: AiRequestAuditDetail;
+  events: AiRequestAuditEventSummary[];
+};
+
+type AiStatsFilterState = {
+  workspaceId: string;
+  chatId: string;
+  providerId: string;
+  modelId: string;
+  status: string;
+  startedAfter: string;
+  startedBefore: string;
+  page: string;
+  pageSize: string;
+};
+
 type ChatToolCallSummary = {
   id: string;
   name: string;
@@ -441,10 +505,45 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Runnable models": "可运行模型",
     "Configured models": "已配置模型",
     "Request audit": "请求审计",
-    "No API request table is exposed yet": "尚未暴露 API 请求表格",
-    "The app records LLM request audit rows in the workspace database. This page now has a dedicated surface ready for the request-summary API when it is added.":
-      "应用会在工作区数据库中记录 LLM 请求审计行。此页面已预留专用区域，等待请求汇总 API 接入。",
-    "audit data pending": "审计数据待接入",
+    "Refresh request audit": "刷新请求审计",
+    "Recorded requests": "已记录请求",
+    "Input tokens": "输入 token",
+    "Output tokens": "输出 token",
+    "Average latency": "平均延迟",
+    "requests {count}": "请求 {count}",
+    "All providers": "全部供应商",
+    "All models": "全部模型",
+    "All statuses": "全部状态",
+    succeeded: "成功",
+    failed: "失败",
+    "Page size": "每页数量",
+    "Showing {start}-{end} of {total}": "显示 {start}-{end}，共 {total}",
+    "Page {page} of {totalPages}": "第 {page} 页，共 {totalPages} 页",
+    "Previous page": "上一页",
+    "Next page": "下一页",
+    "Started after": "开始时间不早于",
+    "Started before": "开始时间不晚于",
+    "Request time": "请求时间",
+    Provider: "供应商",
+    Status: "状态",
+    "Cache read": "缓存读取",
+    "Cache write": "缓存写入",
+    "Cache ratio": "缓存命中率",
+    Latency: "延迟",
+    "First token": "首 token",
+    "Status code": "状态码",
+    Details: "详情",
+    "View request details": "查看请求详情",
+    "No recorded requests": "暂无已记录请求",
+    "Request details": "请求详情",
+    "Close request details": "关闭请求详情",
+    "Request body": "请求正文",
+    "Response body": "响应正文",
+    "Stream events": "流事件",
+    "No stream events": "暂无流事件",
+    Copy: "复制",
+    Copied: "已复制",
+    "Copy {label}": "复制 {label}",
     "Resize git diff panel": "调整 Git diff 面板宽度",
     "Git diff": "Git diff",
     "Workspace changes": "工作区变更",
@@ -1551,7 +1650,6 @@ export function App() {
             <SettingsPanel onSettingsChange={setSettings} />
           ) : (
             <ApiStatsPanel
-              availableModels={availableModels}
               settings={settings}
               workspaces={workspaces}
             />
@@ -3019,89 +3117,718 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
 }
 
 function ApiStatsPanel({
-  availableModels,
   settings,
   workspaces,
 }: {
-  availableModels: ConfiguredModelSummary[];
   settings: SettingsResponse | null;
   workspaces: WorkspaceSummary[];
 }) {
   const { language, t } = useI18n();
-  const enabledProviders =
-    settings?.providers.filter((provider) => provider.enabled).length ?? 0;
-  const configuredModels = settings?.configuredModels.length ?? 0;
+  const [filters, setFilters] = useState<AiStatsFilterState>(
+    emptyAiStatsFilters,
+  );
+  const [stats, setStats] = useState<AiStatisticsResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<AiRequestDetailResponse | null>(null);
+  const [detailError, setDetailError] = useState<string | null>(null);
+  const [isLoadingDetail, setIsLoadingDetail] = useState(false);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const requests = stats?.requests ?? [];
+  const totalCount = stats?.totalCount ?? requests.length;
+  const currentPage = stats?.page ?? positiveIntegerText(filters.page, 1);
+  const pageSize = stats?.pageSize ?? positiveIntegerText(filters.pageSize, 50);
+  const totalPages =
+    stats?.totalPages ?? (totalCount ? Math.ceil(totalCount / pageSize) : 0);
+  const pageStart = requests.length ? (currentPage - 1) * pageSize + 1 : 0;
+  const pageEnd = requests.length
+    ? Math.min(totalCount, pageStart + requests.length - 1)
+    : 0;
   const chatCount = workspaces.reduce(
     (total, workspace) => total + workspace.chats.length,
     0,
   );
+  const selectedWorkspace =
+    workspaces.find((workspace) => workspace.id === filters.workspaceId) ?? null;
+  const chatOptions = (selectedWorkspace ? [selectedWorkspace] : workspaces)
+    .flatMap((workspace) =>
+      workspace.chats.map((chat) => ({
+        label: selectedWorkspace
+          ? chat.title
+          : `${workspace.name} / ${chat.title}`,
+        value: chat.id,
+      })),
+    );
+  const providerOptions = auditOptions(
+    settings?.providers.map((provider) => ({
+      label: provider.name,
+      value: provider.id,
+    })) ?? [],
+    requests.map((request) => request.providerId),
+  );
+  const modelOptions = auditOptions(
+    settings?.configuredModels.map((model) => ({
+      label: model.displayName,
+      value: model.id,
+    })) ?? [],
+    requests.map((request) => request.modelId),
+  );
+  const statusOptions = auditOptions(
+    ["succeeded", "failed", "completed"].map((status) => ({
+      label: auditStatusText(status, t),
+      value: status,
+    })),
+    requests.map((request) => request.finalState),
+    (status) => auditStatusText(status, t),
+  );
+  const totalInputTokens = requests.reduce(
+    (total, request) => total + (request.inputTokens ?? 0),
+    0,
+  );
+  const totalOutputTokens = requests.reduce(
+    (total, request) => total + (request.outputTokens ?? 0),
+    0,
+  );
+  const latencyValues = requests
+    .map((request) => request.totalLatencyMs)
+    .filter((value): value is number => value !== null);
+  const averageLatency = latencyValues.length
+    ? Math.round(
+        latencyValues.reduce((total, value) => total + value, 0) /
+          latencyValues.length,
+      )
+    : null;
+
+  function updateAuditFilters(update: Partial<AiStatsFilterState>) {
+    setFilters((current) => ({
+      ...current,
+      ...update,
+      page: "1",
+    }));
+  }
+
+  function goToAuditPage(page: number) {
+    setFilters((current) => ({
+      ...current,
+      page: String(Math.max(1, page)),
+    }));
+  }
+
+  const loadStats = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const query = aiStatsQuery(filters);
+      const data = await requestJson<AiStatisticsResponse>(
+        `/api/ai-statistics${query ? `?${query}` : ""}`,
+      );
+      setStats(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsLoading(false);
+    }
+  }, [filters]);
+
+  useEffect(() => {
+    void loadStats();
+  }, [loadStats]);
+
+  async function openRequestDetail(request: AiRequestAuditSummary) {
+    setSelectedRequestId(request.id);
+    setDetail(null);
+    setDetailError(null);
+    setCopiedKey(null);
+    setIsLoadingDetail(true);
+
+    try {
+      const data = await requestJson<AiRequestDetailResponse>(
+        `/api/workspaces/${encodeURIComponent(
+          request.workspaceId,
+        )}/ai-statistics/${encodeURIComponent(request.id)}`,
+      );
+      setDetail(data);
+    } catch (requestError) {
+      setDetailError(errorMessage(requestError));
+    } finally {
+      setIsLoadingDetail(false);
+    }
+  }
+
+  async function copyAuditText(key: string, text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedKey(key);
+      window.setTimeout(() => {
+        setCopiedKey((current) => (current === key ? null : current));
+      }, 1600);
+    } catch (copyError) {
+      setDetailError(errorMessage(copyError));
+    }
+  }
 
   return (
     <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
-      <div className="mx-auto flex max-w-6xl flex-col gap-5">
+      <div className="mx-auto flex max-w-7xl flex-col gap-5">
         <section className="rounded-2xl border border-stone-200 bg-white/80 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="inline-flex size-10 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
-              <BarChart3 aria-hidden="true" className="size-5" />
-            </span>
-            <div className="min-w-0">
-              <h2 className="truncate text-lg font-semibold text-stone-950">
-                {t("API statistics")}
-              </h2>
-              <p className="mt-1 truncate text-xs font-medium text-stone-500">
-                {t("All workspaces")}
-              </p>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex min-w-0 items-center gap-3">
+              <span className="inline-flex size-10 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
+                <BarChart3 aria-hidden="true" className="size-5" />
+              </span>
+              <div className="min-w-0">
+                <h2 className="truncate text-lg font-semibold text-stone-950">
+                  {t("API statistics")}
+                </h2>
+                <p className="mt-1 truncate text-xs font-medium text-stone-500">
+                  {filters.workspaceId
+                    ? selectedWorkspace?.name ?? filters.workspaceId
+                    : t("All workspaces")}
+                </p>
+              </div>
             </div>
+            <button
+              aria-label={t("Refresh request audit")}
+              className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+              disabled={isLoading}
+              onClick={() => void loadStats()}
+              title={t("Refresh request audit")}
+              type="button"
+            >
+              {isLoading ? (
+                <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+              ) : (
+                <RefreshCw aria-hidden="true" className="size-4" />
+              )}
+            </button>
           </div>
         </section>
 
         <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <StatsCard
             icon={Activity}
+            label={t("Recorded requests")}
+            value={formatNumber(totalCount, language)}
+          />
+          <StatsCard
+            icon={MessageSquare}
             label={t("All chats")}
             value={formatNumber(chatCount, language)}
           />
           <StatsCard
-            icon={PlugZap}
-            label={t("Enabled providers")}
-            value={formatNumber(enabledProviders, language)}
-          />
-          <StatsCard
             icon={Bot}
-            label={t("Runnable models")}
-            value={formatNumber(availableModels.length, language)}
+            label={t("Input tokens")}
+            value={formatNumber(totalInputTokens, language)}
           />
           <StatsCard
             icon={SlidersHorizontal}
-            label={t("Configured models")}
-            value={formatNumber(configuredModels, language)}
+            label={t("Average latency")}
+            value={formatNullableLatency(averageLatency, language)}
           />
         </section>
 
         <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-          <div className="border-b border-stone-200 px-4 py-3">
-            <h3 className="text-sm font-semibold text-stone-950">
-              {t("Request audit")}
-            </h3>
-          </div>
-          <div className="grid gap-3 px-4 py-8 text-sm text-stone-600 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
-            <div className="min-w-0">
-              <div className="font-semibold text-stone-900">
-                {t("No API request table is exposed yet")}
-              </div>
-              <p className="mt-1 max-w-2xl leading-6">
-                {t(
-                  "The app records LLM request audit rows in the workspace database. This page now has a dedicated surface ready for the request-summary API when it is added.",
-                )}
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+            <div>
+              <h3 className="text-sm font-semibold text-stone-950">
+                {t("Request audit")}
+              </h3>
+              <p className="mt-1 text-xs text-stone-500">
+                {t("requests {count}", {
+                  count: formatNumber(totalCount, language),
+                })}
               </p>
             </div>
-            <span className="inline-flex h-9 items-center rounded-lg border border-dashed border-stone-300 px-3 text-xs font-semibold text-stone-500">
-              {t("audit data pending")}
-            </span>
+            <div className="text-xs text-stone-500">
+              {t("Output tokens")}: {formatNumber(totalOutputTokens, language)}
+            </div>
+          </div>
+          <div className="grid gap-3 border-b border-stone-200 bg-stone-50/70 px-4 py-4 md:grid-cols-2 xl:grid-cols-8">
+            <FilterSelect
+              label={t("Workspace")}
+              onChange={(value) =>
+                updateAuditFilters({
+                  chatId: "",
+                  workspaceId: value,
+                })
+              }
+              options={workspaces.map((workspace) => ({
+                label: workspace.name,
+                value: workspace.id,
+              }))}
+              placeholder={t("All workspaces")}
+              value={filters.workspaceId}
+            />
+            <FilterSelect
+              label={t("Chat")}
+              onChange={(value) => updateAuditFilters({ chatId: value })}
+              options={chatOptions}
+              placeholder={t("All chats")}
+              value={filters.chatId}
+            />
+            <FilterSelect
+              label={t("Provider")}
+              onChange={(value) => updateAuditFilters({ providerId: value })}
+              options={providerOptions}
+              placeholder={t("All providers")}
+              value={filters.providerId}
+            />
+            <FilterSelect
+              label={t("Model")}
+              onChange={(value) => updateAuditFilters({ modelId: value })}
+              options={modelOptions}
+              placeholder={t("All models")}
+              value={filters.modelId}
+            />
+            <FilterSelect
+              label={t("Status")}
+              onChange={(value) => updateAuditFilters({ status: value })}
+              options={statusOptions}
+              placeholder={t("All statuses")}
+              value={filters.status}
+            />
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                {t("Started after")}
+              </span>
+              <input
+                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                onChange={(event) =>
+                  updateAuditFilters({
+                    startedAfter: event.target.value,
+                  })
+                }
+                type="datetime-local"
+                value={filters.startedAfter}
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                {t("Started before")}
+              </span>
+              <input
+                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                onChange={(event) =>
+                  updateAuditFilters({
+                    startedBefore: event.target.value,
+                  })
+                }
+                type="datetime-local"
+                value={filters.startedBefore}
+              />
+            </label>
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                {t("Page size")}
+              </span>
+              <input
+                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                max={500}
+                min={1}
+                onChange={(event) =>
+                  updateAuditFilters({ pageSize: event.target.value })
+                }
+                type="number"
+                value={filters.pageSize}
+              />
+            </label>
+          </div>
+          {error ? (
+            <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+              {error}
+            </div>
+          ) : null}
+          <div className="overflow-x-auto">
+            <table className="min-w-[78rem] w-full text-left text-sm">
+              <thead className="border-b border-stone-200 bg-white text-xs font-semibold text-stone-500">
+                <tr>
+                  <th className="px-4 py-3">{t("Request time")}</th>
+                  <th className="px-4 py-3">{t("Workspace")}</th>
+                  <th className="px-4 py-3">{t("Chat")}</th>
+                  <th className="px-4 py-3">{t("Provider")}</th>
+                  <th className="px-4 py-3">{t("Model")}</th>
+                  <th className="px-4 py-3 text-right">{t("Input tokens")}</th>
+                  <th className="px-4 py-3 text-right">{t("Output tokens")}</th>
+                  <th className="px-4 py-3 text-right">{t("Cache read")}</th>
+                  <th className="px-4 py-3 text-right">{t("Cache write")}</th>
+                  <th className="px-4 py-3 text-right">{t("Cache ratio")}</th>
+                  <th className="px-4 py-3 text-right">{t("Latency")}</th>
+                  <th className="px-4 py-3 text-right">{t("First token")}</th>
+                  <th className="px-4 py-3 text-right">{t("Status code")}</th>
+                  <th className="px-4 py-3">{t("Status")}</th>
+                  <th className="px-4 py-3 text-right">{t("Details")}</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-stone-100">
+                {requests.length ? (
+                  requests.map((request) => (
+                    <tr key={request.id} className="align-top hover:bg-teal-50/40">
+                      <td className="px-4 py-3 font-medium text-stone-900">
+                        {formatAuditDate(request.requestStartedAt, language)}
+                      </td>
+                      <td className="max-w-[10rem] truncate px-4 py-3 text-stone-700">
+                        {request.workspaceName}
+                      </td>
+                      <td className="max-w-[12rem] truncate px-4 py-3 text-stone-600">
+                        {request.chatTitle ?? request.chatId ?? "n/a"}
+                      </td>
+                      <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-stone-700">
+                        {request.providerId}
+                      </td>
+                      <td className="max-w-[14rem] truncate px-4 py-3 font-mono text-xs text-stone-700">
+                        {request.modelId}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {formatNullableNumber(request.inputTokens, language)}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {formatNullableNumber(request.outputTokens, language)}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {formatNullableNumber(request.cacheReadTokens, language)}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {formatNullableNumber(request.cacheWriteTokens, language)}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {formatPercent(request.cacheRatio, language)}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {formatNullableLatency(request.totalLatencyMs, language)}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {formatNullableLatency(
+                          request.firstTokenLatencyMs,
+                          language,
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-right font-mono">
+                        {formatNullableNumber(request.statusCode, language)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={auditStatusClass(request.finalState)}>
+                          {auditStatusText(request.finalState, t)}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-right">
+                        <button
+                          aria-label={t("View request details")}
+                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                          onClick={() => void openRequestDetail(request)}
+                          title={t("View request details")}
+                          type="button"
+                        >
+                          <Eye aria-hidden="true" className="size-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td
+                      className="px-4 py-10 text-center text-sm text-stone-500"
+                      colSpan={15}
+                    >
+                      {isLoading ? t("Loading...") : t("No recorded requests")}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 px-4 py-3 text-sm">
+            <div className="text-stone-500">
+              {t("Showing {start}-{end} of {total}", {
+                end: formatNumber(pageEnd, language),
+                start: formatNumber(pageStart, language),
+                total: formatNumber(totalCount, language),
+              })}
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold text-stone-500">
+                {t("Page {page} of {totalPages}", {
+                  page: formatNumber(currentPage, language),
+                  totalPages: formatNumber(totalPages, language),
+                })}
+              </span>
+              <button
+                aria-label={t("Previous page")}
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                disabled={isLoading || currentPage <= 1}
+                onClick={() => goToAuditPage(currentPage - 1)}
+                title={t("Previous page")}
+                type="button"
+              >
+                <ChevronLeft aria-hidden="true" className="size-4" />
+              </button>
+              <button
+                aria-label={t("Next page")}
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                disabled={
+                  isLoading || totalPages === 0 || currentPage >= totalPages
+                }
+                onClick={() => goToAuditPage(currentPage + 1)}
+                title={t("Next page")}
+                type="button"
+              >
+                <ChevronRight aria-hidden="true" className="size-4" />
+              </button>
+            </div>
           </div>
         </section>
       </div>
+      {selectedRequestId ? (
+        <AiRequestDetailDialog
+          copiedKey={copiedKey}
+          detail={detail}
+          error={detailError}
+          isLoading={isLoadingDetail}
+          onClose={() => {
+            setSelectedRequestId(null);
+            setDetail(null);
+            setDetailError(null);
+            setCopiedKey(null);
+          }}
+          onCopy={(key, text) => void copyAuditText(key, text)}
+        />
+      ) : null}
     </div>
+  );
+}
+
+function FilterSelect({
+  label,
+  onChange,
+  options,
+  placeholder,
+  value,
+}: {
+  label: string;
+  onChange: (value: string) => void;
+  options: { label: string; value: string }[];
+  placeholder: string;
+  value: string;
+}) {
+  return (
+    <label className="block">
+      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+        {label}
+      </span>
+      <select
+        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+        onChange={(event) => onChange(event.target.value)}
+        value={value}
+      >
+        <option value="">{placeholder}</option>
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function AiRequestDetailDialog({
+  copiedKey,
+  detail,
+  error,
+  isLoading,
+  onClose,
+  onCopy,
+}: {
+  copiedKey: string | null;
+  detail: AiRequestDetailResponse | null;
+  error: string | null;
+  isLoading: boolean;
+  onClose: () => void;
+  onCopy: (key: string, text: string) => void;
+}) {
+  const { language, t } = useI18n();
+  const request = detail?.request ?? null;
+  const events = detail?.events ?? [];
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
+      role="presentation"
+    >
+      <section
+        aria-labelledby="ai-request-detail-title"
+        aria-modal="true"
+        className="flex max-h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        role="dialog"
+      >
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+          <div className="min-w-0">
+            <h2
+              className="truncate text-base font-semibold text-stone-950"
+              id="ai-request-detail-title"
+            >
+              {t("Request details")}
+            </h2>
+            <p className="mt-1 truncate text-xs font-medium text-stone-500">
+              {request ? request.id : t("Loading...")}
+            </p>
+          </div>
+          <button
+            aria-label={t("Close request details")}
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            onClick={onClose}
+            title={t("Close")}
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+          {error ? (
+            <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              {error}
+            </div>
+          ) : null}
+          {isLoading ? (
+            <div className="flex items-center gap-2 py-8 text-sm text-stone-500">
+              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+              {t("Loading...")}
+            </div>
+          ) : null}
+          {request ? (
+            <div className="grid gap-4">
+              <div className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3 md:grid-cols-2 xl:grid-cols-4">
+                <AuditMeta label={t("Workspace")} value={request.workspaceName} />
+                <AuditMeta
+                  label={t("Chat")}
+                  value={request.chatTitle ?? request.chatId ?? "n/a"}
+                />
+                <AuditMeta label={t("Provider")} value={request.providerId} />
+                <AuditMeta label={t("Model")} value={request.modelId} />
+                <AuditMeta
+                  label={t("Request time")}
+                  value={formatAuditDate(request.requestStartedAt, language)}
+                />
+                <AuditMeta
+                  label={t("Latency")}
+                  value={formatNullableLatency(request.totalLatencyMs, language)}
+                />
+                <AuditMeta
+                  label={t("First token")}
+                  value={formatNullableLatency(
+                    request.firstTokenLatencyMs,
+                    language,
+                  )}
+                />
+                <AuditMeta
+                  label={t("Status")}
+                  value={auditStatusText(request.finalState, t)}
+                />
+              </div>
+              <div className="grid gap-4 xl:grid-cols-2">
+                <AuditJsonBlock
+                  copied={copiedKey === "request"}
+                  label={t("Request body")}
+                  onCopy={() =>
+                    onCopy("request", auditJsonText(request.requestBody))
+                  }
+                  value={request.requestBody}
+                />
+                <AuditJsonBlock
+                  copied={copiedKey === "response"}
+                  label={t("Response body")}
+                  onCopy={() =>
+                    onCopy("response", auditJsonText(request.responseBody))
+                  }
+                  value={request.responseBody}
+                />
+              </div>
+              <section className="rounded-xl border border-stone-200 bg-white">
+                <div className="border-b border-stone-200 px-3 py-2">
+                  <h3 className="text-sm font-semibold text-stone-950">
+                    {t("Stream events")}
+                  </h3>
+                </div>
+                {events.length ? (
+                  <div className="divide-y divide-stone-100">
+                    {events.map((event) => (
+                      <div className="grid gap-3 px-3 py-3" key={event.id}>
+                        <div className="flex flex-wrap items-center gap-2 text-xs text-stone-500">
+                          <span className="font-mono text-stone-900">
+                            #{event.sequence}
+                          </span>
+                          <span>{event.eventType}</span>
+                          <span>{formatAuditDate(event.eventAt, language)}</span>
+                        </div>
+                        <div className="grid gap-3 xl:grid-cols-2">
+                          <pre className="max-h-80 overflow-auto rounded-lg bg-stone-950 px-3 py-3 text-xs leading-5 text-stone-100">
+                            {auditJsonText(event.rawChunk)}
+                          </pre>
+                          <pre className="max-h-80 overflow-auto rounded-lg bg-stone-950 px-3 py-3 text-xs leading-5 text-stone-100">
+                            {auditJsonText(event.normalizedEvent)}
+                          </pre>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="px-3 py-6 text-sm text-stone-500">
+                    {t("No stream events")}
+                  </div>
+                )}
+              </section>
+            </div>
+          ) : null}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function AuditMeta({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-xs font-semibold text-stone-500">{label}</div>
+      <div className="mt-1 truncate text-sm font-medium text-stone-950">
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function AuditJsonBlock({
+  copied,
+  label,
+  onCopy,
+  value,
+}: {
+  copied: boolean;
+  label: string;
+  onCopy: () => void;
+  value: JsonValue | null;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <section className="min-w-0 rounded-xl border border-stone-200 bg-white">
+      <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-3 py-2">
+        <h3 className="text-sm font-semibold text-stone-950">{label}</h3>
+        <button
+          aria-label={t("Copy {label}", { label })}
+          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+          onClick={onCopy}
+          title={t("Copy {label}", { label })}
+          type="button"
+        >
+          <Copy aria-hidden="true" className="size-3.5" />
+          {copied ? t("Copied") : t("Copy")}
+        </button>
+      </div>
+      <pre className="max-h-[32rem] overflow-auto bg-stone-950 px-3 py-3 text-xs leading-5 text-stone-100">
+        {auditJsonText(value)}
+      </pre>
+    </section>
   );
 }
 
@@ -6138,6 +6865,160 @@ function formatLimit(value: number | null, label: string, language: AppLanguageI
   return value === null
     ? `${label} missing`
     : `${label} ${formatNumber(value, language)}`;
+}
+
+function emptyAiStatsFilters(): AiStatsFilterState {
+  return {
+    chatId: "",
+    modelId: "",
+    page: "1",
+    pageSize: "50",
+    providerId: "",
+    startedAfter: "",
+    startedBefore: "",
+    status: "",
+    workspaceId: "",
+  };
+}
+
+function aiStatsQuery(filters: AiStatsFilterState) {
+  const params = new URLSearchParams();
+  const entries: [keyof AiStatsFilterState, string][] = [
+    ["workspaceId", filters.workspaceId],
+    ["chatId", filters.chatId],
+    ["providerId", filters.providerId],
+    ["modelId", filters.modelId],
+    ["status", filters.status],
+    ["startedAfter", datetimeLocalToRfc3339(filters.startedAfter)],
+    ["startedBefore", datetimeLocalToRfc3339(filters.startedBefore)],
+    ["page", filters.page.trim()],
+    ["pageSize", filters.pageSize.trim()],
+  ];
+
+  for (const [key, value] of entries) {
+    if (value) {
+      params.set(key, value);
+    }
+  }
+
+  return params.toString();
+}
+
+function positiveIntegerText(value: string, fallback: number) {
+  const parsed = Number(value);
+
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function datetimeLocalToRfc3339(value: string) {
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    return "";
+  }
+
+  const date = new Date(trimmed);
+  if (Number.isNaN(date.getTime())) {
+    throw new Error(`invalid date time: ${value}`);
+  }
+
+  return date.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function auditOptions(
+  configuredOptions: { label: string; value: string }[],
+  observedValues: string[],
+  labelForObserved: (value: string) => string = (value) => value,
+) {
+  const optionsByValue = new Map<string, { label: string; value: string }>();
+
+  for (const option of configuredOptions) {
+    if (option.value) {
+      optionsByValue.set(option.value, option);
+    }
+  }
+
+  for (const value of observedValues) {
+    if (value && !optionsByValue.has(value)) {
+      optionsByValue.set(value, { label: labelForObserved(value), value });
+    }
+  }
+
+  return Array.from(optionsByValue.values()).sort((left, right) =>
+    left.label.localeCompare(right.label),
+  );
+}
+
+function auditStatusText(status: string, t: Translate) {
+  if (status === "succeeded" || status === "completed") {
+    return t("succeeded");
+  }
+
+  if (status === "failed") {
+    return t("failed");
+  }
+
+  return status;
+}
+
+function auditStatusClass(status: string) {
+  const base = "inline-flex rounded-md px-2 py-1 text-xs font-semibold";
+
+  if (status === "succeeded" || status === "completed") {
+    return `${base} bg-teal-100 text-teal-800`;
+  }
+
+  if (status === "failed") {
+    return `${base} bg-rose-100 text-rose-700`;
+  }
+
+  return `${base} bg-stone-100 text-stone-600`;
+}
+
+function auditJsonText(value: JsonValue | null) {
+  return value === null ? "null" : formatJsonValue(value);
+}
+
+function formatAuditDate(value: string, language: AppLanguageId = "en") {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat(language, {
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "short",
+    second: "2-digit",
+    year: "numeric",
+  }).format(date);
+}
+
+function formatNullableNumber(
+  value: number | null,
+  language: AppLanguageId = "en",
+) {
+  return value === null ? "n/a" : formatNumber(value, language);
+}
+
+function formatNullableLatency(
+  value: number | null,
+  language: AppLanguageId = "en",
+) {
+  return value === null ? "n/a" : `${formatNumber(value, language)} ms`;
+}
+
+function formatPercent(value: number | null, language: AppLanguageId = "en") {
+  if (value === null) {
+    return "n/a";
+  }
+
+  return new Intl.NumberFormat(language, {
+    maximumFractionDigits: 1,
+    style: "percent",
+  }).format(value);
 }
 
 function formatNumber(value: number, language: AppLanguageId = "en") {

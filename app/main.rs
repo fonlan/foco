@@ -49,10 +49,10 @@ use foco_store::{
         parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
     },
     workspace::{
-        ChatRecord, ContextCompressionSnapshotRecord, LlmRequestEventRecord, MessageRecord,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-        NewTerminalSession, NewToolCall, NewToolResult, ToolCallWithResultRecord,
-        WorkspaceDatabase, initialize_workspace_databases,
+        ChatRecord, ContextCompressionSnapshotRecord, LlmRequestAuditFilters, LlmRequestAuditRow,
+        LlmRequestEventRecord, LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot,
+        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewTerminalSession, NewToolCall,
+        NewToolResult, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
     },
 };
 use foco_tools::{
@@ -155,9 +155,14 @@ async fn run() -> AppResult<()> {
         .route("/api/mcp/servers/delete", post(delete_mcp_server))
         .route("/api/skills/manual", post(save_skills))
         .route("/api/skills/refresh", post(refresh_skills))
+        .route("/api/ai-statistics", get(ai_statistics))
         .route(
             "/api/workspaces/{workspace_id}/chat/stream",
             post(stream_chat_response),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/ai-statistics/{request_id}",
+            get(ai_statistics_detail),
         )
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/messages",
@@ -903,6 +908,105 @@ async fn stream_chat_response(
     ))
 }
 
+async fn ai_statistics(
+    State(state): State<AppState>,
+    Query(query): Query<AiStatisticsQuery>,
+) -> Result<Json<AiStatisticsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let filters = normalized_ai_statistics_query(query)?;
+    let workspaces = ai_statistics_workspaces(&config, filters.workspace_id.as_deref())?;
+    let mut requests = Vec::new();
+    let mut total_count = 0_i64;
+    let page_limit = filters
+        .offset
+        .checked_add(filters.page_size)
+        .ok_or_else(|| ApiError::bad_request("AI statistics page limit is too large"))?;
+
+    for workspace in workspaces {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        let chat_titles = chat_title_map(&database)?;
+        let audit_filters = LlmRequestAuditFilters {
+            workspace_id: None,
+            chat_id: filters.chat_id.as_deref(),
+            provider_id: filters.provider_id.as_deref(),
+            model_id: filters.model_id.as_deref(),
+            final_state: filters.status.as_deref(),
+            started_after: filters.started_after.as_deref(),
+            started_before: filters.started_before.as_deref(),
+            limit: Some(page_limit),
+            offset: Some(0),
+        };
+
+        total_count += database
+            .llm_request_audit_count(audit_filters)
+            .map_err(ApiError::from_workspace_error)?;
+        let rows = database
+            .llm_request_audit_rows(audit_filters)
+            .map_err(ApiError::from_workspace_error)?;
+
+        requests.extend(
+            rows.into_iter()
+                .map(|row| ai_request_audit_summary(row, workspace, &chat_titles)),
+        );
+    }
+
+    requests.sort_by(|left, right| {
+        right
+            .request_started_at
+            .cmp(&left.request_started_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    let start = usize::try_from(filters.offset).expect("non-negative offset fits usize");
+    let page_size = usize::try_from(filters.page_size).expect("positive page size fits usize");
+    let requests = requests.into_iter().skip(start).take(page_size).collect();
+    let total_pages = if total_count == 0 {
+        0
+    } else {
+        (total_count + filters.page_size - 1) / filters.page_size
+    };
+
+    Ok(Json(AiStatisticsResponse {
+        page: filters.page,
+        page_size: filters.page_size,
+        requests,
+        total_count,
+        total_pages,
+    }))
+}
+
+async fn ai_statistics_detail(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, request_id)): AxumPath<(String, String)>,
+) -> Result<Json<AiRequestDetailResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let request_id = request_id.trim();
+
+    if request_id.is_empty() {
+        return Err(ApiError::bad_request("request id must not be empty"));
+    }
+
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let chat_titles = chat_title_map(&database)?;
+    let request = database
+        .llm_request(request_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::bad_request(format!("LLM request was not found: {request_id}")))?;
+    let events = database
+        .llm_request_events(request_id)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .map(ai_request_audit_event_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Json(AiRequestDetailResponse {
+        request: ai_request_audit_detail(request, workspace, &chat_titles)?,
+        events,
+    }))
+}
+
 async fn chat_messages(
     State(state): State<AppState>,
     AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
@@ -1249,6 +1353,21 @@ struct ChatStreamRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct AiStatisticsQuery {
+    workspace_id: Option<String>,
+    chat_id: Option<String>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    status: Option<String>,
+    started_after: Option<String>,
+    started_before: Option<String>,
+    page: Option<i64>,
+    page_size: Option<i64>,
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GitDiffQuery {
     path: Option<String>,
 }
@@ -1450,6 +1569,84 @@ struct ChatMessagesResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct AiStatisticsResponse {
+    page: i64,
+    page_size: i64,
+    requests: Vec<AiRequestAuditSummary>,
+    total_count: i64,
+    total_pages: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiRequestDetailResponse {
+    request: AiRequestAuditDetail,
+    events: Vec<AiRequestAuditEventSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiRequestAuditSummary {
+    id: String,
+    workspace_id: String,
+    workspace_name: String,
+    chat_id: Option<String>,
+    chat_title: Option<String>,
+    provider_id: String,
+    model_id: String,
+    request_started_at: String,
+    first_token_at: Option<String>,
+    completed_at: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    cache_ratio: Option<f64>,
+    first_token_latency_ms: Option<i64>,
+    total_latency_ms: Option<i64>,
+    status_code: Option<i64>,
+    final_state: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiRequestAuditDetail {
+    id: String,
+    workspace_id: String,
+    workspace_name: String,
+    chat_id: Option<String>,
+    chat_title: Option<String>,
+    provider_id: String,
+    model_id: String,
+    request_started_at: String,
+    first_token_at: Option<String>,
+    completed_at: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    cache_ratio: Option<f64>,
+    first_token_latency_ms: Option<i64>,
+    total_latency_ms: Option<i64>,
+    status_code: Option<i64>,
+    final_state: String,
+    request_body: Option<Value>,
+    response_body: Option<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AiRequestAuditEventSummary {
+    id: String,
+    sequence: i64,
+    event_at: String,
+    event_type: String,
+    raw_chunk: Option<Value>,
+    normalized_event: Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GitStatusResponse {
     is_git_repository: bool,
     status: String,
@@ -1590,6 +1787,19 @@ struct CapturedAuditEvent {
     event_at: String,
     event_type: String,
     normalized_event_json: String,
+}
+
+struct NormalizedAiStatisticsFilters {
+    workspace_id: Option<String>,
+    chat_id: Option<String>,
+    provider_id: Option<String>,
+    model_id: Option<String>,
+    status: Option<String>,
+    started_after: Option<String>,
+    started_before: Option<String>,
+    page: i64,
+    page_size: i64,
+    offset: i64,
 }
 
 struct ContextMessageGroup {
@@ -4896,6 +5106,143 @@ fn optional_trimmed_string(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn normalized_ai_statistics_query(
+    query: AiStatisticsQuery,
+) -> Result<NormalizedAiStatisticsFilters, ApiError> {
+    let page = query.page.unwrap_or(1);
+    let page_size = query.page_size.or(query.limit).unwrap_or(50);
+
+    if page < 1 {
+        return Err(ApiError::bad_request(
+            "AI statistics page must be a positive integer",
+        ));
+    }
+
+    if page_size < 1 {
+        return Err(ApiError::bad_request(
+            "AI statistics page size must be a positive integer",
+        ));
+    }
+
+    let page_size = page_size.min(500);
+    let offset = (page - 1)
+        .checked_mul(page_size)
+        .ok_or_else(|| ApiError::bad_request("AI statistics page offset is too large"))?;
+
+    Ok(NormalizedAiStatisticsFilters {
+        workspace_id: optional_trimmed_string(query.workspace_id),
+        chat_id: optional_trimmed_string(query.chat_id),
+        provider_id: optional_trimmed_string(query.provider_id),
+        model_id: optional_trimmed_string(query.model_id),
+        status: optional_trimmed_string(query.status),
+        started_after: optional_trimmed_string(query.started_after),
+        started_before: optional_trimmed_string(query.started_before),
+        page,
+        page_size,
+        offset,
+    })
+}
+
+fn ai_statistics_workspaces<'a>(
+    config: &'a GlobalConfig,
+    workspace_id: Option<&str>,
+) -> Result<Vec<&'a WorkspaceConfig>, ApiError> {
+    if let Some(workspace_id) = workspace_id {
+        return Ok(vec![workspace_by_id(config, workspace_id)?]);
+    }
+
+    Ok(config.workspaces.iter().collect())
+}
+
+fn chat_title_map(database: &WorkspaceDatabase) -> Result<HashMap<String, String>, ApiError> {
+    Ok(database
+        .chats()
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .map(|chat| (chat.id, chat.title))
+        .collect())
+}
+
+fn ai_request_audit_summary(
+    row: LlmRequestAuditRow,
+    workspace: &WorkspaceConfig,
+    chat_titles: &HashMap<String, String>,
+) -> AiRequestAuditSummary {
+    AiRequestAuditSummary {
+        id: row.id,
+        workspace_id: workspace.id.clone(),
+        workspace_name: workspace.name.clone(),
+        chat_title: row
+            .chat_id
+            .as_ref()
+            .and_then(|chat_id| chat_titles.get(chat_id).cloned()),
+        chat_id: row.chat_id,
+        provider_id: row.provider_id,
+        model_id: row.model_id,
+        request_started_at: row.request_started_at,
+        first_token_at: row.first_token_at,
+        completed_at: row.completed_at,
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        cache_write_tokens: row.cache_write_tokens,
+        cache_ratio: row.cache_ratio,
+        first_token_latency_ms: row.first_token_latency_ms,
+        total_latency_ms: row.total_latency_ms,
+        status_code: row.status_code,
+        final_state: row.final_state,
+    }
+}
+
+fn ai_request_audit_detail(
+    request: LlmRequestRecord,
+    workspace: &WorkspaceConfig,
+    chat_titles: &HashMap<String, String>,
+) -> Result<AiRequestAuditDetail, ApiError> {
+    Ok(AiRequestAuditDetail {
+        id: request.id,
+        workspace_id: workspace.id.clone(),
+        workspace_name: workspace.name.clone(),
+        chat_title: request
+            .chat_id
+            .as_ref()
+            .and_then(|chat_id| chat_titles.get(chat_id).cloned()),
+        chat_id: request.chat_id,
+        provider_id: request.provider_id,
+        model_id: request.model_id,
+        request_started_at: request.request_started_at,
+        first_token_at: request.first_token_at,
+        completed_at: request.completed_at,
+        input_tokens: request.input_tokens,
+        output_tokens: request.output_tokens,
+        cache_read_tokens: request.cache_read_tokens,
+        cache_write_tokens: request.cache_write_tokens,
+        cache_ratio: request.cache_ratio,
+        first_token_latency_ms: request.first_token_latency_ms,
+        total_latency_ms: request.total_latency_ms,
+        status_code: request.status_code,
+        final_state: request.final_state,
+        request_body: parse_optional_json_value(request.request_body_json, "LLM request body")?,
+        response_body: parse_optional_json_value(request.response_body_json, "LLM response body")?,
+    })
+}
+
+fn ai_request_audit_event_summary(
+    event: LlmRequestEventRecord,
+) -> Result<AiRequestAuditEventSummary, ApiError> {
+    Ok(AiRequestAuditEventSummary {
+        id: event.id,
+        sequence: event.sequence,
+        event_at: event.event_at,
+        event_type: event.event_type,
+        raw_chunk: parse_optional_json_value(event.raw_chunk_json, "LLM raw stream chunk")?,
+        normalized_event: parse_json_value(
+            &event.normalized_event_json,
+            "LLM normalized stream event",
+        )?,
+    })
+}
+
 fn cached_model_record(
     cache_path: &Path,
     key: &str,
@@ -5246,6 +5593,16 @@ fn chat_tool_call_summary(
 fn parse_json_value(value: &str, field: &str) -> Result<Value, ApiError> {
     serde_json::from_str(value)
         .map_err(|source| ApiError::internal(format!("failed to parse {field}: {source}")))
+}
+
+fn parse_optional_json_value(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<Value>, ApiError> {
+    value
+        .as_deref()
+        .map(|value| parse_json_value(value, field))
+        .transpose()
 }
 
 fn canonical_workspace_path(path: &Path) -> Result<PathBuf, ApiError> {

@@ -634,6 +634,101 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn llm_request_audit_rows(
+        &self,
+        filters: LlmRequestAuditFilters<'_>,
+    ) -> Result<Vec<LlmRequestAuditRow>, WorkspaceDatabaseError> {
+        let limit = filters.limit.unwrap_or(200).max(1);
+        let offset = filters.offset.unwrap_or(0).max(0);
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    id, workspace_id, chat_id, provider_id, model_id, request_started_at,
+                    first_token_at, completed_at, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, cache_ratio,
+                    first_token_latency_ms, total_latency_ms, status_code, final_state
+                 FROM llm_requests
+                 WHERE (?1 IS NULL OR workspace_id = ?1)
+                   AND (?2 IS NULL OR chat_id = ?2)
+                   AND (?3 IS NULL OR provider_id = ?3)
+                   AND (?4 IS NULL OR model_id = ?4)
+                   AND (?5 IS NULL OR final_state = ?5)
+                   AND (?6 IS NULL OR request_started_at >= ?6)
+                   AND (?7 IS NULL OR request_started_at <= ?7)
+                 ORDER BY request_started_at DESC, id DESC
+                 LIMIT ?8 OFFSET ?9",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    filters.workspace_id,
+                    filters.chat_id,
+                    filters.provider_id,
+                    filters.model_id,
+                    filters.final_state,
+                    filters.started_after,
+                    filters.started_before,
+                    limit,
+                    offset
+                ],
+                |row| {
+                    Ok(LlmRequestAuditRow {
+                        id: row.get(0)?,
+                        workspace_id: row.get(1)?,
+                        chat_id: row.get(2)?,
+                        provider_id: row.get(3)?,
+                        model_id: row.get(4)?,
+                        request_started_at: row.get(5)?,
+                        first_token_at: row.get(6)?,
+                        completed_at: row.get(7)?,
+                        input_tokens: row.get(8)?,
+                        output_tokens: row.get(9)?,
+                        cache_read_tokens: row.get(10)?,
+                        cache_write_tokens: row.get(11)?,
+                        cache_ratio: row.get(12)?,
+                        first_token_latency_ms: row.get(13)?,
+                        total_latency_ms: row.get(14)?,
+                        status_code: row.get(15)?,
+                        final_state: row.get(16)?,
+                    })
+                },
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn llm_request_audit_count(
+        &self,
+        filters: LlmRequestAuditFilters<'_>,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM llm_requests
+                 WHERE (?1 IS NULL OR workspace_id = ?1)
+                   AND (?2 IS NULL OR chat_id = ?2)
+                   AND (?3 IS NULL OR provider_id = ?3)
+                   AND (?4 IS NULL OR model_id = ?4)
+                   AND (?5 IS NULL OR final_state = ?5)
+                   AND (?6 IS NULL OR request_started_at >= ?6)
+                   AND (?7 IS NULL OR request_started_at <= ?7)",
+                params![
+                    filters.workspace_id,
+                    filters.chat_id,
+                    filters.provider_id,
+                    filters.model_id,
+                    filters.final_state,
+                    filters.started_after,
+                    filters.started_before,
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn insert_context_compression_snapshot(
         &mut self,
         snapshot: NewContextCompressionSnapshot<'_>,
@@ -1562,6 +1657,40 @@ pub struct LlmRequestRecord {
     pub final_state: String,
     pub request_body_json: Option<String>,
     pub response_body_json: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LlmRequestAuditFilters<'a> {
+    pub workspace_id: Option<&'a str>,
+    pub chat_id: Option<&'a str>,
+    pub provider_id: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    pub final_state: Option<&'a str>,
+    pub started_after: Option<&'a str>,
+    pub started_before: Option<&'a str>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LlmRequestAuditRow {
+    pub id: String,
+    pub workspace_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub provider_id: String,
+    pub model_id: String,
+    pub request_started_at: String,
+    pub first_token_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub cache_ratio: Option<f64>,
+    pub first_token_latency_ms: Option<i64>,
+    pub total_latency_ms: Option<i64>,
+    pub status_code: Option<i64>,
+    pub final_state: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

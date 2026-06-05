@@ -59,6 +59,13 @@ non-secret request/response JSON. Authorization headers and API-key fields are
 redacted before persistence, and cache ratio is calculated from normalized input
 and cache-read token counts.
 
+The top-level Stats view reads `GET /api/ai-statistics` to show recorded LLM
+requests across registered workspaces. It can filter by workspace, chat,
+provider, model, status, and time range, and uses `page` and `pageSize` for
+server-side pagination with total counts. Request details come from `GET
+/api/workspaces/{workspace_id}/ai-statistics/{request_id}` and include the stored
+request/response JSON plus streamed raw chunks and normalized events.
+
 The chat panel sends real model requests through
 `POST /api/workspaces/{workspace_id}/chat/stream`, which returns server-sent
 events. The backend builds provider-neutral `genai` chat requests, supports both

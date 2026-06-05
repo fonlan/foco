@@ -3,11 +3,11 @@ use std::fs;
 use foco_store::{
     config::WorkspaceConfig,
     workspace::{
-        LlmRequestRecord, NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport,
-        NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot, NewLlmRequest,
-        NewLlmRequestEvent, NewMessage, NewRunEvent, NewTerminalSession, NewToolCall,
-        NewToolResult, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, initialize_workspace_databases,
-        workspace_database_path,
+        LlmRequestAuditFilters, LlmRequestRecord, NewCodeGraphEdge, NewCodeGraphFileIndex,
+        NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
+        NewTerminalSession, NewToolCall, NewToolResult, WORKSPACE_SCHEMA_VERSION,
+        WorkspaceDatabase, initialize_workspace_databases, workspace_database_path,
     },
 };
 use rusqlite::Connection;
@@ -745,6 +745,85 @@ fn audits_mocked_llm_request_response_and_stream_events() {
     assert!(raw_chunk.contains(r#""authorization":"[REDACTED]""#));
     assert!(!raw_chunk.contains("streamed-secret"));
     assert_eq!(events[1].event_type, "usage");
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-2",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            provider_id: "openai-chat",
+            model_id: "gpt-other",
+            request_started_at: "2026-06-03T11:00:00.000Z",
+            first_token_at: None,
+            completed_at: Some("2026-06-03T11:00:00.250Z"),
+            input_tokens: Some(8),
+            output_tokens: Some(2),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            first_token_latency_ms: None,
+            total_latency_ms: Some(250),
+            status_code: None,
+            final_state: "failed",
+            request_body_json: Some(r#"{"model":"gpt-other"}"#),
+            response_body_json: Some(r#"{"error":"boom"}"#),
+        })
+        .expect("second llm request insert");
+
+    let all_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters::default())
+        .expect("audit rows");
+    assert_eq!(all_rows.len(), 2);
+    assert_eq!(all_rows[0].id, "request-2");
+    assert_eq!(all_rows[1].id, "request-1");
+    assert_eq!(
+        database
+            .llm_request_audit_count(LlmRequestAuditFilters::default())
+            .expect("audit count"),
+        2
+    );
+
+    let second_page_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            limit: Some(1),
+            offset: Some(1),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("second page audit rows");
+    assert_eq!(second_page_rows.len(), 1);
+    assert_eq!(second_page_rows[0].id, "request-1");
+
+    let filtered_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            workspace_id: Some("workspace-1"),
+            chat_id: Some("chat-1"),
+            provider_id: Some("openai-responses"),
+            model_id: Some("gpt-audit"),
+            final_state: Some("completed"),
+            started_after: Some("2026-06-03T09:00:00.000Z"),
+            started_before: Some("2026-06-03T10:30:00.000Z"),
+            limit: Some(1),
+            offset: None,
+        })
+        .expect("filtered audit rows");
+    assert_eq!(filtered_rows.len(), 1);
+    assert_eq!(filtered_rows[0].id, "request-1");
+    assert_eq!(filtered_rows[0].cache_ratio, Some(0.4));
+    assert_eq!(
+        database
+            .llm_request_audit_count(LlmRequestAuditFilters {
+                workspace_id: Some("workspace-1"),
+                chat_id: Some("chat-1"),
+                provider_id: Some("openai-responses"),
+                model_id: Some("gpt-audit"),
+                final_state: Some("completed"),
+                started_after: Some("2026-06-03T09:00:00.000Z"),
+                started_before: Some("2026-06-03T10:30:00.000Z"),
+                limit: None,
+                offset: None,
+            })
+            .expect("filtered audit count"),
+        1
+    );
 }
 
 fn assert_json_eq(actual: &str, expected: &str) {
