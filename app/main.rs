@@ -38,8 +38,8 @@ use foco_mcp::{
 use foco_providers::{
     DEFAULT_OPENAI_BASE_URL, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
-    OPENAI_RESPONSES_KIND, ProviderConnectionConfig, normalized_base_url, parse_provider_kind,
-    stream_chat, test_provider_connection,
+    OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig, normalized_base_url,
+    parse_provider_kind, stream_chat, test_provider_connection,
 };
 use foco_store::{
     config::{
@@ -2065,6 +2065,7 @@ struct ChatAuditOutcome {
     output_tokens: Option<i64>,
     cache_read_tokens: Option<i64>,
     cache_write_tokens: Option<i64>,
+    status_code: Option<i64>,
     final_state: &'static str,
     response_body_json: Option<String>,
 }
@@ -2201,12 +2202,14 @@ impl PreparedChatContext {
                 } {
                     Ok(provider_stream) => provider_stream,
                     Err(error) => {
+                        let status_code = provider_status_code(&error);
                         let message = error.to_string();
                         let event = ChatSseEvent::Error {
                             message: message.clone(),
                         };
                         events.push(captured_event(&event));
-                        let outcome = failed_audit_outcome(started_at, &message);
+                        let outcome =
+                            failed_provider_audit_outcome(started_at, &message, status_code);
 
                         if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
@@ -2247,12 +2250,14 @@ impl PreparedChatContext {
                     let provider_event = match event_result {
                         Ok(provider_event) => provider_event,
                         Err(error) => {
+                            let status_code = provider_status_code(&error);
                             let message = error.to_string();
                             let event = ChatSseEvent::Error {
                                 message: message.clone(),
                             };
                             events.push(captured_event(&event));
-                            let outcome = failed_audit_outcome(started_at, &message);
+                            let outcome =
+                                failed_provider_audit_outcome(started_at, &message, status_code);
 
                             if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                 let event = ChatSseEvent::Error {
@@ -2411,6 +2416,7 @@ impl PreparedChatContext {
                                     output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
                                     cache_read_tokens: final_usage.as_ref().and_then(|usage| usage.cache_read_tokens),
                                     cache_write_tokens: final_usage.as_ref().and_then(|usage| usage.cache_write_tokens),
+                                    status_code: Some(200),
                                     final_state: "succeeded",
                                     response_body_json: Some(json!({
                                         "text": assistant_message_text.clone(),
@@ -3597,7 +3603,7 @@ fn persist_chat_result(
             cache_write_tokens: outcome.cache_write_tokens,
             first_token_latency_ms: outcome.first_token_latency_ms,
             total_latency_ms: Some(outcome.total_latency_ms),
-            status_code: None,
+            status_code: outcome.status_code,
             final_state: outcome.final_state,
             request_body_json: Some(&context.request_body_json),
             response_body_json: outcome.response_body_json.as_deref(),
@@ -4027,9 +4033,25 @@ fn failed_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome 
         output_tokens: None,
         cache_read_tokens: None,
         cache_write_tokens: None,
+        status_code: None,
         final_state: "failed",
         response_body_json: Some(json!({ "error": message }).to_string()),
     }
+}
+
+fn failed_provider_audit_outcome(
+    started_at: Instant,
+    message: &str,
+    status_code: Option<i64>,
+) -> ChatAuditOutcome {
+    ChatAuditOutcome {
+        status_code,
+        ..failed_audit_outcome(started_at, message)
+    }
+}
+
+fn provider_status_code(error: &ProviderConfigError) -> Option<i64> {
+    error.status_code().map(i64::from)
 }
 
 fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome {
@@ -4042,6 +4064,7 @@ fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutco
         output_tokens: None,
         cache_read_tokens: None,
         cache_write_tokens: None,
+        status_code: None,
         final_state: "cancelled",
         response_body_json: Some(json!({ "cancelled": message }).to_string()),
     }
@@ -6530,6 +6553,111 @@ description: Project memory.
         assert_eq!(messages[4].reasoning.as_deref(), Some("Used tools."));
 
         drop(messages);
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn persist_chat_result_writes_audit_status_code() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-audit-status-code-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            database
+                .insert_chat("chat-1", "Status code chat")
+                .expect("chat insert");
+        }
+        let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
+        let context = PreparedChatContext {
+            workspace_id: "workspace-1".to_string(),
+            workspace_path: workspace_dir.clone(),
+            chat_id: "chat-1".to_string(),
+            provider_id: "openai-responses".to_string(),
+            model_id: "gpt-5.4".to_string(),
+            user_message_id: "user-1".to_string(),
+            assistant_message_id: "assistant-1".to_string(),
+            llm_request_id: "request-1".to_string(),
+            assistant_sequence: 1,
+            provider_config: ProviderConnectionConfig {
+                kind: foco_providers::ProviderKind::OpenAiResponses,
+                base_url: None,
+                api_key: Some("test-key".to_string()),
+            },
+            provider_request: NeutralChatRequest {
+                model_id: "gpt-5.4".to_string(),
+                messages: vec![neutral_text_message(
+                    NeutralChatRole::User,
+                    "Hello".to_string(),
+                )],
+                tools: Vec::new(),
+                thinking_level: None,
+                max_output_tokens: Some(16),
+            },
+            mcp_registry: Arc::new(McpRegistry::default()),
+            app_shutdown_rx,
+            context_budget: foco_agent::ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 16,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: 984,
+            },
+            request_body_json: "{}".to_string(),
+            compression_snapshots: Vec::new(),
+            message_source_sequences: vec![Some(0)],
+            active_tool_start_index: 1,
+        };
+        let outcome = ChatAuditOutcome {
+            first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
+            completed_at: "2026-06-06T09:00:01Z".to_string(),
+            first_token_latency_ms: Some(100),
+            total_latency_ms: 1_000,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            status_code: Some(200),
+            final_state: "succeeded",
+            response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+        };
+        let event = captured_event(&ChatSseEvent::Complete {
+            chat_id: "chat-1".to_string(),
+            assistant_message_id: "assistant-1".to_string(),
+            text: "Done.".to_string(),
+            reasoning: None,
+            usage: None,
+            stop_reason: Some("stop".to_string()),
+            metrics: ChatReplyMetrics {
+                model_id: "gpt-5.4".to_string(),
+                provider_id: "openai-responses".to_string(),
+                total_latency_ms: Some(1_000),
+                first_token_latency_ms: Some(100),
+                output_tokens: Some(5),
+            },
+        });
+
+        persist_chat_result(
+            &context,
+            "2026-06-06T09:00:00Z",
+            outcome,
+            &[event],
+            Some("Done."),
+            None,
+            &[],
+        )
+        .expect("persist chat result");
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let request = database
+            .llm_request("request-1")
+            .expect("llm request read")
+            .expect("llm request");
+
+        assert_eq!(request.status_code, Some(200));
+
         drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }

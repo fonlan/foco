@@ -10,6 +10,7 @@ use genai::{
     },
     resolver::{AuthData, Endpoint, ProviderConfig},
 };
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
@@ -93,7 +94,7 @@ pub async fn test_provider_connection(
     let models = client
         .all_model_names(config.kind.adapter_kind(), provider_config)
         .await
-        .map_err(|source| ProviderConfigError::Connection(source.to_string()))?;
+        .map_err(ProviderConfigError::from_genai_error)?;
 
     Ok(models.len())
 }
@@ -202,7 +203,7 @@ impl NeutralChatStream {
         let event = self.stream.next().await?;
         Some(match event {
             Ok(event) => normalize_stream_event(event),
-            Err(source) => Err(ProviderConfigError::Connection(source.to_string())),
+            Err(source) => Err(ProviderConfigError::from_genai_error(source)),
         })
     }
 }
@@ -222,7 +223,7 @@ pub async fn stream_chat(
     let response = client
         .exec_chat_stream(model, chat_request, Some(&options))
         .await
-        .map_err(|source| ProviderConfigError::Connection(source.to_string()))?;
+        .map_err(ProviderConfigError::from_genai_error)?;
 
     Ok(NeutralChatStream {
         stream: response.stream,
@@ -537,19 +538,50 @@ fn neutral_usage(usage: &Usage) -> NeutralUsage {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProviderConfigError {
-    Connection(String),
+    Connection {
+        message: String,
+        status_code: Option<u16>,
+    },
     EmptyBaseUrl,
-    InvalidBaseUrl { value: String, source: String },
+    InvalidBaseUrl {
+        value: String,
+        source: String,
+    },
     InvalidRequest(String),
     MissingRequiredField(String),
     MissingApiKey,
     UnsupportedKind(String),
 }
 
+impl ProviderConfigError {
+    pub fn status_code(&self) -> Option<u16> {
+        match self {
+            Self::Connection { status_code, .. } => *status_code,
+            Self::EmptyBaseUrl
+            | Self::InvalidBaseUrl { .. }
+            | Self::InvalidRequest(_)
+            | Self::MissingRequiredField(_)
+            | Self::MissingApiKey
+            | Self::UnsupportedKind(_) => None,
+        }
+    }
+
+    fn from_genai_error(source: genai::Error) -> Self {
+        let status_code = genai_error_status_code(&source).map(|status| status.as_u16());
+
+        Self::Connection {
+            message: source.to_string(),
+            status_code,
+        }
+    }
+}
+
 impl fmt::Display for ProviderConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connection(source) => write!(formatter, "provider connection failed: {source}"),
+            Self::Connection { message, .. } => {
+                write!(formatter, "provider connection failed: {message}")
+            }
             Self::EmptyBaseUrl => write!(formatter, "provider base URL must not be empty"),
             Self::InvalidBaseUrl { value, source } => {
                 write!(
@@ -574,6 +606,51 @@ impl fmt::Display for ProviderConfigError {
 }
 
 impl std::error::Error for ProviderConfigError {}
+
+fn genai_error_status_code(source: &genai::Error) -> Option<StatusCode> {
+    match source {
+        genai::Error::HttpError { status, .. } => Some(*status),
+        genai::Error::WebModelCall { webc_error, .. }
+        | genai::Error::WebAdapterCall { webc_error, .. } => webc_error_status_code(webc_error),
+        genai::Error::WebStream { error, .. } => error
+            .downcast_ref::<genai::Error>()
+            .and_then(genai_error_status_code),
+        genai::Error::ChatReqHasNoMessages { .. }
+        | genai::Error::LastChatMessageIsNotUser { .. }
+        | genai::Error::MessageRoleNotSupported { .. }
+        | genai::Error::MessageContentTypeNotSupported { .. }
+        | genai::Error::JsonModeWithoutInstruction
+        | genai::Error::VerbosityParsing { .. }
+        | genai::Error::ReasoningParsingError { .. }
+        | genai::Error::ServiceTierParsing { .. }
+        | genai::Error::PromptCacheRetentionParsing { .. }
+        | genai::Error::NoChatResponse { .. }
+        | genai::Error::InvalidJsonResponseElement { .. }
+        | genai::Error::RequiresApiKey { .. }
+        | genai::Error::NoAuthResolver { .. }
+        | genai::Error::NoAuthData { .. }
+        | genai::Error::ModelMapperFailed { .. }
+        | genai::Error::ChatResponseGeneration { .. }
+        | genai::Error::ChatResponse { .. }
+        | genai::Error::StreamParse { .. }
+        | genai::Error::Resolver { .. }
+        | genai::Error::AdapterNotSupported { .. }
+        | genai::Error::AdapterKindMismatch { .. }
+        | genai::Error::Internal(_)
+        | genai::Error::JsonValueExt(_)
+        | genai::Error::SerdeJson(_) => None,
+    }
+}
+
+fn webc_error_status_code(source: &genai::webc::Error) -> Option<StatusCode> {
+    match source {
+        genai::webc::Error::ResponseFailedStatus { status, .. } => Some(*status),
+        genai::webc::Error::ResponseFailedNotJson { .. }
+        | genai::webc::Error::ResponseFailedInvalidJson { .. }
+        | genai::webc::Error::JsonValueExt(_)
+        | genai::webc::Error::Reqwest(_) => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
