@@ -456,7 +456,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "New chat in {name}": "在 {name} 中新建聊天",
     "Delete chat": "删除聊天",
     "Delete chat {title}": "删除聊天 {title}",
+    "Close chat tab {title}": "关闭会话标签 {title}",
+    "Chat is running": "会话运行中",
     "No chats": "暂无聊天",
+    "No open chats": "暂无打开的会话",
     "Loading workspaces...": "正在加载工作区...",
     "No workspaces": "暂无工作区",
     Workspaces: "工作区",
@@ -779,6 +782,18 @@ type ShellMessage = {
   metrics: ChatReplyMetrics | null;
 };
 
+type OpenChatTab = {
+  workspaceId: string;
+  chatId: string;
+  fallbackTitle: string;
+  fallbackWorkspaceName: string;
+};
+
+type ChatTabSummary = OpenChatTab & {
+  title: string;
+  workspaceName: string;
+};
+
 type RetryRunRequest = {
   workspaceId: string;
   chatId: string | null;
@@ -801,6 +816,10 @@ export function App() {
   const [draftMessage, setDraftMessage] = useState("");
   const [messages, setMessages] = useState<ShellMessage[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [openChatTabs, setOpenChatTabs] = useState<OpenChatTab[]>([]);
+  const [chatMessagesByKey, setChatMessagesByKey] = useState<
+    Record<string, ShellMessage[]>
+  >({});
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
@@ -834,6 +853,7 @@ export function App() {
   const [isSelectingWorkspacePath, setIsSelectingWorkspacePath] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeRunAbortRef = useRef<AbortController | null>(null);
+  const activeChatKeyRef = useRef<string | null>(null);
   const hasManuallySelectedModelRef = useRef(false);
 
   const activeWorkspace = useMemo(
@@ -841,6 +861,10 @@ export function App() {
       workspaces.find((workspace) => workspace.id === activeWorkspaceId) ??
       workspaces[0],
     [activeWorkspaceId, workspaces],
+  );
+  const chatTabs = useMemo(
+    () => openChatTabs.map((tab) => hydrateChatTab(tab, workspaces)),
+    [openChatTabs, workspaces],
   );
   const availableModels = useMemo(
     () =>
@@ -873,6 +897,11 @@ export function App() {
   useEffect(() => {
     document.documentElement.lang = language;
   }, [language]);
+
+  useEffect(() => {
+    activeChatKeyRef.current =
+      activeChatId === null ? null : chatRunKey(activeWorkspaceId, activeChatId);
+  }, [activeChatId, activeWorkspaceId]);
 
   const refreshWorkspaces = useCallback(async () => {
     setIsLoading(true);
@@ -991,6 +1020,13 @@ export function App() {
 
     void loadGitBranches(activeWorkspace.id);
   }, [activeWorkspace?.id, loadGitBranches]);
+
+  useEffect(() => {
+    setOpenChatTabs((current) => {
+      const next = current.filter((tab) => workspaceHasChat(workspaces, tab));
+      return next.length === current.length ? current : next;
+    });
+  }, [workspaces]);
 
   useEffect(() => {
     if (!isResizingDiffPanel) {
@@ -1135,6 +1171,56 @@ export function App() {
     }
   }
 
+  function setMessagesForChatKey(
+    chatKey: string | null,
+    updater: ShellMessage[] | ((current: ShellMessage[]) => ShellMessage[]),
+  ) {
+    const resolveNext = (current: ShellMessage[]) =>
+      typeof updater === "function" ? updater(current) : updater;
+
+    if (!chatKey) {
+      setMessages((current) => resolveNext(current));
+      return;
+    }
+
+    setChatMessagesByKey((current) => {
+      const next = resolveNext(current[chatKey] ?? []);
+      return { ...current, [chatKey]: next };
+    });
+
+    if (activeChatKeyRef.current === chatKey) {
+      setMessages((current) => resolveNext(current));
+    }
+  }
+
+  function moveMessagesForChatKey(
+    fromChatKey: string,
+    toChatKey: string,
+    updater: (current: ShellMessage[]) => ShellMessage[],
+  ) {
+    setChatMessagesByKey((current) => {
+      const nextMessages = updater(current[fromChatKey] ?? []);
+      const { [fromChatKey]: _removed, ...next } = current;
+      return { ...next, [toChatKey]: nextMessages };
+    });
+
+    if (activeChatKeyRef.current === fromChatKey) {
+      activeChatKeyRef.current = toChatKey;
+      setMessages((current) => updater(current));
+    }
+  }
+
+  function removeMessagesForChatKey(chatKey: string) {
+    setChatMessagesByKey((current) => {
+      if (!(chatKey in current)) {
+        return current;
+      }
+
+      const { [chatKey]: _removed, ...next } = current;
+      return next;
+    });
+  }
+
   async function loadChatMessages(workspaceId: string, chatId: string) {
     setError(null);
 
@@ -1142,21 +1228,94 @@ export function App() {
       const data = await requestJson<ChatMessagesResponse>(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages`,
       );
+      const chatKey = chatRunKey(workspaceId, chatId);
+      const nextMessages = data.messages.map(normalizeChatMessageSummary);
       setActiveWorkspaceId(workspaceId);
       setActiveChatId(chatId);
-      setMessages(data.messages.map(normalizeChatMessageSummary));
+      openChatTab(workspaceId, chatId);
+      activeChatKeyRef.current = chatKey;
+      setMessages(nextMessages);
+      setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
       setViewMode("chat");
     } catch (requestError) {
       setError(errorMessage(requestError));
     }
   }
 
+  function selectWorkspaceChat(workspaceId: string, chatId: string) {
+    const chatKey = chatRunKey(workspaceId, chatId);
+    const cachedMessages = chatMessagesByKey[chatKey];
+
+    if (!cachedMessages) {
+      void loadChatMessages(workspaceId, chatId);
+      return;
+    }
+
+    setActiveWorkspaceId(workspaceId);
+    setActiveChatId(chatId);
+    openChatTab(workspaceId, chatId);
+    activeChatKeyRef.current = chatKey;
+    setMessages(cachedMessages);
+    setViewMode("chat");
+  }
+
   function startNewWorkspaceChat(workspaceId: string) {
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
+    activeChatKeyRef.current = null;
     setMessages([]);
     setSelectedDiffPath(null);
     setViewMode("chat");
+  }
+
+  function openChatTab(workspaceId: string, chatId: string) {
+    const workspace = workspaces.find((workspace) => workspace.id === workspaceId);
+    const chat = workspace?.chats.find((chat) => chat.id === chatId);
+
+    setOpenChatTabs((current) =>
+      upsertOpenChatTab(current, {
+        workspaceId,
+        chatId,
+        fallbackTitle: chat?.title ?? t("Chat"),
+        fallbackWorkspaceName: workspace?.name ?? t("Workspace"),
+      }),
+    );
+  }
+
+  function closeChatTab(workspaceId: string, chatId: string) {
+    const chatKey = chatRunKey(workspaceId, chatId);
+    if (runningChatKey === chatKey) {
+      return;
+    }
+
+    const tabIndex = openChatTabs.findIndex(
+      (tab) => tab.workspaceId === workspaceId && tab.chatId === chatId,
+    );
+    setOpenChatTabs((current) =>
+      current.filter(
+        (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
+      ),
+    );
+    removeMessagesForChatKey(chatKey);
+
+    if (activeWorkspaceId !== workspaceId || activeChatId !== chatId) {
+      return;
+    }
+
+    const nextTabs = openChatTabs.filter(
+      (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
+    );
+    const nextTab =
+      nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+
+    if (nextTab) {
+      selectWorkspaceChat(nextTab.workspaceId, nextTab.chatId);
+      return;
+    }
+
+    setActiveChatId(null);
+    activeChatKeyRef.current = null;
+    setMessages([]);
   }
 
   async function deleteWorkspaceChat(workspaceId: string, chatId: string) {
@@ -1373,12 +1532,14 @@ export function App() {
     );
     let assistantMessageId = localAssistantId;
     let requestChatId = request.chatId;
-    let currentRunningChatKey = requestChatId
+    let runMessagesKey = requestChatId
       ? chatRunKey(request.workspaceId, requestChatId)
-      : null;
+      : pendingChatRunKey(request.workspaceId, runKey);
+    let currentRunningChatKey = runMessagesKey;
     const abortController = new AbortController();
 
-    setMessages((current) => [
+    activeChatKeyRef.current = runMessagesKey;
+    setMessagesForChatKey(runMessagesKey, (current) => [
       ...current,
       {
         id: localUserId,
@@ -1446,27 +1607,58 @@ export function App() {
             request.workspaceId,
             streamEvent.chatId,
           );
-          setActiveChatId(streamEvent.chatId);
+          openChatTab(request.workspaceId, streamEvent.chatId);
+          if (runMessagesKey !== currentRunningChatKey) {
+            moveMessagesForChatKey(runMessagesKey, currentRunningChatKey, (current) =>
+              current.map((message) => {
+                if (message.id === localUserId) {
+                  return { ...message, id: streamEvent.userMessageId };
+                }
+
+                if (
+                  message.role === "assistant" &&
+                  message.id === localAssistantId
+                ) {
+                  return { ...message, id: streamEvent.assistantMessageId };
+                }
+
+                return message;
+              }),
+            );
+            runMessagesKey = currentRunningChatKey;
+          } else {
+            setMessagesForChatKey(currentRunningChatKey, (current) =>
+              current.map((message) => {
+                if (message.id === localUserId) {
+                  return { ...message, id: streamEvent.userMessageId };
+                }
+
+                if (
+                  message.role === "assistant" &&
+                  message.id === localAssistantId
+                ) {
+                  return { ...message, id: streamEvent.assistantMessageId };
+                }
+
+                return message;
+              }),
+            );
+          }
+          if (
+            activeChatKeyRef.current === currentRunningChatKey ||
+            activeChatKeyRef.current === null ||
+            request.chatId
+          ) {
+            setActiveChatId(streamEvent.chatId);
+            activeChatKeyRef.current = currentRunningChatKey;
+          }
           setRunningChatKey(currentRunningChatKey);
           void refreshWorkspaces();
-          setMessages((current) =>
-            current.map((message) => {
-              if (message.id === localUserId) {
-                return { ...message, id: streamEvent.userMessageId };
-              }
-
-              if (message.role === "assistant" && message.id === localAssistantId) {
-                return { ...message, id: streamEvent.assistantMessageId };
-              }
-
-              return message;
-            }),
-          );
           return;
         }
 
         if (streamEvent.type === "textDelta") {
-          setMessages((current) =>
+          setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? {
@@ -1481,7 +1673,7 @@ export function App() {
         }
 
         if (streamEvent.type === "reasoningDelta") {
-          setMessages((current) =>
+          setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                   ? {
@@ -1499,9 +1691,8 @@ export function App() {
         }
 
         if (streamEvent.type === "complete") {
-          setActiveChatId(streamEvent.chatId);
           setRetryRunRequest(null);
-          setMessages((current) =>
+          setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? completedAssistantMessage(message, streamEvent)
@@ -1512,7 +1703,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolCall") {
-          setMessages((current) =>
+          setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? {
@@ -1530,7 +1721,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolResult") {
-          setMessages((current) =>
+          setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? {
@@ -1561,7 +1752,7 @@ export function App() {
 
         if (streamEvent.type === "error") {
           setError(streamEvent.message);
-          setMessages((current) =>
+          setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message)
                 ? {
@@ -1587,7 +1778,7 @@ export function App() {
         ...request,
         chatId: requestChatId,
       });
-      setMessages((current) =>
+      setMessagesForChatKey(runMessagesKey, (current) =>
         current.map((item) =>
           isCurrentAssistantMessage(item)
             ? {
@@ -1860,7 +2051,7 @@ export function App() {
                                   }
                                   className={chatItemClass(isChatActive)}
                                   onClick={() =>
-                                    void loadChatMessages(workspace.id, chat.id)
+                                    selectWorkspaceChat(workspace.id, chat.id)
                                   }
                                   type="button"
                                 >
@@ -1943,24 +2134,18 @@ export function App() {
         </aside>
 
         <section className="app-main-panel flex min-w-0 flex-col">
-              <header className="shrink-0 border-b border-stone-200/80 bg-white/80 px-4 py-2 backdrop-blur sm:px-5">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <h1 className="truncate text-lg font-semibold text-stone-950">
-                      {activeWorkspace?.name ?? t("Workspace")}
-                    </h1>
-                    <p className="mt-1 truncate text-xs font-medium text-stone-500">
-                      {activeWorkspace?.path ?? ""}
-                    </p>
-                  </div>
+              <header className="shrink-0 border-b border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-4">
+                <div className="flex min-w-0 items-center justify-between gap-3">
+                  <ChatTabBar
+                    activeChatId={activeChatId}
+                    activeWorkspaceId={activeWorkspaceId}
+                    onCloseTab={closeChatTab}
+                    onSelectTab={selectWorkspaceChat}
+                    runningChatKey={runningChatKey}
+                    tabs={chatTabs}
+                  />
                   <div className="flex flex-wrap items-center gap-2">
                     <div className="flex overflow-x-auto rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
-                      <NavButton
-                        active={viewMode === "chat"}
-                        icon={MessageSquare}
-                        label={t("Chat")}
-                        onClick={() => setViewMode("chat")}
-                      />
                       <button
                         aria-label={
                           isDiffPanelOpen ? t("Close git diff") : t("Open git diff")
@@ -2325,6 +2510,94 @@ function GitBranchDialog({
           </div>
         </form>
       </section>
+    </div>
+  );
+}
+
+function ChatTabBar({
+  activeChatId,
+  activeWorkspaceId,
+  onCloseTab,
+  onSelectTab,
+  runningChatKey,
+  tabs,
+}: {
+  activeChatId: string | null;
+  activeWorkspaceId: string;
+  onCloseTab: (workspaceId: string, chatId: string) => void;
+  onSelectTab: (workspaceId: string, chatId: string) => void;
+  runningChatKey: string | null;
+  tabs: ChatTabSummary[];
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div className="min-w-0 flex-1">
+      <div
+        aria-label={t("Chat")}
+        className="panel-scroll flex min-w-0 gap-1 overflow-x-auto"
+        role="tablist"
+      >
+        {tabs.length ? (
+          tabs.map((tab) => {
+            const isActive =
+              activeWorkspaceId === tab.workspaceId && activeChatId === tab.chatId;
+            const isRunning = runningChatKey === chatRunKey(tab.workspaceId, tab.chatId);
+            const title = tab.title || t("Chat");
+
+            return (
+              <div
+                className={`group flex h-12 min-w-44 max-w-64 shrink-0 items-center rounded-lg border px-2 py-1.5 transition-colors ${
+                  isActive
+                    ? "border-teal-200 bg-white text-stone-950 shadow-sm"
+                    : "border-stone-200 bg-stone-50/80 text-stone-600 hover:border-stone-300 hover:bg-white"
+                }`}
+                key={chatRunKey(tab.workspaceId, tab.chatId)}
+              >
+                <button
+                  aria-selected={isActive}
+                  className="min-w-0 flex-1 text-left"
+                  onClick={() => onSelectTab(tab.workspaceId, tab.chatId)}
+                  role="tab"
+                  title={`${title} · ${tab.workspaceName}`}
+                  type="button"
+                >
+                  <span className="block truncate text-sm font-semibold leading-5">
+                    {title}
+                  </span>
+                  <span className="block truncate text-[11px] font-medium leading-4 text-stone-400">
+                    {tab.workspaceName}
+                  </span>
+                </button>
+                <span className="ml-1 inline-flex size-7 shrink-0 items-center justify-center">
+                  {isRunning ? (
+                    <span aria-label={t("Chat is running")} role="status">
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="size-4 animate-spin text-teal-700"
+                      />
+                    </span>
+                  ) : (
+                    <button
+                      aria-label={t("Close chat tab {title}", { title })}
+                      className="inline-flex size-7 items-center justify-center rounded-md text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
+                      onClick={() => onCloseTab(tab.workspaceId, tab.chatId)}
+                      title={t("Close")}
+                      type="button"
+                    >
+                      <X aria-hidden="true" className="size-3.5" />
+                    </button>
+                  )}
+                </span>
+              </div>
+            );
+          })
+        ) : (
+          <div className="flex h-12 min-w-0 items-center rounded-lg border border-dashed border-stone-300 bg-white/55 px-3 text-sm font-medium text-stone-500">
+            {t("No open chats")}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -6401,6 +6674,41 @@ function chatItemClass(active: boolean) {
   }`;
 }
 
+function hydrateChatTab(
+  tab: OpenChatTab,
+  workspaces: WorkspaceSummary[],
+): ChatTabSummary {
+  const workspace = workspaces.find((workspace) => workspace.id === tab.workspaceId);
+  const chat = workspace?.chats.find((chat) => chat.id === tab.chatId);
+
+  return {
+    ...tab,
+    title: chat?.title ?? tab.fallbackTitle,
+    workspaceName: workspace?.name ?? tab.fallbackWorkspaceName,
+  };
+}
+
+function upsertOpenChatTab(tabs: OpenChatTab[], nextTab: OpenChatTab) {
+  if (
+    tabs.some(
+      (tab) =>
+        tab.workspaceId === nextTab.workspaceId && tab.chatId === nextTab.chatId,
+    )
+  ) {
+    return tabs;
+  }
+
+  return [...tabs, nextTab];
+}
+
+function workspaceHasChat(workspaces: WorkspaceSummary[], tab: OpenChatTab) {
+  return workspaces.some(
+    (workspace) =>
+      workspace.id === tab.workspaceId &&
+      workspace.chats.some((chat) => chat.id === tab.chatId),
+  );
+}
+
 function diffFileButtonClass(active: boolean) {
   return `flex min-h-9 w-full min-w-0 items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-sm ${
     active
@@ -7329,6 +7637,10 @@ function formatChatCreatedAt(value: string) {
 
 function chatRunKey(workspaceId: string, chatId: string) {
   return `${workspaceId}:${chatId}`;
+}
+
+function pendingChatRunKey(workspaceId: string, runKey: string) {
+  return `${workspaceId}:pending:${runKey}`;
 }
 
 function priceText(value: number | null) {

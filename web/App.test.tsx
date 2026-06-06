@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
@@ -10,6 +10,12 @@ const workspace = {
       id: "chat-1",
       title: "Tool run",
       updatedAt: "2026-06-05T10:05:00Z",
+    },
+    {
+      createdAt: "2026-06-05T11:00:00Z",
+      id: "chat-2",
+      title: "Second chat",
+      updatedAt: "2026-06-05T11:05:00Z",
     },
   ],
   id: "workspace-1",
@@ -300,8 +306,35 @@ const chatMessages = {
   ],
 };
 
+const secondChatMessages = {
+  messages: [
+    {
+      content: "Second question.",
+      id: "message-user-2",
+      metrics: null,
+      parts: [{ text: "Second question.", type: "text" }],
+      reasoning: null,
+      role: "user",
+      toolCalls: [],
+    },
+    {
+      content: "Second answer.",
+      id: "message-assistant-2",
+      metrics: null,
+      parts: [{ text: "Second answer.", type: "text" }],
+      reasoning: null,
+      role: "assistant",
+      toolCalls: [],
+    },
+  ],
+};
+
+let activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null =
+  null;
+
 describe("App verification surfaces", () => {
   beforeEach(() => {
+    activeChatStreamController = null;
     vi.stubGlobal("fetch", vi.fn(mockFetch));
   });
 
@@ -356,6 +389,65 @@ describe("App verification surfaces", () => {
       "aria-current",
       "page",
     );
+  });
+
+  it("opens center chat tabs and closes tabs without deleting chat history", async () => {
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(tabList).getByText("Default")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByText("Second chat"));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+    expect(
+      within(tabList).getByRole("tab", { name: /Second chat/ }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toBeInTheDocument();
+
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Tool run/ }));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    await userEvent.click(
+      within(tabList).getByRole("button", { name: "Close chat tab Tool run" }),
+    );
+
+    expect(
+      within(tabList).queryByRole("tab", { name: /Tool run/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(tabList).getByRole("tab", { name: /Second chat/ }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByText("Tool run")).toBeInTheDocument();
+  });
+
+  it("shows a running spinner instead of a close button on a streaming chat tab", async () => {
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(
+      within(tabList).getByRole("button", { name: "Close chat tab Tool run" }),
+    ).toBeInTheDocument();
+
+    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "continue");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(
+      await within(tabList).findByRole("status", { name: "Chat is running" }),
+    ).toBeInTheDocument();
+    expect(
+      within(tabList).queryByRole("button", { name: "Close chat tab Tool run" }),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
   });
 
   it("adds a workspace with a selectable slash-style path", async () => {
@@ -633,7 +725,40 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
     return jsonResponse(chatMessages);
   }
 
+  if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
+    return jsonResponse(secondChatMessages);
+  }
+
+  if (path === "/api/workspaces/workspace-1/chat/stream") {
+    return chatStreamResponse();
+  }
+
   return jsonResponse({ error: `Unhandled test route: ${url}` }, { status: 404 });
+}
+
+function chatStreamResponse() {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      activeChatStreamController = controller;
+      controller.enqueue(
+        encoder.encode(
+          `data: ${JSON.stringify({
+            type: "start",
+            chatId: "chat-1",
+            userMessageId: "message-user-stream",
+            assistantMessageId: "message-assistant-stream",
+            llmRequestId: "request-stream",
+          })}\n\n`,
+        ),
+      );
+    },
+  });
+
+  return new Response(stream, {
+    headers: { "Content-Type": "text/event-stream" },
+    status: 200,
+  });
 }
 
 function jsonResponse(value: unknown, init?: ResponseInit) {
