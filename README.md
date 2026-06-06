@@ -90,8 +90,8 @@ server in the background and keeps Foco in the system tray. Use the tray menu to
 open the local web UI in the browser or quit Foco cleanly.
 
 The repository-root `foco.svg` is the single icon source. Vite publishes it as
-the web favicon, and Windows builds generate and embed the executable icon from
-the same SVG.
+the web favicon and the browser UI logo, and Windows builds generate and embed
+the executable icon from the same SVG.
 
 Run verification:
 

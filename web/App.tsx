@@ -1830,9 +1830,7 @@ export function App() {
           <header className="shrink-0 border-b border-stone-200/80 bg-white/85 px-4 py-3 backdrop-blur">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex min-w-0 items-center gap-3">
-                <span className="inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_10px_24px_rgba(15,118,110,0.24)]">
-                  <Activity aria-hidden="true" className="size-5" />
-                </span>
+                <FocoLogoMark />
                 <div className="min-w-0">
                   <span className="block truncate text-lg font-semibold">
                     Foco
@@ -1928,9 +1926,7 @@ export function App() {
           <div className="flex h-full min-h-0 flex-col">
             <div className="flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
               <div className="flex min-w-0 items-center gap-3">
-                <span className="inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_10px_24px_rgba(15,118,110,0.24)]">
-                  <Activity aria-hidden="true" className="size-5" />
-                </span>
+                <FocoLogoMark />
                 <div className="min-w-0">
                   <span className="block truncate text-lg font-semibold">
                     Foco
@@ -6642,6 +6638,19 @@ function NavButton({
     >
       <Icon aria-hidden="true" className="size-4" />
     </button>
+  );
+}
+
+function FocoLogoMark() {
+  return (
+    <span className="inline-flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-[0_10px_24px_rgba(15,118,110,0.2)] ring-1 ring-stone-200/80">
+      <img
+        alt=""
+        aria-hidden="true"
+        className="size-full object-cover"
+        src="/foco.svg"
+      />
+    </span>
   );
 }
 
