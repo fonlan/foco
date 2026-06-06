@@ -9,7 +9,7 @@ const backendEndpoint = loadBackendEndpoint();
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), backendReloadPlugin()],
+  plugins: [react(), tailwindcss(), focoIconPlugin(), backendReloadPlugin()],
   server: {
     proxy: {
       "/api": {
@@ -24,6 +24,39 @@ export default defineConfig({
     setupFiles: "./test-setup.ts",
   },
 });
+
+function focoIconPlugin(): Plugin {
+  const iconPath = resolve(repoRoot, "foco.svg");
+
+  return {
+    name: "foco-icon",
+    configureServer(server) {
+      server.watcher.add(iconPath);
+      server.middlewares.use((request, response, next) => {
+        if (request.url?.split("?")[0] !== "/foco.svg") {
+          next();
+          return;
+        }
+
+        try {
+          response.statusCode = 200;
+          response.setHeader("Content-Type", "image/svg+xml");
+          response.setHeader("Cache-Control", "no-cache");
+          response.end(readFileSync(iconPath));
+        } catch (error) {
+          next(error as Error);
+        }
+      });
+    },
+    generateBundle() {
+      this.emitFile({
+        type: "asset",
+        fileName: "foco.svg",
+        source: readFileSync(iconPath, "utf8"),
+      });
+    },
+  };
+}
 
 function backendReloadPlugin(): Plugin {
   const backendHealthUrl = `${backendEndpoint.origin}/api/health`;

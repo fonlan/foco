@@ -55,6 +55,9 @@ tree-sitter-toml-ng = "0.7.0"
 tree-sitter-typescript = "0.23.2"
 rust-embed = { version = "8.11.0", features = ["mime-guess"] }
 webbrowser = "1.2.1"
+ico = "0.5.0"
+resvg = { version = "0.47.0", default-features = false }
+winresource = { version = "0.1.31", default-features = false }
 
 [profile.release]
 codegen-units = 1

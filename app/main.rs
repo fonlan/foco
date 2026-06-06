@@ -412,30 +412,7 @@ fn drain_tray_events(ui_url: &str, shutdown_tx: &watch::Sender<bool>) {
 
 #[cfg(all(windows, not(debug_assertions)))]
 fn foco_tray_icon() -> Result<tray_icon::Icon, tray_icon::BadIcon> {
-    let size = 32_u32;
-    let mut rgba = Vec::with_capacity((size * size * 4) as usize);
-
-    for y in 0..size {
-        for x in 0..size {
-            let center = size as f32 / 2.0 - 0.5;
-            let dx = x as f32 - center;
-            let dy = y as f32 - center;
-            let distance = (dx * dx + dy * dy).sqrt();
-            let inside_outer = distance <= 15.0;
-            let inside_inner = distance <= 9.0;
-            let on_cross = (x >= 14 && x <= 17) || (y >= 14 && y <= 17);
-
-            if !inside_outer {
-                rgba.extend_from_slice(&[0, 0, 0, 0]);
-            } else if inside_inner || on_cross {
-                rgba.extend_from_slice(&[37, 99, 235, 255]);
-            } else {
-                rgba.extend_from_slice(&[15, 23, 42, 255]);
-            }
-        }
-    }
-
-    tray_icon::Icon::from_rgba(rgba, size, size)
+    tray_icon::Icon::from_resource(1, Some((32, 32)))
 }
 
 #[cfg(all(windows, not(debug_assertions)))]

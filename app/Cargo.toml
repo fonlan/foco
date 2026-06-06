@@ -3,6 +3,7 @@ name = "foco-app"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "foco"
@@ -32,3 +33,8 @@ webbrowser.workspace = true
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.24.0", default-features = false }
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+ico.workspace = true
+resvg.workspace = true
+winresource.workspace = true
