@@ -25,7 +25,7 @@ port; language changes apply immediately in the current browser UI. Set
 `FOCO_HOST` or `FOCO_PORT` for a one-off startup override.
 
 On first startup, Foco creates `%USERPROFILE%\.foco`, writes
-`%USERPROFILE%\.foco\config.json`, registers a `Default Workspace` at
+`%USERPROFILE%\.foco\config.json`, registers a `Default` workspace at
 `%USERPROFILE%\.foco\workspace`, initializes the workspace database at
 `%USERPROFILE%\.foco\workspace\.foco\foco.sqlite`, and writes daily logs to
 `%USERPROFILE%\.foco\logs\foco-YYYY-MM-DD.log`.

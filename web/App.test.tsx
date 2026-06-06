@@ -13,7 +13,7 @@ const workspace = {
     },
   ],
   id: "workspace-1",
-  name: "Default Workspace",
+  name: "Default",
   path: "C:\\Users\\fonla\\.foco\\workspace",
 };
 
@@ -136,7 +136,7 @@ const aiStatistics = {
       statusCode: 200,
       totalLatencyMs: 2000,
       workspaceId: "workspace-1",
-      workspaceName: "Default Workspace",
+      workspaceName: "Default",
     },
   ],
   totalCount: 125,
@@ -308,7 +308,7 @@ describe("App verification surfaces", () => {
   it("renders the workspace sidebar and persisted chat tool results", async () => {
     render(<App />);
 
-    expect(await screen.findAllByText("Default Workspace")).not.toHaveLength(0);
+    expect(await screen.findAllByText("Default")).not.toHaveLength(0);
     expect(screen.getByText("Tool run")).toBeInTheDocument();
 
     await userEvent.click(screen.getByText("Tool run"));
@@ -349,7 +349,7 @@ describe("App verification surfaces", () => {
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
 
     await userEvent.click(
-      screen.getByRole("button", { name: "New chat in Default Workspace" }),
+      screen.getByRole("button", { name: "New chat in Default" }),
     );
 
     expect(screen.getByRole("button", { name: "New chat" })).toHaveAttribute(
@@ -502,7 +502,7 @@ describe("App verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
 
-    await screen.findAllByText("Default Workspace");
+    await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("button", { name: "Open git diff" }));
 
     expect(await screen.findByText("README.md")).toBeInTheDocument();

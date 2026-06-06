@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_WORKSPACE_ID: &str = "default";
-pub const DEFAULT_WORKSPACE_NAME: &str = "Default Workspace";
+pub const DEFAULT_WORKSPACE_NAME: &str = "Default";
+const LEGACY_DEFAULT_WORKSPACE_NAME: &str = "Default Workspace";
 pub const REDACTED_SECRET: &str = "<redacted>";
 pub const DEFAULT_WEB_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_WEB_SERVER_PORT: u16 = 3210;
@@ -81,8 +82,11 @@ pub fn load_or_create_global_config_at_paths(
         create_first_run_config(&paths)?;
     }
 
-    let config = load_global_config(&paths.config_file)?;
+    let mut config = load_global_config(&paths.config_file)?;
     validate_workspace_directories(&config, &paths.config_file)?;
+    if rename_legacy_default_workspace(&mut config) {
+        save_global_config(&paths.config_file, &config)?;
+    }
 
     Ok(LoadedGlobalConfig { config, paths })
 }
@@ -664,6 +668,23 @@ fn create_first_run_config(paths: &FocoPaths) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn rename_legacy_default_workspace(config: &mut GlobalConfig) -> bool {
+    let Some(workspace) = config
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.id == DEFAULT_WORKSPACE_ID)
+    else {
+        return false;
+    };
+
+    if workspace.name != LEGACY_DEFAULT_WORKSPACE_NAME {
+        return false;
+    }
+
+    workspace.name = DEFAULT_WORKSPACE_NAME.to_string();
+    true
+}
+
 pub const SKILL_SCOPE_GLOBAL: &str = "global";
 pub const SKILL_SCOPE_WORKSPACE: &str = "workspace";
 
@@ -872,6 +893,62 @@ mod tests {
 
         let saved = load_global_config(&paths.config_file).expect("saved config reload");
         assert_eq!(saved.skills.directories, loaded.config.skills.directories);
+    }
+
+    #[test]
+    fn load_or_create_renames_legacy_default_workspace() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        fs::write(
+            &paths.config_file,
+            format!(
+                r#"{{
+  "schema_version": 1,
+  "app": {{ "active_workspace_id": "default" }},
+  "providers": [],
+  "models": [],
+  "mcp": {{ "servers": [] }},
+  "skills": {{ "directories": [], "detected": [], "enabled": [] }},
+  "workspaces": [
+    {{ "id": "default", "name": "Default Workspace", "path": {:?} }}
+  ]
+}}"#,
+                paths.workspace_dir
+            ),
+        )
+        .expect("config write");
+
+        let loaded =
+            load_or_create_global_config_at(profile.path()).expect("legacy config should load");
+
+        assert_eq!(loaded.config.workspaces[0].name, DEFAULT_WORKSPACE_NAME);
+
+        let saved = load_global_config(&paths.config_file).expect("saved config reload");
+        assert_eq!(saved.workspaces[0].name, DEFAULT_WORKSPACE_NAME);
+    }
+
+    #[test]
+    fn load_or_create_keeps_user_named_default_workspace() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir.clone());
+        config.workspaces[0].name = "My Workspace".to_string();
+        fs::write(
+            &paths.config_file,
+            serde_json::to_string_pretty(&config).expect("serialize config"),
+        )
+        .expect("config write");
+
+        let loaded =
+            load_or_create_global_config_at(profile.path()).expect("existing config should load");
+
+        assert_eq!(loaded.config.workspaces[0].name, "My Workspace");
     }
 
     #[test]

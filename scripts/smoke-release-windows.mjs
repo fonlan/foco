@@ -77,12 +77,12 @@ async function assertFirstRunFiles(userProfileDir) {
   const defaultWorkspace = config.workspaces?.find(
     (workspace) =>
       workspace.id === config.app?.active_workspace_id &&
-      workspace.name === "Default Workspace" &&
+      workspace.name === "Default" &&
       path.resolve(workspace.path) === path.resolve(workspaceDir),
   );
 
   if (!defaultWorkspace) {
-    throw new Error("first startup config did not register Default Workspace.");
+    throw new Error("first startup config did not register Default workspace.");
   }
 
   const today = new Date();
