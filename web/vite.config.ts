@@ -12,7 +12,10 @@ export default defineConfig({
   plugins: [react(), tailwindcss(), backendReloadPlugin()],
   server: {
     proxy: {
-      "/api": backendEndpoint.origin,
+      "/api": {
+        target: backendEndpoint.origin,
+        ws: true,
+      },
     },
   },
   test: {
