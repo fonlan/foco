@@ -1132,14 +1132,6 @@ export function App() {
     }
   }
 
-  function selectWorkspace(workspaceId: string) {
-    setActiveWorkspaceId(workspaceId);
-    setActiveChatId(null);
-    setMessages([]);
-    setSelectedDiffPath(null);
-    setViewMode("chat");
-  }
-
   function startNewWorkspaceChat(workspaceId: string) {
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
@@ -1784,34 +1776,16 @@ export function App() {
 
                 return (
                   <div className="mb-1.5" key={workspace.id}>
-                    <div className="flex items-center gap-1">
+                    <div className={workspaceMenuClass(isActive)}>
                       <button
-                        aria-label={
-                          isExpanded
-                            ? t("Collapse chat history")
-                            : t("Expand chat history")
-                        }
-                        className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+                        aria-expanded={isExpanded}
+                        className={workspaceItemClass(isActive)}
                         onClick={() => toggleWorkspace(workspace.id)}
                         title={
                           isExpanded
                             ? t("Collapse chat history")
                             : t("Expand chat history")
                         }
-                        type="button"
-                      >
-                        {isExpanded ? (
-                          <ChevronDown aria-hidden="true" className="size-4" />
-                        ) : (
-                          <ChevronRight
-                            aria-hidden="true"
-                            className="size-4"
-                          />
-                        )}
-                      </button>
-                      <button
-                        className={workspaceItemClass(isActive)}
-                        onClick={() => selectWorkspace(workspace.id)}
                         type="button"
                       >
                         <Folder aria-hidden="true" className="size-4 shrink-0" />
@@ -1823,7 +1797,7 @@ export function App() {
                         aria-label={t("New chat in {name}", {
                           name: workspace.name,
                         })}
-                        className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 hover:bg-teal-50 hover:text-teal-800"
+                        className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-stone-500 hover:text-teal-800"
                         onClick={() => startNewWorkspaceChat(workspace.id)}
                         title={t("New chat")}
                         type="button"
@@ -1832,7 +1806,7 @@ export function App() {
                       </button>
                     </div>
                     {isExpanded ? (
-                      <div className="ml-9 mt-1 space-y-1">
+                      <div className="ml-3 mt-1 space-y-1">
                         {isNewChatActive ? (
                           <button
                             aria-current="page"
@@ -6413,8 +6387,14 @@ function workspaceModeClass(active: boolean) {
 
 function workspaceItemClass(active: boolean) {
   return `flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-sm font-semibold ${
+    active ? "text-teal-950" : "text-stone-700"
+  }`;
+}
+
+function workspaceMenuClass(active: boolean) {
+  return `flex min-w-0 items-center gap-1 rounded-lg px-1 transition-colors ${
     active
-      ? "bg-stone-950 text-white shadow-[0_10px_24px_rgba(33,31,28,0.16)]"
+      ? "bg-teal-50 text-teal-950 shadow-sm ring-1 ring-teal-100"
       : "text-stone-700 hover:bg-white/80 hover:text-stone-950"
   }`;
 }
