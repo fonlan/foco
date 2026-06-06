@@ -354,6 +354,42 @@ describe("App verification surfaces", () => {
     );
   });
 
+  it("adds a workspace with a selectable slash-style path", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Add workspace" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Add workspace" });
+    const nameInput = within(dialog).getByPlaceholderText("Workspace name");
+    const pathInput = within(dialog).getByPlaceholderText("C:/Users/name/workspace");
+    expect(pathInput).toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Choose workspace path" }));
+
+    await waitFor(() => {
+      expect(pathInput).toHaveValue("C:/Users/fonla/Documents/Repos/NewWorkspace");
+      expect(nameInput).toHaveValue("NewWorkspace");
+    });
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/add",
+        expect.objectContaining({
+          body: JSON.stringify({
+            name: "NewWorkspace",
+            path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+          }),
+          method: "POST",
+        }),
+      );
+    });
+
+    expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
+  });
+
   it("shows settings sections for providers, models, MCP servers, and skills", async () => {
     render(<App />);
 
@@ -500,6 +536,25 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
 
   if (path === "/api/workspaces") {
     return jsonResponse({ activeWorkspaceId: workspace.id, workspaces: [workspace] });
+  }
+
+  if (path === "/api/native/select-directory") {
+    return jsonResponse({ path: "C:/Users/fonla/Documents/Repos/NewWorkspace" });
+  }
+
+  if (path === "/api/workspaces/add") {
+    return jsonResponse({
+      activeWorkspaceId: "new-workspace",
+      workspaces: [
+        workspace,
+        {
+          chats: [],
+          id: "new-workspace",
+          name: "New Workspace",
+          path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+        },
+      ],
+    });
   }
 
   if (path === "/api/settings") {

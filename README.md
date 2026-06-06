@@ -31,11 +31,13 @@ On first startup, Foco creates `%USERPROFILE%\.foco`, writes
 `%USERPROFILE%\.foco\logs\foco-YYYY-MM-DD.log`.
 
 The browser UI starts as a three-column product shell. The left sidebar reads
-registered workspaces from `GET /api/workspaces`, can create a new workspace
-directory with `POST /api/workspaces/create`, and can add an existing directory
-with `POST /api/workspaces/add`. Both workspace write APIs update
-`%USERPROFILE%\.foco\config.json` and initialize the workspace-local SQLite
-database before returning the refreshed workspace list.
+registered workspaces from `GET /api/workspaces` and adds workspaces with
+`POST /api/workspaces/add`. The add endpoint creates the directory when it does
+not exist, registers it when it already exists, updates
+`%USERPROFILE%\.foco\config.json`, and initializes the workspace-local SQLite
+database before returning the refreshed workspace list. The path picker button
+uses `POST /api/native/select-directory` to open a native directory picker and
+return the selected absolute path.
 
 Settings can refresh model metadata from `https://models.dev/api.json` through
 `POST /api/model-metadata/refresh`. Foco normalizes the fetched model metadata

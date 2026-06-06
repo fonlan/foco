@@ -6,7 +6,7 @@ use std::{
     env, fs,
     net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -192,8 +192,8 @@ fn app_router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/workspaces", get(workspaces))
-        .route("/api/workspaces/create", post(create_workspace))
         .route("/api/workspaces/add", post(add_workspace))
+        .route("/api/native/select-directory", post(select_directory))
         .route("/api/settings", get(settings))
         .route("/api/settings/general", post(save_general_settings))
         .route("/api/providers/manual", post(save_manual_provider))
@@ -529,26 +529,29 @@ async fn workspaces(State(state): State<AppState>) -> Result<Json<WorkspacesResp
     workspace_response_from_config(&config)
 }
 
-async fn create_workspace(
+async fn add_workspace(
     State(state): State<AppState>,
     Json(request): Json<WorkspacePathRequest>,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
     let (name, requested_path) = validate_workspace_request(request)?;
 
-    if requested_path.exists() {
+    if requested_path.exists() && !requested_path.is_dir() {
         return Err(ApiError::bad_request(format!(
-            "workspace path already exists; use add existing directory instead: {}",
+            "workspace path exists but is not a directory: {}",
             requested_path.display()
         )));
     }
 
-    fs::create_dir_all(&requested_path).map_err(|source| {
-        ApiError::internal(format!(
-            "failed to create workspace directory {}: {}",
-            requested_path.display(),
-            source
-        ))
-    })?;
+    if !requested_path.exists() {
+        fs::create_dir_all(&requested_path).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to create workspace directory {}: {}",
+                requested_path.display(),
+                source
+            ))
+        })?;
+    }
+
     let path = canonical_workspace_path(&requested_path)?;
     let mut config = config_snapshot(&state)?;
 
@@ -565,33 +568,10 @@ async fn create_workspace(
     workspace_response_from_config(&config)
 }
 
-async fn add_workspace(
-    State(state): State<AppState>,
-    Json(request): Json<WorkspacePathRequest>,
-) -> Result<Json<WorkspacesResponse>, ApiError> {
-    let (name, requested_path) = validate_workspace_request(request)?;
+async fn select_directory() -> Result<Json<SelectDirectoryResponse>, ApiError> {
+    let path = native_select_directory()?;
 
-    if !requested_path.is_dir() {
-        return Err(ApiError::bad_request(format!(
-            "workspace path does not exist or is not a directory: {}",
-            requested_path.display()
-        )));
-    }
-
-    let path = canonical_workspace_path(&requested_path)?;
-    let mut config = config_snapshot(&state)?;
-
-    reject_registered_workspace_path(&config, &path)?;
-    WorkspaceDatabase::open_or_create(&path).map_err(ApiError::from_workspace_error)?;
-
-    let id = unique_workspace_id(&config, &name);
-    config.workspaces.push(WorkspaceConfig { id, name, path });
-    save_config(&state, config.clone())?;
-    sync_all_mcp_workspaces(&state.mcp_registry, &config)
-        .await
-        .map_err(ApiError::from_mcp_error)?;
-
-    workspace_response_from_config(&config)
+    Ok(Json(SelectDirectoryResponse { path }))
 }
 
 fn normalize_web_server_settings(
@@ -1489,6 +1469,12 @@ async fn terminal_socket(
 struct WorkspacePathRequest {
     name: String,
     path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectDirectoryResponse {
+    path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4277,6 +4263,169 @@ fn validate_workspace_request(
     Ok((name, path))
 }
 
+fn native_select_directory() -> Result<Option<String>, ApiError> {
+    if !(cfg!(windows) || is_wsl_environment()) {
+        return Err(ApiError::bad_request(
+            "native directory picker is only available on Windows",
+        ));
+    }
+
+    let script = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+[ComImport]
+[Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
+public class FileOpenDialogCom
+{
+}
+
+[ComImport]
+[Guid("D57C7288-D4AD-4768-BE02-9D969532D960")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IFileOpenDialog
+{
+    [PreserveSig]
+    int Show(IntPtr parent);
+    void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
+    void SetFileTypeIndex(uint iFileType);
+    void GetFileTypeIndex(out uint piFileType);
+    void Advise(IntPtr pfde, out uint pdwCookie);
+    void Unadvise(uint dwCookie);
+    void SetOptions(uint fos);
+    void GetOptions(out uint pfos);
+    void SetDefaultFolder(IShellItem psi);
+    void SetFolder(IShellItem psi);
+    void GetFolder(out IShellItem ppsi);
+    void GetCurrentSelection(out IShellItem ppsi);
+    void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+    void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+    void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+    void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+    void GetResult(out IShellItem ppsi);
+    void AddPlace(IShellItem psi, int fdap);
+    void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
+    void Close(int hr);
+    void SetClientGuid(ref Guid guid);
+    void ClearClientData();
+    void SetFilter(IntPtr pFilter);
+    void GetResults(out IntPtr ppenum);
+    void GetSelectedItems(out IntPtr ppsai);
+}
+
+[ComImport]
+[Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IShellItem
+{
+    void BindToHandler(IntPtr pbc, ref Guid bhid, ref Guid riid, out IntPtr ppv);
+    void GetParent(out IShellItem ppsi);
+    void GetDisplayName(uint sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string ppszName);
+    void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+    void Compare(IShellItem psi, uint hint, out int piOrder);
+}
+
+public static class ModernFolderPicker
+{
+    private const uint FOS_PICKFOLDERS = 0x00000020;
+    private const uint FOS_FORCEFILESYSTEM = 0x00000040;
+    private const uint FOS_PATHMUSTEXIST = 0x00000800;
+    private const uint SIGDN_FILESYSPATH = 0x80058000;
+    private const int HRESULT_CANCELLED = unchecked((int)0x800704C7);
+
+    public static string Pick()
+    {
+        IFileOpenDialog dialog = (IFileOpenDialog)new FileOpenDialogCom();
+        uint options;
+        dialog.GetOptions(out options);
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        dialog.SetTitle("Choose workspace path");
+        dialog.SetOkButtonLabel("Select");
+
+        int result = dialog.Show(IntPtr.Zero);
+        if (result == HRESULT_CANCELLED)
+        {
+            return null;
+        }
+
+        if (result != 0)
+        {
+            Marshal.ThrowExceptionForHR(result);
+        }
+
+        IShellItem item;
+        dialog.GetResult(out item);
+
+        string path;
+        item.GetDisplayName(SIGDN_FILESYSPATH, out path);
+        return path;
+    }
+}
+'@
+
+$selectedPath = [ModernFolderPicker]::Pick()
+if ($selectedPath) {
+  Write-Output $selectedPath
+}
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-STA", "-Command", script])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| {
+            ApiError::internal(format!("failed to launch native directory picker: {source}"))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ApiError::internal(format!(
+            "native directory picker failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        )));
+    }
+
+    let selected_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    if selected_path.is_empty() {
+        return Ok(None);
+    }
+
+    if is_wsl_environment() && !cfg!(windows) {
+        let output = Command::new("wslpath")
+            .args(["-u", &selected_path])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|source| {
+                ApiError::internal(format!("failed to convert selected Windows path: {source}"))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(ApiError::internal(format!(
+                "failed to convert selected Windows path{}",
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
+            )));
+        }
+
+        return Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ));
+    }
+
+    Ok(Some(selected_path))
+}
+
 fn config_snapshot(state: &AppState) -> Result<GlobalConfig, ApiError> {
     let config = state
         .config
@@ -6821,6 +6970,54 @@ description: Project memory.
             packed[tool_position].tool_call_id.as_deref(),
             Some("call-1")
         );
+    }
+
+    #[tokio::test]
+    async fn add_workspace_creates_missing_directory_and_registers_it() {
+        let existing_workspace_dir =
+            env::temp_dir().join(unique_id("foco-existing-workspace-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-add-workspace-profile-test"));
+        let new_workspace_dir = env::temp_dir().join(unique_id("foco-new-workspace-test"));
+
+        fs::create_dir_all(&existing_workspace_dir).expect("existing workspace directory");
+        fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+
+        let config = GlobalConfig::first_run(existing_workspace_dir.clone());
+        let state = test_app_state(config, profile_dir.clone());
+
+        let _response = add_workspace(
+            State(state.clone()),
+            Json(WorkspacePathRequest {
+                name: "New Workspace".to_string(),
+                path: new_workspace_dir.display().to_string(),
+            }),
+        )
+        .await
+        .expect("add workspace");
+
+        assert!(new_workspace_dir.is_dir());
+        assert!(
+            WorkspaceDatabase::open_or_create(&new_workspace_dir)
+                .expect("workspace database")
+                .database_path()
+                .is_file()
+        );
+
+        let registered_path =
+            fs::canonicalize(&new_workspace_dir).expect("new workspace canonical path");
+        let config = state.config.lock().expect("config lock");
+        assert!(
+            config
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.name == "New Workspace"
+                    && workspace.path == registered_path)
+        );
+        drop(config);
+
+        fs::remove_dir_all(existing_workspace_dir).expect("remove existing workspace directory");
+        fs::remove_dir_all(new_workspace_dir).expect("remove new workspace directory");
+        fs::remove_dir_all(profile_dir).expect("remove profile directory");
     }
 
     #[tokio::test]

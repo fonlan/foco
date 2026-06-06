@@ -11,6 +11,7 @@ import {
   Eye,
   Folder,
   FolderPlus,
+  FolderSearch,
   GitBranch,
   GitCompare,
   Globe,
@@ -412,7 +413,6 @@ type ChatStreamEvent =
     }
   | { type: "error"; message: string };
 
-type WorkspaceFormMode = "add" | "create";
 type SettingsSection = "general" | "mcp" | "models" | "providers" | "skills";
 type ViewMode = "chat" | "settings" | "stats";
 
@@ -445,7 +445,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
   "zh-CN": {
     "Local workspace": "本地工作区",
     "Refresh workspaces": "刷新工作区",
-    "Create or add workspace": "创建或添加工作区",
+    "Add workspace": "添加工作区",
     "Collapse chat history": "收起聊天历史",
     "Expand chat history": "展开聊天历史",
     "New chat": "新建聊天",
@@ -474,18 +474,13 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Select a workspace before sending.": "发送前请先选择工作区。",
     "Select an enabled model before sending.": "发送前请先选择已启用的模型。",
     "Run cancelled.": "运行已取消。",
-    "Create workspace": "创建工作区",
-    "Add existing workspace": "添加现有工作区",
-    "Create and register a new local folder.": "创建并注册新的本地文件夹。",
-    "Register an existing local folder.": "注册已有本地文件夹。",
+    "Create or register a local folder.": "创建或注册本地文件夹。",
     "Close workspace dialog": "关闭工作区弹窗",
     Close: "关闭",
-    "Switch to create workspace": "切换到创建工作区",
-    "Switch to add workspace": "切换到添加工作区",
-    "Add workspace": "添加工作区",
     Name: "名称",
     "Workspace name": "工作区名称",
     Path: "路径",
+    "Choose workspace path": "选择工作区路径",
     Cancel: "取消",
     "Cancel workspace dialog": "取消工作区弹窗",
     "New branch": "新建分支",
@@ -795,7 +790,6 @@ export function App() {
     () => new Set(),
   );
   const [viewMode, setViewMode] = useState<ViewMode>("chat");
-  const [formMode, setFormMode] = useState<WorkspaceFormMode>("create");
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
@@ -832,6 +826,7 @@ export function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
+  const [isSelectingWorkspacePath, setIsSelectingWorkspacePath] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeRunAbortRef = useRef<AbortController | null>(null);
   const hasManuallySelectedModelRef = useRef(false);
@@ -1087,11 +1082,7 @@ export function App() {
     setError(null);
 
     try {
-      const endpoint =
-        formMode === "create"
-          ? "/api/workspaces/create"
-          : "/api/workspaces/add";
-      const data = await requestJson<WorkspacesResponse>(endpoint, {
+      const data = await requestJson<WorkspacesResponse>("/api/workspaces/add", {
         body: JSON.stringify({
           name: workspaceName,
           path: workspacePath,
@@ -1113,6 +1104,29 @@ export function App() {
       setError(errorMessage(requestError));
     } finally {
       setIsSavingWorkspace(false);
+    }
+  }
+
+  async function handleSelectWorkspacePath() {
+    setIsSelectingWorkspacePath(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<{ path: string | null }>(
+        "/api/native/select-directory",
+        { method: "POST" },
+      );
+
+      if (data.path) {
+        setWorkspacePath(data.path);
+        setWorkspaceName((current) =>
+          current.trim() ? current : workspaceNameFromPath(data.path ?? ""),
+        );
+      }
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSelectingWorkspacePath(false);
     }
   }
 
@@ -1605,8 +1619,7 @@ export function App() {
     });
   }
 
-  function openWorkspaceDialog(mode: WorkspaceFormMode) {
-    setFormMode(mode);
+  function openWorkspaceDialog() {
     setWorkspaceName("");
     setWorkspacePath("");
     setError(null);
@@ -1733,10 +1746,10 @@ export function App() {
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
                 <button
-                  aria-label={t("Create or add workspace")}
+                  aria-label={t("Add workspace")}
                   className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                  onClick={() => openWorkspaceDialog("create")}
-                  title={t("Create or add workspace")}
+                  onClick={() => openWorkspaceDialog()}
+                  title={t("Add workspace")}
                   type="button"
                 >
                   <FolderPlus aria-hidden="true" className="size-4" />
@@ -2046,13 +2059,13 @@ export function App() {
       )}
       {isWorkspaceDialogOpen ? (
         <WorkspaceDialog
-          formMode={formMode}
+          isSelectingPath={isSelectingWorkspacePath}
           isSaving={isSavingWorkspace}
           name={workspaceName}
           onClose={() => setIsWorkspaceDialogOpen(false)}
-          onModeChange={setFormMode}
           onNameChange={setWorkspaceName}
           onPathChange={setWorkspacePath}
+          onSelectPath={handleSelectWorkspacePath}
           onSubmit={handleWorkspaceSubmit}
           path={workspacePath}
         />
@@ -2073,31 +2086,28 @@ export function App() {
 }
 
 function WorkspaceDialog({
-  formMode,
+  isSelectingPath,
   isSaving,
   name,
   onClose,
-  onModeChange,
   onNameChange,
   onPathChange,
+  onSelectPath,
   onSubmit,
   path,
 }: {
-  formMode: WorkspaceFormMode;
+  isSelectingPath: boolean;
   isSaving: boolean;
   name: string;
   onClose: () => void;
-  onModeChange: (mode: WorkspaceFormMode) => void;
   onNameChange: (value: string) => void;
   onPathChange: (value: string) => void;
+  onSelectPath: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   path: string;
 }) {
   const { t } = useI18n();
-  const title =
-    formMode === "create"
-      ? t("Create workspace")
-      : t("Add existing workspace");
+  const title = t("Add workspace");
 
   return (
     <div
@@ -2119,9 +2129,7 @@ function WorkspaceDialog({
               {title}
             </h2>
             <p className="mt-1 truncate text-xs font-medium text-stone-500">
-              {formMode === "create"
-                ? t("Create and register a new local folder.")
-                : t("Register an existing local folder.")}
+              {t("Create or register a local folder.")}
             </p>
           </div>
           <button
@@ -2132,27 +2140,6 @@ function WorkspaceDialog({
             type="button"
           >
             <X aria-hidden="true" className="size-4" />
-          </button>
-        </div>
-
-        <div className="grid grid-cols-2 gap-2 border-b border-stone-200 bg-stone-50/80 px-4 py-3">
-          <button
-            aria-label={t("Switch to create workspace")}
-            className={workspaceModeClass(formMode === "create")}
-            onClick={() => onModeChange("create")}
-            title={t("Create workspace")}
-            type="button"
-          >
-            <Plus aria-hidden="true" className="size-4" />
-          </button>
-          <button
-            aria-label={t("Switch to add workspace")}
-            className={workspaceModeClass(formMode === "add")}
-            onClick={() => onModeChange("add")}
-            title={t("Add workspace")}
-            type="button"
-          >
-            <FolderPlus aria-hidden="true" className="size-4" />
           </button>
         </div>
 
@@ -2177,14 +2164,33 @@ function WorkspaceDialog({
             <span className="mb-1.5 block text-xs font-semibold text-stone-600">
               {t("Path")}
             </span>
-            <input
-              autoComplete="off"
-              className="h-11 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-              name="workspace-path"
-              onChange={(event) => onPathChange(event.target.value)}
-              placeholder="C:\\Users\\name\\workspace"
-              value={path}
-            />
+            <div className="flex gap-2">
+              <input
+                autoComplete="off"
+                className="h-11 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                name="workspace-path"
+                onChange={(event) => onPathChange(event.target.value)}
+                placeholder="C:/Users/name/workspace"
+                value={path}
+              />
+              <button
+                aria-label={t("Choose workspace path")}
+                className="inline-flex size-11 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                disabled={isSelectingPath}
+                onClick={onSelectPath}
+                title={t("Choose workspace path")}
+                type="button"
+              >
+                {isSelectingPath ? (
+                  <LoaderCircle
+                    aria-hidden="true"
+                    className="size-4 animate-spin"
+                  />
+                ) : (
+                  <FolderSearch aria-hidden="true" className="size-4" />
+                )}
+              </button>
+            </div>
           </label>
           <div className="flex justify-end gap-2">
             <button
@@ -2208,8 +2214,6 @@ function WorkspaceDialog({
                   aria-hidden="true"
                   className="size-4 animate-spin"
                 />
-              ) : formMode === "create" ? (
-                <Plus aria-hidden="true" className="size-4" />
               ) : (
                 <FolderPlus aria-hidden="true" className="size-4" />
               )}
@@ -6377,18 +6381,17 @@ function NavButton({
   );
 }
 
-function workspaceModeClass(active: boolean) {
-  return `inline-flex h-9 items-center justify-center gap-2 rounded-lg border px-2 text-sm font-semibold ${
-    active
-      ? "border-teal-200 bg-teal-50 text-teal-900 shadow-sm"
-      : "border-stone-200 bg-white/80 text-stone-600 hover:border-stone-300 hover:bg-white hover:text-stone-950"
-  }`;
-}
-
 function workspaceItemClass(active: boolean) {
   return `flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-sm font-semibold ${
     active ? "text-teal-950" : "text-stone-700"
   }`;
+}
+
+function workspaceNameFromPath(path: string) {
+  const trimmedPath = path.trim().replace(/[\\/]+$/g, "");
+  const parts = trimmedPath.split(/[\\/]+/);
+
+  return parts.at(-1) ?? "";
 }
 
 function workspaceMenuClass(active: boolean) {
