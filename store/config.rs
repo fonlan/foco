@@ -81,11 +81,8 @@ pub fn load_or_create_global_config_at_paths(
         create_first_run_config(&paths)?;
     }
 
-    let mut config = load_global_config(&paths.config_file)?;
+    let config = load_global_config(&paths.config_file)?;
     validate_workspace_directories(&config, &paths.config_file)?;
-    if apply_default_skill_directories(&mut config, &paths.user_profile_dir) {
-        save_global_config(&paths.config_file, &config)?;
-    }
 
     Ok(LoadedGlobalConfig { config, paths })
 }
@@ -378,12 +375,18 @@ impl GlobalConfig {
         validate_unique_named_items(
             config_path,
             "skills.detected",
-            self.skills.detected.iter().map(|skill| skill.id.as_str()),
+            self.skills.detected.iter().map(|skill| {
+                if skill.key.is_empty() {
+                    skill.id.as_str()
+                } else {
+                    skill.key.as_str()
+                }
+            }),
         )?;
-        for directory in &self.skills.directories {
-            validate_skill_directory_path(config_path, directory)?;
-        }
         for skill in &self.skills.detected {
+            if !skill.key.is_empty() {
+                validate_id(config_path, "skills.detected.key", &skill.key)?;
+            }
             validate_id(config_path, "skills.detected.id", &skill.id)?;
             require_non_empty(config_path, "skills.detected.name", &skill.name)?;
             require_non_empty(
@@ -391,6 +394,19 @@ impl GlobalConfig {
                 "skills.detected.description",
                 &skill.description,
             )?;
+            validate_skill_scope(config_path, &skill.scope)?;
+            if skill.scope == SKILL_SCOPE_WORKSPACE {
+                require_non_empty(
+                    config_path,
+                    "skills.detected.workspace_id",
+                    skill.workspace_id.as_deref().unwrap_or_default(),
+                )?;
+                require_non_empty(
+                    config_path,
+                    "skills.detected.workspace_name",
+                    skill.workspace_name.as_deref().unwrap_or_default(),
+                )?;
+            }
             if !skill.path.is_absolute() {
                 return invalid_config(
                     config_path,
@@ -524,22 +540,36 @@ impl McpServerConfig {
 #[serde(deny_unknown_fields)]
 pub struct SkillConfig {
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub directories: Vec<PathBuf>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub detected: Vec<SkillSettings>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub disabled: Vec<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub enabled: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillSettings {
+    #[serde(default)]
+    pub key: String,
     pub id: String,
     pub name: String,
     pub description: String,
     pub path: PathBuf,
+    #[serde(default = "default_skill_scope")]
+    pub scope: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -615,8 +645,7 @@ fn create_first_run_config(paths: &FocoPaths) -> Result<(), ConfigError> {
     create_directory(&paths.root_dir)?;
     create_directory(&paths.workspace_dir)?;
 
-    let mut config = GlobalConfig::first_run(paths.workspace_dir.clone());
-    config.skills.directories = default_skill_directories_for_profile(&paths.user_profile_dir);
+    let config = GlobalConfig::first_run(paths.workspace_dir.clone());
     let content = serde_json::to_string_pretty(&config).map_err(|source| ConfigError::Json {
         path: paths.config_file.clone(),
         source,
@@ -635,55 +664,21 @@ fn create_first_run_config(paths: &FocoPaths) -> Result<(), ConfigError> {
     Ok(())
 }
 
-pub fn default_skill_directories_for_profile(user_profile_dir: &Path) -> Vec<PathBuf> {
-    vec![
-        user_profile_dir.join(".agents").join("skills"),
-        user_profile_dir.join(".claude").join("skills"),
-        PathBuf::from(".agents").join("skills"),
-        PathBuf::from(".claude").join("skills"),
-    ]
+pub const SKILL_SCOPE_GLOBAL: &str = "global";
+pub const SKILL_SCOPE_WORKSPACE: &str = "workspace";
+
+fn default_skill_scope() -> String {
+    SKILL_SCOPE_GLOBAL.to_string()
 }
 
-fn apply_default_skill_directories(config: &mut GlobalConfig, user_profile_dir: &Path) -> bool {
-    if !config.skills.directories.is_empty() {
-        return false;
+fn validate_skill_scope(config_path: Option<&Path>, scope: &str) -> Result<(), ConfigError> {
+    match scope {
+        SKILL_SCOPE_GLOBAL | SKILL_SCOPE_WORKSPACE => Ok(()),
+        _ => invalid_config(
+            config_path,
+            format!("skills.detected.scope '{scope}' is unsupported; expected global or workspace"),
+        ),
     }
-
-    config.skills.directories = default_skill_directories_for_profile(user_profile_dir);
-
-    true
-}
-
-fn validate_skill_directory_path(
-    config_path: Option<&Path>,
-    directory: &Path,
-) -> Result<(), ConfigError> {
-    if directory.as_os_str().is_empty() {
-        return invalid_config(config_path, "skills.directory path must not be empty");
-    }
-
-    if directory.is_absolute() {
-        return Ok(());
-    }
-
-    for component in directory.components() {
-        if matches!(
-            component,
-            std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_)
-        ) {
-            return invalid_config(
-                config_path,
-                format!(
-                    "relative skills.directory path must stay inside each workspace: {}",
-                    directory.display()
-                ),
-            );
-        }
-    }
-
-    Ok(())
 }
 
 fn create_directory(path: &Path) -> Result<(), ConfigError> {
@@ -853,19 +848,11 @@ mod tests {
         assert_eq!(loaded.config.workspaces.len(), 1);
         assert_eq!(loaded.config.workspaces[0].name, DEFAULT_WORKSPACE_NAME);
         assert_eq!(loaded.config.workspaces[0].path, loaded.paths.workspace_dir);
-        assert_eq!(
-            loaded.config.skills.directories,
-            vec![
-                profile.path().join(".agents").join("skills"),
-                profile.path().join(".claude").join("skills"),
-                PathBuf::from(".agents").join("skills"),
-                PathBuf::from(".claude").join("skills"),
-            ]
-        );
+        assert!(loaded.config.skills.directories.is_empty());
     }
 
     #[test]
-    fn load_or_create_backfills_default_skill_directories() {
+    fn load_or_create_keeps_skill_directories_unmanaged() {
         let profile = tempfile::tempdir().expect("temp profile");
         let paths = FocoPaths::from_user_profile(profile.path());
 
@@ -878,18 +865,10 @@ mod tests {
         )
         .expect("config write");
 
-        let loaded = load_or_create_global_config_at(profile.path())
-            .expect("existing config should load with default skill directories");
+        let loaded =
+            load_or_create_global_config_at(profile.path()).expect("existing config should load");
 
-        assert_eq!(
-            loaded.config.skills.directories,
-            vec![
-                profile.path().join(".agents").join("skills"),
-                profile.path().join(".claude").join("skills"),
-                PathBuf::from(".agents").join("skills"),
-                PathBuf::from(".claude").join("skills"),
-            ]
-        );
+        assert!(loaded.config.skills.directories.is_empty());
 
         let saved = load_global_config(&paths.config_file).expect("saved config reload");
         assert_eq!(saved.skills.directories, loaded.config.skills.directories);
@@ -926,15 +905,7 @@ mod tests {
 
         assert_eq!(loaded.config.skills.enabled, vec!["legacy-skill"]);
         assert!(loaded.config.skills.disabled.is_empty());
-        assert_eq!(
-            loaded.config.skills.directories,
-            vec![
-                profile.path().join(".agents").join("skills"),
-                profile.path().join(".claude").join("skills"),
-                PathBuf::from(".agents").join("skills"),
-                PathBuf::from(".claude").join("skills"),
-            ]
-        );
+        assert!(loaded.config.skills.directories.is_empty());
     }
 
     #[test]
@@ -1041,7 +1012,11 @@ mod tests {
         let error = save_global_config(&paths.config_file, &config)
             .expect_err("unsupported language should fail");
 
-        assert!(error.to_string().contains("app.language 'fr' is unsupported"));
+        assert!(
+            error
+                .to_string()
+                .contains("app.language 'fr' is unsupported")
+        );
     }
 
     #[test]

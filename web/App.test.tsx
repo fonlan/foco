@@ -94,9 +94,13 @@ const settings = {
       {
         description: "Project memory.",
         enabled: true,
+        key: "global:gitmemo",
         id: "gitmemo",
         name: "gitmemo",
         path: "C:\\Users\\fonla\\.agents\\skills\\gitmemo\\SKILL.md",
+        scope: "global",
+        workspaceId: null,
+        workspaceName: null,
         warnings: [],
       },
     ],
@@ -411,6 +415,14 @@ describe("App verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Skills" }));
     expect(screen.getByText("Detected skills")).toBeInTheDocument();
+    expect(screen.getByText("Skill locations")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Refresh skill discovery" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Save skills" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Global skill")).toBeInTheDocument();
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
   });
 
@@ -470,14 +482,16 @@ describe("App verification surfaces", () => {
     });
 
     await userEvent.click(screen.getByRole("button", { name: "Skills" }));
-    await userEvent.type(screen.getByLabelText("Directories"), "{enter}.agents\\skills");
-    await userEvent.click(screen.getByRole("button", { name: "Save skills" }));
+    await userEvent.click(screen.getByLabelText("Enable skill gitmemo"));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/skills/manual",
         expect.objectContaining({
-          body: expect.stringContaining(".agents\\\\skills"),
+          body: JSON.stringify({
+            disabled: ["global:gitmemo"],
+            enabled: [],
+          }),
           method: "POST",
         }),
       );

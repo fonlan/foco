@@ -240,10 +240,14 @@ type SkillsSettingsSummary = {
 };
 
 type ConfiguredSkillSummary = {
+  key: string;
   id: string;
   name: string;
   description: string;
   path: string;
+  scope: string;
+  workspaceId: string | null;
+  workspaceName: string | null;
   enabled: boolean;
   warnings: string[];
 };
@@ -496,6 +500,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Message Foco": "给 Foco 发送消息",
     "Select skill {name}": "选择技能 {name}",
     "Skill is disabled": "技能已禁用",
+    "Skill locations": "技能位置",
+    "Global skill": "全局技能",
+    "Workspace skill": "工作区技能",
+    "Workspace skill {name}": "工作区技能：{name}",
     disabled: "已禁用",
     "No matching skills": "没有匹配的技能",
     Model: "模型",
@@ -654,9 +662,6 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Edit MCP server {name}": "编辑 MCP 服务 {name}",
     "No configured MCP servers": "暂无已配置 MCP 服务",
     stopped: "已停止",
-    "Skill directories": "技能目录",
-    Directories: "目录",
-    "Save skills": "保存技能",
     "Refresh skill discovery": "刷新技能发现",
     Refresh: "刷新",
     "Detected skills": "已发现技能",
@@ -1067,7 +1072,7 @@ export function App() {
 
   useEffect(() => {
     const enabledSkillIds = new Set(
-      detectedSkills.filter((skill) => skill.enabled).map((skill) => skill.id),
+      detectedSkills.filter((skill) => skill.enabled).map((skill) => skill.key),
     );
 
     setSelectedSkillIds((current) => {
@@ -2386,7 +2391,7 @@ function ChatPanel({
   const skillQuery = activeSkillQuery(draftMessage);
   const selectedSkillSet = new Set(selectedSkillIds);
   const selectedSkills = selectedSkillIds
-    .map((skillId) => skills.find((skill) => skill.id === skillId))
+    .map((skillId) => skills.find((skill) => skill.key === skillId))
     .filter((skill): skill is ConfiguredSkillSummary => Boolean(skill));
   const visibleSkills =
     skillQuery === null
@@ -2394,9 +2399,10 @@ function ChatPanel({
       : skills.filter((skill) => {
           const query = skillQuery.toLowerCase();
           return (
-            !selectedSkillSet.has(skill.id) &&
+            !selectedSkillSet.has(skill.key) &&
             (skill.name.toLowerCase().includes(query) ||
               skill.id.toLowerCase().includes(query) ||
+              skill.key.toLowerCase().includes(query) ||
               skill.description.toLowerCase().includes(query))
           );
         });
@@ -2456,7 +2462,7 @@ function ChatPanel({
     }
 
     onDraftMessageChange(removeActiveSkillToken(draftMessage));
-    onToggleSkill(skill.id);
+    onToggleSkill(skill.key);
   }
 
   function handleComposerSubmit(event: FormEvent<HTMLFormElement>) {
@@ -2557,7 +2563,7 @@ function ChatPanel({
                 {selectedSkills.map((skill) => (
                   <span
                     className="inline-flex max-w-full items-center gap-1 rounded-full border border-teal-200 bg-teal-50 px-2 py-1 text-xs font-semibold text-teal-900"
-                    key={skill.id}
+                    key={skill.key}
                   >
                     <span className="max-w-44 truncate">{skill.name}</span>
                     <button
@@ -2565,7 +2571,7 @@ function ChatPanel({
                         name: skill.name,
                       })}
                       className="inline-flex size-4 items-center justify-center rounded-full text-teal-800 hover:bg-teal-100"
-                      onClick={() => onRemoveSkill(skill.id)}
+                      onClick={() => onRemoveSkill(skill.key)}
                       title={t("Remove skill")}
                       type="button"
                     >
@@ -2610,7 +2616,7 @@ function ChatPanel({
                         })}
                         className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-left hover:bg-stone-50 disabled:cursor-not-allowed disabled:bg-stone-50 disabled:text-stone-400"
                         disabled={!skill.enabled}
-                        key={skill.id}
+                        key={skill.key}
                         onClick={() => handleSkillSelect(skill)}
                         title={
                           skill.enabled ? skill.description : t("Skill is disabled")
@@ -2626,7 +2632,7 @@ function ChatPanel({
                           </span>
                         </span>
                         <span className="self-center rounded-md border border-stone-200 px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
-                          {skill.enabled ? skill.id : t("disabled")}
+                          {skill.enabled ? skillScopeLabel(skill, t) : t("disabled")}
                         </span>
                       </button>
                     ))
@@ -4236,7 +4242,6 @@ function SettingsPanel({
   const [mcpForm, setMcpForm] = useState<McpServerFormState>(() =>
     emptyMcpServerForm(),
   );
-  const [skillDirectoriesText, setSkillDirectoriesText] = useState("");
   const [enabledSkillIds, setEnabledSkillIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -4327,12 +4332,11 @@ function SettingsPanel({
   const selectedProviderIds = new Set(form.providerIds);
 
   function syncSkillsForm(data: SettingsResponse) {
-    setSkillDirectoriesText(data.skills.directories.join("\n"));
     setEnabledSkillIds(
       new Set(
         data.skills.detected
           .filter((skill) => skill.enabled)
-          .map((skill) => skill.id),
+          .map((skill) => skill.key),
       ),
     );
   }
@@ -4827,22 +4831,18 @@ function SettingsPanel({
     }
   }
 
-  async function saveSkills() {
+  async function saveSkills(nextEnabledSkillIds: Set<string>) {
     setIsSavingSkills(true);
     setError(null);
 
     try {
       const disabledSkillIds = (skills?.detected ?? [])
-        .filter((skill) => !enabledSkillIds.has(skill.id))
-        .map((skill) => skill.id);
+        .filter((skill) => !nextEnabledSkillIds.has(skill.key))
+        .map((skill) => skill.key);
       const data = await requestJson<SettingsResponse>("/api/skills/manual", {
         body: JSON.stringify({
-          directories: skillDirectoriesText
-            .split(/\r?\n/)
-            .map((directory) => directory.trim())
-            .filter(Boolean),
           disabled: disabledSkillIds,
-          enabled: Array.from(enabledSkillIds),
+          enabled: Array.from(nextEnabledSkillIds),
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -4924,17 +4924,16 @@ function SettingsPanel({
   }
 
   function toggleSkill(skillId: string, checked: boolean) {
-    setEnabledSkillIds((current) => {
-      const next = new Set(current);
+    const next = new Set(enabledSkillIds);
 
-      if (checked) {
-        next.add(skillId);
-      } else {
-        next.delete(skillId);
-      }
+    if (checked) {
+      next.add(skillId);
+    } else {
+      next.delete(skillId);
+    }
 
-      return next;
-    });
+    setEnabledSkillIds(next);
+    void saveSkills(next);
   }
 
   function handleModelDragStart(
@@ -5774,53 +5773,24 @@ function SettingsPanel({
             <div className="flex items-center gap-2">
               <Wrench aria-hidden="true" className="size-5 text-teal-700" />
               <h3 className="text-sm font-semibold text-stone-950">
-                {t("Skill directories")}
+                {t("Skill locations")}
               </h3>
             </div>
-            <label className="mt-4 block">
-              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                {t("Directories")}
-              </span>
-              <textarea
-                className="min-h-36 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                onChange={(event) => setSkillDirectoriesText(event.target.value)}
-                placeholder={
-                  "C:/Users/name/.agents/skills\nC:/Users/name/.claude/skills\n.agents/skills\n.claude/skills"
-                }
-                value={skillDirectoriesText}
-              />
-            </label>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <button
-                aria-label={t("Save skills")}
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
-                disabled={isSavingSkills}
-                onClick={() => void saveSkills()}
-                title={t("Save skills")}
-                type="button"
-              >
-                {isSavingSkills ? (
-                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                ) : (
-                  <CheckCircle2 aria-hidden="true" className="size-4" />
-                )}
-                {t("Save")}
-              </button>
-              <button
-                aria-label={t("Refresh skill discovery")}
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-                disabled={isRefreshingSkills}
-                onClick={() => void refreshSkills()}
-                title={t("Refresh skill discovery")}
-                type="button"
-              >
-                {isRefreshingSkills ? (
-                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                ) : (
-                  <RefreshCw aria-hidden="true" className="size-4" />
-                )}
-                {t("Refresh")}
-              </button>
+            <div className="mt-4 grid gap-2">
+              {skills?.directories.length ? (
+                skills.directories.map((directory) => (
+                  <div
+                    className="break-all rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-medium text-stone-600"
+                    key={directory}
+                  >
+                    {directory}
+                  </div>
+                ))
+              ) : (
+                <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-500">
+                  {t("Loading...")}
+                </div>
+              )}
             </div>
             {skills?.errors.length ? (
               <div className="mt-4 space-y-2">
@@ -5842,20 +5812,36 @@ function SettingsPanel({
               <h3 className="text-sm font-semibold text-stone-950">
                 {t("Detected skills")}
               </h3>
-              <CapabilityPill
-                label={t("skills {count}", {
-                  count: skills?.detected.length ?? 0,
-                })}
-                ok={(skills?.detected.length ?? 0) > 0}
-              />
+              <div className="flex items-center gap-2">
+                <CapabilityPill
+                  label={t("skills {count}", {
+                    count: skills?.detected.length ?? 0,
+                  })}
+                  ok={(skills?.detected.length ?? 0) > 0}
+                />
+                <button
+                  aria-label={t("Refresh skill discovery")}
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                  disabled={isRefreshingSkills}
+                  onClick={() => void refreshSkills()}
+                  title={t("Refresh skill discovery")}
+                  type="button"
+                >
+                  {isRefreshingSkills ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <RefreshCw aria-hidden="true" className="size-4" />
+                  )}
+                </button>
+              </div>
             </div>
             <div className="divide-y divide-stone-100">
               {skills?.detected.length ? (
                 skills.detected.map((skill) => {
-                  const enabled = enabledSkillIds.has(skill.id);
+                  const enabled = enabledSkillIds.has(skill.key);
 
                   return (
-                    <div className="px-4 py-3" key={skill.id}>
+                    <div className="px-4 py-3" key={skill.key}>
                       <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-2">
@@ -5866,9 +5852,13 @@ function SettingsPanel({
                               label={enabled ? t("enabled") : t("disabled")}
                               ok={enabled}
                             />
+                            <CapabilityPill
+                              label={skillScopeLabel(skill, t)}
+                              ok={skill.scope === "global"}
+                            />
                           </div>
                           <div className="mt-1 truncate text-xs font-medium text-stone-500">
-                            {skill.id}
+                            {skill.key}
                           </div>
                           <div className="mt-1 break-words text-xs text-stone-500">
                             {skill.description}
@@ -5884,8 +5874,9 @@ function SettingsPanel({
                             })}
                             checked={enabled}
                             className="peer sr-only"
+                            disabled={isSavingSkills}
                             onChange={(event) =>
-                              toggleSkill(skill.id, event.target.checked)
+                              toggleSkill(skill.key, event.target.checked)
                             }
                             type="checkbox"
                           />
@@ -6728,11 +6719,21 @@ function messageWithSelectedSkills(
   message: string,
 ) {
   const links = skillIds
-    .map((skillId) => skills.find((skill) => skill.id === skillId))
+    .map((skillId) => skills.find((skill) => skill.key === skillId))
     .filter((skill): skill is ConfiguredSkillSummary => Boolean(skill))
     .map((skill) => `[$${skill.name}](${skill.path})`);
 
   return links.length ? `${links.join(" ")} ${message}` : message;
+}
+
+function skillScopeLabel(skill: ConfiguredSkillSummary, t: Translate) {
+  if (skill.scope === "global") {
+    return t("Global skill");
+  }
+
+  return skill.workspaceName
+    ? t("Workspace skill {name}", { name: skill.workspaceName })
+    : t("Workspace skill");
 }
 
 function uniqueString(value: string, index: number, values: string[]) {
