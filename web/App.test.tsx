@@ -327,6 +327,22 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("First token latency: 250 ms")).toBeInTheDocument();
   });
 
+  it("marks the new chat row as selected after starting a workspace chat", async () => {
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "New chat in Default Workspace" }),
+    );
+
+    expect(screen.getByRole("button", { name: "New chat" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+  });
+
   it("shows settings sections for providers, models, MCP servers, and skills", async () => {
     render(<App />);
 

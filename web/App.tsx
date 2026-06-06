@@ -1764,6 +1764,7 @@ export function App() {
                 workspaces.map((workspace) => {
                 const isExpanded = expandedWorkspaceIds.has(workspace.id);
                 const isActive = workspace.id === activeWorkspace?.id;
+                const isNewChatActive = isActive && activeChatId === null;
 
                 return (
                   <div className="mb-1.5" key={workspace.id}>
@@ -1816,10 +1817,29 @@ export function App() {
                     </div>
                     {isExpanded ? (
                       <div className="ml-9 mt-1 space-y-1">
+                        {isNewChatActive ? (
+                          <button
+                            aria-current="page"
+                            className={chatItemClass(true)}
+                            onClick={() => startNewWorkspaceChat(workspace.id)}
+                            type="button"
+                          >
+                            <MessageSquare
+                              aria-hidden="true"
+                              className="size-3.5 shrink-0"
+                            />
+                            <span className="min-w-0 flex-1 truncate">
+                              {t("New chat")}
+                            </span>
+                          </button>
+                        ) : null}
                         {workspace.chats.length > 0 ? (
                           workspace.chats.map((chat) => {
                             const isChatRunning =
                               runningChatKey === chatRunKey(workspace.id, chat.id);
+                            const isChatActive =
+                              activeWorkspace?.id === workspace.id &&
+                              activeChatId === chat.id;
 
                             return (
                               <div
@@ -1827,12 +1847,10 @@ export function App() {
                                 key={chat.id}
                               >
                                 <button
-                                  className={`flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium ${
-                                    activeWorkspace?.id === workspace.id &&
-                                    activeChatId === chat.id
-                                      ? "bg-white text-stone-950 shadow-sm"
-                                      : "text-stone-600 hover:bg-white/80 hover:text-stone-950"
-                                  }`}
+                                  aria-current={
+                                    isChatActive ? "page" : undefined
+                                  }
+                                  className={chatItemClass(isChatActive)}
                                   onClick={() =>
                                     void loadChatMessages(workspace.id, chat.id)
                                   }
@@ -1877,11 +1895,11 @@ export function App() {
                               </div>
                             );
                           })
-                        ) : (
+                        ) : !isNewChatActive ? (
                           <div className="rounded-lg px-2 py-1.5 text-xs text-stone-500">
                             {t("No chats")}
                           </div>
-                        )}
+                        ) : null}
                       </div>
                     ) : null}
                   </div>
@@ -6176,6 +6194,14 @@ function workspaceItemClass(active: boolean) {
     active
       ? "bg-stone-950 text-white shadow-[0_10px_24px_rgba(33,31,28,0.16)]"
       : "text-stone-700 hover:bg-white/80 hover:text-stone-950"
+  }`;
+}
+
+function chatItemClass(active: boolean) {
+  return `flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium ${
+    active
+      ? "bg-white text-stone-950 shadow-sm"
+      : "text-stone-600 hover:bg-white/80 hover:text-stone-950"
   }`;
 }
 
