@@ -17,6 +17,7 @@ import {
   Globe,
   GripVertical,
   KeyRound,
+  ListChecks,
   LoaderCircle,
   MessageSquare,
   PlugZap,
@@ -363,6 +364,35 @@ type ChatMessagesResponse = {
   messages: ChatMessageSummary[];
 };
 
+type TaskStatus =
+  | "pending"
+  | "ready"
+  | "running"
+  | "blocked"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+type TaskGraphTask = {
+  id: string;
+  title: string;
+  status: TaskStatus;
+  dependsOn: string[];
+  acceptance: string[];
+  summary: string | null;
+  createdAt: string;
+  updatedAt: string;
+  subtasks: TaskGraphTask[];
+};
+
+type TaskGraphResponse = {
+  chatId: string;
+  exists: boolean;
+  tasks: TaskGraphTask[];
+  createdAt: string | null;
+  updatedAt: string | null;
+};
+
 type ChatUsage = {
   inputTokens: number | null;
   outputTokens: number | null;
@@ -414,6 +444,11 @@ type ChatStreamEvent =
   | {
       type: "gitDiffRefresh";
       workspaceId: string;
+    }
+  | {
+      type: "taskGraphRefresh";
+      workspaceId: string;
+      chatId: string;
     }
   | { type: "error"; message: string };
 
@@ -586,6 +621,14 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Copied: "已复制",
     "Copy {label}": "复制 {label}",
     "Resize git diff panel": "调整 Git diff 面板宽度",
+    "Task graph": "任务图",
+    "Updated {time}": "更新于 {time}",
+    pending: "待处理",
+    ready: "就绪",
+    running: "运行中",
+    blocked: "阻塞",
+    completed: "已完成",
+    cancelled: "已取消",
     "Git diff": "Git diff",
     "Workspace changes": "工作区变更",
     "Refresh diff": "刷新 diff",
@@ -843,6 +886,9 @@ export function App() {
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
+  const [taskGraph, setTaskGraph] = useState<TaskGraphResponse | null>(null);
+  const [isLoadingTaskGraph, setIsLoadingTaskGraph] = useState(false);
+  const [taskGraphError, setTaskGraphError] = useState<string | null>(null);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [runningChatKey, setRunningChatKey] = useState<string | null>(null);
   const [retryRunRequest, setRetryRunRequest] =
@@ -968,6 +1014,30 @@ export function App() {
     }
   }, []);
 
+  const loadTaskGraph = useCallback(async (workspaceId: string, chatId: string) => {
+    const requestedChatKey = chatRunKey(workspaceId, chatId);
+    setIsLoadingTaskGraph(true);
+    setTaskGraphError(null);
+
+    try {
+      const data = await requestJson<TaskGraphResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/task-graph`,
+      );
+      if (activeChatKeyRef.current === requestedChatKey) {
+        setTaskGraph(data);
+      }
+    } catch (requestError) {
+      if (activeChatKeyRef.current === requestedChatKey) {
+        setTaskGraph(null);
+        setTaskGraphError(errorMessage(requestError));
+      }
+    } finally {
+      if (activeChatKeyRef.current === requestedChatKey) {
+        setIsLoadingTaskGraph(false);
+      }
+    }
+  }, []);
+
   const loadGitBranches = useCallback(async (workspaceId: string) => {
     setIsLoadingBranches(true);
     setBranchError(null);
@@ -1009,6 +1079,19 @@ export function App() {
 
     void loadGitDiff(activeWorkspace.id, selectedDiffPath);
   }, [activeWorkspace?.id, isDiffPanelOpen, loadGitDiff, selectedDiffPath]);
+
+  useEffect(() => {
+    if (!activeWorkspace?.id || !activeChatId) {
+      setTaskGraph(null);
+      setTaskGraphError(null);
+      setIsLoadingTaskGraph(false);
+      return;
+    }
+
+    setTaskGraph(null);
+    setTaskGraphError(null);
+    void loadTaskGraph(activeWorkspace.id, activeChatId);
+  }, [activeChatId, activeWorkspace?.id, loadTaskGraph]);
 
   useEffect(() => {
     if (!activeWorkspace?.id) {
@@ -1750,6 +1833,17 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "taskGraphRefresh") {
+          const activeKey = activeChatKeyRef.current;
+          if (
+            activeKey ===
+            chatRunKey(streamEvent.workspaceId, streamEvent.chatId)
+          ) {
+            void loadTaskGraph(streamEvent.workspaceId, streamEvent.chatId);
+          }
+          return;
+        }
+
         if (streamEvent.type === "error") {
           setError(streamEvent.message);
           setMessagesForChatKey(runMessagesKey, (current) =>
@@ -2219,26 +2313,56 @@ export function App() {
 
         {showDiffPanel ? (
         <aside className="diff-sidebar min-w-0 border-stone-200/80 lg:border-l">
-          <GitDiffPanel
-            diffError={diffError}
-            diffText={selectedDiffText}
-            files={gitDiff?.files ?? []}
-            isLoading={isLoadingDiff}
-            onClose={() => setIsDiffPanelOpen(false)}
-            onRefresh={() => {
-              if (activeWorkspace?.id) {
-                void loadGitDiff(activeWorkspace.id, selectedDiffPath);
-              }
-            }}
-            onResizeBy={(delta) =>
-              setDiffPanelWidth((current) =>
-                Math.min(Math.max(current + delta, 280), 720),
-              )
-            }
-            onResizeStart={() => setIsResizingDiffPanel(true)}
-            onSelectFile={setSelectedDiffPath}
-            selectedPath={selectedDiffPath}
-          />
+          <div className="relative flex h-full min-h-0 min-w-0 flex-col">
+            <div
+              aria-label={t("Resize git diff panel")}
+              aria-orientation="vertical"
+              className="absolute bottom-0 left-0 top-0 z-10 hidden w-1 cursor-col-resize bg-transparent hover:bg-teal-500/40 lg:block"
+              onKeyDown={(event) => {
+                if (event.key === "ArrowLeft") {
+                  event.preventDefault();
+                  setDiffPanelWidth((current) =>
+                    Math.min(current + 24, 720),
+                  );
+                }
+
+                if (event.key === "ArrowRight") {
+                  event.preventDefault();
+                  setDiffPanelWidth((current) =>
+                    Math.max(current - 24, 280),
+                  );
+                }
+              }}
+              onPointerDown={() => setIsResizingDiffPanel(true)}
+              role="separator"
+              tabIndex={0}
+            />
+            {taskGraph?.exists && taskGraph.tasks.length ? (
+              <div className="min-h-0 flex-1 border-b border-stone-200/80">
+                <TaskGraphPanel
+                  error={taskGraphError}
+                  isLoading={isLoadingTaskGraph}
+                  taskGraph={taskGraph}
+                />
+              </div>
+            ) : null}
+            <div className="min-h-0 flex-1">
+              <GitDiffPanel
+                diffError={diffError}
+                diffText={selectedDiffText}
+                files={gitDiff?.files ?? []}
+                isLoading={isLoadingDiff}
+                onClose={() => setIsDiffPanelOpen(false)}
+                onRefresh={() => {
+                  if (activeWorkspace?.id) {
+                    void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+                  }
+                }}
+                onSelectFile={setSelectedDiffPath}
+                selectedPath={selectedDiffPath}
+              />
+            </div>
+          </div>
         </aside>
         ) : null}
       </div>
@@ -4352,6 +4476,136 @@ function StatsCard({
   );
 }
 
+function TaskGraphPanel({
+  error,
+  isLoading,
+  taskGraph,
+}: {
+  error: string | null;
+  isLoading: boolean;
+  taskGraph: TaskGraphResponse;
+}) {
+  const { language, t } = useI18n();
+
+  return (
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
+      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-800">
+            <ListChecks aria-hidden="true" className="size-5" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold">
+              {t("Task graph")}
+            </h2>
+            <p className="truncate text-xs font-medium text-stone-500">
+              {taskGraph.updatedAt
+                ? t("Updated {time}", {
+                    time: formatTaskGraphDate(taskGraph.updatedAt, language),
+                  })
+                : taskGraph.chatId}
+            </p>
+          </div>
+        </div>
+        {isLoading ? (
+          <LoaderCircle
+            aria-hidden="true"
+            className="size-4 shrink-0 animate-spin text-stone-500"
+          />
+        ) : null}
+      </div>
+      {error ? (
+        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {error}
+        </div>
+      ) : null}
+      <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        <div className="space-y-2">
+          {taskGraph.tasks.map((task) => (
+            <TaskGraphTaskItem key={task.id} level={0} task={task} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TaskGraphTaskItem({
+  level,
+  task,
+}: {
+  level: number;
+  task: TaskGraphTask;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div>
+      <div
+        className="rounded-lg border border-stone-200 bg-white px-3 py-2 shadow-sm"
+        style={{ marginLeft: level ? Math.min(level * 14, 42) : 0 }}
+      >
+        <div className="flex min-w-0 items-start justify-between gap-2">
+          <div className="min-w-0">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <span className="font-mono text-[11px] font-semibold text-stone-500">
+                {task.id}
+              </span>
+              <span className={taskStatusClass(task.status)}>
+                {t(task.status)}
+              </span>
+            </div>
+            <h3 className="mt-1 break-words text-sm font-semibold leading-snug text-stone-950">
+              {task.title}
+            </h3>
+          </div>
+        </div>
+        {task.summary ? (
+          <p className="mt-2 break-words text-xs leading-5 text-stone-600">
+            {task.summary}
+          </p>
+        ) : null}
+        {task.dependsOn.length ? (
+          <div className="mt-2 flex flex-wrap gap-1.5">
+            {task.dependsOn.map((dependencyId) => (
+              <span
+                className="rounded-md bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600"
+                key={dependencyId}
+              >
+                {dependencyId}
+              </span>
+            ))}
+          </div>
+        ) : null}
+        {task.acceptance.length ? (
+          <ul className="mt-2 space-y-1 text-xs leading-5 text-stone-600">
+            {task.acceptance.map((item, index) => (
+              <li className="flex gap-2" key={`${task.id}-acceptance-${index}`}>
+                <CheckCircle2
+                  aria-hidden="true"
+                  className="mt-0.5 size-3.5 shrink-0 text-teal-700"
+                />
+                <span className="min-w-0 break-words">{item}</span>
+              </li>
+            ))}
+          </ul>
+        ) : null}
+      </div>
+      {task.subtasks.length ? (
+        <div className="mt-2 space-y-2">
+          {task.subtasks.map((subtask) => (
+            <TaskGraphTaskItem
+              key={subtask.id}
+              level={level + 1}
+              task={subtask}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function GitDiffPanel({
   diffError,
   diffText,
@@ -4359,8 +4613,6 @@ function GitDiffPanel({
   isLoading,
   onClose,
   onRefresh,
-  onResizeBy,
-  onResizeStart,
   onSelectFile,
   selectedPath,
 }: {
@@ -4370,8 +4622,6 @@ function GitDiffPanel({
   isLoading: boolean;
   onClose: () => void;
   onRefresh: () => void;
-  onResizeBy: (delta: number) => void;
-  onResizeStart: () => void;
   onSelectFile: (path: string | null) => void;
   selectedPath: string | null;
 }) {
@@ -4379,25 +4629,6 @@ function GitDiffPanel({
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col">
-      <div
-        aria-label={t("Resize git diff panel")}
-        aria-orientation="vertical"
-        className="absolute bottom-0 left-0 top-0 hidden w-1 cursor-col-resize bg-transparent hover:bg-teal-500/40 lg:block"
-        onKeyDown={(event) => {
-          if (event.key === "ArrowLeft") {
-            event.preventDefault();
-            onResizeBy(24);
-          }
-
-          if (event.key === "ArrowRight") {
-            event.preventDefault();
-            onResizeBy(-24);
-          }
-        }}
-        onPointerDown={onResizeStart}
-        role="separator"
-        tabIndex={0}
-      />
       <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-4">
         <div className="flex min-w-0 items-center gap-2">
           <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
@@ -7561,6 +7792,28 @@ function auditStatusClass(status: string) {
   return `${base} bg-stone-100 text-stone-600`;
 }
 
+function taskStatusClass(status: TaskStatus) {
+  const base = "inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold";
+
+  if (status === "completed") {
+    return `${base} bg-teal-100 text-teal-800`;
+  }
+
+  if (status === "running" || status === "ready") {
+    return `${base} bg-sky-100 text-sky-800`;
+  }
+
+  if (status === "blocked") {
+    return `${base} bg-amber-100 text-amber-800`;
+  }
+
+  if (status === "failed" || status === "cancelled") {
+    return `${base} bg-rose-100 text-rose-700`;
+  }
+
+  return `${base} bg-stone-100 text-stone-600`;
+}
+
 function auditJsonText(value: JsonValue | null) {
   return value === null ? "null" : formatJsonValue(value);
 }
@@ -7579,6 +7832,21 @@ function formatAuditDate(value: string, language: AppLanguageId = "en") {
     month: "short",
     second: "2-digit",
     year: "numeric",
+  }).format(date);
+}
+
+function formatTaskGraphDate(value: string, language: AppLanguageId = "en") {
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+
+  return new Intl.DateTimeFormat(language, {
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "short",
   }).format(date);
 }
 
@@ -7940,6 +8208,20 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     }
 
     return { type: "gitDiffRefresh", workspaceId };
+  }
+
+  if (
+    value.type === "taskGraphRefresh" ||
+    value.type === "task_graph_refresh"
+  ) {
+    const workspaceId = stringField(value, "workspaceId", "workspace_id");
+    const chatId = stringField(value, "chatId", "chat_id");
+
+    if (!workspaceId || !chatId) {
+      return null;
+    }
+
+    return { type: "taskGraphRefresh", workspaceId, chatId };
   }
 
   if (value.type === "error") {

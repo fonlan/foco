@@ -1,18 +1,19 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
 };
 
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::WorkspaceConfig;
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 4;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 5;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -30,6 +31,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 4,
         sql: MIGRATION_004,
+    },
+    Migration {
+        version: 5,
+        sql: MIGRATION_005,
     },
 ];
 
@@ -1331,6 +1336,127 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn upsert_task_graph(
+        &mut self,
+        chat_id: &str,
+        tasks: Vec<TaskGraphTask>,
+    ) -> Result<TaskGraphRecord, WorkspaceDatabaseError> {
+        if self.chat(chat_id)?.is_none() {
+            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                message: format!("chat was not found: {chat_id}"),
+            });
+        }
+
+        let now = now_timestamp();
+        let tasks = normalize_new_task_graph_tasks(tasks, &now)?;
+        let graph_json = serde_json::to_string(&tasks)
+            .map_err(|source| WorkspaceDatabaseError::TaskGraphJson { source })?;
+
+        self.connection
+            .execute(
+                "INSERT INTO task_graphs
+                    (chat_id, graph_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)
+                 ON CONFLICT(chat_id) DO UPDATE SET
+                    graph_json = excluded.graph_json,
+                    updated_at = excluded.updated_at",
+                params![chat_id, graph_json, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        self.task_graph(chat_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidTaskGraph {
+                message: format!("task graph was not saved for chat: {chat_id}"),
+            })
+    }
+
+    pub fn task_graph(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<TaskGraphRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT chat_id, graph_json, created_at, updated_at
+                 FROM task_graphs
+                 WHERE chat_id = ?1",
+                params![chat_id],
+                |row| {
+                    let graph_json: String = row.get(1)?;
+                    let tasks = serde_json::from_str(&graph_json).map_err(|source| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(source),
+                        )
+                    })?;
+
+                    Ok(TaskGraphRecord {
+                        chat_id: row.get(0)?,
+                        tasks,
+                        created_at: row.get(2)?,
+                        updated_at: row.get(3)?,
+                        updated_task: None,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn filtered_task_graph(
+        &self,
+        chat_id: &str,
+        filter: TaskGraphFilter<'_>,
+    ) -> Result<Option<TaskGraphRecord>, WorkspaceDatabaseError> {
+        let Some(mut graph) = self.task_graph(chat_id)? else {
+            return Ok(None);
+        };
+
+        graph.tasks = filter_task_graph_tasks(graph.tasks, filter)?;
+
+        Ok(Some(graph))
+    }
+
+    pub fn update_task_graph_task(
+        &mut self,
+        chat_id: &str,
+        task_id: &str,
+        patch: TaskGraphTaskPatch,
+    ) -> Result<TaskGraphRecord, WorkspaceDatabaseError> {
+        let mut record =
+            self.task_graph(chat_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::MissingTaskGraph {
+                    chat_id: chat_id.to_string(),
+                })?;
+        if task_id.trim().is_empty() {
+            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                message: "task id must not be empty".to_string(),
+            });
+        }
+        let now = now_timestamp();
+        let updated_task = update_task_by_id(&mut record.tasks, task_id.trim(), &patch, &now)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidTaskGraph {
+                message: format!("task was not found: {}", task_id.trim()),
+            })?;
+        validate_task_graph_tasks(&record.tasks)?;
+
+        let graph_json = serde_json::to_string(&record.tasks)
+            .map_err(|source| WorkspaceDatabaseError::TaskGraphJson { source })?;
+        self.connection
+            .execute(
+                "UPDATE task_graphs
+                 SET graph_json = ?2, updated_at = ?3
+                 WHERE chat_id = ?1",
+                params![chat_id, graph_json, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        record.updated_at = now;
+        record.updated_task = Some(updated_task);
+
+        Ok(record)
+    }
+
     fn code_graph_symbol_relations<P>(
         &self,
         where_clause: &str,
@@ -1763,6 +1889,47 @@ pub struct TerminalSessionRecord {
     pub metadata_json: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskGraphTask {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub depends_on: Vec<String>,
+    pub acceptance: Vec<String>,
+    pub summary: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub subtasks: Vec<TaskGraphTask>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskGraphRecord {
+    pub chat_id: String,
+    pub tasks: Vec<TaskGraphTask>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub updated_task: Option<TaskGraphTask>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskGraphTaskPatch {
+    pub title: Option<String>,
+    pub status: Option<String>,
+    pub depends_on: Option<Vec<String>>,
+    pub acceptance: Option<Vec<String>>,
+    pub summary: Option<String>,
+    pub subtasks: Option<Vec<TaskGraphTask>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TaskGraphFilter<'a> {
+    pub status: Option<&'a str>,
+    pub task_id: Option<&'a str>,
+    pub include_subtasks: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewCodeGraphFileIndex<'a> {
     pub path: &'a str,
@@ -1877,6 +2044,9 @@ pub enum WorkspaceDatabaseError {
     InvalidCodeGraphInput {
         message: String,
     },
+    InvalidTaskGraph {
+        message: String,
+    },
     InvalidAuditJson {
         field: &'static str,
         source: serde_json::Error,
@@ -1891,6 +2061,9 @@ pub enum WorkspaceDatabaseError {
     MissingDatabaseParent {
         path: PathBuf,
     },
+    MissingTaskGraph {
+        chat_id: String,
+    },
     MissingTerminalSession {
         id: String,
     },
@@ -1900,6 +2073,9 @@ pub enum WorkspaceDatabaseError {
     Sqlite {
         path: PathBuf,
         source: rusqlite::Error,
+    },
+    TaskGraphJson {
+        source: serde_json::Error,
     },
     UnsupportedSchemaVersion {
         path: PathBuf,
@@ -1917,6 +2093,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             Self::InvalidCodeGraphInput { message } => {
                 write!(formatter, "invalid code graph index data: {message}")
             }
+            Self::InvalidTaskGraph { message } => {
+                write!(formatter, "invalid task graph: {message}")
+            }
             Self::InvalidAuditJson { field, source } => {
                 write!(formatter, "invalid LLM audit JSON in {field}: {source}")
             }
@@ -1929,6 +2108,9 @@ impl fmt::Display for WorkspaceDatabaseError {
                 "workspace database path has no parent directory: {}",
                 path.display()
             ),
+            Self::MissingTaskGraph { chat_id } => {
+                write!(formatter, "task graph was not found for chat: {chat_id}")
+            }
             Self::MissingTerminalSession { id } => {
                 write!(formatter, "terminal session was not found: {id}")
             }
@@ -1937,6 +2119,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             }
             Self::Sqlite { path, source } => {
                 write!(formatter, "{} SQLite error: {}", path.display(), source)
+            }
+            Self::TaskGraphJson { source } => {
+                write!(formatter, "invalid task graph JSON: {source}")
             }
             Self::UnsupportedSchemaVersion {
                 path,
@@ -1964,9 +2149,12 @@ impl std::error::Error for WorkspaceDatabaseError {
             Self::InvalidAuditJson { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
+            Self::TaskGraphJson { source } => Some(source),
             Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
+            | Self::InvalidTaskGraph { .. }
             | Self::MissingDatabaseParent { .. }
+            | Self::MissingTaskGraph { .. }
             | Self::MissingTerminalSession { .. }
             | Self::NonUtf8Path { .. }
             | Self::UnsupportedSchemaVersion { .. }
@@ -2173,6 +2361,304 @@ fn delete_code_graph_fts_entry(
 
     Ok(())
 }
+
+fn normalize_new_task_graph_tasks(
+    tasks: Vec<TaskGraphTask>,
+    now: &str,
+) -> Result<Vec<TaskGraphTask>, WorkspaceDatabaseError> {
+    let mut normalized = Vec::with_capacity(tasks.len());
+
+    for task in tasks {
+        normalized.push(normalize_task_graph_task(task, now)?);
+    }
+
+    validate_task_graph_tasks(&normalized)?;
+
+    Ok(normalized)
+}
+
+fn normalize_task_graph_task(
+    mut task: TaskGraphTask,
+    now: &str,
+) -> Result<TaskGraphTask, WorkspaceDatabaseError> {
+    task.id = required_task_graph_text("id", task.id)?;
+    task.title = required_task_graph_text("title", task.title)?;
+    task.status = normalize_task_status(task.status)?;
+    task.depends_on = normalize_task_graph_text_array("dependsOn", task.depends_on)?;
+    task.acceptance = normalize_task_graph_text_array("acceptance", task.acceptance)?;
+    task.summary = task.summary.trim().to_string();
+    task.created_at = now.to_string();
+    task.updated_at = now.to_string();
+    task.subtasks = normalize_new_task_graph_tasks_without_validation(task.subtasks, now)?;
+
+    Ok(task)
+}
+
+fn normalize_new_task_graph_tasks_without_validation(
+    tasks: Vec<TaskGraphTask>,
+    now: &str,
+) -> Result<Vec<TaskGraphTask>, WorkspaceDatabaseError> {
+    let mut normalized = Vec::with_capacity(tasks.len());
+
+    for task in tasks {
+        normalized.push(normalize_task_graph_task(task, now)?);
+    }
+
+    Ok(normalized)
+}
+
+fn required_task_graph_text(field: &str, value: String) -> Result<String, WorkspaceDatabaseError> {
+    let value = value.trim().to_string();
+
+    if value.is_empty() {
+        return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+            message: format!("{field} must not be empty"),
+        });
+    }
+
+    Ok(value)
+}
+
+fn normalize_task_graph_text_array(
+    field: &str,
+    values: Vec<String>,
+) -> Result<Vec<String>, WorkspaceDatabaseError> {
+    let mut normalized = Vec::with_capacity(values.len());
+    let mut seen = HashSet::new();
+
+    for value in values {
+        let value = required_task_graph_text(field, value)?;
+
+        if seen.insert(value.clone()) {
+            normalized.push(value);
+        }
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_task_status(status: String) -> Result<String, WorkspaceDatabaseError> {
+    let status = status.trim().to_string();
+
+    if is_task_graph_status(&status) {
+        Ok(status)
+    } else {
+        Err(WorkspaceDatabaseError::InvalidTaskGraph {
+            message: format!("status must be one of: {}", TASK_GRAPH_STATUSES.join(", ")),
+        })
+    }
+}
+
+fn validate_task_graph_tasks(tasks: &[TaskGraphTask]) -> Result<(), WorkspaceDatabaseError> {
+    let mut task_ids = HashSet::new();
+    let mut dependencies = HashMap::new();
+
+    collect_task_graph_ids(tasks, &mut task_ids, &mut dependencies)?;
+
+    for (task_id, depends_on) in &dependencies {
+        for dependency_id in depends_on {
+            if dependency_id == task_id {
+                return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                    message: format!("task '{task_id}' cannot depend on itself"),
+                });
+            }
+
+            if !task_ids.contains(dependency_id) {
+                return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                    message: format!("task '{task_id}' depends on missing task '{dependency_id}'"),
+                });
+            }
+        }
+    }
+
+    validate_task_graph_dependency_cycles(&dependencies)
+}
+
+fn collect_task_graph_ids(
+    tasks: &[TaskGraphTask],
+    task_ids: &mut HashSet<String>,
+    dependencies: &mut HashMap<String, Vec<String>>,
+) -> Result<(), WorkspaceDatabaseError> {
+    for task in tasks {
+        if !task_ids.insert(task.id.clone()) {
+            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                message: format!("duplicate task id: {}", task.id),
+            });
+        }
+        if !is_task_graph_status(&task.status) {
+            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                message: format!("task '{}' has invalid status '{}'", task.id, task.status),
+            });
+        }
+        dependencies.insert(task.id.clone(), task.depends_on.clone());
+        collect_task_graph_ids(&task.subtasks, task_ids, dependencies)?;
+    }
+
+    Ok(())
+}
+
+fn validate_task_graph_dependency_cycles(
+    dependencies: &HashMap<String, Vec<String>>,
+) -> Result<(), WorkspaceDatabaseError> {
+    let mut states = HashMap::new();
+
+    for task_id in dependencies.keys() {
+        visit_task_dependency(task_id, dependencies, &mut states)?;
+    }
+
+    Ok(())
+}
+
+fn visit_task_dependency(
+    task_id: &str,
+    dependencies: &HashMap<String, Vec<String>>,
+    states: &mut HashMap<String, u8>,
+) -> Result<(), WorkspaceDatabaseError> {
+    match states.get(task_id).copied() {
+        Some(1) => {
+            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                message: format!("task graph dependencies contain a cycle at '{task_id}'"),
+            });
+        }
+        Some(2) => return Ok(()),
+        _ => {}
+    }
+
+    states.insert(task_id.to_string(), 1);
+    if let Some(depends_on) = dependencies.get(task_id) {
+        for dependency_id in depends_on {
+            visit_task_dependency(dependency_id, dependencies, states)?;
+        }
+    }
+    states.insert(task_id.to_string(), 2);
+
+    Ok(())
+}
+
+fn update_task_by_id(
+    tasks: &mut [TaskGraphTask],
+    task_id: &str,
+    patch: &TaskGraphTaskPatch,
+    now: &str,
+) -> Result<Option<TaskGraphTask>, WorkspaceDatabaseError> {
+    for task in tasks {
+        if task.id == task_id {
+            apply_task_patch(task, patch, now)?;
+            return Ok(Some(task.clone()));
+        }
+
+        if let Some(updated) = update_task_by_id(&mut task.subtasks, task_id, patch, now)? {
+            return Ok(Some(updated));
+        }
+    }
+
+    Ok(None)
+}
+
+fn apply_task_patch(
+    task: &mut TaskGraphTask,
+    patch: &TaskGraphTaskPatch,
+    now: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    if patch.title.is_none()
+        && patch.status.is_none()
+        && patch.depends_on.is_none()
+        && patch.acceptance.is_none()
+        && patch.summary.is_none()
+        && patch.subtasks.is_none()
+    {
+        return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+            message: "task patch must update at least one field".to_string(),
+        });
+    }
+
+    if let Some(title) = &patch.title {
+        task.title = required_task_graph_text("title", title.clone())?;
+    }
+    if let Some(status) = &patch.status {
+        task.status = normalize_task_status(status.clone())?;
+    }
+    if let Some(depends_on) = &patch.depends_on {
+        task.depends_on = normalize_task_graph_text_array("dependsOn", depends_on.clone())?;
+    }
+    if let Some(acceptance) = &patch.acceptance {
+        task.acceptance = normalize_task_graph_text_array("acceptance", acceptance.clone())?;
+    }
+    if let Some(summary) = &patch.summary {
+        task.summary = summary.trim().to_string();
+    }
+    if let Some(subtasks) = &patch.subtasks {
+        task.subtasks = normalize_new_task_graph_tasks_without_validation(subtasks.clone(), now)?;
+    }
+
+    task.updated_at = now.to_string();
+
+    Ok(())
+}
+
+fn filter_task_graph_tasks(
+    tasks: Vec<TaskGraphTask>,
+    filter: TaskGraphFilter<'_>,
+) -> Result<Vec<TaskGraphTask>, WorkspaceDatabaseError> {
+    if let Some(status) = filter.status {
+        if !is_task_graph_status(status) {
+            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                message: format!("status must be one of: {}", TASK_GRAPH_STATUSES.join(", ")),
+            });
+        }
+    }
+
+    if filter.status.is_none() && filter.task_id.is_none() {
+        return Ok(tasks);
+    }
+
+    let mut matches = Vec::new();
+    collect_matching_task_graph_tasks(&tasks, filter, &mut matches);
+
+    Ok(matches)
+}
+
+fn collect_matching_task_graph_tasks(
+    tasks: &[TaskGraphTask],
+    filter: TaskGraphFilter<'_>,
+    matches: &mut Vec<TaskGraphTask>,
+) {
+    for task in tasks {
+        let status_matches = filter.status.is_none_or(|status| task.status == status);
+        let id_matches = filter.task_id.is_none_or(|task_id| task.id == task_id);
+
+        if status_matches && id_matches {
+            matches.push(if filter.include_subtasks {
+                task.clone()
+            } else {
+                task_without_subtasks(task)
+            });
+        }
+
+        collect_matching_task_graph_tasks(&task.subtasks, filter, matches);
+    }
+}
+
+fn task_without_subtasks(task: &TaskGraphTask) -> TaskGraphTask {
+    TaskGraphTask {
+        subtasks: Vec::new(),
+        ..task.clone()
+    }
+}
+
+fn is_task_graph_status(status: &str) -> bool {
+    TASK_GRAPH_STATUSES.contains(&status)
+}
+
+const TASK_GRAPH_STATUSES: &[&str] = &[
+    "pending",
+    "ready",
+    "running",
+    "blocked",
+    "completed",
+    "failed",
+    "cancelled",
+];
 
 fn sqlite_error(database_path: &Path, source: rusqlite::Error) -> WorkspaceDatabaseError {
     WorkspaceDatabaseError::Sqlite {
@@ -2705,4 +3191,15 @@ CREATE VIRTUAL TABLE code_graph_fts_index USING fts5(
 INSERT INTO code_graph_fts_index (entity_kind, entity_id, title, body)
     SELECT entity_kind, entity_id, title, body
     FROM code_graph_fts_data;
+"#;
+
+const MIGRATION_005: &str = r#"
+CREATE TABLE task_graphs (
+    chat_id TEXT PRIMARY KEY NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    graph_json TEXT NOT NULL CHECK (length(graph_json) > 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX task_graphs_updated_at_idx ON task_graphs (updated_at);
 "#;

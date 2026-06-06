@@ -6,8 +6,9 @@ use foco_store::{
         LlmRequestAuditFilters, LlmRequestRecord, NewCodeGraphEdge, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
-        NewTerminalSession, NewToolCall, NewToolResult, WORKSPACE_SCHEMA_VERSION,
-        WorkspaceDatabase, initialize_workspace_databases, workspace_database_path,
+        NewTerminalSession, NewToolCall, NewToolResult, TaskGraphFilter, TaskGraphTask,
+        TaskGraphTaskPatch, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
+        initialize_workspace_databases, workspace_database_path,
     },
 };
 use rusqlite::Connection;
@@ -47,6 +48,7 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "code_graph_fts_index",
         "code_graph_file_hashes",
         "code_graph_parse_status",
+        "task_graphs",
     ] {
         assert!(
             table_exists(&connection, table),
@@ -109,6 +111,134 @@ fn backs_up_existing_database_before_migration() {
         .expect("backup entries");
     assert_eq!(backups.len(), 1);
     assert!(backups[0].path().is_file());
+}
+
+#[test]
+fn repository_helpers_round_trip_task_graphs() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Task graph chat")
+        .expect("chat insert");
+    let graph = database
+        .upsert_task_graph(
+            "chat-1",
+            vec![task_graph_task(
+                "plan",
+                "Plan work",
+                "ready",
+                vec![],
+                vec!["Plan is clear"],
+                "Find the smallest path.",
+                vec![task_graph_task(
+                    "probe",
+                    "Probe code",
+                    "pending",
+                    vec!["plan"],
+                    vec!["Entrypoints identified"],
+                    "",
+                    vec![],
+                )],
+            )],
+        )
+        .expect("task graph create");
+
+    assert_eq!(graph.chat_id, "chat-1");
+    assert_eq!(graph.tasks.len(), 1);
+    assert_eq!(graph.tasks[0].created_at, graph.tasks[0].updated_at);
+    assert_eq!(graph.tasks[0].subtasks[0].depends_on, vec!["plan"]);
+
+    let updated = database
+        .update_task_graph_task(
+            "chat-1",
+            "probe",
+            TaskGraphTaskPatch {
+                status: Some("completed".to_string()),
+                summary: Some("Found store, tools, app, and web entrypoints.".to_string()),
+                ..TaskGraphTaskPatch::default()
+            },
+        )
+        .expect("task patch");
+    let updated_task = updated.updated_task.expect("updated task");
+    assert_eq!(updated_task.id, "probe");
+    assert_eq!(updated_task.status, "completed");
+    assert_eq!(
+        updated_task.summary,
+        "Found store, tools, app, and web entrypoints."
+    );
+
+    let completed = database
+        .filtered_task_graph(
+            "chat-1",
+            TaskGraphFilter {
+                status: Some("completed"),
+                task_id: None,
+                include_subtasks: false,
+            },
+        )
+        .expect("filtered task graph")
+        .expect("task graph");
+    assert_eq!(completed.tasks.len(), 1);
+    assert_eq!(completed.tasks[0].id, "probe");
+    assert!(completed.tasks[0].subtasks.is_empty());
+}
+
+#[test]
+fn repository_helpers_reject_invalid_task_graph_dependencies() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Task graph chat")
+        .expect("chat insert");
+
+    let missing = database
+        .upsert_task_graph(
+            "chat-1",
+            vec![task_graph_task(
+                "build",
+                "Build feature",
+                "pending",
+                vec!["missing"],
+                vec![],
+                "",
+                vec![],
+            )],
+        )
+        .expect_err("missing dependency should fail")
+        .to_string();
+    assert!(missing.contains("depends on missing task"));
+
+    let cycle = database
+        .upsert_task_graph(
+            "chat-1",
+            vec![
+                task_graph_task(
+                    "first",
+                    "First",
+                    "pending",
+                    vec!["second"],
+                    vec![],
+                    "",
+                    vec![],
+                ),
+                task_graph_task(
+                    "second",
+                    "Second",
+                    "pending",
+                    vec!["first"],
+                    vec![],
+                    "",
+                    vec![],
+                ),
+            ],
+        )
+        .expect_err("cycle should fail")
+        .to_string();
+    assert!(cycle.contains("cycle"));
 }
 
 #[test]
@@ -831,6 +961,34 @@ fn assert_json_eq(actual: &str, expected: &str) {
     let expected: Value = serde_json::from_str(expected).expect("expected json");
 
     assert_eq!(actual, expected);
+}
+
+fn task_graph_task(
+    id: &str,
+    title: &str,
+    status: &str,
+    depends_on: Vec<&str>,
+    acceptance: Vec<&str>,
+    summary: &str,
+    subtasks: Vec<TaskGraphTask>,
+) -> TaskGraphTask {
+    TaskGraphTask {
+        id: id.to_string(),
+        title: title.to_string(),
+        status: status.to_string(),
+        depends_on: depends_on
+            .into_iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+        acceptance: acceptance
+            .into_iter()
+            .map(std::string::ToString::to_string)
+            .collect(),
+        summary: summary.to_string(),
+        created_at: String::new(),
+        updated_at: String::new(),
+        subtasks,
+    }
 }
 
 fn table_exists(connection: &Connection, table: &str) -> bool {

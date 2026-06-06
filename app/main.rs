@@ -55,12 +55,14 @@ use foco_store::{
         ChatRecord, ContextCompressionSnapshotRecord, LlmRequestAuditFilters, LlmRequestAuditRow,
         LlmRequestEventRecord, LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot,
         NewLlmRequest, NewLlmRequestEvent, NewMessage, NewTerminalSession, NewToolCall,
-        NewToolResult, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
+        NewToolResult, TaskGraphFilter, TaskGraphRecord, TaskGraphTask, ToolCallWithResultRecord,
+        WorkspaceDatabase, initialize_workspace_databases,
     },
 };
 use foco_tools::{
-    PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolExecution,
-    WRITE_FILE_TOOL, builtin_tool_definitions, builtin_tool_timeout_ms, execute_builtin_tool,
+    CREATE_TASK_GRAPH_TOOL, PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL,
+    ToolExecution, UPDATE_TASK_GRAPH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions,
+    builtin_tool_timeout_ms, execute_builtin_tool_for_chat,
 };
 use futures_util::future::join_all;
 use rust_embed::Embed;
@@ -226,6 +228,10 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/messages",
             get(chat_messages),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/task-graph",
+            get(chat_task_graph),
         )
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/delete",
@@ -1232,6 +1238,44 @@ async fn chat_messages(
     Ok(Json(ChatMessagesResponse { messages }))
 }
 
+async fn chat_task_graph(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
+    Query(query): Query<TaskGraphQuery>,
+) -> Result<Json<TaskGraphResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace_id = workspace_id.trim();
+    let chat_id = chat_id.trim();
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+
+    if database
+        .chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+        .is_none()
+    {
+        return Err(ApiError::bad_request(format!(
+            "chat was not found: {chat_id}"
+        )));
+    }
+
+    let status = optional_trimmed_string(query.status);
+    let task_id = optional_trimmed_string(query.task_id);
+    let graph = database
+        .filtered_task_graph(
+            chat_id,
+            TaskGraphFilter {
+                status: status.as_deref(),
+                task_id: task_id.as_deref(),
+                include_subtasks: query.include_subtasks.unwrap_or(true),
+            },
+        )
+        .map_err(ApiError::from_workspace_error)?;
+
+    Ok(Json(task_graph_response(chat_id, graph)))
+}
+
 async fn delete_chat(
     State(state): State<AppState>,
     AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
@@ -1525,6 +1569,14 @@ struct GitDiffQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct TaskGraphQuery {
+    status: Option<String>,
+    task_id: Option<String>,
+    include_subtasks: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GitBranchRequest {
     name: String,
 }
@@ -1724,6 +1776,16 @@ struct ChatMessagesResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct TaskGraphResponse {
+    chat_id: String,
+    exists: bool,
+    tasks: Vec<TaskGraphTask>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AiStatisticsResponse {
     page: i64,
     page_size: i64,
@@ -1912,6 +1974,10 @@ enum ChatSseEvent {
     },
     GitDiffRefresh {
         workspace_id: String,
+    },
+    TaskGraphRefresh {
+        workspace_id: String,
+        chat_id: String,
     },
     Usage {
         usage: NeutralUsage,
@@ -2448,6 +2514,7 @@ impl PreparedChatContext {
                                     self.mcp_registry.clone(),
                                     &self.workspace_id,
                                     &self.workspace_path,
+                                    &self.chat_id,
                                     tool_calls.clone(),
                                 ) => tool_results,
                             } {
@@ -2485,6 +2552,14 @@ impl PreparedChatContext {
                             if tool_results_affect_git_diff(&next_tool_results) {
                                 let event = ChatSseEvent::GitDiffRefresh {
                                     workspace_id: self.workspace_id.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                yield Ok(sse_event(&event));
+                            }
+                            if tool_results_affect_task_graph(&next_tool_results) {
+                                let event = ChatSseEvent::TaskGraphRefresh {
+                                    workspace_id: self.workspace_id.clone(),
+                                    chat_id: self.chat_id.clone(),
                                 };
                                 events.push(captured_event(&event));
                                 yield Ok(sse_event(&event));
@@ -3818,31 +3893,41 @@ async fn execute_tool_calls_parallel(
     mcp_registry: Arc<McpRegistry>,
     workspace_id: &str,
     workspace_path: &Path,
+    chat_id: &str,
     tool_calls: Vec<NeutralToolCall>,
 ) -> Result<Vec<ExecutedToolCall>, ApiError> {
+    if tool_calls.iter().any(tool_call_writes_task_graph) {
+        let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
+        for tool_call in tool_calls {
+            executed_tool_calls.push(
+                execute_tool_call(
+                    mcp_registry.clone(),
+                    workspace_id,
+                    workspace_path,
+                    chat_id,
+                    tool_call,
+                )
+                .await,
+            );
+        }
+        return Ok(executed_tool_calls);
+    }
+
     let tasks = tool_calls.into_iter().map(|tool_call| {
         let workspace_path = workspace_path.to_path_buf();
         let workspace_id = workspace_id.to_string();
+        let chat_id = chat_id.to_string();
         let mcp_registry = mcp_registry.clone();
 
         tokio::spawn(async move {
-            let started_at_text = utc_timestamp();
-            let tool_execution = execute_tool(
+            execute_tool_call(
                 mcp_registry,
                 &workspace_id,
                 &workspace_path,
-                &tool_call.name,
-                tool_call.arguments.clone(),
-            )
-            .await;
-            let completed_at_text = utc_timestamp();
-
-            executed_tool_call(
+                &chat_id,
                 tool_call,
-                tool_execution,
-                started_at_text,
-                completed_at_text,
             )
+            .await
         })
     });
     let results = join_all(tasks).await;
@@ -3857,10 +3942,38 @@ async fn execute_tool_calls_parallel(
     Ok(executed_tool_calls)
 }
 
+async fn execute_tool_call(
+    mcp_registry: Arc<McpRegistry>,
+    workspace_id: &str,
+    workspace_path: &Path,
+    chat_id: &str,
+    tool_call: NeutralToolCall,
+) -> ExecutedToolCall {
+    let started_at_text = utc_timestamp();
+    let tool_execution = execute_tool(
+        mcp_registry,
+        workspace_id,
+        workspace_path,
+        chat_id,
+        &tool_call.name,
+        tool_call.arguments.clone(),
+    )
+    .await;
+    let completed_at_text = utc_timestamp();
+
+    executed_tool_call(
+        tool_call,
+        tool_execution,
+        started_at_text,
+        completed_at_text,
+    )
+}
+
 async fn execute_tool(
     mcp_registry: Arc<McpRegistry>,
     workspace_id: &str,
     workspace_path: &Path,
+    chat_id: &str,
     tool_name: &str,
     arguments: Value,
 ) -> ToolExecution {
@@ -3891,8 +4004,16 @@ async fn execute_tool(
         let tool_name = tool_name.to_string();
         let worker = tokio::task::spawn_blocking({
             let workspace_path = workspace_path.to_path_buf();
+            let chat_id = chat_id.to_string();
             let tool_name = tool_name.clone();
-            move || execute_builtin_tool(&workspace_path, &tool_name, arguments)
+            move || {
+                execute_builtin_tool_for_chat(
+                    &workspace_path,
+                    Some(&chat_id),
+                    &tool_name,
+                    arguments,
+                )
+            }
         });
         let execution: Result<ToolExecution, String> = if matches!(
             tool_name.as_str(),
@@ -3939,11 +4060,27 @@ fn append_tool_state_messages(
     }
 }
 
+fn tool_call_writes_task_graph(tool_call: &NeutralToolCall) -> bool {
+    matches!(
+        tool_call.name.as_str(),
+        CREATE_TASK_GRAPH_TOOL | UPDATE_TASK_GRAPH_TOOL
+    )
+}
+
 fn tool_results_affect_git_diff(tool_results: &[ExecutedToolCall]) -> bool {
     tool_results.iter().any(|tool_result| {
         matches!(
             tool_result.name.as_str(),
             WRITE_FILE_TOOL | PATCH_FILE_TOOL | RUN_COMMAND_TOOL
+        )
+    })
+}
+
+fn tool_results_affect_task_graph(tool_results: &[ExecutedToolCall]) -> bool {
+    tool_results.iter().any(|tool_result| {
+        matches!(
+            tool_result.name.as_str(),
+            CREATE_TASK_GRAPH_TOOL | UPDATE_TASK_GRAPH_TOOL
         )
     })
 }
@@ -4066,6 +4203,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::ToolCall { .. } => "tool_call",
         ChatSseEvent::ToolResult { .. } => "tool_result",
         ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
+        ChatSseEvent::TaskGraphRefresh { .. } => "task_graph_refresh",
         ChatSseEvent::Usage { .. } => "usage",
         ChatSseEvent::Complete { .. } => "completion",
         ChatSseEvent::Error { .. } => "error",
@@ -4163,7 +4301,13 @@ impl ApiError {
     }
 
     fn from_workspace_error(error: foco_store::workspace::WorkspaceDatabaseError) -> Self {
-        Self::internal(error.to_string())
+        match error {
+            foco_store::workspace::WorkspaceDatabaseError::InvalidTaskGraph { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::MissingTaskGraph { .. } => {
+                Self::bad_request(error.to_string())
+            }
+            _ => Self::internal(error.to_string()),
+        }
     }
 
     fn from_model_metadata_error(error: ModelMetadataError) -> Self {
@@ -5264,6 +5408,25 @@ fn workspace_response_from_config(
         active_workspace_id: config.app.active_workspace_id.clone(),
         workspaces,
     }))
+}
+
+fn task_graph_response(chat_id: &str, graph: Option<TaskGraphRecord>) -> TaskGraphResponse {
+    match graph {
+        Some(graph) => TaskGraphResponse {
+            chat_id: graph.chat_id,
+            exists: true,
+            tasks: graph.tasks,
+            created_at: Some(graph.created_at),
+            updated_at: Some(graph.updated_at),
+        },
+        None => TaskGraphResponse {
+            chat_id: chat_id.to_string(),
+            exists: false,
+            tasks: Vec::new(),
+            created_at: None,
+            updated_at: None,
+        },
+    }
 }
 
 fn workspace_by_id<'a>(

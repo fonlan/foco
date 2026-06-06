@@ -9,7 +9,8 @@ use std::{
 
 use foco_store::workspace::{
     CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
-    CodeGraphSymbolRelationRecord, WorkspaceDatabase, WorkspaceDatabaseError,
+    CodeGraphSymbolRelationRecord, TaskGraphFilter, TaskGraphRecord, TaskGraphTask,
+    TaskGraphTaskPatch, WorkspaceDatabase, WorkspaceDatabaseError,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,9 @@ pub const GRAPH_FIND_CALLERS_TOOL: &str = "graph_find_callers";
 pub const GRAPH_FIND_CALLEES_TOOL: &str = "graph_find_callees";
 pub const GRAPH_FIND_REFERENCES_TOOL: &str = "graph_find_references";
 pub const GRAPH_RELATED_FILES_TOOL: &str = "graph_related_files";
+pub const CREATE_TASK_GRAPH_TOOL: &str = "create_task_graph";
+pub const UPDATE_TASK_GRAPH_TOOL: &str = "update_task_graph";
+pub const GET_TASK_GRAPH_TOOL: &str = "get_task_graph";
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
@@ -40,6 +44,7 @@ const DEFAULT_SEARCH_TEXT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_TASK_GRAPH_TIMEOUT_MS: u64 = 10_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
 
@@ -71,6 +76,9 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         search_text_definition(),
         write_file_definition(),
         patch_file_definition(),
+        create_task_graph_definition(),
+        update_task_graph_definition(),
+        get_task_graph_definition(),
         run_command_definition(),
         sleep_definition(),
     ]
@@ -81,7 +89,16 @@ pub fn execute_builtin_tool(
     tool_name: &str,
     arguments: Value,
 ) -> ToolExecution {
-    match execute_builtin_tool_inner(workspace_path, tool_name, arguments) {
+    execute_builtin_tool_for_chat(workspace_path, None, tool_name, arguments)
+}
+
+pub fn execute_builtin_tool_for_chat(
+    workspace_path: &Path,
+    chat_id: Option<&str>,
+    tool_name: &str,
+    arguments: Value,
+) -> ToolExecution {
+    match execute_builtin_tool_inner(workspace_path, chat_id, tool_name, arguments) {
         Ok(output) => ToolExecution {
             output,
             is_error: false,
@@ -103,6 +120,9 @@ pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64
         | GRAPH_RELATED_FILES_TOOL => DEFAULT_GRAPH_TOOL_TIMEOUT_MS,
         SEARCH_TEXT_TOOL => DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
         WRITE_FILE_TOOL | PATCH_FILE_TOOL => DEFAULT_WRITE_FILE_TIMEOUT_MS,
+        CREATE_TASK_GRAPH_TOOL | UPDATE_TASK_GRAPH_TOOL | GET_TASK_GRAPH_TOOL => {
+            DEFAULT_TASK_GRAPH_TIMEOUT_MS
+        }
         RUN_COMMAND_TOOL => DEFAULT_RUN_COMMAND_TIMEOUT_MS,
         SLEEP_TOOL => DEFAULT_SLEEP_TIMEOUT_MS,
         other => return Err(ToolRuntimeError::UnknownTool(other.to_string()).to_string()),
@@ -113,6 +133,7 @@ pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64
 
 fn execute_builtin_tool_inner(
     workspace_path: &Path,
+    chat_id: Option<&str>,
     tool_name: &str,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
@@ -127,6 +148,9 @@ fn execute_builtin_tool_inner(
         SEARCH_TEXT_TOOL => search_text(workspace_path, arguments),
         WRITE_FILE_TOOL => write_file(workspace_path, arguments),
         PATCH_FILE_TOOL => patch_file(workspace_path, arguments),
+        CREATE_TASK_GRAPH_TOOL => create_task_graph(workspace_path, chat_id, arguments),
+        UPDATE_TASK_GRAPH_TOOL => update_task_graph(workspace_path, chat_id, arguments),
+        GET_TASK_GRAPH_TOOL => get_task_graph(workspace_path, chat_id, arguments),
         RUN_COMMAND_TOOL => run_command(workspace_path, arguments),
         SLEEP_TOOL => sleep_tool(arguments),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
@@ -539,6 +563,94 @@ fn patch_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
     }))
 }
 
+fn create_task_graph(
+    workspace_path: &Path,
+    chat_id: Option<&str>,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: CreateTaskGraphInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TASK_GRAPH_TIMEOUT_MS)?;
+    let chat_id = required_chat_id(chat_id)?;
+    let mut database = open_task_graph_database(workspace_path)?;
+    let graph = database.upsert_task_graph(
+        chat_id,
+        request
+            .tasks
+            .into_iter()
+            .map(task_graph_task_from_input)
+            .collect(),
+    )?;
+
+    Ok(task_graph_json(graph, timeout_ms))
+}
+
+fn update_task_graph(
+    workspace_path: &Path,
+    chat_id: Option<&str>,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: UpdateTaskGraphInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TASK_GRAPH_TIMEOUT_MS)?;
+    let chat_id = required_chat_id(chat_id)?;
+    let patch = TaskGraphTaskPatch {
+        title: request.patch.title,
+        status: request.patch.status,
+        depends_on: request.patch.depends_on,
+        acceptance: request.patch.acceptance,
+        summary: request.patch.summary,
+        subtasks: request
+            .patch
+            .subtasks
+            .map(|tasks| tasks.into_iter().map(task_graph_task_from_input).collect()),
+    };
+    let mut database = open_task_graph_database(workspace_path)?;
+    let graph = database.update_task_graph_task(chat_id, &request.task_id, patch)?;
+
+    Ok(task_graph_json(graph, timeout_ms))
+}
+
+fn get_task_graph(
+    workspace_path: &Path,
+    chat_id: Option<&str>,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: GetTaskGraphInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TASK_GRAPH_TIMEOUT_MS)?;
+    let chat_id = required_chat_id(chat_id)?;
+    let status = request
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let task_id = request
+        .task_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let database = open_task_graph_database(workspace_path)?;
+    let graph = database.filtered_task_graph(
+        chat_id,
+        TaskGraphFilter {
+            status,
+            task_id,
+            include_subtasks: request.include_subtasks,
+        },
+    )?;
+
+    match graph {
+        Some(graph) => Ok(task_graph_json(graph, timeout_ms)),
+        None => Ok(json!({
+            "chatId": chat_id,
+            "tasks": [],
+            "exists": false,
+            "createdAt": null,
+            "updatedAt": null,
+            "updatedTask": null,
+            "timeoutMs": timeout_ms
+        })),
+    }
+}
+
 fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: RunCommandInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_RUN_COMMAND_TIMEOUT_MS)?;
@@ -606,6 +718,21 @@ fn sleep_tool(arguments: Value) -> Result<Value, ToolRuntimeError> {
 
 fn open_code_graph_database(workspace_path: &Path) -> Result<WorkspaceDatabase, ToolRuntimeError> {
     WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
+}
+
+fn open_task_graph_database(workspace_path: &Path) -> Result<WorkspaceDatabase, ToolRuntimeError> {
+    WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
+}
+
+fn required_chat_id(chat_id: Option<&str>) -> Result<&str, ToolRuntimeError> {
+    chat_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments(
+                "task graph tools require an active chat".to_string(),
+            )
+        })
 }
 
 fn resolve_graph_symbol(
@@ -846,6 +973,38 @@ fn related_file_json(file: CodeGraphRelatedFileRecord) -> Value {
         "relation": file.relation,
         "score": file.score
     })
+}
+
+fn task_graph_json(graph: TaskGraphRecord, timeout_ms: u64) -> Value {
+    json!({
+        "chatId": graph.chat_id,
+        "tasks": graph.tasks,
+        "exists": true,
+        "createdAt": graph.created_at,
+        "updatedAt": graph.updated_at,
+        "updatedTask": graph.updated_task,
+        "timeoutMs": timeout_ms
+    })
+}
+
+fn task_graph_task_from_input(task: TaskGraphTaskInput) -> TaskGraphTask {
+    let _server_generated_timestamps = (task.created_at, task.updated_at);
+
+    TaskGraphTask {
+        id: task.id,
+        title: task.title,
+        status: task.status,
+        depends_on: task.depends_on,
+        acceptance: task.acceptance,
+        summary: task.summary,
+        created_at: String::new(),
+        updated_at: String::new(),
+        subtasks: task
+            .subtasks
+            .into_iter()
+            .map(task_graph_task_from_input)
+            .collect(),
+    }
 }
 
 fn parse_arguments<T>(arguments: Value) -> Result<T, ToolRuntimeError>
@@ -1974,6 +2133,120 @@ fn patch_file_definition() -> ToolDefinition {
     }
 }
 
+fn create_task_graph_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: CREATE_TASK_GRAPH_TOOL,
+        description: "Create or replace the current chat's task graph. Use this instead of plain todo lists to preserve task context, dependencies, acceptance criteria, summaries, and nested subtasks.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "items": task_graph_task_schema(),
+                    "description": "Top-level tasks for the current chat task graph."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["tasks", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn update_task_graph_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: UPDATE_TASK_GRAPH_TOOL,
+        description: "Patch one task in the current chat's task graph without resending the entire graph. Pass the task id and only the fields that should change.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "taskId": {
+                    "type": "string",
+                    "description": "Id of the task to patch."
+                },
+                "patch": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "title": {
+                            "type": ["string", "null"],
+                            "description": "New task title, or null to leave unchanged."
+                        },
+                        "status": {
+                            "type": ["string", "null"],
+                            "enum": ["pending", "ready", "running", "blocked", "completed", "failed", "cancelled", null],
+                            "description": "New task status, or null to leave unchanged."
+                        },
+                        "dependsOn": {
+                            "type": ["array", "null"],
+                            "items": { "type": "string" },
+                            "description": "Complete replacement dependency id list, or null to leave unchanged."
+                        },
+                        "acceptance": {
+                            "type": ["array", "null"],
+                            "items": { "type": "string" },
+                            "description": "Complete replacement acceptance criteria list, or null to leave unchanged."
+                        },
+                        "summary": {
+                            "type": ["string", "null"],
+                            "description": "New task progress/context summary, or null to leave unchanged."
+                        },
+                        "subtasks": {
+                            "type": ["array", "null"],
+                            "items": task_graph_task_schema(),
+                            "description": "Complete replacement nested subtask list, or null to leave unchanged."
+                        }
+                    },
+                    "required": ["title", "status", "dependsOn", "acceptance", "summary", "subtasks"]
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["taskId", "patch", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn get_task_graph_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GET_TASK_GRAPH_TOOL,
+        description: "Read the current chat's task graph, optionally filtering tasks by id or status such as completed, pending, ready, running, blocked, failed, or cancelled.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "status": {
+                    "type": ["string", "null"],
+                    "enum": ["pending", "ready", "running", "blocked", "completed", "failed", "cancelled", null],
+                    "description": "Optional task status filter. Null returns all statuses."
+                },
+                "taskId": {
+                    "type": ["string", "null"],
+                    "description": "Optional exact task id filter. Null returns all task ids."
+                },
+                "includeSubtasks": {
+                    "type": "boolean",
+                    "description": "When filtering, include matching task subtasks in the returned task objects."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["status", "taskId", "includeSubtasks", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
 fn run_command_definition() -> ToolDefinition {
     ToolDefinition {
         name: RUN_COMMAND_TOOL,
@@ -2027,6 +2300,74 @@ fn sleep_definition() -> ToolDefinition {
         }),
         strict: true,
     }
+}
+
+fn task_graph_task_schema() -> Value {
+    task_graph_task_schema_with_depth(3)
+}
+
+fn task_graph_task_schema_with_depth(depth: usize) -> Value {
+    let subtasks_schema = if depth == 0 {
+        json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {},
+                "required": []
+            },
+            "maxItems": 0
+        })
+    } else {
+        json!({
+            "type": "array",
+            "items": task_graph_task_schema_with_depth(depth - 1)
+        })
+    };
+
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Stable unique task id inside the graph."
+            },
+            "title": {
+                "type": "string",
+                "description": "Short human-readable task title."
+            },
+            "status": {
+                "type": "string",
+                "enum": ["pending", "ready", "running", "blocked", "completed", "failed", "cancelled"],
+                "description": "Task execution status."
+            },
+            "dependsOn": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Task ids that must be completed or resolved before this task can proceed."
+            },
+            "acceptance": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Acceptance criteria for this task."
+            },
+            "summary": {
+                "type": "string",
+                "description": "Current context, decisions, blockers, and progress summary for interruption recovery."
+            },
+            "createdAt": {
+                "type": ["string", "null"],
+                "description": "Ignored on input; the server writes the task creation timestamp."
+            },
+            "updatedAt": {
+                "type": ["string", "null"],
+                "description": "Ignored on input; the server writes the task update timestamp."
+            },
+            "subtasks": subtasks_schema
+        },
+        "required": ["id", "title", "status", "dependsOn", "acceptance", "summary", "createdAt", "updatedAt", "subtasks"]
+    })
 }
 
 #[derive(Deserialize)]
@@ -2099,6 +2440,55 @@ struct PatchFileInput {
     path: String,
     diff: String,
     timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateTaskGraphInput {
+    tasks: Vec<TaskGraphTaskInput>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateTaskGraphInput {
+    task_id: String,
+    patch: TaskGraphPatchInput,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetTaskGraphInput {
+    status: Option<String>,
+    task_id: Option<String>,
+    include_subtasks: bool,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskGraphPatchInput {
+    title: Option<String>,
+    status: Option<String>,
+    depends_on: Option<Vec<String>>,
+    acceptance: Option<Vec<String>>,
+    summary: Option<String>,
+    subtasks: Option<Vec<TaskGraphTaskInput>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskGraphTaskInput {
+    id: String,
+    title: String,
+    status: String,
+    depends_on: Vec<String>,
+    acceptance: Vec<String>,
+    summary: String,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    subtasks: Vec<TaskGraphTaskInput>,
 }
 
 #[derive(Deserialize)]
@@ -2197,7 +2587,7 @@ impl fmt::Display for ToolRuntimeError {
             ),
             Self::UnknownTool(tool) => write!(formatter, "unknown built-in tool '{tool}'"),
             Self::WorkspaceDatabase(source) => {
-                write!(formatter, "code graph database error: {source}")
+                write!(formatter, "workspace database error: {source}")
             }
         }
     }
@@ -2496,6 +2886,98 @@ mod tests {
         assert_eq!(write_file.start_line, None);
         assert_eq!(write_file.end_line, None);
         assert_eq!(write_file.timeout_ms, None);
+    }
+
+    #[test]
+    fn task_graph_tools_round_trip_current_chat() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .insert_chat("chat-1", "Task graph chat")
+            .expect("chat insert");
+        drop(database);
+
+        let create = execute_builtin_tool_for_chat(
+            workspace.path(),
+            Some("chat-1"),
+            CREATE_TASK_GRAPH_TOOL,
+            json!({
+                "tasks": [
+                    {
+                        "id": "plan",
+                        "title": "Plan work",
+                        "status": "ready",
+                        "dependsOn": [],
+                        "acceptance": ["Plan is clear"],
+                        "summary": "Find the smallest path.",
+                        "createdAt": null,
+                        "updatedAt": null,
+                        "subtasks": [
+                            {
+                                "id": "probe",
+                                "title": "Probe code",
+                                "status": "pending",
+                                "dependsOn": ["plan"],
+                                "acceptance": ["Entrypoints identified"],
+                                "summary": "",
+                                "createdAt": null,
+                                "updatedAt": null,
+                                "subtasks": []
+                            }
+                        ]
+                    }
+                ],
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!create.is_error, "{:?}", create.output);
+        assert_eq!(create.output["exists"], true);
+        assert_eq!(create.output["tasks"][0]["id"], "plan");
+        assert!(create.output["tasks"][0]["createdAt"].is_string());
+
+        let update = execute_builtin_tool_for_chat(
+            workspace.path(),
+            Some("chat-1"),
+            UPDATE_TASK_GRAPH_TOOL,
+            json!({
+                "taskId": "probe",
+                "patch": {
+                    "title": null,
+                    "status": "completed",
+                    "dependsOn": null,
+                    "acceptance": null,
+                    "summary": "Found store, tools, app, and web entrypoints.",
+                    "subtasks": null
+                },
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!update.is_error, "{:?}", update.output);
+        assert_eq!(update.output["updatedTask"]["id"], "probe");
+        assert_eq!(update.output["updatedTask"]["status"], "completed");
+
+        let completed = execute_builtin_tool_for_chat(
+            workspace.path(),
+            Some("chat-1"),
+            GET_TASK_GRAPH_TOOL,
+            json!({
+                "status": "completed",
+                "taskId": null,
+                "includeSubtasks": false,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!completed.is_error, "{:?}", completed.output);
+        assert_eq!(
+            completed.output["tasks"].as_array().expect("tasks").len(),
+            1
+        );
+        assert_eq!(completed.output["tasks"][0]["id"], "probe");
+        assert_eq!(completed.output["tasks"][0]["subtasks"], json!([]));
     }
 
     #[test]

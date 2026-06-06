@@ -329,6 +329,38 @@ const secondChatMessages = {
   ],
 };
 
+const taskGraph = {
+  chatId: "chat-1",
+  createdAt: "2026-06-05T10:01:00Z",
+  exists: true,
+  tasks: [
+    {
+      acceptance: ["README.md diff is visible"],
+      createdAt: "2026-06-05T10:01:00Z",
+      dependsOn: [],
+      id: "task-1",
+      status: "running",
+      subtasks: [
+        {
+          acceptance: ["Tool result is persisted"],
+          createdAt: "2026-06-05T10:02:00Z",
+          dependsOn: ["task-1"],
+          id: "task-1.1",
+          status: "completed",
+          subtasks: [],
+          summary: "read_file returned README context.",
+          title: "Persist tool result",
+          updatedAt: "2026-06-05T10:04:00Z",
+        },
+      ],
+      summary: "Coordinate the current tool run.",
+      title: "Inspect workspace changes",
+      updatedAt: "2026-06-05T10:05:00Z",
+    },
+  ],
+  updatedAt: "2026-06-05T10:05:00Z",
+};
+
 let activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null =
   null;
 
@@ -609,6 +641,19 @@ describe("App verification surfaces", () => {
     );
   });
 
+  it("shows the active chat task graph above the git diff panel", async () => {
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(screen.getByRole("button", { name: "Open git diff" }));
+
+    expect(await screen.findByText("Task graph")).toBeInTheDocument();
+    expect(screen.getByText("Inspect workspace changes")).toBeInTheDocument();
+    expect(screen.getByText("README.md diff is visible")).toBeInTheDocument();
+    expect(screen.getByText("Git diff")).toBeInTheDocument();
+    expect(screen.getByText(/\+hello/)).toBeInTheDocument();
+  });
+
   it("shows AI statistics and request details", async () => {
     render(<App />);
 
@@ -725,8 +770,22 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
     return jsonResponse(chatMessages);
   }
 
+  if (path === "/api/workspaces/workspace-1/chats/chat-1/task-graph") {
+    return jsonResponse(taskGraph);
+  }
+
   if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
     return jsonResponse(secondChatMessages);
+  }
+
+  if (path === "/api/workspaces/workspace-1/chats/chat-2/task-graph") {
+    return jsonResponse({
+      chatId: "chat-2",
+      createdAt: null,
+      exists: false,
+      tasks: [],
+      updatedAt: null,
+    });
   }
 
   if (path === "/api/workspaces/workspace-1/chat/stream") {
