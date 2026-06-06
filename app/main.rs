@@ -70,6 +70,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio::time::timeout;
 
+use crate::git_backend::{
+    create_git_branch as create_git_branch_in_workspace, git_branches_response, git_diff_response,
+    git_status_response, is_git_workspace, switch_git_branch as switch_git_branch_in_workspace,
+};
+
+mod git_backend;
 mod logging;
 mod terminal;
 
@@ -1261,14 +1267,7 @@ async fn git_status(
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
 
-    ensure_git_workspace(&workspace.path)?;
-    let status = run_git_command(&workspace.path, &["status", "--short"])?;
-
-    Ok(Json(GitStatusResponse {
-        is_git_repository: true,
-        files: parse_git_status_files(&status),
-        status,
-    }))
+    Ok(Json(git_status_response(&workspace.path)?))
 }
 
 async fn git_diff(
@@ -1284,28 +1283,7 @@ async fn git_diff(
         .map(normalize_workspace_relative_path)
         .transpose()?;
 
-    ensure_git_workspace(&workspace.path)?;
-
-    let mut diff_args = vec!["diff"];
-    let mut staged_diff_args = vec!["diff", "--cached"];
-    if let Some(path) = path.as_deref() {
-        diff_args.push("--");
-        diff_args.push(path);
-        staged_diff_args.push("--");
-        staged_diff_args.push(path);
-    }
-
-    let status = run_git_command(&workspace.path, &["status", "--short"])?;
-    let diff = run_git_command(&workspace.path, &diff_args)?;
-    let staged_diff = run_git_command(&workspace.path, &staged_diff_args)?;
-
-    Ok(Json(GitDiffResponse {
-        path,
-        files: parse_git_status_files(&status),
-        status,
-        diff,
-        staged_diff,
-    }))
+    Ok(Json(git_diff_response(&workspace.path, path)?))
 }
 
 async fn git_branches(
@@ -1333,10 +1311,8 @@ async fn switch_git_branch(
 ) -> Result<Json<GitBranchesResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let branch = validate_git_branch_name(&workspace.path, request.name)?;
 
-    ensure_git_workspace(&workspace.path)?;
-    run_git_command(&workspace.path, &["switch", &branch])?;
+    switch_git_branch_in_workspace(&workspace.path, request.name)?;
 
     Ok(Json(git_branches_response(&workspace.path)?))
 }
@@ -1348,10 +1324,8 @@ async fn create_git_branch(
 ) -> Result<Json<GitBranchesResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let branch = validate_git_branch_name(&workspace.path, request.name)?;
 
-    ensure_git_workspace(&workspace.path)?;
-    run_git_command(&workspace.path, &["switch", "-c", &branch])?;
+    create_git_branch_in_workspace(&workspace.path, request.name)?;
 
     Ok(Json(git_branches_response(&workspace.path)?))
 }
@@ -5309,54 +5283,6 @@ fn workspace_by_id<'a>(
         .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))
 }
 
-fn ensure_git_workspace(workspace_path: &Path) -> Result<(), ApiError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace_path)
-        .arg("rev-parse")
-        .arg("--is-inside-work-tree")
-        .output()
-        .map_err(|source| ApiError::internal(format!("failed to run git: {source}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    if output.status.success() && stdout.trim() == "true" {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        Err(ApiError::bad_request(format!(
-            "workspace is not a git repository: {}",
-            workspace_path.display()
-        )))
-    } else {
-        Err(ApiError::bad_request(format!(
-            "workspace is not a git repository: {} ({stderr})",
-            workspace_path.display()
-        )))
-    }
-}
-
-fn run_git_command(workspace_path: &Path, args: &[&str]) -> Result<String, ApiError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace_path)
-        .args(args)
-        .output()
-        .map_err(|source| ApiError::internal(format!("failed to run git: {source}")))?;
-
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
-    }
-
-    Err(ApiError::bad_request(format!(
-        "git {} exited with status {:?}: {}",
-        args.join(" "),
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
-}
-
 fn normalize_workspace_relative_path(input: &str) -> Result<String, ApiError> {
     let trimmed = input.trim();
 
@@ -5383,37 +5309,6 @@ fn normalize_workspace_relative_path(input: &str) -> Result<String, ApiError> {
     }
 
     Ok(trimmed.replace('\\', "/"))
-}
-
-fn parse_git_status_files(status: &str) -> Vec<GitStatusFileSummary> {
-    status.lines().filter_map(parse_git_status_file).collect()
-}
-
-fn parse_git_status_file(line: &str) -> Option<GitStatusFileSummary> {
-    if line.len() < 4 {
-        return None;
-    }
-
-    let index_status = line.get(0..1)?.to_string();
-    let worktree_status = line.get(1..2)?.to_string();
-    let path = line
-        .get(3..)?
-        .split(" -> ")
-        .last()
-        .unwrap_or_default()
-        .trim()
-        .trim_matches('"')
-        .replace('\\', "/");
-
-    if path.is_empty() {
-        return None;
-    }
-
-    Some(GitStatusFileSummary {
-        path,
-        index_status,
-        worktree_status,
-    })
 }
 
 fn model_metadata_response(
@@ -6276,61 +6171,6 @@ fn unique_workspace_id(config: &GlobalConfig, name: &str) -> String {
 
 fn workspace_id_exists(config: &GlobalConfig, id: &str) -> bool {
     config.workspaces.iter().any(|workspace| workspace.id == id)
-}
-
-fn git_branches_response(workspace_path: &Path) -> Result<GitBranchesResponse, ApiError> {
-    let current_branch =
-        non_empty_string(run_git_command(workspace_path, &["branch", "--show-current"])?.trim());
-    let branches = run_git_command(workspace_path, &["branch", "--format=%(refname:short)"])?
-        .lines()
-        .filter_map(non_empty_string)
-        .collect::<Vec<_>>();
-
-    Ok(GitBranchesResponse {
-        is_git_repository: true,
-        current_branch,
-        branches,
-    })
-}
-
-fn validate_git_branch_name(workspace_path: &Path, name: String) -> Result<String, ApiError> {
-    let branch = name.trim();
-
-    if branch.is_empty() {
-        return Err(ApiError::bad_request("git branch name must not be empty"));
-    }
-
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace_path)
-        .arg("check-ref-format")
-        .arg("--branch")
-        .arg(branch)
-        .output()
-        .map_err(|source| ApiError::internal(format!("failed to run git: {source}")))?;
-
-    if output.status.success() {
-        return Ok(branch.to_string());
-    }
-
-    Err(ApiError::bad_request(format!(
-        "invalid git branch name '{}': {}",
-        branch,
-        String::from_utf8_lossy(&output.stderr).trim()
-    )))
-}
-
-fn is_git_workspace(workspace_path: &Path) -> Result<bool, ApiError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace_path)
-        .arg("rev-parse")
-        .arg("--is-inside-work-tree")
-        .output()
-        .map_err(|source| ApiError::internal(format!("failed to run git: {source}")))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    Ok(output.status.success() && stdout.trim() == "true")
 }
 
 fn workspace_id_slug(name: &str) -> String {

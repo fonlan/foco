@@ -20,6 +20,7 @@ foco-store.workspace = true
 foco-tools.workspace = true
 chrono.workspace = true
 futures-util.workspace = true
+gix.workspace = true
 portable-pty.workspace = true
 reqwest.workspace = true
 serde.workspace = true
