@@ -249,6 +249,7 @@ const chatMessages = {
     {
       content: "Please inspect README.",
       id: "message-user",
+      metrics: null,
       parts: [{ text: "Please inspect README.", type: "text" }],
       reasoning: null,
       role: "user",
@@ -257,6 +258,13 @@ const chatMessages = {
     {
       content: "Done.",
       id: "message-assistant",
+      metrics: {
+        firstTokenLatencyMs: 250,
+        modelId: "gpt-test",
+        outputTokens: 40,
+        providerId: "openai",
+        totalLatencyMs: 2000,
+      },
       parts: [
         { text: "Need file context.", type: "reasoning" },
         {
@@ -312,6 +320,11 @@ describe("App verification surfaces", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("Done.")).toBeInTheDocument();
+    expect(screen.getByText("Model: gpt-test")).toBeInTheDocument();
+    expect(screen.getByText("Channel: openai")).toBeInTheDocument();
+    expect(screen.getByText("Total time: 2,000 ms")).toBeInTheDocument();
+    expect(screen.getByText("tokens/s: 20")).toBeInTheDocument();
+    expect(screen.getByText("First token latency: 250 ms")).toBeInTheDocument();
   });
 
   it("shows settings sections for providers, models, MCP servers, and skills", async () => {

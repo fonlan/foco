@@ -1919,6 +1919,7 @@ struct ChatMessageSummary {
     reasoning: Option<String>,
     tool_calls: Vec<ChatToolCallSummary>,
     parts: Vec<ChatMessagePart>,
+    metrics: Option<ChatReplyMetrics>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1938,6 +1939,16 @@ enum ChatMessagePart {
     Text { text: String },
     Reasoning { text: String },
     ToolCall { tool_call: ChatToolCallSummary },
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatReplyMetrics {
+    model_id: String,
+    provider_id: String,
+    total_latency_ms: Option<i64>,
+    first_token_latency_ms: Option<i64>,
+    output_tokens: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1980,6 +1991,7 @@ enum ChatSseEvent {
         reasoning: Option<String>,
         usage: Option<NeutralUsage>,
         stop_reason: Option<String>,
+        metrics: ChatReplyMetrics,
     },
     Error {
         message: String,
@@ -2371,6 +2383,14 @@ impl PreparedChatContext {
                             if tool_calls.is_empty() {
                                 let assistant_message_text =
                                     assistant_message_text(&assistant_text, &executed_tool_calls);
+                                let total_latency_ms = elapsed_millis(started_at);
+                                let metrics = ChatReplyMetrics {
+                                    model_id: self.model_id.clone(),
+                                    provider_id: self.provider_id.clone(),
+                                    total_latency_ms: Some(total_latency_ms),
+                                    first_token_latency_ms,
+                                    output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
+                                };
                                 let complete_event = ChatSseEvent::Complete {
                                     chat_id: self.chat_id.clone(),
                                     assistant_message_id: self.assistant_message_id.clone(),
@@ -2378,6 +2398,7 @@ impl PreparedChatContext {
                                     reasoning: non_empty_string(&assistant_reasoning),
                                     usage: final_usage.clone(),
                                     stop_reason: stop_reason.clone(),
+                                    metrics,
                                 };
                                 events.push(captured_event(&complete_event));
                                 let completed_at = utc_timestamp();
@@ -2385,7 +2406,7 @@ impl PreparedChatContext {
                                     first_token_at,
                                     completed_at,
                                     first_token_latency_ms,
-                                    total_latency_ms: elapsed_millis(started_at),
+                                    total_latency_ms,
                                     input_tokens: final_usage.as_ref().and_then(|usage| usage.input_tokens),
                                     output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
                                     cache_read_tokens: final_usage.as_ref().and_then(|usage| usage.cache_read_tokens),
@@ -5715,6 +5736,11 @@ fn chat_message_summary(
         &tool_calls,
         llm_request_events,
     )?;
+    let metrics = if message.role == "assistant" {
+        assistant_reply_metrics(database, &message.id, llm_request_events)?
+    } else {
+        None
+    };
 
     Ok(ChatMessageSummary {
         id: message.id,
@@ -5723,7 +5749,46 @@ fn chat_message_summary(
         content: message.content,
         tool_calls,
         parts,
+        metrics,
     })
+}
+
+fn assistant_reply_metrics(
+    database: &WorkspaceDatabase,
+    message_id: &str,
+    llm_request_events: &[LlmRequestEventRecord],
+) -> Result<Option<ChatReplyMetrics>, ApiError> {
+    let request_ids = assistant_message_request_ids(message_id, llm_request_events)?;
+    let Some(request_id) = request_ids.first() else {
+        return Ok(None);
+    };
+
+    if request_ids.len() > 1 {
+        return Err(ApiError::internal(format!(
+            "assistant message '{message_id}' is linked to multiple LLM requests"
+        )));
+    }
+
+    let request = database
+        .llm_request(request_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "assistant message '{message_id}' is linked to missing LLM request '{request_id}'"
+            ))
+        })?;
+
+    Ok(Some(chat_reply_metrics_from_request(&request)))
+}
+
+fn chat_reply_metrics_from_request(request: &LlmRequestRecord) -> ChatReplyMetrics {
+    ChatReplyMetrics {
+        model_id: request.model_id.clone(),
+        provider_id: request.provider_id.clone(),
+        total_latency_ms: request.total_latency_ms,
+        first_token_latency_ms: request.first_token_latency_ms,
+        output_tokens: request.output_tokens,
+    }
 }
 
 fn chat_message_parts(
@@ -6465,6 +6530,82 @@ description: Project memory.
         assert_eq!(messages[4].reasoning.as_deref(), Some("Used tools."));
 
         drop(messages);
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn chat_message_summary_includes_assistant_reply_metrics() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-message-metrics-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+
+        database
+            .insert_chat("chat-1", "Metrics chat")
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "Done.",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("assistant message insert");
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: "request-1",
+                workspace_id: "workspace-1",
+                chat_id: Some("chat-1"),
+                provider_id: "openai-responses",
+                model_id: "gpt-5.4",
+                request_started_at: "2026-06-06T09:00:00Z",
+                first_token_at: Some("2026-06-06T09:00:00Z"),
+                completed_at: Some("2026-06-06T09:00:02Z"),
+                input_tokens: Some(100),
+                output_tokens: Some(40),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                first_token_latency_ms: Some(250),
+                total_latency_ms: Some(2000),
+                status_code: None,
+                final_state: "succeeded",
+                request_body_json: Some("{}"),
+                response_body_json: Some("{}"),
+            })
+            .expect("llm request insert");
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: "request-1-event-0",
+                llm_request_id: "request-1",
+                sequence: 0,
+                event_at: "2026-06-06T09:00:00Z",
+                event_type: "start",
+                raw_chunk_json: None,
+                normalized_event_json: r#"{"type":"start","chatId":"chat-1","userMessageId":"user-1","assistantMessageId":"assistant-1","llmRequestId":"request-1"}"#,
+            })
+            .expect("llm start event insert");
+
+        let message = database
+            .messages_for_chat("chat-1")
+            .expect("messages")
+            .into_iter()
+            .next()
+            .expect("assistant message");
+        let events = database
+            .llm_request_events_for_chat("chat-1")
+            .expect("llm request events");
+        let summary = chat_message_summary(&database, message, &events).expect("message summary");
+        let metrics = summary.metrics.expect("assistant metrics");
+
+        assert_eq!(metrics.model_id, "gpt-5.4");
+        assert_eq!(metrics.provider_id, "openai-responses");
+        assert_eq!(metrics.total_latency_ms, Some(2000));
+        assert_eq!(metrics.first_token_latency_ms, Some(250));
+        assert_eq!(metrics.output_tokens, Some(40));
+
         drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }

@@ -342,6 +342,7 @@ type ChatMessageSummary = {
   reasoning: string | null;
   toolCalls: ChatToolCallSummary[];
   parts: ChatMessagePart[];
+  metrics: ChatReplyMetrics | null;
 };
 
 type ChatMessagesResponse = {
@@ -353,6 +354,14 @@ type ChatUsage = {
   outputTokens: number | null;
   cacheReadTokens: number | null;
   cacheWriteTokens: number | null;
+};
+
+type ChatReplyMetrics = {
+  modelId: string;
+  providerId: string;
+  totalLatencyMs: number | null;
+  firstTokenLatencyMs: number | null;
+  outputTokens: number | null;
 };
 
 type ChatStreamEvent =
@@ -374,6 +383,7 @@ type ChatStreamEvent =
       reasoning?: string | null;
       usage?: ChatUsage | null;
       stopReason?: string | null;
+      metrics: ChatReplyMetrics;
     }
   | {
       type: "toolCall";
@@ -515,12 +525,16 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Started before": "开始时间不晚于",
     "Request time": "请求时间",
     Provider: "供应商",
+    Channel: "渠道",
+    "Total time": "总耗时",
+    "tokens/s": "token/秒",
     Status: "状态",
     "Cache read": "缓存读取",
     "Cache write": "缓存写入",
     "Cache ratio": "缓存命中率",
     Latency: "延迟",
     "First token": "首 token",
+    "First token latency": "首字延迟",
     "Status code": "状态码",
     Details: "详情",
     "View request details": "查看请求详情",
@@ -729,6 +743,7 @@ type ShellMessage = {
   status?: "error" | "streaming";
   toolCalls: ChatToolCallSummary[];
   parts: ChatMessagePart[];
+  metrics: ChatReplyMetrics | null;
 };
 
 type RetryRunRequest = {
@@ -1328,6 +1343,7 @@ export function App() {
         reasoning: null,
         toolCalls: [],
         parts: [{ type: "text", text: visibleUserContent }],
+        metrics: null,
       },
       {
         id: localAssistantId,
@@ -1337,6 +1353,7 @@ export function App() {
         status: "streaming",
         toolCalls: [],
         parts: [],
+        metrics: null,
       },
     ]);
     setDraftMessage("");
@@ -1507,6 +1524,7 @@ export function App() {
                     ...message,
                     content: streamEvent.message,
                     parts: [{ type: "text", text: streamEvent.message }],
+                    metrics: null,
                     status: "error",
                   }
                 : message,
@@ -2473,6 +2491,9 @@ function ChatPanel({
                         className="size-4 animate-spin"
                       />
                     ) : null}
+                    {!isUser && message.metrics ? (
+                      <ChatReplyMetricsLine metrics={message.metrics} />
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -2798,6 +2819,33 @@ function MessagePartBlock({
 
   return (
     <MarkdownContent content={part.text} isError={isError} isUser={isUser} />
+  );
+}
+
+function ChatReplyMetricsLine({ metrics }: { metrics: ChatReplyMetrics }) {
+  const { language, t } = useI18n();
+  const values = [
+    `${t("Model")}: ${metrics.modelId}`,
+    `${t("Channel")}: ${metrics.providerId}`,
+    `${t("Total time")}: ${formatNullableLatency(
+      metrics.totalLatencyMs,
+      language,
+    )}`,
+    `${t("tokens/s")}: ${formatTokensPerSecond(metrics, language)}`,
+    `${t("First token latency")}: ${formatNullableLatency(
+      metrics.firstTokenLatencyMs,
+      language,
+    )}`,
+  ];
+
+  return (
+    <div className="flex flex-wrap gap-x-2 gap-y-1 border-t border-stone-100 pt-2 text-[11px] leading-4 text-stone-400">
+      {values.map((value) => (
+        <span className="min-w-0 break-words" key={value}>
+          {value}
+        </span>
+      ))}
+    </div>
   );
 }
 
@@ -6538,6 +6586,7 @@ function completedAssistantMessage(
   return {
     ...message,
     content: streamEvent.text,
+    metrics: streamEvent.metrics,
     reasoning: nextReasoning,
     status: undefined,
     parts: parts.length
@@ -6963,6 +7012,23 @@ function formatNullableLatency(
   return value === null ? "n/a" : `${formatNumber(value, language)} ms`;
 }
 
+function formatTokensPerSecond(
+  metrics: ChatReplyMetrics,
+  language: AppLanguageId = "en",
+) {
+  if (
+    metrics.outputTokens === null ||
+    metrics.totalLatencyMs === null ||
+    metrics.totalLatencyMs <= 0
+  ) {
+    return "n/a";
+  }
+
+  return new Intl.NumberFormat(language, {
+    maximumFractionDigits: 2,
+  }).format(metrics.outputTokens / (metrics.totalLatencyMs / 1000));
+}
+
 function formatPercent(value: number | null, language: AppLanguageId = "en") {
   if (value === null) {
     return "n/a";
@@ -7212,12 +7278,18 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       "stopReason",
       "stop_reason",
     );
+    const metrics = parseRequiredChatReplyMetrics(fieldValue(value, "metrics"));
 
     if (!chatId || !assistantMessageId || text === null) {
       return null;
     }
 
-    if (reasoning === false || usage === false || stopReason === false) {
+    if (
+      reasoning === false ||
+      usage === false ||
+      stopReason === false ||
+      metrics === false
+    ) {
       return null;
     }
 
@@ -7229,6 +7301,7 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       reasoning,
       usage,
       stopReason,
+      metrics,
     };
   }
 
@@ -7333,6 +7406,11 @@ function parseChatToolCallSummary(value: unknown): ChatToolCallSummary | null {
 function normalizeChatMessageSummary(
   message: ChatMessageSummary,
 ): ChatMessageSummary {
+  const metrics = parseOptionalChatReplyMetrics(message.metrics);
+  if (metrics === false) {
+    throw new Error("chat message metrics are invalid");
+  }
+
   const toolCalls = Array.isArray(message.toolCalls)
     ? message.toolCalls.map(normalizedToolCallSummary)
     : [];
@@ -7342,6 +7420,7 @@ function normalizeChatMessageSummary(
     .filter((part): part is ChatMessagePart => part !== null);
   const normalizedMessage = {
     ...message,
+    metrics,
     toolCalls,
     parts,
   };
@@ -7383,6 +7462,72 @@ function parseNullableChatUsage(value: unknown): ChatUsage | null | undefined | 
   }
 
   return parseChatUsage(value);
+}
+
+function parseRequiredChatReplyMetrics(value: unknown): ChatReplyMetrics | false {
+  const metrics = parseChatReplyMetrics(value);
+
+  if (metrics === undefined || metrics === null) {
+    return false;
+  }
+
+  return metrics;
+}
+
+function parseOptionalChatReplyMetrics(
+  value: unknown,
+): ChatReplyMetrics | null | false {
+  if (typeof value === "undefined" || value === null) {
+    return null;
+  }
+
+  const metrics = parseChatReplyMetrics(value);
+
+  return metrics === undefined ? false : metrics;
+}
+
+function parseChatReplyMetrics(
+  value: unknown,
+): ChatReplyMetrics | undefined | false {
+  if (typeof value === "undefined") {
+    return undefined;
+  }
+
+  if (!isObjectRecord(value)) {
+    return false;
+  }
+
+  const modelId = stringField(value, "modelId", "model_id");
+  const providerId = stringField(value, "providerId", "provider_id");
+  const totalLatencyMs = fieldValue(
+    value,
+    "totalLatencyMs",
+    "total_latency_ms",
+  );
+  const firstTokenLatencyMs = fieldValue(
+    value,
+    "firstTokenLatencyMs",
+    "first_token_latency_ms",
+  );
+  const outputTokens = fieldValue(value, "outputTokens", "output_tokens");
+
+  if (
+    !modelId ||
+    !providerId ||
+    !isNullableNumber(totalLatencyMs) ||
+    !isNullableNumber(firstTokenLatencyMs) ||
+    !isNullableNumber(outputTokens)
+  ) {
+    return false;
+  }
+
+  return {
+    firstTokenLatencyMs,
+    modelId,
+    outputTokens,
+    providerId,
+    totalLatencyMs,
+  };
 }
 
 function parseChatUsage(value: unknown): ChatUsage | undefined | false {
