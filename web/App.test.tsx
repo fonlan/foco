@@ -266,7 +266,7 @@ const chatMessages = {
         totalLatencyMs: 2000,
       },
       parts: [
-        { text: "Need file context.", type: "reasoning" },
+        { text: "Need file context.\n\nThen answer.", type: "reasoning" },
         {
           toolCall: {
             id: "tool-1",
@@ -280,7 +280,7 @@ const chatMessages = {
         },
         { text: "Done.", type: "text" },
       ],
-      reasoning: "Need file context.",
+      reasoning: "Need file context.\n\nThen answer.",
       role: "assistant",
       toolCalls: [
         {
@@ -310,7 +310,18 @@ describe("App verification surfaces", () => {
     await userEvent.click(screen.getByText("Tool run"));
 
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    const reasoningToggle = screen.getByRole("button", {
+      name: "Expand thinking",
+    });
+    expect(reasoningToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByText("Need file context. Then answer.")).toBeInTheDocument();
+    expect(screen.queryByText("Then answer.")).not.toBeInTheDocument();
+
+    await userEvent.click(reasoningToggle);
+
+    expect(reasoningToggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("Need file context.")).toBeInTheDocument();
+    expect(screen.getByText("Then answer.")).toBeInTheDocument();
     expect(screen.getByText("read_file")).toBeInTheDocument();
     expect(screen.getByText("README.md")).toBeInTheDocument();
     expect(

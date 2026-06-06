@@ -478,6 +478,8 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Model: "模型",
     "No enabled models": "没有已启用模型",
     Thinking: "思考",
+    "Collapse thinking": "收起思考",
+    "Expand thinking": "展开思考",
     "Model default": "模型默认",
     "Retry last run": "重试上次运行",
     "Cancel run": "取消运行",
@@ -2498,6 +2500,7 @@ function ChatPanel({
                       parts.map((part, partIndex) => (
                         <MessagePartBlock
                           isError={message.status === "error"}
+                          isStreaming={message.status === "streaming"}
                           isUser={isUser}
                           key={`${message.id}-part-${partIndex}`}
                           part={part}
@@ -2805,30 +2808,70 @@ function BranchSelector({
   );
 }
 
-function ReasoningBlock({ reasoning }: { reasoning: string }) {
+function ReasoningBlock({
+  isStreaming,
+  reasoning,
+}: {
+  isStreaming: boolean;
+  reasoning: string;
+}) {
   const { t } = useI18n();
+  const [isExpanded, setIsExpanded] = useState(isStreaming);
+  const preview = compactInlineText(reasoning);
+
+  useEffect(() => {
+    setIsExpanded(isStreaming);
+  }, [isStreaming]);
+
+  const toggleLabel = isExpanded ? t("Collapse thinking") : t("Expand thinking");
 
   return (
     <div className="reasoning-block min-w-0 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-      <div className="mb-1.5 text-xs font-semibold text-stone-500">
-        {t("Thinking")}
-      </div>
-      <MarkdownContent content={reasoning} isUser={false} variant="reasoning" />
+      <button
+        aria-expanded={isExpanded}
+        aria-label={toggleLabel}
+        className="flex min-h-6 w-full min-w-0 items-center gap-2 text-left text-xs font-semibold text-stone-500 hover:text-stone-700"
+        onClick={() => setIsExpanded((current) => !current)}
+        title={toggleLabel}
+        type="button"
+      >
+        {isExpanded ? (
+          <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
+        ) : (
+          <ChevronRight aria-hidden="true" className="size-3.5 shrink-0" />
+        )}
+        <span className="shrink-0">{t("Thinking")}</span>
+        {isExpanded ? null : (
+          <span
+            className="min-w-0 flex-1 truncate font-normal text-stone-600"
+            title={preview}
+          >
+            {preview}
+          </span>
+        )}
+      </button>
+      {isExpanded ? (
+        <div className="mt-1.5">
+          <MarkdownContent content={reasoning} isUser={false} variant="reasoning" />
+        </div>
+      ) : null}
     </div>
   );
 }
 
 function MessagePartBlock({
   isError,
+  isStreaming,
   isUser,
   part,
 }: {
   isError: boolean;
+  isStreaming: boolean;
   isUser: boolean;
   part: ChatMessagePart;
 }) {
   if (part.type === "reasoning") {
-    return <ReasoningBlock reasoning={part.text} />;
+    return <ReasoningBlock isStreaming={isStreaming} reasoning={part.text} />;
   }
 
   if (part.type === "toolCall") {
@@ -6632,6 +6675,10 @@ function missingFinalSuffix(current: string, next: string) {
   }
 
   return next.startsWith(current) ? next.slice(current.length) : "";
+}
+
+function compactInlineText(value: string) {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function appendTextPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
