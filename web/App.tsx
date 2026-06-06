@@ -408,6 +408,27 @@ type ChatReplyMetrics = {
   outputTokens: number | null;
 };
 
+type QuestionOptionSummary = {
+  label: string;
+  value: string;
+  description: string | null;
+};
+
+type QuestionItemSummary = {
+  id: string;
+  question: string;
+  options: QuestionOptionSummary[];
+  allowFreeText: boolean;
+};
+
+type QuestionRequestSummary = {
+  id: string;
+  toolCallId: string;
+  workspaceId: string;
+  chatId: string;
+  questions: QuestionItemSummary[];
+};
+
 type ChatStreamEvent =
   | {
       type: "start";
@@ -440,6 +461,11 @@ type ChatStreamEvent =
       toolCallId: string;
       output: JsonValue;
       isError: boolean;
+    }
+  | {
+      type: "questionRequest";
+      assistantMessageId: string;
+      request: QuestionRequestSummary;
     }
   | {
       type: "gitDiffRefresh";
@@ -516,6 +542,11 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Select a workspace before sending.": "发送前请先选择工作区。",
     "Select an enabled model before sending.": "发送前请先选择已启用的模型。",
     "Run cancelled.": "运行已取消。",
+    "Foco needs your answer": "Foco 需要你的回答",
+    "Waiting for your answer": "正在等待你的回答",
+    "Custom answer": "手动输入",
+    "Continue run": "继续运行",
+    "Answer must not be empty.": "回答不能为空。",
     "Create or register a local folder.": "创建或注册本地文件夹。",
     "Close workspace dialog": "关闭工作区弹窗",
     Close: "关闭",
@@ -846,6 +877,14 @@ type RetryRunRequest = {
   skillIds: string[];
 };
 
+type QuestionAnswerSubmission = {
+  answers: {
+    id: string;
+    answer: string;
+    selectedOptionValue: string | null;
+  }[];
+};
+
 export function App() {
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>("");
@@ -897,6 +936,10 @@ export function App() {
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [isSelectingWorkspacePath, setIsSelectingWorkspacePath] = useState(false);
+  const [pendingQuestion, setPendingQuestion] =
+    useState<QuestionRequestSummary | null>(null);
+  const [isAnsweringQuestion, setIsAnsweringQuestion] = useState(false);
+  const [questionError, setQuestionError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const activeRunAbortRef = useRef<AbortController | null>(null);
   const activeChatKeyRef = useRef<string | null>(null);
@@ -1547,6 +1590,33 @@ export function App() {
     }
   }
 
+  async function handleQuestionSubmit(answer: QuestionAnswerSubmission) {
+    if (!pendingQuestion || isAnsweringQuestion) {
+      return;
+    }
+
+    setIsAnsweringQuestion(true);
+    setQuestionError(null);
+
+    try {
+      await requestJson<{ ok: boolean; questionId: string }>(
+        `/api/chat/questions/${encodeURIComponent(pendingQuestion.id)}/answer`,
+        {
+          body: JSON.stringify(answer),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setPendingQuestion((current) =>
+        current?.id === pendingQuestion.id ? null : current,
+      );
+    } catch (requestError) {
+      setQuestionError(errorMessage(requestError));
+    } finally {
+      setIsAnsweringQuestion(false);
+    }
+  }
+
   async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
@@ -1600,6 +1670,9 @@ export function App() {
 
   function handleCancelRun() {
     activeRunAbortRef.current?.abort();
+    setPendingQuestion(null);
+    setQuestionError(null);
+    setIsAnsweringQuestion(false);
   }
 
   async function runChatMessage(request: RetryRunRequest) {
@@ -1775,6 +1848,9 @@ export function App() {
 
         if (streamEvent.type === "complete") {
           setRetryRunRequest(null);
+          setPendingQuestion(null);
+          setQuestionError(null);
+          setIsAnsweringQuestion(false);
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -1828,6 +1904,12 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "questionRequest") {
+          setQuestionError(null);
+          setPendingQuestion(streamEvent.request);
+          return;
+        }
+
         if (streamEvent.type === "gitDiffRefresh") {
           void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
           return;
@@ -1846,6 +1928,9 @@ export function App() {
 
         if (streamEvent.type === "error") {
           setError(streamEvent.message);
+          setPendingQuestion(null);
+          setQuestionError(null);
+          setIsAnsweringQuestion(false);
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message)
@@ -1868,6 +1953,9 @@ export function App() {
         requestError instanceof DOMException && requestError.name === "AbortError";
       const message = wasCancelled ? t("Run cancelled.") : errorMessage(requestError);
       setError(message);
+      setPendingQuestion(null);
+      setQuestionError(null);
+      setIsAnsweringQuestion(false);
       setRetryRunRequest({
         ...request,
         chatId: requestChatId,
@@ -2390,6 +2478,15 @@ export function App() {
           onSubmit={handleCreateGitBranch}
         />
       ) : null}
+      {pendingQuestion ? (
+        <QuestionDialog
+          error={questionError}
+          isSaving={isAnsweringQuestion}
+          onCancelRun={handleCancelRun}
+          onSubmit={handleQuestionSubmit}
+          question={pendingQuestion}
+        />
+      ) : null}
     </main>
     </I18nContext.Provider>
   );
@@ -2625,6 +2722,261 @@ function GitBranchDialog({
                 />
               ) : (
                 <Plus aria-hidden="true" className="size-4" />
+              )}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function QuestionDialog({
+  error,
+  isSaving,
+  onCancelRun,
+  onSubmit,
+  question,
+}: {
+  error: string | null;
+  isSaving: boolean;
+  onCancelRun: () => void;
+  onSubmit: (answer: QuestionAnswerSubmission) => void;
+  question: QuestionRequestSummary;
+}) {
+  const { t } = useI18n();
+  const [draftAnswers, setDraftAnswers] = useState<
+    Record<string, { manualAnswer: string; selectedOptionValue: string | null }>
+  >({});
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDraftAnswers(
+      Object.fromEntries(
+        question.questions.map((item) => [
+          item.id,
+          {
+            manualAnswer: "",
+            selectedOptionValue: null,
+          },
+        ]),
+      ),
+    );
+    setLocalError(null);
+  }, [question.id, question.questions]);
+
+  function submitAnswer(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const answers = question.questions.map((item) => {
+      const draft = draftAnswers[item.id] ?? {
+        manualAnswer: "",
+        selectedOptionValue: null,
+      };
+
+      if (draft.selectedOptionValue !== null) {
+        return {
+          id: item.id,
+          answer: draft.selectedOptionValue,
+          selectedOptionValue: draft.selectedOptionValue,
+        };
+      }
+
+      return {
+        id: item.id,
+        answer: draft.manualAnswer.trim(),
+        selectedOptionValue: null,
+      };
+    });
+
+    if (answers.some((answer) => !answer.answer)) {
+      setLocalError(t("Answer must not be empty."));
+      return;
+    }
+
+    onSubmit({ answers });
+  }
+
+  const displayedError = localError ?? error;
+  const canSubmit =
+    question.questions.length > 0 &&
+    question.questions.every((item) => {
+      const draft = draftAnswers[item.id];
+      if (!draft) {
+        return false;
+      }
+
+      return (
+        draft.selectedOptionValue !== null ||
+        draft.manualAnswer.trim().length > 0
+      );
+    });
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
+      role="presentation"
+    >
+      <section
+        aria-labelledby="question-dialog-title"
+        aria-modal="true"
+        className="w-full max-w-xl overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        role="dialog"
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <MessageSquare
+              aria-hidden="true"
+              className="size-5 shrink-0 text-teal-700"
+            />
+            <div className="min-w-0">
+              <h2
+                className="truncate text-base font-semibold text-stone-950"
+                id="question-dialog-title"
+              >
+                {t("Foco needs your answer")}
+              </h2>
+              <p className="mt-1 truncate text-xs font-medium text-stone-500">
+                {t("Waiting for your answer")}
+              </p>
+            </div>
+          </div>
+          <button
+            aria-label={t("Cancel run")}
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            onClick={onCancelRun}
+            title={t("Cancel run")}
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+
+        <form
+          className="max-h-[min(72vh,720px)] space-y-4 overflow-y-auto px-4 py-4"
+          onSubmit={submitAnswer}
+        >
+          <div className="space-y-4">
+            {question.questions.map((item, index) => {
+              const draft = draftAnswers[item.id] ?? {
+                manualAnswer: "",
+                selectedOptionValue: null,
+              };
+
+              return (
+                <section
+                  className="space-y-3 rounded-lg border border-stone-200 bg-stone-50/60 p-3"
+                  key={item.id}
+                >
+                  <p className="whitespace-pre-wrap text-sm font-semibold leading-6 text-stone-900">
+                    {question.questions.length > 1
+                      ? `${index + 1}. ${item.question}`
+                      : item.question}
+                  </p>
+
+                  {item.options.length ? (
+                    <div className="space-y-2">
+                      {item.options.map((option) => {
+                        const isSelected =
+                          draft.selectedOptionValue === option.value;
+                        return (
+                          <label
+                            className={`flex cursor-pointer gap-3 rounded-lg border px-3 py-2 text-sm transition ${
+                              isSelected
+                                ? "border-teal-700 bg-teal-50 text-teal-950"
+                                : "border-stone-200 bg-white text-stone-800 hover:border-teal-200 hover:bg-teal-50/60"
+                            }`}
+                            key={option.value}
+                          >
+                            <input
+                              checked={isSelected}
+                              className="mt-1 size-4 accent-teal-800"
+                              name={`question-option-${item.id}`}
+                              onChange={() => {
+                                setDraftAnswers((current) => ({
+                                  ...current,
+                                  [item.id]: {
+                                    manualAnswer:
+                                      current[item.id]?.manualAnswer ?? "",
+                                    selectedOptionValue: option.value,
+                                  },
+                                }));
+                                setLocalError(null);
+                              }}
+                              type="radio"
+                            />
+                            <span className="min-w-0">
+                              <span className="block font-semibold">
+                                {option.label}
+                              </span>
+                              {option.description ? (
+                                <span className="mt-0.5 block text-xs leading-5 text-stone-500">
+                                  {option.description}
+                                </span>
+                              ) : null}
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+
+                  {item.allowFreeText ? (
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Custom answer")}
+                      </span>
+                      <textarea
+                        className="min-h-24 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) => {
+                          setDraftAnswers((current) => ({
+                            ...current,
+                            [item.id]: {
+                              manualAnswer: event.target.value,
+                              selectedOptionValue: null,
+                            },
+                          }));
+                          setLocalError(null);
+                        }}
+                        value={draft.manualAnswer}
+                      />
+                    </label>
+                  ) : null}
+                </section>
+              );
+            })}
+          </div>
+
+          {displayedError ? (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              {displayedError}
+            </div>
+          ) : null}
+
+          <div className="flex justify-end gap-2">
+            <button
+              aria-label={t("Cancel run")}
+              className="inline-flex size-11 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+              onClick={onCancelRun}
+              title={t("Cancel run")}
+              type="button"
+            >
+              <X aria-hidden="true" className="size-4" />
+            </button>
+            <button
+              aria-label={t("Continue run")}
+              className="inline-flex size-11 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+              disabled={isSaving || !canSubmit}
+              title={t("Continue run")}
+              type="submit"
+            >
+              {isSaving ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="size-4 animate-spin"
+                />
+              ) : (
+                <CheckCircle2 aria-hidden="true" className="size-4" />
               )}
             </button>
           </div>
@@ -8200,6 +8552,21 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     return { type: "toolResult", assistantMessageId, toolCallId, output, isError };
   }
 
+  if (value.type === "questionRequest" || value.type === "question_request") {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const request = parseQuestionRequestSummary(fieldValue(value, "request"));
+
+    if (!assistantMessageId || !request) {
+      return null;
+    }
+
+    return { type: "questionRequest", assistantMessageId, request };
+  }
+
   if (value.type === "gitDiffRefresh" || value.type === "git_diff_refresh") {
     const workspaceId = stringField(value, "workspaceId", "workspace_id");
 
@@ -8235,6 +8602,94 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
   }
 
   return null;
+}
+
+function parseQuestionRequestSummary(value: unknown): QuestionRequestSummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const id = stringField(value, "id");
+  const toolCallId = stringField(value, "toolCallId", "tool_call_id");
+  const workspaceId = stringField(value, "workspaceId", "workspace_id");
+  const chatId = stringField(value, "chatId", "chat_id");
+  const questions = fieldValue(value, "questions");
+
+  if (
+    !id ||
+    !toolCallId ||
+    !workspaceId ||
+    !chatId ||
+    !Array.isArray(questions) ||
+    questions.length === 0
+  ) {
+    return null;
+  }
+
+  const parsedQuestions = questions.map(parseQuestionItemSummary);
+  if (parsedQuestions.some((question) => question === null)) {
+    return null;
+  }
+
+  return {
+    chatId,
+    id,
+    questions: parsedQuestions as QuestionItemSummary[],
+    toolCallId,
+    workspaceId,
+  };
+}
+
+function parseQuestionItemSummary(value: unknown): QuestionItemSummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const id = stringField(value, "id");
+  const question = stringField(value, "question");
+  const options = fieldValue(value, "options");
+  const allowFreeText = fieldValue(value, "allowFreeText", "allow_free_text");
+
+  if (
+    !id ||
+    !question ||
+    !Array.isArray(options) ||
+    typeof allowFreeText !== "boolean"
+  ) {
+    return null;
+  }
+
+  const parsedOptions = options.map(parseQuestionOptionSummary);
+  if (parsedOptions.some((option) => option === null)) {
+    return null;
+  }
+
+  return {
+    allowFreeText,
+    id,
+    options: parsedOptions as QuestionOptionSummary[],
+    question,
+  };
+}
+
+function parseQuestionOptionSummary(value: unknown): QuestionOptionSummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const label = stringField(value, "label");
+  const optionValue = stringField(value, "value");
+  const description = optionalNullableStringField(value, "description");
+
+  if (!label || !optionValue || description === false) {
+    return null;
+  }
+
+  return {
+    description: description ?? null,
+    label,
+    value: optionValue,
+  };
 }
 
 function describeChatStreamEvent(value: unknown) {

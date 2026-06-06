@@ -31,6 +31,7 @@ pub const GRAPH_RELATED_FILES_TOOL: &str = "graph_related_files";
 pub const CREATE_TASK_GRAPH_TOOL: &str = "create_task_graph";
 pub const UPDATE_TASK_GRAPH_TOOL: &str = "update_task_graph";
 pub const GET_TASK_GRAPH_TOOL: &str = "get_task_graph";
+pub const ASK_QUESTION_TOOL: &str = "ask_question";
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
@@ -79,6 +80,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         create_task_graph_definition(),
         update_task_graph_definition(),
         get_task_graph_definition(),
+        ask_question_definition(),
         run_command_definition(),
         sleep_definition(),
     ]
@@ -123,6 +125,11 @@ pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64
         CREATE_TASK_GRAPH_TOOL | UPDATE_TASK_GRAPH_TOOL | GET_TASK_GRAPH_TOOL => {
             DEFAULT_TASK_GRAPH_TIMEOUT_MS
         }
+        ASK_QUESTION_TOOL => {
+            return Err(
+                "tool 'ask_question' waits for user input and does not use timeoutMs".to_string(),
+            );
+        }
         RUN_COMMAND_TOOL => DEFAULT_RUN_COMMAND_TIMEOUT_MS,
         SLEEP_TOOL => DEFAULT_SLEEP_TIMEOUT_MS,
         other => return Err(ToolRuntimeError::UnknownTool(other.to_string()).to_string()),
@@ -151,6 +158,9 @@ fn execute_builtin_tool_inner(
         CREATE_TASK_GRAPH_TOOL => create_task_graph(workspace_path, chat_id, arguments),
         UPDATE_TASK_GRAPH_TOOL => update_task_graph(workspace_path, chat_id, arguments),
         GET_TASK_GRAPH_TOOL => get_task_graph(workspace_path, chat_id, arguments),
+        ASK_QUESTION_TOOL => Err(ToolRuntimeError::InvalidArguments(
+            "ask_question must be executed through the chat UI question bridge".to_string(),
+        )),
         RUN_COMMAND_TOOL => run_command(workspace_path, arguments),
         SLEEP_TOOL => sleep_tool(arguments),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
@@ -2242,6 +2252,64 @@ fn get_task_graph_definition() -> ToolDefinition {
                 }
             },
             "required": ["status", "taskId", "includeSubtasks", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn ask_question_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: ASK_QUESTION_TOOL,
+        description: "Ask the user one or more blocking questions through the Foco UI when required information is missing. Provide choices when an answer should be selected from known options; otherwise allow free-form input.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "Clear question to show the user."
+                            },
+                            "options": {
+                                "type": ["array", "null"],
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "label": {
+                                            "type": "string",
+                                            "description": "Short visible option label."
+                                        },
+                                        "value": {
+                                            "type": "string",
+                                            "description": "Exact value returned when the user selects this option."
+                                        },
+                                        "description": {
+                                            "type": ["string", "null"],
+                                            "description": "Optional one-sentence explanation of this option."
+                                        }
+                                    },
+                                    "required": ["label", "value", "description"]
+                                },
+                                "description": "Optional choices for this question. Null means free-form input only."
+                            },
+                            "allowFreeText": {
+                                "type": "boolean",
+                                "description": "Whether the user may type an answer manually."
+                            }
+                        },
+                        "required": ["question", "options", "allowFreeText"]
+                    },
+                    "description": "Questions that must all be answered before the tool returns."
+                }
+            },
+            "required": ["questions"]
         }),
         strict: true,
     }

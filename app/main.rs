@@ -60,8 +60,8 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    CREATE_TASK_GRAPH_TOOL, PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL,
-    ToolExecution, UPDATE_TASK_GRAPH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions,
+    ASK_QUESTION_TOOL, CREATE_TASK_GRAPH_TOOL, PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
+    SLEEP_TOOL, ToolExecution, UPDATE_TASK_GRAPH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions,
     builtin_tool_timeout_ms, execute_builtin_tool_for_chat,
 };
 use futures_util::future::join_all;
@@ -69,7 +69,7 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 use crate::git_backend::{
@@ -116,7 +116,259 @@ struct AppState {
     terminal_shutdown_tx: broadcast::Sender<()>,
     app_shutdown_rx: watch::Receiver<bool>,
     mcp_registry: Arc<McpRegistry>,
+    question_registry: QuestionRegistry,
     _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
+}
+
+#[derive(Clone, Default)]
+struct QuestionRegistry {
+    pending: Arc<Mutex<HashMap<String, PendingQuestion>>>,
+}
+
+struct PendingQuestion {
+    request: QuestionRequest,
+    answer_tx: oneshot::Sender<QuestionAnswer>,
+}
+
+struct QuestionRegistration {
+    answer_rx: oneshot::Receiver<QuestionAnswer>,
+    _cleanup: QuestionCleanup,
+}
+
+struct QuestionCleanup {
+    registry: QuestionRegistry,
+    question_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AskQuestionInput {
+    questions: Vec<AskQuestionItemInput>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AskQuestionItemInput {
+    question: String,
+    options: Option<Vec<QuestionOption>>,
+    allow_free_text: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionOption {
+    label: String,
+    value: String,
+    description: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionRequest {
+    id: String,
+    tool_call_id: String,
+    workspace_id: String,
+    chat_id: String,
+    questions: Vec<QuestionItem>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionItem {
+    id: String,
+    question: String,
+    options: Vec<QuestionOption>,
+    allow_free_text: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionAnswer {
+    answers: Vec<QuestionItemAnswer>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionItemAnswer {
+    id: String,
+    answer: String,
+    #[serde(default)]
+    selected_option_value: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QuestionAnswerResponse {
+    ok: bool,
+    question_id: String,
+}
+
+impl QuestionRegistry {
+    fn register(&self, request: QuestionRequest) -> Result<QuestionRegistration, ApiError> {
+        let question_id = request.id.clone();
+        let (answer_tx, answer_rx) = oneshot::channel();
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| ApiError::internal("question registry lock is poisoned"))?;
+
+        if pending
+            .insert(question_id.clone(), PendingQuestion { request, answer_tx })
+            .is_some()
+        {
+            return Err(ApiError::internal(format!(
+                "duplicate pending question id: {question_id}"
+            )));
+        }
+
+        Ok(QuestionRegistration {
+            answer_rx,
+            _cleanup: QuestionCleanup {
+                registry: self.clone(),
+                question_id,
+            },
+        })
+    }
+
+    fn answer(&self, question_id: &str, answer: QuestionAnswer) -> Result<(), ApiError> {
+        let question_id = question_id.trim();
+
+        if question_id.is_empty() {
+            return Err(ApiError::bad_request("question id must not be empty"));
+        }
+
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| ApiError::internal("question registry lock is poisoned"))?;
+        let pending_question = pending.get(question_id).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "question is not waiting for an answer: {question_id}"
+            ))
+        })?;
+        validate_question_answer(&pending_question.request, &answer)?;
+        let pending_question = pending
+            .remove(question_id)
+            .expect("pending question should still exist after validation");
+
+        pending_question.answer_tx.send(answer).map_err(|_| {
+            ApiError::bad_request(format!(
+                "question is no longer waiting for an answer: {question_id}"
+            ))
+        })
+    }
+
+    fn remove(&self, question_id: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(question_id);
+        }
+    }
+}
+
+impl Drop for QuestionCleanup {
+    fn drop(&mut self) {
+        self.registry.remove(&self.question_id);
+    }
+}
+
+fn validate_question_answer(
+    request: &QuestionRequest,
+    answer: &QuestionAnswer,
+) -> Result<(), ApiError> {
+    if answer.answers.len() != request.questions.len() {
+        return Err(ApiError::bad_request(format!(
+            "question '{}' requires answers for all {} questions",
+            request.id,
+            request.questions.len()
+        )));
+    }
+
+    let mut answered_question_ids = HashSet::new();
+
+    for answer in &answer.answers {
+        let question_id = answer.id.trim();
+
+        if question_id.is_empty() {
+            return Err(ApiError::bad_request(
+                "answer question id must not be empty",
+            ));
+        }
+
+        if !answered_question_ids.insert(question_id) {
+            return Err(ApiError::bad_request(format!(
+                "duplicate answer for question item: {question_id}"
+            )));
+        }
+
+        let question = request
+            .questions
+            .iter()
+            .find(|question| question.id == question_id)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "answer references unknown question item: {question_id}"
+                ))
+            })?;
+
+        validate_question_item_answer(question, answer)?;
+    }
+
+    for question in &request.questions {
+        if !answered_question_ids.contains(question.id.as_str()) {
+            return Err(ApiError::bad_request(format!(
+                "missing answer for question item: {}",
+                question.id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_question_item_answer(
+    question: &QuestionItem,
+    answer: &QuestionItemAnswer,
+) -> Result<(), ApiError> {
+    let answer_text = answer.answer.trim();
+    let selected_option_value = answer
+        .selected_option_value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if let Some(selected_option_value) = selected_option_value {
+        let selected_option = question
+            .options
+            .iter()
+            .find(|option| option.value == selected_option_value)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "selected option was not found for question item '{}': {selected_option_value}",
+                    question.id
+                ))
+            })?;
+
+        if answer_text != selected_option.value {
+            return Err(ApiError::bad_request(
+                "answer must match selectedOptionValue when an option is selected",
+            ));
+        }
+
+        return Ok(());
+    }
+
+    if !question.allow_free_text {
+        return Err(ApiError::bad_request(format!(
+            "question item '{}' requires selecting one of the provided options",
+            question.id
+        )));
+    }
+
+    if answer_text.is_empty() {
+        return Err(ApiError::bad_request("answer must not be empty"));
+    }
+
+    Ok(())
 }
 
 #[tokio::main]
@@ -177,6 +429,7 @@ async fn run_server_until_shutdown(shutdown_rx: Option<watch::Receiver<bool>>) -
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
         app_shutdown_rx: app_shutdown_rx.clone(),
         mcp_registry: mcp_registry.clone(),
+        question_registry: QuestionRegistry::default(),
         _code_graph_watchers: Arc::new(code_graph_watchers),
     };
     let app = app_router(state);
@@ -220,6 +473,10 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/chat/stream",
             post(stream_chat_response),
+        )
+        .route(
+            "/api/chat/questions/{question_id}/answer",
+            post(answer_question),
         )
         .route(
             "/api/workspaces/{workspace_id}/ai-statistics/{request_id}",
@@ -1090,6 +1347,21 @@ async fn stream_chat_response(
             .interval(Duration::from_secs(10))
             .text("keep-alive"),
     ))
+}
+
+async fn answer_question(
+    State(state): State<AppState>,
+    AxumPath(question_id): AxumPath<String>,
+    Json(answer): Json<QuestionAnswer>,
+) -> Result<Json<QuestionAnswerResponse>, ApiError> {
+    let question_id = question_id.trim().to_string();
+
+    state.question_registry.answer(&question_id, answer)?;
+
+    Ok(Json(QuestionAnswerResponse {
+        ok: true,
+        question_id,
+    }))
 }
 
 async fn ai_statistics(
@@ -1972,6 +2244,10 @@ enum ChatSseEvent {
         output: Value,
         is_error: bool,
     },
+    QuestionRequest {
+        assistant_message_id: String,
+        request: QuestionRequest,
+    },
     GitDiffRefresh {
         workspace_id: String,
     },
@@ -2009,6 +2285,7 @@ struct PreparedChatContext {
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
     mcp_registry: Arc<McpRegistry>,
+    question_registry: QuestionRegistry,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
     request_body_json: String,
@@ -2495,28 +2772,57 @@ impl PreparedChatContext {
                                 yield Ok(sse_event(&event));
                             }
 
-                            let next_tool_results = match tokio::select! {
-                                changed = app_shutdown_rx.changed() => {
-                                    if changed.is_err() || *app_shutdown_rx.borrow() {
-                                        let event = finish_cancelled_chat_run(
-                                            &self,
-                                            &request_started_at,
-                                            started_at,
-                                            &mut events,
-                                            &executed_tool_calls,
-                                        );
-                                        yield Ok(sse_event(&event));
-                                        return;
-                                    }
-                                    continue;
-                                }
-                                tool_results = execute_tool_calls_parallel(
+                            let next_tool_results = match {
+                                let (question_event_tx, mut question_event_rx) = mpsc::unbounded_channel();
+                                let tool_results = execute_tool_calls_parallel(
                                     self.mcp_registry.clone(),
+                                    self.question_registry.clone(),
+                                    question_event_tx,
                                     &self.workspace_id,
                                     &self.workspace_path,
                                     &self.chat_id,
                                     tool_calls.clone(),
-                                ) => tool_results,
+                                );
+                                tokio::pin!(tool_results);
+                                let mut question_events_open = true;
+
+                                loop {
+                                    let next = tokio::select! {
+                                        changed = app_shutdown_rx.changed() => {
+                                            if changed.is_err() || *app_shutdown_rx.borrow() {
+                                                let event = finish_cancelled_chat_run(
+                                                    &self,
+                                                    &request_started_at,
+                                                    started_at,
+                                                    &mut events,
+                                                    &executed_tool_calls,
+                                                );
+                                                yield Ok(sse_event(&event));
+                                                return;
+                                            }
+                                            None
+                                        }
+                                        question_request = question_event_rx.recv(), if question_events_open => {
+                                            match question_request {
+                                                Some(question_request) => Some(question_request),
+                                                None => {
+                                                    question_events_open = false;
+                                                    None
+                                                }
+                                            }
+                                        }
+                                        tool_results = &mut tool_results => break tool_results,
+                                    };
+
+                                    if let Some(question_request) = next {
+                                        let event = ChatSseEvent::QuestionRequest {
+                                            assistant_message_id: self.assistant_message_id.clone(),
+                                            request: question_request,
+                                        };
+                                        events.push(captured_event(&event));
+                                        yield Ok(sse_event(&event));
+                                    }
+                                }
                             } {
                                 Ok(tool_results) => tool_results,
                                 Err(error) => {
@@ -2890,6 +3196,7 @@ async fn prepare_chat_context(
         provider_config,
         provider_request,
         mcp_registry: state.mcp_registry.clone(),
+        question_registry: state.question_registry.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget,
         request_body_json,
@@ -3891,17 +4198,24 @@ fn pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingToolCall> {
 
 async fn execute_tool_calls_parallel(
     mcp_registry: Arc<McpRegistry>,
+    question_registry: QuestionRegistry,
+    question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
     tool_calls: Vec<NeutralToolCall>,
 ) -> Result<Vec<ExecutedToolCall>, ApiError> {
-    if tool_calls.iter().any(tool_call_writes_task_graph) {
+    if tool_calls
+        .iter()
+        .any(tool_call_requires_sequential_execution)
+    {
         let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
         for tool_call in tool_calls {
             executed_tool_calls.push(
                 execute_tool_call(
                     mcp_registry.clone(),
+                    question_registry.clone(),
+                    question_event_tx.clone(),
                     workspace_id,
                     workspace_path,
                     chat_id,
@@ -3918,10 +4232,14 @@ async fn execute_tool_calls_parallel(
         let workspace_id = workspace_id.to_string();
         let chat_id = chat_id.to_string();
         let mcp_registry = mcp_registry.clone();
+        let question_registry = question_registry.clone();
+        let question_event_tx = question_event_tx.clone();
 
         tokio::spawn(async move {
             execute_tool_call(
                 mcp_registry,
+                question_registry,
+                question_event_tx,
                 &workspace_id,
                 &workspace_path,
                 &chat_id,
@@ -3944,6 +4262,8 @@ async fn execute_tool_calls_parallel(
 
 async fn execute_tool_call(
     mcp_registry: Arc<McpRegistry>,
+    question_registry: QuestionRegistry,
+    question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -3952,9 +4272,12 @@ async fn execute_tool_call(
     let started_at_text = utc_timestamp();
     let tool_execution = execute_tool(
         mcp_registry,
+        question_registry,
+        question_event_tx,
         workspace_id,
         workspace_path,
         chat_id,
+        &tool_call.call_id,
         &tool_call.name,
         tool_call.arguments.clone(),
     )
@@ -3971,12 +4294,27 @@ async fn execute_tool_call(
 
 async fn execute_tool(
     mcp_registry: Arc<McpRegistry>,
+    question_registry: QuestionRegistry,
+    question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
+    tool_call_id: &str,
     tool_name: &str,
     arguments: Value,
 ) -> ToolExecution {
+    if tool_name == ASK_QUESTION_TOOL {
+        return execute_ask_question(
+            question_registry,
+            question_event_tx,
+            workspace_id,
+            chat_id,
+            tool_call_id,
+            arguments,
+        )
+        .await;
+    }
+
     if is_mcp_tool_name(tool_name) {
         match mcp_registry
             .execute_tool(workspace_id, tool_name, arguments)
@@ -4041,6 +4379,177 @@ async fn execute_tool(
     }
 }
 
+async fn execute_ask_question(
+    question_registry: QuestionRegistry,
+    question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
+    workspace_id: &str,
+    chat_id: &str,
+    tool_call_id: &str,
+    arguments: Value,
+) -> ToolExecution {
+    let input = match serde_json::from_value::<AskQuestionInput>(arguments) {
+        Ok(input) => input,
+        Err(source) => {
+            return ToolExecution {
+                output: json!({
+                    "error": format!("ask_question arguments do not match schema: {source}")
+                }),
+                is_error: true,
+            };
+        }
+    };
+    let request = match question_request_from_input(workspace_id, chat_id, tool_call_id, input) {
+        Ok(request) => request,
+        Err(error) => {
+            return ToolExecution {
+                output: json!({ "error": error.message }),
+                is_error: true,
+            };
+        }
+    };
+    let registration = match question_registry.register(request.clone()) {
+        Ok(registration) => registration,
+        Err(error) => {
+            return ToolExecution {
+                output: json!({ "error": error.message }),
+                is_error: true,
+            };
+        }
+    };
+
+    if question_event_tx.send(request.clone()).is_err() {
+        return ToolExecution {
+            output: json!({
+                "error": format!("failed to show question '{}' because the chat stream is closed", request.id)
+            }),
+            is_error: true,
+        };
+    }
+
+    match registration.answer_rx.await {
+        Ok(answer) => {
+            let mut answers_by_id = answer
+                .answers
+                .into_iter()
+                .map(|answer| (answer.id.clone(), answer))
+                .collect::<HashMap<_, _>>();
+            let answers = request
+                .questions
+                .iter()
+                .filter_map(|question| {
+                    answers_by_id.remove(&question.id).map(|answer| {
+                        json!({
+                            "id": question.id,
+                            "question": question.question,
+                            "answer": answer.answer,
+                            "selectedOptionValue": answer.selected_option_value,
+                        })
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            ToolExecution {
+                output: json!({
+                    "questionId": request.id,
+                    "answers": answers,
+                }),
+                is_error: false,
+            }
+        }
+        Err(_) => ToolExecution {
+            output: json!({
+                "error": format!("question '{}' was cancelled before the user answered", request.id)
+            }),
+            is_error: true,
+        },
+    }
+}
+
+fn question_request_from_input(
+    workspace_id: &str,
+    chat_id: &str,
+    tool_call_id: &str,
+    input: AskQuestionInput,
+) -> Result<QuestionRequest, ApiError> {
+    if input.questions.is_empty() {
+        return Err(ApiError::bad_request(
+            "ask_question requires at least one question",
+        ));
+    }
+
+    let request_id = unique_id("question");
+    let mut questions = Vec::with_capacity(input.questions.len());
+
+    for (index, item) in input.questions.into_iter().enumerate() {
+        let item_number = index + 1;
+        let question = non_empty_trimmed(item.question, &format!("question {item_number}"))?;
+        let options = normalize_question_options(item.options.unwrap_or_default())?;
+
+        if !item.allow_free_text && options.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "ask_question item {item_number} requires options when allowFreeText is false"
+            )));
+        }
+
+        questions.push(QuestionItem {
+            id: format!("{request_id}-item-{item_number}"),
+            question,
+            options,
+            allow_free_text: item.allow_free_text,
+        });
+    }
+
+    Ok(QuestionRequest {
+        id: request_id,
+        tool_call_id: tool_call_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        chat_id: chat_id.to_string(),
+        questions,
+    })
+}
+
+fn normalize_question_options(
+    options: Vec<QuestionOption>,
+) -> Result<Vec<QuestionOption>, ApiError> {
+    let mut seen_values = HashSet::new();
+    let mut normalized = Vec::with_capacity(options.len());
+
+    for option in options {
+        let label = non_empty_trimmed(option.label, "option label")?;
+        let value = non_empty_trimmed(option.value, "option value")?;
+        let description = option
+            .description
+            .map(|description| description.trim().to_string())
+            .filter(|description| !description.is_empty());
+
+        if !seen_values.insert(value.clone()) {
+            return Err(ApiError::bad_request(format!(
+                "ask_question option value is duplicated: {value}"
+            )));
+        }
+
+        normalized.push(QuestionOption {
+            label,
+            value,
+            description,
+        });
+    }
+
+    Ok(normalized)
+}
+
+fn non_empty_trimmed(value: String, field_name: &str) -> Result<String, ApiError> {
+    let value = value.trim().to_string();
+
+    if value.is_empty() {
+        Err(ApiError::bad_request(format!(
+            "{field_name} must not be empty"
+        )))
+    } else {
+        Ok(value)
+    }
+}
+
 fn append_tool_state_messages(
     messages: &mut Vec<NeutralChatMessage>,
     message_source_sequences: &mut Vec<Option<i64>>,
@@ -4060,10 +4569,10 @@ fn append_tool_state_messages(
     }
 }
 
-fn tool_call_writes_task_graph(tool_call: &NeutralToolCall) -> bool {
+fn tool_call_requires_sequential_execution(tool_call: &NeutralToolCall) -> bool {
     matches!(
         tool_call.name.as_str(),
-        CREATE_TASK_GRAPH_TOOL | UPDATE_TASK_GRAPH_TOOL
+        ASK_QUESTION_TOOL | CREATE_TASK_GRAPH_TOOL | UPDATE_TASK_GRAPH_TOOL
     )
 }
 
@@ -4202,6 +4711,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::ReasoningDelta { .. } => "reasoning_delta",
         ChatSseEvent::ToolCall { .. } => "tool_call",
         ChatSseEvent::ToolResult { .. } => "tool_result",
+        ChatSseEvent::QuestionRequest { .. } => "question_request",
         ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
         ChatSseEvent::TaskGraphRefresh { .. } => "task_graph_refresh",
         ChatSseEvent::Usage { .. } => "usage",
@@ -6426,6 +6936,7 @@ fn verify_frontend_assets() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use foco_store::config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
     #[test]
     fn parse_skill_markdown_requires_description() {
@@ -6517,6 +7028,96 @@ description: Project memory.
         assert!(messages.is_empty());
 
         fs::remove_dir_all(profile_dir).expect("remove skill test profile");
+    }
+
+    #[test]
+    fn question_registry_rejects_invalid_answer_without_consuming_question() {
+        let registry = QuestionRegistry::default();
+        let registration = registry
+            .register(QuestionRequest {
+                id: "question-1".to_string(),
+                tool_call_id: "tool-call-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                chat_id: "chat-1".to_string(),
+                questions: vec![
+                    QuestionItem {
+                        id: "question-1-item-1".to_string(),
+                        question: "Pick a mode.".to_string(),
+                        options: vec![QuestionOption {
+                            label: "Fast".to_string(),
+                            value: "fast".to_string(),
+                            description: None,
+                        }],
+                        allow_free_text: false,
+                    },
+                    QuestionItem {
+                        id: "question-1-item-2".to_string(),
+                        question: "Name the target.".to_string(),
+                        options: Vec::new(),
+                        allow_free_text: true,
+                    },
+                ],
+            })
+            .expect("question registration");
+
+        let error = registry
+            .answer(
+                "question-1",
+                QuestionAnswer {
+                    answers: vec![QuestionItemAnswer {
+                        id: "question-1-item-1".to_string(),
+                        answer: "manual".to_string(),
+                        selected_option_value: None,
+                    }],
+                },
+            )
+            .expect_err("manual answer should be rejected");
+
+        assert!(error.message.contains("requires answers for all"));
+        assert!(
+            registry
+                .pending
+                .lock()
+                .expect("question registry lock")
+                .contains_key("question-1")
+        );
+
+        registry
+            .answer(
+                "question-1",
+                QuestionAnswer {
+                    answers: vec![
+                        QuestionItemAnswer {
+                            id: "question-1-item-1".to_string(),
+                            answer: "fast".to_string(),
+                            selected_option_value: Some("fast".to_string()),
+                        },
+                        QuestionItemAnswer {
+                            id: "question-1-item-2".to_string(),
+                            answer: "prod".to_string(),
+                            selected_option_value: None,
+                        },
+                    ],
+                },
+            )
+            .expect("valid selected option answer");
+
+        let received_answer = registration
+            .answer_rx
+            .blocking_recv()
+            .expect("question answer");
+        assert_eq!(
+            received_answer.answers[0].selected_option_value.as_deref(),
+            Some("fast")
+        );
+        assert_eq!(received_answer.answers[1].answer, "prod");
+        assert!(
+            !registry
+                .pending
+                .lock()
+                .expect("question registry lock")
+                .contains_key("question-1")
+        );
     }
 
     #[test]
@@ -6801,6 +7402,7 @@ description: Project memory.
                 max_output_tokens: Some(16),
             },
             mcp_registry: Arc::new(McpRegistry::default()),
+            question_registry: QuestionRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
                 context_window: 1_000,
@@ -7492,6 +8094,7 @@ description: Project memory.
             terminal_shutdown_tx,
             app_shutdown_rx,
             mcp_registry,
+            question_registry: QuestionRegistry::default(),
             _code_graph_watchers: Arc::new(Vec::new()),
         }
     }
