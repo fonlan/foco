@@ -1725,7 +1725,7 @@ export function App() {
             tabIndex={0}
           />
           <div className="flex h-full min-h-0 flex-col">
-            <div className="flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-3">
+            <div className="flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
               <div className="flex min-w-0 items-center gap-3">
                 <span className="inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_10px_24px_rgba(15,118,110,0.24)]">
                   <Activity aria-hidden="true" className="size-5" />
@@ -1734,26 +1734,21 @@ export function App() {
                   <span className="block truncate text-lg font-semibold">
                     Foco
                   </span>
-                  <span className="block truncate text-xs text-stone-500">
+                  <span className="mt-1 block truncate text-xs text-stone-500">
                     {t("Local workspace")}
                   </span>
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
-                <div className="flex rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
-                  <NavButton
-                    active={false}
-                    icon={Settings}
-                    label={t("Settings")}
-                    onClick={() => setViewMode("settings")}
-                  />
-                  <NavButton
-                    active={false}
-                    icon={BarChart3}
-                    label={t("Stats")}
-                    onClick={() => setViewMode("stats")}
-                  />
-                </div>
+                <button
+                  aria-label={t("Create or add workspace")}
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  onClick={() => openWorkspaceDialog("create")}
+                  title={t("Create or add workspace")}
+                  type="button"
+                >
+                  <FolderPlus aria-hidden="true" className="size-4" />
+                </button>
                 <button
                   aria-label={t("Refresh workspaces")}
                   className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
@@ -1772,18 +1767,6 @@ export function App() {
                   )}
                 </button>
               </div>
-            </div>
-
-            <div className="border-b border-stone-200/80 px-4 py-2">
-              <button
-                aria-label={t("Create or add workspace")}
-                className={`${workspaceActionClass()} w-full`}
-                onClick={() => openWorkspaceDialog("create")}
-                title={t("Create or add workspace")}
-                type="button"
-              >
-                <FolderPlus aria-hidden="true" className="size-4" />
-              </button>
             </div>
 
             {error ? (
@@ -1944,6 +1927,26 @@ export function App() {
                 </div>
               )}
             </nav>
+            <footer className="flex shrink-0 justify-center gap-1.5 border-t border-stone-200/80 px-4 py-1.5">
+              <button
+                aria-label={t("Settings")}
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                onClick={() => setViewMode("settings")}
+                title={t("Settings")}
+                type="button"
+              >
+                <Settings aria-hidden="true" className="size-4" />
+              </button>
+              <button
+                aria-label={t("Stats")}
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                onClick={() => setViewMode("stats")}
+                title={t("Stats")}
+                type="button"
+              >
+                <BarChart3 aria-hidden="true" className="size-4" />
+              </button>
+            </footer>
           </div>
         </aside>
 
@@ -6406,10 +6409,6 @@ function workspaceModeClass(active: boolean) {
       ? "border-teal-200 bg-teal-50 text-teal-900 shadow-sm"
       : "border-stone-200 bg-white/80 text-stone-600 hover:border-stone-300 hover:bg-white hover:text-stone-950"
   }`;
-}
-
-function workspaceActionClass() {
-  return "inline-flex h-10 items-center justify-center rounded-lg border border-stone-200 bg-white/85 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800";
 }
 
 function workspaceItemClass(active: boolean) {
