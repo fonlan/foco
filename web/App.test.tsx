@@ -135,8 +135,8 @@ const aiStatistics = {
       workspaceName: "Default Workspace",
     },
   ],
-  totalCount: 1,
-  totalPages: 1,
+  totalCount: 125,
+  totalPages: 3,
 };
 
 const aiStatisticsDetail = {
@@ -474,8 +474,16 @@ describe("App verification surfaces", () => {
 
     expect(await screen.findByText("API statistics")).toBeInTheDocument();
     expect(screen.getByText("Request audit")).toBeInTheDocument();
-    expect(screen.getByText("openai")).toBeInTheDocument();
-    expect(screen.getByText("gpt-test")).toBeInTheDocument();
+    const table = screen.getByRole("table");
+    expect(within(table).getByText("openai")).toBeInTheDocument();
+    expect(within(table).getByText("gpt-test")).toBeInTheDocument();
+    expect(screen.getByRole("navigation", { name: "Request audit pagination" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Go to page 2" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Page size")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByText("Columns"));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Provider" }));
+    expect(within(table).queryByText("openai")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "View request details" }));
 

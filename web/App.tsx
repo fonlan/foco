@@ -49,6 +49,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -321,6 +322,14 @@ type AiStatsFilterState = {
   pageSize: string;
 };
 
+type AiStatsColumn = {
+  cellClassName: string;
+  headerClassName?: string;
+  id: AiStatsColumnId;
+  label: string;
+  render: (request: AiRequestAuditSummary) => ReactNode;
+};
+
 type ChatToolCallSummary = {
   id: string;
   name: string;
@@ -409,8 +418,27 @@ type ViewMode = "chat" | "settings" | "stats";
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
+const AI_STATS_COLUMN_IDS = [
+  "requestTime",
+  "workspace",
+  "chat",
+  "provider",
+  "model",
+  "inputTokens",
+  "outputTokens",
+  "cacheRead",
+  "cacheWrite",
+  "cacheRatio",
+  "latency",
+  "firstToken",
+  "statusCode",
+  "status",
+  "details",
+] as const;
+const DEFAULT_AI_STATS_COLUMN_IDS: AiStatsColumnId[] = [...AI_STATS_COLUMN_IDS];
 
 type Translate = (key: string, values?: Record<string, string | number>) => string;
+type AiStatsColumnId = (typeof AI_STATS_COLUMN_IDS)[number];
 
 const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
   en: {},
@@ -508,6 +536,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Configured models": "已配置模型",
     "Request audit": "请求审计",
     "Refresh request audit": "刷新请求审计",
+    Columns: "列",
     "Recorded requests": "已记录请求",
     "Input tokens": "输入 token",
     "Output tokens": "输出 token",
@@ -523,6 +552,8 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Page {page} of {totalPages}": "第 {page} 页，共 {totalPages} 页",
     "Previous page": "上一页",
     "Next page": "下一页",
+    "Go to page {page}": "前往第 {page} 页",
+    "Request audit pagination": "请求审计分页",
     "Started after": "开始时间不早于",
     "Started before": "开始时间不晚于",
     "Request time": "请求时间",
@@ -3232,12 +3263,16 @@ function ApiStatsPanel({
   const [detailError, setDetailError] = useState<string | null>(null);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [visibleColumnIds, setVisibleColumnIds] = useState<
+    Set<AiStatsColumnId>
+  >(() => new Set(DEFAULT_AI_STATS_COLUMN_IDS));
   const requests = stats?.requests ?? [];
   const totalCount = stats?.totalCount ?? requests.length;
   const currentPage = stats?.page ?? positiveIntegerText(filters.page, 1);
   const pageSize = stats?.pageSize ?? positiveIntegerText(filters.pageSize, 50);
   const totalPages =
     stats?.totalPages ?? (totalCount ? Math.ceil(totalCount / pageSize) : 0);
+  const paginationItems = auditPaginationItems(currentPage, totalPages);
   const pageStart = requests.length ? (currentPage - 1) * pageSize + 1 : 0;
   const pageEnd = requests.length
     ? Math.min(totalCount, pageStart + requests.length - 1)
@@ -3296,6 +3331,131 @@ function ApiStatsPanel({
           latencyValues.length,
       )
     : null;
+  const aiStatsColumns: AiStatsColumn[] = [
+    {
+      cellClassName: "px-4 py-3 font-medium text-stone-900",
+      id: "requestTime",
+      label: t("Request time"),
+      render: (request) =>
+        formatAuditDate(request.requestStartedAt, language),
+    },
+    {
+      cellClassName: "max-w-[10rem] truncate px-4 py-3 text-stone-700",
+      id: "workspace",
+      label: t("Workspace"),
+      render: (request) => request.workspaceName,
+    },
+    {
+      cellClassName: "max-w-[12rem] truncate px-4 py-3 text-stone-600",
+      id: "chat",
+      label: t("Chat"),
+      render: (request) => request.chatTitle ?? request.chatId ?? "n/a",
+    },
+    {
+      cellClassName:
+        "max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-stone-700",
+      id: "provider",
+      label: t("Provider"),
+      render: (request) => request.providerId,
+    },
+    {
+      cellClassName:
+        "max-w-[14rem] truncate px-4 py-3 font-mono text-xs text-stone-700",
+      id: "model",
+      label: t("Model"),
+      render: (request) => request.modelId,
+    },
+    {
+      cellClassName: "px-4 py-3 text-right font-mono",
+      headerClassName: "text-right",
+      id: "inputTokens",
+      label: t("Input tokens"),
+      render: (request) => formatNullableNumber(request.inputTokens, language),
+    },
+    {
+      cellClassName: "px-4 py-3 text-right font-mono",
+      headerClassName: "text-right",
+      id: "outputTokens",
+      label: t("Output tokens"),
+      render: (request) => formatNullableNumber(request.outputTokens, language),
+    },
+    {
+      cellClassName: "px-4 py-3 text-right font-mono",
+      headerClassName: "text-right",
+      id: "cacheRead",
+      label: t("Cache read"),
+      render: (request) =>
+        formatNullableNumber(request.cacheReadTokens, language),
+    },
+    {
+      cellClassName: "px-4 py-3 text-right font-mono",
+      headerClassName: "text-right",
+      id: "cacheWrite",
+      label: t("Cache write"),
+      render: (request) =>
+        formatNullableNumber(request.cacheWriteTokens, language),
+    },
+    {
+      cellClassName: "px-4 py-3 text-right font-mono",
+      headerClassName: "text-right",
+      id: "cacheRatio",
+      label: t("Cache ratio"),
+      render: (request) => formatPercent(request.cacheRatio, language),
+    },
+    {
+      cellClassName: "px-4 py-3 text-right font-mono",
+      headerClassName: "text-right",
+      id: "latency",
+      label: t("Latency"),
+      render: (request) =>
+        formatNullableLatency(request.totalLatencyMs, language),
+    },
+    {
+      cellClassName: "px-4 py-3 text-right font-mono",
+      headerClassName: "text-right",
+      id: "firstToken",
+      label: t("First token"),
+      render: (request) =>
+        formatNullableLatency(request.firstTokenLatencyMs, language),
+    },
+    {
+      cellClassName: "px-4 py-3 text-right font-mono",
+      headerClassName: "text-right",
+      id: "statusCode",
+      label: t("Status code"),
+      render: (request) => formatNullableNumber(request.statusCode, language),
+    },
+    {
+      cellClassName: "px-4 py-3",
+      id: "status",
+      label: t("Status"),
+      render: (request) => (
+        <span className={auditStatusClass(request.finalState)}>
+          {auditStatusText(request.finalState, t)}
+        </span>
+      ),
+    },
+    {
+      cellClassName: "px-4 py-3 text-right",
+      headerClassName: "text-right",
+      id: "details",
+      label: t("Details"),
+      render: (request) => (
+        <button
+          aria-label={t("View request details")}
+          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+          onClick={() => void openRequestDetail(request)}
+          title={t("View request details")}
+          type="button"
+        >
+          <Eye aria-hidden="true" className="size-4" />
+        </button>
+      ),
+    },
+  ];
+  const visibleColumns = aiStatsColumns.filter((column) =>
+    visibleColumnIds.has(column.id),
+  );
 
   function updateAuditFilters(update: Partial<AiStatsFilterState>) {
     setFilters((current) => ({
@@ -3306,10 +3466,28 @@ function ApiStatsPanel({
   }
 
   function goToAuditPage(page: number) {
+    const maxPage = Math.max(1, totalPages);
     setFilters((current) => ({
       ...current,
-      page: String(Math.max(1, page)),
+      page: String(Math.min(maxPage, Math.max(1, page))),
     }));
+  }
+
+  function toggleAiStatsColumn(columnId: AiStatsColumnId) {
+    setVisibleColumnIds((current) => {
+      if (current.has(columnId) && current.size === 1) {
+        return current;
+      }
+
+      const next = new Set(current);
+      if (next.has(columnId)) {
+        next.delete(columnId);
+      } else {
+        next.add(columnId);
+      }
+
+      return next;
+    });
   }
 
   const loadStats = useCallback(async () => {
@@ -3368,7 +3546,7 @@ function ApiStatsPanel({
 
   return (
     <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
-      <div className="mx-auto flex max-w-7xl flex-col gap-5">
+      <div className="flex w-full min-w-0 flex-col gap-5">
         <section className="rounded-2xl border border-stone-200 bg-white/80 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-3">
@@ -3438,11 +3616,39 @@ function ApiStatsPanel({
                 })}
               </p>
             </div>
-            <div className="text-xs text-stone-500">
-              {t("Output tokens")}: {formatNumber(totalOutputTokens, language)}
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="text-xs text-stone-500">
+                {t("Output tokens")}: {formatNumber(totalOutputTokens, language)}
+              </div>
+              <details className="relative">
+                <summary className="inline-flex h-9 cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 [&::-webkit-details-marker]:hidden">
+                  <SlidersHorizontal aria-hidden="true" className="size-4" />
+                  {t("Columns")}
+                </summary>
+                <div className="absolute right-0 z-20 mt-2 w-56 rounded-xl border border-stone-200 bg-white p-2 shadow-[0_18px_42px_rgba(75,63,42,0.16)]">
+                  {aiStatsColumns.map((column) => (
+                    <label
+                      className="flex min-h-9 cursor-pointer items-center gap-2 rounded-lg px-2 text-sm font-medium text-stone-700 hover:bg-stone-50"
+                      key={column.id}
+                    >
+                      <input
+                        checked={visibleColumnIds.has(column.id)}
+                        className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-200"
+                        disabled={
+                          visibleColumnIds.has(column.id) &&
+                          visibleColumnIds.size === 1
+                        }
+                        onChange={() => toggleAiStatsColumn(column.id)}
+                        type="checkbox"
+                      />
+                      <span className="min-w-0 truncate">{column.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </details>
             </div>
           </div>
-          <div className="grid gap-3 border-b border-stone-200 bg-stone-50/70 px-4 py-4 md:grid-cols-2 xl:grid-cols-8">
+          <div className="grid gap-3 border-b border-stone-200 bg-stone-50/70 px-4 py-4 md:grid-cols-2 xl:grid-cols-7">
             <FilterSelect
               label={t("Workspace")}
               onChange={(value) =>
@@ -3516,21 +3722,6 @@ function ApiStatsPanel({
                 value={filters.startedBefore}
               />
             </label>
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                {t("Page size")}
-              </span>
-              <input
-                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                max={500}
-                min={1}
-                onChange={(event) =>
-                  updateAuditFilters({ pageSize: event.target.value })
-                }
-                type="number"
-                value={filters.pageSize}
-              />
-            </label>
           </div>
           {error ? (
             <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
@@ -3538,95 +3729,40 @@ function ApiStatsPanel({
             </div>
           ) : null}
           <div className="overflow-x-auto">
-            <table className="min-w-[78rem] w-full text-left text-sm">
+            <table className="w-full min-w-max text-left text-sm">
               <thead className="border-b border-stone-200 bg-white text-xs font-semibold text-stone-500">
                 <tr>
-                  <th className="px-4 py-3">{t("Request time")}</th>
-                  <th className="px-4 py-3">{t("Workspace")}</th>
-                  <th className="px-4 py-3">{t("Chat")}</th>
-                  <th className="px-4 py-3">{t("Provider")}</th>
-                  <th className="px-4 py-3">{t("Model")}</th>
-                  <th className="px-4 py-3 text-right">{t("Input tokens")}</th>
-                  <th className="px-4 py-3 text-right">{t("Output tokens")}</th>
-                  <th className="px-4 py-3 text-right">{t("Cache read")}</th>
-                  <th className="px-4 py-3 text-right">{t("Cache write")}</th>
-                  <th className="px-4 py-3 text-right">{t("Cache ratio")}</th>
-                  <th className="px-4 py-3 text-right">{t("Latency")}</th>
-                  <th className="px-4 py-3 text-right">{t("First token")}</th>
-                  <th className="px-4 py-3 text-right">{t("Status code")}</th>
-                  <th className="px-4 py-3">{t("Status")}</th>
-                  <th className="px-4 py-3 text-right">{t("Details")}</th>
+                  {visibleColumns.map((column) => (
+                    <th
+                      className={`whitespace-nowrap px-4 py-3 ${
+                        column.headerClassName ?? ""
+                      }`}
+                      key={column.id}
+                    >
+                      {column.label}
+                    </th>
+                  ))}
                 </tr>
               </thead>
               <tbody className="divide-y divide-stone-100">
                 {requests.length ? (
                   requests.map((request) => (
                     <tr key={request.id} className="align-top hover:bg-teal-50/40">
-                      <td className="px-4 py-3 font-medium text-stone-900">
-                        {formatAuditDate(request.requestStartedAt, language)}
-                      </td>
-                      <td className="max-w-[10rem] truncate px-4 py-3 text-stone-700">
-                        {request.workspaceName}
-                      </td>
-                      <td className="max-w-[12rem] truncate px-4 py-3 text-stone-600">
-                        {request.chatTitle ?? request.chatId ?? "n/a"}
-                      </td>
-                      <td className="max-w-[12rem] truncate px-4 py-3 font-mono text-xs text-stone-700">
-                        {request.providerId}
-                      </td>
-                      <td className="max-w-[14rem] truncate px-4 py-3 font-mono text-xs text-stone-700">
-                        {request.modelId}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {formatNullableNumber(request.inputTokens, language)}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {formatNullableNumber(request.outputTokens, language)}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {formatNullableNumber(request.cacheReadTokens, language)}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {formatNullableNumber(request.cacheWriteTokens, language)}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {formatPercent(request.cacheRatio, language)}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {formatNullableLatency(request.totalLatencyMs, language)}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {formatNullableLatency(
-                          request.firstTokenLatencyMs,
-                          language,
-                        )}
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono">
-                        {formatNullableNumber(request.statusCode, language)}
-                      </td>
-                      <td className="px-4 py-3">
-                        <span className={auditStatusClass(request.finalState)}>
-                          {auditStatusText(request.finalState, t)}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 text-right">
-                        <button
-                          aria-label={t("View request details")}
-                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                          onClick={() => void openRequestDetail(request)}
-                          title={t("View request details")}
-                          type="button"
+                      {visibleColumns.map((column) => (
+                        <td
+                          className={`whitespace-nowrap ${column.cellClassName}`}
+                          key={column.id}
                         >
-                          <Eye aria-hidden="true" className="size-4" />
-                        </button>
-                      </td>
+                          {column.render(request)}
+                        </td>
+                      ))}
                     </tr>
                   ))
                 ) : (
                   <tr>
                     <td
                       className="px-4 py-10 text-center text-sm text-stone-500"
-                      colSpan={15}
+                      colSpan={visibleColumns.length}
                     >
                       {isLoading ? t("Loading...") : t("No recorded requests")}
                     </td>
@@ -3643,13 +3779,24 @@ function ApiStatsPanel({
                 total: formatNumber(totalCount, language),
               })}
             </div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-semibold text-stone-500">
-                {t("Page {page} of {totalPages}", {
-                  page: formatNumber(currentPage, language),
-                  totalPages: formatNumber(totalPages, language),
-                })}
-              </span>
+            <div className="flex flex-wrap items-center justify-end gap-3">
+              <label className="flex items-center gap-2 text-xs font-semibold text-stone-500">
+                <span>{t("Page size")}</span>
+                <input
+                  className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  max={500}
+                  min={1}
+                  onChange={(event) =>
+                    updateAuditFilters({ pageSize: event.target.value })
+                  }
+                  type="number"
+                  value={filters.pageSize}
+                />
+              </label>
+              <nav
+                aria-label={t("Request audit pagination")}
+                className="flex items-center gap-1"
+              >
               <button
                 aria-label={t("Previous page")}
                 className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
@@ -3660,6 +3807,38 @@ function ApiStatsPanel({
               >
                 <ChevronLeft aria-hidden="true" className="size-4" />
               </button>
+              {paginationItems.map((item, index) =>
+                item === "ellipsis" ? (
+                  <span
+                    aria-hidden="true"
+                    className="inline-flex size-9 items-center justify-center text-stone-400"
+                    key={`ellipsis-${index}`}
+                  >
+                    ...
+                  </span>
+                ) : (
+                  <button
+                    aria-current={item === currentPage ? "page" : undefined}
+                    aria-label={t("Go to page {page}", {
+                      page: formatNumber(item, language),
+                    })}
+                    className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${
+                      item === currentPage
+                        ? "border-teal-700 bg-teal-700 text-white"
+                        : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                    }`}
+                    disabled={isLoading}
+                    key={item}
+                    onClick={() => goToAuditPage(item)}
+                    title={t("Go to page {page}", {
+                      page: formatNumber(item, language),
+                    })}
+                    type="button"
+                  >
+                    {formatNumber(item, language)}
+                  </button>
+                ),
+              )}
               <button
                 aria-label={t("Next page")}
                 className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
@@ -3672,6 +3851,7 @@ function ApiStatsPanel({
               >
                 <ChevronRight aria-hidden="true" className="size-4" />
               </button>
+              </nav>
             </div>
           </div>
         </section>
@@ -6983,6 +7163,37 @@ function positiveIntegerText(value: string, fallback: number) {
   const parsed = Number(value);
 
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function auditPaginationItems(
+  currentPage: number,
+  totalPages: number,
+): Array<number | "ellipsis"> {
+  if (totalPages <= 0) {
+    return [];
+  }
+
+  const pages = new Set<number>([1, totalPages]);
+  for (
+    let page = Math.max(1, currentPage - 2);
+    page <= Math.min(totalPages, currentPage + 2);
+    page += 1
+  ) {
+    pages.add(page);
+  }
+
+  const sortedPages = Array.from(pages).sort((left, right) => left - right);
+  const items: Array<number | "ellipsis"> = [];
+
+  for (const page of sortedPages) {
+    const previous = items[items.length - 1];
+    if (typeof previous === "number" && page - previous > 1) {
+      items.push("ellipsis");
+    }
+    items.push(page);
+  }
+
+  return items;
 }
 
 function datetimeLocalToRfc3339(value: string) {
