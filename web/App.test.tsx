@@ -452,6 +452,41 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("First token latency: 250 ms")).toBeInTheDocument();
   });
 
+  it("closes composer menus when clicking outside", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<App />);
+
+    const modelSummary = await screen.findByLabelText("Model");
+    const thinkingSummary = await screen.findByLabelText("Thinking");
+    const branchDetails = await waitFor(() => {
+      const element = container.querySelector<HTMLDetailsElement>(
+        ".composer-branch-select",
+      );
+      if (!element) {
+        throw new Error("branch selector details was not rendered");
+      }
+      expect(element.tagName).toBe("DETAILS");
+      return element;
+    });
+    const branchSummary = branchDetails.querySelector("summary");
+    expect(branchSummary).not.toBeNull();
+
+    await user.click(modelSummary);
+    expect(modelSummary.closest("details")).toHaveAttribute("open");
+    await user.click(document.body);
+    expect(modelSummary.closest("details")).not.toHaveAttribute("open");
+
+    await user.click(thinkingSummary);
+    expect(thinkingSummary.closest("details")).toHaveAttribute("open");
+    await user.click(document.body);
+    expect(thinkingSummary.closest("details")).not.toHaveAttribute("open");
+
+    await user.click(branchSummary as HTMLElement);
+    expect(branchDetails).toHaveAttribute("open");
+    await user.click(document.body);
+    expect(branchDetails).not.toHaveAttribute("open");
+  });
+
   it("expands a collapsed workspace after starting a workspace chat", async () => {
     render(<App />);
 

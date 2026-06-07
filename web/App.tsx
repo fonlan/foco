@@ -3852,6 +3852,7 @@ function ComposerSelectMenu({
   const selectedOption =
     options.find((option) => option.value === selectedValue) ?? null;
   const selectedLabel = selectedOption?.label ?? emptyLabel;
+  const detailsRef = useCloseDetailsOnOutsidePointerDown();
 
   function handleSelect(value: string, event: ReactMouseEvent<HTMLButtonElement>) {
     event.currentTarget.closest("details")?.removeAttribute("open");
@@ -3859,7 +3860,10 @@ function ComposerSelectMenu({
   }
 
   return (
-    <details className={`composer-select-menu group relative ${className}`}>
+    <details
+      className={`composer-select-menu group relative ${className}`}
+      ref={detailsRef}
+    >
       <summary
         aria-disabled={disabled}
         aria-label={ariaLabel}
@@ -3919,6 +3923,7 @@ function BranchSelector({
   onChange: (value: string) => void;
 }) {
   const { t } = useI18n();
+  const detailsRef = useCloseDetailsOnOutsidePointerDown();
   if (!isGitRepository) {
     return (
       <div
@@ -3937,7 +3942,10 @@ function BranchSelector({
   }
 
   return (
-    <details className="composer-branch-select group relative max-w-full">
+    <details
+      className="composer-branch-select group relative max-w-full"
+      ref={detailsRef}
+    >
       <summary
         className={`composer-select-summary flex h-8 w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${
           disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
@@ -3994,6 +4002,29 @@ function BranchSelector({
       </div>
     </details>
   );
+}
+
+function useCloseDetailsOnOutsidePointerDown() {
+  const detailsRef = useRef<HTMLDetailsElement | null>(null);
+
+  useEffect(() => {
+    function handlePointerDown(event: PointerEvent) {
+      const details = detailsRef.current;
+      if (!details?.open) {
+        return;
+      }
+      const target = event.target;
+      if (!(target instanceof Node) || details.contains(target)) {
+        return;
+      }
+      details.removeAttribute("open");
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, []);
+
+  return detailsRef;
 }
 
 function ReasoningBlock({
