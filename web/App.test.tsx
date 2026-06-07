@@ -21,6 +21,8 @@ const workspace = {
   id: "workspace-1",
   name: "Default",
   path: "C:\\Users\\fonla\\.foco\\workspace",
+  pinned: false,
+  terminalShell: "powershell",
 };
 
 const settings = {
@@ -71,6 +73,12 @@ const settings = {
     { label: "stdio", transport: "stdio" },
     { label: "streamable-http", transport: "streamable-http" },
   ],
+  terminalShells: [
+    { label: "PowerShell", shell: "powershell" },
+    { label: "Command Prompt", shell: "cmd" },
+    { label: "Bash", shell: "bash" },
+    { label: "Zsh", shell: "zsh" },
+  ],
   providerKinds: [
     {
       defaultBaseUrl: "https://api.openai.com/v1",
@@ -116,6 +124,16 @@ const settings = {
   thinkingLevels: [
     { label: "Low", value: "low" },
     { label: "High", value: "high" },
+  ],
+  workspaces: [
+    {
+      id: workspace.id,
+      isDefault: true,
+      name: workspace.name,
+      path: workspace.path,
+      pinned: workspace.pinned,
+      terminalShell: workspace.terminalShell,
+    },
   ],
 };
 
@@ -210,6 +228,17 @@ const savedSettings = {
       ...settings.skills,
       directories: ["C:\\Users\\fonla\\.agents\\skills", ".agents\\skills"],
     },
+  },
+  workspace: {
+    ...settings,
+    workspaces: [
+      {
+        ...settings.workspaces[0],
+        name: "Renamed Workspace",
+        pinned: true,
+        terminalShell: "cmd",
+      },
+    ],
   },
 };
 
@@ -804,6 +833,8 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
           id: "new-workspace",
           name: "New Workspace",
           path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+          pinned: false,
+          terminalShell: "powershell",
         },
       ],
     });
@@ -811,6 +842,10 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
 
   if (path === "/api/settings") {
     return jsonResponse(settings);
+  }
+
+  if (path === "/api/workspaces/manual" || path === "/api/workspaces/order") {
+    return jsonResponse(savedSettings.workspace);
   }
 
   if (path === "/api/model-metadata") {

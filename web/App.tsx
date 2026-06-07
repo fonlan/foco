@@ -18,8 +18,10 @@ import {
   GripVertical,
   KeyRound,
   ListChecks,
+  Lock,
   LoaderCircle,
   MessageSquare,
+  Pencil,
   PlugZap,
   Plus,
   RefreshCw,
@@ -67,6 +69,8 @@ type WorkspaceSummary = {
   id: string;
   name: string;
   path: string;
+  pinned: boolean;
+  terminalShell: string;
   chats: ChatSummary[];
 };
 
@@ -177,8 +181,24 @@ type GeneralSettingsSummary = {
   webServer: WebServerSettingsSummary;
 };
 
+type ConfiguredWorkspaceSummary = {
+  id: string;
+  name: string;
+  path: string;
+  pinned: boolean;
+  terminalShell: string;
+  isDefault: boolean;
+};
+
+type TerminalShellSummary = {
+  shell: string;
+  label: string;
+};
+
 type SettingsResponse = {
   general: GeneralSettingsSummary;
+  workspaces: ConfiguredWorkspaceSummary[];
+  terminalShells: TerminalShellSummary[];
   providerKinds: ProviderKindSummary[];
   thinkingLevels: ThinkingLevelSummary[];
   providers: ConfiguredProviderSummary[];
@@ -202,6 +222,14 @@ type GeneralFormState = {
   language: string;
   listenHost: string;
   listenPort: string;
+};
+
+type WorkspaceFormState = {
+  id: string;
+  name: string;
+  path: string;
+  pinned: boolean;
+  terminalShell: string;
 };
 
 type McpTransportSummary = {
@@ -478,7 +506,13 @@ type ChatStreamEvent =
     }
   | { type: "error"; message: string };
 
-type SettingsSection = "general" | "mcp" | "models" | "providers" | "skills";
+type SettingsSection =
+  | "general"
+  | "mcp"
+  | "models"
+  | "providers"
+  | "skills"
+  | "workspaces";
 type ViewMode = "chat" | "settings" | "stats";
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
@@ -528,6 +562,23 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Loading workspaces...": "正在加载工作区...",
     "No workspaces": "暂无工作区",
     Workspaces: "工作区",
+    "Workspace settings": "工作区设置",
+    "Workspace order and terminal shell": "工作区顺序与终端 Shell",
+    "Workspace configuration": "工作区配置",
+    "Close workspace configuration": "关闭工作区配置",
+    "Edit workspace": "编辑工作区",
+    "Workspace list": "工作区列表",
+    "Terminal shell": "终端 Shell",
+    "Pinned workspace": "置顶工作区",
+    "Save workspace": "保存工作区",
+    "Default workspace": "Default 工作区",
+    pinned: "已置顶",
+    "Pin workspace": "置顶工作区",
+    "Unpin workspace": "取消置顶工作区",
+    "Pin workspace {name}": "置顶工作区 {name}",
+    "Unpin workspace {name}": "取消置顶工作区 {name}",
+    "Edit workspace {name}": "编辑工作区 {name}",
+    "Reorder workspace {name}": "调整工作区顺序 {name}",
     "All workspaces": "全部工作区",
     "All chats": "全部聊天",
     Workspace: "工作区",
@@ -920,6 +971,7 @@ export function App() {
   );
   const [viewMode, setViewMode] = useState<ViewMode>("chat");
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
+  const [workspaceDialogRevision, setWorkspaceDialogRevision] = useState(0);
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
   const [draftMessage, setDraftMessage] = useState("");
@@ -2069,6 +2121,7 @@ export function App() {
     setWorkspaceName("");
     setWorkspacePath("");
     setError(null);
+    setWorkspaceDialogRevision((current) => current + 1);
     setIsWorkspaceDialogOpen(true);
   }
 
@@ -2135,7 +2188,12 @@ export function App() {
             </div>
           </header>
           {viewMode === "settings" ? (
-            <SettingsPanel onSettingsChange={setSettings} />
+            <SettingsPanel
+              onAddWorkspace={openWorkspaceDialog}
+              onSettingsChange={setSettings}
+              onWorkspacesChange={refreshWorkspaces}
+              workspaceDialogRevision={workspaceDialogRevision}
+            />
           ) : (
             <ApiStatsPanel
               settings={settings}
@@ -5601,13 +5659,20 @@ function GitDiffPanel({
 }
 
 function SettingsPanel({
+  onAddWorkspace,
   onSettingsChange,
+  onWorkspacesChange,
+  workspaceDialogRevision,
 }: {
+  onAddWorkspace: () => void;
   onSettingsChange: (settings: SettingsResponse) => void;
+  onWorkspacesChange: () => Promise<void>;
+  workspaceDialogRevision: number;
 }) {
   const { t } = useI18n();
   const [activeSection, setActiveSection] =
     useState<SettingsSection>("general");
+  const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isProviderDialogOpen, setIsProviderDialogOpen] = useState(false);
   const [isModelDialogOpen, setIsModelDialogOpen] = useState(false);
   const [isMcpDialogOpen, setIsMcpDialogOpen] = useState(false);
@@ -5622,6 +5687,9 @@ function SettingsPanel({
   const [generalForm, setGeneralForm] = useState<GeneralFormState>(() =>
     emptyGeneralForm(),
   );
+  const [workspaceForm, setWorkspaceForm] = useState<WorkspaceFormState>(() =>
+    emptyWorkspaceForm(),
+  );
   const [mcpForm, setMcpForm] = useState<McpServerFormState>(() =>
     emptyMcpServerForm(),
   );
@@ -5634,6 +5702,10 @@ function SettingsPanel({
   const [isSaving, setIsSaving] = useState(false);
   const [isSavingGeneral, setIsSavingGeneral] = useState(false);
   const [isSavingLanguage, setIsSavingLanguage] = useState(false);
+  const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
+  const [isSavingWorkspaceOrder, setIsSavingWorkspaceOrder] = useState(false);
+  const [isSelectingWorkspaceFormPath, setIsSelectingWorkspaceFormPath] =
+    useState(false);
   const [isSavingProvider, setIsSavingProvider] = useState(false);
   const [isSavingMcpServer, setIsSavingMcpServer] = useState(false);
   const [isSavingModelOrder, setIsSavingModelOrder] = useState(false);
@@ -5643,6 +5715,12 @@ function SettingsPanel({
   const [modelOrderPreview, setModelOrderPreview] = useState<string[] | null>(
     null,
   );
+  const [draggedWorkspaceId, setDraggedWorkspaceId] = useState<string | null>(
+    null,
+  );
+  const [workspaceOrderPreview, setWorkspaceOrderPreview] = useState<
+    string[] | null
+  >(null);
   const [providerTests, setProviderTests] = useState<
     Record<string, ProviderTestState>
   >({});
@@ -5682,6 +5760,8 @@ function SettingsPanel({
     (!form.contextWindow.trim() || !form.maxOutputTokens.trim());
   const providerKinds = settings?.providerKinds ?? [];
   const providers = settings?.providers ?? [];
+  const workspaces = settings?.workspaces ?? [];
+  const terminalShells = settings?.terminalShells ?? [];
   const mcpTransports = settings?.mcpTransports ?? [];
   const mcpServers = settings?.mcpServers ?? [];
   const skills = settings?.skills;
@@ -5704,8 +5784,29 @@ function SettingsPanel({
       ? previewModels
       : configuredModels;
   }, [configuredModels, modelOrderPreview]);
+  const orderedWorkspaces = useMemo(() => {
+    if (!workspaceOrderPreview) {
+      return workspaces;
+    }
+
+    const workspacesById = new Map(
+      workspaces.map((workspace) => [workspace.id, workspace]),
+    );
+    const previewWorkspaces = workspaceOrderPreview
+      .map((workspaceId) => workspacesById.get(workspaceId))
+      .filter(
+        (workspace): workspace is ConfiguredWorkspaceSummary =>
+          Boolean(workspace),
+      );
+
+    return previewWorkspaces.length === workspaces.length
+      ? previewWorkspaces
+      : workspaces;
+  }, [workspaceOrderPreview, workspaces]);
   const editingModel =
     configuredModels.find((model) => model.id === form.modelId) ?? null;
+  const editingWorkspace =
+    workspaces.find((workspace) => workspace.id === workspaceForm.id) ?? null;
   const selectedProviderKind = providerKinds.find(
     (kind) => kind.kind === providerForm.kind,
   );
@@ -5756,6 +5857,8 @@ function SettingsPanel({
       const data = await requestJson<SettingsResponse>("/api/settings");
       setSettings(data);
       onSettingsChange(data);
+      setDraggedWorkspaceId(null);
+      setWorkspaceOrderPreview(null);
       setDraggedModelId(null);
       setModelOrderPreview(null);
       syncGeneralForm(data);
@@ -5779,6 +5882,12 @@ function SettingsPanel({
     void loadMetadata();
     void loadSettings();
   }, [loadMetadata, loadSettings]);
+
+  useEffect(() => {
+    if (workspaceDialogRevision > 0) {
+      void loadSettings();
+    }
+  }, [loadSettings, workspaceDialogRevision]);
 
   function selectMetadataModel(key: string) {
     setSelectedMetadataKey(key);
@@ -5899,6 +6008,17 @@ function SettingsPanel({
       url: server.url ?? "",
     });
     setIsMcpDialogOpen(true);
+  }
+
+  function editConfiguredWorkspace(workspace: ConfiguredWorkspaceSummary) {
+    setWorkspaceForm({
+      id: workspace.id,
+      name: workspace.name,
+      path: workspace.path,
+      pinned: workspace.pinned,
+      terminalShell: workspace.terminalShell,
+    });
+    setIsWorkspaceDialogOpen(true);
   }
 
   function startAddingMcpServer() {
@@ -6055,6 +6175,206 @@ function SettingsPanel({
     } finally {
       setIsSavingModelOrder(false);
     }
+  }
+
+  async function saveWorkspace(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSavingWorkspace(true);
+    setError(null);
+
+    const shouldSaveOrder = editingWorkspace?.pinned !== workspaceForm.pinned;
+    const workspaceIds = shouldSaveOrder
+      ? groupedWorkspaceIds(
+          orderedWorkspaces.map((workspace) =>
+            workspace.id === workspaceForm.id
+              ? { ...workspace, pinned: workspaceForm.pinned }
+              : workspace,
+          ),
+        )
+      : null;
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/workspaces/manual", {
+        body: JSON.stringify({
+          id: workspaceForm.id,
+          name: workspaceForm.name,
+          path: workspaceForm.path,
+          pinned: workspaceForm.pinned,
+          terminalShell: workspaceForm.terminalShell,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      const finalData = workspaceIds
+        ? await requestJson<SettingsResponse>("/api/workspaces/order", {
+            body: JSON.stringify({ workspaceIds }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          })
+        : data;
+      setSettings(finalData);
+      onSettingsChange(finalData);
+      await onWorkspacesChange();
+      setIsWorkspaceDialogOpen(false);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingWorkspace(false);
+    }
+  }
+
+  async function saveWorkspaceOrder(workspaceIds: string[]) {
+    setIsSavingWorkspaceOrder(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/workspaces/order", {
+        body: JSON.stringify({ workspaceIds }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      await onWorkspacesChange();
+      setDraggedWorkspaceId(null);
+      setWorkspaceOrderPreview(null);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      await loadSettings();
+      await onWorkspacesChange();
+    } finally {
+      setIsSavingWorkspaceOrder(false);
+    }
+  }
+
+  async function toggleWorkspacePinned(
+    workspace: ConfiguredWorkspaceSummary,
+    pinned: boolean,
+  ) {
+    setIsSavingWorkspaceOrder(true);
+    setError(null);
+
+    const nextWorkspaces = orderedWorkspaces.map((item) =>
+      item.id === workspace.id ? { ...item, pinned } : item,
+    );
+    const workspaceIds = groupedWorkspaceIds(nextWorkspaces);
+
+    try {
+      await requestJson<SettingsResponse>("/api/workspaces/manual", {
+          body: JSON.stringify({
+            id: workspace.id,
+            name: workspace.name,
+            path: workspace.path,
+            pinned,
+            terminalShell: workspace.terminalShell,
+          }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      const orderData = await requestJson<SettingsResponse>("/api/workspaces/order", {
+        body: JSON.stringify({ workspaceIds }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(orderData);
+      onSettingsChange(orderData);
+      setWorkspaceForm((current) =>
+        current.id === workspace.id ? { ...current, pinned } : current,
+      );
+      await onWorkspacesChange();
+      setDraggedWorkspaceId(null);
+      setWorkspaceOrderPreview(null);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      await loadSettings();
+      await onWorkspacesChange();
+    } finally {
+      setIsSavingWorkspaceOrder(false);
+    }
+  }
+
+  async function selectWorkspaceFormPath() {
+    setIsSelectingWorkspaceFormPath(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<{ path: string | null }>(
+        "/api/native/select-directory",
+        { method: "POST" },
+      );
+
+      if (data.path) {
+        setWorkspaceForm((current) => ({
+          ...current,
+          name: current.name.trim()
+            ? current.name
+            : workspaceNameFromPath(data.path ?? ""),
+          path: data.path ?? current.path,
+        }));
+      }
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSelectingWorkspaceFormPath(false);
+    }
+  }
+
+  function handleWorkspaceDragStart(
+    event: ReactDragEvent<HTMLElement>,
+    workspaceId: string,
+  ) {
+    setDraggedWorkspaceId(workspaceId);
+    setWorkspaceOrderPreview(orderedWorkspaces.map((workspace) => workspace.id));
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", workspaceId);
+  }
+
+  function handleWorkspaceDragOver(
+    event: ReactDragEvent<HTMLDivElement>,
+    targetWorkspaceId: string,
+  ) {
+    event.preventDefault();
+
+    const sourceWorkspaceId = draggedWorkspaceId;
+    if (!sourceWorkspaceId || sourceWorkspaceId === targetWorkspaceId) {
+      return;
+    }
+
+    const sourceWorkspace = orderedWorkspaces.find(
+      (workspace) => workspace.id === sourceWorkspaceId,
+    );
+    const targetWorkspace = orderedWorkspaces.find(
+      (workspace) => workspace.id === targetWorkspaceId,
+    );
+    if (!sourceWorkspace || !targetWorkspace || sourceWorkspace.pinned !== targetWorkspace.pinned) {
+      return;
+    }
+
+    const workspaceIds = moveItemId(
+      workspaceOrderPreview ?? orderedWorkspaces.map((workspace) => workspace.id),
+      sourceWorkspaceId,
+      targetWorkspaceId,
+    );
+    setWorkspaceOrderPreview(workspaceIds);
+  }
+
+  async function handleWorkspaceDrop(event: ReactDragEvent<HTMLDivElement>) {
+    event.preventDefault();
+
+    const workspaceIds = workspaceOrderPreview;
+    setDraggedWorkspaceId(null);
+
+    if (!workspaceIds || sameStringList(workspaceIds, workspaces.map((workspace) => workspace.id))) {
+      setWorkspaceOrderPreview(null);
+      return;
+    }
+
+    await saveWorkspaceOrder(workspaceIds);
+  }
+
+  function handleWorkspaceDragEnd() {
+    setDraggedWorkspaceId(null);
+    setWorkspaceOrderPreview(null);
   }
 
   async function saveProvider(event: FormEvent<HTMLFormElement>) {
@@ -6340,7 +6660,7 @@ function SettingsPanel({
       return;
     }
 
-    const modelIds = moveModelId(
+    const modelIds = moveItemId(
       modelOrderPreview ?? orderedConfiguredModels.map((model) => model.id),
       sourceModelId,
       targetModelId,
@@ -6380,6 +6700,12 @@ function SettingsPanel({
             icon={Globe}
             label={t("General")}
             onClick={() => setActiveSection("general")}
+          />
+          <SettingsNavButton
+            active={activeSection === "workspaces"}
+            icon={Folder}
+            label={t("Workspaces")}
+            onClick={() => setActiveSection("workspaces")}
           />
           <SettingsNavButton
             active={activeSection === "providers"}
@@ -6561,6 +6887,273 @@ function SettingsPanel({
               <div className="mt-2 text-xs text-stone-500">
                 {t("Saved host and port are used the next time the backend starts.")}
               </div>
+            </div>
+          </section>
+        </section>
+        ) : null}
+
+        {activeSection === "workspaces" ? (
+        <section className="grid gap-4">
+          {isWorkspaceDialogOpen ? (
+            <>
+              <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+              <form
+                aria-label={t("Workspace configuration")}
+                className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                onSubmit={(event) => void saveWorkspace(event)}
+              >
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <Folder aria-hidden="true" className="size-5 text-teal-700" />
+                      <h3 className="text-sm font-semibold text-stone-950">
+                        {t("Edit workspace")}
+                      </h3>
+                    </div>
+                    {editingWorkspace ? (
+                      <div className="mt-1 truncate text-xs text-stone-500">
+                        {editingWorkspace.path}
+                      </div>
+                    ) : null}
+                  </div>
+                  <button
+                    aria-label={t("Close workspace configuration")}
+                    className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                    onClick={() => setIsWorkspaceDialogOpen(false)}
+                    title={t("Close")}
+                    type="button"
+                  >
+                    <X aria-hidden="true" className="size-4" />
+                  </button>
+                </div>
+                <div className="space-y-3">
+                  <TextField
+                    label={t("Workspace name")}
+                    onChange={(value) =>
+                      setWorkspaceForm((current) => ({
+                        ...current,
+                        name: value,
+                      }))
+                    }
+                    placeholder={t("Workspace name")}
+                    value={workspaceForm.name}
+                  />
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Path")}
+                    </span>
+                    <div className="flex gap-2">
+                      <input
+                        autoComplete="off"
+                        className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        name="workspace-path"
+                        onChange={(event) =>
+                          setWorkspaceForm((current) => ({
+                            ...current,
+                            path: event.target.value,
+                          }))
+                        }
+                        placeholder="C:/Users/name/workspace"
+                        value={workspaceForm.path}
+                      />
+                      <button
+                        aria-label={t("Choose workspace path")}
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                        disabled={isSelectingWorkspaceFormPath}
+                        onClick={() => void selectWorkspaceFormPath()}
+                        title={t("Choose workspace path")}
+                        type="button"
+                      >
+                        {isSelectingWorkspaceFormPath ? (
+                          <LoaderCircle
+                            aria-hidden="true"
+                            className="size-4 animate-spin"
+                          />
+                        ) : (
+                          <FolderSearch aria-hidden="true" className="size-4" />
+                        )}
+                      </button>
+                    </div>
+                  </label>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Terminal shell")}
+                    </span>
+                    <select
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setWorkspaceForm((current) => ({
+                          ...current,
+                          terminalShell: event.target.value,
+                        }))
+                      }
+                      value={workspaceForm.terminalShell || terminalShells[0]?.shell || ""}
+                    >
+                      {terminalShells.map((shell) => (
+                        <option key={shell.shell} value={shell.shell}>
+                          {shell.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+                    <span className="text-sm font-semibold text-stone-700">
+                      {t("Pinned workspace")}
+                    </span>
+                    <input
+                      checked={workspaceForm.pinned}
+                      className="size-4 accent-teal-700"
+                      onChange={(event) =>
+                        setWorkspaceForm((current) => ({
+                          ...current,
+                          pinned: event.target.checked,
+                        }))
+                      }
+                      type="checkbox"
+                    />
+                  </label>
+                  <button
+                    aria-label={t("Save workspace")}
+                    className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    disabled={
+                      isSavingWorkspace ||
+                      !workspaceForm.name.trim() ||
+                      !workspaceForm.path.trim()
+                    }
+                    title={t("Save workspace")}
+                    type="submit"
+                  >
+                    {isSavingWorkspace ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <CheckCircle2 aria-hidden="true" className="size-4" />
+                    )}
+                    {t("Save")}
+                  </button>
+                </div>
+              </form>
+            </>
+          ) : null}
+
+          <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-stone-950">
+                {t("Workspace list")}
+              </h3>
+              <button
+                aria-label={t("Add workspace")}
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                onClick={onAddWorkspace}
+                title={t("Add workspace")}
+                type="button"
+              >
+                <Plus aria-hidden="true" className="size-4" />
+              </button>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {orderedWorkspaces.length ? (
+                orderedWorkspaces.map((workspace) => (
+                  <div
+                    className={`grid gap-3 px-4 py-3 transition md:grid-cols-[auto_minmax(0,1fr)_auto] ${
+                      draggedWorkspaceId === workspace.id
+                        ? "bg-teal-50/70 opacity-80"
+                        : "bg-white/0"
+                    }`}
+                    key={workspace.id}
+                    onDragOver={(event) =>
+                      handleWorkspaceDragOver(event, workspace.id)
+                    }
+                    onDrop={(event) => void handleWorkspaceDrop(event)}
+                  >
+                    <div className="flex items-start pt-1">
+                      <span
+                        aria-label={t("Reorder workspace {name}", {
+                          name: workspace.name,
+                        })}
+                        className={`inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-400 shadow-sm ${
+                          isSavingWorkspaceOrder
+                            ? "cursor-not-allowed opacity-60"
+                            : "cursor-grab hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                        }`}
+                        title={t("Reorder workspace {name}", {
+                          name: workspace.name,
+                        })}
+                        draggable={!isSavingWorkspaceOrder}
+                        onDragEnd={handleWorkspaceDragEnd}
+                        onDragStart={(event) =>
+                          handleWorkspaceDragStart(event, workspace.id)
+                        }
+                      >
+                        {isSavingWorkspaceOrder && draggedWorkspaceId === workspace.id ? (
+                          <LoaderCircle
+                            aria-hidden="true"
+                            className="size-4 animate-spin"
+                          />
+                        ) : (
+                          <GripVertical aria-hidden="true" className="size-4" />
+                        )}
+                      </span>
+                    </div>
+                    <div className="min-w-0 select-text">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="truncate text-sm font-semibold">
+                          {workspace.name}
+                        </span>
+                        {workspace.isDefault ? (
+                          <CapabilityPill label={t("Default workspace")} ok />
+                        ) : null}
+                        {workspace.pinned ? (
+                          <CapabilityPill label={t("pinned")} ok />
+                        ) : null}
+                      </div>
+                      <div className="mt-1 truncate text-xs font-medium text-stone-500">
+                        {workspace.id} / {terminalShellLabel(terminalShells, workspace.terminalShell)}
+                      </div>
+                      <div className="mt-1 break-all text-xs text-stone-500">
+                        {workspace.path}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2 md:justify-end">
+                      <button
+                        aria-label={t(
+                          workspace.pinned
+                            ? "Unpin workspace {name}"
+                            : "Pin workspace {name}",
+                          { name: workspace.name },
+                        )}
+                        className={`inline-flex size-9 items-center justify-center rounded-lg border shadow-sm ${
+                          workspace.pinned
+                            ? "border-teal-300 bg-teal-700 text-white shadow-[0_10px_22px_rgba(15,118,110,0.22)] hover:bg-teal-800"
+                            : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                        }`}
+                        disabled={isSavingWorkspaceOrder}
+                        onClick={() =>
+                          void toggleWorkspacePinned(workspace, !workspace.pinned)
+                        }
+                        title={t(workspace.pinned ? "Unpin workspace" : "Pin workspace")}
+                        type="button"
+                      >
+                        <Lock aria-hidden="true" className="size-4" />
+                      </button>
+                      <button
+                        aria-label={t("Edit workspace {name}", {
+                          name: workspace.name,
+                        })}
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                        onClick={() => editConfiguredWorkspace(workspace)}
+                        title={t("Edit workspace")}
+                        type="button"
+                      >
+                        <Pencil aria-hidden="true" className="size-4" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="px-4 py-6 text-sm text-stone-500">
+                  {t("No workspaces")}
+                </div>
+              )}
             </div>
           </section>
         </section>
@@ -7848,6 +8441,10 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
     return t("General settings");
   }
 
+  if (section === "workspaces") {
+    return t("Workspace settings");
+  }
+
   if (section === "providers") {
     return t("Provider settings");
   }
@@ -7866,6 +8463,10 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
 function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
   if (section === "general") {
     return t("Web service listen address");
+  }
+
+  if (section === "workspaces") {
+    return t("Workspace order and terminal shell");
   }
 
   if (section === "providers") {
@@ -8011,6 +8612,16 @@ function emptyGeneralForm(): GeneralFormState {
   };
 }
 
+function emptyWorkspaceForm(): WorkspaceFormState {
+  return {
+    id: "",
+    name: "",
+    path: "",
+    pinned: false,
+    terminalShell: "",
+  };
+}
+
 function emptyMcpServerForm(): McpServerFormState {
   return {
     argsText: "",
@@ -8063,23 +8674,44 @@ function nextMcpServerId(
   return `${base}-${index}`;
 }
 
-function moveModelId(
-  modelIds: string[],
-  sourceModelId: string,
-  targetModelId: string,
+function moveItemId(
+  itemIds: string[],
+  sourceItemId: string,
+  targetItemId: string,
 ) {
-  const sourceIndex = modelIds.indexOf(sourceModelId);
-  const targetIndex = modelIds.indexOf(targetModelId);
+  const sourceIndex = itemIds.indexOf(sourceItemId);
+  const targetIndex = itemIds.indexOf(targetItemId);
 
   if (sourceIndex === -1 || targetIndex === -1 || sourceIndex === targetIndex) {
-    return modelIds;
+    return itemIds;
   }
 
-  const next = [...modelIds];
+  const next = [...itemIds];
   const [source] = next.splice(sourceIndex, 1);
   next.splice(targetIndex, 0, source);
 
   return next;
+}
+
+function groupedWorkspaceIds(workspaces: ConfiguredWorkspaceSummary[]) {
+  return [
+    ...workspaces
+      .filter((workspace) => workspace.pinned)
+      .map((workspace) => workspace.id),
+    ...workspaces
+      .filter((workspace) => !workspace.pinned)
+      .map((workspace) => workspace.id),
+  ];
+}
+
+function terminalShellLabel(
+  terminalShells: TerminalShellSummary[],
+  terminalShell: string,
+) {
+  return (
+    terminalShells.find((shell) => shell.shell === terminalShell)?.label ??
+    terminalShell
+  );
 }
 
 function sameStringList(left: string[], right: string[]) {

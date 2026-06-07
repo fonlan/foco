@@ -94,6 +94,7 @@ pub(crate) async fn handle_terminal_socket(
     mut shutdown_rx: broadcast::Receiver<()>,
     registry: TerminalRegistry,
     workspace_path: PathBuf,
+    terminal_shell: String,
     session: TerminalSessionRecord,
     cols: u16,
     rows: u16,
@@ -119,7 +120,7 @@ pub(crate) async fn handle_terminal_socket(
         return;
     }
 
-    let terminal = match spawn_terminal(&cwd, cols, rows) {
+    let terminal = match spawn_terminal(&cwd, &terminal_shell, cols, rows) {
         Ok(terminal) => terminal,
         Err(message) => {
             send_socket_error(socket, message).await;
@@ -325,7 +326,12 @@ async fn send_terminal_event(
     sender.send(Message::Text(payload.into())).await
 }
 
-fn spawn_terminal(cwd: &Path, cols: u16, rows: u16) -> Result<SpawnedTerminal, String> {
+fn spawn_terminal(
+    cwd: &Path,
+    terminal_shell: &str,
+    cols: u16,
+    rows: u16,
+) -> Result<SpawnedTerminal, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -335,20 +341,15 @@ fn spawn_terminal(cwd: &Path, cols: u16, rows: u16) -> Result<SpawnedTerminal, S
             pixel_height: 0,
         })
         .map_err(|source| format!("failed to create Windows PTY: {source}"))?;
-    let mut command = CommandBuilder::new("powershell.exe");
+    let mut command = terminal_command(terminal_shell)?;
     let shell_cwd = shell_path(cwd);
 
     command.cwd(&shell_cwd);
-    command.arg("-NoLogo");
-    command.arg("-NoProfile");
-    command.arg("-NoExit");
-    command.arg("-Command");
-    command.arg(powershell_prompt_command());
 
     let child = pair
         .slave
         .spawn_command(command)
-        .map_err(|source| format!("failed to spawn terminal shell: {source}"))?;
+        .map_err(|source| format!("failed to spawn {terminal_shell} terminal shell: {source}"))?;
     let writer = pair
         .master
         .take_writer()
@@ -359,6 +360,24 @@ fn spawn_terminal(cwd: &Path, cols: u16, rows: u16) -> Result<SpawnedTerminal, S
         writer,
         child,
     })
+}
+
+fn terminal_command(terminal_shell: &str) -> Result<CommandBuilder, String> {
+    match terminal_shell {
+        "powershell" => {
+            let mut command = CommandBuilder::new("powershell.exe");
+            command.arg("-NoLogo");
+            command.arg("-NoProfile");
+            command.arg("-NoExit");
+            command.arg("-Command");
+            command.arg(powershell_prompt_command());
+            Ok(command)
+        }
+        "cmd" => Ok(CommandBuilder::new("cmd.exe")),
+        "bash" => Ok(CommandBuilder::new("bash")),
+        "zsh" => Ok(CommandBuilder::new("zsh")),
+        _ => Err(format!("unsupported terminal shell: {terminal_shell}")),
+    }
 }
 
 fn spawn_reader(mut reader: Box<dyn Read + Send>, output_tx: mpsc::UnboundedSender<PtyOutput>) {

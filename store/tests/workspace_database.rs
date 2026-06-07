@@ -66,11 +66,15 @@ fn initializes_every_registered_workspace() {
             id: "first".to_string(),
             name: "First".to_string(),
             path: first.path().to_path_buf(),
+            pinned: false,
+            terminal_shell: foco_store::config::DEFAULT_TERMINAL_SHELL.to_string(),
         },
         WorkspaceConfig {
             id: "second".to_string(),
             name: "Second".to_string(),
             path: second.path().to_path_buf(),
+            pinned: false,
+            terminal_shell: foco_store::config::DEFAULT_TERMINAL_SHELL.to_string(),
         },
     ];
 

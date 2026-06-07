@@ -18,6 +18,8 @@ pub const DEFAULT_WEB_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_WEB_SERVER_PORT: u16 = 3210;
 pub const DEFAULT_APP_LANGUAGE: &str = "en";
 pub const SUPPORTED_APP_LANGUAGES: &[&str] = &["zh-CN", "en"];
+pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
+pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FocoPaths {
@@ -178,6 +180,8 @@ impl GlobalConfig {
                 id: DEFAULT_WORKSPACE_ID.to_string(),
                 name: DEFAULT_WORKSPACE_NAME.to_string(),
                 path: default_workspace_path,
+                pinned: false,
+                terminal_shell: default_terminal_shell(),
             }],
         }
     }
@@ -218,6 +222,11 @@ impl GlobalConfig {
                     ),
                 );
             }
+            validate_terminal_shell(
+                config_path,
+                "workspace.terminal_shell",
+                &workspace.terminal_shell,
+            )?;
 
             if !workspace_ids.insert(workspace.id.as_str()) {
                 return invalid_config(
@@ -582,6 +591,10 @@ pub struct WorkspaceConfig {
     pub id: String,
     pub name: String,
     pub path: PathBuf,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default = "default_terminal_shell")]
+    pub terminal_shell: String,
 }
 
 #[derive(Debug)]
@@ -692,6 +705,10 @@ fn default_skill_scope() -> String {
     SKILL_SCOPE_GLOBAL.to_string()
 }
 
+fn default_terminal_shell() -> String {
+    DEFAULT_TERMINAL_SHELL.to_string()
+}
+
 fn validate_skill_scope(config_path: Option<&Path>, scope: &str) -> Result<(), ConfigError> {
     match scope {
         SKILL_SCOPE_GLOBAL | SKILL_SCOPE_WORKSPACE => Ok(()),
@@ -786,6 +803,24 @@ fn validate_app_language(config_path: Option<&Path>, language: &str) -> Result<(
     )
 }
 
+fn validate_terminal_shell(
+    config_path: Option<&Path>,
+    field: &str,
+    shell: &str,
+) -> Result<(), ConfigError> {
+    if SUPPORTED_TERMINAL_SHELLS.contains(&shell) {
+        return Ok(());
+    }
+
+    invalid_config(
+        config_path,
+        format!(
+            "{field} '{shell}' is unsupported; expected one of {}",
+            SUPPORTED_TERMINAL_SHELLS.join(", ")
+        ),
+    )
+}
+
 fn require_non_empty_list(
     config_path: Option<&Path>,
     field: &str,
@@ -869,6 +904,11 @@ mod tests {
         assert_eq!(loaded.config.workspaces.len(), 1);
         assert_eq!(loaded.config.workspaces[0].name, DEFAULT_WORKSPACE_NAME);
         assert_eq!(loaded.config.workspaces[0].path, loaded.paths.workspace_dir);
+        assert!(!loaded.config.workspaces[0].pinned);
+        assert_eq!(
+            loaded.config.workspaces[0].terminal_shell,
+            DEFAULT_TERMINAL_SHELL
+        );
         assert!(loaded.config.skills.directories.is_empty());
     }
 
@@ -1015,6 +1055,8 @@ mod tests {
 
         assert_eq!(loaded.app.language, DEFAULT_APP_LANGUAGE);
         assert_eq!(loaded.app.web_server, WebServerSettings::default());
+        assert!(!loaded.workspaces[0].pinned);
+        assert_eq!(loaded.workspaces[0].terminal_shell, DEFAULT_TERMINAL_SHELL);
     }
 
     #[test]
@@ -1093,6 +1135,26 @@ mod tests {
             error
                 .to_string()
                 .contains("app.language 'fr' is unsupported")
+        );
+    }
+
+    #[test]
+    fn load_rejects_unsupported_workspace_terminal_shell() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.workspaces[0].terminal_shell = "fish".to_string();
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("unsupported terminal shell should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("workspace.terminal_shell 'fish' is unsupported")
         );
     }
 

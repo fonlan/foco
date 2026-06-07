@@ -43,9 +43,10 @@ use foco_providers::{
 };
 use foco_store::{
     config::{
-        GlobalConfig, McpServerConfig, ModelLimits, ModelSettings, ProviderSettings,
-        SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_APP_LANGUAGES, SkillSettings,
-        WebServerSettings, WorkspaceConfig, load_or_create_global_config, save_global_config,
+        DEFAULT_TERMINAL_SHELL, GlobalConfig, McpServerConfig, ModelLimits, ModelSettings,
+        ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_APP_LANGUAGES,
+        SUPPORTED_TERMINAL_SHELLS, SkillSettings, WebServerSettings, WorkspaceConfig,
+        load_or_create_global_config, save_global_config,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
@@ -454,6 +455,8 @@ fn app_router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/workspaces", get(workspaces))
         .route("/api/workspaces/add", post(add_workspace))
+        .route("/api/workspaces/manual", post(save_workspace_settings))
+        .route("/api/workspaces/order", post(save_workspace_order))
         .route("/api/native/select-directory", post(select_directory))
         .route("/api/settings", get(settings))
         .route("/api/settings/general", post(save_general_settings))
@@ -801,17 +804,91 @@ async fn add_workspace(
     let path = canonical_workspace_path(&requested_path)?;
     let mut config = config_snapshot(&state)?;
 
-    reject_registered_workspace_path(&config, &path)?;
+    reject_registered_workspace_path(&config, &path, None)?;
     WorkspaceDatabase::open_or_create(&path).map_err(ApiError::from_workspace_error)?;
 
     let id = unique_workspace_id(&config, &name);
-    config.workspaces.push(WorkspaceConfig { id, name, path });
+    config.workspaces.push(WorkspaceConfig {
+        id,
+        name,
+        path,
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+    });
     save_config(&state, config.clone())?;
     sync_all_mcp_workspaces(&state.mcp_registry, &config)
         .await
         .map_err(ApiError::from_mcp_error)?;
 
     workspace_response_from_config(&config)
+}
+
+async fn save_workspace_settings(
+    State(state): State<AppState>,
+    Json(request): Json<ManualWorkspaceRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let workspace_id = request.id.trim();
+    let name = request.name.trim();
+    let requested_path = validate_workspace_path(&request.path)?;
+    let terminal_shell = normalize_terminal_shell(&request.terminal_shell)?;
+
+    if workspace_id.is_empty() {
+        return Err(ApiError::bad_request("workspace id must not be empty"));
+    }
+
+    if name.is_empty() {
+        return Err(ApiError::bad_request("workspace name must not be empty"));
+    }
+
+    if requested_path.exists() && !requested_path.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "workspace path exists but is not a directory: {}",
+            requested_path.display()
+        )));
+    }
+
+    if !requested_path.exists() {
+        fs::create_dir_all(&requested_path).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to create workspace directory {}: {}",
+                requested_path.display(),
+                source
+            ))
+        })?;
+    }
+
+    let path = canonical_workspace_path(&requested_path)?;
+    reject_registered_workspace_path(&config, &path, Some(workspace_id))?;
+
+    let workspace = config
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
+
+    workspace.name = name.to_string();
+    workspace.path = path;
+    workspace.pinned = request.pinned;
+    workspace.terminal_shell = terminal_shell;
+    group_pinned_workspaces(&mut config.workspaces);
+
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
+async fn save_workspace_order(
+    State(state): State<AppState>,
+    Json(request): Json<WorkspaceOrderRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+
+    reorder_workspaces(&mut config.workspaces, request.workspace_ids)?;
+    group_pinned_workspaces(&mut config.workspaces);
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
 }
 
 async fn select_directory() -> Result<Json<SelectDirectoryResponse>, ApiError> {
@@ -1709,6 +1786,7 @@ async fn terminal_socket(
     let shutdown_rx = state.terminal_shutdown_tx.subscribe();
     let registry = state.terminal_registry.clone();
     let workspace_path = workspace.path.clone();
+    let terminal_shell = workspace.terminal_shell.clone();
 
     Ok(ws.on_upgrade(move |socket| {
         terminal::handle_terminal_socket(
@@ -1716,6 +1794,7 @@ async fn terminal_socket(
             shutdown_rx,
             registry,
             workspace_path,
+            terminal_shell,
             session,
             query.cols.unwrap_or(80),
             query.rows.unwrap_or(24),
@@ -1728,6 +1807,22 @@ async fn terminal_socket(
 struct WorkspacePathRequest {
     name: String,
     path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualWorkspaceRequest {
+    id: String,
+    name: String,
+    path: String,
+    pinned: bool,
+    terminal_shell: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceOrderRequest {
+    workspace_ids: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1864,6 +1959,8 @@ struct TerminalSocketQuery {
 #[serde(rename_all = "camelCase")]
 struct SettingsResponse {
     general: GeneralSettingsSummary,
+    workspaces: Vec<ConfiguredWorkspaceSummary>,
+    terminal_shells: Vec<TerminalShellSummary>,
     provider_kinds: Vec<ProviderKindSummary>,
     thinking_levels: Vec<ThinkingLevelSummary>,
     providers: Vec<ConfiguredProviderSummary>,
@@ -1893,6 +1990,24 @@ struct WebServerSettingsSummary {
 struct AppLanguageSummary {
     id: &'static str,
     name: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfiguredWorkspaceSummary {
+    id: String,
+    name: String,
+    path: String,
+    pinned: bool,
+    terminal_shell: String,
+    is_default: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalShellSummary {
+    shell: &'static str,
+    label: &'static str,
 }
 
 #[derive(Serialize)]
@@ -2028,6 +2143,8 @@ struct WorkspaceSummary {
     id: String,
     name: String,
     path: String,
+    pinned: bool,
+    terminal_shell: String,
     chats: Vec<ChatSummary>,
 }
 
@@ -4849,11 +4966,17 @@ fn validate_workspace_request(
     request: WorkspacePathRequest,
 ) -> Result<(String, PathBuf), ApiError> {
     let name = request.name.trim().to_string();
-    let path = PathBuf::from(request.path.trim());
+    let path = validate_workspace_path(&request.path)?;
 
     if name.is_empty() {
         return Err(ApiError::bad_request("workspace name must not be empty"));
     }
+
+    Ok((name, path))
+}
+
+fn validate_workspace_path(path: &str) -> Result<PathBuf, ApiError> {
+    let path = PathBuf::from(path.trim());
 
     if path.as_os_str().is_empty() {
         return Err(ApiError::bad_request("workspace path must not be empty"));
@@ -4866,7 +4989,7 @@ fn validate_workspace_request(
         )));
     }
 
-    Ok((name, path))
+    Ok(path)
 }
 
 fn native_select_directory() -> Result<Option<String>, ApiError> {
@@ -5077,6 +5200,12 @@ async fn settings_response(
                 })
                 .collect(),
         },
+        workspaces: config
+            .workspaces
+            .iter()
+            .map(configured_workspace_summary)
+            .collect(),
+        terminal_shells: terminal_shell_summaries(),
         provider_kinds: vec![
             ProviderKindSummary {
                 kind: OPENAI_CHAT_KIND,
@@ -5139,6 +5268,37 @@ async fn settings_response(
             .collect(),
         skills: skills_settings_summary(config, &state.user_profile_dir),
     }))
+}
+
+fn configured_workspace_summary(workspace: &WorkspaceConfig) -> ConfiguredWorkspaceSummary {
+    ConfiguredWorkspaceSummary {
+        id: workspace.id.clone(),
+        name: workspace.name.clone(),
+        path: display_path(&workspace.path),
+        pinned: workspace.pinned,
+        terminal_shell: workspace.terminal_shell.clone(),
+        is_default: workspace.id == foco_store::config::DEFAULT_WORKSPACE_ID,
+    }
+}
+
+fn terminal_shell_summaries() -> Vec<TerminalShellSummary> {
+    SUPPORTED_TERMINAL_SHELLS
+        .iter()
+        .map(|shell| TerminalShellSummary {
+            shell: *shell,
+            label: terminal_shell_label(shell),
+        })
+        .collect()
+}
+
+fn terminal_shell_label(shell: &str) -> &'static str {
+    match shell {
+        "powershell" => "PowerShell",
+        "cmd" => "Command Prompt",
+        "bash" => "Bash",
+        "zsh" => "Zsh",
+        _ => "Unknown",
+    }
 }
 
 fn configured_provider_summary(provider: &ProviderSettings) -> ConfiguredProviderSummary {
@@ -5909,7 +6069,9 @@ fn workspace_response_from_config(
         workspaces.push(WorkspaceSummary {
             id: workspace.id.clone(),
             name: workspace.name.clone(),
-            path: workspace.path.display().to_string(),
+            path: display_path(&workspace.path),
+            pinned: workspace.pinned,
+            terminal_shell: workspace.terminal_shell.clone(),
             chats,
         });
     }
@@ -6133,6 +6295,93 @@ fn reorder_models(models: &mut Vec<ModelSettings>, model_ids: Vec<String>) -> Re
     *models = reordered_models;
 
     Ok(())
+}
+
+fn reorder_workspaces(
+    workspaces: &mut Vec<WorkspaceConfig>,
+    workspace_ids: Vec<String>,
+) -> Result<(), ApiError> {
+    if workspace_ids.len() != workspaces.len() {
+        return Err(ApiError::bad_request(format!(
+            "workspace order must contain exactly {} workspace ids",
+            workspaces.len()
+        )));
+    }
+
+    let mut seen = HashSet::new();
+    let stored_workspace_ids = workspaces
+        .iter()
+        .map(|workspace| workspace.id.clone())
+        .collect::<HashSet<_>>();
+    let mut normalized_workspace_ids = Vec::with_capacity(workspace_ids.len());
+
+    for raw_workspace_id in workspace_ids {
+        let workspace_id = raw_workspace_id.trim().to_string();
+
+        if workspace_id.is_empty() {
+            return Err(ApiError::bad_request("workspace id must not be empty"));
+        }
+
+        if !seen.insert(workspace_id.clone()) {
+            return Err(ApiError::bad_request(format!(
+                "workspace order contains duplicate id: {workspace_id}"
+            )));
+        }
+
+        if !stored_workspace_ids.contains(&workspace_id) {
+            return Err(ApiError::bad_request(format!(
+                "workspace was not found: {workspace_id}"
+            )));
+        }
+
+        normalized_workspace_ids.push(workspace_id);
+    }
+
+    let mut stored_workspaces = workspaces
+        .drain(..)
+        .map(|workspace| (workspace.id.clone(), workspace))
+        .collect::<HashMap<_, _>>();
+    let reordered_workspaces = normalized_workspace_ids
+        .into_iter()
+        .map(|workspace_id| {
+            stored_workspaces
+                .remove(&workspace_id)
+                .expect("workspace id was validated before reorder")
+        })
+        .collect();
+
+    *workspaces = reordered_workspaces;
+
+    Ok(())
+}
+
+fn group_pinned_workspaces(workspaces: &mut Vec<WorkspaceConfig>) {
+    let mut pinned = Vec::new();
+    let mut unpinned = Vec::new();
+
+    for workspace in workspaces.drain(..) {
+        if workspace.pinned {
+            pinned.push(workspace);
+        } else {
+            unpinned.push(workspace);
+        }
+    }
+
+    pinned.extend(unpinned);
+    *workspaces = pinned;
+}
+
+fn normalize_terminal_shell(shell: &str) -> Result<String, ApiError> {
+    let shell = shell.trim();
+
+    if SUPPORTED_TERMINAL_SHELLS.contains(&shell) {
+        return Ok(shell.to_string());
+    }
+
+    Err(ApiError::bad_request(format!(
+        "terminal shell '{shell}' is unsupported; expected one of {}",
+        SUPPORTED_TERMINAL_SHELLS.join(", ")
+    )))
 }
 
 fn validate_model_provider_references(
@@ -6799,17 +7048,27 @@ fn parse_optional_json_value(
 }
 
 fn canonical_workspace_path(path: &Path) -> Result<PathBuf, ApiError> {
-    fs::canonicalize(path).map_err(|source| {
-        ApiError::internal(format!(
-            "failed to resolve workspace path {}: {}",
-            path.display(),
-            source
-        ))
-    })
+    fs::canonicalize(path)
+        .map(normalize_windows_verbatim_path)
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to resolve workspace path {}: {}",
+                path.display(),
+                source
+            ))
+        })
 }
 
-fn reject_registered_workspace_path(config: &GlobalConfig, path: &Path) -> Result<(), ApiError> {
+fn reject_registered_workspace_path(
+    config: &GlobalConfig,
+    path: &Path,
+    allowed_workspace_id: Option<&str>,
+) -> Result<(), ApiError> {
     for workspace in &config.workspaces {
+        if allowed_workspace_id == Some(workspace.id.as_str()) {
+            continue;
+        }
+
         let registered_path = canonical_workspace_path(&workspace.path)?;
 
         if registered_path == path {
@@ -6822,6 +7081,26 @@ fn reject_registered_workspace_path(config: &GlobalConfig, path: &Path) -> Resul
     }
 
     Ok(())
+}
+
+fn normalize_windows_verbatim_path(path: PathBuf) -> PathBuf {
+    let value = path.display().to_string();
+
+    if let Some(stripped) = value.strip_prefix("\\\\?\\UNC\\") {
+        return PathBuf::from(format!("\\\\{stripped}"));
+    }
+
+    if let Some(stripped) = value.strip_prefix("\\\\?\\") {
+        return PathBuf::from(stripped);
+    }
+
+    path
+}
+
+fn display_path(path: &Path) -> String {
+    normalize_windows_verbatim_path(path.to_path_buf())
+        .display()
+        .to_string()
 }
 
 fn unique_workspace_id(config: &GlobalConfig, name: &str) -> String {
@@ -7155,6 +7434,92 @@ description: Project memory.
     }
 
     #[test]
+    fn reorder_workspaces_requires_complete_unique_existing_ids() {
+        let mut workspaces = vec![
+            test_workspace_config("default"),
+            test_workspace_config("side"),
+            test_workspace_config("archive"),
+        ];
+
+        reorder_workspaces(
+            &mut workspaces,
+            vec![
+                "side".to_string(),
+                "archive".to_string(),
+                "default".to_string(),
+            ],
+        )
+        .expect("reordered workspaces");
+        assert_eq!(
+            workspace_ids(&workspaces),
+            vec!["side", "archive", "default"]
+        );
+
+        let duplicate_error = reorder_workspaces(
+            &mut workspaces,
+            vec![
+                "side".to_string(),
+                "side".to_string(),
+                "default".to_string(),
+            ],
+        )
+        .expect_err("duplicate workspace ids should fail");
+        assert_eq!(duplicate_error.status, StatusCode::BAD_REQUEST);
+        assert!(duplicate_error.message.contains("duplicate"));
+        assert_eq!(
+            workspace_ids(&workspaces),
+            vec!["side", "archive", "default"]
+        );
+
+        let missing_error = reorder_workspaces(
+            &mut workspaces,
+            vec![
+                "side".to_string(),
+                "missing".to_string(),
+                "default".to_string(),
+            ],
+        )
+        .expect_err("unknown workspace ids should fail");
+        assert_eq!(missing_error.status, StatusCode::BAD_REQUEST);
+        assert!(missing_error.message.contains("not found"));
+        assert_eq!(
+            workspace_ids(&workspaces),
+            vec!["side", "archive", "default"]
+        );
+    }
+
+    #[test]
+    fn group_pinned_workspaces_keeps_group_order() {
+        let mut workspaces = vec![
+            test_workspace_config("first"),
+            test_workspace_config("second"),
+            test_workspace_config("third"),
+            test_workspace_config("fourth"),
+        ];
+        workspaces[2].pinned = true;
+        workspaces[0].pinned = true;
+
+        group_pinned_workspaces(&mut workspaces);
+
+        assert_eq!(
+            workspace_ids(&workspaces),
+            vec!["first", "third", "second", "fourth"]
+        );
+    }
+
+    #[test]
+    fn normalize_windows_verbatim_path_removes_prefixes() {
+        assert_eq!(
+            normalize_windows_verbatim_path(PathBuf::from(r"\\?\C:\Users\fonla\Repo")),
+            PathBuf::from(r"C:\Users\fonla\Repo")
+        );
+        assert_eq!(
+            normalize_windows_verbatim_path(PathBuf::from(r"\\?\UNC\server\share\Repo")),
+            PathBuf::from(r"\\server\share\Repo")
+        );
+    }
+
+    #[test]
     fn discover_skills_ignores_missing_directories() {
         let profile_dir = env::temp_dir().join(unique_id("foco-missing-skill-profile-test"));
         let workspace_dir = env::temp_dir().join(unique_id("foco-missing-skill-test"));
@@ -7166,6 +7531,8 @@ description: Project memory.
             id: "default".to_string(),
             name: "Default".to_string(),
             path: workspace_dir.clone(),
+            pinned: false,
+            terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         }];
         let discovery = discover_skills(&profile_dir, &workspaces);
 
@@ -7662,8 +8029,9 @@ description: Project memory.
                 .is_file()
         );
 
-        let registered_path =
-            fs::canonicalize(&new_workspace_dir).expect("new workspace canonical path");
+        let registered_path = normalize_windows_verbatim_path(
+            fs::canonicalize(&new_workspace_dir).expect("new workspace canonical path"),
+        );
         let config = state.config.lock().expect("config lock");
         assert!(config.workspaces.iter().any(
             |workspace| workspace.name == "New Workspace" && workspace.path == registered_path
@@ -8021,6 +8389,8 @@ description: Project memory.
             id: "default".to_string(),
             name: "Default".to_string(),
             path: workspace_dir.clone(),
+            pinned: false,
+            terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         }];
         let discovery = discover_skills(&profile_dir, &workspaces);
 
@@ -8078,6 +8448,23 @@ description: Project memory.
 
     fn model_ids(models: &[ModelSettings]) -> Vec<&str> {
         models.iter().map(|model| model.id.as_str()).collect()
+    }
+
+    fn test_workspace_config(id: &str) -> WorkspaceConfig {
+        WorkspaceConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            path: env::temp_dir().join(id),
+            pinned: false,
+            terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        }
+    }
+
+    fn workspace_ids(workspaces: &[WorkspaceConfig]) -> Vec<&str> {
+        workspaces
+            .iter()
+            .map(|workspace| workspace.id.as_str())
+            .collect()
     }
 
     fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
