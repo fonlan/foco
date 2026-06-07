@@ -2126,6 +2126,24 @@ export function App() {
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
                 <button
+                  aria-label={t("Settings")}
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  onClick={() => setViewMode("settings")}
+                  title={t("Settings")}
+                  type="button"
+                >
+                  <Settings aria-hidden="true" className="size-4" />
+                </button>
+                <button
+                  aria-label={t("Stats")}
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  onClick={() => setViewMode("stats")}
+                  title={t("Stats")}
+                  type="button"
+                >
+                  <BarChart3 aria-hidden="true" className="size-4" />
+                </button>
+                <button
                   aria-label={t("Add workspace")}
                   className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                   onClick={() => openWorkspaceDialog()}
@@ -2133,23 +2151,6 @@ export function App() {
                   type="button"
                 >
                   <FolderPlus aria-hidden="true" className="size-4" />
-                </button>
-                <button
-                  aria-label={t("Refresh workspaces")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
-                  disabled={isLoading}
-                  onClick={() => void refreshWorkspaces()}
-                  title={t("Refresh workspaces")}
-                  type="button"
-                >
-                  {isLoading ? (
-                    <LoaderCircle
-                      aria-hidden="true"
-                      className="size-4 animate-spin"
-                    />
-                  ) : (
-                    <RefreshCw aria-hidden="true" className="size-4" />
-                  )}
                 </button>
               </div>
             </div>
@@ -2294,26 +2295,6 @@ export function App() {
                 </div>
               )}
             </nav>
-            <footer className="flex shrink-0 justify-center gap-1.5 border-t border-stone-200/80 px-4 py-1.5">
-              <button
-                aria-label={t("Settings")}
-                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                onClick={() => setViewMode("settings")}
-                title={t("Settings")}
-                type="button"
-              >
-                <Settings aria-hidden="true" className="size-4" />
-              </button>
-              <button
-                aria-label={t("Stats")}
-                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                onClick={() => setViewMode("stats")}
-                title={t("Stats")}
-                type="button"
-              >
-                <BarChart3 aria-hidden="true" className="size-4" />
-              </button>
-            </footer>
           </div>
         </aside>
 
