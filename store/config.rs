@@ -449,6 +449,9 @@ impl GlobalConfig {
                 provider.api_key = Some(REDACTED_SECRET.to_string());
             }
         }
+        if redacted.app.web_server.password_hash.is_some() {
+            redacted.app.web_server.password_hash = Some(REDACTED_SECRET.to_string());
+        }
 
         serde_json::to_string(&redacted)
     }
@@ -473,6 +476,8 @@ fn default_app_language() -> String {
 pub struct WebServerSettings {
     pub listen_host: String,
     pub listen_port: u16,
+    #[serde(default)]
+    pub password_hash: Option<String>,
 }
 
 impl Default for WebServerSettings {
@@ -480,6 +485,7 @@ impl Default for WebServerSettings {
         Self {
             listen_host: DEFAULT_WEB_SERVER_HOST.to_string(),
             listen_port: DEFAULT_WEB_SERVER_PORT,
+            password_hash: None,
         }
     }
 }
@@ -783,6 +789,40 @@ fn validate_web_server_settings(
         return invalid_config(
             config_path,
             "app.web_server.listen_port must be a number from 1 to 65535",
+        );
+    }
+
+    if let Some(password_hash) = &settings.password_hash {
+        validate_password_hash(config_path, password_hash)?;
+    }
+
+    Ok(())
+}
+
+fn validate_password_hash(
+    config_path: Option<&Path>,
+    password_hash: &str,
+) -> Result<(), ConfigError> {
+    let parts = password_hash.split(':').collect::<Vec<_>>();
+
+    if parts.len() != 3 || parts[0] != "sha256" {
+        return invalid_config(
+            config_path,
+            "app.web_server.password_hash must use sha256:<salt_hex>:<hash_hex>",
+        );
+    }
+
+    if parts[1].len() != 32 || !parts[1].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return invalid_config(
+            config_path,
+            "app.web_server.password_hash salt must be 16 bytes of hex",
+        );
+    }
+
+    if parts[2].len() != 64 || !parts[2].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return invalid_config(
+            config_path,
+            "app.web_server.password_hash digest must be 32 bytes of hex",
         );
     }
 
@@ -1116,6 +1156,13 @@ mod tests {
             .expect_err("zero listen port should fail");
 
         assert!(error.to_string().contains("listen_port must be a number"));
+
+        config.app.web_server.listen_port = DEFAULT_WEB_SERVER_PORT;
+        config.app.web_server.password_hash = Some("plain-password".to_string());
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("plain password hash should fail");
+
+        assert!(error.to_string().contains("password_hash must use sha256"));
     }
 
     #[test]
@@ -1195,6 +1242,20 @@ mod tests {
         let log_json = config.to_redacted_log_json().expect("redacted json");
 
         assert!(!log_json.contains("sk-test-secret"));
+        assert!(log_json.contains(REDACTED_SECRET));
+    }
+
+    #[test]
+    fn web_auth_password_hash_is_redacted_for_logs() {
+        let mut config = GlobalConfig::first_run(PathBuf::from(r"C:\Users\foco\.foco\workspace"));
+        config.app.web_server.password_hash = Some(
+            "sha256:00112233445566778899aabbccddeeff:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+        );
+
+        let log_json = config.to_redacted_log_json().expect("redacted json");
+
+        assert!(!log_json.contains("00112233445566778899aabbccddeeff"));
         assert!(log_json.contains(REDACTED_SECRET));
     }
 

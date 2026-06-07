@@ -17,8 +17,9 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as AxumPath, Query, State, ws::WebSocketUpgrade},
-    http::{StatusCode, header},
+    extract::{Path as AxumPath, Query, Request, State, ws::WebSocketUpgrade},
+    http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -69,6 +70,7 @@ use futures_util::future::join_all;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
@@ -94,6 +96,8 @@ const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
     "Enabled skill front matter loaded from configured skills";
 const ENVIRONMENT_CONTEXT_MESSAGE_PREFIX: &str = "Environment context for this chat";
 const SHUTDOWN_MESSAGE: &str = "app shutdown requested";
+const AUTH_COOKIE_NAME: &str = "foco_auth";
+const PASSWORD_HASH_PREFIX: &str = "sha256";
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -451,8 +455,13 @@ async fn run_server_until_shutdown(shutdown_rx: Option<watch::Receiver<bool>>) -
 }
 
 fn app_router(state: AppState) -> Router {
+    let auth_state = state.clone();
+
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
         .route("/api/workspaces", get(workspaces))
         .route("/api/workspaces/add", post(add_workspace))
         .route("/api/workspaces/manual", post(save_workspace_settings))
@@ -520,6 +529,7 @@ fn app_router(state: AppState) -> Router {
             get(terminal_socket),
         )
         .fallback(static_asset)
+        .layer(middleware::from_fn_with_state(auth_state, require_auth))
         .with_state(state)
 }
 
@@ -527,7 +537,7 @@ fn app_router(state: AppState) -> Router {
 fn run_windows_tray_entrypoint() -> AppResult<()> {
     let loaded_config = load_or_create_global_config()?;
     let addr = local_addr(&loaded_config.config)?;
-    let ui_url = format!("http://{addr}");
+    let ui_url = format!("http://{}", browser_addr_for_listen_addr(addr));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let runtime_thread = std::thread::Builder::new()
         .name("foco-http-runtime".to_string())
@@ -731,6 +741,82 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if auth_route_is_public(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let config = match config_snapshot(&state) {
+        Ok(config) => config,
+        Err(error) => return error.into_response(),
+    };
+
+    if !web_auth_enabled(&config) || request_has_valid_auth_cookie(request.headers(), &config) {
+        return next.run(request).await;
+    }
+
+    ApiError::unauthorized("authentication required").into_response()
+}
+
+fn auth_route_is_public(path: &str) -> bool {
+    path == "/api/health"
+        || path == "/api/auth/status"
+        || path == "/api/auth/login"
+        || path == "/api/auth/logout"
+        || !path.starts_with("/api/")
+}
+
+async fn auth_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AuthStatusResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let enabled = web_auth_enabled(&config);
+    let authenticated = !enabled || request_has_valid_auth_cookie(&headers, &config);
+
+    Ok(Json(AuthStatusResponse {
+        enabled,
+        authenticated,
+    }))
+}
+
+async fn auth_login(
+    State(state): State<AppState>,
+    Json(request): Json<AuthLoginRequest>,
+) -> Result<Response, ApiError> {
+    let config = config_snapshot(&state)?;
+    let Some(password_hash) = config.app.web_server.password_hash.as_deref() else {
+        return Err(ApiError::bad_request("web authentication is not enabled"));
+    };
+
+    if !verify_password(&request.password, password_hash) {
+        return Err(ApiError::unauthorized("invalid password"));
+    }
+
+    let cookie = auth_cookie(password_hash);
+    Ok((
+        [(header::SET_COOKIE, cookie)],
+        Json(AuthStatusResponse {
+            enabled: true,
+            authenticated: true,
+        }),
+    )
+        .into_response())
+}
+
+async fn auth_logout(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let config = config_snapshot(&state)?;
+
+    Ok((
+        [(header::SET_COOKIE, expired_auth_cookie())],
+        Json(AuthStatusResponse {
+            enabled: web_auth_enabled(&config),
+            authenticated: false,
+        }),
+    )
+        .into_response())
+}
+
 async fn static_asset(uri: axum::http::Uri) -> Response {
     let request_path = uri.path().trim_start_matches('/');
     if request_path.starts_with("api/") {
@@ -770,6 +856,12 @@ async fn static_asset(uri: axum::http::Uri) -> Response {
 struct HealthResponse {
     service: &'static str,
     status: &'static str,
+}
+
+#[derive(Serialize)]
+struct AuthStatusResponse {
+    enabled: bool,
+    authenticated: bool,
 }
 
 async fn workspaces(State(state): State<AppState>) -> Result<Json<WorkspacesResponse>, ApiError> {
@@ -898,6 +990,7 @@ async fn select_directory() -> Result<Json<SelectDirectoryResponse>, ApiError> {
 }
 
 fn normalize_web_server_settings(
+    current: &WebServerSettings,
     request: &ManualGeneralSettingsRequest,
 ) -> Result<WebServerSettings, ApiError> {
     let listen_host = request.listen_host.trim();
@@ -918,9 +1011,23 @@ fn normalize_web_server_settings(
         ));
     }
 
+    let password_hash = if request.clear_password.unwrap_or(false) {
+        None
+    } else if let Some(password) = &request.password {
+        if password.trim().is_empty() {
+            return Err(ApiError::bad_request(
+                "web authentication password must not be empty",
+            ));
+        }
+        Some(hash_password(password)?)
+    } else {
+        current.password_hash.clone()
+    };
+
     Ok(WebServerSettings {
         listen_host: listen_host.to_string(),
         listen_port: request.listen_port as u16,
+        password_hash,
     })
 }
 
@@ -954,15 +1061,34 @@ async fn settings(State(state): State<AppState>) -> Result<Json<SettingsResponse
 async fn save_general_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualGeneralSettingsRequest>,
-) -> Result<Json<SettingsResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let mut config = config_snapshot(&state)?;
+    let should_set_auth_cookie = request
+        .password
+        .as_ref()
+        .is_some_and(|password| !password.trim().is_empty());
+    let should_clear_auth_cookie = request.clear_password.unwrap_or(false);
 
-    config.app.web_server = normalize_web_server_settings(&request)?;
+    config.app.web_server = normalize_web_server_settings(&config.app.web_server, &request)?;
     config.app.language = normalize_app_language(&request.language)?;
 
     save_config(&state, config.clone())?;
 
-    settings_response(&state, &config).await
+    let response = settings_response(&state, &config).await?;
+    if should_set_auth_cookie {
+        let password_hash = config
+            .app
+            .web_server
+            .password_hash
+            .as_deref()
+            .ok_or_else(|| ApiError::internal("saved password hash is missing"))?;
+        return Ok(([(header::SET_COOKIE, auth_cookie(password_hash))], response).into_response());
+    }
+    if should_clear_auth_cookie {
+        return Ok(([(header::SET_COOKIE, expired_auth_cookie())], response).into_response());
+    }
+
+    Ok(response.into_response())
 }
 
 async fn save_manual_provider(
@@ -1837,6 +1963,14 @@ struct ManualGeneralSettingsRequest {
     listen_host: String,
     listen_port: u32,
     language: String,
+    password: Option<String>,
+    clear_password: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthLoginRequest {
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -1983,6 +2117,7 @@ struct GeneralSettingsSummary {
 struct WebServerSettingsSummary {
     listen_host: String,
     listen_port: u16,
+    password_enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -4916,6 +5051,13 @@ impl ApiError {
         }
     }
 
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -5190,6 +5332,7 @@ async fn settings_response(
             web_server: WebServerSettingsSummary {
                 listen_host: config.app.web_server.listen_host.clone(),
                 listen_port: config.app.web_server.listen_port,
+                password_enabled: web_auth_enabled(config),
             },
             language: config.app.language.clone(),
             supported_languages: SUPPORTED_APP_LANGUAGES
@@ -5380,7 +5523,7 @@ fn skills_settings_summary(
     SkillsSettingsSummary {
         directories: skill_search_roots(user_profile_dir, &config.workspaces)
             .iter()
-            .map(|root| root.directory.display().to_string())
+            .map(|root| display_path(&root.directory))
             .collect(),
         detected: discovery
             .skills
@@ -7195,6 +7338,128 @@ fn parse_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+#[cfg(any(test, all(windows, not(debug_assertions))))]
+fn browser_addr_for_listen_addr(addr: SocketAddr) -> SocketAddr {
+    let host = match addr.ip() {
+        IpAddr::V4(ip) if ip.octets() == [0, 0, 0, 0] => IpAddr::from([127, 0, 0, 1]),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::from([0, 0, 0, 0, 0, 0, 0, 1]),
+        ip => ip,
+    };
+
+    SocketAddr::from((host, addr.port()))
+}
+
+fn web_auth_enabled(config: &GlobalConfig) -> bool {
+    config.app.web_server.password_hash.is_some()
+}
+
+fn request_has_valid_auth_cookie(headers: &HeaderMap, config: &GlobalConfig) -> bool {
+    let Some(password_hash) = config.app.web_server.password_hash.as_deref() else {
+        return true;
+    };
+
+    headers
+        .get(header::COOKIE)
+        .and_then(|header| header.to_str().ok())
+        .and_then(|cookie| cookie_value(cookie, AUTH_COOKIE_NAME))
+        .is_some_and(|value| constant_time_eq(value.as_bytes(), password_hash.as_bytes()))
+}
+
+fn cookie_value(cookie: &str, name: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let (cookie_name, cookie_value) = part.trim().split_once('=')?;
+        (cookie_name == name).then(|| cookie_value.to_string())
+    })
+}
+
+fn auth_cookie(password_hash: &str) -> String {
+    format!("{AUTH_COOKIE_NAME}={password_hash}; Path=/; HttpOnly; SameSite=Strict")
+}
+
+fn expired_auth_cookie() -> String {
+    format!("{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+}
+
+fn hash_password(password: &str) -> Result<String, ApiError> {
+    let mut salt = [0u8; 16];
+    getrandom::fill(&mut salt).map_err(|source| {
+        ApiError::internal(format!("failed to generate password salt: {source}"))
+    })?;
+    let digest = password_digest(&salt, password);
+
+    Ok(format!(
+        "{PASSWORD_HASH_PREFIX}:{}:{}",
+        hex_encode(&salt),
+        hex_encode(&digest)
+    ))
+}
+
+fn verify_password(password: &str, password_hash: &str) -> bool {
+    let Some((algorithm, rest)) = password_hash.split_once(':') else {
+        return false;
+    };
+    let Some((salt_hex, digest_hex)) = rest.split_once(':') else {
+        return false;
+    };
+
+    if algorithm != PASSWORD_HASH_PREFIX {
+        return false;
+    }
+
+    let Some(salt) = hex_decode(salt_hex) else {
+        return false;
+    };
+    let Some(expected_digest) = hex_decode(digest_hex) else {
+        return false;
+    };
+
+    let actual_digest = password_digest(&salt, password);
+    constant_time_eq(&actual_digest, &expected_digest)
+}
+
+fn password_digest(salt: &[u8], password: &str) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(salt);
+    hasher.update(password.as_bytes());
+    hasher.finalize().to_vec()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push_str(&format!("{byte:02x}"));
+    }
+    value
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if value.len() % 2 != 0 {
+        return None;
+    }
+
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let text = std::str::from_utf8(chunk).ok()?;
+            u8::from_str_radix(text, 16).ok()
+        })
+        .collect()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let diff = left
+        .iter()
+        .zip(right.iter())
+        .fold(0u8, |acc, (left, right)| acc | (left ^ right));
+
+    diff == 0
+}
+
 fn verify_frontend_assets() -> Result<(), String> {
     if WebAssets::get("index.html").is_some() {
         return Ok(());
@@ -7216,6 +7481,87 @@ fn verify_frontend_assets() -> Result<(), String> {
 mod tests {
     use super::*;
     use foco_store::config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
+
+    #[test]
+    fn password_hash_verifies_only_matching_password() {
+        let password_hash = hash_password("secret").expect("password hash");
+
+        assert!(password_hash.starts_with("sha256:"));
+        assert!(verify_password("secret", &password_hash));
+        assert!(!verify_password(" secret ", &password_hash));
+        assert!(!verify_password("wrong", &password_hash));
+    }
+
+    #[test]
+    fn browser_open_addr_uses_loopback_for_unspecified_listen_hosts() {
+        assert_eq!(
+            browser_addr_for_listen_addr(SocketAddr::from(([0, 0, 0, 0], 3210))).to_string(),
+            "127.0.0.1:3210"
+        );
+        assert_eq!(
+            browser_addr_for_listen_addr(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 3210)))
+                .to_string(),
+            "[::1]:3210"
+        );
+        assert_eq!(
+            browser_addr_for_listen_addr(SocketAddr::from(([192, 168, 1, 10], 3210))).to_string(),
+            "192.168.1.10:3210"
+        );
+    }
+
+    #[test]
+    fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
+        let current = WebServerSettings {
+            listen_host: "127.0.0.1".to_string(),
+            listen_port: 3210,
+            password_hash: Some(hash_password("old-password").expect("old password hash")),
+        };
+
+        let preserved = normalize_web_server_settings(
+            &current,
+            &ManualGeneralSettingsRequest {
+                clear_password: None,
+                language: "en".to_string(),
+                listen_host: "0.0.0.0".to_string(),
+                listen_port: 3211,
+                password: None,
+            },
+        )
+        .expect("preserve password hash");
+        assert_eq!(preserved.password_hash, current.password_hash);
+
+        let updated = normalize_web_server_settings(
+            &current,
+            &ManualGeneralSettingsRequest {
+                clear_password: None,
+                language: "en".to_string(),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: 3210,
+                password: Some("new-password".to_string()),
+            },
+        )
+        .expect("update password hash");
+        assert!(verify_password(
+            "new-password",
+            updated
+                .password_hash
+                .as_deref()
+                .expect("updated password hash")
+        ));
+
+        let cleared = normalize_web_server_settings(
+            &current,
+            &ManualGeneralSettingsRequest {
+                clear_password: Some(true),
+                language: "en".to_string(),
+                listen_host: "127.0.0.1".to_string(),
+                listen_port: 3210,
+                password: Some("ignored".to_string()),
+            },
+        )
+        .expect("clear password hash");
+        assert!(cleared.password_hash.is_none());
+    }
 
     #[test]
     fn parse_skill_markdown_requires_description() {
@@ -7520,6 +7866,23 @@ description: Project memory.
     }
 
     #[test]
+    fn skills_settings_summary_strips_windows_verbatim_directory_prefixes() {
+        let user_profile_dir = PathBuf::from(r"\\?\C:\Users\fonla");
+        let mut config =
+            GlobalConfig::first_run(PathBuf::from(r"\\?\C:\Users\fonla\.foco\workspace"));
+        config.workspaces[0].path = PathBuf::from(r"\\?\C:\Users\fonla\Projects\Foco");
+
+        let summary = skills_settings_summary(&config, &user_profile_dir);
+
+        assert!(
+            summary
+                .directories
+                .iter()
+                .all(|directory| !directory.starts_with(r"\\?\"))
+        );
+    }
+
+    #[test]
     fn discover_skills_ignores_missing_directories() {
         let profile_dir = env::temp_dir().join(unique_id("foco-missing-skill-profile-test"));
         let workspace_dir = env::temp_dir().join(unique_id("foco-missing-skill-test"));
@@ -7539,7 +7902,7 @@ description: Project memory.
         assert!(discovery.errors.is_empty());
         assert!(discovery.skills.is_empty());
 
-        fs::remove_dir_all(profile_dir).expect("remove profile directory");
+        remove_dir_if_exists(&profile_dir);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }
 
@@ -7567,7 +7930,7 @@ description: Project memory.
         assert!(messages[1].content.contains("Codex instructions."));
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
-        fs::remove_dir_all(profile_dir).expect("remove profile directory");
+        remove_dir_if_exists(&profile_dir);
     }
 
     #[test]
@@ -8218,7 +8581,7 @@ Search memory before repo work.
         );
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
-        fs::remove_dir_all(profile_dir).expect("remove profile directory");
+        remove_dir_if_exists(&profile_dir);
     }
 
     #[tokio::test]
@@ -8312,7 +8675,7 @@ Use the existing product UI conventions.
         }
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
-        fs::remove_dir_all(profile_dir).expect("remove profile directory");
+        remove_dir_if_exists(&profile_dir);
     }
 
     #[test]
@@ -8465,6 +8828,12 @@ description: Project memory.
             .iter()
             .map(|workspace| workspace.id.as_str())
             .collect()
+    }
+
+    fn remove_dir_if_exists(path: &Path) {
+        if path.exists() {
+            fs::remove_dir_all(path).expect("remove test directory");
+        }
     }
 
     fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {

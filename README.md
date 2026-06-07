@@ -19,10 +19,10 @@ npm run backend
 ```
 
 The backend binds to `127.0.0.1:3210` by default. The settings page General tab
-persists the web service listen host, port, and UI language to
-`%USERPROFILE%\.foco\config.json`. Restart the backend after changing host or
-port; language changes apply immediately in the current browser UI. Set
-`FOCO_HOST` or `FOCO_PORT` for a one-off startup override.
+persists the web service listen address, port, browser authentication password,
+and UI language to `%USERPROFILE%\.foco\config.json`. Restart the backend after
+changing address or port; language changes apply immediately in the current
+browser UI. Set `FOCO_HOST` or `FOCO_PORT` for a one-off startup override.
 
 On first startup, Foco creates `%USERPROFILE%\.foco`, writes
 `%USERPROFILE%\.foco\config.json`, registers a `Default` workspace at
@@ -87,7 +87,9 @@ npm run frontend
 
 On Windows release builds, double-clicking `foco.exe` starts the local HTTP
 server in the background and keeps Foco in the system tray. Use the tray menu to
-open the local web UI in the browser or quit Foco cleanly.
+open the local web UI in the browser or quit Foco cleanly. When the configured
+listen address is `0.0.0.0`, Open Foco still opens `127.0.0.1` for local browser
+access.
 
 The repository-root `foco.svg` is the single icon source. Vite publishes it as
 the web favicon and the browser UI logo, and Windows builds generate and embed

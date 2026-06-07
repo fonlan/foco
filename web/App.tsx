@@ -9,6 +9,7 @@ import {
   CircleAlert,
   Copy,
   Eye,
+  EyeOff,
   Folder,
   FolderPlus,
   FolderSearch,
@@ -166,6 +167,7 @@ type ConfiguredProviderSummary = {
 type WebServerSettingsSummary = {
   listenHost: string;
   listenPort: number;
+  passwordEnabled: boolean;
 };
 
 type AppLanguageId = "en" | "zh-CN";
@@ -222,6 +224,12 @@ type GeneralFormState = {
   language: string;
   listenHost: string;
   listenPort: string;
+  password: string;
+};
+
+type AuthStatusResponse = {
+  authenticated: boolean;
+  enabled: boolean;
 };
 
 type WorkspaceFormState = {
@@ -517,6 +525,7 @@ type ViewMode = "chat" | "settings" | "stats";
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
+const SAVED_PASSWORD_MASK = "********";
 const AI_STATS_COLUMN_IDS = [
   "requestTime",
   "workspace",
@@ -744,8 +753,25 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Model metadata has not been refreshed": "尚未刷新模型元数据",
     "Refresh model metadata": "刷新模型元数据",
     "Web service": "Web 服务",
-    "Listen host": "监听 host",
+    "Listen address": "监听地址",
     "Listen port": "监听端口",
+    "Browser authentication": "浏览器认证",
+    "Authentication password": "认证密码",
+    "Password required": "需要密码",
+    Password: "密码",
+    "Show password": "显示密码",
+    "Hide password": "隐藏密码",
+    "Log in": "登录",
+    "Log out": "退出登录",
+    "Password is enabled": "已启用密码",
+    "Password is disabled": "未启用密码",
+    "New password is kept empty unless changed.":
+      "不填写则保留当前密码。",
+    "Saved password cannot be revealed; type a new password to preview it.":
+      "已保存的密码无法显示；输入新密码后可预览。",
+    "Set a password to require browser login.":
+      "设置密码后，浏览器访问需要先登录。",
+    "Clear browser password": "清除浏览器密码",
     Language: "语言",
     "Save general settings": "保存常规设置",
     Save: "保存",
@@ -964,6 +990,10 @@ type QuestionAnswerSubmission = {
 };
 
 export function App() {
+  const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
+  const [authPassword, setAuthPassword] = useState("");
+  const [isCheckingAuth, setIsCheckingAuth] = useState(true);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>("");
   const [expandedWorkspaceIds, setExpandedWorkspaceIds] = useState<Set<string>>(
@@ -1059,6 +1089,7 @@ export function App() {
     : false;
   const isGlobalView = viewMode === "settings" || viewMode === "stats";
   const showDiffPanel = !isGlobalView && isDiffPanelOpen;
+  const canLogout = Boolean(settings?.general.webServer.passwordEnabled);
   const language = settings?.general.language ?? "en";
   const t = useCallback<Translate>(
     (key, values) => translate(key, values, language),
@@ -1073,6 +1104,20 @@ export function App() {
     activeChatKeyRef.current =
       activeChatId === null ? null : chatRunKey(activeWorkspaceId, activeChatId);
   }, [activeChatId, activeWorkspaceId]);
+
+  const loadAuthStatus = useCallback(async () => {
+    setIsCheckingAuth(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<AuthStatusResponse>("/api/auth/status");
+      setAuthStatus(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsCheckingAuth(false);
+    }
+  }, []);
 
   const refreshWorkspaces = useCallback(async () => {
     setIsLoading(true);
@@ -1183,12 +1228,17 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    void refreshWorkspaces();
-  }, [refreshWorkspaces]);
+    void loadAuthStatus();
+  }, [loadAuthStatus]);
 
   useEffect(() => {
+    if (!authStatus?.authenticated) {
+      return;
+    }
+
+    void refreshWorkspaces();
     void loadSettings();
-  }, [loadSettings]);
+  }, [authStatus?.authenticated, loadSettings, refreshWorkspaces]);
 
   useEffect(() => {
     if (!activeWorkspace?.id) {
@@ -1864,6 +1914,7 @@ export function App() {
             thinkingLevel: request.thinkingLevel || null,
           }),
           cache: "no-store",
+          credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
           method: "POST",
           signal: abortController.signal,
@@ -2125,6 +2176,67 @@ export function App() {
     setIsWorkspaceDialogOpen(true);
   }
 
+  async function handleLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsLoggingIn(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<AuthStatusResponse>("/api/auth/login", {
+        body: JSON.stringify({ password: authPassword }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setAuthStatus(data);
+      setAuthPassword("");
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsLoggingIn(false);
+    }
+  }
+
+  async function handleLogout() {
+    setError(null);
+
+    try {
+      const data = await requestJson<AuthStatusResponse>("/api/auth/logout", {
+        method: "POST",
+      });
+      setAuthStatus(data);
+      setWorkspaces([]);
+      setSettings(null);
+      setOpenChatTabs([]);
+      setActiveChatId(null);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
+  }
+
+  if (isCheckingAuth) {
+    return (
+      <I18nContext.Provider value={{ language, t }}>
+        <main className="app-root grid place-items-center bg-stone-100 text-stone-950">
+          <LoaderCircle aria-hidden="true" className="size-6 animate-spin text-teal-700" />
+        </main>
+      </I18nContext.Provider>
+    );
+  }
+
+  if (authStatus?.enabled && !authStatus.authenticated) {
+    return (
+      <I18nContext.Provider value={{ language, t }}>
+        <LoginView
+          error={error}
+          isLoggingIn={isLoggingIn}
+          onLogin={(event) => void handleLogin(event)}
+          onPasswordChange={setAuthPassword}
+          password={authPassword}
+        />
+      </I18nContext.Provider>
+    );
+  }
+
   return (
     <I18nContext.Provider value={{ language, t }}>
     <main className="app-root text-stone-950">
@@ -2189,7 +2301,9 @@ export function App() {
           </header>
           {viewMode === "settings" ? (
             <SettingsPanel
+              canLogout={canLogout}
               onAddWorkspace={openWorkspaceDialog}
+              onLogout={handleLogout}
               onSettingsChange={setSettings}
               onWorkspacesChange={refreshWorkspaces}
               workspaceDialogRevision={workspaceDialogRevision}
@@ -5659,12 +5773,16 @@ function GitDiffPanel({
 }
 
 function SettingsPanel({
+  canLogout,
   onAddWorkspace,
+  onLogout,
   onSettingsChange,
   onWorkspacesChange,
   workspaceDialogRevision,
 }: {
+  canLogout: boolean;
   onAddWorkspace: () => void;
+  onLogout: () => Promise<void>;
   onSettingsChange: (settings: SettingsResponse) => void;
   onWorkspacesChange: () => Promise<void>;
   workspaceDialogRevision: number;
@@ -5701,6 +5819,7 @@ function SettingsPanel({
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isSavingGeneral, setIsSavingGeneral] = useState(false);
+  const [isClearingPassword, setIsClearingPassword] = useState(false);
   const [isSavingLanguage, setIsSavingLanguage] = useState(false);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [isSavingWorkspaceOrder, setIsSavingWorkspaceOrder] = useState(false);
@@ -5725,6 +5844,8 @@ function SettingsPanel({
     Record<string, ProviderTestState>
   >({});
   const [error, setError] = useState<string | null>(null);
+  const [isGeneralPasswordVisible, setIsGeneralPasswordVisible] = useState(false);
+  const [isEditingGeneralPassword, setIsEditingGeneralPassword] = useState(false);
 
   const selectedMetadata = useMemo(
     () =>
@@ -5768,6 +5889,11 @@ function SettingsPanel({
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const configuredModels =
     settings?.configuredModels ?? metadata?.configuredModels ?? [];
+  const passwordInputValue =
+    generalForm.password ||
+    (settings?.general.webServer.passwordEnabled && !isEditingGeneralPassword
+      ? SAVED_PASSWORD_MASK
+      : "");
   const orderedConfiguredModels = useMemo(() => {
     if (!modelOrderPreview) {
       return configuredModels;
@@ -5826,10 +5952,13 @@ function SettingsPanel({
   }
 
   function syncGeneralForm(data: SettingsResponse) {
+    setIsEditingGeneralPassword(false);
+    setIsGeneralPasswordVisible(false);
     setGeneralForm({
       language: data.general.language,
       listenHost: data.general.webServer.listenHost,
       listenPort: String(data.general.webServer.listenPort),
+      password: "",
     });
   }
 
@@ -6052,14 +6181,17 @@ function SettingsPanel({
     setError(null);
 
     try {
+      const password = generalForm.password;
       const data = await requestJson<SettingsResponse>("/api/settings/general", {
         body: JSON.stringify({
+          clearPassword: false,
           listenHost: generalForm.listenHost,
           listenPort: optionalPositiveInteger(
             generalForm.listenPort,
             t("Listen port"),
           ),
           language: generalForm.language,
+          password: password.trim() ? password : null,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -6090,9 +6222,11 @@ function SettingsPanel({
     try {
       const data = await requestJson<SettingsResponse>("/api/settings/general", {
         body: JSON.stringify({
+          clearPassword: false,
           listenHost: settings.general.webServer.listenHost,
           listenPort: settings.general.webServer.listenPort,
           language,
+          password: null,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -6111,6 +6245,36 @@ function SettingsPanel({
       }));
     } finally {
       setIsSavingLanguage(false);
+    }
+  }
+
+  async function clearBrowserPassword() {
+    if (!settings?.general.webServer.passwordEnabled) {
+      return;
+    }
+
+    setIsClearingPassword(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings/general", {
+        body: JSON.stringify({
+          clearPassword: true,
+          listenHost: settings.general.webServer.listenHost,
+          listenPort: settings.general.webServer.listenPort,
+          language: settings.general.language,
+          password: null,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncGeneralForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsClearingPassword(false);
     }
   }
 
@@ -6791,7 +6955,7 @@ function SettingsPanel({
             </div>
             <div className="mt-4 grid gap-3">
               <TextField
-                label={t("Listen host")}
+                label={t("Listen address")}
                 onChange={(value) =>
                   setGeneralForm((current) => ({
                     ...current,
@@ -6813,6 +6977,124 @@ function SettingsPanel({
                 placeholder="3210"
                 value={generalForm.listenPort}
               />
+            </div>
+            <div className="mt-4 border-t border-stone-200 pt-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <Lock aria-hidden="true" className="size-4 text-teal-700" />
+                  <h4 className="text-sm font-semibold text-stone-950">
+                    {t("Browser authentication")}
+                  </h4>
+                </div>
+                <CapabilityPill
+                  label={
+                    settings?.general.webServer.passwordEnabled
+                      ? t("Password is enabled")
+                      : t("Password is disabled")
+                  }
+                  ok={Boolean(settings?.general.webServer.passwordEnabled)}
+                />
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                {canLogout ? (
+                  <button
+                    aria-label={t("Log out")}
+                    className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                    onClick={() => void onLogout()}
+                    title={t("Log out")}
+                    type="button"
+                  >
+                    <Lock aria-hidden="true" className="size-4" />
+                    {t("Log out")}
+                  </button>
+                ) : null}
+                <button
+                  aria-label={t("Clear browser password")}
+                  className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:border-stone-200 disabled:bg-stone-100 disabled:text-stone-400"
+                  disabled={
+                    isClearingPassword ||
+                    !settings?.general.webServer.passwordEnabled
+                  }
+                  onClick={() => void clearBrowserPassword()}
+                  title={t("Clear browser password")}
+                  type="button"
+                >
+                  {isClearingPassword ? (
+                    <LoaderCircle
+                      aria-hidden="true"
+                      className="size-4 animate-spin"
+                    />
+                  ) : (
+                    <X aria-hidden="true" className="size-4" />
+                  )}
+                  {t("Clear browser password")}
+                </button>
+              </div>
+              <div className="mt-3 grid gap-3">
+                <div className="grid gap-2">
+                  <label className="block min-w-0">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Authentication password")}
+                    </span>
+                    <span className="relative block">
+                      <input
+                        autoComplete="new-password"
+                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 pr-10 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) =>
+                          setGeneralForm((current) => ({
+                            ...current,
+                            password: event.target.value,
+                          }))
+                        }
+                        onBlur={() => {
+                          if (!generalForm.password) {
+                            setIsEditingGeneralPassword(false);
+                          }
+                        }}
+                        onFocus={() => setIsEditingGeneralPassword(true)}
+                        placeholder={
+                          settings?.general.webServer.passwordEnabled
+                            ? t("New password is kept empty unless changed.")
+                            : t("Set a password to require browser login.")
+                        }
+                        type={isGeneralPasswordVisible ? "text" : "password"}
+                        value={passwordInputValue}
+                      />
+                      <button
+                        aria-label={
+                          isGeneralPasswordVisible
+                            ? t("Hide password")
+                            : t("Show password")
+                        }
+                        className="absolute right-1 top-1 inline-flex size-8 items-center justify-center rounded-md text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+                        disabled={!generalForm.password}
+                        onClick={() =>
+                          setIsGeneralPasswordVisible((current) => !current)
+                        }
+                        title={
+                          isGeneralPasswordVisible
+                            ? t("Hide password")
+                            : t("Show password")
+                        }
+                        type="button"
+                      >
+                        {isGeneralPasswordVisible ? (
+                          <EyeOff aria-hidden="true" className="size-4" />
+                        ) : (
+                          <Eye aria-hidden="true" className="size-4" />
+                        )}
+                      </button>
+                    </span>
+                    {settings?.general.webServer.passwordEnabled ? (
+                      <span className="mt-1 block text-xs text-stone-500">
+                        {t(
+                          "Saved password cannot be revealed; type a new password to preview it.",
+                        )}
+                      </span>
+                    ) : null}
+                  </label>
+                </div>
+              </div>
             </div>
             <label className="mt-4 block">
               <span className="mb-1.5 block text-xs font-semibold text-stone-600">
@@ -7745,44 +8027,6 @@ function SettingsPanel({
 
         {activeSection === "skills" ? (
         <section className="grid gap-4">
-          <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-            <div className="flex items-center gap-2">
-              <Wrench aria-hidden="true" className="size-5 text-teal-700" />
-              <h3 className="text-sm font-semibold text-stone-950">
-                {t("Skill locations")}
-              </h3>
-            </div>
-            <div className="mt-4 grid gap-2">
-              {skills?.directories.length ? (
-                skills.directories.map((directory) => (
-                  <div
-                    className="break-all rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-medium text-stone-600"
-                    key={directory}
-                  >
-                    {directory}
-                  </div>
-                ))
-              ) : (
-                <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-500">
-                  {t("Loading...")}
-                </div>
-              )}
-            </div>
-            {skills?.errors.length ? (
-              <div className="mt-4 space-y-2">
-                {skills.errors.map((skillError) => (
-                  <div
-                    className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
-                    key={`${skillError.path}-${skillError.message}`}
-                  >
-                    <div className="break-all font-medium">{skillError.path}</div>
-                    <div className="mt-1 break-words">{skillError.message}</div>
-                  </div>
-                ))}
-              </div>
-            ) : null}
-          </section>
-
           <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
             <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
               <h3 className="text-sm font-semibold text-stone-950">
@@ -7870,6 +8114,44 @@ function SettingsPanel({
                 </div>
               )}
             </div>
+          </section>
+
+          <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center gap-2">
+              <Wrench aria-hidden="true" className="size-5 text-teal-700" />
+              <h3 className="text-sm font-semibold text-stone-950">
+                {t("Skill locations")}
+              </h3>
+            </div>
+            <div className="mt-4 grid gap-2">
+              {skills?.directories.length ? (
+                skills.directories.map((directory) => (
+                  <div
+                    className="break-all rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-medium text-stone-600"
+                    key={directory}
+                  >
+                    {directory}
+                  </div>
+                ))
+              ) : (
+                <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-500">
+                  {t("Loading...")}
+                </div>
+              )}
+            </div>
+            {skills?.errors.length ? (
+              <div className="mt-4 space-y-2">
+                {skills.errors.map((skillError) => (
+                  <div
+                    className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
+                    key={`${skillError.path}-${skillError.message}`}
+                  >
+                    <div className="break-all font-medium">{skillError.path}</div>
+                    <div className="mt-1 break-words">{skillError.message}</div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </section>
         </section>
         ) : null}
@@ -8514,17 +8796,85 @@ function SettingsNavButton({
   );
 }
 
+function LoginView({
+  error,
+  isLoggingIn,
+  onLogin,
+  onPasswordChange,
+  password,
+}: {
+  error: string | null;
+  isLoggingIn: boolean;
+  onLogin: (event: FormEvent<HTMLFormElement>) => void;
+  onPasswordChange: (value: string) => void;
+  password: string;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <main className="app-root grid place-items-center bg-stone-100 px-4 text-stone-950">
+      <form
+        aria-label={t("Foco authentication")}
+        className="w-full max-w-sm rounded-2xl border border-stone-200 bg-white/90 px-4 py-5 shadow-[0_24px_70px_rgba(33,31,28,0.16)]"
+        onSubmit={onLogin}
+      >
+        <div className="flex items-center gap-3">
+          <FocoLogoMark />
+          <div className="min-w-0">
+            <h1 className="text-lg font-semibold text-stone-950">Foco</h1>
+            <p className="mt-1 text-xs font-medium text-stone-500">
+              {t("Password required")}
+            </p>
+          </div>
+        </div>
+        <label className="mt-5 block">
+          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+            {t("Password")}
+          </span>
+          <input
+            autoComplete="current-password"
+            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+            onChange={(event) => onPasswordChange(event.target.value)}
+            type="password"
+            value={password}
+          />
+        </label>
+        {error ? (
+          <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+            {error}
+          </div>
+        ) : null}
+        <button
+          aria-label={t("Log in")}
+          className="mt-4 inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+          disabled={isLoggingIn || !password.trim()}
+          type="submit"
+        >
+          {isLoggingIn ? (
+            <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+          ) : (
+            <Lock aria-hidden="true" className="size-4" />
+          )}
+          {t("Log in")}
+        </button>
+      </form>
+    </main>
+  );
+}
+
 function TextField({
   inputMode,
   label,
   onChange,
   placeholder,
+  type = "text",
   value,
 }: {
   inputMode?: "numeric";
   label: string;
   onChange: (value: string) => void;
   placeholder: string;
+  type?: "password" | "text";
   value: string;
 }) {
   return (
@@ -8539,6 +8889,7 @@ function TextField({
         name={label.toLowerCase().replace(/\s+/g, "-")}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
+        type={type}
         value={value}
       />
     </label>
@@ -8609,6 +8960,7 @@ function emptyGeneralForm(): GeneralFormState {
     language: "en",
     listenHost: "127.0.0.1",
     listenPort: "3210",
+    password: "",
   };
 }
 
@@ -10184,7 +10536,11 @@ async function requestJson<T>(
   url: string,
   init?: RequestInit,
 ): Promise<T> {
-  const response = await fetch(url, { cache: "no-store", ...init });
+  const response = await fetch(url, {
+    cache: "no-store",
+    credentials: "same-origin",
+    ...init,
+  });
   const contentType = response.headers.get("content-type") ?? "";
   const data = contentType.includes("application/json")
     ? ((await response.json()) as unknown)

@@ -51,7 +51,11 @@ const settings = {
       { id: "en", name: "English" },
       { id: "zh-CN", name: "简体中文" },
     ],
-    webServer: { listenHost: "127.0.0.1", listenPort: 3210 },
+    webServer: {
+      listenHost: "127.0.0.1",
+      listenPort: 3210,
+      passwordEnabled: false,
+    },
   },
   mcpServers: [
     {
@@ -227,6 +231,16 @@ const savedSettings = {
     skills: {
       ...settings.skills,
       directories: ["C:\\Users\\fonla\\.agents\\skills", ".agents\\skills"],
+    },
+  },
+  general: {
+    ...settings,
+    general: {
+      ...settings.general,
+      webServer: {
+        ...settings.general.webServer,
+        passwordEnabled: true,
+      },
     },
   },
   workspace: {
@@ -595,6 +609,7 @@ describe("App verification surfaces", () => {
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
     expect(await screen.findByText("General settings")).toBeInTheDocument();
     expect(screen.getByText("127.0.0.1:3210")).toBeInTheDocument();
+    expect(screen.getByText("Password is disabled")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Providers" }));
     expect(screen.getByText("Configured providers")).toBeInTheDocument();
@@ -619,6 +634,71 @@ describe("App verification surfaces", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByText("Global skill")).toBeInTheDocument();
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
+  });
+
+  it("logs in before loading the browser UI when authentication is enabled", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+
+      if (path === "/api/auth/status") {
+        return jsonResponse({ authenticated: false, enabled: true });
+      }
+
+      if (path === "/api/auth/login") {
+        expect(init?.body).toBe(JSON.stringify({ password: "secret" }));
+        return jsonResponse({ authenticated: true, enabled: true });
+      }
+
+      return mockFetch(input);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText("Password required")).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("Password"), "secret");
+    await userEvent.click(screen.getByRole("button", { name: "Log in" }));
+
+    expect(await screen.findByText("Tool run")).toBeInTheDocument();
+  });
+
+  it("saves browser authentication password from general settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const passwordInput = await screen.findByLabelText("Authentication password");
+    expect(passwordInput).toHaveAttribute("type", "password");
+    expect(screen.queryByRole("button", { name: "Log out" })).not.toBeInTheDocument();
+
+    await userEvent.type(passwordInput, "secret");
+    await userEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(passwordInput).toHaveAttribute("type", "text");
+    expect(screen.queryByRole("checkbox", { name: "Clear browser password" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clear browser password" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Save general settings" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/general",
+        expect.objectContaining({
+          body: expect.stringContaining('"password":"secret"'),
+          method: "POST",
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(passwordInput).toHaveValue("********");
+    });
+    expect(screen.getByRole("button", { name: "Show password" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Log out" })).toBeInTheDocument();
+
+    await userEvent.click(passwordInput);
+    await userEvent.type(passwordInput, "replacement");
+    await userEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(passwordInput).toHaveAttribute("type", "text");
+    expect(passwordInput).toHaveValue("replacement");
   });
 
   it("saves provider, model, MCP server, and skill settings", async () => {
@@ -763,7 +843,7 @@ describe("App verification surfaces", () => {
   it("opens the task graph sidebar when a task graph refresh arrives", async () => {
     render(<App />);
 
-    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "plan");
+    await userEvent.type(await screen.findByPlaceholderText("Message Foco"), "plan");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(activeChatStreamController).not.toBeNull());
 
@@ -815,6 +895,18 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
   const url = typeof input === "string" ? input : input.toString();
   const path = url.startsWith("http://127.0.0.1") ? new URL(url).pathname : url.split("?")[0];
 
+  if (path === "/api/auth/status") {
+    return jsonResponse({ authenticated: true, enabled: false });
+  }
+
+  if (path === "/api/auth/login") {
+    return jsonResponse({ authenticated: true, enabled: true });
+  }
+
+  if (path === "/api/auth/logout") {
+    return jsonResponse({ authenticated: false, enabled: true });
+  }
+
   if (path === "/api/workspaces") {
     return jsonResponse({ activeWorkspaceId: workspace.id, workspaces: [workspace] });
   }
@@ -842,6 +934,10 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
 
   if (path === "/api/settings") {
     return jsonResponse(settings);
+  }
+
+  if (path === "/api/settings/general") {
+    return jsonResponse(savedSettings.general);
   }
 
   if (path === "/api/workspaces/manual" || path === "/api/workspaces/order") {
