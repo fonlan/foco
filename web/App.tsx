@@ -3313,6 +3313,17 @@ function ChatPanel({
   const selectedSkills = selectedSkillIds
     .map((skillId) => skills.find((skill) => skill.key === skillId))
     .filter((skill): skill is ConfiguredSkillSummary => Boolean(skill));
+  const modelOptions = availableModels.map((model) => ({
+    label: model.displayName,
+    value: model.id,
+  }));
+  const thinkingOptions = [
+    { label: t("Model default"), value: "" },
+    ...thinkingLevels.map((level) => ({
+      label: t(level.label),
+      value: level.value,
+    })),
+  ];
   const visibleSkills =
     skillQuery === null
       ? []
@@ -3564,42 +3575,31 @@ function ChatPanel({
                 </div>
               </div>
             ) : null}
-            <div className="message-composer-actions flex flex-wrap items-center gap-2 border-t border-stone-100 px-2 py-2">
-              <label className="min-w-36 flex-1 sm:max-w-64">
-                <span className="sr-only">{t("Model")}</span>
-                <select
-                  className="h-8 w-full rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  disabled={isLoadingSettings || isSendingMessage}
-                  onChange={(event) => onModelChange(event.target.value)}
-                  value={selectedModelId}
-                >
-                  {availableModels.length ? (
-                    availableModels.map((model) => (
-                      <option key={model.id} value={model.id}>
-                        {model.displayName}
-                      </option>
-                    ))
-                  ) : (
-                    <option value="">{t("No enabled models")}</option>
-                  )}
-                </select>
-              </label>
-              <label className="w-36 max-w-full">
-                <span className="sr-only">{t("Thinking")}</span>
-                <select
-                  className="h-8 w-full rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  disabled={isSendingMessage}
-                  onChange={(event) => onThinkingLevelChange(event.target.value)}
-                  value={selectedThinkingLevel}
-                >
-                  <option value="">{t("Model default")}</option>
-                  {thinkingLevels.map((level) => (
-                    <option key={level.value} value={level.value}>
-                      {t(level.label)}
-                    </option>
-                  ))}
-                </select>
-              </label>
+            <div
+              className={`message-composer-actions flex flex-wrap items-center gap-2 border-t border-stone-100 px-2 py-2 ${
+                canRetryRun ? "message-composer-actions-with-retry" : ""
+              }`}
+            >
+              <ComposerSelectMenu
+                ariaLabel={t("Model")}
+                className="composer-model-select max-w-full"
+                disabled={isLoadingSettings || isSendingMessage || !modelOptions.length}
+                emptyLabel={t("No enabled models")}
+                icon={Bot}
+                onChange={onModelChange}
+                options={modelOptions}
+                selectedValue={selectedModelId}
+              />
+              <ComposerSelectMenu
+                ariaLabel={t("Thinking")}
+                className="composer-thinking-select max-w-full"
+                disabled={isSendingMessage}
+                emptyLabel={t("Model default")}
+                icon={SlidersHorizontal}
+                onChange={onThinkingLevelChange}
+                options={thinkingOptions}
+                selectedValue={selectedThinkingLevel}
+              />
               <BranchSelector
                 branches={gitBranches?.branches ?? []}
                 currentBranch={selectedGitBranch}
@@ -3611,7 +3611,7 @@ function ChatPanel({
             {canRetryRun ? (
               <button
                 aria-label={t("Retry last run")}
-                className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                className="composer-retry-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                 onClick={onRetryRun}
                 title={t("Retry last run")}
                 type="button"
@@ -3622,7 +3622,7 @@ function ChatPanel({
               {isSendingMessage ? (
                 <button
                   aria-label={t("Cancel run")}
-                  className="ml-auto inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                  className="composer-run-button ml-auto inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
                   onClick={onCancelRun}
                   title={t("Cancel run")}
                   type="button"
@@ -3632,7 +3632,7 @@ function ChatPanel({
               ) : (
                 <button
                   aria-label={t("Send message")}
-                  className="ml-auto inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                  className="composer-run-button ml-auto inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
                   disabled={!draftMessage.trim() || !selectedModelId}
                   title={t("Send")}
                   type="submit"
@@ -3650,6 +3650,84 @@ function ChatPanel({
         </form>
       </div>
     </div>
+  );
+}
+
+type ComposerSelectOption = {
+  label: string;
+  value: string;
+};
+
+function ComposerSelectMenu({
+  ariaLabel,
+  className,
+  disabled,
+  emptyLabel,
+  icon: Icon,
+  onChange,
+  options,
+  selectedValue,
+}: {
+  ariaLabel: string;
+  className: string;
+  disabled: boolean;
+  emptyLabel: string;
+  icon: LucideIcon;
+  onChange: (value: string) => void;
+  options: ComposerSelectOption[];
+  selectedValue: string;
+}) {
+  const selectedOption =
+    options.find((option) => option.value === selectedValue) ?? null;
+  const selectedLabel = selectedOption?.label ?? emptyLabel;
+
+  function handleSelect(value: string, event: ReactMouseEvent<HTMLButtonElement>) {
+    event.currentTarget.closest("details")?.removeAttribute("open");
+    onChange(value);
+  }
+
+  return (
+    <details className={`composer-select-menu group relative ${className}`}>
+      <summary
+        aria-disabled={disabled}
+        aria-label={ariaLabel}
+        className={`composer-select-summary flex h-8 w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${
+          disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
+        }`}
+        title={selectedLabel}
+      >
+        <Icon aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <span className="min-w-0 flex-1 truncate">{selectedLabel}</span>
+        <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
+      </summary>
+      <div className="composer-select-popover absolute bottom-full left-0 z-20 mb-2 w-64 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
+        <div className="panel-scroll max-h-52 overflow-y-auto py-1">
+          {options.length ? (
+            options.map((option) => (
+              <button
+                aria-label={`${ariaLabel}: ${option.label}`}
+                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 ${
+                  option.value === selectedValue
+                    ? "font-semibold text-teal-900"
+                    : "text-stone-700"
+                }`}
+                key={option.value}
+                onClick={(event) => handleSelect(option.value, event)}
+                type="button"
+              >
+                <Icon aria-hidden="true" className="size-3.5 shrink-0" />
+                <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                {option.value === selectedValue ? (
+                  <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
+                ) : null}
+              </button>
+            ))
+          ) : (
+            <div className="px-3 py-3 text-sm text-stone-500">{emptyLabel}</div>
+          )}
+        </div>
+      </div>
+    </details>
   );
 }
 
@@ -3673,7 +3751,7 @@ function BranchSelector({
     return (
       <div
         aria-label={t("Git branch")}
-        className="inline-flex h-8 w-44 max-w-full items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-400"
+        className="composer-branch-select inline-flex h-8 max-w-full items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-400"
       >
         <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
         <span className="min-w-0 flex-1 truncate" />
@@ -3687,9 +3765,9 @@ function BranchSelector({
   }
 
   return (
-    <details className="group relative">
+    <details className="composer-branch-select group relative max-w-full">
       <summary
-        className={`flex h-8 w-44 max-w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${
+        className={`composer-select-summary flex h-8 w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${
           disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
         }`}
         title={t("Git branch")}
@@ -3702,7 +3780,7 @@ function BranchSelector({
           <ChevronDown aria-hidden="true" className="size-3.5" />
         )}
       </summary>
-      <div className="absolute bottom-full left-0 z-20 mb-2 w-64 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
+      <div className="composer-select-popover absolute bottom-full left-0 z-20 mb-2 w-64 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
         <div className="panel-scroll max-h-52 overflow-y-auto py-1">
           {branches.length ? (
             branches.map((branch) => (
