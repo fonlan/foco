@@ -41,15 +41,18 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import {
+  Children,
   CSSProperties,
   DragEvent as ReactDragEvent,
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   createContext,
+  isValidElement,
   useCallback,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -57,6 +60,7 @@ import {
   type ReactNode,
 } from "react";
 import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 type ChatSummary = {
@@ -548,6 +552,50 @@ const DEFAULT_AI_STATS_COLUMN_IDS: AiStatsColumnId[] = [...AI_STATS_COLUMN_IDS];
 type Translate = (key: string, values?: Record<string, string | number>) => string;
 type AiStatsColumnId = (typeof AI_STATS_COLUMN_IDS)[number];
 
+type MermaidRuntime = {
+  initialize: (config: Record<string, unknown>) => void;
+  render: (
+    id: string,
+    definition: string,
+  ) => Promise<{
+    bindFunctions?: (element: Element) => void;
+    svg: string;
+  }>;
+};
+
+const MERMAID_CONFIG: Record<string, unknown> = {
+  flowchart: {
+    curve: "basis",
+  },
+  htmlLabels: false,
+  securityLevel: "strict",
+  startOnLoad: false,
+  theme: "base",
+  themeVariables: {
+    fontFamily:
+      "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
+    lineColor: "#78716c",
+    primaryBorderColor: "#0f766e",
+    primaryColor: "#f5f5f4",
+    primaryTextColor: "#1c1917",
+    secondaryBorderColor: "#a8a29e",
+    secondaryColor: "#fafaf9",
+    tertiaryColor: "#ccfbf1",
+  },
+};
+let mermaidRuntimePromise: Promise<MermaidRuntime> | null = null;
+
+const MARKDOWN_COMPONENTS: Components = {
+  pre({ children, node: _node, ...props }) {
+    const mermaidDefinition = mermaidDefinitionFromPreChildren(children);
+    if (mermaidDefinition !== null) {
+      return <MermaidDiagram definition={mermaidDefinition} />;
+    }
+
+    return <pre {...props}>{children}</pre>;
+  },
+};
+
 const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
   en: {},
   "zh-CN": {
@@ -656,6 +704,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Create git branch": "创建 Git 分支",
     Input: "输入",
     Output: "输出",
+    "Mermaid diagram failed to render.": "Mermaid 图渲染失败。",
     error: "错误",
     connected: "已连接",
     connecting: "连接中",
@@ -4141,7 +4190,9 @@ function MarkdownContent({
   variant?: "message" | "reasoning";
 }) {
   const skillPrefix = selectedSkillPrefix(content, isUser);
-  const markdownContent = skillPrefix?.remaining ?? content;
+  const markdownContent = deferIncompleteMermaidBlocks(
+    skillPrefix?.remaining ?? content,
+  );
 
   return (
     <div
@@ -4166,10 +4217,194 @@ function MarkdownContent({
         </div>
       ) : null}
       {markdownContent ? (
-        <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdownContent}</ReactMarkdown>
+        <ReactMarkdown components={MARKDOWN_COMPONENTS} remarkPlugins={[remarkGfm]}>
+          {markdownContent}
+        </ReactMarkdown>
       ) : null}
     </div>
   );
+}
+
+function MermaidDiagram({ definition }: { definition: string }) {
+  const { t } = useI18n();
+  const reactId = useId();
+  const baseRenderId = `foco-mermaid-${reactId.replaceAll(":", "")}`;
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const renderCounterRef = useRef(0);
+  const [error, setError] = useState<string | null>(null);
+  const [svg, setSvg] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    renderCounterRef.current += 1;
+    const renderId = `${baseRenderId}-${renderCounterRef.current}`;
+
+    async function renderDiagram() {
+      setError(null);
+      setSvg("");
+
+      try {
+        const mermaid = await loadMermaidRuntime();
+        if (cancelled) {
+          return;
+        }
+        const result = await mermaid.render(renderId, definition);
+        if (cancelled) {
+          return;
+        }
+        setSvg(result.svg);
+        window.setTimeout(() => {
+          if (!cancelled && containerRef.current) {
+            result.bindFunctions?.(containerRef.current);
+          }
+        }, 0);
+      } catch (renderError) {
+        if (!cancelled) {
+          setError(errorMessage(renderError));
+        }
+      }
+    }
+
+    void renderDiagram();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [definition, baseRenderId]);
+
+  if (error !== null) {
+    return (
+      <div className="mermaid-diagram mermaid-diagram-error">
+        <div className="mermaid-diagram-error-title">
+          {t("Mermaid diagram failed to render.")}
+        </div>
+        <div className="mermaid-diagram-error-message">{error}</div>
+        <pre>
+          <code>{definition}</code>
+        </pre>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      aria-label="Mermaid diagram"
+      className={`mermaid-diagram ${svg ? "" : "mermaid-diagram-loading"}`}
+      dangerouslySetInnerHTML={svg ? { __html: svg } : undefined}
+      ref={containerRef}
+      role="img"
+    />
+  );
+}
+
+async function loadMermaidRuntime() {
+  mermaidRuntimePromise ??= import("mermaid").then((module) => {
+    module.default.initialize(MERMAID_CONFIG);
+    return module.default;
+  });
+
+  return mermaidRuntimePromise;
+}
+
+function mermaidDefinitionFromPreChildren(children: ReactNode) {
+  const childNodes = Children.toArray(children);
+  if (childNodes.length !== 1) {
+    return null;
+  }
+
+  const child = childNodes[0];
+  if (!isValidElement<{ className?: string; children?: ReactNode }>(child)) {
+    return null;
+  }
+
+  const className = child.props.className ?? "";
+  if (!/\blanguage-mermaid\b/i.test(className)) {
+    return null;
+  }
+
+  const definition = Children.toArray(child.props.children).join("").trim();
+  return definition ? definition : null;
+}
+
+function deferIncompleteMermaidBlocks(content: string) {
+  const lines = content.match(/[^\r\n]*(?:\r\n|\n|\r|$)/g) ?? [];
+  const nonEmptyLines = lines.filter((line) => line.length > 0);
+  if (nonEmptyLines.length === 0) {
+    return content;
+  }
+
+  let activeFence: MarkdownFence | null = null;
+  for (let index = 0; index < nonEmptyLines.length; index += 1) {
+    const line = nonEmptyLines[index];
+
+    if (activeFence !== null) {
+      if (isFenceClosingLine(line, activeFence)) {
+        activeFence = null;
+      }
+      continue;
+    }
+
+    const fence = parseMarkdownFence(line);
+    if (fence !== null) {
+      activeFence = {
+        ...fence,
+        lineIndex: index,
+      };
+    }
+  }
+
+  if (activeFence?.language !== "mermaid") {
+    return content;
+  }
+
+  const nextLines = [...nonEmptyLines];
+  nextLines[activeFence.lineIndex] = neutralizeMermaidFenceLine(
+    nextLines[activeFence.lineIndex],
+  );
+  return nextLines.join("");
+}
+
+type MarkdownFence = {
+  char: "`" | "~";
+  length: number;
+  language: string | null;
+  lineIndex: number;
+};
+
+function parseMarkdownFence(line: string) {
+  const body = line.replace(/(?:\r\n|\n|\r)$/, "");
+  const match = /^([ \t]{0,3})(`{3,}|~{3,})([^\r\n]*)$/.exec(body);
+  if (!match) {
+    return null;
+  }
+
+  const marker = match[2];
+  const language = match[3].trim().split(/\s+/, 1)[0]?.toLowerCase() || null;
+  return {
+    char: marker[0] as "`" | "~",
+    length: marker.length,
+    language,
+    lineIndex: -1,
+  };
+}
+
+function isFenceClosingLine(line: string, fence: MarkdownFence) {
+  const body = line.replace(/(?:\r\n|\n|\r)$/, "");
+  const escapedChar = fence.char === "`" ? "`" : "~";
+  return new RegExp(`^[ \\t]{0,3}${escapedChar}{${fence.length},}[ \\t]*$`).test(
+    body,
+  );
+}
+
+function neutralizeMermaidFenceLine(line: string) {
+  const lineEnding = line.match(/(?:\r\n|\n|\r)$/)?.[0] ?? "";
+  const body = line.slice(0, line.length - lineEnding.length);
+  const match = /^([ \t]{0,3})(`{3,}|~{3,})([^\r\n]*)$/.exec(body);
+  if (!match) {
+    return line;
+  }
+
+  return `${match[1]}${match[2]}text${lineEnding}`;
 }
 
 function ToolCallBlock({ toolCall }: { toolCall: ChatToolCallSummary }) {

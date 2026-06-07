@@ -1,6 +1,20 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mermaidMock = vi.hoisted(() => ({
+  initialize: vi.fn(),
+  render: vi.fn(async () => ({
+    bindFunctions: vi.fn(),
+    diagramType: "flowchart",
+    svg: '<svg data-testid="mermaid-svg"><text>Rendered Mermaid</text></svg>',
+  })),
+}));
+
+vi.mock("mermaid", () => ({
+  default: mermaidMock,
+}));
+
 import { App } from "./App";
 
 const workspace = {
@@ -331,7 +345,10 @@ const chatMessages = {
           },
           type: "toolCall",
         },
-        { text: "Done.", type: "text" },
+        {
+          text: "Done.\n\n```mermaid\nflowchart TD\n  A --> B\n```",
+          type: "text",
+        },
       ],
       reasoning: "Need file context.\n\nThen answer.",
       role: "assistant",
@@ -412,6 +429,8 @@ describe("App verification surfaces", () => {
   beforeEach(() => {
     activeChatStreamController = null;
     terminalSessionCounter = 0;
+    mermaidMock.initialize.mockClear();
+    mermaidMock.render.mockClear();
     vi.stubGlobal("fetch", vi.fn(mockFetch));
   });
 
@@ -445,6 +464,11 @@ describe("App verification surfaces", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("Done.")).toBeInTheDocument();
+    expect(await screen.findByTestId("mermaid-svg")).toBeInTheDocument();
+    expect(mermaidMock.render).toHaveBeenCalledWith(
+      expect.stringMatching(/^foco-mermaid-/),
+      "flowchart TD\n  A --> B",
+    );
     expect(screen.getByText("Model: gpt-test")).toBeInTheDocument();
     expect(screen.getByText("Channel: openai")).toBeInTheDocument();
     expect(screen.getByText("Total time: 2,000 ms")).toBeInTheDocument();
@@ -485,6 +509,45 @@ describe("App verification surfaces", () => {
     expect(branchDetails).toHaveAttribute("open");
     await user.click(document.body);
     expect(branchDetails).not.toHaveAttribute("open");
+  });
+
+  it("waits for a streaming Mermaid fence to close before rendering", async () => {
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Second chat"));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "diagram");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "```mermaid\nflowchart TD",
+        type: "textDelta",
+      });
+    });
+
+    expect(await screen.findByText("flowchart TD")).toBeInTheDocument();
+    expect(screen.queryByText("Mermaid diagram failed to render.")).not.toBeInTheDocument();
+    expect(mermaidMock.render).not.toHaveBeenCalled();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "\n  A --> B\n```",
+        type: "textDelta",
+      });
+    });
+
+    expect(await screen.findByTestId("mermaid-svg")).toBeInTheDocument();
+    expect(mermaidMock.render).toHaveBeenCalledWith(
+      expect.stringMatching(/^foco-mermaid-/),
+      "flowchart TD\n  A --> B",
+    );
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
   });
 
   it("expands a collapsed workspace after starting a workspace chat", async () => {
