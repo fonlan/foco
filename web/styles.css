@@ -127,6 +127,12 @@ summary:focus-visible {
   box-shadow: -18px 0 50px rgba(75, 63, 42, 0.08);
 }
 
+.mobile-sidebar-backdrop,
+.mobile-sidebar-close,
+.mobile-workspace-button {
+  display: none;
+}
+
 .panel-scroll {
   scrollbar-gutter: stable;
 }
@@ -345,37 +351,151 @@ summary:focus-visible {
 
 @media (max-width: 767px) {
   .app-shell {
-    grid-template-areas:
-      "sidebar"
-      "main";
+    position: relative;
+    grid-template-areas: "main";
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(0, auto) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .app-shell-with-diff {
-    grid-template-areas:
-      "sidebar"
-      "main"
-      "diff";
-    grid-template-rows: minmax(0, auto) minmax(0, 1fr) minmax(14rem, 30dvh);
+    grid-template-areas: "main";
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .workspace-sidebar {
-    height: auto;
-    max-height: 52dvh;
-    border-right: 0;
-    border-bottom: 1px solid rgba(214, 211, 209, 0.9);
+    position: fixed;
+    z-index: 45;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(21rem, calc(100vw - 3rem));
+    max-width: 100%;
+    border-right: 1px solid rgba(214, 211, 209, 0.9);
+    transform: translateX(-105%);
+    transition: transform 200ms ease;
+    box-shadow: 18px 0 50px rgba(33, 31, 28, 0.18);
+  }
+
+  .workspace-sidebar-mobile-open {
+    transform: translateX(0);
+  }
+
+  .mobile-sidebar-backdrop {
+    position: fixed;
+    z-index: 44;
+    inset: 0;
+    display: block;
+    border: 0;
+    background: rgba(33, 31, 28, 0.34);
+    padding: 0;
+    backdrop-filter: blur(3px);
+  }
+
+  .mobile-sidebar-close,
+  .mobile-workspace-button {
+    display: inline-flex;
   }
 
   .app-main-panel {
     height: 100%;
-    min-height: 78dvh;
+    min-height: 0;
   }
 
   .diff-sidebar {
-    height: 100%;
+    position: fixed;
+    z-index: 43;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    height: min(72dvh, 34rem);
     min-height: 0;
-    box-shadow: none;
+    border-top: 1px solid rgba(214, 211, 209, 0.9);
+    border-radius: 1rem 1rem 0 0;
+    box-shadow: 0 -24px 60px rgba(33, 31, 28, 0.18);
+  }
+
+  .app-main-panel > header {
+    padding-inline: 0.5rem;
+  }
+
+  .app-main-panel > header > div {
+    gap: 0.5rem;
+  }
+
+  .chat-tab-item {
+    min-width: 9.5rem;
+    max-width: 12rem;
+  }
+
+  .chat-tab-item:first-child:last-child {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .chat-tab-list {
+    padding-bottom: 0.125rem;
+  }
+
+  .chat-header-actions {
+    flex-wrap: nowrap;
+  }
+
+  .message-composer-textarea {
+    min-height: 4.5rem;
+  }
+
+  .message-composer-actions {
+    gap: 0.375rem;
+  }
+
+  .message-composer-actions > label:first-child {
+    min-width: min(100%, 10rem);
+  }
+
+  .message-composer-actions > label:nth-child(2),
+  .message-composer-actions > details,
+  .message-composer-actions > [aria-label="Git branch"] {
+    width: calc(50% - 0.25rem);
+    min-width: 8rem;
+  }
+
+  .message-composer-actions select,
+  .message-composer-actions summary,
+  .message-composer-actions > [aria-label="Git branch"] {
+    min-height: 2.5rem;
+  }
+
+  .message-composer-actions > button {
+    min-width: 2.5rem;
+    min-height: 2.5rem;
+  }
+
+  .settings-layout {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .settings-section-nav-card {
+    position: sticky;
+    z-index: 10;
+    top: 0;
+    border-radius: 0.75rem;
+  }
+
+  .settings-section-nav {
+    flex-direction: row;
+    overflow-x: auto;
+    padding-bottom: 0.125rem;
+  }
+
+  .settings-section-nav > button {
+    width: auto;
+    min-width: max-content;
+  }
+
+  .panel-scroll::-webkit-scrollbar {
+    height: 0.5rem;
+    width: 0.5rem;
   }
 
 }

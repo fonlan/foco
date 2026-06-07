@@ -918,6 +918,7 @@ export function App() {
   const [isResizingDiffPanel, setIsResizingDiffPanel] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(288);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
+  const [isMobileWorkspaceOpen, setIsMobileWorkspaceOpen] = useState(false);
   const [terminalOpenWorkspaceIds, setTerminalOpenWorkspaceIds] = useState<
     Set<string>
   >(() => new Set());
@@ -1363,6 +1364,7 @@ export function App() {
       setMessages(nextMessages);
       setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
       setViewMode("chat");
+      setIsMobileWorkspaceOpen(false);
     } catch (requestError) {
       setError(errorMessage(requestError));
     }
@@ -1383,6 +1385,7 @@ export function App() {
     activeChatKeyRef.current = chatKey;
     setMessages(cachedMessages);
     setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
   }
 
   function startNewWorkspaceChat(workspaceId: string) {
@@ -1397,6 +1400,7 @@ export function App() {
     setMessages([]);
     setSelectedDiffPath(null);
     setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
   }
 
   function openChatTab(workspaceId: string, chatId: string) {
@@ -2091,7 +2095,19 @@ export function App() {
             } as CSSProperties
           }
         >
-        <aside className="workspace-sidebar relative border-stone-200/80 lg:border-r">
+        {isMobileWorkspaceOpen ? (
+          <button
+            aria-label={t("Close")}
+            className="mobile-sidebar-backdrop"
+            onClick={() => setIsMobileWorkspaceOpen(false)}
+            type="button"
+          />
+        ) : null}
+        <aside
+          className={`workspace-sidebar relative border-stone-200/80 lg:border-r ${
+            isMobileWorkspaceOpen ? "workspace-sidebar-mobile-open" : ""
+          }`}
+        >
           <div
             aria-label={t("Resize workspace sidebar")}
             aria-orientation="vertical"
@@ -2125,6 +2141,15 @@ export function App() {
                 </div>
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  aria-label={t("Close")}
+                  className="mobile-sidebar-close inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                  onClick={() => setIsMobileWorkspaceOpen(false)}
+                  title={t("Close")}
+                  type="button"
+                >
+                  <X aria-hidden="true" className="size-4" />
+                </button>
                 <button
                   aria-label={t("Settings")}
                   className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
@@ -2300,7 +2325,16 @@ export function App() {
 
         <section className="app-main-panel flex min-w-0 flex-col">
               <header className="shrink-0 border-b border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-4">
-                <div className="flex min-w-0 items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <button
+                    aria-label={t("Workspaces")}
+                    className="mobile-workspace-button inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 md:hidden"
+                    onClick={() => setIsMobileWorkspaceOpen(true)}
+                    title={t("Workspaces")}
+                    type="button"
+                  >
+                    <Folder aria-hidden="true" className="size-4" />
+                  </button>
                   <ChatTabBar
                     activeChatId={activeChatId}
                     activeWorkspaceId={activeWorkspaceId}
@@ -2309,7 +2343,7 @@ export function App() {
                     runningChatKey={runningChatKey}
                     tabs={chatTabs}
                   />
-                  <div className="flex flex-wrap items-center gap-2">
+                  <div className="chat-header-actions flex flex-wrap items-center gap-2">
                     <div className="flex overflow-x-auto rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
                       <button
                         aria-label={
@@ -2994,7 +3028,7 @@ function ChatTabBar({
     <div className="min-w-0 flex-1">
       <div
         aria-label={t("Chat")}
-        className="panel-scroll flex min-w-0 gap-1 overflow-x-auto"
+        className="chat-tab-list panel-scroll flex min-w-0 gap-1 overflow-x-auto"
         role="tablist"
       >
         {tabs.length ? (
@@ -3006,7 +3040,7 @@ function ChatTabBar({
 
             return (
               <div
-                className={`group flex h-12 min-w-44 max-w-64 shrink-0 items-center rounded-lg border px-2 py-1.5 transition-colors ${
+                className={`chat-tab-item group flex h-12 min-w-44 max-w-64 shrink-0 items-center rounded-lg border px-2 py-1.5 transition-colors ${
                   isActive
                     ? "border-teal-200 bg-white text-stone-950 shadow-sm"
                     : "border-stone-200 bg-stone-50/80 text-stone-600 hover:border-stone-300 hover:bg-white"
@@ -3376,7 +3410,7 @@ function ChatPanel({
                 </div>
               </div>
             ) : null}
-            <div className="flex flex-wrap items-center gap-2 border-t border-stone-100 px-2 py-2">
+            <div className="message-composer-actions flex flex-wrap items-center gap-2 border-t border-stone-100 px-2 py-2">
               <label className="min-w-36 flex-1 sm:max-w-64">
                 <span className="sr-only">{t("Model")}</span>
                 <select
@@ -5825,11 +5859,11 @@ function SettingsPanel({
 
   return (
     <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
-      <div className="mx-auto grid max-w-7xl gap-4 lg:grid-cols-[13rem_minmax(0,1fr)]">
-        <aside className="rounded-2xl border border-stone-200 bg-white/85 p-2 shadow-[0_18px_42px_rgba(75,63,42,0.07)] lg:self-start">
+      <div className="settings-layout mx-auto grid max-w-7xl gap-4 lg:grid-cols-[13rem_minmax(0,1fr)]">
+        <aside className="settings-section-nav-card rounded-2xl border border-stone-200 bg-white/85 p-2 shadow-[0_18px_42px_rgba(75,63,42,0.07)] lg:self-start">
           <nav
             aria-label={t("Settings")}
-            className="flex flex-col gap-1.5"
+            className="settings-section-nav flex flex-col gap-1.5"
           >
           <SettingsNavButton
             active={activeSection === "general"}
