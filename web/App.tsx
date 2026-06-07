@@ -1386,6 +1386,11 @@ export function App() {
   }
 
   function startNewWorkspaceChat(workspaceId: string) {
+    setExpandedWorkspaceIds((current) => {
+      const next = new Set(current);
+      next.add(workspaceId);
+      return next;
+    });
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
     activeChatKeyRef.current = null;
@@ -1921,6 +1926,7 @@ export function App() {
             activeKey ===
             chatRunKey(streamEvent.workspaceId, streamEvent.chatId)
           ) {
+            setIsDiffPanelOpen(true);
             void loadTaskGraph(streamEvent.workspaceId, streamEvent.chatId);
           }
           return;

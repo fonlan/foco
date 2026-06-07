@@ -407,16 +407,19 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("First token latency: 250 ms")).toBeInTheDocument();
   });
 
-  it("marks the new chat row as selected after starting a workspace chat", async () => {
+  it("expands a collapsed workspace after starting a workspace chat", async () => {
     render(<App />);
 
-    await userEvent.click(await screen.findByText("Tool run"));
-    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    const workspaceToggle = await screen.findByRole("button", { name: "Default" });
+    await userEvent.click(workspaceToggle);
+    expect(workspaceToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Tool run")).not.toBeInTheDocument();
 
     await userEvent.click(
       screen.getByRole("button", { name: "New chat in Default" }),
     );
 
+    expect(workspaceToggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: "New chat" })).toHaveAttribute(
       "aria-current",
       "page",
@@ -654,6 +657,30 @@ describe("App verification surfaces", () => {
     expect(screen.getByText(/\+hello/)).toBeInTheDocument();
   });
 
+  it("opens the task graph sidebar when a task graph refresh arrives", async () => {
+    render(<App />);
+
+    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "plan");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        chatId: "chat-1",
+        type: "taskGraphRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
+
+    expect(await screen.findByText("Task graph")).toBeInTheDocument();
+    expect(screen.getByText("Inspect workspace changes")).toBeInTheDocument();
+    expect(screen.getByText("Git diff")).toBeInTheDocument();
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
   it("shows AI statistics and request details", async () => {
     render(<App />);
 
@@ -818,6 +845,17 @@ function chatStreamResponse() {
     headers: { "Content-Type": "text/event-stream" },
     status: 200,
   });
+}
+
+function enqueueChatStreamEvent(value: unknown) {
+  if (!activeChatStreamController) {
+    throw new Error("chat stream is not active");
+  }
+
+  const encoder = new TextEncoder();
+  activeChatStreamController.enqueue(
+    encoder.encode(`data: ${JSON.stringify(value)}\n\n`),
+  );
 }
 
 function jsonResponse(value: unknown, init?: ResponseInit) {
