@@ -535,6 +535,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Settings: "设置",
     Stats: "统计",
     "Close terminal": "关闭终端",
+    "Close terminal {number}": "关闭终端 {number}",
     "Open terminal": "打开终端",
     "Close git diff": "关闭 Git diff",
     "Open git diff": "打开 Git diff",
@@ -656,6 +657,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Copied: "已复制",
     "Copy {label}": "复制 {label}",
     "Resize git diff panel": "调整 Git diff 面板宽度",
+    "Resize terminal panel": "调整终端面板高度",
+    "New terminal": "新建终端",
+    "Terminal sessions": "终端列表",
+    "Terminal {number}": "终端 {number}",
     "Task graph": "任务图",
     "Updated {time}": "更新于 {time}",
     pending: "待处理",
@@ -848,6 +853,17 @@ type TerminalServerEvent =
   | { type: "cwd"; cwd: string }
   | { type: "exit"; status: string }
   | { type: "error"; message: string };
+
+type TerminalPaneStatus = "closed" | "connected" | "connecting" | "error";
+
+type TerminalPanelSession = {
+  clientId: string;
+  cwd: string;
+  error: string | null;
+  number: number;
+  serverSessionId: string | null;
+  status: TerminalPaneStatus;
+};
 
 type ShellMessage = {
   id: string;
@@ -2458,7 +2474,18 @@ export function App() {
               thinkingLevels={thinkingLevels}
             />
           {isTerminalOpen ? (
-            <TerminalPanel workspace={activeWorkspace} />
+            <TerminalPanel
+              onClose={() => {
+                if (activeWorkspace) {
+                  setTerminalOpenWorkspaceIds((current) => {
+                    const next = new Set(current);
+                    next.delete(activeWorkspace.id);
+                    return next;
+                  });
+                }
+              }}
+              workspace={activeWorkspace}
+            />
           ) : null}
         </section>
 
@@ -3920,25 +3947,291 @@ function ToolCallBlock({ toolCall }: { toolCall: ChatToolCallSummary }) {
   );
 }
 
-function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined }) {
+function TerminalPanel({
+  onClose,
+  workspace,
+}: {
+  onClose: () => void;
+  workspace: WorkspaceSummary | undefined;
+}) {
+  const { t } = useI18n();
+  const [panelHeight, setPanelHeight] = useState(256);
+  const [isResizing, setIsResizing] = useState(false);
+  const [activeClientId, setActiveClientId] = useState("");
+  const [sessions, setSessions] = useState<TerminalPanelSession[]>(() => [
+    createTerminalPanelSession(1),
+  ]);
+  const nextSessionNumberRef = useRef(2);
+  const previousWorkspaceIdRef = useRef(workspace?.id ?? "");
+  const workspaceId = workspace?.id ?? "";
+  const workspacePath = workspace?.path ?? "";
+  const activeSession =
+    sessions.find((session) => session.clientId === activeClientId) ??
+    sessions[0] ??
+    null;
+
+  useEffect(() => {
+    if (previousWorkspaceIdRef.current === workspaceId) {
+      return;
+    }
+
+    previousWorkspaceIdRef.current = workspaceId;
+    const initialSession = createTerminalPanelSession(1);
+    nextSessionNumberRef.current = 2;
+    setSessions([initialSession]);
+    setActiveClientId(initialSession.clientId);
+  }, [workspaceId]);
+
+  useEffect(() => {
+    if (activeClientId || sessions.length === 0) {
+      return;
+    }
+
+    setActiveClientId(sessions[0].clientId);
+  }, [activeClientId, sessions]);
+
+  useEffect(() => {
+    if (!isResizing) {
+      return;
+    }
+
+    function handlePointerMove(event: PointerEvent) {
+      const nextHeight = window.innerHeight - event.clientY;
+      setPanelHeight(Math.min(Math.max(nextHeight, 180), 520));
+    }
+
+    function handlePointerUp() {
+      setIsResizing(false);
+    }
+
+    document.body.style.cursor = "row-resize";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      document.body.style.cursor = "";
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [isResizing]);
+
+  const updateSession = useCallback(
+    (clientId: string, patch: Partial<Omit<TerminalPanelSession, "clientId">>) => {
+      setSessions((current) =>
+        current.map((session) =>
+          session.clientId === clientId ? { ...session, ...patch } : session,
+        ),
+      );
+    },
+    [],
+  );
+
+  const markSessionClosed = useCallback((clientId: string) => {
+    setSessions((current) =>
+      current.map((session) =>
+        session.clientId === clientId
+          ? {
+              ...session,
+              status: session.status === "error" ? "error" : "closed",
+            }
+          : session,
+      ),
+    );
+  }, []);
+
+  function createSession() {
+    const session = createTerminalPanelSession(nextSessionNumberRef.current);
+    nextSessionNumberRef.current += 1;
+    setSessions((current) => [...current, session]);
+    setActiveClientId(session.clientId);
+  }
+
+  function closeSession(clientId: string) {
+    if (sessions.length <= 1) {
+      return;
+    }
+
+    const next = sessions.filter((session) => session.clientId !== clientId);
+    setSessions(next);
+    if (clientId === activeClientId) {
+      setActiveClientId(next[0]?.clientId ?? "");
+    }
+  }
+
+  return (
+    <section
+      className="terminal-panel relative shrink-0 border-t border-stone-800 bg-[#16130f]"
+      style={{ "--terminal-panel-height": `${panelHeight}px` } as CSSProperties}
+    >
+      <div
+        aria-label={t("Resize terminal panel")}
+        aria-orientation="horizontal"
+        className="absolute left-0 right-0 top-0 z-10 h-1 cursor-row-resize bg-transparent hover:bg-teal-500/50"
+        onKeyDown={(event) => {
+          if (event.key === "ArrowUp") {
+            event.preventDefault();
+            setPanelHeight((current) => Math.min(current + 24, 520));
+          }
+
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            setPanelHeight((current) => Math.max(current - 24, 180));
+          }
+        }}
+        onPointerDown={(event) => {
+          event.preventDefault();
+          setIsResizing(true);
+        }}
+        role="separator"
+        tabIndex={0}
+      />
+      <div className="terminal-panel-body mx-auto flex h-[var(--terminal-panel-height)] w-full max-w-5xl min-w-0">
+        <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex h-8 items-center justify-between gap-3 px-3 text-xs text-stone-400">
+            <span className="inline-flex min-w-0 items-center gap-2">
+              <Terminal aria-hidden="true" className="size-4 shrink-0" />
+              <span className={terminalStatusClass(activeSession?.status ?? "closed")}>
+                {terminalStatusText(activeSession?.status ?? "closed", t)}
+              </span>
+              <span className="min-w-0 truncate">
+                {activeSession?.cwd || workspacePath}
+              </span>
+            </span>
+            <span className="flex min-w-0 shrink-0 items-center gap-2">
+              {activeSession?.error ? (
+                <span className="min-w-0 truncate text-rose-300">
+                  {activeSession.error}
+                </span>
+              ) : null}
+              <button
+                aria-label={t("New terminal")}
+                className="inline-flex size-6 items-center justify-center rounded-md text-stone-400 hover:bg-stone-800 hover:text-stone-100"
+                onClick={createSession}
+                title={t("New terminal")}
+                type="button"
+              >
+                <Plus aria-hidden="true" className="size-3.5" />
+              </button>
+              <button
+                aria-label={t("Close terminal")}
+                className="inline-flex size-6 items-center justify-center rounded-md text-stone-400 hover:bg-rose-950/60 hover:text-rose-200"
+                onClick={onClose}
+                title={t("Close terminal")}
+                type="button"
+              >
+                <X aria-hidden="true" className="size-3.5" />
+              </button>
+            </span>
+          </div>
+          <div className="relative min-h-0 flex-1">
+            {sessions.map((session) => (
+              <TerminalSessionPane
+                isActive={session.clientId === activeSession?.clientId}
+                key={session.clientId}
+                markClosed={markSessionClosed}
+                onUpdate={updateSession}
+                session={session}
+                workspaceId={workspaceId}
+              />
+            ))}
+          </div>
+        </div>
+        {sessions.length > 1 ? (
+          <aside
+            aria-label={t("Terminal sessions")}
+            className="terminal-session-list panel-scroll w-44 shrink-0 overflow-y-auto border-l border-stone-800 bg-stone-950/35 px-2 py-2"
+          >
+            {sessions.map((session) => (
+              <div
+                className={`flex w-full min-w-0 items-center gap-1 rounded-md text-xs ${
+                  session.clientId === activeSession?.clientId
+                    ? "bg-stone-800 text-stone-100"
+                    : "text-stone-400 hover:bg-stone-900 hover:text-stone-100"
+                }`}
+                key={session.clientId}
+              >
+                <button
+                  className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
+                  onClick={() => setActiveClientId(session.clientId)}
+                  type="button"
+                >
+                  <span
+                    aria-label={terminalStatusText(session.status, t)}
+                    className={`size-2 shrink-0 rounded-full ${
+                      isTerminalConnected(session.status)
+                        ? "bg-emerald-400"
+                        : "bg-rose-500"
+                    }`}
+                    title={terminalStatusText(session.status, t)}
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate font-semibold">
+                      {t("Terminal {number}", { number: session.number })}
+                    </span>
+                    <span
+                      className="block truncate text-[11px] opacity-60"
+                      title={session.cwd || workspacePath}
+                    >
+                      {session.cwd || workspacePath}
+                    </span>
+                  </span>
+                </button>
+                <button
+                  aria-label={t("Close terminal {number}", {
+                    number: session.number,
+                  })}
+                  className="mr-1 inline-flex size-6 shrink-0 items-center justify-center rounded-md text-stone-500 hover:bg-rose-950/60 hover:text-rose-200"
+                  onClick={() => closeSession(session.clientId)}
+                  title={t("Close terminal {number}", { number: session.number })}
+                  type="button"
+                >
+                  <X aria-hidden="true" className="size-3.5" />
+                </button>
+              </div>
+            ))}
+          </aside>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function TerminalSessionPane({
+  isActive,
+  markClosed,
+  onUpdate,
+  session,
+  workspaceId,
+}: {
+  isActive: boolean;
+  markClosed: (clientId: string) => void;
+  onUpdate: (
+    clientId: string,
+    patch: Partial<Omit<TerminalPanelSession, "clientId">>,
+  ) => void;
+  session: TerminalPanelSession;
+  workspaceId: string;
+}) {
   const { t } = useI18n();
   const tRef = useRef(t);
-  const [cwd, setCwd] = useState("");
-  const [status, setStatus] = useState<"closed" | "connected" | "connecting" | "error">(
-    "closed",
-  );
-  const [error, setError] = useState<string | null>(null);
+  const isActiveRef = useRef(isActive);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const xtermRef = useRef<XTerm | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
-  const workspaceId = workspace?.id ?? "";
-  const workspacePath = workspace?.path ?? "";
+  const { clientId } = session;
 
   useEffect(() => {
     tRef.current = t;
   }, [t]);
+
+  useEffect(() => {
+    isActiveRef.current = isActive;
+    if (isActive) {
+      xtermRef.current?.focus();
+    }
+  }, [isActive]);
 
   useEffect(() => {
     if (!workspaceId) {
@@ -3965,12 +4258,13 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
     xtermRef.current = terminal;
     fitAddonRef.current = fitAddon;
     terminal.loadAddon(fitAddon);
-    setStatus("connecting");
-    setError(null);
+    onUpdate(clientId, { error: null, status: "connecting" });
 
     if (!containerRef.current) {
-      setStatus("error");
-      setError(tRef.current("Terminal container was not mounted."));
+      onUpdate(clientId, {
+        error: tRef.current("Terminal container was not mounted."),
+        status: "error",
+      });
       terminal.dispose();
       return;
     }
@@ -4011,7 +4305,7 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
       }
 
       try {
-        const session = await requestJson<TerminalSessionResponse>(
+        const serverSession = await requestJson<TerminalSessionResponse>(
           `/api/workspaces/${encodeURIComponent(workspaceId)}/terminal/session`,
           { method: "POST" },
         );
@@ -4019,30 +4313,37 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
           return;
         }
 
-        setCwd(session.workingDirectory);
+        onUpdate(clientId, {
+          cwd: serverSession.workingDirectory,
+          serverSessionId: serverSession.id,
+        });
         const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
         socket = new WebSocket(
           `${protocol}//${window.location.host}/api/workspaces/${encodeURIComponent(
             workspaceId,
-          )}/terminal/${encodeURIComponent(session.id)}/ws?cols=${terminal.cols}&rows=${terminal.rows}`,
+          )}/terminal/${encodeURIComponent(serverSession.id)}/ws?cols=${terminal.cols}&rows=${terminal.rows}`,
         );
         socketRef.current = socket;
 
         socket.onopen = () => {
-          setStatus("connected");
+          onUpdate(clientId, { status: "connected" });
           sendResize();
-          terminal.focus();
+          if (isActiveRef.current) {
+            terminal.focus();
+          }
         };
         socket.onmessage = (event) => {
           const parsed = JSON.parse(event.data as string) as unknown;
           if (!isTerminalServerEvent(parsed)) {
-            setStatus("error");
-            setError(tRef.current("Terminal returned an unknown event."));
+            onUpdate(clientId, {
+              error: tRef.current("Terminal returned an unknown event."),
+              status: "error",
+            });
             return;
           }
 
           if (parsed.type === "started" || parsed.type === "cwd") {
-            setCwd(parsed.cwd);
+            onUpdate(clientId, { cwd: parsed.cwd });
             return;
           }
 
@@ -4052,7 +4353,7 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
           }
 
           if (parsed.type === "exit") {
-            setStatus("closed");
+            onUpdate(clientId, { status: "closed" });
             terminal.writeln(
               `\r\n[${tRef.current("terminal exited: {status}", {
                 status: parsed.status,
@@ -4061,8 +4362,7 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
             return;
           }
 
-          setStatus("error");
-          setError(parsed.message);
+          onUpdate(clientId, { error: parsed.message, status: "error" });
           terminal.writeln(
             `\r\n[${tRef.current("terminal error: {message}", {
               message: parsed.message,
@@ -4070,17 +4370,18 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
           );
         };
         socket.onerror = () => {
-          setStatus("error");
-          setError(tRef.current("Terminal WebSocket failed."));
+          onUpdate(clientId, {
+            error: tRef.current("Terminal WebSocket failed."),
+            status: "error",
+          });
         };
         socket.onclose = () => {
-          setStatus((current) => (current === "error" ? current : "closed"));
+          markClosed(clientId);
         };
       } catch (requestError) {
         if (!cancelled) {
           const message = errorMessage(requestError);
-          setStatus("error");
-          setError(message);
+          onUpdate(clientId, { error: message, status: "error" });
           terminal.writeln(
             `[${tRef.current("terminal error: {message}", { message })}]`,
           );
@@ -4101,27 +4402,31 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
       fitAddonRef.current = null;
       resizeObserverRef.current = null;
     };
-  }, [workspaceId]);
+  }, [clientId, markClosed, onUpdate, workspaceId]);
 
   return (
-    <section className="shrink-0 border-t border-stone-800 bg-[#16130f]">
-      <div className="mx-auto w-full max-w-5xl">
-        <div className="flex h-8 items-center justify-between gap-3 px-3 text-xs text-stone-400">
-          <span className="inline-flex min-w-0 items-center gap-2">
-            <Terminal aria-hidden="true" className="size-4 shrink-0" />
-            <span className={terminalStatusClass(status)}>
-              {terminalStatusText(status, t)}
-            </span>
-            <span className="min-w-0 truncate">{cwd || workspacePath}</span>
-          </span>
-          {error ? (
-            <span className="shrink-0 text-rose-300">{error}</span>
-          ) : null}
-        </div>
-        <div ref={containerRef} className="terminal-xterm h-56 min-w-0 p-2" />
-      </div>
-    </section>
+    <div
+      aria-hidden={!isActive}
+      className={`terminal-session-pane absolute inset-0 min-h-0 min-w-0 p-2 ${
+        isActive ? "" : "pointer-events-none opacity-0"
+      }`}
+    >
+      <div ref={containerRef} className="terminal-xterm h-full min-w-0" />
+    </div>
   );
+}
+
+function createTerminalPanelSession(number: number): TerminalPanelSession {
+  return {
+    clientId: `${Date.now().toString(36)}-${number}-${Math.random()
+      .toString(36)
+      .slice(2)}`,
+    cwd: "",
+    error: null,
+    number,
+    serverSessionId: null,
+    status: "closed",
+  };
 }
 
 function ApiStatsPanel({
@@ -8470,6 +8775,10 @@ function terminalStatusText(
   }
 
   return t("closed");
+}
+
+function isTerminalConnected(status: TerminalPaneStatus) {
+  return status === "connected";
 }
 
 function terminalStatusClass(status: "closed" | "connected" | "connecting" | "error") {

@@ -363,10 +363,12 @@ const taskGraph = {
 
 let activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null =
   null;
+let terminalSessionCounter = 0;
 
 describe("App verification surfaces", () => {
   beforeEach(() => {
     activeChatStreamController = null;
+    terminalSessionCounter = 0;
     vi.stubGlobal("fetch", vi.fn(mockFetch));
   });
 
@@ -679,6 +681,41 @@ describe("App verification surfaces", () => {
       "/api/workspaces/workspace-1/terminal/session",
       expect.objectContaining({ method: "POST" }),
     );
+
+    await userEvent.click(screen.getByRole("button", { name: "New terminal" }));
+
+    const terminalList = await screen.findByRole("complementary", {
+      name: "Terminal sessions",
+    });
+    expect(within(terminalList).getByText("Terminal 1")).toBeInTheDocument();
+    expect(within(terminalList).getByText("Terminal 2")).toBeInTheDocument();
+    expect(within(terminalList).getAllByLabelText("connected")).toHaveLength(2);
+    expect(within(terminalList).getAllByText(workspace.path)[0]).toHaveAttribute(
+      "title",
+      workspace.path,
+    );
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url]) => url === "/api/workspaces/workspace-1/terminal/session",
+      ),
+    ).toHaveLength(2);
+
+    await userEvent.click(
+      within(terminalList).getByRole("button", { name: /Terminal 1/ }),
+    );
+    expect(within(terminalList).getByText("Terminal 1")).toBeInTheDocument();
+
+    await userEvent.click(
+      within(terminalList).getByRole("button", { name: "Close terminal 2" }),
+    );
+    expect(within(terminalList).queryByText("Terminal 2")).not.toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "Terminal sessions" })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getAllByRole("button", { name: "Close terminal" })[1]);
+
+    await waitFor(() => {
+      expect(screen.queryByText("connected")).not.toBeInTheDocument();
+    });
   });
 
   it("shows the active chat task graph above the git diff panel", async () => {
@@ -823,9 +860,10 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
   }
 
   if (path === "/api/workspaces/workspace-1/terminal/session") {
+    terminalSessionCounter += 1;
     return jsonResponse({
-      id: "terminal-1",
-      name: "Terminal",
+      id: `terminal-${terminalSessionCounter}`,
+      name: `Terminal ${terminalSessionCounter}`,
       workingDirectory: workspace.path,
     });
   }

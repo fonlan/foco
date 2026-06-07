@@ -167,6 +167,15 @@ summary:focus-visible {
   width: 0;
 }
 
+.terminal-panel-body {
+  min-height: 11rem;
+  max-height: min(32.5rem, 70dvh);
+}
+
+.terminal-session-pane {
+  transition: opacity 120ms ease;
+}
+
 .markdown-content {
   overflow-wrap: anywhere;
 }
@@ -421,6 +430,14 @@ summary:focus-visible {
     border-top: 1px solid rgba(214, 211, 209, 0.9);
     border-radius: 1rem 1rem 0 0;
     box-shadow: 0 -24px 60px rgba(33, 31, 28, 0.18);
+  }
+
+  .terminal-panel-body {
+    max-height: min(26rem, 64dvh);
+  }
+
+  .terminal-session-list {
+    width: 8.5rem;
   }
 
   .app-main-panel > header {
