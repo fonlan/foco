@@ -4118,7 +4118,7 @@ function TerminalPanel({ workspace }: { workspace: WorkspaceSummary | undefined 
             <span className="shrink-0 text-rose-300">{error}</span>
           ) : null}
         </div>
-        <div ref={containerRef} className="h-56 min-w-0 p-2" />
+        <div ref={containerRef} className="terminal-xterm h-56 min-w-0 p-2" />
       </div>
     </section>
   );

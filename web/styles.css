@@ -158,6 +158,15 @@ summary:focus-visible {
   background-color: transparent !important;
 }
 
+.terminal-xterm .xterm .xterm-viewport {
+  scrollbar-width: none;
+}
+
+.terminal-xterm .xterm .xterm-viewport::-webkit-scrollbar {
+  height: 0;
+  width: 0;
+}
+
 .markdown-content {
   overflow-wrap: anywhere;
 }
