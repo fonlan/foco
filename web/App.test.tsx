@@ -461,6 +461,43 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("Tool run")).toBeInTheDocument();
   });
 
+  it("asks for confirmation before deleting a chat", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByText("Tool run");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Delete chat Tool run" }),
+    );
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Delete this chat?",
+    });
+    expect(within(dialog).getByText("Tool run")).toBeInTheDocument();
+    expect(within(dialog).getByText("Default")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/chats/chat-1/delete",
+      ),
+    ).toBe(false);
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Confirm delete chat" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-1/chats/chat-1/delete",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    expect(screen.queryByRole("dialog", { name: "Delete this chat?" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Tool run")).not.toBeInTheDocument();
+    expect(screen.getByText("Second chat")).toBeInTheDocument();
+  });
+
   it("shows a running spinner instead of a close button on a streaming chat tab", async () => {
     render(<App />);
 
@@ -812,6 +849,18 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
       exists: false,
       tasks: [],
       updatedAt: null,
+    });
+  }
+
+  if (path === "/api/workspaces/workspace-1/chats/chat-1/delete") {
+    return jsonResponse({
+      activeWorkspaceId: workspace.id,
+      workspaces: [
+        {
+          ...workspace,
+          chats: workspace.chats.filter((chat) => chat.id !== "chat-1"),
+        },
+      ],
     });
   }
 

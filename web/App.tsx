@@ -517,6 +517,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "New chat in {name}": "在 {name} 中新建聊天",
     "Delete chat": "删除聊天",
     "Delete chat {title}": "删除聊天 {title}",
+    "Delete this chat?": "删除此聊天？",
+    "This will delete the saved chat history.": "这会删除已保存的聊天历史。",
+    "Cancel chat deletion": "取消删除聊天",
+    "Confirm delete chat": "确认删除聊天",
     "Close chat tab {title}": "关闭会话标签 {title}",
     "Chat is running": "会话运行中",
     "No chats": "暂无聊天",
@@ -868,6 +872,13 @@ type ChatTabSummary = OpenChatTab & {
   workspaceName: string;
 };
 
+type PendingDeleteChat = {
+  workspaceId: string;
+  chatId: string;
+  title: string;
+  workspaceName: string;
+};
+
 type RetryRunRequest = {
   workspaceId: string;
   chatId: string | null;
@@ -899,6 +910,8 @@ export function App() {
   const [messages, setMessages] = useState<ShellMessage[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [openChatTabs, setOpenChatTabs] = useState<OpenChatTab[]>([]);
+  const [pendingDeleteChat, setPendingDeleteChat] =
+    useState<PendingDeleteChat | null>(null);
   const [chatMessagesByKey, setChatMessagesByKey] = useState<
     Record<string, ShellMessage[]>
   >({});
@@ -1153,6 +1166,10 @@ export function App() {
       const next = current.filter((tab) => workspaceHasChat(workspaces, tab));
       return next.length === current.length ? current : next;
     });
+
+    setPendingDeleteChat((current) =>
+      current && workspaceHasChat(workspaces, current) ? current : null,
+    );
   }, [workspaces]);
 
   useEffect(() => {
@@ -1453,8 +1470,32 @@ export function App() {
     setMessages([]);
   }
 
+  function requestDeleteWorkspaceChat(workspace: WorkspaceSummary, chat: ChatSummary) {
+    if (runningChatKey === chatRunKey(workspace.id, chat.id)) {
+      setError(t("Cancel the current run before deleting this chat."));
+      return;
+    }
+
+    setError(null);
+    setPendingDeleteChat({
+      workspaceId: workspace.id,
+      chatId: chat.id,
+      title: chat.title,
+      workspaceName: workspace.name,
+    });
+  }
+
+  async function confirmDeleteWorkspaceChat() {
+    const target = pendingDeleteChat;
+    if (!target) {
+      return;
+    }
+
+    await deleteWorkspaceChat(target.workspaceId, target.chatId);
+  }
+
   async function deleteWorkspaceChat(workspaceId: string, chatId: string) {
-    if (isSendingMessage && activeChatId === chatId) {
+    if (runningChatKey === chatRunKey(workspaceId, chatId)) {
       setError(t("Cancel the current run before deleting this chat."));
       return;
     }
@@ -1482,6 +1523,7 @@ export function App() {
       setRetryRunRequest((current) =>
         current?.chatId === chatId ? null : current,
       );
+      setPendingDeleteChat(null);
     } catch (requestError) {
       setError(errorMessage(requestError));
     }
@@ -2291,7 +2333,7 @@ export function App() {
                                   })}
                                   className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
                                   onClick={() =>
-                                    void deleteWorkspaceChat(workspace.id, chat.id)
+                                    requestDeleteWorkspaceChat(workspace, chat)
                                   }
                                   title={t("Delete chat")}
                                   type="button"
@@ -2497,6 +2539,13 @@ export function App() {
           onBranchNameChange={setNewBranchName}
           onClose={() => setIsBranchDialogOpen(false)}
           onSubmit={handleCreateGitBranch}
+        />
+      ) : null}
+      {pendingDeleteChat ? (
+        <DeleteChatDialog
+          chat={pendingDeleteChat}
+          onClose={() => setPendingDeleteChat(null)}
+          onConfirm={() => void confirmDeleteWorkspaceChat()}
         />
       ) : null}
       {pendingQuestion ? (
@@ -2747,6 +2796,84 @@ function GitBranchDialog({
             </button>
           </div>
         </form>
+      </section>
+    </div>
+  );
+}
+
+function DeleteChatDialog({
+  chat,
+  onClose,
+  onConfirm,
+}: {
+  chat: PendingDeleteChat;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
+      role="presentation"
+    >
+      <section
+        aria-labelledby="delete-chat-dialog-title"
+        aria-modal="true"
+        className="w-full max-w-md overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        role="dialog"
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <Trash2 aria-hidden="true" className="size-5 text-rose-700" />
+            <h2
+              className="truncate text-base font-semibold text-stone-950"
+              id="delete-chat-dialog-title"
+            >
+              {t("Delete this chat?")}
+            </h2>
+          </div>
+          <button
+            aria-label={t("Cancel chat deletion")}
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            onClick={onClose}
+            title={t("Cancel")}
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+        <div className="space-y-4 px-4 py-4">
+          <div>
+            <p className="text-sm font-medium text-stone-950">{chat.title}</p>
+            <p className="mt-1 text-xs font-medium text-stone-500">
+              {chat.workspaceName}
+            </p>
+          </div>
+          <p className="text-sm leading-6 text-stone-600">
+            {t("This will delete the saved chat history.")}
+          </p>
+          <div className="flex justify-end gap-2">
+            <button
+              aria-label={t("Cancel chat deletion")}
+              className="inline-flex size-11 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-stone-300 hover:bg-stone-50"
+              onClick={onClose}
+              title={t("Cancel")}
+              type="button"
+            >
+              <X aria-hidden="true" className="size-4" />
+            </button>
+            <button
+              aria-label={t("Confirm delete chat")}
+              className="inline-flex size-11 items-center justify-center rounded-lg bg-rose-700 text-white shadow-[0_12px_28px_rgba(190,18,60,0.22)] hover:bg-rose-800"
+              onClick={onConfirm}
+              title={t("Delete chat")}
+              type="button"
+            >
+              <Trash2 aria-hidden="true" className="size-4" />
+            </button>
+          </div>
+        </div>
       </section>
     </div>
   );
@@ -7314,7 +7441,10 @@ function upsertOpenChatTab(tabs: OpenChatTab[], nextTab: OpenChatTab) {
   return [...tabs, nextTab];
 }
 
-function workspaceHasChat(workspaces: WorkspaceSummary[], tab: OpenChatTab) {
+function workspaceHasChat(
+  workspaces: WorkspaceSummary[],
+  tab: { workspaceId: string; chatId: string },
+) {
   return workspaces.some(
     (workspace) =>
       workspace.id === tab.workspaceId &&
