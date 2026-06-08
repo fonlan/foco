@@ -1511,13 +1511,6 @@ export function App() {
       return;
     }
 
-    if (activeChatId && activeWorkspaceId) {
-      setExpandedWorkspaceId((current) =>
-        current === activeWorkspaceId ? current : activeWorkspaceId,
-      );
-      return;
-    }
-
     setExpandedWorkspaceId((current) => {
       if (
         current === null ||
@@ -1683,6 +1676,7 @@ export function App() {
       const nextMessages = data.messages.map(normalizeChatMessageSummary);
       setActiveWorkspaceId(workspaceId);
       setActiveChatId(chatId);
+      setExpandedWorkspaceId(workspaceId);
       openChatTab(workspaceId, chatId);
       activeChatKeyRef.current = chatKey;
       setMessages(nextMessages);
@@ -1705,6 +1699,7 @@ export function App() {
 
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(chatId);
+    setExpandedWorkspaceId(workspaceId);
     openChatTab(workspaceId, chatId);
     activeChatKeyRef.current = chatKey;
     setMessages(cachedMessages);
@@ -2340,11 +2335,6 @@ export function App() {
   }
 
   function toggleWorkspace(workspaceId: string) {
-    if (activeChatId && activeWorkspaceId) {
-      setExpandedWorkspaceId(activeWorkspaceId);
-      return;
-    }
-
     setExpandedWorkspaceId((current) =>
       current === workspaceId ? null : workspaceId,
     );

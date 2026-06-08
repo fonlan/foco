@@ -620,7 +620,7 @@ describe("App verification surfaces", () => {
     );
   });
 
-  it("keeps the active chat workspace as the only expanded workspace", async () => {
+  it("opens the selected chat workspace and collapses the previous workspace", async () => {
     render(<App />);
 
     await userEvent.click(await screen.findByText("Tool run"));
@@ -629,11 +629,30 @@ describe("App verification surfaces", () => {
     const defaultToggle = screen.getByRole("button", { name: "Default" });
     const sideToggle = screen.getByRole("button", { name: "Side project" });
     await userEvent.click(sideToggle);
+    await userEvent.click(await screen.findByText("Side note"));
+
+    expect(defaultToggle).toHaveAttribute("aria-expanded", "false");
+    expect(sideToggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getAllByText("Side note").length).toBeGreaterThan(0);
+  });
+
+  it("allows workspace toggles after selecting a historical chat", async () => {
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    const defaultToggle = screen.getByRole("button", { name: "Default" });
+    const sideToggle = screen.getByRole("button", { name: "Side project" });
 
     expect(defaultToggle).toHaveAttribute("aria-expanded", "true");
-    expect(sideToggle).toHaveAttribute("aria-expanded", "false");
-    expect(screen.getAllByText("Tool run").length).toBeGreaterThan(0);
-    expect(screen.queryByText("Side note")).not.toBeInTheDocument();
+
+    await userEvent.click(defaultToggle);
+    expect(defaultToggle).toHaveAttribute("aria-expanded", "false");
+
+    await userEvent.click(sideToggle);
+    expect(sideToggle).toHaveAttribute("aria-expanded", "true");
+    expect(await screen.findByText("Side note")).toBeInTheDocument();
   });
 
   it("opens center chat tabs and closes tabs without deleting chat history", async () => {
