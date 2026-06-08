@@ -4,6 +4,7 @@ TODO.md
 .mem/
 .codegraph/
 .agents/
+.foco/
 target/
 node_modules/
 web/dist/

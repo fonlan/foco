@@ -1,5 +1,7 @@
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
   BarChart3,
   Bot,
   CheckCircle2,
@@ -33,6 +35,7 @@ import {
   Terminal,
   Trash2,
   User,
+  Webhook,
   Wrench,
   X,
   type LucideIcon,
@@ -191,6 +194,7 @@ type AppLanguageSummary = {
 };
 
 type GeneralSettingsSummary = {
+  hookAuditEnabled: boolean;
   language: AppLanguageId;
   supportedLanguages: AppLanguageSummary[];
   webServer: WebServerSettingsSummary;
@@ -234,6 +238,7 @@ type ProviderFormState = {
 };
 
 type GeneralFormState = {
+  hookAuditEnabled: boolean;
   language: string;
   listenHost: string;
   listenPort: string;
@@ -305,6 +310,142 @@ type ConfiguredSkillSummary = {
 type SkillDiscoveryErrorSummary = {
   path: string;
   message: string;
+};
+
+type HookHandlerType = "command" | "http" | "mcp_tool" | "prompt";
+
+type HookConfig = {
+  disableAllHooks?: boolean;
+  [eventName: string]: boolean | HookMatcherGroup[] | undefined;
+};
+
+type HookMatcherGroup = {
+  enabled?: boolean;
+  matcher?: string | null;
+  hooks: HookHandler[];
+};
+
+type HookHandler = {
+  enabled?: boolean;
+  type: HookHandlerType | string;
+  if?: string | null;
+  command?: string | null;
+  args?: string[];
+  shell?: string | null;
+  url?: string | null;
+  serverId?: string | null;
+  toolName?: string | null;
+  prompt?: string | null;
+  timeout?: number | null;
+  async?: boolean;
+  asyncRewake?: boolean;
+  statusMessage?: string | null;
+  input?: JsonValue | null;
+};
+
+type HookConfigScopeSummary = {
+  source: string;
+  path: string;
+  workspaceId: string | null;
+  config: HookConfig;
+};
+
+type EffectiveHookSummary = {
+  source: string;
+  event: string;
+  matcher: string | null;
+  handlerType: string;
+  command: string | null;
+  url: string | null;
+  serverId: string | null;
+  toolName: string | null;
+  asyncHook: boolean;
+  statusMessage: string | null;
+};
+
+type HookRunSummaryRow = {
+  id: string;
+  workspaceId: string;
+  chatId: string | null;
+  runId: string | null;
+  toolCallId: string | null;
+  event: string;
+  hookSource: string;
+  handlerType: string;
+  status: string;
+  exitCode: number | null;
+  stdoutPreview: string | null;
+  stderrPreview: string | null;
+  startedAt: string;
+  completedAt: string;
+};
+
+type HooksSettingsResponse = {
+  supportedEvents: string[];
+  unsupportedEvents: string[];
+  global: HookConfigScopeSummary;
+  workspace: HookConfigScopeSummary;
+  effective: EffectiveHookSummary[];
+  recentRuns: HookRunSummaryRow[];
+};
+
+type HookRunsResponse = {
+  runs: HookRunSummaryRow[];
+};
+
+type ImportClaudeHooksResponse = {
+  saved: boolean;
+  target: "global" | "workspace" | string;
+  path: string;
+  importedFiles: string[];
+  validationErrors: string[];
+  config: HookConfig;
+};
+
+type HookDecision =
+  | { type: "allow" }
+  | { type: "ask"; reason: string }
+  | { type: "block"; reason: string }
+  | { type: "deny"; reason: string };
+
+type HookRunSummary = {
+  decisions: HookDecision[];
+  additionalContext: string[];
+  systemMessages: string[];
+  errors: string[];
+};
+
+type HookRunDetail = HookRunSummaryRow & {
+  input: JsonValue;
+  output: JsonValue | null;
+};
+
+type HookRunDetailResponse = {
+  run: HookRunDetail;
+};
+
+type HookScope = "global" | "workspace";
+
+type HookHandlerFormState = {
+  argsText: string;
+  asyncHook: boolean;
+  asyncRewake: boolean;
+  command: string;
+  enabled: boolean;
+  event: string;
+  groupIndex: number | null;
+  handlerIndex: number | null;
+  ifFilter: string;
+  inputText: string;
+  matcher: string;
+  prompt: string;
+  serverId: string;
+  shell: string;
+  statusMessage: string;
+  timeout: string;
+  toolName: string;
+  type: HookHandlerType;
+  url: string;
 };
 
 type ProviderTestResponse = {
@@ -517,6 +658,11 @@ type ChatStreamEvent =
       request: QuestionRequestSummary;
     }
   | {
+      type: "hookNotification";
+      assistantMessageId: string;
+      notification: HookNotificationSummary;
+    }
+  | {
       type: "gitDiffRefresh";
       workspaceId: string;
     }
@@ -527,8 +673,15 @@ type ChatStreamEvent =
     }
   | { type: "error"; message: string };
 
+type HookNotificationSummary = {
+  event: string;
+  level: string;
+  message: string;
+};
+
 type SettingsSection =
   | "general"
+  | "hooks"
   | "mcp"
   | "models"
   | "providers"
@@ -848,6 +1001,86 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
       "已保存的 host 和端口会在后端下次启动时生效。",
     "Language changes apply immediately after saving.":
       "语言设置保存后会立即生效。",
+    "Hook settings": "Hook 设置",
+    "Global and workspace lifecycle hooks": "全局与工作区生命周期 Hook",
+    "Hook run detail": "Hook 运行详情",
+    "Hook configuration": "Hook 配置",
+    "Add hook": "添加 Hook",
+    "Edit hook": "编辑 Hook",
+    Global: "全局",
+    "Global hooks": "全局 Hook",
+    "Workspace hooks": "工作区 Hook",
+    Event: "事件",
+    "Matcher": "匹配器",
+    "Enable hook": "启用 Hook",
+    "Handler type": "处理器类型",
+    HTTP: "HTTP",
+    "MCP tool": "MCP 工具",
+    "If filter": "if 过滤器",
+    "Shell": "Shell",
+    "Timeout ms": "超时 ms",
+    "Async": "异步",
+    "Async re-wake": "异步唤醒",
+    "Status message": "状态消息",
+    "Input override JSON": "输入覆盖 JSON",
+    "Save hook": "保存 Hook",
+    "Hook rules": "Hook 规则",
+    "Disable all hooks": "禁用全部 Hook",
+    "Record hook run logs": "记录 Hook 运行日志",
+    "Import Claude hooks": "导入 Claude Hook",
+    "Import to global hooks": "导入到全局 Hook",
+    "Import to workspace hooks": "导入到工作区 Hook",
+    "Global import reads user Claude settings; workspace import reads the selected workspace.":
+      "全局导入读取用户级 Claude 设置；工作区导入读取当前选择的工作区。",
+    "Import saved": "导入已保存",
+    "Import not saved": "导入未保存",
+    "Test hook": "测试 Hook",
+    "Match value": "匹配值",
+    "Sample payload": "示例载荷",
+    "Run hook test": "运行 Hook 测试",
+    "Effective hooks": "生效的 Hook",
+    "Recent hook runs": "最近 Hook 运行",
+    "No hook rules": "暂无 Hook 规则",
+    "No effective hooks": "暂无生效 Hook",
+    "No hook runs": "暂无 Hook 运行",
+    "Refresh hook runs": "刷新 Hook 运行",
+    "Close hook configuration": "关闭 Hook 配置",
+    "Close hook run detail": "关闭 Hook 运行详情",
+    "Running hook": "正在运行 Hook",
+    "Session start": "会话开始",
+    "Session end": "会话结束",
+    "User prompt submit": "用户提交",
+    "Pre tool use": "工具调用前",
+    "Permission request": "权限请求",
+    "Permission denied": "权限拒绝",
+    "Post tool use": "工具调用后",
+    "Post tool use failure": "工具调用失败后",
+    "Post tool batch": "工具批次后",
+    Stop: "停止",
+    "Stop failure": "停止失败",
+    "Pre compact": "压缩前",
+    "Post compact": "压缩后",
+    Elicitation: "询问",
+    "Elicitation result": "询问结果",
+    "Hook asks whether to allow tool '{toolName}': {reason}":
+      "Hook 询问是否允许工具 '{toolName}'：{reason}",
+    "Return a JSON hook result.": "返回 JSON 格式的 Hook 结果。",
+    "Select a workspace first.": "请先选择工作区。",
+    "Prompt": "提示词",
+    "MCP server id": "MCP 服务 ID",
+    "MCP tool name": "MCP 工具名",
+    "rules {count}": "规则 {count}",
+    "handlers {count}": "处理器 {count}",
+    "hooks {count}": "Hook {count}",
+    "last {status}": "最近 {status}",
+    "Reload hooks": "重新加载 Hook",
+    "Move hook up": "上移 Hook",
+    "Move hook down": "下移 Hook",
+    "Move handler up": "上移处理器",
+    "Move handler down": "下移处理器",
+    "Delete hook": "删除 Hook",
+    "Enable hook group": "启用 Hook 组",
+    "Failed to render.": "渲染失败。",
     "Provider configuration": "供应商配置",
     "Edit provider": "编辑供应商",
     "Add provider": "添加供应商",
@@ -2257,6 +2490,26 @@ export function App() {
         if (streamEvent.type === "questionRequest") {
           setQuestionError(null);
           setPendingQuestion(streamEvent.request);
+          return;
+        }
+
+        if (streamEvent.type === "hookNotification") {
+          if (streamEvent.notification.level === "error") {
+            setError(streamEvent.notification.message);
+          }
+          setMessagesForChatKey(runMessagesKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? {
+                    ...message,
+                    parts: appendTextPart(
+                      message.parts,
+                      `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
+                    ),
+                  }
+                : message,
+            ),
+          );
           return;
         }
 
@@ -6320,6 +6573,31 @@ function SettingsPanel({
   const [mcpForm, setMcpForm] = useState<McpServerFormState>(() =>
     emptyMcpServerForm(),
   );
+  const [hookSettings, setHookSettings] = useState<HooksSettingsResponse | null>(
+    null,
+  );
+  const [hookScope, setHookScope] = useState<HookScope>("global");
+  const [hookWorkspaceId, setHookWorkspaceId] = useState("");
+  const [hookForm, setHookForm] = useState<HookHandlerFormState>(() =>
+    emptyHookHandlerForm(),
+  );
+  const [isHookDialogOpen, setIsHookDialogOpen] = useState(false);
+  const [isLoadingHooks, setIsLoadingHooks] = useState(false);
+  const [isSavingHooks, setIsSavingHooks] = useState(false);
+  const [isImportingHooks, setIsImportingHooks] = useState(false);
+  const [isTestingHooks, setIsTestingHooks] = useState(false);
+  const [isRefreshingHookRuns, setIsRefreshingHookRuns] = useState(false);
+  const [hookImportResult, setHookImportResult] =
+    useState<ImportClaudeHooksResponse | null>(null);
+  const [hookTestResult, setHookTestResult] = useState<HookRunSummary | null>(
+    null,
+  );
+  const [hookRunDetail, setHookRunDetail] = useState<HookRunDetail | null>(null);
+  const [hookTestEvent, setHookTestEvent] = useState("PreToolUse");
+  const [hookTestMatcher, setHookTestMatcher] = useState("run_command");
+  const [hookTestPayload, setHookTestPayload] = useState(
+    '{\n  "toolInput": {\n    "command": "git status"\n  }\n}',
+  );
   const [enabledSkillIds, setEnabledSkillIds] = useState<Set<string>>(
     () => new Set(),
   );
@@ -6391,6 +6669,19 @@ function SettingsPanel({
   const providerKinds = settings?.providerKinds ?? [];
   const providers = settings?.providers ?? [];
   const workspaces = settings?.workspaces ?? [];
+  const selectedHookWorkspace =
+    workspaces.find((workspace) => workspace.id === hookWorkspaceId) ??
+    workspaces[0] ??
+    null;
+  const activeHookConfig =
+    hookScope === "global"
+      ? hookSettings?.global.config
+      : hookSettings?.workspace.config;
+  const activeHookPath =
+    hookScope === "global"
+      ? hookSettings?.global.path
+      : hookSettings?.workspace.path;
+  const activeHookGroups = hookConfigEntries(activeHookConfig);
   const terminalShells = settings?.terminalShells ?? [];
   const mcpTransports = settings?.mcpTransports ?? [];
   const mcpServers = settings?.mcpServers ?? [];
@@ -6464,6 +6755,7 @@ function SettingsPanel({
     setIsEditingGeneralPassword(false);
     setIsGeneralPasswordVisible(false);
     setGeneralForm({
+      hookAuditEnabled: data.general.hookAuditEnabled,
       language: data.general.language,
       listenHost: data.general.webServer.listenHost,
       listenPort: String(data.general.webServer.listenPort),
@@ -6495,6 +6787,7 @@ function SettingsPanel({
       const data = await requestJson<SettingsResponse>("/api/settings");
       setSettings(data);
       onSettingsChange(data);
+      setHookWorkspaceId((current) => current || data.workspaces[0]?.id || "");
       setDraggedWorkspaceId(null);
       setWorkspaceOrderPreview(null);
       setDraggedModelId(null);
@@ -6516,10 +6809,36 @@ function SettingsPanel({
     }
   }, [onSettingsChange]);
 
+  const loadHooks = useCallback(async (workspaceId: string) => {
+    if (!workspaceId) {
+      return;
+    }
+
+    setIsLoadingHooks(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<HooksSettingsResponse>(
+        `/api/hooks?workspaceId=${encodeURIComponent(workspaceId)}`,
+      );
+      setHookSettings(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsLoadingHooks(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadMetadata();
     void loadSettings();
   }, [loadMetadata, loadSettings]);
+
+  useEffect(() => {
+    if (hookWorkspaceId) {
+      void loadHooks(hookWorkspaceId);
+    }
+  }, [hookWorkspaceId, loadHooks]);
 
   useEffect(() => {
     if (workspaceDialogRevision > 0) {
@@ -6667,6 +6986,25 @@ function SettingsPanel({
     setIsMcpDialogOpen(true);
   }
 
+  function startAddingHookHandler() {
+    setHookForm({
+      ...emptyHookHandlerForm(),
+      event: hookSettings?.supportedEvents[0] ?? "PreToolUse",
+    });
+    setIsHookDialogOpen(true);
+  }
+
+  function editHookHandler(
+    event: string,
+    groupIndex: number,
+    handlerIndex: number,
+    group: HookMatcherGroup,
+    handler: HookHandler,
+  ) {
+    setHookForm(hookHandlerFormFromConfig(event, groupIndex, handlerIndex, group, handler));
+    setIsHookDialogOpen(true);
+  }
+
   async function refreshMetadata() {
     setIsRefreshing(true);
     setError(null);
@@ -6699,6 +7037,7 @@ function SettingsPanel({
             generalForm.listenPort,
             t("Listen port"),
           ),
+          hookAuditEnabled: generalForm.hookAuditEnabled,
           language: generalForm.language,
           password: password.trim() ? password : null,
         }),
@@ -6732,6 +7071,7 @@ function SettingsPanel({
       const data = await requestJson<SettingsResponse>("/api/settings/general", {
         body: JSON.stringify({
           clearPassword: false,
+          hookAuditEnabled: settings.general.hookAuditEnabled,
           listenHost: settings.general.webServer.listenHost,
           listenPort: settings.general.webServer.listenPort,
           language,
@@ -6769,6 +7109,7 @@ function SettingsPanel({
       const data = await requestJson<SettingsResponse>("/api/settings/general", {
         body: JSON.stringify({
           clearPassword: true,
+          hookAuditEnabled: settings.general.hookAuditEnabled,
           listenHost: settings.general.webServer.listenHost,
           listenPort: settings.general.webServer.listenPort,
           language: settings.general.language,
@@ -7251,6 +7592,262 @@ function SettingsPanel({
     }
   }
 
+  async function saveHookAuditEnabled(hookAuditEnabled: boolean) {
+    if (!settings) {
+      return;
+    }
+
+    setGeneralForm((current) => ({
+      ...current,
+      hookAuditEnabled,
+    }));
+    setIsSavingGeneral(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings/general", {
+        body: JSON.stringify({
+          clearPassword: false,
+          hookAuditEnabled,
+          listenHost: settings.general.webServer.listenHost,
+          listenPort: settings.general.webServer.listenPort,
+          language: settings.general.language,
+          password: null,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncGeneralForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setGeneralForm((current) => ({
+        ...current,
+        hookAuditEnabled: settings.general.hookAuditEnabled,
+      }));
+    } finally {
+      setIsSavingGeneral(false);
+    }
+  }
+
+  async function refreshHookRuns() {
+    const workspaceId = selectedHookWorkspace?.id;
+    if (!workspaceId) {
+      setError(t("Select a workspace first."));
+      return;
+    }
+
+    setIsRefreshingHookRuns(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<HookRunsResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/hooks/runs?limit=50`,
+      );
+      setHookSettings((current) =>
+        current ? { ...current, recentRuns: data.runs } : current,
+      );
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsRefreshingHookRuns(false);
+    }
+  }
+
+  async function saveHookConfig(nextConfig: HookConfig) {
+    const workspaceId = selectedHookWorkspace?.id;
+    if (!workspaceId) {
+      setError(t("Select a workspace first."));
+      return;
+    }
+
+    setIsSavingHooks(true);
+    setError(null);
+    setHookImportResult(null);
+
+    try {
+      const url =
+        hookScope === "global" ? "/api/hooks/global" : "/api/hooks/workspace";
+      const body =
+        hookScope === "global"
+          ? { config: nextConfig }
+          : { workspaceId, config: nextConfig };
+      const data = await requestJson<HooksSettingsResponse>(url, {
+        body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setHookSettings(data);
+      setIsHookDialogOpen(false);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingHooks(false);
+    }
+  }
+
+  async function submitHookForm(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    try {
+      const currentConfig = activeHookConfig ?? emptyHookConfig();
+      const nextConfig = upsertHookHandlerInConfig(currentConfig, hookForm);
+      await saveHookConfig(nextConfig);
+    } catch (formError) {
+      setError(errorMessage(formError));
+    }
+  }
+
+  function updateHookConfig(nextConfig: HookConfig) {
+    void saveHookConfig(nextConfig);
+  }
+
+  function deleteHookHandler(event: string, groupIndex: number, handlerIndex: number) {
+    const nextConfig = deleteHookHandlerFromConfig(
+      activeHookConfig ?? emptyHookConfig(),
+      event,
+      groupIndex,
+      handlerIndex,
+    );
+    updateHookConfig(nextConfig);
+  }
+
+  function toggleHookGroup(event: string, groupIndex: number, enabled: boolean) {
+    updateHookConfig(
+      updateHookGroupInConfig(activeHookConfig ?? emptyHookConfig(), event, groupIndex, {
+        enabled,
+      }),
+    );
+  }
+
+  function toggleHookHandler(
+    event: string,
+    groupIndex: number,
+    handlerIndex: number,
+    enabled: boolean,
+  ) {
+    updateHookConfig(
+      updateHookHandlerInConfig(
+        activeHookConfig ?? emptyHookConfig(),
+        event,
+        groupIndex,
+        handlerIndex,
+        { enabled },
+      ),
+    );
+  }
+
+  function moveHookGroup(event: string, groupIndex: number, direction: -1 | 1) {
+    updateHookConfig(
+      moveHookGroupInConfig(
+        activeHookConfig ?? emptyHookConfig(),
+        event,
+        groupIndex,
+        direction,
+      ),
+    );
+  }
+
+  function moveHookHandler(
+    event: string,
+    groupIndex: number,
+    handlerIndex: number,
+    direction: -1 | 1,
+  ) {
+    updateHookConfig(
+      moveHookHandlerInConfig(
+        activeHookConfig ?? emptyHookConfig(),
+        event,
+        groupIndex,
+        handlerIndex,
+        direction,
+      ),
+    );
+  }
+
+  async function importClaudeHooks(target: HookScope) {
+    const workspaceId = selectedHookWorkspace?.id;
+    if (target === "workspace" && !workspaceId) {
+      setError(t("Select a workspace first."));
+      return;
+    }
+
+    setIsImportingHooks(true);
+    setError(null);
+    setHookImportResult(null);
+
+    try {
+      const data = await requestJson<ImportClaudeHooksResponse>(
+        "/api/hooks/import-claude",
+        {
+          body: JSON.stringify({
+            target,
+            workspaceId: target === "workspace" ? workspaceId : null,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setHookImportResult(data);
+      await loadHooks(workspaceId);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsImportingHooks(false);
+    }
+  }
+
+  async function testHooks(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const workspaceId = selectedHookWorkspace?.id;
+    if (!workspaceId) {
+      setError(t("Select a workspace first."));
+      return;
+    }
+
+    setIsTestingHooks(true);
+    setError(null);
+    setHookTestResult(null);
+
+    try {
+      const parsedPayload = parseJsonText(hookTestPayload, t("Sample payload"));
+      const data = await requestJson<HookRunSummary>("/api/hooks/test", {
+        body: JSON.stringify({
+          event: hookTestEvent,
+          matchValue: hookTestMatcher.trim() || null,
+          payload: parsedPayload,
+          workspaceId,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setHookTestResult(data);
+      await loadHooks(workspaceId);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsTestingHooks(false);
+    }
+  }
+
+  async function openHookRunDetail(runId: string) {
+    const workspaceId = selectedHookWorkspace?.id;
+    if (!workspaceId) {
+      return;
+    }
+
+    setError(null);
+    try {
+      const data = await requestJson<HookRunDetailResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/hooks/runs/${encodeURIComponent(runId)}`,
+      );
+      setHookRunDetail(data.run);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
+  }
+
   async function testProvider(providerId: string) {
     setProviderTests((current) => ({
       ...current,
@@ -7379,6 +7976,12 @@ function SettingsPanel({
             icon={Folder}
             label={t("Workspaces")}
             onClick={() => setActiveSection("workspaces")}
+          />
+          <SettingsNavButton
+            active={activeSection === "hooks"}
+            icon={Webhook}
+            label={t("Hooks")}
+            onClick={() => setActiveSection("hooks")}
           />
           <SettingsNavButton
             active={activeSection === "providers"}
@@ -7943,6 +8546,962 @@ function SettingsPanel({
               ) : (
                 <div className="px-4 py-6 text-sm text-stone-500">
                   {t("No workspaces")}
+                </div>
+              )}
+            </div>
+          </section>
+        </section>
+        ) : null}
+
+        {activeSection === "hooks" ? (
+        <section className="grid gap-4">
+          {hookRunDetail ? (
+            <>
+              <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+              <div
+                aria-label={t("Hook run detail")}
+                className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,46rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                role="dialog"
+              >
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <Webhook aria-hidden="true" className="size-5 text-teal-700" />
+                      <h3 className="text-sm font-semibold text-stone-950">
+                        {hookEventLabel(hookRunDetail.event, t)}
+                      </h3>
+                    </div>
+                    <div className="mt-1 truncate text-xs text-stone-500">
+                      {hookRunDetail.id}
+                    </div>
+                  </div>
+                  <button
+                    aria-label={t("Close hook run detail")}
+                    className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                    onClick={() => setHookRunDetail(null)}
+                    title={t("Close")}
+                    type="button"
+                  >
+                    <X aria-hidden="true" className="size-4" />
+                  </button>
+                </div>
+                <div className="grid gap-3">
+                  <div className="grid gap-2 sm:grid-cols-3">
+                    <CapabilityPill
+                      label={hookRunStatusLabel(hookRunDetail.status, t)}
+                      ok={hookRunDetail.status === "succeeded"}
+                    />
+                    <CapabilityPill
+                      label={hookSourceLabel(hookRunDetail.hookSource, t)}
+                      ok={hookRunDetail.hookSource === "global"}
+                    />
+                    <CapabilityPill
+                      label={hookHandlerTypeLabel(hookRunDetail.handlerType, t)}
+                      ok
+                    />
+                  </div>
+                  {hookRunDetail.stdoutPreview ? (
+                    <pre className="max-h-32 overflow-auto rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-700">
+                      {hookRunDetail.stdoutPreview}
+                    </pre>
+                  ) : null}
+                  {hookRunDetail.stderrPreview ? (
+                    <pre className="max-h-32 overflow-auto rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                      {hookRunDetail.stderrPreview}
+                    </pre>
+                  ) : null}
+                  <div className="grid gap-3 lg:grid-cols-2">
+                    <pre className="max-h-80 overflow-auto rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-700">
+                      {JSON.stringify(hookRunDetail.input, null, 2)}
+                    </pre>
+                    <pre className="max-h-80 overflow-auto rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-700">
+                      {JSON.stringify(hookRunDetail.output, null, 2)}
+                    </pre>
+                  </div>
+                </div>
+              </div>
+            </>
+          ) : null}
+
+          {isHookDialogOpen ? (
+            <>
+              <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+              <form
+                aria-label={t("Hook configuration")}
+                className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,40rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                onSubmit={(event) => void submitHookForm(event)}
+              >
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <Webhook aria-hidden="true" className="size-5 text-teal-700" />
+                      <h3 className="text-sm font-semibold text-stone-950">
+                        {hookForm.handlerIndex === null
+                          ? t("Add hook")
+                          : t("Edit hook")}
+                      </h3>
+                    </div>
+                    <div className="mt-1 truncate text-xs text-stone-500">
+                      {hookScope === "global" ? t("Global hooks") : selectedHookWorkspace?.name}
+                    </div>
+                  </div>
+                  <button
+                    aria-label={t("Close hook configuration")}
+                    className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                    onClick={() => setIsHookDialogOpen(false)}
+                    title={t("Close")}
+                    type="button"
+                  >
+                    <X aria-hidden="true" className="size-4" />
+                  </button>
+                </div>
+
+                <div className="grid gap-3">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Event")}
+                      </span>
+                      <select
+                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) =>
+                          setHookForm((current) => ({
+                            ...current,
+                            event: event.target.value,
+                            groupIndex:
+                              current.handlerIndex === null ? null : current.groupIndex,
+                            handlerIndex:
+                              current.handlerIndex === null ? null : current.handlerIndex,
+                          }))
+                        }
+                        value={hookForm.event}
+                      >
+                        {(hookSettings?.supportedEvents ?? []).map((eventName) => (
+                          <option key={eventName} value={eventName}>
+                            {hookEventLabel(eventName, t)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <TextField
+                      label={t("Matcher")}
+                      onChange={(value) =>
+                        setHookForm((current) => ({ ...current, matcher: value }))
+                      }
+                      placeholder="run_command|write_file"
+                      value={hookForm.matcher}
+                    />
+                  </div>
+                  <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+                    <span className="text-sm font-semibold text-stone-700">
+                      {t("Enable hook")}
+                    </span>
+                    <input
+                      checked={hookForm.enabled}
+                      className="size-4 accent-teal-700"
+                      onChange={(event) =>
+                        setHookForm((current) => ({
+                          ...current,
+                          enabled: event.target.checked,
+                        }))
+                      }
+                      type="checkbox"
+                    />
+                  </label>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Handler type")}
+                      </span>
+                      <select
+                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) =>
+                          setHookForm((current) => ({
+                            ...current,
+                            type: event.target.value as HookHandlerType,
+                          }))
+                        }
+                        value={hookForm.type}
+                      >
+                        {["command", "http", "mcp_tool", "prompt"].map((type) => (
+                          <option key={type} value={type}>
+                            {hookHandlerTypeLabel(type, t)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <TextField
+                      label={t("If filter")}
+                      onChange={(value) =>
+                        setHookForm((current) => ({ ...current, ifFilter: value }))
+                      }
+                      placeholder="run_command(git *)"
+                      value={hookForm.ifFilter}
+                    />
+                  </div>
+
+                  {hookForm.type === "command" ? (
+                    <>
+                      <TextField
+                        label={t("Command")}
+                        onChange={(value) =>
+                          setHookForm((current) => ({ ...current, command: value }))
+                        }
+                        placeholder="node scripts/hook.js"
+                        value={hookForm.command}
+                      />
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <TextField
+                          label={t("Shell")}
+                          onChange={(value) =>
+                            setHookForm((current) => ({ ...current, shell: value }))
+                          }
+                          placeholder="powershell"
+                          value={hookForm.shell}
+                        />
+                        <TextField
+                          inputMode="numeric"
+                          label={t("Timeout ms")}
+                          onChange={(value) =>
+                            setHookForm((current) => ({ ...current, timeout: value }))
+                          }
+                          placeholder="30000"
+                          value={hookForm.timeout}
+                        />
+                      </div>
+                      <label className="block">
+                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          {t("Args")}
+                        </span>
+                        <textarea
+                          className="min-h-20 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          onChange={(event) =>
+                            setHookForm((current) => ({
+                              ...current,
+                              argsText: event.target.value,
+                            }))
+                          }
+                          placeholder={"scripts/hook.js\n--check"}
+                          value={hookForm.argsText}
+                        />
+                      </label>
+                    </>
+                  ) : null}
+
+                  {hookForm.type === "http" ? (
+                    <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem]">
+                      <TextField
+                        label={t("URL")}
+                        onChange={(value) =>
+                          setHookForm((current) => ({ ...current, url: value }))
+                        }
+                        placeholder="http://127.0.0.1:8787/hook"
+                        value={hookForm.url}
+                      />
+                      <TextField
+                        inputMode="numeric"
+                        label={t("Timeout ms")}
+                        onChange={(value) =>
+                          setHookForm((current) => ({ ...current, timeout: value }))
+                        }
+                        placeholder="30000"
+                        value={hookForm.timeout}
+                      />
+                    </div>
+                  ) : null}
+
+                  {hookForm.type === "mcp_tool" ? (
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <TextField
+                        label={t("MCP server id")}
+                        onChange={(value) =>
+                          setHookForm((current) => ({ ...current, serverId: value }))
+                        }
+                        placeholder="server"
+                        value={hookForm.serverId}
+                      />
+                      <TextField
+                        label={t("MCP tool name")}
+                        onChange={(value) =>
+                          setHookForm((current) => ({ ...current, toolName: value }))
+                        }
+                        placeholder="validate"
+                        value={hookForm.toolName}
+                      />
+                    </div>
+                  ) : null}
+
+                  {hookForm.type === "prompt" ? (
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Prompt")}
+                      </span>
+                      <textarea
+                        className="min-h-28 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) =>
+                          setHookForm((current) => ({
+                            ...current,
+                            prompt: event.target.value,
+                          }))
+                        }
+                        placeholder={t("Return a JSON hook result.")}
+                        value={hookForm.prompt}
+                      />
+                    </label>
+                  ) : null}
+
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <TextField
+                      label={t("Status message")}
+                      onChange={(value) =>
+                        setHookForm((current) => ({
+                          ...current,
+                          statusMessage: value,
+                        }))
+                      }
+                      placeholder={t("Running hook")}
+                      value={hookForm.statusMessage}
+                    />
+                    <TextField
+                      inputMode="numeric"
+                      label={t("Timeout ms")}
+                      onChange={(value) =>
+                        setHookForm((current) => ({ ...current, timeout: value }))
+                      }
+                      placeholder="60000"
+                      value={hookForm.timeout}
+                    />
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+                      <span className="text-sm font-semibold text-stone-700">
+                        {t("Async")}
+                      </span>
+                      <input
+                        checked={hookForm.asyncHook}
+                        className="size-4 accent-teal-700"
+                        onChange={(event) =>
+                          setHookForm((current) => ({
+                            ...current,
+                            asyncHook: event.target.checked,
+                          }))
+                        }
+                        type="checkbox"
+                      />
+                    </label>
+                    <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+                      <span className="text-sm font-semibold text-stone-700">
+                        {t("Async re-wake")}
+                      </span>
+                      <input
+                        checked={hookForm.asyncRewake}
+                        className="size-4 accent-teal-700"
+                        onChange={(event) =>
+                          setHookForm((current) => ({
+                            ...current,
+                            asyncRewake: event.target.checked,
+                          }))
+                        }
+                        type="checkbox"
+                      />
+                    </label>
+                  </div>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Input override JSON")}
+                    </span>
+                    <textarea
+                      className="min-h-20 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-xs text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setHookForm((current) => ({
+                          ...current,
+                          inputText: event.target.value,
+                        }))
+                      }
+                      placeholder="{ }"
+                      value={hookForm.inputText}
+                    />
+                  </label>
+                  <button
+                    aria-label={t("Save hook")}
+                    className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    disabled={isSavingHooks || !hookForm.event || !hookForm.type}
+                    title={t("Save hook")}
+                    type="submit"
+                  >
+                    {isSavingHooks ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <CheckCircle2 aria-hidden="true" className="size-4" />
+                    )}
+                    {t("Save")}
+                  </button>
+                </div>
+              </form>
+            </>
+          ) : null}
+
+          <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="grid gap-3 lg:grid-cols-[auto_minmax(0,1fr)_auto]">
+              <div className="inline-flex h-10 rounded-lg border border-stone-200 bg-stone-100 p-1">
+                {(["global", "workspace"] as HookScope[]).map((scope) => (
+                  <button
+                    className={`rounded-md px-3 text-sm font-semibold ${
+                      hookScope === scope
+                        ? "bg-white text-teal-900 shadow-sm"
+                        : "text-stone-600 hover:text-stone-950"
+                    }`}
+                    key={scope}
+                    onClick={() => setHookScope(scope)}
+                    type="button"
+                  >
+                    {scope === "global" ? t("Global") : t("Workspace")}
+                  </button>
+                ))}
+              </div>
+              <label className="min-w-0">
+                <span className="sr-only">{t("Workspace")}</span>
+                <select
+                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) => {
+                    setHookWorkspaceId(event.target.value);
+                    setHookRunDetail(null);
+                  }}
+                  value={hookWorkspaceId}
+                >
+                  {workspaces.map((workspace) => (
+                    <option key={workspace.id} value={workspace.id}>
+                      {workspace.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="flex gap-2">
+                <button
+                  aria-label={t("Add hook")}
+                  className="inline-flex size-10 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300"
+                  disabled={!hookSettings}
+                  onClick={startAddingHookHandler}
+                  title={t("Add hook")}
+                  type="button"
+                >
+                  <Plus aria-hidden="true" className="size-4" />
+                </button>
+                <button
+                  aria-label={t("Reload hooks")}
+                  className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                  disabled={isLoadingHooks || !selectedHookWorkspace}
+                  onClick={() =>
+                    selectedHookWorkspace
+                      ? void loadHooks(selectedHookWorkspace.id)
+                      : undefined
+                  }
+                  title={t("Reload hooks")}
+                  type="button"
+                >
+                  {isLoadingHooks ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <RefreshCw aria-hidden="true" className="size-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+            <div className="mt-3 break-all rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-600">
+              {activeHookPath ?? t("Loading...")}
+            </div>
+            <label className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+              <span className="text-sm font-semibold text-stone-700">
+                {t("Disable all hooks")}
+              </span>
+              <input
+                checked={Boolean(activeHookConfig?.disableAllHooks)}
+                className="size-4 accent-teal-700"
+                disabled={isSavingHooks || !activeHookConfig}
+                onChange={(event) =>
+                  updateHookConfig({
+                    ...(activeHookConfig ?? emptyHookConfig()),
+                    disableAllHooks: event.target.checked,
+                  })
+                }
+                type="checkbox"
+              />
+            </label>
+            <label className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+              <span className="text-sm font-semibold text-stone-700">
+                {t("Record hook run logs")}
+              </span>
+              <input
+                checked={generalForm.hookAuditEnabled}
+                className="size-4 accent-teal-700"
+                disabled={isSavingGeneral || !settings}
+                onChange={(event) => void saveHookAuditEnabled(event.target.checked)}
+                type="checkbox"
+              />
+            </label>
+          </section>
+
+          <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-stone-950">
+                {t("Hook rules")}
+              </h3>
+              <CapabilityPill
+                label={t("rules {count}", { count: activeHookGroups.length })}
+                ok={activeHookGroups.length > 0}
+              />
+            </div>
+            <div className="divide-y divide-stone-100">
+              {activeHookGroups.length ? (
+                activeHookGroups.map((entry) => (
+                  <div className="px-4 py-3" key={`${entry.event}-${entry.groupIndex}`}>
+                    <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-sm font-semibold text-stone-950">
+                            {entry.event}
+                          </span>
+                          <CapabilityPill
+                            label={entry.group.enabled === false ? t("disabled") : t("enabled")}
+                            ok={entry.group.enabled !== false}
+                          />
+                          <CapabilityPill
+                            label={entry.group.matcher || "*"}
+                            ok={Boolean(entry.group.matcher)}
+                          />
+                        </div>
+                        <div className="mt-1 text-xs text-stone-500">
+                          {t("handlers {count}", { count: entry.group.hooks.length })}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          aria-label={t("Move hook up")}
+                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                          disabled={entry.groupIndex === 0 || isSavingHooks}
+                          onClick={() => moveHookGroup(entry.event, entry.groupIndex, -1)}
+                          title={t("Move hook up")}
+                          type="button"
+                        >
+                          <ArrowUp aria-hidden="true" className="size-4" />
+                        </button>
+                        <button
+                          aria-label={t("Move hook down")}
+                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                          disabled={
+                            entry.groupIndex >=
+                              hookGroupsForEvent(activeHookConfig, entry.event).length - 1 ||
+                            isSavingHooks
+                          }
+                          onClick={() => moveHookGroup(entry.event, entry.groupIndex, 1)}
+                          title={t("Move hook down")}
+                          type="button"
+                        >
+                          <ArrowDown aria-hidden="true" className="size-4" />
+                        </button>
+                        <label className="relative inline-flex cursor-pointer items-center">
+                          <input
+                            aria-label={t("Enable hook group")}
+                            checked={entry.group.enabled !== false}
+                            className="peer sr-only"
+                            disabled={isSavingHooks}
+                            onChange={(event) =>
+                              toggleHookGroup(
+                                entry.event,
+                                entry.groupIndex,
+                                event.target.checked,
+                              )
+                            }
+                            type="checkbox"
+                          />
+                          <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
+                          <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                        </label>
+                      </div>
+                    </div>
+                    <div className="mt-3 space-y-2">
+                      {entry.group.hooks.map((handler, handlerIndex) => (
+                        <div
+                          className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3 md:grid-cols-[minmax(0,1fr)_auto]"
+                          key={`${entry.event}-${entry.groupIndex}-${handlerIndex}`}
+                        >
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="font-mono text-xs font-semibold text-stone-800">
+                                {handler.type}
+                              </span>
+                              <CapabilityPill
+                                label={handler.enabled === false ? t("disabled") : t("enabled")}
+                                ok={handler.enabled !== false}
+                              />
+                              {handler.if ? (
+                                <CapabilityPill label={handler.if} ok />
+                              ) : null}
+                              {handler.async ? (
+                                <CapabilityPill label={t("async")} ok />
+                              ) : null}
+                            </div>
+                            <div className="mt-1 truncate text-xs text-stone-500">
+                              {hookHandlerSummary(handler)}
+                            </div>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              aria-label={t("Move handler up")}
+                              className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                              disabled={handlerIndex === 0 || isSavingHooks}
+                              onClick={() =>
+                                moveHookHandler(
+                                  entry.event,
+                                  entry.groupIndex,
+                                  handlerIndex,
+                                  -1,
+                                )
+                              }
+                              title={t("Move handler up")}
+                              type="button"
+                            >
+                              <ArrowUp aria-hidden="true" className="size-4" />
+                            </button>
+                            <button
+                              aria-label={t("Move handler down")}
+                              className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                              disabled={
+                                handlerIndex >= entry.group.hooks.length - 1 ||
+                                isSavingHooks
+                              }
+                              onClick={() =>
+                                moveHookHandler(
+                                  entry.event,
+                                  entry.groupIndex,
+                                  handlerIndex,
+                                  1,
+                                )
+                              }
+                              title={t("Move handler down")}
+                              type="button"
+                            >
+                              <ArrowDown aria-hidden="true" className="size-4" />
+                            </button>
+                            <button
+                              aria-label={t("Edit hook")}
+                              className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                              onClick={() =>
+                                editHookHandler(
+                                  entry.event,
+                                  entry.groupIndex,
+                                  handlerIndex,
+                                  entry.group,
+                                  handler,
+                                )
+                              }
+                              title={t("Edit hook")}
+                              type="button"
+                            >
+                              <Pencil aria-hidden="true" className="size-4" />
+                            </button>
+                            <button
+                              aria-label={t("Delete hook")}
+                              className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                              disabled={isSavingHooks}
+                              onClick={() =>
+                                deleteHookHandler(
+                                  entry.event,
+                                  entry.groupIndex,
+                                  handlerIndex,
+                                )
+                              }
+                              title={t("Delete hook")}
+                              type="button"
+                            >
+                              <Trash2 aria-hidden="true" className="size-4" />
+                            </button>
+                            <label className="relative inline-flex cursor-pointer items-center">
+                              <input
+                                aria-label={t("Enable hook")}
+                                checked={handler.enabled !== false}
+                                className="peer sr-only"
+                                disabled={isSavingHooks}
+                                onChange={(event) =>
+                                  toggleHookHandler(
+                                    entry.event,
+                                    entry.groupIndex,
+                                    handlerIndex,
+                                    event.target.checked,
+                                  )
+                                }
+                                type="checkbox"
+                              />
+                              <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
+                              <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                            </label>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <div className="px-4 py-6 text-sm text-stone-500">
+                  {t("No hook rules")}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <div className="grid gap-4 xl:grid-cols-2">
+            <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-sm font-semibold text-stone-950">
+                  {t("Import Claude hooks")}
+                </h3>
+                <div className="flex gap-2">
+                  <button
+                    aria-label={t("Import to global hooks")}
+                    className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                    disabled={isImportingHooks}
+                    onClick={() => void importClaudeHooks("global")}
+                    title={t("Import to global hooks")}
+                    type="button"
+                  >
+                    {isImportingHooks ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <Globe aria-hidden="true" className="size-4" />
+                    )}
+                    {t("Global")}
+                  </button>
+                  <button
+                    aria-label={t("Import to workspace hooks")}
+                    className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                    disabled={isImportingHooks || !selectedHookWorkspace}
+                    onClick={() => void importClaudeHooks("workspace")}
+                    title={t("Import to workspace hooks")}
+                    type="button"
+                  >
+                    <Folder aria-hidden="true" className="size-4" />
+                    {t("Workspace")}
+                  </button>
+                </div>
+              </div>
+              <p className="mt-2 text-xs text-stone-500">
+                {t("Global import reads user Claude settings; workspace import reads the selected workspace.")}
+              </p>
+              {hookImportResult ? (
+                <div
+                  className={`mt-3 rounded-lg border px-3 py-2 text-sm ${
+                    hookImportResult.saved
+                      ? "border-teal-200 bg-teal-50 text-teal-800"
+                      : "border-amber-200 bg-amber-50 text-amber-800"
+                  }`}
+                >
+                  <div className="font-semibold">
+                    {hookImportResult.saved ? t("Import saved") : t("Import not saved")}
+                  </div>
+                  <div className="mt-1 break-all text-xs">{hookImportResult.path}</div>
+                  {hookImportResult.importedFiles.length ? (
+                    <div className="mt-2 space-y-1">
+                      {hookImportResult.importedFiles.map((path) => (
+                        <div className="break-all text-xs" key={path}>
+                          {path}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                  {hookImportResult.validationErrors.length ? (
+                    <div className="mt-2 space-y-1">
+                      {hookImportResult.validationErrors.map((message) => (
+                        <div className="break-words text-xs" key={message}>
+                          {message}
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+            </section>
+
+            <form
+              className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+              onSubmit={(event) => void testHooks(event)}
+            >
+              <h3 className="text-sm font-semibold text-stone-950">
+                {t("Test hook")}
+              </h3>
+              <div className="mt-3 grid gap-3">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Event")}
+                    </span>
+                    <select
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) => setHookTestEvent(event.target.value)}
+                      value={hookTestEvent}
+                    >
+                      {(hookSettings?.supportedEvents ?? []).map((eventName) => (
+                        <option key={eventName} value={eventName}>
+                          {hookEventLabel(eventName, t)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <TextField
+                    label={t("Match value")}
+                    onChange={setHookTestMatcher}
+                    placeholder="run_command"
+                    value={hookTestMatcher}
+                  />
+                </div>
+                <label className="block">
+                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    {t("Sample payload")}
+                  </span>
+                  <textarea
+                    className="min-h-28 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-xs text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    onChange={(event) => setHookTestPayload(event.target.value)}
+                    value={hookTestPayload}
+                  />
+                </label>
+                <button
+                  aria-label={t("Run hook test")}
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                  disabled={isTestingHooks || !selectedHookWorkspace}
+                  title={t("Run hook test")}
+                  type="submit"
+                >
+                  {isTestingHooks ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <CheckCircle2 aria-hidden="true" className="size-4" />
+                  )}
+                  {t("Run")}
+                </button>
+              </div>
+              {hookTestResult ? (
+                <pre className="mt-3 max-h-48 overflow-auto rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-700">
+                  {JSON.stringify(hookTestResult, null, 2)}
+                </pre>
+              ) : null}
+            </form>
+          </div>
+
+          <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-stone-950">
+                {t("Effective hooks")}
+              </h3>
+              <CapabilityPill
+                label={t("hooks {count}", { count: hookSettings?.effective.length ?? 0 })}
+                ok={(hookSettings?.effective.length ?? 0) > 0}
+              />
+            </div>
+            <div className="divide-y divide-stone-100">
+              {hookSettings?.effective.length ? (
+                hookSettings.effective.map((hook, index) => {
+                  const lastRun = latestHookRunForSummary(
+                    hook,
+                    hookSettings.recentRuns,
+                  );
+
+                  return (
+                    <div className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(0,1fr)_auto]" key={`${hook.source}-${hook.event}-${index}`}>
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-sm font-semibold text-stone-950">
+                            {hookEventLabel(hook.event, t)}
+                          </span>
+                          <CapabilityPill
+                            label={hookSourceLabel(hook.source, t)}
+                            ok={hook.source === "global"}
+                          />
+                          <CapabilityPill
+                            label={hookHandlerTypeLabel(hook.handlerType, t)}
+                            ok
+                          />
+                          {hook.asyncHook ? <CapabilityPill label={t("async")} ok /> : null}
+                          {lastRun ? (
+                            <CapabilityPill
+                              label={t("last {status}", {
+                                status: hookRunStatusLabel(lastRun.status, t),
+                              })}
+                              ok={lastRun.status === "succeeded"}
+                            />
+                          ) : null}
+                        </div>
+                        <div className="mt-1 truncate text-xs text-stone-500">
+                          {[hook.matcher || "*", hook.command, hook.url, hook.serverId, hook.toolName]
+                            .filter(Boolean)
+                            .join(" / ")}
+                        </div>
+                      </div>
+                      <div className="text-xs text-stone-500">
+                        {lastRun?.startedAt ?? hook.statusMessage ?? t("ready")}
+                      </div>
+                    </div>
+                  );
+                })
+              ) : (
+                <div className="px-4 py-6 text-sm text-stone-500">
+                  {t("No effective hooks")}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-stone-950">
+                {t("Recent hook runs")}
+              </h3>
+              <button
+                aria-label={t("Refresh hook runs")}
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                disabled={isRefreshingHookRuns || !selectedHookWorkspace}
+                onClick={() => void refreshHookRuns()}
+                title={t("Refresh hook runs")}
+                type="button"
+              >
+                {isRefreshingHookRuns ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <RefreshCw aria-hidden="true" className="size-4" />
+                )}
+              </button>
+            </div>
+            <div className="divide-y divide-stone-100">
+              {hookSettings?.recentRuns.length ? (
+                hookSettings.recentRuns.map((run) => (
+                  <button
+                    className="grid w-full gap-3 px-4 py-3 text-left hover:bg-stone-50 md:grid-cols-[minmax(0,1fr)_auto]"
+                    key={run.id}
+                    onClick={() => void openHookRunDetail(run.id)}
+                    type="button"
+                  >
+                    <span className="min-w-0">
+                      <span className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-semibold text-stone-950">
+                          {hookEventLabel(run.event, t)}
+                        </span>
+                        <CapabilityPill
+                          label={hookRunStatusLabel(run.status, t)}
+                          ok={run.status === "succeeded"}
+                        />
+                        <CapabilityPill
+                          label={hookHandlerTypeLabel(run.handlerType, t)}
+                          ok
+                        />
+                      </span>
+                      <span className="mt-1 block truncate text-xs text-stone-500">
+                        {run.id}
+                      </span>
+                    </span>
+                    <span className="text-xs text-stone-500">{run.startedAt}</span>
+                  </button>
+                ))
+              ) : (
+                <div className="px-4 py-6 text-sm text-stone-500">
+                  {t("No hook runs")}
                 </div>
               )}
             </div>
@@ -9236,6 +10795,10 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
     return t("Workspace settings");
   }
 
+  if (section === "hooks") {
+    return t("Hook settings");
+  }
+
   if (section === "providers") {
     return t("Provider settings");
   }
@@ -9258,6 +10821,10 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
 
   if (section === "workspaces") {
     return t("Workspace order and terminal shell");
+  }
+
+  if (section === "hooks") {
+    return t("Global and workspace lifecycle hooks");
   }
 
   if (section === "providers") {
@@ -9466,6 +11033,7 @@ function emptyProviderForm(): ProviderFormState {
 
 function emptyGeneralForm(): GeneralFormState {
   return {
+    hookAuditEnabled: false,
     language: "en",
     listenHost: "127.0.0.1",
     listenPort: "3210",
@@ -9493,6 +11061,415 @@ function emptyMcpServerForm(): McpServerFormState {
     transport: "",
     url: "",
   };
+}
+
+function emptyHookConfig(): HookConfig {
+  return { disableAllHooks: false };
+}
+
+function emptyHookHandlerForm(): HookHandlerFormState {
+  return {
+    argsText: "",
+    asyncHook: false,
+    asyncRewake: false,
+    command: "",
+    enabled: true,
+    event: "PreToolUse",
+    groupIndex: null,
+    handlerIndex: null,
+    ifFilter: "",
+    inputText: "",
+    matcher: "",
+    prompt: "",
+    serverId: "",
+    shell: "",
+    statusMessage: "",
+    timeout: "",
+    toolName: "",
+    type: "command",
+    url: "",
+  };
+}
+
+function hookConfigEntries(config: HookConfig | null | undefined) {
+  if (!config) {
+    return [];
+  }
+
+  return Object.entries(config).flatMap(([event, value]) => {
+    if (event === "disableAllHooks" || !Array.isArray(value)) {
+      return [];
+    }
+
+    return value.map((group, groupIndex) => ({
+      event,
+      group,
+      groupIndex,
+    }));
+  });
+}
+
+function hookGroupsForEvent(config: HookConfig | null | undefined, event: string) {
+  const value = config?.[event];
+  return Array.isArray(value) ? value : [];
+}
+
+function hookHandlerFormFromConfig(
+  event: string,
+  groupIndex: number,
+  handlerIndex: number,
+  group: HookMatcherGroup,
+  handler: HookHandler,
+): HookHandlerFormState {
+  return {
+    argsText: (handler.args ?? []).join("\n"),
+    asyncHook: Boolean(handler.async),
+    asyncRewake: Boolean(handler.asyncRewake),
+    command: handler.command ?? "",
+    enabled: handler.enabled !== false,
+    event,
+    groupIndex,
+    handlerIndex,
+    ifFilter: handler.if ?? "",
+    inputText:
+      typeof handler.input === "undefined" || handler.input === null
+        ? ""
+        : JSON.stringify(handler.input, null, 2),
+    matcher: group.matcher ?? "",
+    prompt: handler.prompt ?? "",
+    serverId: handler.serverId ?? "",
+    shell: handler.shell ?? "",
+    statusMessage: handler.statusMessage ?? "",
+    timeout: numberInputValue(handler.timeout ?? null),
+    toolName: handler.toolName ?? "",
+    type: hookHandlerType(handler.type),
+    url: handler.url ?? "",
+  };
+}
+
+function hookHandlerType(type: string): HookHandlerType {
+  return type === "http" || type === "mcp_tool" || type === "prompt"
+    ? type
+    : "command";
+}
+
+function upsertHookHandlerInConfig(
+  config: HookConfig,
+  form: HookHandlerFormState,
+): HookConfig {
+  const nextConfig = cloneHookConfig(config);
+  const event = form.event;
+  const nextHandler = hookHandlerFromForm(form);
+  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const existingGroupIndex =
+    form.groupIndex !== null && form.event === event ? form.groupIndex : null;
+  const groupIndex =
+    existingGroupIndex !== null && groups[existingGroupIndex]
+      ? existingGroupIndex
+      : groups.findIndex((group) => (group.matcher ?? "") === form.matcher);
+
+  if (groupIndex >= 0) {
+    const group = groups[groupIndex];
+    group.enabled = form.enabled;
+    group.matcher = optionalText(form.matcher);
+    if (form.handlerIndex !== null && group.hooks[form.handlerIndex]) {
+      group.hooks[form.handlerIndex] = nextHandler;
+    } else {
+      group.hooks = [...group.hooks, nextHandler];
+    }
+  } else {
+    groups.push({
+      enabled: form.enabled,
+      hooks: [nextHandler],
+      matcher: optionalText(form.matcher),
+    });
+  }
+
+  nextConfig[event] = groups;
+  return compactHookConfig(nextConfig);
+}
+
+function hookHandlerFromForm(form: HookHandlerFormState): HookHandler {
+  const timeout = optionalPositiveInteger(form.timeout, "Timeout");
+  const input = form.inputText.trim()
+    ? parseJsonText(form.inputText, "Input override JSON")
+    : null;
+  const base: HookHandler = {
+    enabled: form.enabled,
+    type: form.type,
+    async: form.asyncHook,
+    asyncRewake: form.asyncRewake,
+    if: optionalText(form.ifFilter),
+    input,
+    statusMessage: optionalText(form.statusMessage),
+    timeout,
+  };
+
+  if (form.type === "command") {
+    return {
+      ...base,
+      args: form.argsText
+        .split(/\r?\n/)
+        .map((arg) => arg.trim())
+        .filter(Boolean),
+      command: form.command.trim(),
+      shell: optionalText(form.shell),
+    };
+  }
+
+  if (form.type === "http") {
+    return {
+      ...base,
+      url: form.url.trim(),
+    };
+  }
+
+  if (form.type === "mcp_tool") {
+    return {
+      ...base,
+      serverId: form.serverId.trim(),
+      toolName: form.toolName.trim(),
+    };
+  }
+
+  return {
+    ...base,
+    prompt: form.prompt.trim(),
+  };
+}
+
+function deleteHookHandlerFromConfig(
+  config: HookConfig,
+  event: string,
+  groupIndex: number,
+  handlerIndex: number,
+): HookConfig {
+  const nextConfig = cloneHookConfig(config);
+  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const group = groups[groupIndex];
+  if (!group) {
+    return nextConfig;
+  }
+
+  group.hooks = group.hooks.filter((_, index) => index !== handlerIndex);
+  if (!group.hooks.length) {
+    groups.splice(groupIndex, 1);
+  }
+  nextConfig[event] = groups;
+  return compactHookConfig(nextConfig);
+}
+
+function updateHookGroupInConfig(
+  config: HookConfig,
+  event: string,
+  groupIndex: number,
+  patch: Partial<HookMatcherGroup>,
+): HookConfig {
+  const nextConfig = cloneHookConfig(config);
+  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  if (groups[groupIndex]) {
+    groups[groupIndex] = { ...groups[groupIndex], ...patch };
+  }
+  nextConfig[event] = groups;
+  return compactHookConfig(nextConfig);
+}
+
+function updateHookHandlerInConfig(
+  config: HookConfig,
+  event: string,
+  groupIndex: number,
+  handlerIndex: number,
+  patch: Partial<HookHandler>,
+): HookConfig {
+  const nextConfig = cloneHookConfig(config);
+  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const handler = groups[groupIndex]?.hooks[handlerIndex];
+  if (handler) {
+    groups[groupIndex].hooks[handlerIndex] = { ...handler, ...patch };
+  }
+  nextConfig[event] = groups;
+  return compactHookConfig(nextConfig);
+}
+
+function moveHookGroupInConfig(
+  config: HookConfig,
+  event: string,
+  groupIndex: number,
+  direction: -1 | 1,
+): HookConfig {
+  const nextConfig = cloneHookConfig(config);
+  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const targetIndex = groupIndex + direction;
+  if (!groups[groupIndex] || targetIndex < 0 || targetIndex >= groups.length) {
+    return nextConfig;
+  }
+  [groups[groupIndex], groups[targetIndex]] = [
+    groups[targetIndex],
+    groups[groupIndex],
+  ];
+  nextConfig[event] = groups;
+  return nextConfig;
+}
+
+function moveHookHandlerInConfig(
+  config: HookConfig,
+  event: string,
+  groupIndex: number,
+  handlerIndex: number,
+  direction: -1 | 1,
+): HookConfig {
+  const nextConfig = cloneHookConfig(config);
+  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const handlers = groups[groupIndex]?.hooks;
+  const targetIndex = handlerIndex + direction;
+  if (!handlers || !handlers[handlerIndex] || targetIndex < 0 || targetIndex >= handlers.length) {
+    return nextConfig;
+  }
+  [handlers[handlerIndex], handlers[targetIndex]] = [
+    handlers[targetIndex],
+    handlers[handlerIndex],
+  ];
+  nextConfig[event] = groups;
+  return nextConfig;
+}
+
+function cloneHookConfig(config: HookConfig): HookConfig {
+  const nextConfig: HookConfig = {
+    disableAllHooks: Boolean(config.disableAllHooks),
+  };
+
+  for (const [event, value] of Object.entries(config)) {
+    if (event === "disableAllHooks" || !Array.isArray(value)) {
+      continue;
+    }
+    nextConfig[event] = value.map(cloneHookGroup);
+  }
+
+  return nextConfig;
+}
+
+function cloneHookGroup(group: HookMatcherGroup): HookMatcherGroup {
+  return {
+    ...group,
+    hooks: group.hooks.map((handler) => ({ ...handler })),
+  };
+}
+
+function compactHookConfig(config: HookConfig): HookConfig {
+  const nextConfig: HookConfig = {
+    disableAllHooks: Boolean(config.disableAllHooks),
+  };
+
+  for (const [event, value] of Object.entries(config)) {
+    if (event === "disableAllHooks" || !Array.isArray(value) || !value.length) {
+      continue;
+    }
+    nextConfig[event] = value;
+  }
+
+  return nextConfig;
+}
+
+function hookHandlerSummary(handler: HookHandler) {
+  return (
+    handler.command ||
+    handler.url ||
+    [handler.serverId, handler.toolName].filter(Boolean).join(" / ") ||
+    handler.prompt ||
+    ""
+  );
+}
+
+function hookEventLabel(event: string, t: Translate) {
+  const labels: Record<string, string> = {
+    SessionStart: "Session start",
+    SessionEnd: "Session end",
+    UserPromptSubmit: "User prompt submit",
+    PreToolUse: "Pre tool use",
+    PermissionRequest: "Permission request",
+    PermissionDenied: "Permission denied",
+    PostToolUse: "Post tool use",
+    PostToolUseFailure: "Post tool use failure",
+    PostToolBatch: "Post tool batch",
+    Stop: "Stop",
+    StopFailure: "Stop failure",
+    PreCompact: "Pre compact",
+    PostCompact: "Post compact",
+    Elicitation: "Elicitation",
+    ElicitationResult: "Elicitation result",
+  };
+
+  return t(labels[event] ?? event);
+}
+
+function hookHandlerTypeLabel(type: string, t: Translate) {
+  switch (type) {
+    case "command":
+      return t("Command");
+    case "http":
+      return t("HTTP");
+    case "mcp_tool":
+      return t("MCP tool");
+    case "prompt":
+      return t("Prompt");
+    default:
+      return type;
+  }
+}
+
+function hookSourceLabel(source: string, t: Translate) {
+  switch (source) {
+    case "global":
+      return t("Global");
+    case "workspace":
+      return t("Workspace");
+    default:
+      return source;
+  }
+}
+
+function hookRunStatusLabel(status: string, t: Translate) {
+  switch (status) {
+    case "succeeded":
+      return t("succeeded");
+    case "failed":
+      return t("failed");
+    case "error":
+      return t("error");
+    case "blocked":
+      return t("blocked");
+    case "running":
+      return t("running");
+    case "cancelled":
+      return t("cancelled");
+    default:
+      return status;
+  }
+}
+
+function latestHookRunForSummary(
+  hook: EffectiveHookSummary,
+  runs: HookRunSummaryRow[],
+) {
+  return runs.find(
+    (run) =>
+      run.event === hook.event &&
+      run.hookSource === hook.source &&
+      run.handlerType === hook.handlerType,
+  );
+}
+
+function parseJsonText(value: string, label: string): JsonValue {
+  const parsed = JSON.parse(value) as unknown;
+  if (!isJsonValue(parsed)) {
+    throw new Error(`${label} must be JSON-compatible`);
+  }
+  return parsed;
+}
+
+function optionalText(value: string) {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
 }
 
 function nextProviderId(
@@ -10598,6 +12575,26 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     return { type: "questionRequest", assistantMessageId, request };
   }
 
+  if (
+    value.type === "hookNotification" ||
+    value.type === "hook_notification"
+  ) {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const notification = parseHookNotificationSummary(
+      fieldValue(value, "notification"),
+    );
+
+    if (!assistantMessageId || !notification) {
+      return null;
+    }
+
+    return { type: "hookNotification", assistantMessageId, notification };
+  }
+
   if (value.type === "gitDiffRefresh" || value.type === "git_diff_refresh") {
     const workspaceId = stringField(value, "workspaceId", "workspace_id");
 
@@ -10633,6 +12630,24 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
   }
 
   return null;
+}
+
+function parseHookNotificationSummary(
+  value: unknown,
+): HookNotificationSummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const event = stringField(value, "event");
+  const level = stringField(value, "level");
+  const message = stringField(value, "message");
+
+  if (!event || !level || !message) {
+    return null;
+  }
+
+  return { event, level, message };
 }
 
 function parseQuestionRequestSummary(value: unknown): QuestionRequestSummary | null {

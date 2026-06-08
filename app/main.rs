@@ -44,21 +44,23 @@ use foco_providers::{
 };
 use foco_store::{
     config::{
-        DEFAULT_TERMINAL_SHELL, GlobalConfig, McpServerConfig, ModelLimits, ModelSettings,
-        ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_APP_LANGUAGES,
-        SUPPORTED_TERMINAL_SHELLS, SkillSettings, WebServerSettings, WorkspaceConfig,
-        load_or_create_global_config, save_global_config,
+        DEFAULT_TERMINAL_SHELL, GlobalConfig, HookConfig, HookEventMap, McpServerConfig,
+        ModelLimits, ModelSettings, ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE,
+        SUPPORTED_APP_LANGUAGES, SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings,
+        UNSUPPORTED_HOOK_EVENTS, WebServerSettings, WorkspaceConfig, load_or_create_global_config,
+        load_workspace_hook_config, save_global_config, save_workspace_hook_config,
+        workspace_hook_config_path,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
         parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
     },
     workspace::{
-        ChatRecord, ContextCompressionSnapshotRecord, LlmRequestAuditFilters, LlmRequestAuditRow,
-        LlmRequestEventRecord, LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot,
-        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewTerminalSession, NewToolCall,
-        NewToolResult, TaskGraphFilter, TaskGraphRecord, TaskGraphTask, ToolCallWithResultRecord,
-        WorkspaceDatabase, initialize_workspace_databases,
+        ChatRecord, ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
+        LlmRequestAuditRow, LlmRequestEventRecord, LlmRequestRecord, MessageRecord,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+        NewTerminalSession, NewToolCall, NewToolResult, TaskGraphFilter, TaskGraphRecord,
+        TaskGraphTask, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
     },
 };
 use foco_tools::{
@@ -79,11 +81,16 @@ use crate::git_backend::{
     create_git_branch as create_git_branch_in_workspace, git_branches_response, git_diff_response,
     git_status_response, is_git_workspace, switch_git_branch as switch_git_branch_in_workspace,
 };
+use crate::hooks::{
+    EffectiveHookSummary, HookDecision, HookNotification, HookRunRequest, HookRunSummary,
+    HookRuntime, effective_hook_summaries,
+};
 
 #[cfg(all(windows, not(debug_assertions)))]
 use std::sync::atomic::AtomicU32;
 
 mod git_backend;
+mod hooks;
 mod logging;
 mod terminal;
 
@@ -156,6 +163,7 @@ struct AppState {
     terminal_shutdown_tx: broadcast::Sender<()>,
     app_shutdown_rx: watch::Receiver<bool>,
     mcp_registry: Arc<McpRegistry>,
+    hook_runtime: HookRuntime,
     question_registry: QuestionRegistry,
     _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
     #[cfg(all(windows, not(debug_assertions)))]
@@ -453,6 +461,7 @@ async fn run_server_until_shutdown(
     let code_graph_watchers = initialize_code_graph_indexes(&loaded_config.config.workspaces)?;
     let mcp_registry = Arc::new(McpRegistry::default());
     sync_all_mcp_workspaces(&mcp_registry, &loaded_config.config).await?;
+    let hook_runtime = HookRuntime::new(mcp_registry.clone());
 
     let addr = local_addr(&loaded_config.config)?;
     verify_frontend_assets()?;
@@ -474,6 +483,7 @@ async fn run_server_until_shutdown(
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
         app_shutdown_rx: app_shutdown_rx.clone(),
         mcp_registry: mcp_registry.clone(),
+        hook_runtime,
         question_registry: QuestionRegistry::default(),
         _code_graph_watchers: Arc::new(code_graph_watchers),
         #[cfg(all(windows, not(debug_assertions)))]
@@ -511,6 +521,16 @@ fn app_router(state: AppState) -> Router {
         .route("/api/native/select-directory", post(select_directory))
         .route("/api/settings", get(settings))
         .route("/api/settings/general", post(save_general_settings))
+        .route("/api/hooks", get(hooks_settings))
+        .route("/api/hooks/global", post(save_global_hooks))
+        .route("/api/hooks/workspace", post(save_workspace_hooks))
+        .route("/api/hooks/import-claude", post(import_claude_hooks))
+        .route("/api/hooks/test", post(test_hooks))
+        .route("/api/workspaces/{workspace_id}/hooks/runs", get(hook_runs))
+        .route(
+            "/api/workspaces/{workspace_id}/hooks/runs/{hook_run_id}",
+            get(hook_run_detail),
+        )
         .route("/api/providers/manual", post(save_manual_provider))
         .route("/api/providers/delete", post(delete_provider))
         .route("/api/providers/test", post(test_provider))
@@ -1141,6 +1161,236 @@ async fn settings(State(state): State<AppState>) -> Result<Json<SettingsResponse
     settings_response(&state, &config).await
 }
 
+async fn hooks_settings(
+    State(state): State<AppState>,
+    Query(query): Query<HooksQuery>,
+) -> Result<Json<HooksSettingsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    hooks_settings_response(&state, &config, query.workspace_id.as_deref()).await
+}
+
+async fn save_global_hooks(
+    State(state): State<AppState>,
+    Json(request): Json<SaveGlobalHooksRequest>,
+) -> Result<Json<HooksSettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let audit_enabled = config.hooks.audit_enabled;
+
+    config.hooks = request.config;
+    config.hooks.audit_enabled = audit_enabled;
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    save_config(&state, config.clone())?;
+
+    hooks_settings_response(&state, &config, None).await
+}
+
+async fn save_workspace_hooks(
+    State(state): State<AppState>,
+    Json(request): Json<SaveWorkspaceHooksRequest>,
+) -> Result<Json<HooksSettingsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &request.workspace_id)?.clone();
+    let mut validation_config = config.clone();
+
+    validation_config.hooks = request.config.clone();
+    validation_config
+        .validate(Some(&workspace_hook_config_path(&workspace.path)))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    save_workspace_hook_config(&workspace.path, &request.config)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+
+    hooks_settings_response(&state, &config, Some(&workspace.id)).await
+}
+
+async fn import_claude_hooks(
+    State(state): State<AppState>,
+    Json(request): Json<ImportClaudeHooksRequest>,
+) -> Result<Json<ImportClaudeHooksResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let target = request.target.trim();
+    if target != "global" && target != "workspace" {
+        return Err(ApiError::bad_request(
+            "hook import target must be 'global' or 'workspace'",
+        ));
+    }
+    let workspace = if target == "workspace" {
+        let workspace_id = request.workspace_id.as_deref().ok_or_else(|| {
+            ApiError::bad_request("workspaceId is required for workspace hook import")
+        })?;
+        Some(workspace_by_id(&config, workspace_id)?.clone())
+    } else {
+        None
+    };
+
+    let (import_source, save_path, source_paths) = if target == "global" {
+        (
+            "global",
+            state.config_file.clone(),
+            claude_hook_settings_paths(&state.user_profile_dir),
+        )
+    } else {
+        let workspace = workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("workspace hook import lost selected workspace"))?;
+        (
+            "workspace",
+            workspace_hook_config_path(&workspace.path),
+            claude_hook_settings_paths(&workspace.path),
+        )
+    };
+    let (mut imported, imported_files, mut validation_errors) =
+        import_claude_hook_config(&source_paths)?;
+
+    if imported_files.is_empty() {
+        validation_errors.push(format!(
+            "no Claude hook settings were found under {}",
+            source_paths
+                .first()
+                .and_then(|path| path.parent())
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| ".claude".to_string())
+        ));
+    }
+
+    if validation_errors.is_empty() {
+        let mut validation_config = config.clone();
+        if target == "global" {
+            imported.audit_enabled = config.hooks.audit_enabled;
+        }
+        validation_config.hooks = imported.clone();
+        if let Err(error) = validation_config.validate(Some(&save_path)) {
+            validation_errors.push(error.to_string());
+        }
+    }
+
+    if !validation_errors.is_empty() {
+        return Ok(Json(ImportClaudeHooksResponse {
+            saved: false,
+            target: import_source.to_string(),
+            path: display_path(&save_path),
+            imported_files,
+            validation_errors,
+            config: imported,
+        }));
+    }
+
+    if target == "global" {
+        config.hooks = imported.clone();
+        save_config(&state, config)?;
+    } else {
+        let workspace = workspace
+            .as_ref()
+            .ok_or_else(|| ApiError::internal("workspace hook import lost selected workspace"))?;
+        save_workspace_hook_config(&workspace.path, &imported)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    }
+
+    Ok(Json(ImportClaudeHooksResponse {
+        saved: true,
+        target: import_source.to_string(),
+        path: display_path(&save_path),
+        imported_files,
+        validation_errors,
+        config: imported,
+    }))
+}
+
+async fn test_hooks(
+    State(state): State<AppState>,
+    Json(request): Json<TestHookRequest>,
+) -> Result<Json<HookRunSummary>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &request.workspace_id)?;
+    let event = request.event.trim();
+
+    if UNSUPPORTED_HOOK_EVENTS.contains(&event) {
+        return Err(ApiError::bad_request(format!(
+            "{event} is a Claude Code hook event that Foco does not support yet"
+        )));
+    }
+    if !SUPPORTED_HOOK_EVENTS.contains(&event) {
+        return Err(ApiError::bad_request(format!(
+            "{event} is unsupported; expected one of {}",
+            SUPPORTED_HOOK_EVENTS.join(", ")
+        )));
+    }
+
+    let provider = default_hook_provider(&config).transpose()?;
+    let summary = state
+        .hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &config.hooks,
+            workspace_id: &workspace.id,
+            workspace_path: &workspace.path,
+            event,
+            match_value: optional_trimmed_string(request.match_value),
+            chat_id: None,
+            run_id: None,
+            session_id: None,
+            tool_call_id: None,
+            model_id: provider.as_ref().map(|provider| provider.0.as_str()),
+            provider_id: provider.as_ref().map(|provider| provider.1.as_str()),
+            provider_config: provider.as_ref().map(|provider| &provider.2),
+            permission_mode: None,
+            payload: request.payload.unwrap_or_else(|| json!({})),
+        })
+        .await;
+
+    Ok(Json(summary))
+}
+
+async fn hook_run_detail(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, hook_run_id)): AxumPath<(String, String)>,
+) -> Result<Json<HookRunDetailResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let hook_run_id = hook_run_id.trim();
+
+    if hook_run_id.is_empty() {
+        return Err(ApiError::bad_request("hook run id must not be empty"));
+    }
+
+    let record = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?
+        .hook_run(hook_run_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::bad_request(format!("hook run was not found: {hook_run_id}")))?;
+
+    if record.workspace_id != workspace.id {
+        return Err(ApiError::bad_request(format!(
+            "hook run '{}' does not belong to workspace '{}'",
+            record.id, workspace.id
+        )));
+    }
+
+    Ok(Json(HookRunDetailResponse {
+        run: hook_run_detail_from_record(record)?,
+    }))
+}
+
+async fn hook_runs(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Query(query): Query<HookRunsQuery>,
+) -> Result<Json<HookRunsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let runs = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?
+        .hook_runs(limit)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .filter(|record| record.workspace_id == workspace.id)
+        .map(hook_run_summary_row)
+        .collect();
+
+    Ok(Json(HookRunsResponse { runs }))
+}
+
 async fn save_general_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualGeneralSettingsRequest>,
@@ -1155,6 +1405,9 @@ async fn save_general_settings(
 
     config.app.web_server = normalize_web_server_settings(&config.app.web_server, &request)?;
     config.app.language = normalize_app_language(&request.language)?;
+    if let Some(hook_audit_enabled) = request.hook_audit_enabled {
+        config.hooks.audit_enabled = hook_audit_enabled;
+    }
     validate_tray_menu_language(&config.app.language)?;
 
     save_config(&state, config.clone())?;
@@ -2103,6 +2356,7 @@ struct ManualGeneralSettingsRequest {
     listen_host: String,
     listen_port: u32,
     language: String,
+    hook_audit_enabled: Option<bool>,
     password: Option<String>,
     clear_password: Option<bool>,
 }
@@ -2163,6 +2417,47 @@ struct ManualMcpServerRequest {
 struct ManualSkillsRequest {
     disabled: Option<Vec<String>>,
     enabled: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HooksQuery {
+    workspace_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveGlobalHooksRequest {
+    config: HookConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveWorkspaceHooksRequest {
+    workspace_id: String,
+    config: HookConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportClaudeHooksRequest {
+    workspace_id: Option<String>,
+    target: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HookRunsQuery {
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TestHookRequest {
+    workspace_id: String,
+    event: String,
+    match_value: Option<String>,
+    payload: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -2302,6 +2597,7 @@ struct SettingsResponse {
 struct GeneralSettingsSummary {
     web_server: WebServerSettingsSummary,
     language: String,
+    hook_audit_enabled: bool,
     supported_languages: Vec<AppLanguageSummary>,
 }
 
@@ -2396,6 +2692,89 @@ struct SkillsSettingsSummary {
     directories: Vec<String>,
     detected: Vec<ConfiguredSkillSummary>,
     errors: Vec<SkillDiscoveryErrorSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HooksSettingsResponse {
+    supported_events: Vec<&'static str>,
+    unsupported_events: Vec<&'static str>,
+    global: HookConfigScopeSummary,
+    workspace: HookConfigScopeSummary,
+    effective: Vec<EffectiveHookSummary>,
+    recent_runs: Vec<HookRunSummaryRow>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookRunsResponse {
+    runs: Vec<HookRunSummaryRow>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookConfigScopeSummary {
+    source: String,
+    path: String,
+    workspace_id: Option<String>,
+    config: HookConfig,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookRunSummaryRow {
+    id: String,
+    workspace_id: String,
+    chat_id: Option<String>,
+    run_id: Option<String>,
+    tool_call_id: Option<String>,
+    event: String,
+    hook_source: String,
+    handler_type: String,
+    status: String,
+    exit_code: Option<i64>,
+    stdout_preview: Option<String>,
+    stderr_preview: Option<String>,
+    started_at: String,
+    completed_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookRunDetailResponse {
+    run: HookRunDetail,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookRunDetail {
+    id: String,
+    workspace_id: String,
+    chat_id: Option<String>,
+    run_id: Option<String>,
+    tool_call_id: Option<String>,
+    event: String,
+    hook_source: String,
+    handler_type: String,
+    input: Value,
+    output: Option<Value>,
+    status: String,
+    exit_code: Option<i64>,
+    stdout_preview: Option<String>,
+    stderr_preview: Option<String>,
+    started_at: String,
+    completed_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportClaudeHooksResponse {
+    saved: bool,
+    target: String,
+    path: String,
+    imported_files: Vec<String>,
+    validation_errors: Vec<String>,
+    config: HookConfig,
 }
 
 #[derive(Serialize)]
@@ -2693,6 +3072,10 @@ enum ChatSseEvent {
         assistant_message_id: String,
         request: QuestionRequest,
     },
+    HookNotification {
+        assistant_message_id: String,
+        notification: HookNotification,
+    },
     GitDiffRefresh {
         workspace_id: String,
     },
@@ -2730,6 +3113,8 @@ struct PreparedChatContext {
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
     mcp_registry: Arc<McpRegistry>,
+    hook_runtime: HookRuntime,
+    global_hooks: HookConfig,
     question_registry: QuestionRegistry,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
@@ -2737,6 +3122,8 @@ struct PreparedChatContext {
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
     active_tool_start_index: usize,
+    hook_context_messages: Vec<String>,
+    hook_notifications: Vec<HookNotification>,
 }
 
 struct PreparedPromptContext {
@@ -2793,6 +3180,16 @@ struct ExecutedToolCall {
     completed_at: String,
 }
 
+struct ToolHookOutcome {
+    tool_call: ExecutedToolCall,
+    hook_summary: HookRunSummary,
+}
+
+struct ToolExecutionWithHooks {
+    execution: ToolExecution,
+    hook_summary: HookRunSummary,
+}
+
 struct ChatAuditOutcome {
     first_token_at: Option<String>,
     completed_at: String,
@@ -2831,8 +3228,28 @@ impl PreparedChatContext {
             let mut app_shutdown_rx = self.app_shutdown_rx.clone();
 
             yield Ok(sse_event(&start_event));
+            for event in self
+                .hook_notifications
+                .iter()
+                .flat_map(|notification| {
+                    [ChatSseEvent::HookNotification {
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        notification: notification.clone(),
+                    }]
+                })
+            {
+                events.push(captured_event(&event));
+                yield Ok(sse_event(&event));
+            }
+            self.hook_notifications.clear();
+            append_hook_context_messages(
+                &mut self.provider_request.messages,
+                &mut self.message_source_sequences,
+                &self.hook_context_messages,
+            );
+            self.hook_context_messages.clear();
 
-            for turn_index in 0..=MAX_AGENT_TOOL_ROUNDS {
+            'agent_turns: for turn_index in 0..=MAX_AGENT_TOOL_ROUNDS {
                 if *app_shutdown_rx.borrow() {
                     let event = finish_cancelled_chat_run(
                         &self,
@@ -2840,12 +3257,13 @@ impl PreparedChatContext {
                         started_at,
                         &mut events,
                         &executed_tool_calls,
-                    );
+                    )
+                    .await;
                     yield Ok(sse_event(&event));
                     return;
                 }
 
-                let turn_active_tool_start_index = match ensure_context_compression(&mut self) {
+                let turn_active_tool_start_index = match ensure_context_compression(&mut self).await {
                     Ok(index) => index,
                     Err(error) => {
                         let message = error.message;
@@ -2853,7 +3271,14 @@ impl PreparedChatContext {
                             message: message.clone(),
                         };
                         events.push(captured_event(&event));
-                        let outcome = failed_audit_outcome(started_at, &message);
+                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                         if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
@@ -2867,6 +3292,14 @@ impl PreparedChatContext {
                         return;
                     }
                 };
+                for notification in std::mem::take(&mut self.hook_notifications) {
+                    let event = ChatSseEvent::HookNotification {
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        notification,
+                    };
+                    events.push(captured_event(&event));
+                    yield Ok(sse_event(&event));
+                }
                 let packed_messages = match pack_neutral_messages(
                     self.provider_request.messages.clone(),
                     &self.message_source_sequences,
@@ -2880,7 +3313,14 @@ impl PreparedChatContext {
                             message: message.clone(),
                         };
                         events.push(captured_event(&event));
-                        let outcome = failed_audit_outcome(started_at, &message);
+                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                         if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
@@ -2906,7 +3346,14 @@ impl PreparedChatContext {
                             message: message.clone(),
                         };
                         events.push(captured_event(&event));
-                        let outcome = failed_audit_outcome(started_at, &message);
+                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                         if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
@@ -2929,7 +3376,8 @@ impl PreparedChatContext {
                                 started_at,
                                 &mut events,
                                 &executed_tool_calls,
-                            );
+                            )
+                            .await;
                             yield Ok(sse_event(&event));
                             return;
                         }
@@ -2945,8 +3393,14 @@ impl PreparedChatContext {
                             message: message.clone(),
                         };
                         events.push(captured_event(&event));
-                        let outcome =
-                            failed_provider_audit_outcome(started_at, &message, status_code);
+                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            status_code,
+                        )
+                        .await;
 
                         if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
@@ -2974,7 +3428,8 @@ impl PreparedChatContext {
                                     started_at,
                                     &mut events,
                                     &executed_tool_calls,
-                                );
+                                )
+                                .await;
                                 yield Ok(sse_event(&event));
                                 return;
                             }
@@ -2993,8 +3448,14 @@ impl PreparedChatContext {
                                 message: message.clone(),
                             };
                             events.push(captured_event(&event));
-                            let outcome =
-                                failed_provider_audit_outcome(started_at, &message, status_code);
+                            let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            status_code,
+                        )
+                        .await;
 
                             if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                 let event = ChatSseEvent::Error {
@@ -3067,7 +3528,14 @@ impl PreparedChatContext {
                                     message: message.clone(),
                                 };
                                 events.push(captured_event(&event));
-                                let outcome = failed_audit_outcome(started_at, &message);
+                                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                                 if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                     let event = ChatSseEvent::Error {
@@ -3087,7 +3555,14 @@ impl PreparedChatContext {
                                     message: message.clone(),
                                 };
                                 events.push(captured_event(&event));
-                                let outcome = failed_audit_outcome(started_at, &message);
+                                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                                 if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                     let event = ChatSseEvent::Error {
@@ -3125,6 +3600,43 @@ impl PreparedChatContext {
                             if tool_calls.is_empty() {
                                 let assistant_message_text =
                                     assistant_message_text(&assistant_text, &executed_tool_calls);
+                                let stop_text = assistant_message_text.clone();
+                                let stop_summary = self.hook_runtime.run_hooks(HookRunRequest {
+                                    global_config: &self.global_hooks,
+                                    workspace_id: &self.workspace_id,
+                                    workspace_path: &self.workspace_path,
+                                    event: "Stop",
+                                    match_value: None,
+                                    chat_id: Some(&self.chat_id),
+                                    run_id: Some(&self.llm_request_id),
+                                    session_id: Some(&self.chat_id),
+                                    tool_call_id: None,
+                                    model_id: Some(&self.model_id),
+                                    provider_id: Some(&self.provider_id),
+                                    provider_config: Some(&self.provider_config),
+                                    permission_mode: None,
+                                    payload: json!({
+                                        "text": stop_text,
+                                        "reasoning": non_empty_string(&assistant_reasoning),
+                                        "usage": final_usage.clone(),
+                                        "stopReason": stop_reason.clone(),
+                                    }),
+                                }).await;
+                                for event in hook_notification_events(&self.assistant_message_id, "Stop", &stop_summary) {
+                                    events.push(captured_event(&event));
+                                    yield Ok(sse_event(&event));
+                                }
+                                if let Some(reason) = stop_summary.first_block_reason() {
+                                    append_hook_context_messages(
+                                        &mut self.provider_request.messages,
+                                        &mut self.message_source_sequences,
+                                        &[
+                                            format!("Stop hook blocked the assistant response: {reason}"),
+                                            stop_summary.additional_context.join("\n"),
+                                        ],
+                                    );
+                                    continue 'agent_turns;
+                                }
                                 let total_latency_ms = elapsed_millis(started_at);
                                 let metrics = ChatReplyMetrics {
                                     model_id: self.model_id.clone(),
@@ -3142,6 +3654,20 @@ impl PreparedChatContext {
                                     stop_reason: stop_reason.clone(),
                                     metrics,
                                 };
+                                let session_end_summary = session_end_hook(
+                                    &self,
+                                    "succeeded",
+                                    json!({
+                                        "text": assistant_message_text.clone(),
+                                        "reasoning": non_empty_string(&assistant_reasoning),
+                                        "usage": final_usage.clone(),
+                                        "stopReason": stop_reason.clone(),
+                                    }),
+                                ).await;
+                                for event in hook_notification_events(&self.assistant_message_id, "SessionEnd", &session_end_summary) {
+                                    events.push(captured_event(&event));
+                                    yield Ok(sse_event(&event));
+                                }
                                 events.push(captured_event(&complete_event));
                                 let completed_at = utc_timestamp();
                                 let outcome = ChatAuditOutcome {
@@ -3188,7 +3714,14 @@ impl PreparedChatContext {
                                     message: message.clone(),
                                 };
                                 events.push(captured_event(&event));
-                                let outcome = failed_audit_outcome(started_at, &message);
+                                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                                 if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                     let event = ChatSseEvent::Error {
@@ -3209,7 +3742,14 @@ impl PreparedChatContext {
                                     message: message.clone(),
                                 };
                                 events.push(captured_event(&event));
-                                let outcome = failed_audit_outcome(started_at, &message);
+                                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                                 if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                     let event = ChatSseEvent::Error {
@@ -3238,11 +3778,17 @@ impl PreparedChatContext {
                                 let (question_event_tx, mut question_event_rx) = mpsc::unbounded_channel();
                                 let tool_results = execute_tool_calls_parallel(
                                     self.mcp_registry.clone(),
+                                    self.hook_runtime.clone(),
+                                    self.global_hooks.clone(),
+                                    self.provider_config.clone(),
                                     self.question_registry.clone(),
                                     question_event_tx,
                                     &self.workspace_id,
                                     &self.workspace_path,
                                     &self.chat_id,
+                                    &self.llm_request_id,
+                                    &self.model_id,
+                                    &self.provider_id,
                                     tool_calls.clone(),
                                 );
                                 tokio::pin!(tool_results);
@@ -3258,7 +3804,8 @@ impl PreparedChatContext {
                                                     started_at,
                                                     &mut events,
                                                     &executed_tool_calls,
-                                                );
+                                                )
+                                                .await;
                                                 yield Ok(sse_event(&event));
                                                 return;
                                             }
@@ -3293,7 +3840,14 @@ impl PreparedChatContext {
                                         message: message.clone(),
                                     };
                                     events.push(captured_event(&event));
-                                    let outcome = failed_audit_outcome(started_at, &message);
+                                    let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                                     if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                         let event = ChatSseEvent::Error {
@@ -3307,7 +3861,45 @@ impl PreparedChatContext {
                                     return;
                                 }
                             };
-                            for executed_tool_call in &next_tool_results {
+                            let mut next_executed_tool_calls = Vec::with_capacity(next_tool_results.len());
+                            let mut batch_hook_summary = HookRunSummary::default();
+                            for outcome in next_tool_results {
+                                for event in hook_notification_events(&self.assistant_message_id, "ToolHook", &outcome.hook_summary) {
+                                    events.push(captured_event(&event));
+                                    yield Ok(sse_event(&event));
+                                }
+                                merge_hook_summaries(&mut batch_hook_summary, outcome.hook_summary);
+                                next_executed_tool_calls.push(outcome.tool_call);
+                            }
+                            let batch_summary = self.hook_runtime.run_hooks(HookRunRequest {
+                                global_config: &self.global_hooks,
+                                workspace_id: &self.workspace_id,
+                                workspace_path: &self.workspace_path,
+                                event: "PostToolBatch",
+                                match_value: None,
+                                chat_id: Some(&self.chat_id),
+                                run_id: Some(&self.llm_request_id),
+                                session_id: Some(&self.chat_id),
+                                tool_call_id: None,
+                                model_id: Some(&self.model_id),
+                                provider_id: Some(&self.provider_id),
+                                provider_config: Some(&self.provider_config),
+                                permission_mode: None,
+                                payload: json!({
+                                    "toolResults": next_executed_tool_calls.clone(),
+                                }),
+                            }).await;
+                            for event in hook_notification_events(&self.assistant_message_id, "PostToolBatch", &batch_summary) {
+                                events.push(captured_event(&event));
+                                yield Ok(sse_event(&event));
+                            }
+                            merge_hook_summaries(&mut batch_hook_summary, batch_summary);
+                            append_hook_context_messages(
+                                &mut self.provider_request.messages,
+                                &mut self.message_source_sequences,
+                                &batch_hook_summary.additional_context,
+                            );
+                            for executed_tool_call in &next_executed_tool_calls {
                                 let result_event = ChatSseEvent::ToolResult {
                                     assistant_message_id: self.assistant_message_id.clone(),
                                     tool_call_id: executed_tool_call.id.clone(),
@@ -3317,14 +3909,14 @@ impl PreparedChatContext {
                                 events.push(captured_event(&result_event));
                                 yield Ok(sse_event(&result_event));
                             }
-                            if tool_results_affect_git_diff(&next_tool_results) {
+                            if tool_results_affect_git_diff(&next_executed_tool_calls) {
                                 let event = ChatSseEvent::GitDiffRefresh {
                                     workspace_id: self.workspace_id.clone(),
                                 };
                                 events.push(captured_event(&event));
                                 yield Ok(sse_event(&event));
                             }
-                            if tool_results_affect_task_graph(&next_tool_results) {
+                            if tool_results_affect_task_graph(&next_executed_tool_calls) {
                                 let event = ChatSseEvent::TaskGraphRefresh {
                                     workspace_id: self.workspace_id.clone(),
                                     chat_id: self.chat_id.clone(),
@@ -3337,11 +3929,11 @@ impl PreparedChatContext {
                                 &mut self.provider_request.messages,
                                 &mut self.message_source_sequences,
                                 tool_calls,
-                                &next_tool_results,
+                                &next_executed_tool_calls,
                                 turn_text,
                                 non_empty_string(&turn_reasoning),
                             );
-                            executed_tool_calls.extend(next_tool_results);
+                            executed_tool_calls.extend(next_executed_tool_calls);
 
                             break;
                         }
@@ -3350,7 +3942,14 @@ impl PreparedChatContext {
                                 message: message.clone(),
                             };
                             events.push(captured_event(&event));
-                            let outcome = failed_audit_outcome(started_at, &message);
+                            let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                             if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                 let event = ChatSseEvent::Error {
@@ -3375,7 +3974,14 @@ impl PreparedChatContext {
                     message: message.clone(),
                 };
                 events.push(captured_event(&event));
-                let outcome = failed_audit_outcome(started_at, &message);
+                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
 
                 if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                     let event = ChatSseEvent::Error {
@@ -3664,18 +4270,71 @@ async fn prepare_chat_context(
     let user_message_id = unique_id("msg-user");
     let assistant_message_id = unique_id("msg-assistant");
     let llm_request_id = unique_id("llm");
+    let user_prompt_summary = state
+        .hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &config.hooks,
+            workspace_id: &prompt_context.workspace_id,
+            workspace_path: &prompt_context.workspace_path,
+            event: "UserPromptSubmit",
+            match_value: None,
+            chat_id: prompt_context.chat_id.as_deref(),
+            run_id: None,
+            session_id: prompt_context.chat_id.as_deref(),
+            tool_call_id: None,
+            model_id: Some(&prompt_context.model_id),
+            provider_id: Some(&prompt_context.provider_id),
+            provider_config: Some(&prompt_context.provider_config),
+            permission_mode: None,
+            payload: json!({
+                "prompt": raw_message,
+                "message": message,
+            }),
+        })
+        .await;
+    if let Some(reason) = user_prompt_summary.first_block_reason() {
+        return Err(ApiError::bad_request(format!(
+            "UserPromptSubmit hook blocked message: {reason}"
+        )));
+    }
     let mut database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
-    let chat_id = match prompt_context.chat_id.clone() {
-        Some(chat_id) => chat_id,
+    let (chat_id, chat_created) = match prompt_context.chat_id.clone() {
+        Some(chat_id) => (chat_id, false),
         None => {
             let chat_id = unique_id("chat");
             database
                 .insert_chat(&chat_id, &chat_title(raw_message))
                 .map_err(ApiError::from_workspace_error)?;
-            chat_id
+            (chat_id, true)
         }
     };
+    let session_start_summary = state
+        .hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &config.hooks,
+            workspace_id: &prompt_context.workspace_id,
+            workspace_path: &prompt_context.workspace_path,
+            event: "SessionStart",
+            match_value: None,
+            chat_id: Some(&chat_id),
+            run_id: Some(&llm_request_id),
+            session_id: Some(&chat_id),
+            tool_call_id: None,
+            model_id: Some(&prompt_context.model_id),
+            provider_id: Some(&prompt_context.provider_id),
+            provider_config: Some(&prompt_context.provider_config),
+            permission_mode: None,
+            payload: json!({
+                "chatCreated": chat_created,
+                "prompt": raw_message,
+            }),
+        })
+        .await;
+    let mut hook_notifications = user_prompt_summary.hook_messages("UserPromptSubmit");
+    hook_notifications.extend(session_start_summary.hook_messages("SessionStart"));
+    let mut hook_context_messages = user_prompt_summary.additional_context;
+    hook_context_messages.extend(session_start_summary.additional_context);
 
     database
         .insert_message(NewMessage {
@@ -3703,6 +4362,8 @@ async fn prepare_chat_context(
         provider_config: prompt_context.provider_config,
         provider_request: prompt_context.provider_request,
         mcp_registry: state.mcp_registry.clone(),
+        hook_runtime: state.hook_runtime.clone(),
+        global_hooks: config.hooks.clone(),
         question_registry: state.question_registry.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget: prompt_context.context_budget,
@@ -3710,6 +4371,8 @@ async fn prepare_chat_context(
         compression_snapshots: prompt_context.compression_snapshots,
         message_source_sequences: prompt_context.message_source_sequences,
         active_tool_start_index: prompt_context.active_tool_start_index,
+        hook_context_messages,
+        hook_notifications,
     })
 }
 
@@ -4032,7 +4695,7 @@ fn is_wsl_environment() -> bool {
         .unwrap_or(false)
 }
 
-fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize, ApiError> {
+async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize, ApiError> {
     if context.provider_request.messages.len() != context.message_source_sequences.len() {
         return Err(ApiError::internal(
             "context message source sequence count does not match prompt message count",
@@ -4069,6 +4732,41 @@ fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize
 
     let covered_sequences =
         compression_covered_sequences(&context.message_source_sequences, &covered_indices)?;
+    let pre_summary = context
+        .hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &context.global_hooks,
+            workspace_id: &context.workspace_id,
+            workspace_path: &context.workspace_path,
+            event: "PreCompact",
+            match_value: None,
+            chat_id: Some(&context.chat_id),
+            run_id: Some(&context.llm_request_id),
+            session_id: Some(&context.chat_id),
+            tool_call_id: None,
+            model_id: Some(&context.model_id),
+            provider_id: Some(&context.provider_id),
+            provider_config: Some(&context.provider_config),
+            permission_mode: None,
+            payload: json!({
+                "coveredSequences": covered_sequences,
+                "originalTokenCount": plan.original_tokens,
+                "summaryTokenCount": summary_token_count,
+                "summary": summary.clone(),
+            }),
+        })
+        .await;
+    context
+        .hook_notifications
+        .extend(pre_summary.hook_messages("PreCompact"));
+    append_hook_context_messages(
+        &mut context.provider_request.messages,
+        &mut context.message_source_sequences,
+        &pre_summary.additional_context,
+    );
+    if pre_summary.first_block_reason().is_some() {
+        return Ok(context.active_tool_start_index);
+    }
     let snapshot_id = unique_id("ctx");
     let snapshot_sequence = next_context_snapshot_sequence(&context.compression_snapshots)?;
     let metadata_json = json!({
@@ -4134,6 +4832,36 @@ fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize
     context.active_tool_start_index =
         compressed_active_tool_start_index(context.active_tool_start_index, &covered_indices);
     context.compression_snapshots.push(snapshot);
+
+    let post_summary = context
+        .hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &context.global_hooks,
+            workspace_id: &context.workspace_id,
+            workspace_path: &context.workspace_path,
+            event: "PostCompact",
+            match_value: None,
+            chat_id: Some(&context.chat_id),
+            run_id: Some(&context.llm_request_id),
+            session_id: Some(&context.chat_id),
+            tool_call_id: None,
+            model_id: Some(&context.model_id),
+            provider_id: Some(&context.provider_id),
+            provider_config: Some(&context.provider_config),
+            permission_mode: None,
+            payload: json!({
+                "snapshotId": context.compression_snapshots.last().map(|snapshot| snapshot.id.clone()),
+            }),
+        })
+        .await;
+    context
+        .hook_notifications
+        .extend(post_summary.hook_messages("PostCompact"));
+    append_hook_context_messages(
+        &mut context.provider_request.messages,
+        &mut context.message_source_sequences,
+        &post_summary.additional_context,
+    );
 
     Ok(context.active_tool_start_index)
 }
@@ -4749,13 +5477,19 @@ fn pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingToolCall> {
 
 async fn execute_tool_calls_parallel(
     mcp_registry: Arc<McpRegistry>,
+    hook_runtime: HookRuntime,
+    global_hooks: HookConfig,
+    provider_config: ProviderConnectionConfig,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
+    run_id: &str,
+    model_id: &str,
+    provider_id: &str,
     tool_calls: Vec<NeutralToolCall>,
-) -> Result<Vec<ExecutedToolCall>, ApiError> {
+) -> Result<Vec<ToolHookOutcome>, ApiError> {
     if tool_calls
         .iter()
         .any(tool_call_requires_sequential_execution)
@@ -4765,11 +5499,17 @@ async fn execute_tool_calls_parallel(
             executed_tool_calls.push(
                 execute_tool_call(
                     mcp_registry.clone(),
+                    hook_runtime.clone(),
+                    global_hooks.clone(),
+                    provider_config.clone(),
                     question_registry.clone(),
                     question_event_tx.clone(),
                     workspace_id,
                     workspace_path,
                     chat_id,
+                    run_id,
+                    model_id,
+                    provider_id,
                     tool_call,
                 )
                 .await,
@@ -4782,18 +5522,30 @@ async fn execute_tool_calls_parallel(
         let workspace_path = workspace_path.to_path_buf();
         let workspace_id = workspace_id.to_string();
         let chat_id = chat_id.to_string();
+        let run_id = run_id.to_string();
+        let model_id = model_id.to_string();
+        let provider_id = provider_id.to_string();
         let mcp_registry = mcp_registry.clone();
+        let hook_runtime = hook_runtime.clone();
+        let global_hooks = global_hooks.clone();
+        let provider_config = provider_config.clone();
         let question_registry = question_registry.clone();
         let question_event_tx = question_event_tx.clone();
 
         tokio::spawn(async move {
             execute_tool_call(
                 mcp_registry,
+                hook_runtime,
+                global_hooks,
+                provider_config,
                 question_registry,
                 question_event_tx,
                 &workspace_id,
                 &workspace_path,
                 &chat_id,
+                &run_id,
+                &model_id,
+                &provider_id,
                 tool_call,
             )
             .await
@@ -4813,60 +5565,308 @@ async fn execute_tool_calls_parallel(
 
 async fn execute_tool_call(
     mcp_registry: Arc<McpRegistry>,
+    hook_runtime: HookRuntime,
+    global_hooks: HookConfig,
+    provider_config: ProviderConnectionConfig,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
+    run_id: &str,
+    model_id: &str,
+    provider_id: &str,
     tool_call: NeutralToolCall,
-) -> ExecutedToolCall {
+) -> ToolHookOutcome {
     let started_at_text = utc_timestamp();
     let tool_execution = execute_tool(
         mcp_registry,
+        hook_runtime.clone(),
+        &global_hooks,
+        &provider_config,
         question_registry,
         question_event_tx,
         workspace_id,
         workspace_path,
         chat_id,
+        run_id,
+        model_id,
+        provider_id,
         &tool_call.call_id,
         &tool_call.name,
         tool_call.arguments.clone(),
     )
     .await;
     let completed_at_text = utc_timestamp();
+    let mut hook_summary = tool_execution.hook_summary;
 
-    executed_tool_call(
+    let executed = executed_tool_call(
         tool_call,
-        tool_execution,
+        tool_execution.execution,
         started_at_text,
         completed_at_text,
-    )
+    );
+    let post_event = if executed.is_error {
+        "PostToolUseFailure"
+    } else {
+        "PostToolUse"
+    };
+    let post_summary = hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &global_hooks,
+            workspace_id,
+            workspace_path,
+            event: post_event,
+            match_value: Some(executed.name.clone()),
+            chat_id: Some(chat_id),
+            run_id: Some(run_id),
+            session_id: Some(chat_id),
+            tool_call_id: Some(&executed.id),
+            model_id: Some(model_id),
+            provider_id: Some(provider_id),
+            provider_config: Some(&provider_config),
+            permission_mode: None,
+            payload: json!({
+                "toolName": executed.name.clone(),
+                "toolInput": executed.input.clone(),
+                "toolOutput": executed.output.clone(),
+                "isError": executed.is_error,
+            }),
+        })
+        .await;
+    merge_hook_summaries(&mut hook_summary, post_summary);
+
+    ToolHookOutcome {
+        tool_call: executed,
+        hook_summary,
+    }
 }
 
 async fn execute_tool(
     mcp_registry: Arc<McpRegistry>,
+    hook_runtime: HookRuntime,
+    global_hooks: &HookConfig,
+    provider_config: &ProviderConnectionConfig,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
+    run_id: &str,
+    model_id: &str,
+    provider_id: &str,
     tool_call_id: &str,
     tool_name: &str,
-    arguments: Value,
-) -> ToolExecution {
+    mut arguments: Value,
+) -> ToolExecutionWithHooks {
+    let pre_summary = hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: global_hooks,
+            workspace_id,
+            workspace_path,
+            event: "PreToolUse",
+            match_value: Some(tool_name.to_string()),
+            chat_id: Some(chat_id),
+            run_id: Some(run_id),
+            session_id: Some(chat_id),
+            tool_call_id: Some(tool_call_id),
+            model_id: Some(model_id),
+            provider_id: Some(provider_id),
+            provider_config: Some(provider_config),
+            permission_mode: None,
+            payload: json!({
+                "toolName": tool_name,
+                "toolInput": arguments.clone(),
+            }),
+        })
+        .await;
+    let blocking_decision = pre_summary
+        .decisions
+        .iter()
+        .find(|decision| {
+            matches!(
+                decision,
+                HookDecision::Block { .. } | HookDecision::Deny { .. } | HookDecision::Ask { .. }
+            )
+        })
+        .cloned();
+    let mut hook_summary = pre_summary;
+    if let Some(updated_input) = hook_updated_input(&hook_summary) {
+        arguments = updated_input;
+    }
+    if let Some(decision) = blocking_decision {
+        match decision {
+            HookDecision::Allow => {}
+            HookDecision::Block { reason } | HookDecision::Deny { reason } => {
+                return ToolExecutionWithHooks {
+                    execution: ToolExecution {
+                        output: json!({ "error": format!("PreToolUse hook blocked '{tool_name}': {reason}") }),
+                        is_error: true,
+                    },
+                    hook_summary,
+                };
+            }
+            HookDecision::Ask { reason } => {
+                let permission_request_summary = hook_runtime
+                    .run_hooks(HookRunRequest {
+                        global_config: global_hooks,
+                        workspace_id,
+                        workspace_path,
+                        event: "PermissionRequest",
+                        match_value: Some(tool_name.to_string()),
+                        chat_id: Some(chat_id),
+                        run_id: Some(run_id),
+                        session_id: Some(chat_id),
+                        tool_call_id: Some(tool_call_id),
+                        model_id: Some(model_id),
+                        provider_id: Some(provider_id),
+                        provider_config: Some(provider_config),
+                        permission_mode: Some("ask"),
+                        payload: json!({
+                            "toolName": tool_name,
+                            "toolInput": arguments.clone(),
+                            "reason": reason,
+                        }),
+                    })
+                    .await;
+                let permission_request_decision = permission_request_summary
+                    .decisions
+                    .iter()
+                    .find(|decision| {
+                        matches!(
+                            decision,
+                            HookDecision::Allow
+                                | HookDecision::Block { .. }
+                                | HookDecision::Deny { .. }
+                                | HookDecision::Ask { .. }
+                        )
+                    })
+                    .cloned();
+                merge_hook_summaries(&mut hook_summary, permission_request_summary);
+
+                if let Some(updated_input) = hook_updated_input(&hook_summary) {
+                    arguments = updated_input;
+                }
+
+                let prompt_reason = match permission_request_decision {
+                    Some(HookDecision::Allow) => None,
+                    Some(HookDecision::Block { reason }) | Some(HookDecision::Deny { reason }) => {
+                        let denied_summary = hook_runtime
+                            .run_hooks(HookRunRequest {
+                                global_config: global_hooks,
+                                workspace_id,
+                                workspace_path,
+                                event: "PermissionDenied",
+                                match_value: Some(tool_name.to_string()),
+                                chat_id: Some(chat_id),
+                                run_id: Some(run_id),
+                                session_id: Some(chat_id),
+                                tool_call_id: Some(tool_call_id),
+                                model_id: Some(model_id),
+                                provider_id: Some(provider_id),
+                                provider_config: Some(provider_config),
+                                permission_mode: Some("deny"),
+                                payload: json!({
+                                    "toolName": tool_name,
+                                    "toolInput": arguments.clone(),
+                                    "reason": reason,
+                                }),
+                            })
+                            .await;
+                        let retry_message = permission_denied_retry_message(&denied_summary);
+                        merge_hook_summaries(&mut hook_summary, denied_summary);
+                        return ToolExecutionWithHooks {
+                            execution: ToolExecution {
+                                output: json!({
+                                    "error": format!("PermissionRequest hook denied '{tool_name}': {reason}"),
+                                    "retry": retry_message,
+                                }),
+                                is_error: true,
+                            },
+                            hook_summary,
+                        };
+                    }
+                    Some(HookDecision::Ask { reason }) => Some(reason),
+                    None => Some(reason),
+                };
+
+                if let Some(prompt_reason) = prompt_reason {
+                    let permission = execute_hook_permission_question(
+                        question_registry.clone(),
+                        question_event_tx.clone(),
+                        workspace_id,
+                        chat_id,
+                        tool_call_id,
+                        tool_name,
+                        &prompt_reason,
+                    )
+                    .await;
+                    if let Err(reason) = permission {
+                        let denied_summary = hook_runtime
+                            .run_hooks(HookRunRequest {
+                                global_config: global_hooks,
+                                workspace_id,
+                                workspace_path,
+                                event: "PermissionDenied",
+                                match_value: Some(tool_name.to_string()),
+                                chat_id: Some(chat_id),
+                                run_id: Some(run_id),
+                                session_id: Some(chat_id),
+                                tool_call_id: Some(tool_call_id),
+                                model_id: Some(model_id),
+                                provider_id: Some(provider_id),
+                                provider_config: Some(provider_config),
+                                permission_mode: Some("deny"),
+                                payload: json!({
+                                    "toolName": tool_name,
+                                    "toolInput": arguments.clone(),
+                                    "reason": reason,
+                                }),
+                            })
+                            .await;
+                        let retry_message = permission_denied_retry_message(&denied_summary);
+                        merge_hook_summaries(&mut hook_summary, denied_summary);
+                        return ToolExecutionWithHooks {
+                            execution: ToolExecution {
+                                output: json!({
+                                    "error": format!("PreToolUse hook permission denied for '{tool_name}': {reason}"),
+                                    "retry": retry_message,
+                                }),
+                                is_error: true,
+                            },
+                            hook_summary,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
     if tool_name == ASK_QUESTION_TOOL {
-        return execute_ask_question(
+        let ask_question = execute_ask_question(
+            hook_runtime,
+            global_hooks,
+            provider_config,
             question_registry,
             question_event_tx,
             workspace_id,
+            workspace_path,
             chat_id,
+            run_id,
+            model_id,
+            provider_id,
             tool_call_id,
             arguments,
         )
         .await;
+        merge_hook_summaries(&mut hook_summary, ask_question.hook_summary);
+        return ToolExecutionWithHooks {
+            execution: ask_question.execution,
+            hook_summary,
+        };
     }
 
-    if is_mcp_tool_name(tool_name) {
+    let execution = if is_mcp_tool_name(tool_name) {
         match mcp_registry
             .execute_tool(workspace_id, tool_name, arguments)
             .await
@@ -4884,9 +5884,12 @@ async fn execute_tool(
         let timeout_ms = match builtin_tool_timeout_ms(tool_name, &arguments) {
             Ok(timeout_ms) => timeout_ms,
             Err(error) => {
-                return ToolExecution {
-                    output: json!({ "error": error }),
-                    is_error: true,
+                return ToolExecutionWithHooks {
+                    execution: ToolExecution {
+                        output: json!({ "error": error }),
+                        is_error: true,
+                    },
+                    hook_summary,
                 };
             }
         };
@@ -4927,83 +5930,166 @@ async fn execute_tool(
                 is_error: true,
             },
         }
+    };
+
+    ToolExecutionWithHooks {
+        execution,
+        hook_summary,
     }
 }
 
 async fn execute_ask_question(
+    hook_runtime: HookRuntime,
+    global_hooks: &HookConfig,
+    provider_config: &ProviderConnectionConfig,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
+    workspace_path: &Path,
     chat_id: &str,
+    run_id: &str,
+    model_id: &str,
+    provider_id: &str,
     tool_call_id: &str,
     arguments: Value,
-) -> ToolExecution {
+) -> ToolExecutionWithHooks {
+    let mut hook_summary = HookRunSummary::default();
     let input = match serde_json::from_value::<AskQuestionInput>(arguments) {
         Ok(input) => input,
         Err(source) => {
-            return ToolExecution {
-                output: json!({
-                    "error": format!("ask_question arguments do not match schema: {source}")
-                }),
-                is_error: true,
+            return ToolExecutionWithHooks {
+                execution: ToolExecution {
+                    output: json!({
+                        "error": format!("ask_question arguments do not match schema: {source}")
+                    }),
+                    is_error: true,
+                },
+                hook_summary,
             };
         }
     };
     let request = match question_request_from_input(workspace_id, chat_id, tool_call_id, input) {
         Ok(request) => request,
         Err(error) => {
-            return ToolExecution {
-                output: json!({ "error": error.message }),
-                is_error: true,
+            return ToolExecutionWithHooks {
+                execution: ToolExecution {
+                    output: json!({ "error": error.message }),
+                    is_error: true,
+                },
+                hook_summary,
             };
         }
     };
+    let elicitation_summary = hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: global_hooks,
+            workspace_id,
+            workspace_path,
+            event: "Elicitation",
+            match_value: Some(ASK_QUESTION_TOOL.to_string()),
+            chat_id: Some(chat_id),
+            run_id: Some(run_id),
+            session_id: Some(chat_id),
+            tool_call_id: Some(tool_call_id),
+            model_id: Some(model_id),
+            provider_id: Some(provider_id),
+            provider_config: Some(provider_config),
+            permission_mode: None,
+            payload: json!({
+                "questionRequest": request.clone(),
+            }),
+        })
+        .await;
+    let block_reason = elicitation_summary.first_block_reason();
+    let elicitation_action = elicitation_action(&elicitation_summary, &request);
+    merge_hook_summaries(&mut hook_summary, elicitation_summary);
+    if let Some(reason) = block_reason {
+        return ToolExecutionWithHooks {
+            execution: ToolExecution {
+                output: json!({ "error": format!("Elicitation hook blocked question '{}': {reason}", request.id) }),
+                is_error: true,
+            },
+            hook_summary,
+        };
+    }
+    if let Some(action) = elicitation_action {
+        match action {
+            ElicitationAction::Accept(answer) => {
+                let execution = ToolExecution {
+                    output: question_answer_output(&request, answer),
+                    is_error: false,
+                };
+                let result_summary = hook_runtime
+                    .run_hooks(HookRunRequest {
+                        global_config: global_hooks,
+                        workspace_id,
+                        workspace_path,
+                        event: "ElicitationResult",
+                        match_value: Some(ASK_QUESTION_TOOL.to_string()),
+                        chat_id: Some(chat_id),
+                        run_id: Some(run_id),
+                        session_id: Some(chat_id),
+                        tool_call_id: Some(tool_call_id),
+                        model_id: Some(model_id),
+                        provider_id: Some(provider_id),
+                        provider_config: Some(provider_config),
+                        permission_mode: None,
+                        payload: json!({
+                            "questionRequest": request,
+                            "questionResult": execution.output.clone(),
+                            "isError": execution.is_error,
+                        }),
+                    })
+                    .await;
+                let execution = apply_elicitation_result_action(execution, &result_summary);
+                merge_hook_summaries(&mut hook_summary, result_summary);
+                return ToolExecutionWithHooks {
+                    execution,
+                    hook_summary,
+                };
+            }
+            ElicitationAction::Decline(reason) | ElicitationAction::Cancel(reason) => {
+                return ToolExecutionWithHooks {
+                    execution: ToolExecution {
+                        output: json!({ "error": reason }),
+                        is_error: true,
+                    },
+                    hook_summary,
+                };
+            }
+        }
+    }
+
     let registration = match question_registry.register(request.clone()) {
         Ok(registration) => registration,
         Err(error) => {
-            return ToolExecution {
-                output: json!({ "error": error.message }),
-                is_error: true,
+            return ToolExecutionWithHooks {
+                execution: ToolExecution {
+                    output: json!({ "error": error.message }),
+                    is_error: true,
+                },
+                hook_summary,
             };
         }
     };
 
     if question_event_tx.send(request.clone()).is_err() {
-        return ToolExecution {
-            output: json!({
-                "error": format!("failed to show question '{}' because the chat stream is closed", request.id)
-            }),
-            is_error: true,
+        return ToolExecutionWithHooks {
+            execution: ToolExecution {
+                output: json!({
+                    "error": format!("failed to show question '{}' because the chat stream is closed", request.id)
+                }),
+                is_error: true,
+            },
+            hook_summary,
         };
     }
 
-    match registration.answer_rx.await {
+    let execution = match registration.answer_rx.await {
         Ok(answer) => {
-            let mut answers_by_id = answer
-                .answers
-                .into_iter()
-                .map(|answer| (answer.id.clone(), answer))
-                .collect::<HashMap<_, _>>();
-            let answers = request
-                .questions
-                .iter()
-                .filter_map(|question| {
-                    answers_by_id.remove(&question.id).map(|answer| {
-                        json!({
-                            "id": question.id,
-                            "question": question.question,
-                            "answer": answer.answer,
-                            "selectedOptionValue": answer.selected_option_value,
-                        })
-                    })
-                })
-                .collect::<Vec<_>>();
-
+            let output = question_answer_output(&request, answer);
             ToolExecution {
-                output: json!({
-                    "questionId": request.id,
-                    "answers": answers,
-                }),
+                output,
                 is_error: false,
             }
         }
@@ -5013,6 +6099,297 @@ async fn execute_ask_question(
             }),
             is_error: true,
         },
+    };
+    let result_summary = hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: global_hooks,
+            workspace_id,
+            workspace_path,
+            event: "ElicitationResult",
+            match_value: Some(ASK_QUESTION_TOOL.to_string()),
+            chat_id: Some(chat_id),
+            run_id: Some(run_id),
+            session_id: Some(chat_id),
+            tool_call_id: Some(tool_call_id),
+            model_id: Some(model_id),
+            provider_id: Some(provider_id),
+            provider_config: Some(provider_config),
+            permission_mode: None,
+            payload: json!({
+                "questionRequest": request,
+                "questionResult": execution.output.clone(),
+                "isError": execution.is_error,
+            }),
+        })
+        .await;
+    let execution = apply_elicitation_result_action(execution, &result_summary);
+    merge_hook_summaries(&mut hook_summary, result_summary);
+
+    ToolExecutionWithHooks {
+        execution,
+        hook_summary,
+    }
+}
+
+fn question_answer_output(request: &QuestionRequest, answer: QuestionAnswer) -> Value {
+    let mut answers_by_id = answer
+        .answers
+        .into_iter()
+        .map(|answer| (answer.id.clone(), answer))
+        .collect::<HashMap<_, _>>();
+    let answers = request
+        .questions
+        .iter()
+        .filter_map(|question| {
+            answers_by_id.remove(&question.id).map(|answer| {
+                json!({
+                    "id": question.id,
+                    "question": question.question,
+                    "answer": answer.answer,
+                    "selectedOptionValue": answer.selected_option_value,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "questionId": request.id,
+        "answers": answers,
+    })
+}
+
+enum ElicitationAction {
+    Accept(QuestionAnswer),
+    Decline(String),
+    Cancel(String),
+}
+
+fn hook_updated_input(summary: &HookRunSummary) -> Option<Value> {
+    summary
+        .hook_specific_outputs
+        .iter()
+        .rev()
+        .find_map(|output| {
+            output
+                .get("updatedInput")
+                .or_else(|| output.get("input"))
+                .or_else(|| {
+                    output
+                        .get("decision")
+                        .and_then(|decision| decision.get("updatedInput"))
+                })
+                .cloned()
+        })
+}
+
+fn permission_denied_retry_message(summary: &HookRunSummary) -> Option<String> {
+    summary.hook_specific_outputs.iter().find_map(|output| {
+        if output
+            .get("retry")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let suffix = output
+                .get("updatedInput")
+                .or_else(|| output.get("input"))
+                .or_else(|| {
+                    output
+                        .get("decision")
+                        .and_then(|decision| decision.get("updatedInput"))
+                })
+                .map(|_| " with updated input")
+                .unwrap_or_default();
+            Some(format!("PermissionDenied hook requested retry{suffix}."))
+        } else {
+            None
+        }
+    })
+}
+
+fn elicitation_action(
+    summary: &HookRunSummary,
+    request: &QuestionRequest,
+) -> Option<ElicitationAction> {
+    summary
+        .hook_specific_outputs
+        .iter()
+        .find_map(|output| match hook_action(output).as_deref() {
+            Some("accept") | Some("accepted") => {
+                hook_question_answer(output.get("content"), request).map(ElicitationAction::Accept)
+            }
+            Some("decline") | Some("declined") => Some(ElicitationAction::Decline(
+                hook_action_reason(output, "Elicitation hook declined the question"),
+            )),
+            Some("cancel") | Some("cancelled") | Some("canceled") => {
+                Some(ElicitationAction::Cancel(hook_action_reason(
+                    output,
+                    "Elicitation hook cancelled the question",
+                )))
+            }
+            _ => None,
+        })
+}
+
+fn apply_elicitation_result_action(
+    mut execution: ToolExecution,
+    summary: &HookRunSummary,
+) -> ToolExecution {
+    for output in &summary.hook_specific_outputs {
+        match hook_action(output).as_deref() {
+            Some("accept") | Some("accepted") => {
+                if let Some(content) = output.get("content") {
+                    execution.output = content.clone();
+                    execution.is_error = false;
+                }
+            }
+            Some("decline") | Some("declined") | Some("cancel") | Some("cancelled")
+            | Some("canceled") => {
+                execution.output = json!({ "error": hook_action_reason(output, "ElicitationResult hook rejected the question result") });
+                execution.is_error = true;
+            }
+            _ => {}
+        }
+    }
+
+    execution
+}
+
+fn hook_action(output: &Value) -> Option<String> {
+    output
+        .get("action")
+        .and_then(Value::as_str)
+        .map(|action| action.trim().to_ascii_lowercase())
+}
+
+fn hook_action_reason(output: &Value, default_reason: &str) -> String {
+    output
+        .get("reason")
+        .or_else(|| output.get("message"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(default_reason)
+        .to_string()
+}
+
+fn hook_question_answer(
+    content: Option<&Value>,
+    request: &QuestionRequest,
+) -> Option<QuestionAnswer> {
+    let content = content?;
+
+    if let Ok(answer) = serde_json::from_value::<QuestionAnswer>(content.clone()) {
+        return Some(answer);
+    }
+
+    let answers = request
+        .questions
+        .iter()
+        .map(|question| {
+            let answer = hook_answer_for_question(content, question);
+            QuestionItemAnswer {
+                id: question.id.clone(),
+                selected_option_value: matching_option_value(question, &answer),
+                answer,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Some(QuestionAnswer { answers })
+}
+
+fn hook_answer_for_question(content: &Value, question: &QuestionItem) -> String {
+    if let Some(value) = content.get(&question.id) {
+        return hook_answer_text(value);
+    }
+
+    if let Some(value) = content.get(&question.question) {
+        return hook_answer_text(value);
+    }
+
+    if let Some(value) = content.get("answer") {
+        return hook_answer_text(value);
+    }
+
+    if let Some(value) = content.get("value") {
+        return hook_answer_text(value);
+    }
+
+    hook_answer_text(content)
+}
+
+fn hook_answer_text(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn matching_option_value(question: &QuestionItem, answer: &str) -> Option<String> {
+    question
+        .options
+        .iter()
+        .find(|option| option.value == answer || option.label == answer)
+        .map(|option| option.value.clone())
+}
+
+async fn execute_hook_permission_question(
+    question_registry: QuestionRegistry,
+    question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
+    workspace_id: &str,
+    chat_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let request_id = unique_id("hook-question");
+    let request = QuestionRequest {
+        id: request_id.clone(),
+        tool_call_id: tool_call_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        chat_id: chat_id.to_string(),
+        questions: vec![QuestionItem {
+            id: format!("{request_id}-item-1"),
+            question: format!("Hook asks whether to allow tool '{tool_name}': {reason}"),
+            options: vec![
+                QuestionOption {
+                    label: "Allow".to_string(),
+                    value: "allow".to_string(),
+                    description: Some("Run the tool once.".to_string()),
+                },
+                QuestionOption {
+                    label: "Deny".to_string(),
+                    value: "deny".to_string(),
+                    description: Some("Block this tool call.".to_string()),
+                },
+            ],
+            allow_free_text: false,
+        }],
+    };
+    let registration = question_registry
+        .register(request.clone())
+        .map_err(|source| source.message)?;
+
+    if question_event_tx.send(request.clone()).is_err() {
+        return Err(format!(
+            "failed to show hook permission question '{}' because the chat stream is closed",
+            request.id
+        ));
+    }
+
+    let answer = registration
+        .answer_rx
+        .await
+        .map_err(|_| format!("hook permission question '{}' was cancelled", request.id))?;
+    let selected = answer
+        .answers
+        .first()
+        .and_then(|answer| answer.selected_option_value.as_deref())
+        .unwrap_or_default();
+
+    if selected == "allow" {
+        Ok(())
+    } else {
+        Err("user denied hook permission request".to_string())
     }
 }
 
@@ -5120,6 +6497,42 @@ fn append_tool_state_messages(
     }
 }
 
+fn append_hook_context_messages(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    contexts: &[String],
+) {
+    for context in contexts.iter().filter(|context| !context.trim().is_empty()) {
+        messages.push(neutral_text_message(
+            NeutralChatRole::System,
+            format!("Hook additional context:\n\n{}", context.trim()),
+        ));
+        message_source_sequences.push(None);
+    }
+}
+
+fn hook_notification_events(
+    assistant_message_id: &str,
+    event: &str,
+    summary: &HookRunSummary,
+) -> Vec<ChatSseEvent> {
+    summary
+        .hook_messages(event)
+        .into_iter()
+        .map(|notification| ChatSseEvent::HookNotification {
+            assistant_message_id: assistant_message_id.to_string(),
+            notification,
+        })
+        .collect()
+}
+
+fn merge_hook_summaries(target: &mut HookRunSummary, source: HookRunSummary) {
+    target.decisions.extend(source.decisions);
+    target.additional_context.extend(source.additional_context);
+    target.system_messages.extend(source.system_messages);
+    target.errors.extend(source.errors);
+}
+
 fn tool_call_requires_sequential_execution(tool_call: &NeutralToolCall) -> bool {
     matches!(
         tool_call.name.as_str(),
@@ -5185,6 +6598,50 @@ fn failed_provider_audit_outcome(
     }
 }
 
+async fn failed_chat_audit_outcome(
+    context: &PreparedChatContext,
+    started_at: Instant,
+    events: &mut Vec<CapturedAuditEvent>,
+    message: &str,
+    status_code: Option<i64>,
+) -> ChatAuditOutcome {
+    let stop_failure_summary = context
+        .hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &context.global_hooks,
+            workspace_id: &context.workspace_id,
+            workspace_path: &context.workspace_path,
+            event: "StopFailure",
+            match_value: None,
+            chat_id: Some(&context.chat_id),
+            run_id: Some(&context.llm_request_id),
+            session_id: Some(&context.chat_id),
+            tool_call_id: None,
+            model_id: Some(&context.model_id),
+            provider_id: Some(&context.provider_id),
+            provider_config: Some(&context.provider_config),
+            permission_mode: None,
+            payload: json!({
+                "message": message,
+                "statusCode": status_code,
+            }),
+        })
+        .await;
+    for event in hook_notification_events(
+        &context.assistant_message_id,
+        "StopFailure",
+        &stop_failure_summary,
+    ) {
+        events.push(captured_event(&event));
+    }
+
+    if let Some(status_code) = status_code {
+        failed_provider_audit_outcome(started_at, message, Some(status_code))
+    } else {
+        failed_audit_outcome(started_at, message)
+    }
+}
+
 fn provider_status_code(error: &ProviderConfigError) -> Option<i64> {
     error.status_code().map(i64::from)
 }
@@ -5205,13 +6662,28 @@ fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutco
     }
 }
 
-fn finish_cancelled_chat_run(
+async fn finish_cancelled_chat_run(
     context: &PreparedChatContext,
     request_started_at: &str,
     started_at: Instant,
     events: &mut Vec<CapturedAuditEvent>,
     executed_tool_calls: &[ExecutedToolCall],
 ) -> ChatSseEvent {
+    let session_end_summary = session_end_hook(
+        context,
+        "cancelled",
+        json!({
+            "reason": SHUTDOWN_MESSAGE,
+        }),
+    )
+    .await;
+    for event in hook_notification_events(
+        &context.assistant_message_id,
+        "SessionEnd",
+        &session_end_summary,
+    ) {
+        events.push(captured_event(&event));
+    }
     let event = ChatSseEvent::Error {
         message: SHUTDOWN_MESSAGE.to_string(),
     };
@@ -5233,6 +6705,35 @@ fn finish_cancelled_chat_run(
     }
 
     event
+}
+
+async fn session_end_hook(
+    context: &PreparedChatContext,
+    final_state: &str,
+    payload: Value,
+) -> HookRunSummary {
+    context
+        .hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &context.global_hooks,
+            workspace_id: &context.workspace_id,
+            workspace_path: &context.workspace_path,
+            event: "SessionEnd",
+            match_value: None,
+            chat_id: Some(&context.chat_id),
+            run_id: Some(&context.llm_request_id),
+            session_id: Some(&context.chat_id),
+            tool_call_id: None,
+            model_id: Some(&context.model_id),
+            provider_id: Some(&context.provider_id),
+            provider_config: Some(&context.provider_config),
+            permission_mode: None,
+            payload: json!({
+                "finalState": final_state,
+                "details": payload,
+            }),
+        })
+        .await
 }
 
 fn captured_provider_event(event: &NeutralChatStreamEvent) -> CapturedAuditEvent {
@@ -5263,6 +6764,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::ToolCall { .. } => "tool_call",
         ChatSseEvent::ToolResult { .. } => "tool_result",
         ChatSseEvent::QuestionRequest { .. } => "question_request",
+        ChatSseEvent::HookNotification { .. } => "hook_notification",
         ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
         ChatSseEvent::TaskGraphRefresh { .. } => "task_graph_refresh",
         ChatSseEvent::Usage { .. } => "usage",
@@ -5634,6 +7136,7 @@ async fn settings_response(
                 password_enabled: web_auth_enabled(config),
             },
             language: config.app.language.clone(),
+            hook_audit_enabled: config.hooks.audit_enabled,
             supported_languages: SUPPORTED_APP_LANGUAGES
                 .iter()
                 .map(|language| AppLanguageSummary {
@@ -5710,6 +7213,206 @@ async fn settings_response(
             .collect(),
         skills: skills_settings_summary(config, &state.user_profile_dir),
     }))
+}
+
+async fn hooks_settings_response(
+    state: &AppState,
+    config: &GlobalConfig,
+    workspace_id: Option<&str>,
+) -> Result<Json<HooksSettingsResponse>, ApiError> {
+    let workspace = selected_hooks_workspace(config, workspace_id)?;
+    let workspace_config = load_workspace_hook_config(&workspace.path)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let effective = effective_hook_summaries(&config.hooks, &workspace.path)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let recent_runs = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?
+        .hook_runs(50)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .map(hook_run_summary_row)
+        .collect();
+
+    Ok(Json(HooksSettingsResponse {
+        supported_events: SUPPORTED_HOOK_EVENTS.to_vec(),
+        unsupported_events: UNSUPPORTED_HOOK_EVENTS.to_vec(),
+        global: HookConfigScopeSummary {
+            source: "global".to_string(),
+            path: display_path(&state.config_file),
+            workspace_id: None,
+            config: config.hooks.clone(),
+        },
+        workspace: HookConfigScopeSummary {
+            source: "workspace".to_string(),
+            path: display_path(&workspace_hook_config_path(&workspace.path)),
+            workspace_id: Some(workspace.id.clone()),
+            config: workspace_config,
+        },
+        effective,
+        recent_runs,
+    }))
+}
+
+fn selected_hooks_workspace<'a>(
+    config: &'a GlobalConfig,
+    workspace_id: Option<&str>,
+) -> Result<&'a WorkspaceConfig, ApiError> {
+    match workspace_id.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }) {
+        Some(workspace_id) => workspace_by_id(config, workspace_id),
+        None => workspace_by_id(config, &config.app.active_workspace_id),
+    }
+}
+
+fn hook_run_summary_row(record: HookRunRecord) -> HookRunSummaryRow {
+    HookRunSummaryRow {
+        id: record.id,
+        workspace_id: record.workspace_id,
+        chat_id: record.chat_id,
+        run_id: record.run_id,
+        tool_call_id: record.tool_call_id,
+        event: record.event,
+        hook_source: record.hook_source,
+        handler_type: record.handler_type,
+        status: record.status,
+        exit_code: record.exit_code,
+        stdout_preview: record.stdout_preview,
+        stderr_preview: record.stderr_preview,
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+    }
+}
+
+fn hook_run_detail_from_record(record: HookRunRecord) -> Result<HookRunDetail, ApiError> {
+    let input = parse_json_value(&record.input_json, "hook run input")?;
+    let output = record
+        .output_json
+        .as_deref()
+        .map(|json| parse_json_value(json, "hook run output"))
+        .transpose()?;
+
+    Ok(HookRunDetail {
+        id: record.id,
+        workspace_id: record.workspace_id,
+        chat_id: record.chat_id,
+        run_id: record.run_id,
+        tool_call_id: record.tool_call_id,
+        event: record.event,
+        hook_source: record.hook_source,
+        handler_type: record.handler_type,
+        input,
+        output,
+        status: record.status,
+        exit_code: record.exit_code,
+        stdout_preview: record.stdout_preview,
+        stderr_preview: record.stderr_preview,
+        started_at: record.started_at,
+        completed_at: record.completed_at,
+    })
+}
+
+fn claude_hook_settings_paths(base_path: &Path) -> Vec<PathBuf> {
+    vec![
+        base_path.join(".claude").join("settings.json"),
+        base_path.join(".claude").join("settings.local.json"),
+    ]
+}
+
+fn import_claude_hook_config(
+    paths: &[PathBuf],
+) -> Result<(HookConfig, Vec<String>, Vec<String>), ApiError> {
+    let mut config = HookConfig::default();
+    let mut imported_files = Vec::new();
+    let mut validation_errors = Vec::new();
+
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&path).map_err(|source| {
+            ApiError::internal(format!("failed to read {}: {source}", path.display()))
+        })?;
+        let value = serde_json::from_str::<Value>(&content).map_err(|source| {
+            ApiError::bad_request(format!("failed to parse {}: {source}", path.display()))
+        })?;
+        let Some(imported) = hook_config_from_claude_settings(&value).map_err(|message| {
+            ApiError::bad_request(format!("failed to import {}: {message}", path.display()))
+        })?
+        else {
+            continue;
+        };
+
+        imported_files.push(display_path(&path));
+        config.disable_all_hooks = imported.disable_all_hooks;
+        merge_hook_event_maps(&mut config.hooks, imported.hooks);
+    }
+
+    for event in config.hooks.keys() {
+        if UNSUPPORTED_HOOK_EVENTS.contains(&event.as_str()) {
+            validation_errors.push(format!(
+                "{event} is a Claude Code hook event that Foco does not support yet"
+            ));
+        } else if !SUPPORTED_HOOK_EVENTS.contains(&event.as_str()) {
+            validation_errors.push(format!("{event} is not a supported Foco hook event"));
+        }
+    }
+
+    Ok((config, imported_files, validation_errors))
+}
+
+fn hook_config_from_claude_settings(value: &Value) -> Result<Option<HookConfig>, String> {
+    let mut config = HookConfig::default();
+    let mut found = false;
+
+    if let Some(disable_all_hooks) = value.get("disableAllHooks") {
+        config.disable_all_hooks = disable_all_hooks
+            .as_bool()
+            .ok_or_else(|| "disableAllHooks must be a boolean".to_string())?;
+        found = true;
+    }
+
+    if let Some(hooks) = value.get("hooks") {
+        config.hooks = serde_json::from_value::<HookEventMap>(hooks.clone())
+            .map_err(|source| format!("hooks do not match Foco hook shape: {source}"))?;
+        found = true;
+    }
+
+    Ok(found.then_some(config))
+}
+
+fn merge_hook_event_maps(target: &mut HookEventMap, imported: HookEventMap) {
+    for (event, mut groups) in imported {
+        target.entry(event).or_default().append(&mut groups);
+    }
+}
+
+fn default_hook_provider(
+    config: &GlobalConfig,
+) -> Option<Result<(String, String, ProviderConnectionConfig), ApiError>> {
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.enabled && model.active_provider_id.is_some())?;
+    let provider_id = model.active_provider_id.as_deref()?;
+    let provider = match config.providers.iter().find(|provider| {
+        provider.id == provider_id
+            && provider.enabled
+            && model.provider_ids.iter().any(|id| id == provider_id)
+    }) {
+        Some(provider) => provider,
+        None => return None,
+    };
+
+    Some(
+        provider_connection_config(provider)
+            .map(|provider_config| (model.id.clone(), provider.id.clone(), provider_config)),
+    )
 }
 
 fn configured_workspace_summary(workspace: &WorkspaceConfig) -> ConfiguredWorkspaceSummary {
@@ -7867,6 +9570,7 @@ mod tests {
             &current,
             &ManualGeneralSettingsRequest {
                 clear_password: None,
+                hook_audit_enabled: None,
                 language: "en".to_string(),
                 listen_host: "0.0.0.0".to_string(),
                 listen_port: 3211,
@@ -7880,6 +9584,7 @@ mod tests {
             &current,
             &ManualGeneralSettingsRequest {
                 clear_password: None,
+                hook_audit_enabled: None,
                 language: "en".to_string(),
                 listen_host: "127.0.0.1".to_string(),
                 listen_port: 3210,
@@ -7899,6 +9604,7 @@ mod tests {
             &current,
             &ManualGeneralSettingsRequest {
                 clear_password: Some(true),
+                hook_audit_enabled: None,
                 language: "en".to_string(),
                 listen_host: "127.0.0.1".to_string(),
                 listen_port: 3210,
@@ -8452,6 +10158,7 @@ description: Project memory.
                 .expect("chat insert");
         }
         let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
+        let mcp_registry = Arc::new(McpRegistry::default());
         let context = PreparedChatContext {
             workspace_id: "workspace-1".to_string(),
             workspace_path: workspace_dir.clone(),
@@ -8477,7 +10184,9 @@ description: Project memory.
                 thinking_level: None,
                 max_output_tokens: Some(16),
             },
-            mcp_registry: Arc::new(McpRegistry::default()),
+            hook_runtime: HookRuntime::new(mcp_registry.clone()),
+            global_hooks: HookConfig::default(),
+            mcp_registry,
             question_registry: QuestionRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
@@ -8492,6 +10201,8 @@ description: Project memory.
             compression_snapshots: Vec::new(),
             message_source_sequences: vec![Some(0)],
             active_tool_start_index: 1,
+            hook_context_messages: Vec::new(),
+            hook_notifications: Vec::new(),
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -9260,6 +10971,7 @@ description: Project memory.
             terminal_registry: terminal::TerminalRegistry::default(),
             terminal_shutdown_tx,
             app_shutdown_rx,
+            hook_runtime: HookRuntime::new(mcp_registry.clone()),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
             _code_graph_watchers: Arc::new(Vec::new()),

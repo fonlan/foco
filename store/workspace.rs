@@ -13,7 +13,7 @@ use crate::config::WorkspaceConfig;
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 5;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 6;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -35,6 +35,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 5,
         sql: MIGRATION_005,
+    },
+    Migration {
+        version: 6,
+        sql: MIGRATION_006,
     },
 ];
 
@@ -1636,6 +1640,128 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    pub fn insert_hook_run(
+        &mut self,
+        hook_run: NewHookRun<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let input_json = redact_audit_json(hook_run.input_json, "hook_runs.input_json")?;
+        let output_json =
+            redact_optional_audit_json(hook_run.output_json, "hook_runs.output_json")?;
+
+        self.connection
+            .execute(
+                "INSERT INTO hook_runs
+                    (
+                        id, workspace_id, chat_id, run_id, tool_call_id,
+                        event, hook_source, handler_type, input_json, output_json,
+                        status, exit_code, stdout_preview, stderr_preview,
+                        started_at, completed_at
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    hook_run.id,
+                    hook_run.workspace_id,
+                    hook_run.chat_id,
+                    hook_run.run_id,
+                    hook_run.tool_call_id,
+                    hook_run.event,
+                    hook_run.hook_source,
+                    hook_run.handler_type,
+                    input_json,
+                    output_json,
+                    hook_run.status,
+                    hook_run.exit_code,
+                    hook_run.stdout_preview,
+                    hook_run.stderr_preview,
+                    hook_run.started_at,
+                    hook_run.completed_at
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn hook_runs(&self, limit: i64) -> Result<Vec<HookRunRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, workspace_id, chat_id, run_id, tool_call_id,
+                        event, hook_source, handler_type, input_json, output_json,
+                        status, exit_code, stdout_preview, stderr_preview,
+                        started_at, completed_at
+                 FROM hook_runs
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT ?1",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![limit], |row| {
+                Ok(HookRunRecord {
+                    id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    chat_id: row.get(2)?,
+                    run_id: row.get(3)?,
+                    tool_call_id: row.get(4)?,
+                    event: row.get(5)?,
+                    hook_source: row.get(6)?,
+                    handler_type: row.get(7)?,
+                    input_json: row.get(8)?,
+                    output_json: row.get(9)?,
+                    status: row.get(10)?,
+                    exit_code: row.get(11)?,
+                    stdout_preview: row.get(12)?,
+                    stderr_preview: row.get(13)?,
+                    started_at: row.get(14)?,
+                    completed_at: row.get(15)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn hook_run(&self, id: &str) -> Result<Option<HookRunRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, workspace_id, chat_id, run_id, tool_call_id,
+                        event, hook_source, handler_type, input_json, output_json,
+                        status, exit_code, stdout_preview, stderr_preview,
+                        started_at, completed_at
+                 FROM hook_runs
+                 WHERE id = ?1",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let mut rows = statement
+            .query_map(params![id], |row| {
+                Ok(HookRunRecord {
+                    id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    chat_id: row.get(2)?,
+                    run_id: row.get(3)?,
+                    tool_call_id: row.get(4)?,
+                    event: row.get(5)?,
+                    hook_source: row.get(6)?,
+                    handler_type: row.get(7)?,
+                    input_json: row.get(8)?,
+                    output_json: row.get(9)?,
+                    status: row.get(10)?,
+                    exit_code: row.get(11)?,
+                    stdout_preview: row.get(12)?,
+                    stderr_preview: row.get(13)?,
+                    started_at: row.get(14)?,
+                    completed_at: row.get(15)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        match rows.next() {
+            Some(row) => Ok(Some(row.map_err(|source| self.sqlite_error(source))?)),
+            None => Ok(None),
+        }
+    }
+
     fn sqlite_error(&self, source: rusqlite::Error) -> WorkspaceDatabaseError {
         WorkspaceDatabaseError::Sqlite {
             path: self.database_path.clone(),
@@ -1887,6 +2013,46 @@ pub struct TerminalSessionRecord {
     pub updated_at: String,
     pub closed_at: Option<String>,
     pub metadata_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewHookRun<'a> {
+    pub id: &'a str,
+    pub workspace_id: &'a str,
+    pub chat_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+    pub tool_call_id: Option<&'a str>,
+    pub event: &'a str,
+    pub hook_source: &'a str,
+    pub handler_type: &'a str,
+    pub input_json: &'a str,
+    pub output_json: Option<&'a str>,
+    pub status: &'a str,
+    pub exit_code: Option<i64>,
+    pub stdout_preview: Option<&'a str>,
+    pub stderr_preview: Option<&'a str>,
+    pub started_at: &'a str,
+    pub completed_at: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HookRunRecord {
+    pub id: String,
+    pub workspace_id: String,
+    pub chat_id: Option<String>,
+    pub run_id: Option<String>,
+    pub tool_call_id: Option<String>,
+    pub event: String,
+    pub hook_source: String,
+    pub handler_type: String,
+    pub input_json: String,
+    pub output_json: Option<String>,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub stdout_preview: Option<String>,
+    pub stderr_preview: Option<String>,
+    pub started_at: String,
+    pub completed_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2941,7 +3107,10 @@ fn is_secret_audit_key(key: &str) -> bool {
         .flat_map(char::to_lowercase)
         .collect::<String>();
 
-    normalized == "authorization" || normalized.contains("apikey")
+    normalized == "authorization"
+        || normalized.contains("apikey")
+        || normalized.contains("cookie")
+        || normalized.contains("password")
 }
 
 const MIGRATION_001: &str = r#"
@@ -3203,3 +3372,86 @@ CREATE TABLE task_graphs (
 
 CREATE INDEX task_graphs_updated_at_idx ON task_graphs (updated_at);
 "#;
+
+const MIGRATION_006: &str = r#"
+CREATE TABLE hook_runs (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    workspace_id TEXT NOT NULL CHECK (length(workspace_id) > 0),
+    chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+    run_id TEXT CHECK (run_id IS NULL OR length(run_id) > 0),
+    tool_call_id TEXT REFERENCES tool_calls(id) ON DELETE SET NULL,
+    event TEXT NOT NULL CHECK (length(event) > 0),
+    hook_source TEXT NOT NULL CHECK (length(hook_source) > 0),
+    handler_type TEXT NOT NULL CHECK (length(handler_type) > 0),
+    input_json TEXT NOT NULL,
+    output_json TEXT,
+    status TEXT NOT NULL CHECK (length(status) > 0),
+    exit_code INTEGER,
+    stdout_preview TEXT,
+    stderr_preview TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT NOT NULL
+);
+
+CREATE INDEX hook_runs_workspace_started_idx ON hook_runs (workspace_id, started_at);
+CREATE INDEX hook_runs_chat_idx ON hook_runs (chat_id);
+CREATE INDEX hook_runs_run_idx ON hook_runs (run_id);
+CREATE INDEX hook_runs_event_idx ON hook_runs (event);
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_runs_redact_secret_input_and_output_json() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+        database
+            .insert_hook_run(NewHookRun {
+                id: "hook-1",
+                workspace_id: "workspace-1",
+                chat_id: None,
+                run_id: Some("run-1"),
+                tool_call_id: None,
+                event: "PreToolUse",
+                hook_source: "global",
+                handler_type: "command",
+                input_json: r#"{"headers":{"authorization":"Bearer sk-secret"},"cookie":"abc","safe":"ok"}"#,
+                output_json: Some(r#"{"password":"secret","nested":{"api_key":"sk-test"},"ok":true}"#),
+                status: "succeeded",
+                exit_code: Some(0),
+                stdout_preview: Some("safe output"),
+                stderr_preview: None,
+                started_at: "2026-06-08T10:00:00Z",
+                completed_at: "2026-06-08T10:00:01Z",
+            })
+            .expect("hook run insert");
+
+        let run = database
+            .hook_runs(10)
+            .expect("hook runs")
+            .into_iter()
+            .next()
+            .expect("inserted hook run");
+
+        assert!(run.input_json.contains("[REDACTED]"));
+        assert!(
+            run.output_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("[REDACTED]")
+        );
+        assert!(!run.input_json.contains("sk-secret"));
+        assert!(!run.input_json.contains("abc"));
+        assert!(
+            !run.output_json
+                .as_deref()
+                .unwrap_or_default()
+                .contains("sk-test")
+        );
+        assert!(run.input_json.contains("\"safe\":\"ok\""));
+    }
+}

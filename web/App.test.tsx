@@ -446,6 +446,121 @@ const contextUsage = {
   willCompressOnNextSend: false,
 };
 
+const hookSettings = {
+  supportedEvents: [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PermissionDenied",
+    "PostToolUse",
+    "Elicitation",
+    "ElicitationResult",
+  ],
+  unsupportedEvents: ["Setup"],
+  global: {
+    config: {
+      PreToolUse: [
+        {
+          hooks: [
+            {
+              command: "node global-hook.js",
+              enabled: true,
+              type: "command",
+            },
+          ],
+          matcher: "run_command",
+        },
+      ],
+      disableAllHooks: false,
+    },
+    path: "C:\\Users\\fonla\\.foco\\config.json",
+    source: "global",
+    workspaceId: null,
+  },
+  workspace: {
+    config: {
+      UserPromptSubmit: [
+        {
+          hooks: [
+            {
+              enabled: true,
+              statusMessage: "checking prompt",
+              type: "http",
+              url: "http://127.0.0.1:8787/hook",
+            },
+          ],
+        },
+      ],
+      disableAllHooks: false,
+    },
+    path: "C:\\Users\\fonla\\.foco\\workspace\\.foco\\hooks.json",
+    source: "workspace",
+    workspaceId: "workspace-1",
+  },
+  effective: [
+    {
+      asyncHook: false,
+      command: "node global-hook.js",
+      event: "PreToolUse",
+      handlerType: "command",
+      matcher: "run_command",
+      serverId: null,
+      source: "global",
+      statusMessage: null,
+      toolName: null,
+      url: null,
+    },
+    {
+      asyncHook: false,
+      command: null,
+      event: "UserPromptSubmit",
+      handlerType: "http",
+      matcher: null,
+      serverId: null,
+      source: "workspace",
+      statusMessage: "checking prompt",
+      toolName: null,
+      url: "http://127.0.0.1:8787/hook",
+    },
+  ],
+  recentRuns: [
+    {
+      chatId: "chat-1",
+      completedAt: "2026-06-08T10:00:01Z",
+      event: "PreToolUse",
+      exitCode: 0,
+      handlerType: "command",
+      hookSource: "global",
+      id: "hook-run-1",
+      runId: "run-1",
+      startedAt: "2026-06-08T10:00:00Z",
+      status: "succeeded",
+      stderrPreview: null,
+      stdoutPreview: "ok",
+      toolCallId: "tool-1",
+      workspaceId: "workspace-1",
+    },
+  ],
+};
+
+const hookRunDetail = {
+  run: {
+    ...hookSettings.recentRuns[0],
+    input: { payload: { toolInput: { command: "git status" } } },
+    output: { systemMessage: "ok" },
+  },
+};
+
+const importedHooks = {
+  config: { disableAllHooks: false },
+  importedFiles: ["C:\\Users\\fonla\\.claude\\settings.json"],
+  path: "C:\\Users\\fonla\\.foco\\config.json",
+  saved: true,
+  target: "global",
+  validationErrors: [],
+};
+
 let activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null =
   null;
 let terminalSessionCounter = 0;
@@ -595,6 +710,34 @@ describe("App verification surfaces", () => {
       expect.stringMatching(/^foco-mermaid-/),
       "flowchart TD\n  A --> B",
     );
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
+  it("shows hook blocking notifications in the active chat", async () => {
+    render(<App />);
+
+    await userEvent.type(await screen.findByPlaceholderText("Message Foco"), "danger");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        notification: {
+          event: "PreToolUse",
+          level: "error",
+          message: "Hook blocked run_command: denied",
+        },
+        type: "hookNotification",
+      });
+    });
+
+    expect(await screen.findByText("Hook blocked run_command: denied")).toBeInTheDocument();
+    expect(
+      screen.getByText("[PreToolUse] Hook blocked run_command: denied"),
+    ).toBeInTheDocument();
 
     await act(async () => {
       activeChatStreamController?.close();
@@ -818,6 +961,51 @@ describe("App verification surfaces", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByText("Global skill")).toBeInTheDocument();
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
+  });
+
+  it("shows translated hook settings and imports Claude hooks by target scope", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Hooks" }));
+
+    expect(await screen.findByText("Hook settings")).toBeInTheDocument();
+    expect(screen.getAllByText("Pre tool use").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("User prompt submit").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Command").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("HTTP").length).toBeGreaterThan(0);
+    expect(screen.getByText("Record hook run logs")).toBeInTheDocument();
+    expect(
+      screen.getByText("Global import reads user Claude settings; workspace import reads the selected workspace."),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Import to global hooks" }));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/hooks/import-claude",
+        expect.objectContaining({
+          body: JSON.stringify({ target: "global", workspaceId: null }),
+          method: "POST",
+        }),
+      );
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Import to workspace hooks" }));
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/hooks/import-claude",
+        expect.objectContaining({
+          body: JSON.stringify({ target: "workspace", workspaceId: "workspace-1" }),
+          method: "POST",
+        }),
+      );
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: /Pre tool use/ }));
+    const dialog = await screen.findByRole("dialog", { name: "Hook run detail" });
+    expect(dialog).toBeInTheDocument();
+    expect(within(dialog).getByText("succeeded")).toBeInTheDocument();
   });
 
   it("logs in before loading the browser UI when authentication is enabled", async () => {
@@ -1141,6 +1329,24 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
     return jsonResponse(savedSettings.general);
   }
 
+  if (path === "/api/hooks") {
+    return jsonResponse(hookSettings);
+  }
+
+  if (path === "/api/hooks/import-claude") {
+    return jsonResponse(importedHooks);
+  }
+
+  if (path === "/api/hooks/test") {
+    return jsonResponse({
+      additionalContext: [],
+      decisions: [],
+      errors: [],
+      hookSpecificOutputs: [],
+      systemMessages: [],
+    });
+  }
+
   if (path === "/api/workspaces/manual" || path === "/api/workspaces/order") {
     return jsonResponse(savedSettings.workspace);
   }
@@ -1193,6 +1399,14 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
 
   if (path === "/api/workspaces/workspace-1/context-usage") {
     return jsonResponse(contextUsage);
+  }
+
+  if (path === "/api/workspaces/workspace-1/hooks/runs") {
+    return jsonResponse({ runs: hookSettings.recentRuns });
+  }
+
+  if (path === "/api/workspaces/workspace-1/hooks/runs/hook-run-1") {
+    return jsonResponse(hookRunDetail);
   }
 
   if (path === "/api/workspaces/workspace-1/terminal/session") {

@@ -8,6 +8,7 @@ use std::{
 use foco_mcp::{McpServerDefinition, McpTransportKind, validate_server_definitions};
 use foco_providers::{normalized_base_url, parse_provider_kind};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_WORKSPACE_ID: &str = "default";
@@ -20,6 +21,45 @@ pub const DEFAULT_APP_LANGUAGE: &str = "en";
 pub const SUPPORTED_APP_LANGUAGES: &[&str] = &["zh-CN", "en"];
 pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
+pub const WORKSPACE_HOOK_CONFIG_FILE: &str = "hooks.json";
+pub const SUPPORTED_HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PermissionDenied",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PostToolBatch",
+    "Stop",
+    "StopFailure",
+    "PreCompact",
+    "PostCompact",
+    "Elicitation",
+    "ElicitationResult",
+];
+pub const UNSUPPORTED_HOOK_EVENTS: &[&str] = &[
+    "Setup",
+    "UserPromptExpansion",
+    "MessageDisplay",
+    "Notification",
+    "SubagentStart",
+    "SubagentStop",
+    "TaskCreated",
+    "TaskCompleted",
+    "TeammateIdle",
+    "InstructionsLoaded",
+    "ConfigChange",
+    "CwdChanged",
+    "FileChanged",
+    "WorktreeCreate",
+    "WorktreeRemove",
+];
+pub const HOOK_HANDLER_COMMAND: &str = "command";
+pub const HOOK_HANDLER_HTTP: &str = "http";
+pub const HOOK_HANDLER_MCP_TOOL: &str = "mcp_tool";
+pub const HOOK_HANDLER_PROMPT: &str = "prompt";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FocoPaths {
@@ -111,6 +151,65 @@ pub fn load_global_config(path: impl AsRef<Path>) -> Result<GlobalConfig, Config
     Ok(config)
 }
 
+pub fn workspace_hook_config_path(workspace_path: impl AsRef<Path>) -> PathBuf {
+    workspace_path
+        .as_ref()
+        .join(".foco")
+        .join(WORKSPACE_HOOK_CONFIG_FILE)
+}
+
+pub fn load_workspace_hook_config(
+    workspace_path: impl AsRef<Path>,
+) -> Result<HookConfig, ConfigError> {
+    let path = workspace_hook_config_path(workspace_path);
+
+    if !path.exists() {
+        return Ok(HookConfig::default());
+    }
+
+    let content = fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let config: HookConfig =
+        serde_json::from_str(&content).map_err(|source| ConfigError::Json {
+            path: path.clone(),
+            source,
+        })?;
+    validate_hook_config(Some(&path), "hooks", &config)?;
+
+    Ok(config)
+}
+
+pub fn save_workspace_hook_config(
+    workspace_path: impl AsRef<Path>,
+    config: &HookConfig,
+) -> Result<(), ConfigError> {
+    let path = workspace_hook_config_path(workspace_path);
+    let parent = path.parent().ok_or_else(|| ConfigError::Validation {
+        path: Some(path.clone()),
+        message: "workspace hook config path has no parent directory".to_string(),
+    })?;
+    create_directory(parent)?;
+    validate_hook_config(Some(&path), "hooks", config)?;
+    let content = serde_json::to_string_pretty(config).map_err(|source| ConfigError::Json {
+        path: path.clone(),
+        source,
+    })?;
+    let temp_file = path.with_extension("json.tmp");
+
+    fs::write(&temp_file, content).map_err(|source| ConfigError::Io {
+        path: temp_file.clone(),
+        source,
+    })?;
+    fs::rename(&temp_file, &path).map_err(|source| ConfigError::Io {
+        path: path.clone(),
+        source,
+    })?;
+
+    Ok(())
+}
+
 pub fn save_global_config(
     path: impl AsRef<Path>,
     config: &GlobalConfig,
@@ -149,6 +248,8 @@ pub fn save_global_config(
 pub struct GlobalConfig {
     pub schema_version: u32,
     pub app: AppSettings,
+    #[serde(default)]
+    pub hooks: HookConfig,
     pub providers: Vec<ProviderSettings>,
     pub models: Vec<ModelSettings>,
     pub mcp: McpConfig,
@@ -165,6 +266,7 @@ impl GlobalConfig {
                 language: DEFAULT_APP_LANGUAGE.to_string(),
                 web_server: WebServerSettings::default(),
             },
+            hooks: HookConfig::default(),
             providers: Vec::new(),
             models: Vec::new(),
             mcp: McpConfig {
@@ -204,6 +306,7 @@ impl GlobalConfig {
         )?;
         validate_app_language(config_path, &self.app.language)?;
         validate_web_server_settings(config_path, &self.app.web_server)?;
+        validate_hook_config(config_path, "hooks", &self.hooks)?;
         require_non_empty_list(config_path, "workspaces", self.workspaces.len())?;
 
         let mut workspace_ids = HashSet::new();
@@ -478,6 +581,89 @@ pub struct WebServerSettings {
     pub listen_port: u16,
     #[serde(default)]
     pub password_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookConfig {
+    #[serde(default)]
+    pub disable_all_hooks: bool,
+    #[serde(default)]
+    pub audit_enabled: bool,
+    #[serde(default)]
+    #[serde(flatten)]
+    pub hooks: HookEventMap,
+}
+
+pub type HookEventMap = std::collections::BTreeMap<String, Vec<HookMatcherGroup>>;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HookMatcherGroup {
+    #[serde(default = "default_true")]
+    #[serde(skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    #[serde(default)]
+    pub hooks: Vec<HookHandler>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HookHandler {
+    #[serde(default = "default_true")]
+    #[serde(skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(rename = "type")]
+    pub handler_type: String,
+    #[serde(default)]
+    #[serde(rename = "if", alias = "ifFilter")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub if_filter: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    #[serde(default)]
+    #[serde(rename = "async", alias = "asyncHook")]
+    pub async_hook: bool,
+    #[serde(default)]
+    pub async_rewake: bool,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<Value>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl Default for WebServerSettings {
@@ -827,6 +1013,188 @@ fn validate_password_hash(
     }
 
     Ok(())
+}
+
+fn validate_hook_config(
+    config_path: Option<&Path>,
+    field: &str,
+    config: &HookConfig,
+) -> Result<(), ConfigError> {
+    for (event, groups) in &config.hooks {
+        if UNSUPPORTED_HOOK_EVENTS.contains(&event.as_str()) {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.{event} is a Claude Code hook event that Foco does not support yet"
+                ),
+            );
+        }
+
+        if !SUPPORTED_HOOK_EVENTS.contains(&event.as_str()) {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.{event} is unsupported; expected one of {}",
+                    SUPPORTED_HOOK_EVENTS.join(", ")
+                ),
+            );
+        }
+
+        for (group_index, group) in groups.iter().enumerate() {
+            if group.hooks.is_empty() {
+                return invalid_config(
+                    config_path,
+                    format!("{field}.{event}[{group_index}].hooks must not be empty"),
+                );
+            }
+
+            for (handler_index, handler) in group.hooks.iter().enumerate() {
+                validate_hook_handler(
+                    config_path,
+                    &format!("{field}.{event}[{group_index}].hooks[{handler_index}]"),
+                    event,
+                    handler,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_hook_handler(
+    config_path: Option<&Path>,
+    field: &str,
+    event: &str,
+    handler: &HookHandler,
+) -> Result<(), ConfigError> {
+    require_non_empty(config_path, &format!("{field}.type"), &handler.handler_type)?;
+
+    if handler.if_filter.is_some() && !is_tool_hook_event(event) {
+        return invalid_config(
+            config_path,
+            format!("{field}.if is only supported for tool hook events"),
+        );
+    }
+
+    if let Some(timeout) = handler.timeout
+        && timeout == 0
+    {
+        return invalid_config(
+            config_path,
+            format!("{field}.timeout must be greater than 0"),
+        );
+    }
+
+    match handler.handler_type.as_str() {
+        HOOK_HANDLER_COMMAND => {
+            require_non_empty(
+                config_path,
+                &format!("{field}.command"),
+                handler.command.as_deref().unwrap_or_default(),
+            )?;
+            require_empty_hook_field(config_path, field, "url", handler.url.as_deref())?;
+            require_empty_hook_field(config_path, field, "serverId", handler.server_id.as_deref())?;
+            require_empty_hook_field(config_path, field, "toolName", handler.tool_name.as_deref())?;
+            require_empty_hook_field(config_path, field, "prompt", handler.prompt.as_deref())?;
+        }
+        HOOK_HANDLER_HTTP => {
+            let url = handler.url.as_deref().unwrap_or_default();
+            require_non_empty(config_path, &format!("{field}.url"), url)?;
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                return invalid_config(
+                    config_path,
+                    format!("{field}.url must start with http:// or https://"),
+                );
+            }
+            require_empty_hook_field(config_path, field, "command", handler.command.as_deref())?;
+            require_empty_hook_field(config_path, field, "serverId", handler.server_id.as_deref())?;
+            require_empty_hook_field(config_path, field, "toolName", handler.tool_name.as_deref())?;
+            require_empty_hook_field(config_path, field, "prompt", handler.prompt.as_deref())?;
+            if !handler.args.is_empty() {
+                return invalid_config(
+                    config_path,
+                    format!("{field}.args is only valid for command hooks"),
+                );
+            }
+        }
+        HOOK_HANDLER_MCP_TOOL => {
+            require_non_empty(
+                config_path,
+                &format!("{field}.serverId"),
+                handler.server_id.as_deref().unwrap_or_default(),
+            )?;
+            require_non_empty(
+                config_path,
+                &format!("{field}.toolName"),
+                handler.tool_name.as_deref().unwrap_or_default(),
+            )?;
+            require_empty_hook_field(config_path, field, "command", handler.command.as_deref())?;
+            require_empty_hook_field(config_path, field, "url", handler.url.as_deref())?;
+            require_empty_hook_field(config_path, field, "prompt", handler.prompt.as_deref())?;
+            if !handler.args.is_empty() {
+                return invalid_config(
+                    config_path,
+                    format!("{field}.args is only valid for command hooks"),
+                );
+            }
+        }
+        HOOK_HANDLER_PROMPT => {
+            require_non_empty(
+                config_path,
+                &format!("{field}.prompt"),
+                handler.prompt.as_deref().unwrap_or_default(),
+            )?;
+            require_empty_hook_field(config_path, field, "command", handler.command.as_deref())?;
+            require_empty_hook_field(config_path, field, "url", handler.url.as_deref())?;
+            require_empty_hook_field(config_path, field, "serverId", handler.server_id.as_deref())?;
+            require_empty_hook_field(config_path, field, "toolName", handler.tool_name.as_deref())?;
+            if !handler.args.is_empty() {
+                return invalid_config(
+                    config_path,
+                    format!("{field}.args is only valid for command hooks"),
+                );
+            }
+        }
+        other => {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.type '{other}' is unsupported; expected command, http, mcp_tool, or prompt"
+                ),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn require_empty_hook_field(
+    config_path: Option<&Path>,
+    field: &str,
+    name: &str,
+    value: Option<&str>,
+) -> Result<(), ConfigError> {
+    if value.map(|value| !value.trim().is_empty()).unwrap_or(false) {
+        return invalid_config(
+            config_path,
+            format!("{field}.{name} is not valid for this hook handler type"),
+        );
+    }
+
+    Ok(())
+}
+
+fn is_tool_hook_event(event: &str) -> bool {
+    matches!(
+        event,
+        "PreToolUse"
+            | "PermissionRequest"
+            | "PermissionDenied"
+            | "PostToolUse"
+            | "PostToolUseFailure"
+            | "PostToolBatch"
+    )
 }
 
 fn validate_app_language(config_path: Option<&Path>, language: &str) -> Result<(), ConfigError> {
@@ -1257,6 +1625,69 @@ mod tests {
 
         assert!(!log_json.contains("00112233445566778899aabbccddeeff"));
         assert!(log_json.contains(REDACTED_SECRET));
+    }
+
+    #[test]
+    fn hook_config_rejects_unsupported_events_and_non_tool_if_filters() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+        loaded.config.hooks.hooks.insert(
+            "Setup".to_string(),
+            vec![HookMatcherGroup {
+                enabled: true,
+                matcher: None,
+                hooks: vec![HookHandler {
+                    enabled: true,
+                    handler_type: HOOK_HANDLER_COMMAND.to_string(),
+                    if_filter: None,
+                    command: Some("echo ok".to_string()),
+                    args: Vec::new(),
+                    shell: None,
+                    url: None,
+                    server_id: None,
+                    tool_name: None,
+                    prompt: None,
+                    timeout: None,
+                    async_hook: false,
+                    async_rewake: false,
+                    status_message: None,
+                    input: None,
+                }],
+            }],
+        );
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("unsupported hook event should fail");
+        assert!(error.to_string().contains("does not support yet"));
+
+        loaded.config.hooks.hooks.clear();
+        loaded.config.hooks.hooks.insert(
+            "SessionStart".to_string(),
+            vec![HookMatcherGroup {
+                enabled: true,
+                matcher: None,
+                hooks: vec![HookHandler {
+                    enabled: true,
+                    handler_type: HOOK_HANDLER_COMMAND.to_string(),
+                    if_filter: Some("run_command(git *)".to_string()),
+                    command: Some("echo ok".to_string()),
+                    args: Vec::new(),
+                    shell: None,
+                    url: None,
+                    server_id: None,
+                    tool_name: None,
+                    prompt: None,
+                    timeout: None,
+                    async_hook: false,
+                    async_rewake: false,
+                    status_message: None,
+                    input: None,
+                }],
+            }],
+        );
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("non-tool if filter should fail");
+        assert!(error.to_string().contains("if is only supported"));
     }
 
     #[test]
