@@ -127,6 +127,15 @@ const settings = {
   ],
   providers: [
     {
+      apiProxy: {
+        enabled: false,
+        proxyType: "http",
+        supportedTypes: [
+          { label: "HTTP", proxyType: "http" },
+          { label: "SOCKS", proxyType: "socks" },
+        ],
+        url: "",
+      },
       baseUrl: "https://api.openai.com/v1",
       enabled: true,
       hasApiKey: true,
@@ -245,6 +254,15 @@ const savedSettings = {
     providers: [
       ...settings.providers,
       {
+        apiProxy: {
+          enabled: true,
+          proxyType: "socks",
+          supportedTypes: [
+            { label: "HTTP", proxyType: "http" },
+            { label: "SOCKS", proxyType: "socks" },
+          ],
+          url: "socks5h://127.0.0.1:7891",
+        },
         baseUrl: null,
         enabled: true,
         hasApiKey: false,
@@ -1059,7 +1077,6 @@ describe("App verification surfaces", () => {
         }),
       );
     });
-
     await waitFor(() => {
       expect(passwordInput).toHaveValue("********");
     });
@@ -1082,6 +1099,9 @@ describe("App verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Providers" }));
     await userEvent.click(screen.getByRole("button", { name: "Add provider" }));
     await userEvent.type(screen.getByLabelText("Name"), "Test Provider");
+    await userEvent.click(screen.getByRole("checkbox", { name: "Enable AI API proxy" }));
+    await userEvent.selectOptions(screen.getByLabelText("Proxy type"), "socks");
+    await userEvent.type(screen.getByLabelText("Proxy server"), "127.0.0.1:7891");
     await userEvent.click(screen.getByRole("button", { name: "Save provider" }));
 
     await waitFor(() => {
@@ -1093,6 +1113,15 @@ describe("App verification surfaces", () => {
         }),
       );
     });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/providers/manual",
+      expect.objectContaining({
+        body: expect.stringContaining(
+          '"apiProxy":{"enabled":true,"proxyType":"socks","url":"127.0.0.1:7891"}',
+        ),
+        method: "POST",
+      }),
+    );
 
     await userEvent.click(screen.getByRole("button", { name: "Models" }));
     await userEvent.click(screen.getByRole("button", { name: "Add model" }));

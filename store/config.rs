@@ -6,7 +6,10 @@ use std::{
 };
 
 use foco_mcp::{McpServerDefinition, McpTransportKind, validate_server_definitions};
-use foco_providers::{normalized_base_url, parse_provider_kind};
+use foco_providers::{
+    HTTP_PROXY_KIND, SOCKS_PROXY_KIND, normalized_base_url, normalized_proxy_url,
+    parse_provider_kind,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -21,6 +24,7 @@ pub const DEFAULT_APP_LANGUAGE: &str = "en";
 pub const SUPPORTED_APP_LANGUAGES: &[&str] = &["zh-CN", "en"];
 pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
+pub const SUPPORTED_API_PROXY_TYPES: &[&str] = &[HTTP_PROXY_KIND, SOCKS_PROXY_KIND];
 pub const WORKSPACE_HOOK_CONFIG_FILE: &str = "hooks.json";
 pub const SUPPORTED_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
@@ -368,6 +372,7 @@ impl GlobalConfig {
                     message: source.to_string(),
                 })?;
             }
+            validate_api_proxy_settings(config_path, "provider.api_proxy", &provider.api_proxy)?;
         }
 
         validate_unique_named_items(
@@ -576,6 +581,31 @@ fn default_app_language() -> String {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct ApiProxySettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_api_proxy_type")]
+    pub proxy_type: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+impl Default for ApiProxySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy_type: default_api_proxy_type(),
+            url: String::new(),
+        }
+    }
+}
+
+fn default_api_proxy_type() -> String {
+    HTTP_PROXY_KIND.to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebServerSettings {
     pub listen_host: String,
     pub listen_port: u16,
@@ -685,6 +715,8 @@ pub struct ProviderSettings {
     pub enabled: bool,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_proxy: ApiProxySettings,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -945,6 +977,41 @@ fn require_non_empty(
 ) -> Result<(), ConfigError> {
     if value.trim().is_empty() {
         return invalid_config(config_path, format!("{field} must not be empty"));
+    }
+
+    Ok(())
+}
+
+fn validate_api_proxy_settings(
+    config_path: Option<&Path>,
+    field: &str,
+    settings: &ApiProxySettings,
+) -> Result<(), ConfigError> {
+    let proxy_type = settings.proxy_type.trim();
+
+    if !SUPPORTED_API_PROXY_TYPES.contains(&proxy_type) {
+        return invalid_config(
+            config_path,
+            format!(
+                "{field}.proxy_type '{proxy_type}' is unsupported; expected one of {}",
+                SUPPORTED_API_PROXY_TYPES.join(", ")
+            ),
+        );
+    }
+
+    let proxy_url = settings.url.trim();
+    if settings.enabled && proxy_url.is_empty() {
+        return invalid_config(
+            config_path,
+            format!("{field}.url must not be empty when enabled"),
+        );
+    }
+
+    if settings.enabled || !proxy_url.is_empty() {
+        normalized_proxy_url(proxy_type, proxy_url).map_err(|source| ConfigError::Validation {
+            path: config_path.map(Path::to_path_buf),
+            message: source.to_string(),
+        })?;
     }
 
     Ok(())
@@ -1534,6 +1601,49 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_invalid_api_proxy_settings() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.providers.push(ProviderSettings {
+            id: "openai".to_string(),
+            name: "OpenAI".to_string(),
+            kind: "openai-chat".to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings {
+                enabled: true,
+                proxy_type: HTTP_PROXY_KIND.to_string(),
+                url: String::new(),
+            },
+        });
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("enabled proxy without URL should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("provider.api_proxy.url must not be empty")
+        );
+
+        config.providers[0].api_proxy.url = "127.0.0.1:7890".to_string();
+        config.providers[0].api_proxy.proxy_type = "ftp".to_string();
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("unsupported proxy type should fail");
+        assert!(error.to_string().contains("provider.api_proxy.proxy_type"));
+
+        config.providers[0].api_proxy.proxy_type = SOCKS_PROXY_KIND.to_string();
+        config.providers[0].api_proxy.url = "http://127.0.0.1:7890".to_string();
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("proxy URL type mismatch should fail");
+        assert!(error.to_string().contains("does not match proxy type"));
+    }
+
+    #[test]
     fn load_rejects_unsupported_app_language() {
         let profile = tempfile::tempdir().expect("temp profile");
         let paths = FocoPaths::from_user_profile(profile.path());
@@ -1605,6 +1715,7 @@ mod tests {
             enabled: true,
             base_url: None,
             api_key: Some("sk-test-secret".to_string()),
+            api_proxy: ApiProxySettings::default(),
         });
 
         let log_json = config.to_redacted_log_json().expect("redacted json");

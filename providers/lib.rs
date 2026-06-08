@@ -2,7 +2,7 @@ use std::fmt;
 
 use futures_util::StreamExt;
 use genai::{
-    Client,
+    Client, WebConfig,
     adapter::AdapterKind,
     chat::{
         ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart, MessageContent,
@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
 pub const OPENAI_RESPONSES_KIND: &str = "openai-responses";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1/";
+pub const HTTP_PROXY_KIND: &str = "http";
+pub const SOCKS_PROXY_KIND: &str = "socks";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderKind {
@@ -44,6 +46,7 @@ pub struct ProviderConnectionConfig {
     pub kind: ProviderKind,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    pub proxy_url: Option<String>,
 }
 
 impl ProviderConnectionConfig {
@@ -52,15 +55,33 @@ impl ProviderConnectionConfig {
         let auth = self.auth_data()?;
         let resolver_endpoint = endpoint.clone();
         let resolver_auth = auth.clone();
-
-        Ok(Client::builder()
+        let mut builder = Client::builder()
             .with_adapter_kind(self.kind.adapter_kind())
             .with_service_target_resolver_fn(move |mut target: genai::ServiceTarget| {
                 target.endpoint = resolver_endpoint.clone();
                 target.auth = resolver_auth.clone();
                 Ok(target)
-            })
-            .build())
+            });
+
+        if let Some(proxy_url) = self.proxy_url.as_deref() {
+            let proxy = self.reqwest_proxy(proxy_url)?;
+            builder = builder.with_web_config(WebConfig::default().with_proxy(proxy));
+        }
+
+        Ok(builder.build())
+    }
+
+    fn reqwest_client(&self) -> Result<reqwest::Client, ProviderConfigError> {
+        let mut builder = reqwest::Client::builder();
+
+        if let Some(proxy_url) = self.proxy_url.as_deref() {
+            let proxy = self.reqwest_proxy(proxy_url)?;
+            builder = builder.proxy(proxy);
+        }
+
+        builder
+            .build()
+            .map_err(|source| ProviderConfigError::InvalidRequest(source.to_string()))
     }
 
     pub fn genai_provider_config(&self) -> Result<ProviderConfig, ProviderConfigError> {
@@ -84,17 +105,55 @@ impl ProviderConnectionConfig {
 
         Ok(AuthData::from_single(api_key.to_string()))
     }
+
+    fn api_key(&self) -> Result<&str, ProviderConfigError> {
+        self.api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(ProviderConfigError::MissingApiKey)
+    }
+
+    fn reqwest_proxy(&self, proxy_url: &str) -> Result<reqwest::Proxy, ProviderConfigError> {
+        reqwest::Proxy::all(proxy_url).map_err(|source| ProviderConfigError::InvalidProxyUrl {
+            value: proxy_url.to_string(),
+            source: source.to_string(),
+        })
+    }
 }
 
 pub async fn test_provider_connection(
     config: &ProviderConnectionConfig,
 ) -> Result<usize, ProviderConfigError> {
-    let client = config.genai_client()?;
-    let provider_config = config.genai_provider_config()?;
-    let models = client
-        .all_model_names(config.kind.adapter_kind(), provider_config)
+    let url = format!("{}models", config.endpoint_url()?);
+    let response = config
+        .reqwest_client()?
+        .get(url)
+        .bearer_auth(config.api_key()?)
+        .send()
         .await
-        .map_err(ProviderConfigError::from_genai_error)?;
+        .map_err(ProviderConfigError::from_reqwest_error)?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|source| format!("failed to read error response body: {source}"));
+        return Err(ProviderConfigError::Connection {
+            message: format!("provider model list failed with status {status}: {body}"),
+            status_code: Some(status.as_u16()),
+        });
+    }
+
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(ProviderConfigError::from_reqwest_error)?;
+    let models = body
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| ProviderConfigError::MissingRequiredField("models.data".to_string()))?;
 
     Ok(models.len())
 }
@@ -236,6 +295,61 @@ pub fn parse_provider_kind(value: &str) -> Result<ProviderKind, ProviderConfigEr
         OPENAI_RESPONSES_KIND => Ok(ProviderKind::OpenAiResponses),
         other => Err(ProviderConfigError::UnsupportedKind(other.to_string())),
     }
+}
+
+pub fn normalized_proxy_url(proxy_type: &str, value: &str) -> Result<String, ProviderConfigError> {
+    let proxy_type = proxy_type.trim();
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        return Err(ProviderConfigError::EmptyProxyUrl);
+    }
+
+    let normalized = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        match proxy_type {
+            HTTP_PROXY_KIND => format!("http://{trimmed}"),
+            SOCKS_PROXY_KIND => format!("socks5h://{trimmed}"),
+            other => return Err(ProviderConfigError::UnsupportedProxyKind(other.to_string())),
+        }
+    };
+    let url = reqwest::Url::parse(&normalized).map_err(|source| {
+        ProviderConfigError::InvalidProxyUrl {
+            value: normalized.clone(),
+            source: source.to_string(),
+        }
+    })?;
+    let scheme = url.scheme();
+    let scheme_matches = match proxy_type {
+        HTTP_PROXY_KIND => scheme == "http",
+        SOCKS_PROXY_KIND => {
+            scheme == "socks4" || scheme == "socks4a" || scheme == "socks5" || scheme == "socks5h"
+        }
+        other => return Err(ProviderConfigError::UnsupportedProxyKind(other.to_string())),
+    };
+
+    if !scheme_matches {
+        return Err(ProviderConfigError::InvalidProxyUrl {
+            value: normalized,
+            source: format!("scheme '{scheme}' does not match proxy type '{proxy_type}'"),
+        });
+    }
+
+    if url.host_str().is_none() {
+        return Err(ProviderConfigError::InvalidProxyUrl {
+            value: url.to_string(),
+            source: "host is required".to_string(),
+        });
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ProviderConfigError::InvalidProxyUrl {
+            value: url.to_string(),
+            source: "proxy credentials in URL are not supported".to_string(),
+        });
+    }
+
+    Ok(url.to_string())
 }
 
 pub fn normalized_base_url(value: &str) -> Result<String, ProviderConfigError> {
@@ -543,7 +657,12 @@ pub enum ProviderConfigError {
         status_code: Option<u16>,
     },
     EmptyBaseUrl,
+    EmptyProxyUrl,
     InvalidBaseUrl {
+        value: String,
+        source: String,
+    },
+    InvalidProxyUrl {
         value: String,
         source: String,
     },
@@ -551,6 +670,7 @@ pub enum ProviderConfigError {
     MissingRequiredField(String),
     MissingApiKey,
     UnsupportedKind(String),
+    UnsupportedProxyKind(String),
 }
 
 impl ProviderConfigError {
@@ -558,11 +678,14 @@ impl ProviderConfigError {
         match self {
             Self::Connection { status_code, .. } => *status_code,
             Self::EmptyBaseUrl
+            | Self::EmptyProxyUrl
             | Self::InvalidBaseUrl { .. }
+            | Self::InvalidProxyUrl { .. }
             | Self::InvalidRequest(_)
             | Self::MissingRequiredField(_)
             | Self::MissingApiKey
-            | Self::UnsupportedKind(_) => None,
+            | Self::UnsupportedKind(_)
+            | Self::UnsupportedProxyKind(_) => None,
         }
     }
 
@@ -574,6 +697,13 @@ impl ProviderConfigError {
             status_code,
         }
     }
+
+    fn from_reqwest_error(source: reqwest::Error) -> Self {
+        Self::Connection {
+            status_code: source.status().map(|status| status.as_u16()),
+            message: source.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for ProviderConfigError {
@@ -583,11 +713,15 @@ impl fmt::Display for ProviderConfigError {
                 write!(formatter, "provider connection failed: {message}")
             }
             Self::EmptyBaseUrl => write!(formatter, "provider base URL must not be empty"),
+            Self::EmptyProxyUrl => write!(formatter, "AI API proxy URL must not be empty"),
             Self::InvalidBaseUrl { value, source } => {
                 write!(
                     formatter,
                     "provider base URL '{value}' is invalid: {source}"
                 )
+            }
+            Self::InvalidProxyUrl { value, source } => {
+                write!(formatter, "AI API proxy URL '{value}' is invalid: {source}")
             }
             Self::InvalidRequest(message) => {
                 write!(formatter, "invalid provider request: {message}")
@@ -600,6 +734,10 @@ impl fmt::Display for ProviderConfigError {
             Self::UnsupportedKind(kind) => write!(
                 formatter,
                 "unsupported provider kind '{kind}'; expected '{OPENAI_CHAT_KIND}' or '{OPENAI_RESPONSES_KIND}'"
+            ),
+            Self::UnsupportedProxyKind(kind) => write!(
+                formatter,
+                "unsupported AI API proxy type '{kind}'; expected '{HTTP_PROXY_KIND}' or '{SOCKS_PROXY_KIND}'"
             ),
         }
     }
@@ -681,6 +819,35 @@ mod tests {
             normalized_base_url("https://api.openai.com/v1").expect("base url"),
             DEFAULT_OPENAI_BASE_URL
         );
+    }
+
+    #[test]
+    fn normalizes_proxy_urls_for_supported_types() {
+        assert_eq!(
+            normalized_proxy_url(HTTP_PROXY_KIND, "127.0.0.1:7890").expect("http proxy"),
+            "http://127.0.0.1:7890/"
+        );
+        assert_eq!(
+            normalized_proxy_url(SOCKS_PROXY_KIND, "127.0.0.1:7891").expect("socks proxy"),
+            "socks5h://127.0.0.1:7891"
+        );
+        assert_eq!(
+            normalized_proxy_url(SOCKS_PROXY_KIND, "socks5://127.0.0.1:7891")
+                .expect("explicit socks proxy"),
+            "socks5://127.0.0.1:7891"
+        );
+    }
+
+    #[test]
+    fn rejects_proxy_url_type_mismatches_and_credentials() {
+        let mismatch = normalized_proxy_url(HTTP_PROXY_KIND, "socks5://127.0.0.1:7891")
+            .expect_err("scheme mismatch should fail");
+        assert!(mismatch.to_string().contains("does not match proxy type"));
+
+        let credentials =
+            normalized_proxy_url(SOCKS_PROXY_KIND, "socks5://user:pass@127.0.0.1:7891")
+                .expect_err("proxy credentials should fail");
+        assert!(credentials.to_string().contains("credentials"));
     }
 
     #[test]

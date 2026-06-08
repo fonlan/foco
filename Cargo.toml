@@ -29,7 +29,7 @@ futures-util = { version = "0.3.31", features = ["sink"] }
 genai = { version = "0.6.4", default-features = true }
 getrandom = "0.3.4"
 gix = { version = "0.84.0", default-features = false, features = ["sha1", "status", "worktree-mutation"] }
-reqwest = { version = "0.12.25", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "socks"] }
 regex = "1.12.2"
 rmcp = { version = "1.7.0", default-features = false, features = ["client", "reqwest", "transport-child-process", "transport-streamable-http-client-reqwest", "which-command"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }

@@ -170,6 +170,7 @@ type ThinkingLevelSummary = {
 };
 
 type ConfiguredProviderSummary = {
+  apiProxy: ApiProxySettingsSummary;
   id: string;
   name: string;
   kind: string;
@@ -184,6 +185,18 @@ type WebServerSettingsSummary = {
   listenHost: string;
   listenPort: number;
   passwordEnabled: boolean;
+};
+
+type ApiProxyTypeSummary = {
+  proxyType: string;
+  label: string;
+};
+
+type ApiProxySettingsSummary = {
+  enabled: boolean;
+  proxyType: string;
+  supportedTypes: ApiProxyTypeSummary[];
+  url: string;
 };
 
 type AppLanguageId = "en" | "zh-CN";
@@ -229,6 +242,9 @@ type SettingsResponse = {
 
 type ProviderFormState = {
   apiKey: string;
+  apiProxyEnabled: boolean;
+  apiProxyType: string;
+  apiProxyUrl: string;
   baseUrl: string;
   clearApiKey: boolean;
   enabled: boolean;
@@ -1081,6 +1097,12 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Delete hook": "删除 Hook",
     "Enable hook group": "启用 Hook 组",
     "Failed to render.": "渲染失败。",
+    "AI API proxy": "大模型 API 代理",
+    "Proxy enabled": "代理已启用",
+    "Proxy disabled": "代理已禁用",
+    "Enable AI API proxy": "启用大模型 API 代理",
+    "Proxy type": "代理类型",
+    "Proxy server": "代理服务器",
     "Provider configuration": "供应商配置",
     "Edit provider": "编辑供应商",
     "Add provider": "添加供应商",
@@ -6738,6 +6760,11 @@ function SettingsPanel({
   );
   const editingProvider =
     providers.find((provider) => provider.id === providerForm.id) ?? null;
+  const apiProxyTypes = editingProvider?.apiProxy.supportedTypes ??
+    providers[0]?.apiProxy.supportedTypes ?? [
+      { label: "HTTP", proxyType: "http" },
+      { label: "SOCKS", proxyType: "socks" },
+    ];
   const hasSavedProviderKey = editingProvider?.hasApiKey ?? false;
   const selectedProviderIds = new Set(form.providerIds);
 
@@ -6936,6 +6963,12 @@ function SettingsPanel({
   function editConfiguredProvider(provider: ConfiguredProviderSummary) {
     setProviderForm({
       apiKey: "",
+      apiProxyEnabled: provider.apiProxy.enabled,
+      apiProxyType:
+        provider.apiProxy.proxyType ||
+        provider.apiProxy.supportedTypes[0]?.proxyType ||
+        "http",
+      apiProxyUrl: provider.apiProxy.url,
       baseUrl: provider.baseUrl ?? "",
       clearApiKey: false,
       enabled: provider.enabled,
@@ -7402,6 +7435,11 @@ function SettingsPanel({
         {
           body: JSON.stringify({
             apiKey: providerForm.apiKey || null,
+            apiProxy: {
+              enabled: providerForm.apiProxyEnabled,
+              proxyType: providerForm.apiProxyType,
+              url: providerForm.apiProxyUrl,
+            },
             baseUrl: providerForm.baseUrl || null,
             clearApiKey: providerForm.clearApiKey,
             enabled: providerForm.enabled,
@@ -9516,7 +9554,7 @@ function SettingsPanel({
           <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
           <form
             aria-label={t("Provider configuration")}
-            className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+            className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
             onSubmit={(event) => void saveProvider(event)}
           >
             <div className="mb-4 flex items-center justify-between gap-3">
@@ -9664,6 +9702,78 @@ function SettingsPanel({
                 ) : null}
                 </span>
               </label>
+              <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <PlugZap aria-hidden="true" className="size-4 text-teal-700" />
+                    <h4 className="text-sm font-semibold text-stone-950">
+                      {t("AI API proxy")}
+                    </h4>
+                  </div>
+                  <CapabilityPill
+                    label={
+                      providerForm.apiProxyEnabled
+                        ? t("Proxy enabled")
+                        : t("Proxy disabled")
+                    }
+                    ok={providerForm.apiProxyEnabled}
+                  />
+                </div>
+                <div className="mt-3 grid gap-3">
+                  <label className="inline-flex items-center gap-2 text-sm font-semibold text-stone-700">
+                    <input
+                      aria-label={t("Enable AI API proxy")}
+                      checked={providerForm.apiProxyEnabled}
+                      className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-200"
+                      onChange={(event) =>
+                        setProviderForm((current) => ({
+                          ...current,
+                          apiProxyEnabled: event.target.checked,
+                        }))
+                      }
+                      type="checkbox"
+                    />
+                    {t("Enable AI API proxy")}
+                  </label>
+                  <div className="grid gap-3 sm:grid-cols-[12rem_minmax(0,1fr)]">
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Proxy type")}
+                      </span>
+                      <select
+                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) =>
+                          setProviderForm((current) => ({
+                            ...current,
+                            apiProxyType: event.target.value,
+                          }))
+                        }
+                        value={providerForm.apiProxyType}
+                      >
+                        {apiProxyTypes.map((proxyType) => (
+                          <option
+                            key={proxyType.proxyType}
+                            value={proxyType.proxyType}
+                          >
+                            {proxyType.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <TextField
+                      label={t("Proxy server")}
+                      onChange={(value) =>
+                        setProviderForm((current) => ({
+                          ...current,
+                          apiProxyUrl: value,
+                        }))
+                      }
+                      placeholder="127.0.0.1:7890"
+                      value={providerForm.apiProxyUrl}
+                    />
+                  </div>
+                </div>
+              </div>
               <button
                 aria-label={t("Save provider")}
                 className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
@@ -11022,6 +11132,9 @@ function emptyModelForm(): ModelFormState {
 function emptyProviderForm(): ProviderFormState {
   return {
     apiKey: "",
+    apiProxyEnabled: false,
+    apiProxyType: "http",
+    apiProxyUrl: "",
     baseUrl: "",
     clearApiKey: false,
     enabled: true,

@@ -52,7 +52,10 @@ Provider settings are managed from the same settings page and persisted in
 Chat and OpenAI Responses provider configs, `POST /api/providers/test` checks
 the selected provider through `genai`, and `POST /api/models/manual` also saves
 model-provider associations, the active provider, and the model thinking level.
-Capability warnings are shown without silently changing saved choices.
+Capability warnings are shown without silently changing saved choices. Each
+provider can also save its own HTTP or SOCKS AI API proxy; provider tests, chat
+requests, and prompt hook provider calls use the active provider's proxy for
+model API endpoints.
 
 Workspace databases store LLM audit records in `llm_requests` and streamed audit
 events in `llm_request_events`. Audit inserts require request time, workspace,

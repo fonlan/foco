@@ -40,14 +40,15 @@ use foco_providers::{
     DEFAULT_OPENAI_BASE_URL, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
     OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig, normalized_base_url,
-    parse_provider_kind, stream_chat, test_provider_connection,
+    normalized_proxy_url, parse_provider_kind, stream_chat, test_provider_connection,
 };
 use foco_store::{
     config::{
-        DEFAULT_TERMINAL_SHELL, GlobalConfig, HookConfig, HookEventMap, McpServerConfig,
-        ModelLimits, ModelSettings, ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE,
-        SUPPORTED_APP_LANGUAGES, SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings,
-        UNSUPPORTED_HOOK_EVENTS, WebServerSettings, WorkspaceConfig, load_or_create_global_config,
+        ApiProxySettings, DEFAULT_TERMINAL_SHELL, GlobalConfig, HookConfig, HookEventMap,
+        McpServerConfig, ModelLimits, ModelSettings, ProviderSettings, SKILL_SCOPE_GLOBAL,
+        SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
+        SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings, UNSUPPORTED_HOOK_EVENTS,
+        WebServerSettings, WorkspaceConfig, load_or_create_global_config,
         load_workspace_hook_config, save_global_config, save_workspace_hook_config,
         workspace_hook_config_path,
     },
@@ -1134,6 +1135,43 @@ fn normalize_web_server_settings(
     })
 }
 
+fn normalize_api_proxy_settings(
+    current: &ApiProxySettings,
+    request: Option<&ManualApiProxySettingsRequest>,
+) -> Result<ApiProxySettings, ApiError> {
+    let Some(request) = request else {
+        return Ok(current.clone());
+    };
+    let proxy_type = request.proxy_type.trim();
+
+    if !SUPPORTED_API_PROXY_TYPES.contains(&proxy_type) {
+        return Err(ApiError::bad_request(format!(
+            "AI API proxy type '{proxy_type}' is unsupported; expected one of {}",
+            SUPPORTED_API_PROXY_TYPES.join(", ")
+        )));
+    }
+
+    let proxy_url = request.url.trim();
+    if request.enabled && proxy_url.is_empty() {
+        return Err(ApiError::bad_request(
+            "AI API proxy URL must not be empty when enabled",
+        ));
+    }
+
+    let normalized_url = if request.enabled || !proxy_url.is_empty() {
+        normalized_proxy_url(proxy_type, proxy_url)
+            .map_err(|source| ApiError::bad_request(source.to_string()))?
+    } else {
+        String::new()
+    };
+
+    Ok(ApiProxySettings {
+        enabled: request.enabled,
+        proxy_type: proxy_type.to_string(),
+        url: normalized_url,
+    })
+}
+
 fn normalize_app_language(language: &str) -> Result<String, ApiError> {
     let language = language.trim();
 
@@ -1500,6 +1538,10 @@ async fn save_manual_provider(
         ),
         None => None,
     };
+    let current_api_proxy = existing_provider
+        .map(|provider| provider.api_proxy.clone())
+        .unwrap_or_default();
+    let api_proxy = normalize_api_proxy_settings(&current_api_proxy, request.api_proxy.as_ref())?;
     let provider = ProviderSettings {
         id: id.to_string(),
         name: name.to_string(),
@@ -1507,6 +1549,7 @@ async fn save_manual_provider(
         enabled: request.enabled,
         base_url: normalized_base_url,
         api_key,
+        api_proxy,
     };
 
     if let Some(stored_provider) = config
@@ -2363,6 +2406,14 @@ struct ManualGeneralSettingsRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ManualApiProxySettingsRequest {
+    enabled: bool,
+    proxy_type: String,
+    url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AuthLoginRequest {
     password: String,
 }
@@ -2391,6 +2442,7 @@ struct ModelOrderRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManualProviderRequest {
+    api_proxy: Option<ManualApiProxySettingsRequest>,
     id: String,
     name: String,
     kind: String,
@@ -2603,6 +2655,22 @@ struct GeneralSettingsSummary {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ApiProxySettingsSummary {
+    enabled: bool,
+    proxy_type: String,
+    url: String,
+    supported_types: Vec<ApiProxyTypeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiProxyTypeSummary {
+    proxy_type: &'static str,
+    label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WebServerSettingsSummary {
     listen_host: String,
     listen_port: u16,
@@ -2659,6 +2727,7 @@ struct McpTransportSummary {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfiguredProviderSummary {
+    api_proxy: ApiProxySettingsSummary,
     id: String,
     name: String,
     kind: String,
@@ -7436,6 +7505,24 @@ fn terminal_shell_summaries() -> Vec<TerminalShellSummary> {
         .collect()
 }
 
+fn api_proxy_type_summaries() -> Vec<ApiProxyTypeSummary> {
+    SUPPORTED_API_PROXY_TYPES
+        .iter()
+        .map(|proxy_type| ApiProxyTypeSummary {
+            proxy_type: *proxy_type,
+            label: api_proxy_type_label(proxy_type),
+        })
+        .collect()
+}
+
+fn api_proxy_type_label(proxy_type: &str) -> &'static str {
+    match proxy_type {
+        "http" => "HTTP",
+        "socks" => "SOCKS",
+        _ => "Unknown",
+    }
+}
+
 fn terminal_shell_label(shell: &str) -> &'static str {
     match shell {
         "powershell" => "PowerShell",
@@ -7448,6 +7535,12 @@ fn terminal_shell_label(shell: &str) -> &'static str {
 
 fn configured_provider_summary(provider: &ProviderSettings) -> ConfiguredProviderSummary {
     ConfiguredProviderSummary {
+        api_proxy: ApiProxySettingsSummary {
+            enabled: provider.api_proxy.enabled,
+            proxy_type: provider.api_proxy.proxy_type.clone(),
+            url: provider.api_proxy.url.clone(),
+            supported_types: api_proxy_type_summaries(),
+        },
         id: provider.id.clone(),
         name: provider.name.clone(),
         kind: provider.kind.clone(),
@@ -8354,6 +8447,10 @@ fn provider_connection_config(
             .map_err(|source| ApiError::bad_request(source.to_string()))?,
         base_url: provider.base_url.clone(),
         api_key: provider.api_key.clone(),
+        proxy_url: provider
+            .api_proxy
+            .enabled
+            .then(|| provider.api_proxy.url.clone()),
     })
 }
 
@@ -9616,6 +9713,44 @@ mod tests {
     }
 
     #[test]
+    fn normalize_api_proxy_settings_preserves_updates_and_disables_proxy() {
+        let current = ApiProxySettings {
+            enabled: true,
+            proxy_type: "http".to_string(),
+            url: "http://127.0.0.1:7890/".to_string(),
+        };
+
+        let preserved =
+            normalize_api_proxy_settings(&current, None).expect("preserve current proxy settings");
+        assert_eq!(preserved, current);
+
+        let updated = normalize_api_proxy_settings(
+            &current,
+            Some(&ManualApiProxySettingsRequest {
+                enabled: true,
+                proxy_type: "socks".to_string(),
+                url: "127.0.0.1:7891".to_string(),
+            }),
+        )
+        .expect("normalize updated proxy");
+        assert!(updated.enabled);
+        assert_eq!(updated.proxy_type, "socks");
+        assert_eq!(updated.url, "socks5h://127.0.0.1:7891");
+
+        let disabled = normalize_api_proxy_settings(
+            &current,
+            Some(&ManualApiProxySettingsRequest {
+                enabled: false,
+                proxy_type: "http".to_string(),
+                url: "".to_string(),
+            }),
+        )
+        .expect("disable proxy");
+        assert!(!disabled.enabled);
+        assert!(disabled.url.is_empty());
+    }
+
+    #[test]
     fn parse_skill_markdown_requires_description() {
         let error = parse_skill_markdown(
             Path::new("SKILL.md"),
@@ -10173,6 +10308,7 @@ description: Project memory.
                 kind: foco_providers::ProviderKind::OpenAiResponses,
                 base_url: None,
                 api_key: Some("test-key".to_string()),
+                proxy_url: None,
             },
             provider_request: NeutralChatRequest {
                 model_id: "gpt-5.4".to_string(),
@@ -10502,6 +10638,7 @@ Search memory before repo work.
             enabled: true,
             base_url: None,
             api_key: None,
+            api_proxy: ApiProxySettings::default(),
         });
         config.models.push(ModelSettings {
             id: "model".to_string(),
@@ -10675,6 +10812,7 @@ Use the existing product UI conventions.
             enabled: true,
             base_url: None,
             api_key: None,
+            api_proxy: ApiProxySettings::default(),
         });
         config.models.push(ModelSettings {
             id: "model".to_string(),
@@ -10750,6 +10888,7 @@ Use the existing product UI conventions.
             enabled: true,
             base_url: None,
             api_key: None,
+            api_proxy: ApiProxySettings::default(),
         });
         config.models.push(ModelSettings {
             id: "model".to_string(),
