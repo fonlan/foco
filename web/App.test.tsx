@@ -684,6 +684,7 @@ describe("App verification surfaces", () => {
       "/api/workspaces/workspace-1/context-usage",
       expect.objectContaining({
         body: JSON.stringify({
+          attachments: [],
           chatId: "chat-1",
           draftMessage: "continue",
           modelId: "gpt-test",
@@ -693,6 +694,53 @@ describe("App verification surfaces", () => {
         method: "POST",
       }),
     );
+  });
+
+  it("adds native path attachments into the composer and sends them with the chat request", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await screen.findByText("Tool run");
+    await userEvent.click(screen.getByRole("button", { name: "Add attachment" }));
+    expect(await screen.findByText("note.txt")).toBeInTheDocument();
+
+    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "Review it");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-1/chat/stream",
+        ),
+      ).toBe(true);
+    });
+    const chatStreamCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    const body = JSON.parse(String(chatStreamCall?.[1]?.body));
+
+    expect(body).toEqual(
+      expect.objectContaining({
+        attachments: [
+          expect.objectContaining({
+            contentType: "text/plain",
+            name: "note.txt",
+            path: "C:/Users/fonla/Desktop/note.txt",
+            sizeBytes: 5,
+          }),
+        ],
+        message: "Review it",
+      }),
+    );
+    expect(body.attachments[0]).not.toHaveProperty("contentBase64");
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
   });
 
   it("waits for a streaming Mermaid fence to close before rendering", async () => {
@@ -1330,6 +1378,20 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
 
   if (path === "/api/native/select-directory") {
     return jsonResponse({ path: "C:/Users/fonla/Documents/Repos/NewWorkspace" });
+  }
+
+  if (path === "/api/native/select-files") {
+    return jsonResponse({
+      files: [
+        {
+          contentBase64: null,
+          contentType: "text/plain",
+          name: "note.txt",
+          path: "C:/Users/fonla/Desktop/note.txt",
+          sizeBytes: 5,
+        },
+      ],
+    });
   }
 
   if (path === "/api/workspaces/add") {

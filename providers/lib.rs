@@ -172,6 +172,8 @@ pub struct NeutralChatRequest {
 pub struct NeutralChatMessage {
     pub role: NeutralChatRole,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<NeutralChatAttachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -180,6 +182,19 @@ pub struct NeutralChatMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NeutralChatAttachment {
+    pub id: String,
+    pub name: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,7 +423,12 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
 
 fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderConfigError> {
     match message.role {
-        NeutralChatRole::System | NeutralChatRole::User => {
+        NeutralChatRole::System => {
+            if !message.attachments.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "system messages cannot contain attachments".to_string(),
+                ));
+            }
             if message.content.trim().is_empty() {
                 return Err(ProviderConfigError::InvalidRequest(
                     "chat message content must not be empty".to_string(),
@@ -420,13 +440,62 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
                 ));
             }
 
-            Ok(match message.role {
-                NeutralChatRole::System => ChatMessage::system(message.content.clone()),
-                NeutralChatRole::User => ChatMessage::user(message.content.clone()),
-                NeutralChatRole::Assistant | NeutralChatRole::Tool => unreachable!(),
-            })
+            Ok(ChatMessage::system(message.content.clone()))
+        }
+        NeutralChatRole::User => {
+            if message.content.trim().is_empty() && message.attachments.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "user message content must not be empty unless it contains attachments"
+                        .to_string(),
+                ));
+            }
+            if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "user messages cannot contain tool state".to_string(),
+                ));
+            }
+
+            if message.attachments.is_empty() {
+                return Ok(ChatMessage::user(message.content.clone()));
+            }
+
+            let mut parts = Vec::new();
+            if !message.content.trim().is_empty() {
+                parts.push(ContentPart::Text(message.content.clone()));
+            }
+            for attachment in &message.attachments {
+                if let Some(content_base64) = &attachment.content_base64 {
+                    parts.push(ContentPart::from_binary_base64(
+                        attachment.content_type.clone(),
+                        content_base64.clone(),
+                        Some(attachment.name.clone()),
+                    ));
+                    continue;
+                }
+
+                if attachment.path.is_none() {
+                    return Err(ProviderConfigError::InvalidRequest(format!(
+                        "attachment '{}' must have contentBase64 or path",
+                        attachment.name
+                    )));
+                }
+            }
+
+            if parts.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "user message content must not be empty unless it contains binary attachments"
+                        .to_string(),
+                ));
+            }
+
+            Ok(ChatMessage::user(MessageContent::from_parts(parts)))
         }
         NeutralChatRole::Assistant => {
+            if !message.attachments.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "assistant messages cannot contain attachments".to_string(),
+                ));
+            }
             if message.tool_calls.is_empty() {
                 if message.content.trim().is_empty() {
                     return Err(ProviderConfigError::InvalidRequest(
@@ -487,6 +556,11 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
             Ok(ChatMessage::assistant(MessageContent::from_parts(parts)))
         }
         NeutralChatRole::Tool => {
+            if !message.attachments.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "tool messages cannot contain attachments".to_string(),
+                ));
+            }
             if !message.tool_calls.is_empty() {
                 return Err(ProviderConfigError::InvalidRequest(
                     "tool messages cannot contain tool calls".to_string(),
@@ -880,6 +954,7 @@ mod tests {
                 NeutralChatMessage {
                     role: NeutralChatRole::User,
                     content: "Read the note.".to_string(),
+                    attachments: Vec::new(),
                     reasoning: None,
                     tool_calls: Vec::new(),
                     tool_call_id: None,
@@ -888,6 +963,7 @@ mod tests {
                 NeutralChatMessage {
                     role: NeutralChatRole::Assistant,
                     content: String::new(),
+                    attachments: Vec::new(),
                     reasoning: None,
                     tool_calls: vec![NeutralToolCall {
                         call_id: "call-1".to_string(),
@@ -901,6 +977,7 @@ mod tests {
                 NeutralChatMessage {
                     role: NeutralChatRole::Tool,
                     content: r#"{"content":"hello"}"#.to_string(),
+                    attachments: Vec::new(),
                     reasoning: None,
                     tool_calls: Vec::new(),
                     tool_call_id: Some("call-1".to_string()),
@@ -916,5 +993,75 @@ mod tests {
 
         assert!(chat_request.messages[1].content.contains_tool_call());
         assert!(chat_request.messages[2].content.contains_tool_response());
+    }
+
+    #[test]
+    fn converts_user_image_attachments_to_binary_parts() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-4o-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "Inspect this image.".to_string(),
+                attachments: vec![NeutralChatAttachment {
+                    id: "att-1".to_string(),
+                    name: "image.png".to_string(),
+                    content_type: "image/png".to_string(),
+                    size_bytes: 5,
+                    content_base64: Some("SGVsbG8=".to_string()),
+                    path: None,
+                }],
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+        };
+
+        let chat_request = genai_chat_request(&request).expect("chat request");
+        let parts = (&chat_request.messages[0].content)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].is_text());
+        assert!(parts[1].is_binary());
+    }
+
+    #[test]
+    fn keeps_path_attachments_as_text_only_messages() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-4o-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "# Files mentioned by the user:\n\n## note.txt: C:\\Users\\fonla\\Desktop\\note.txt\n\n## My request for Foco:\nReview it"
+                    .to_string(),
+                attachments: vec![NeutralChatAttachment {
+                    id: "att-1".to_string(),
+                    name: "note.txt".to_string(),
+                    content_type: "text/plain".to_string(),
+                    size_bytes: 5,
+                    content_base64: None,
+                    path: Some("C:\\Users\\fonla\\Desktop\\note.txt".to_string()),
+                }],
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+        };
+
+        let chat_request = genai_chat_request(&request).expect("chat request");
+        let parts = (&chat_request.messages[0].content)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].is_text());
     }
 }

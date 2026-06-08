@@ -17,7 +17,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as AxumPath, Query, Request, State, ws::WebSocketUpgrade},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State, ws::WebSocketUpgrade},
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{
@@ -26,6 +26,7 @@ use axum::{
     },
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose};
 use chrono::{Local, SecondsFormat, Utc};
 use foco_agent::{
     ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo, build_system_prompt,
@@ -37,10 +38,11 @@ use foco_mcp::{
     McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition, is_mcp_tool_name,
 };
 use foco_providers::{
-    DEFAULT_OPENAI_BASE_URL, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
-    NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
-    OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig, normalized_base_url,
-    normalized_proxy_url, parse_provider_kind, stream_chat, test_provider_connection,
+    DEFAULT_OPENAI_BASE_URL, NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest,
+    NeutralChatRole, NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
+    OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig,
+    normalized_base_url, normalized_proxy_url, parse_provider_kind, stream_chat,
+    test_provider_connection,
 };
 use foco_store::{
     config::{
@@ -102,6 +104,10 @@ const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES: usize = 16;
 const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
+const MAX_CHAT_ATTACHMENTS: usize = 6;
+const MAX_CHAT_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_CHAT_ATTACHMENT_TOTAL_BYTES: u64 = 24 * 1024 * 1024;
+const CHAT_ATTACHMENT_BODY_LIMIT_BYTES: usize = 40 * 1024 * 1024;
 const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
 const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
     "Enabled skill front matter loaded from configured skills";
@@ -520,6 +526,7 @@ fn app_router(state: AppState) -> Router {
         .route("/api/workspaces/manual", post(save_workspace_settings))
         .route("/api/workspaces/order", post(save_workspace_order))
         .route("/api/native/select-directory", post(select_directory))
+        .route("/api/native/select-files", post(select_files))
         .route("/api/settings", get(settings))
         .route("/api/settings/general", post(save_general_settings))
         .route("/api/hooks", get(hooks_settings))
@@ -547,11 +554,12 @@ fn app_router(state: AppState) -> Router {
         .route("/api/ai-statistics", get(ai_statistics))
         .route(
             "/api/workspaces/{workspace_id}/chat/stream",
-            post(stream_chat_response),
+            post(stream_chat_response)
+                .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/workspaces/{workspace_id}/context-usage",
-            post(context_usage),
+            post(context_usage).layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/chat/questions/{question_id}/answer",
@@ -1091,6 +1099,12 @@ async fn select_directory() -> Result<Json<SelectDirectoryResponse>, ApiError> {
     let path = native_select_directory()?;
 
     Ok(Json(SelectDirectoryResponse { path }))
+}
+
+async fn select_files() -> Result<Json<SelectFilesResponse>, ApiError> {
+    let files = native_select_files()?;
+
+    Ok(Json(SelectFilesResponse { files }))
 }
 
 fn normalize_web_server_settings(
@@ -2393,6 +2407,22 @@ struct SelectDirectoryResponse {
     path: Option<String>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SelectFilesResponse {
+    files: Vec<NativeSelectedFile>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeSelectedFile {
+    path: String,
+    name: String,
+    content_type: String,
+    size_bytes: u64,
+    content_base64: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManualGeneralSettingsRequest {
@@ -2532,6 +2562,8 @@ struct ChatStreamRequest {
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
     message: String,
+    #[serde(default)]
+    attachments: Vec<ChatAttachmentInput>,
 }
 
 #[derive(Deserialize)]
@@ -2542,6 +2574,30 @@ struct ContextUsageRequest {
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
     draft_message: Option<String>,
+    #[serde(default)]
+    attachments: Vec<ChatAttachmentInput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatAttachmentInput {
+    id: String,
+    name: String,
+    content_type: String,
+    content_base64: Option<String>,
+    path: Option<String>,
+    size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatAttachmentPart {
+    id: String,
+    name: String,
+    content_type: String,
+    size_bytes: u64,
+    path: Option<String>,
+    preview_data_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2561,6 +2617,7 @@ struct PromptContextRequest {
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
     message: Option<String>,
+    attachments: Vec<ChatAttachmentInput>,
 }
 
 impl ChatStreamRequest {
@@ -2571,6 +2628,7 @@ impl ChatStreamRequest {
             thinking_level: self.thinking_level,
             skill_ids: self.skill_ids,
             message: Some(self.message),
+            attachments: self.attachments,
         }
     }
 }
@@ -2583,6 +2641,7 @@ impl ContextUsageRequest {
             thinking_level: self.thinking_level,
             skill_ids: self.skill_ids,
             message: optional_trimmed_string(self.draft_message),
+            attachments: self.attachments,
         }
     }
 }
@@ -3097,6 +3156,7 @@ struct ChatToolCallSummary {
 enum ChatMessagePart {
     Text { text: String },
     Reasoning { text: String },
+    Attachment { attachment: ChatAttachmentPart },
     ToolCall { tool_call: ChatToolCallSummary },
 }
 
@@ -3209,6 +3269,7 @@ struct PreparedPromptContext {
     chat_id: Option<String>,
     raw_message: Option<String>,
     message: Option<String>,
+    attachments: Vec<NeutralChatAttachment>,
     next_message_sequence: i64,
 }
 
@@ -4078,6 +4139,7 @@ async fn prepare_prompt_context(
     let thinking_level = optional_trimmed_string(request.thinking_level);
     let requested_skill_ids = request.skill_ids;
     let raw_message = optional_trimmed_string(request.message);
+    let attachments = normalized_chat_attachments(request.attachments)?;
 
     if workspace_id.is_empty() {
         return Err(ApiError::bad_request("workspace id must not be empty"));
@@ -4157,15 +4219,17 @@ async fn prepare_prompt_context(
     let mcp_tools = state.mcp_registry.tool_definitions(&workspace.id).await;
     let database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
-    let message = match raw_message.as_deref() {
-        Some(raw_message) => Some(message_with_selected_skills(
+    let has_user_turn = raw_message.is_some() || !attachments.is_empty();
+    let message = if has_user_turn {
+        Some(message_with_selected_skills(
             &state.user_profile_dir,
             config,
             &workspace.id,
             requested_skill_ids,
-            raw_message,
-        )?),
-        None => None,
+            raw_message.as_deref().unwrap_or(""),
+        )?)
+    } else {
+        None
     };
     let chat_id = optional_trimmed_string(request.chat_id);
     let is_new_chat = chat_id.is_none();
@@ -4287,8 +4351,11 @@ async fn prepare_prompt_context(
             message_source_sequences.push(Some(sequence));
         }
     }
-    if let Some(message) = &message {
-        neutral_messages.push(neutral_text_message(NeutralChatRole::User, message.clone()));
+    if message.is_some() || !attachments.is_empty() {
+        neutral_messages.push(neutral_user_message(
+            message.clone().unwrap_or_default(),
+            attachments.clone(),
+        ));
         message_source_sequences.push(Some(user_sequence));
     }
     let active_tool_start_index = neutral_messages.len();
@@ -4314,6 +4381,7 @@ async fn prepare_prompt_context(
         active_tool_start_index,
         raw_message,
         message,
+        attachments,
         next_message_sequence: user_sequence,
     })
 }
@@ -4326,10 +4394,7 @@ async fn prepare_chat_context(
 ) -> Result<PreparedChatContext, ApiError> {
     let prompt_context =
         prepare_prompt_context(state, config, workspace_id, request.into_prompt_request()).await?;
-    let raw_message = prompt_context
-        .raw_message
-        .as_deref()
-        .ok_or_else(|| ApiError::bad_request("message must not be empty"))?;
+    let raw_message = prompt_context.raw_message.as_deref().unwrap_or("");
     let message = prompt_context
         .message
         .as_deref()
@@ -4358,6 +4423,7 @@ async fn prepare_chat_context(
             payload: json!({
                 "prompt": raw_message,
                 "message": message,
+                "attachments": chat_attachment_hook_summaries(&prompt_context.attachments),
             }),
         })
         .await;
@@ -4373,7 +4439,10 @@ async fn prepare_chat_context(
         None => {
             let chat_id = unique_id("chat");
             database
-                .insert_chat(&chat_id, &chat_title(raw_message))
+                .insert_chat(
+                    &chat_id,
+                    &chat_title_for_prompt(raw_message, &prompt_context.attachments),
+                )
                 .map_err(ApiError::from_workspace_error)?;
             (chat_id, true)
         }
@@ -4397,6 +4466,7 @@ async fn prepare_chat_context(
             payload: json!({
                 "chatCreated": chat_created,
                 "prompt": raw_message,
+                "attachments": chat_attachment_hook_summaries(&prompt_context.attachments),
             }),
         })
         .await;
@@ -4404,6 +4474,7 @@ async fn prepare_chat_context(
     hook_notifications.extend(session_start_summary.hook_messages("SessionStart"));
     let mut hook_context_messages = user_prompt_summary.additional_context;
     hook_context_messages.extend(session_start_summary.additional_context);
+    let user_metadata_json = user_message_metadata_json(&prompt_context.attachments)?;
 
     database
         .insert_message(NewMessage {
@@ -4412,7 +4483,7 @@ async fn prepare_chat_context(
             role: "user",
             content: message,
             sequence: user_sequence,
-            metadata_json: Some("{}"),
+            metadata_json: Some(&user_metadata_json),
         })
         .map_err(ApiError::from_workspace_error)?;
 
@@ -4462,9 +4533,19 @@ fn neutral_messages_from_record(
     };
 
     if role != NeutralChatRole::Assistant && role != NeutralChatRole::Tool {
+        let attachments = if role == NeutralChatRole::User {
+            message_attachments_from_metadata(&message.metadata_json)?
+        } else {
+            Vec::new()
+        };
+        if role == NeutralChatRole::User {
+            return Ok(vec![neutral_user_message(message.content, attachments)]);
+        }
+
         return Ok(vec![NeutralChatMessage {
             role,
             content: message.content,
+            attachments,
             reasoning: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
@@ -4486,6 +4567,7 @@ fn neutral_messages_from_record(
             return Ok(vec![NeutralChatMessage {
                 role,
                 content: message.content,
+                attachments: Vec::new(),
                 reasoning,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
@@ -4505,6 +4587,7 @@ fn neutral_messages_from_record(
             messages.push(NeutralChatMessage {
                 role: NeutralChatRole::Assistant,
                 content: String::new(),
+                attachments: Vec::new(),
                 reasoning: None,
                 tool_calls: vec![neutral_tool_call_from_record(&tool_call)?],
                 tool_call_id: None,
@@ -4513,6 +4596,7 @@ fn neutral_messages_from_record(
             messages.push(NeutralChatMessage {
                 role: NeutralChatRole::Tool,
                 content: result.output_json,
+                attachments: Vec::new(),
                 reasoning: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some(tool_call.id),
@@ -4524,6 +4608,7 @@ fn neutral_messages_from_record(
             messages.push(NeutralChatMessage {
                 role: NeutralChatRole::Assistant,
                 content: message.content,
+                attachments: Vec::new(),
                 reasoning,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
@@ -4559,6 +4644,7 @@ fn neutral_messages_from_record(
     Ok(vec![NeutralChatMessage {
         role,
         content: message.content,
+        attachments: Vec::new(),
         reasoning: None,
         tool_calls: Vec::new(),
         tool_call_id: Some(tool_call_id),
@@ -4584,6 +4670,7 @@ fn neutral_tool_message_from_executed_tool_call(
         role: NeutralChatRole::Tool,
         content: serde_json::to_string(&tool_result.output)
             .expect("tool outputs are always JSON serializable"),
+        attachments: Vec::new(),
         reasoning: None,
         tool_calls: Vec::new(),
         tool_call_id: Some(tool_result.id.clone()),
@@ -4599,6 +4686,7 @@ fn neutral_assistant_tool_call_message(
     NeutralChatMessage {
         role: NeutralChatRole::Assistant,
         content: assistant_text,
+        attachments: Vec::new(),
         reasoning: assistant_reasoning,
         tool_calls: vec![tool_call],
         tool_call_id: None,
@@ -5032,6 +5120,21 @@ fn context_compression_summary(
 fn compact_message_for_compression(message: &NeutralChatMessage) -> String {
     let mut content = truncate_for_context_snapshot(&message.content);
 
+    if !message.attachments.is_empty() {
+        let names = message
+            .attachments
+            .iter()
+            .map(|attachment| attachment.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if content.is_empty() {
+            content = format!("attachments: {names}");
+        } else {
+            content.push_str("; attachments: ");
+            content.push_str(&names);
+        }
+    }
+
     if !message.tool_calls.is_empty() {
         let names = message
             .tool_calls
@@ -5311,11 +5414,67 @@ fn neutral_text_message(role: NeutralChatRole, content: String) -> NeutralChatMe
     NeutralChatMessage {
         role,
         content,
+        attachments: Vec::new(),
         reasoning: None,
         tool_calls: Vec::new(),
         tool_call_id: None,
         tool_name: None,
     }
+}
+
+fn neutral_user_message(
+    content: String,
+    attachments: Vec<NeutralChatAttachment>,
+) -> NeutralChatMessage {
+    let content = user_message_with_attachment_paths(&content, &attachments);
+
+    NeutralChatMessage {
+        role: NeutralChatRole::User,
+        content,
+        attachments,
+        reasoning: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        tool_name: None,
+    }
+}
+
+fn user_message_with_attachment_paths(
+    content: &str,
+    attachments: &[NeutralChatAttachment],
+) -> String {
+    let path_attachments = attachments
+        .iter()
+        .filter_map(|attachment| {
+            attachment.path.as_ref().map(|path| {
+                (
+                    markdown_safe_single_line(&attachment.name),
+                    markdown_safe_single_line(path),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if path_attachments.is_empty() {
+        return content.to_string();
+    }
+
+    let mut message = String::from("# Files mentioned by the user:\n\n");
+    for (name, path) in path_attachments {
+        message.push_str("## ");
+        message.push_str(&name);
+        message.push_str(": ");
+        message.push_str(&path);
+        message.push_str("\n\n");
+    }
+    message.push_str("## My request for Foco:\n");
+    message.push_str(content);
+
+    message
+}
+
+fn markdown_safe_single_line(value: &str) -> String {
+    value.replace(['\r', '\n'], " ").trim().to_string()
 }
 
 fn estimate_tool_schema_tokens(tools: &[NeutralToolDefinition]) -> u64 {
@@ -5500,6 +5659,10 @@ fn pack_neutral_messages(
 fn neutral_message_estimated_tokens(message: &NeutralChatMessage) -> u64 {
     let mut tokens = estimate_text_tokens(&message.content);
 
+    for attachment in &message.attachments {
+        tokens += neutral_attachment_estimated_tokens(attachment);
+    }
+
     for tool_call in &message.tool_calls {
         tokens += neutral_tool_call_estimated_tokens(tool_call);
     }
@@ -5513,6 +5676,18 @@ fn neutral_message_estimated_tokens(message: &NeutralChatMessage) -> u64 {
     }
 
     tokens
+}
+
+fn neutral_attachment_estimated_tokens(attachment: &NeutralChatAttachment) -> u64 {
+    estimate_text_tokens(&attachment.name)
+        + estimate_text_tokens(&attachment.content_type)
+        + attachment
+            .path
+            .as_deref()
+            .map(estimate_text_tokens)
+            .unwrap_or(0)
+        + estimate_text_tokens(&format!("{} bytes", attachment.size_bytes))
+        + 32
 }
 
 fn neutral_tool_call_estimated_tokens(tool_call: &NeutralToolCall) -> u64 {
@@ -6895,6 +7070,16 @@ fn chat_title(message: &str) -> String {
     title
 }
 
+fn chat_title_for_prompt(message: &str, attachments: &[NeutralChatAttachment]) -> String {
+    if message.trim().is_empty() {
+        if let Some(attachment) = attachments.first() {
+            return chat_title(&attachment.name);
+        }
+    }
+
+    chat_title(message)
+}
+
 fn unique_id(prefix: &str) -> String {
     let timestamp = Utc::now().timestamp_millis();
     let suffix = NEXT_ID_SUFFIX.fetch_add(1, Ordering::Relaxed);
@@ -7167,6 +7352,213 @@ if ($selectedPath) {
     }
 
     Ok(Some(selected_path))
+}
+
+fn native_select_files() -> Result<Vec<NativeSelectedFile>, ApiError> {
+    if !(cfg!(windows) || is_wsl_environment()) {
+        return Err(ApiError::bad_request(
+            "native file picker is only available on Windows",
+        ));
+    }
+
+    let script = r#"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.CheckFileExists = $true
+$dialog.CheckPathExists = $true
+$dialog.Multiselect = $true
+$dialog.Title = "Choose attachments"
+
+if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+  ConvertTo-Json -InputObject @($dialog.FileNames) -Compress
+} else {
+  Write-Output "[]"
+}
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoLogo", "-NoProfile", "-STA", "-Command", script])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| {
+            ApiError::internal(format!("failed to launch native file picker: {source}"))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ApiError::internal(format!(
+            "native file picker failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut selected_paths = serde_json::from_str::<Vec<String>>(&stdout).map_err(|source| {
+        ApiError::internal(format!(
+            "native file picker returned invalid JSON: {source}"
+        ))
+    })?;
+    if is_wsl_environment() && !cfg!(windows) {
+        selected_paths = selected_paths
+            .into_iter()
+            .map(windows_path_to_wsl_path)
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+
+    native_selected_files_from_paths(selected_paths)
+}
+
+fn windows_path_to_wsl_path(path: String) -> Result<String, ApiError> {
+    let output = Command::new("wslpath")
+        .args(["-u", &path])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| {
+            ApiError::internal(format!("failed to convert selected Windows path: {source}"))
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(ApiError::internal(format!(
+            "failed to convert selected Windows path{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn native_selected_files_from_paths(
+    paths: Vec<String>,
+) -> Result<Vec<NativeSelectedFile>, ApiError> {
+    if paths.len() > MAX_CHAT_ATTACHMENTS {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_CHAT_ATTACHMENTS} attachments are allowed"
+        )));
+    }
+
+    let mut files = Vec::with_capacity(paths.len());
+    let mut total_size = 0_u64;
+    for path in paths {
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return Err(ApiError::bad_request(
+                "selected file path must not be empty",
+            ));
+        }
+
+        let path_buf = PathBuf::from(&path);
+        let metadata = fs::metadata(&path_buf).map_err(|source| {
+            ApiError::bad_request(format!("selected file is not readable: {path}: {source}"))
+        })?;
+        if !metadata.is_file() {
+            return Err(ApiError::bad_request(format!(
+                "selected attachment path must be a file: {path}"
+            )));
+        }
+
+        let name = path_buf
+            .file_name()
+            .map(|value| value.to_string_lossy().trim().to_string())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ApiError::bad_request(format!("selected file has no name: {path}")))?;
+        let size_bytes = metadata.len();
+        if size_bytes > MAX_CHAT_ATTACHMENT_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "attachment {name} exceeds the {} byte limit",
+                MAX_CHAT_ATTACHMENT_BYTES
+            )));
+        }
+
+        total_size = total_size
+            .checked_add(size_bytes)
+            .ok_or_else(|| ApiError::bad_request("attachment total size exceeds u64"))?;
+        if total_size > MAX_CHAT_ATTACHMENT_TOTAL_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "attachments exceed the {} byte total limit",
+                MAX_CHAT_ATTACHMENT_TOTAL_BYTES
+            )));
+        }
+
+        let content_type = attachment_content_type_for_path(&path_buf);
+        let content_base64 = if content_type.starts_with("image/") {
+            let bytes = fs::read(&path_buf).map_err(|source| {
+                ApiError::bad_request(format!("failed to read selected image {name}: {source}"))
+            })?;
+            Some(general_purpose::STANDARD.encode(bytes))
+        } else {
+            None
+        };
+
+        files.push(NativeSelectedFile {
+            path,
+            name,
+            content_type,
+            size_bytes,
+            content_base64,
+        });
+    }
+
+    Ok(files)
+}
+
+fn attachment_content_type_for_path(path: &Path) -> String {
+    let extension = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match extension.as_str() {
+        "avif" => "image/avif",
+        "bat" => "text/plain",
+        "bmp" => "image/bmp",
+        "c" => "text/plain",
+        "cmd" => "text/plain",
+        "cpp" => "text/plain",
+        "cs" => "text/plain",
+        "css" => "text/css",
+        "csv" => "text/csv",
+        "gif" => "image/gif",
+        "go" => "text/plain",
+        "h" => "text/plain",
+        "hpp" => "text/plain",
+        "htm" => "text/html",
+        "html" => "text/html",
+        "java" => "text/plain",
+        "jpeg" | "jpg" => "image/jpeg",
+        "js" => "text/javascript",
+        "json" => "application/json",
+        "jsx" => "text/javascript",
+        "md" => "text/markdown",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "ps1" => "text/plain",
+        "py" => "text/x-python",
+        "rs" => "text/plain",
+        "sh" => "text/x-shellscript",
+        "toml" => "application/toml",
+        "ts" => "text/typescript",
+        "tsx" => "text/typescript",
+        "txt" => "text/plain",
+        "webp" => "image/webp",
+        "xml" => "application/xml",
+        "yaml" | "yml" => "application/yaml",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 fn config_snapshot(state: &AppState) -> Result<GlobalConfig, ApiError> {
@@ -8991,6 +9383,297 @@ fn assistant_message_metadata_json(reasoning: Option<&str>) -> Result<String, Ap
     })
 }
 
+fn user_message_metadata_json(attachments: &[NeutralChatAttachment]) -> Result<String, ApiError> {
+    if attachments.is_empty() {
+        return Ok("{}".to_string());
+    }
+
+    serde_json::to_string(&json!({ "attachments": attachments })).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize user message metadata: {source}"
+        ))
+    })
+}
+
+fn message_attachments_from_metadata(
+    metadata_json: &str,
+) -> Result<Vec<NeutralChatAttachment>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "user message metadata")?;
+    let Some(attachments) = metadata.get("attachments") else {
+        return Ok(Vec::new());
+    };
+
+    if attachments.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let attachments = serde_json::from_value::<Vec<NeutralChatAttachment>>(attachments.clone())
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to parse user message attachments: {source}"
+            ))
+        })?;
+    validate_stored_chat_attachments(&attachments)?;
+
+    Ok(attachments)
+}
+
+fn normalized_chat_attachments(
+    inputs: Vec<ChatAttachmentInput>,
+) -> Result<Vec<NeutralChatAttachment>, ApiError> {
+    if inputs.len() > MAX_CHAT_ATTACHMENTS {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_CHAT_ATTACHMENTS} attachments are allowed"
+        )));
+    }
+
+    let mut attachments = Vec::with_capacity(inputs.len());
+    let mut seen_ids = HashSet::new();
+    let mut total_size = 0_u64;
+
+    for (index, input) in inputs.into_iter().enumerate() {
+        let id = input.id.trim().to_string();
+        let name = input.name.trim().to_string();
+        let content_type = input.content_type.trim().to_string();
+        let content_base64 = input
+            .content_base64
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let path = input
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        if id.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "attachment {} id must not be empty",
+                index + 1
+            )));
+        }
+
+        if !seen_ids.insert(id.clone()) {
+            return Err(ApiError::bad_request(format!(
+                "duplicate attachment id: {id}"
+            )));
+        }
+
+        if name.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "attachment {id} name must not be empty"
+            )));
+        }
+
+        if content_type.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "attachment {name} content type must not be empty"
+            )));
+        }
+
+        if input.size_bytes > MAX_CHAT_ATTACHMENT_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "attachment {name} exceeds the {} byte limit",
+                MAX_CHAT_ATTACHMENT_BYTES
+            )));
+        }
+
+        total_size = total_size
+            .checked_add(input.size_bytes)
+            .ok_or_else(|| ApiError::bad_request("attachment total size exceeds u64"))?;
+        if total_size > MAX_CHAT_ATTACHMENT_TOTAL_BYTES {
+            return Err(ApiError::bad_request(format!(
+                "attachments exceed the {} byte total limit",
+                MAX_CHAT_ATTACHMENT_TOTAL_BYTES
+            )));
+        }
+
+        if is_inline_binary_attachment(&content_type) {
+            if path.is_some() {
+                return Err(ApiError::bad_request(format!(
+                    "attachment {name} images must use contentBase64, not path"
+                )));
+            }
+
+            let content_base64 = content_base64.ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "attachment {name} image contentBase64 must not be empty"
+                ))
+            })?;
+            validate_attachment_base64(&name, &content_base64, input.size_bytes)?;
+
+            attachments.push(NeutralChatAttachment {
+                id,
+                name,
+                content_type,
+                size_bytes: input.size_bytes,
+                content_base64: Some(content_base64),
+                path: None,
+            });
+            continue;
+        }
+
+        if content_base64.is_some() {
+            return Err(ApiError::bad_request(format!(
+                "attachment {name} must use path; contentBase64 is only accepted for image attachments"
+            )));
+        }
+
+        let path = path.ok_or_else(|| {
+            ApiError::bad_request(format!("attachment {name} path must not be empty"))
+        })?;
+        validate_attachment_file_path(&name, &path, input.size_bytes)?;
+
+        attachments.push(NeutralChatAttachment {
+            id,
+            name,
+            content_type,
+            size_bytes: input.size_bytes,
+            content_base64: None,
+            path: Some(path),
+        });
+    }
+
+    Ok(attachments)
+}
+
+fn validate_stored_chat_attachments(attachments: &[NeutralChatAttachment]) -> Result<(), ApiError> {
+    for attachment in attachments {
+        if attachment.id.trim().is_empty() {
+            return Err(ApiError::internal("stored attachment id must not be empty"));
+        }
+        if attachment.name.trim().is_empty() {
+            return Err(ApiError::internal(
+                "stored attachment name must not be empty",
+            ));
+        }
+        if attachment.content_type.trim().is_empty() {
+            return Err(ApiError::internal(
+                "stored attachment content type must not be empty",
+            ));
+        }
+        if attachment.content_base64.is_none() && attachment.path.is_none() {
+            return Err(ApiError::internal(
+                "stored attachment must have contentBase64 or path",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn is_inline_binary_attachment(content_type: &str) -> bool {
+    content_type.starts_with("image/")
+}
+
+fn validate_attachment_base64(
+    name: &str,
+    content_base64: &str,
+    size_bytes: u64,
+) -> Result<(), ApiError> {
+    if content_base64.contains(',') {
+        return Err(ApiError::bad_request(format!(
+            "attachment {name} contentBase64 must be raw base64, not a data URL"
+        )));
+    }
+
+    let decoded = general_purpose::STANDARD
+        .decode(content_base64.as_bytes())
+        .map_err(|source| {
+            ApiError::bad_request(format!("attachment {name} has invalid base64: {source}"))
+        })?;
+    let decoded_len = u64::try_from(decoded.len())
+        .map_err(|_| ApiError::bad_request(format!("attachment {name} size exceeds u64")))?;
+
+    if decoded_len != size_bytes {
+        return Err(ApiError::bad_request(format!(
+            "attachment {name} sizeBytes does not match decoded content"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_attachment_file_path(name: &str, path: &str, size_bytes: u64) -> Result<(), ApiError> {
+    let path_value = Path::new(path);
+    if !path_value.is_absolute() {
+        return Err(ApiError::bad_request(format!(
+            "attachment {name} path must be absolute"
+        )));
+    }
+
+    if path_value
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(ApiError::bad_request(format!(
+            "attachment {name} path must not contain parent directory components"
+        )));
+    }
+
+    let metadata = fs::metadata(path_value).map_err(|source| {
+        ApiError::bad_request(format!("attachment {name} path is not readable: {source}"))
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "attachment {name} path must point to a file"
+        )));
+    }
+
+    if metadata.len() != size_bytes {
+        return Err(ApiError::bad_request(format!(
+            "attachment {name} sizeBytes does not match file size"
+        )));
+    }
+
+    Ok(())
+}
+
+fn chat_attachment_hook_summaries(attachments: &[NeutralChatAttachment]) -> Vec<Value> {
+    attachments
+        .iter()
+        .map(|attachment| {
+            json!({
+                "id": attachment.id,
+                "name": attachment.name,
+                "contentType": attachment.content_type,
+                "path": attachment.path.as_deref(),
+                "sizeBytes": attachment.size_bytes,
+            })
+        })
+        .collect()
+}
+
+fn chat_attachment_message_parts(metadata_json: &str) -> Result<Vec<ChatMessagePart>, ApiError> {
+    Ok(message_attachments_from_metadata(metadata_json)?
+        .into_iter()
+        .map(|attachment| ChatMessagePart::Attachment {
+            attachment: chat_attachment_part(attachment),
+        })
+        .collect())
+}
+
+fn chat_attachment_part(attachment: NeutralChatAttachment) -> ChatAttachmentPart {
+    let preview_data_url = if attachment.content_type.starts_with("image/") {
+        attachment.content_base64.as_ref().map(|content_base64| {
+            format!("data:{};base64,{}", attachment.content_type, content_base64)
+        })
+    } else {
+        None
+    };
+
+    ChatAttachmentPart {
+        id: attachment.id,
+        name: attachment.name,
+        content_type: attachment.content_type,
+        size_bytes: attachment.size_bytes,
+        path: attachment.path,
+        preview_data_url,
+    }
+}
+
 fn non_empty_string(value: &str) -> Option<String> {
     if value.trim().is_empty() {
         None
@@ -9083,7 +9766,11 @@ fn chat_message_parts(
     llm_request_events: &[LlmRequestEventRecord],
 ) -> Result<Vec<ChatMessagePart>, ApiError> {
     if message.role != "assistant" {
-        return Ok(fallback_chat_message_parts(&message.content, None, &[]));
+        let mut parts = fallback_chat_message_parts(&message.content, None, &[]);
+        if message.role == "user" {
+            parts.extend(chat_attachment_message_parts(&message.metadata_json)?);
+        }
+        return Ok(parts);
     }
 
     let request_ids = assistant_message_request_ids(&message.id, llm_request_events)?;
@@ -10282,6 +10969,146 @@ description: Project memory.
     }
 
     #[test]
+    fn normalized_chat_attachments_rejects_invalid_payloads() {
+        let invalid_base64 = normalized_chat_attachments(vec![ChatAttachmentInput {
+            id: "att-1".to_string(),
+            name: "image.png".to_string(),
+            content_type: "image/png".to_string(),
+            content_base64: Some("not base64".to_string()),
+            path: None,
+            size_bytes: 1,
+        }])
+        .expect_err("invalid base64 should fail");
+        assert!(invalid_base64.message.contains("invalid base64"));
+
+        let size_mismatch = normalized_chat_attachments(vec![ChatAttachmentInput {
+            id: "att-1".to_string(),
+            name: "image.png".to_string(),
+            content_type: "image/png".to_string(),
+            content_base64: Some("SGVsbG8=".to_string()),
+            path: None,
+            size_bytes: 6,
+        }])
+        .expect_err("size mismatch should fail");
+        assert!(size_mismatch.message.contains("sizeBytes"));
+
+        let text_base64 = normalized_chat_attachments(vec![ChatAttachmentInput {
+            id: "att-1".to_string(),
+            name: "note.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            content_base64: Some("SGVsbG8=".to_string()),
+            path: None,
+            size_bytes: 5,
+        }])
+        .expect_err("text base64 should fail");
+        assert!(text_base64.message.contains("must use path"));
+    }
+
+    #[test]
+    fn text_attachments_use_original_path_in_user_prompt() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-text-attachment-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let attachment_path = workspace_dir.join("note.txt");
+        let attachment_path_string = attachment_path.display().to_string();
+        fs::write(&attachment_path, "Hello").expect("write attachment");
+
+        let attachments = normalized_chat_attachments(vec![ChatAttachmentInput {
+            id: "att-1".to_string(),
+            name: "note.txt".to_string(),
+            content_type: "text/plain".to_string(),
+            content_base64: None,
+            path: Some(attachment_path_string.clone()),
+            size_bytes: 5,
+        }])
+        .expect("path attachment");
+
+        assert_eq!(attachments[0].content_base64, None);
+        assert_eq!(
+            attachments[0].path.as_deref(),
+            Some(attachment_path_string.as_str())
+        );
+
+        let message = neutral_user_message("Review it".to_string(), attachments.clone());
+        assert!(message.content.contains("# Files mentioned by the user:"));
+        assert!(message.content.contains("## note.txt:"));
+        assert!(message.content.contains(&attachment_path_string));
+        assert!(message.content.contains("## My request for Foco:"));
+        assert!(!message.content.contains("SGVsbG8="));
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let metadata_json = user_message_metadata_json(&attachments).expect("attachment metadata");
+        let stored_message = MessageRecord {
+            id: "user-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            role: "user".to_string(),
+            content: "Review it".to_string(),
+            sequence: 0,
+            created_at: "2026-06-08T10:00:00Z".to_string(),
+            metadata_json,
+        };
+        let replayed_messages =
+            neutral_messages_from_record(&database, stored_message).expect("neutral messages");
+        assert!(
+            replayed_messages[0]
+                .content
+                .contains(&attachment_path_string)
+        );
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn user_attachments_round_trip_into_neutral_history_and_message_parts() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-user-attachment-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let metadata_json = user_message_metadata_json(&[NeutralChatAttachment {
+            id: "att-1".to_string(),
+            name: "screenshot.png".to_string(),
+            content_type: "image/png".to_string(),
+            size_bytes: 5,
+            content_base64: Some("SGVsbG8=".to_string()),
+            path: None,
+        }])
+        .expect("attachment metadata");
+        let message = MessageRecord {
+            id: "user-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            role: "user".to_string(),
+            content: "See attached.".to_string(),
+            sequence: 0,
+            created_at: "2026-06-08T10:00:00Z".to_string(),
+            metadata_json,
+        };
+
+        let neutral_messages =
+            neutral_messages_from_record(&database, message.clone()).expect("neutral messages");
+        assert_eq!(neutral_messages.len(), 1);
+        assert_eq!(neutral_messages[0].attachments.len(), 1);
+        assert_eq!(neutral_messages[0].attachments[0].name, "screenshot.png");
+
+        let parts = chat_message_parts(&message, None, &[], &[]).expect("message parts");
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(parts[0], ChatMessagePart::Text { .. }));
+        match &parts[1] {
+            ChatMessagePart::Attachment { attachment } => {
+                assert_eq!(attachment.name, "screenshot.png");
+                assert_eq!(
+                    attachment.preview_data_url.as_deref(),
+                    Some("data:image/png;base64,SGVsbG8=")
+                );
+            }
+            other => panic!("expected attachment part, got {other:?}"),
+        }
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
     fn persist_chat_result_writes_audit_status_code() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-audit-status-code-test"));
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -10487,6 +11314,7 @@ description: Project memory.
             NeutralChatMessage {
                 role: NeutralChatRole::Tool,
                 content: r#"{"content":"hello"}"#.to_string(),
+                attachments: Vec::new(),
                 reasoning: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call-1".to_string()),
@@ -10667,6 +11495,7 @@ Search memory before repo work.
                 thinking_level: None,
                 skill_ids: None,
                 message: "Hello".to_string(),
+                attachments: Vec::new(),
             },
         )
         .await
@@ -10747,6 +11576,7 @@ Search memory before repo work.
                 thinking_level: None,
                 skill_ids: None,
                 message: "Next".to_string(),
+                attachments: Vec::new(),
             },
         )
         .await
@@ -10845,6 +11675,7 @@ Use the existing product UI conventions.
                 thinking_level: None,
                 skill_ids: Some(vec!["workspace:default:web-design-guidelines".to_string()]),
                 message: "Settings single-column layout.".to_string(),
+                attachments: Vec::new(),
             },
         )
         .await
@@ -10917,6 +11748,7 @@ Use the existing product UI conventions.
                 thinking_level: None,
                 skill_ids: None,
                 message: Some("Preview usage".to_string()),
+                attachments: Vec::new(),
             },
         )
         .await

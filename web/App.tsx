@@ -12,6 +12,7 @@ import {
   Copy,
   Eye,
   EyeOff,
+  FileText,
   Folder,
   FolderPlus,
   FolderSearch,
@@ -48,6 +49,7 @@ import {
   CSSProperties,
   DragEvent as ReactDragEvent,
   FormEvent,
+  ClipboardEvent as ReactClipboardEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   createContext,
@@ -554,7 +556,38 @@ type ChatToolCallSummary = {
 type ChatMessagePart =
   | { type: "text"; text: string }
   | { type: "reasoning"; text: string }
+  | { type: "attachment"; attachment: ChatAttachmentPartSummary }
   | { type: "toolCall"; toolCall: ChatToolCallSummary };
+
+type ChatAttachmentPayload = {
+  id: string;
+  name: string;
+  contentType: string;
+  contentBase64?: string;
+  path?: string;
+  sizeBytes: number;
+};
+
+type ChatAttachmentPartSummary = {
+  id: string;
+  name: string;
+  contentType: string;
+  sizeBytes: number;
+  path: string | null;
+  previewDataUrl: string | null;
+};
+
+type ComposerAttachment = ChatAttachmentPayload & {
+  previewDataUrl: string | null;
+};
+
+type NativeSelectedFile = {
+  path: string;
+  name: string;
+  contentType: string;
+  sizeBytes: number;
+  contentBase64?: string | null;
+};
 
 type ChatMessageSummary = {
   id: string;
@@ -707,6 +740,9 @@ type ViewMode = "chat" | "settings" | "stats";
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
+const MAX_CHAT_ATTACHMENTS = 6;
+const MAX_CHAT_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024;
 const SAVED_PASSWORD_MASK = "********";
 const AI_STATS_COLUMN_IDS = [
   "requestTime",
@@ -832,6 +868,13 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Git branch name must not be empty.": "Git 分支名不能为空。",
     "Select a workspace before sending.": "发送前请先选择工作区。",
     "Select an enabled model before sending.": "发送前请先选择已启用的模型。",
+    "Add attachment": "添加附件",
+    "Remove attachment {name}": "移除附件 {name}",
+    "At most {count} attachments are allowed.": "最多允许 {count} 个附件。",
+    "Attachment {name} exceeds the {size} limit.":
+      "附件 {name} 超过 {size} 限制。",
+    "Attachments exceed the {size} total limit.":
+      "附件总大小超过 {size} 限制。",
     "Run cancelled.": "运行已取消。",
     "Foco needs your answer": "Foco 需要你的回答",
     "Waiting for your answer": "正在等待你的回答",
@@ -1294,6 +1337,7 @@ type RetryRunRequest = {
   workspaceId: string;
   chatId: string | null;
   content: string;
+  attachments: ChatAttachmentPayload[];
   modelId: string;
   thinkingLevel: string;
   skillIds: string[];
@@ -1323,6 +1367,9 @@ export function App() {
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
   const [draftMessage, setDraftMessage] = useState("");
+  const [draftAttachments, setDraftAttachments] = useState<ComposerAttachment[]>(
+    [],
+  );
   const [messages, setMessages] = useState<ShellMessage[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [openChatTabs, setOpenChatTabs] = useState<OpenChatTab[]>([]);
@@ -1370,6 +1417,7 @@ export function App() {
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [isSelectingWorkspacePath, setIsSelectingWorkspacePath] = useState(false);
+  const [isSelectingAttachments, setIsSelectingAttachments] = useState(false);
   const [pendingQuestion, setPendingQuestion] =
     useState<QuestionRequestSummary | null>(null);
   const [isAnsweringQuestion, setIsAnsweringQuestion] = useState(false);
@@ -1492,6 +1540,7 @@ export function App() {
         `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/context-usage`,
         {
           body: JSON.stringify({
+            attachments: draftAttachments.map(chatAttachmentPayload),
             chatId: activeChatId,
             draftMessage: draftMessage.trim() || null,
             modelId: selectedModelId,
@@ -1528,6 +1577,7 @@ export function App() {
   }, [
     activeChatId,
     activeWorkspace,
+    draftAttachments,
     draftMessage,
     isGlobalView,
     selectedModelId,
@@ -2221,11 +2271,94 @@ export function App() {
     }
   }
 
+  async function handleAddDraftAttachments(attachments: ComposerAttachment[]) {
+    if (!attachments.length) {
+      return;
+    }
+
+    const totalCount = draftAttachments.length + attachments.length;
+    if (totalCount > MAX_CHAT_ATTACHMENTS) {
+      setError(
+        t("At most {count} attachments are allowed.", {
+          count: MAX_CHAT_ATTACHMENTS,
+        }),
+      );
+      return;
+    }
+
+    for (const attachment of attachments) {
+      if (attachment.sizeBytes > MAX_CHAT_ATTACHMENT_BYTES) {
+        setError(
+          t("Attachment {name} exceeds the {size} limit.", {
+            name: attachment.name,
+            size: formatFileSize(MAX_CHAT_ATTACHMENT_BYTES),
+          }),
+        );
+        return;
+      }
+    }
+
+    const totalSize =
+      draftAttachments.reduce((sum, attachment) => sum + attachment.sizeBytes, 0) +
+      attachments.reduce((sum, attachment) => sum + attachment.sizeBytes, 0);
+    if (totalSize > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
+      setError(
+        t("Attachments exceed the {size} total limit.", {
+          size: formatFileSize(MAX_CHAT_ATTACHMENT_TOTAL_BYTES),
+        }),
+      );
+      return;
+    }
+
+    setDraftAttachments((current) => [...current, ...attachments]);
+    setError(null);
+  }
+
+  async function handleAddPastedImageAttachments(files: File[]) {
+    if (!files.length) {
+      return;
+    }
+
+    try {
+      const nextAttachments = await Promise.all(
+        files.map(fileToComposerAttachment),
+      );
+      await handleAddDraftAttachments(nextAttachments);
+    } catch (readError) {
+      setError(errorMessage(readError));
+    }
+  }
+
+  async function handleSelectDraftAttachments() {
+    setIsSelectingAttachments(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<{ files: NativeSelectedFile[] }>(
+        "/api/native/select-files",
+        { method: "POST" },
+      );
+      const attachments = data.files.map(nativeSelectedFileToComposerAttachment);
+      await handleAddDraftAttachments(attachments);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSelectingAttachments(false);
+    }
+  }
+
+  function handleRemoveDraftAttachment(attachmentId: string) {
+    setDraftAttachments((current) =>
+      current.filter((attachment) => attachment.id !== attachmentId),
+    );
+  }
+
   async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
     const content = draftMessage.trim();
-    if (!content || isSendingMessage) {
+    const attachments = draftAttachments.map(chatAttachmentPayload);
+    if ((!content && !attachments.length) || isSendingMessage) {
       return;
     }
 
@@ -2241,8 +2374,10 @@ export function App() {
 
     const skillIds = [...selectedSkillIds];
     setSelectedSkillIds([]);
+    setDraftAttachments([]);
 
     await runChatMessage({
+      attachments,
       chatId: activeChatId,
       content,
       modelId: selectedModelId,
@@ -2290,6 +2425,10 @@ export function App() {
       request.skillIds,
       request.content,
     );
+    const localUserParts = userMessageParts(
+      visibleUserContent,
+      request.attachments,
+    );
     let assistantMessageId = localAssistantId;
     let requestChatId = request.chatId;
     let runMessagesKey = requestChatId
@@ -2307,7 +2446,7 @@ export function App() {
         content: visibleUserContent,
         reasoning: null,
         toolCalls: [],
-        parts: [{ type: "text", text: visibleUserContent }],
+        parts: localUserParts,
         metrics: null,
       },
       {
@@ -2344,6 +2483,7 @@ export function App() {
           body: JSON.stringify({
             chatId: request.chatId,
             message: request.content,
+            attachments: request.attachments,
             modelId: request.modelId,
             skillIds: request.skillIds.length ? request.skillIds : null,
             thinkingLevel: request.thinkingLevel || null,
@@ -3085,17 +3225,24 @@ export function App() {
               branchError={branchError}
               chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
               contextUsage={contextUsage}
+              draftAttachments={draftAttachments}
               draftMessage={draftMessage}
               gitBranches={gitBranches}
               isLoadingContextUsage={isLoadingContextUsage}
               isLoadingSettings={isLoadingSettings}
               isLoadingBranches={isLoadingBranches}
               isSendingMessage={isSendingMessage}
+              isSelectingAttachments={isSelectingAttachments}
               messages={messages}
+              onAddPastedImageAttachments={(files) =>
+                void handleAddPastedImageAttachments(files)
+              }
               onBranchChange={(branch) => void handleGitBranchChange(branch)}
               onDraftMessageChange={setDraftMessage}
+              onSelectAttachments={() => void handleSelectDraftAttachments()}
               onCancelRun={handleCancelRun}
               onModelChange={handleChatModelChange}
+              onRemoveAttachment={handleRemoveDraftAttachment}
               onRemoveSkill={removeSelectedSkill}
               onRetryRun={() => void handleRetryRun()}
               onSubmit={handleSendMessage}
@@ -3938,19 +4085,24 @@ function ChatPanel({
   chatScrollKey,
   canRetryRun,
   contextUsage,
+  draftAttachments,
   draftMessage,
   gitBranches,
   isLoadingContextUsage,
   isLoadingBranches,
   isLoadingSettings,
   isSendingMessage,
+  isSelectingAttachments,
   messages,
+  onAddPastedImageAttachments,
   onBranchChange,
   onCancelRun,
   onDraftMessageChange,
   onModelChange,
+  onRemoveAttachment,
   onRemoveSkill,
   onRetryRun,
+  onSelectAttachments,
   onSubmit,
   onThinkingLevelChange,
   onToggleSkill,
@@ -3966,19 +4118,24 @@ function ChatPanel({
   chatScrollKey: string;
   canRetryRun: boolean;
   contextUsage: ContextUsageResponse | null;
+  draftAttachments: ComposerAttachment[];
   draftMessage: string;
   gitBranches: GitBranchesResponse | null;
   isLoadingContextUsage: boolean;
   isLoadingBranches: boolean;
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
+  isSelectingAttachments: boolean;
   messages: ShellMessage[];
+  onAddPastedImageAttachments: (files: File[]) => void;
   onBranchChange: (value: string) => void;
   onCancelRun: () => void;
   onDraftMessageChange: (value: string) => void;
   onModelChange: (value: string) => void;
+  onRemoveAttachment: (attachmentId: string) => void;
   onRemoveSkill: (skillId: string) => void;
   onRetryRun: () => void;
+  onSelectAttachments: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   onThinkingLevelChange: (value: string) => void;
   onToggleSkill: (skillId: string) => void;
@@ -4086,6 +4243,24 @@ function ChatPanel({
   function handleComposerSubmit(event: FormEvent<HTMLFormElement>) {
     onSubmit(event);
     window.requestAnimationFrame(() => messageTextareaRef.current?.focus());
+  }
+
+  function handlePaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
+    const itemFiles = Array.from(event.clipboardData.items)
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    const imageFiles = itemFiles.length
+      ? itemFiles
+      : Array.from(event.clipboardData.files).filter((file) =>
+          file.type.startsWith("image/"),
+        );
+    if (!imageFiles.length) {
+      return;
+    }
+
+    event.preventDefault();
+    onAddPastedImageAttachments(imageFiles);
   }
 
   return (
@@ -4199,6 +4374,17 @@ function ChatPanel({
                 ))}
               </div>
             ) : null}
+            {draftAttachments.length ? (
+              <div className="composer-attachment-list px-3 pt-2">
+                {draftAttachments.map((attachment) => (
+                  <ComposerAttachmentChip
+                    attachment={attachment}
+                    key={attachment.id}
+                    onRemove={() => onRemoveAttachment(attachment.id)}
+                  />
+                ))}
+              </div>
+            ) : null}
             <textarea
               className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-stone-900 outline-none placeholder:text-stone-400"
               name="message"
@@ -4219,6 +4405,7 @@ function ChatPanel({
 
                 event.currentTarget.form?.requestSubmit();
               }}
+              onPaste={handlePaste}
               placeholder={t("Message Foco")}
               ref={messageTextareaRef}
               value={draftMessage}
@@ -4267,6 +4454,20 @@ function ChatPanel({
                 canRetryRun ? "message-composer-actions-with-retry" : ""
               }`}
             >
+              <button
+                aria-label={t("Add attachment")}
+                className="composer-attach-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                disabled={isSendingMessage || isSelectingAttachments}
+                onClick={onSelectAttachments}
+                title={t("Add attachment")}
+                type="button"
+              >
+                {isSelectingAttachments ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <Plus aria-hidden="true" className="size-4" />
+                )}
+              </button>
               <ComposerSelectMenu
                 ariaLabel={t("Model")}
                 className="composer-model-select max-w-full"
@@ -4325,7 +4526,10 @@ function ChatPanel({
                 <button
                   aria-label={t("Send message")}
                   className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-                  disabled={!draftMessage.trim() || !selectedModelId}
+                  disabled={
+                    (!draftMessage.trim() && !draftAttachments.length) ||
+                    !selectedModelId
+                  }
                   title={t("Send")}
                   type="submit"
                 >
@@ -4664,8 +4868,85 @@ function MessagePartBlock({
     return <ToolCallBlock toolCall={part.toolCall} />;
   }
 
+  if (part.type === "attachment") {
+    return <AttachmentPartBlock attachment={part.attachment} isUser={isUser} />;
+  }
+
   return (
     <MarkdownContent content={part.text} isError={isError} isUser={isUser} />
+  );
+}
+
+function ComposerAttachmentChip({
+  attachment,
+  onRemove,
+}: {
+  attachment: ComposerAttachment;
+  onRemove: () => void;
+}) {
+  const { t } = useI18n();
+  const title = attachment.path
+    ? `${attachment.name} · ${attachment.path} · ${formatFileSize(attachment.sizeBytes)}`
+    : `${attachment.name} · ${formatFileSize(attachment.sizeBytes)}`;
+
+  return (
+    <span
+      className={`composer-attachment-chip ${
+        attachment.previewDataUrl ? "composer-attachment-chip-image" : ""
+      }`}
+      title={title}
+    >
+      {attachment.previewDataUrl ? (
+        <img alt={attachment.name} src={attachment.previewDataUrl} />
+      ) : (
+        <FileText aria-hidden="true" className="size-4 shrink-0" />
+      )}
+      <span className="min-w-0 truncate">{attachment.name}</span>
+      <button
+        aria-label={t("Remove attachment {name}", { name: attachment.name })}
+        className="inline-flex size-5 shrink-0 items-center justify-center rounded-full text-stone-500 hover:bg-stone-200 hover:text-stone-900"
+        onClick={onRemove}
+        title={t("Remove attachment {name}", { name: attachment.name })}
+        type="button"
+      >
+        <X aria-hidden="true" className="size-3" />
+      </button>
+    </span>
+  );
+}
+
+function AttachmentPartBlock({
+  attachment,
+  isUser,
+}: {
+  attachment: ChatAttachmentPartSummary;
+  isUser: boolean;
+}) {
+  const title = attachment.path
+    ? `${attachment.name} · ${attachment.path} · ${formatFileSize(attachment.sizeBytes)}`
+    : `${attachment.name} · ${formatFileSize(attachment.sizeBytes)}`;
+
+  return (
+    <div
+      className={`message-attachment-part ${
+        isUser ? "message-attachment-part-user" : ""
+      }`}
+      title={title}
+    >
+      {attachment.previewDataUrl ? (
+        <img alt={attachment.name} src={attachment.previewDataUrl} />
+      ) : (
+        <span className="message-attachment-file-icon">
+          <FileText aria-hidden="true" className="size-4" />
+        </span>
+      )}
+      <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+        {attachment.name}
+      </span>
+      <span className="shrink-0 text-[11px] font-medium opacity-70">
+        {formatFileSize(attachment.sizeBytes)}
+      </span>
+    </div>
   );
 }
 
@@ -11743,6 +12024,200 @@ function messageWithSelectedSkills(
   return links.length ? `${links.join(" ")} ${message}` : message;
 }
 
+async function fileToComposerAttachment(file: File): Promise<ComposerAttachment> {
+  const name = file.name.trim();
+  const contentType = fileContentType(file);
+
+  if (!name) {
+    throw new Error("attachment name must not be empty");
+  }
+
+  if (!contentType) {
+    throw new Error(`attachment ${name} content type is missing`);
+  }
+
+  const contentBase64 = arrayBufferToBase64(await file.arrayBuffer());
+  const previewDataUrl = contentType.startsWith("image/")
+    ? `data:${contentType};base64,${contentBase64}`
+    : null;
+
+  return {
+    id: localChatAttachmentId(),
+    name,
+    contentType,
+    contentBase64,
+    path: undefined,
+    previewDataUrl,
+    sizeBytes: file.size,
+  };
+}
+
+function nativeSelectedFileToComposerAttachment(
+  file: NativeSelectedFile,
+): ComposerAttachment {
+  const name = file.name.trim();
+  const contentType = file.contentType.trim();
+  const path = file.path.trim();
+
+  if (!name) {
+    throw new Error("attachment name must not be empty");
+  }
+
+  if (!contentType) {
+    throw new Error(`attachment ${name} content type is missing`);
+  }
+
+  if (!path) {
+    throw new Error(`attachment ${name} path is missing`);
+  }
+
+  const isImage = contentType.startsWith("image/");
+  const contentBase64 = isImage ? file.contentBase64?.trim() : undefined;
+  if (isImage && !contentBase64) {
+    throw new Error(`attachment ${name} image content is missing`);
+  }
+
+  return {
+    id: localChatAttachmentId(),
+    name,
+    contentBase64,
+    contentType,
+    path: isImage ? undefined : path,
+    previewDataUrl: isImage
+      ? `data:${contentType};base64,${contentBase64}`
+      : null,
+    sizeBytes: file.sizeBytes,
+  };
+}
+
+function fileContentType(file: File) {
+  const explicitType = file.type.trim();
+  if (explicitType) {
+    return explicitType;
+  }
+
+  const extension = file.name.trim().toLowerCase().split(".").pop() ?? "";
+  const extensionTypes: Record<string, string> = {
+    bat: "text/plain",
+    c: "text/plain",
+    cmd: "text/plain",
+    cpp: "text/plain",
+    cs: "text/plain",
+    css: "text/css",
+    csv: "text/csv",
+    go: "text/plain",
+    h: "text/plain",
+    hpp: "text/plain",
+    htm: "text/html",
+    html: "text/html",
+    java: "text/plain",
+    js: "text/javascript",
+    json: "application/json",
+    jsx: "text/javascript",
+    md: "text/markdown",
+    pdf: "application/pdf",
+    ps1: "text/plain",
+    py: "text/x-python",
+    rs: "text/plain",
+    sh: "text/x-shellscript",
+    toml: "application/toml",
+    ts: "text/typescript",
+    tsx: "text/typescript",
+    txt: "text/plain",
+    xml: "application/xml",
+    yaml: "application/yaml",
+    yml: "application/yaml",
+  };
+
+  return extensionTypes[extension] ?? "";
+}
+
+function localChatAttachmentId() {
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `attachment-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  );
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer) {
+  const bytes = new Uint8Array(buffer);
+  const chunkSize = 0x8000;
+  let binary = "";
+
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+
+  return btoa(binary);
+}
+
+function chatAttachmentPayload(
+  attachment: ComposerAttachment,
+): ChatAttachmentPayload {
+  const payload: ChatAttachmentPayload = {
+    id: attachment.id,
+    name: attachment.name,
+    contentType: attachment.contentType,
+    sizeBytes: attachment.sizeBytes,
+  };
+  if (attachment.contentBase64) {
+    payload.contentBase64 = attachment.contentBase64;
+  }
+  if (attachment.path) {
+    payload.path = attachment.path;
+  }
+
+  return payload;
+}
+
+function userMessageParts(
+  content: string,
+  attachments: ChatAttachmentPayload[],
+): ChatMessagePart[] {
+  const parts: ChatMessagePart[] = [];
+  if (content) {
+    parts.push({ type: "text", text: content });
+  }
+  parts.push(
+    ...attachments.map((attachment) => ({
+      type: "attachment" as const,
+      attachment: attachmentPartFromPayload(attachment),
+    })),
+  );
+  return parts;
+}
+
+function attachmentPartFromPayload(
+  attachment: ChatAttachmentPayload,
+): ChatAttachmentPartSummary {
+  return {
+    id: attachment.id,
+    name: attachment.name,
+    contentType: attachment.contentType,
+    path: attachment.path ?? null,
+    previewDataUrl: attachment.contentType.startsWith("image/") &&
+      attachment.contentBase64
+      ? `data:${attachment.contentType};base64,${attachment.contentBase64}`
+      : null,
+    sizeBytes: attachment.sizeBytes,
+  };
+}
+
+function formatFileSize(sizeBytes: number) {
+  const units = ["B", "KB", "MB", "GB"];
+  let value = sizeBytes;
+  let unitIndex = 0;
+
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  const formatted =
+    unitIndex === 0 || value >= 10 ? value.toFixed(0) : value.toFixed(1);
+  return `${formatted} ${units[unitIndex]}`;
+}
+
 function skillScopeLabel(skill: ConfiguredSkillSummary, t: Translate) {
   if (skill.scope === "global") {
     return t("Global skill");
@@ -12930,6 +13405,13 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
     return typeof text === "string" ? { type: "reasoning", text } : null;
   }
 
+  if (part.type === "attachment") {
+    const attachment = parseChatAttachmentPartSummary(
+      fieldValue(part, "attachment"),
+    );
+    return attachment ? { type: "attachment", attachment } : null;
+  }
+
   if (part.type === "toolCall" || part.type === "tool_call") {
     const toolCall = parseChatToolCallSummary(
       fieldValue(part, "toolCall", "tool_call"),
@@ -12938,6 +13420,45 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
   }
 
   return null;
+}
+
+function parseChatAttachmentPartSummary(
+  value: unknown,
+): ChatAttachmentPartSummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const id = stringField(value, "id");
+  const name = stringField(value, "name");
+  const contentType = stringField(value, "contentType", "content_type");
+  const previewDataUrl = optionalNullableStringField(
+    value,
+    "previewDataUrl",
+    "preview_data_url",
+  );
+  const path = optionalNullableStringField(value, "path");
+  const sizeBytes = fieldValue(value, "sizeBytes", "size_bytes");
+
+  if (
+    !id ||
+    !name ||
+    !contentType ||
+    previewDataUrl === false ||
+    path === false ||
+    typeof sizeBytes !== "number"
+  ) {
+    return null;
+  }
+
+  return {
+    contentType,
+    id,
+    name,
+    path: path ?? null,
+    previewDataUrl: previewDataUrl ?? null,
+    sizeBytes,
+  };
 }
 
 function parseNullableChatUsage(value: unknown): ChatUsage | null | undefined | false {

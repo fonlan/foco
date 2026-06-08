@@ -645,6 +645,7 @@ async fn run_prompt_hook(
             NeutralChatMessage {
                 role: NeutralChatRole::System,
                 content: format!("{prompt}\n\nReturn only a JSON hook result. Do not call tools."),
+                attachments: Vec::new(),
                 reasoning: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
@@ -653,6 +654,7 @@ async fn run_prompt_hook(
             NeutralChatMessage {
                 role: NeutralChatRole::User,
                 content: input_json,
+                attachments: Vec::new(),
                 reasoning: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
