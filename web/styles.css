@@ -127,6 +127,19 @@ summary:focus-visible {
   box-shadow: -18px 0 50px rgba(75, 63, 42, 0.08);
 }
 
+.diff-panel-split {
+  height: 100%;
+}
+
+.task-graph-panel-slot {
+  flex: 0 0 var(--task-graph-panel-height, 48%);
+  min-height: 8rem;
+}
+
+.git-diff-panel-slot {
+  flex: 1 1 0;
+}
+
 .mobile-sidebar-backdrop,
 .mobile-sidebar-close,
 .mobile-workspace-button {

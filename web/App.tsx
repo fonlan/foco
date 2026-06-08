@@ -766,6 +766,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Copied: "已复制",
     "Copy {label}": "复制 {label}",
     "Resize git diff panel": "调整 Git diff 面板宽度",
+    "Resize task graph and git diff panels": "调整任务图和 Git diff 面板高度",
     "Resize terminal panel": "调整终端面板高度",
     "New terminal": "新建终端",
     "Terminal sessions": "终端列表",
@@ -1045,8 +1046,8 @@ export function App() {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string>("");
-  const [expandedWorkspaceIds, setExpandedWorkspaceIds] = useState<Set<string>>(
-    () => new Set(),
+  const [expandedWorkspaceId, setExpandedWorkspaceId] = useState<string | null>(
+    null,
   );
   const [viewMode, setViewMode] = useState<ViewMode>("chat");
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
@@ -1076,6 +1077,10 @@ export function App() {
   const [isDiffPanelOpen, setIsDiffPanelOpen] = useState(false);
   const [diffPanelWidth, setDiffPanelWidth] = useState(400);
   const [isResizingDiffPanel, setIsResizingDiffPanel] = useState(false);
+  const [taskGraphPanelHeightPercent, setTaskGraphPanelHeightPercent] =
+    useState(48);
+  const [isResizingTaskGraphPanel, setIsResizingTaskGraphPanel] =
+    useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(288);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [isMobileWorkspaceOpen, setIsMobileWorkspaceOpen] = useState(false);
@@ -1105,6 +1110,7 @@ export function App() {
   const activeRunAbortRef = useRef<AbortController | null>(null);
   const activeChatKeyRef = useRef<string | null>(null);
   const hasManuallySelectedModelRef = useRef(false);
+  const diffPanelSplitRef = useRef<HTMLDivElement | null>(null);
 
   const activeWorkspace = useMemo(
     () =>
@@ -1180,9 +1186,7 @@ export function App() {
           ? current
           : data.activeWorkspaceId,
       );
-      setExpandedWorkspaceIds(
-        new Set(data.workspaces.map((workspace) => workspace.id)),
-      );
+      setExpandedWorkspaceId(data.activeWorkspaceId);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -1389,6 +1393,72 @@ export function App() {
   }, [isResizingSidebar]);
 
   useEffect(() => {
+    if (!isResizingTaskGraphPanel) {
+      return;
+    }
+
+    function handlePointerMove(event: PointerEvent) {
+      const container = diffPanelSplitRef.current;
+      if (!container) {
+        return;
+      }
+
+      const rect = container.getBoundingClientRect();
+      if (rect.height <= 0) {
+        return;
+      }
+
+      const nextHeight = ((event.clientY - rect.top) / rect.height) * 100;
+      setTaskGraphPanelHeightPercent(
+        Math.min(Math.max(nextHeight, 24), 76),
+      );
+    }
+
+    function handlePointerUp() {
+      setIsResizingTaskGraphPanel(false);
+    }
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+
+    return () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+    };
+  }, [isResizingTaskGraphPanel]);
+
+  useEffect(() => {
+    if (!workspaces.length) {
+      setExpandedWorkspaceId(null);
+      return;
+    }
+
+    if (activeChatId && activeWorkspaceId) {
+      setExpandedWorkspaceId((current) =>
+        current === activeWorkspaceId ? current : activeWorkspaceId,
+      );
+      return;
+    }
+
+    setExpandedWorkspaceId((current) => {
+      if (
+        current === null ||
+        workspaces.some((workspace) => workspace.id === current)
+      ) {
+        return current;
+      }
+
+      return activeWorkspace?.id ?? workspaces[0]?.id ?? null;
+    });
+  }, [activeChatId, activeWorkspace?.id, activeWorkspaceId, workspaces]);
+
+  useEffect(() => {
     setSelectedModelId((current) => {
       const highestPriorityModelId = availableModels[0]?.id ?? "";
 
@@ -1446,9 +1516,7 @@ export function App() {
 
       setWorkspaces(data.workspaces);
       setActiveWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
-      setExpandedWorkspaceIds(
-        new Set(data.workspaces.map((workspace) => workspace.id)),
-      );
+      setExpandedWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
       setWorkspaceName("");
       setWorkspacePath("");
       setIsWorkspaceDialogOpen(false);
@@ -1573,11 +1641,7 @@ export function App() {
   }
 
   function startNewWorkspaceChat(workspaceId: string) {
-    setExpandedWorkspaceIds((current) => {
-      const next = new Set(current);
-      next.add(workspaceId);
-      return next;
-    });
+    setExpandedWorkspaceId(workspaceId);
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
     activeChatKeyRef.current = null;
@@ -2204,17 +2268,14 @@ export function App() {
   }
 
   function toggleWorkspace(workspaceId: string) {
-    setExpandedWorkspaceIds((current) => {
-      const next = new Set(current);
+    if (activeChatId && activeWorkspaceId) {
+      setExpandedWorkspaceId(activeWorkspaceId);
+      return;
+    }
 
-      if (next.has(workspaceId)) {
-        next.delete(workspaceId);
-      } else {
-        next.add(workspaceId);
-      }
-
-      return next;
-    });
+    setExpandedWorkspaceId((current) =>
+      current === workspaceId ? null : workspaceId,
+    );
   }
 
   function openWorkspaceDialog() {
@@ -2371,6 +2432,7 @@ export function App() {
             {
               "--diff-panel-width": `${diffPanelWidth}px`,
               "--sidebar-width": `${sidebarWidth}px`,
+              "--task-graph-panel-height": `${taskGraphPanelHeightPercent}%`,
             } as CSSProperties
           }
         >
@@ -2468,7 +2530,7 @@ export function App() {
             <nav className="panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3">
               {workspaces.length ? (
                 workspaces.map((workspace) => {
-                const isExpanded = expandedWorkspaceIds.has(workspace.id);
+                const isExpanded = expandedWorkspaceId === workspace.id;
                 const isActive = workspace.id === activeWorkspace?.id;
                 const isNewChatActive = isActive && activeChatId === null;
 
@@ -2504,22 +2566,36 @@ export function App() {
                       </button>
                     </div>
                     {isExpanded ? (
-                      <div className="ml-3 mt-1 space-y-1">
+                      <div className="ml-4 mt-1 space-y-1 border-l border-stone-200/80 pl-2">
                         {isNewChatActive ? (
-                          <button
-                            aria-current="page"
-                            className={chatItemClass(true)}
-                            onClick={() => startNewWorkspaceChat(workspace.id)}
-                            type="button"
-                          >
-                            <MessageSquare
+                          <div className="group flex min-w-0 items-center gap-1">
+                            <button
+                              aria-current="page"
+                              className={chatItemClass(true)}
+                              onClick={() => startNewWorkspaceChat(workspace.id)}
+                              type="button"
+                            >
+                              <MessageSquare
+                                aria-hidden="true"
+                                className="size-3.5 shrink-0"
+                              />
+                              <span className="min-w-0 flex-1">
+                                <span className="block truncate">
+                                  {t("New chat")}
+                                </span>
+                                <span
+                                  aria-hidden="true"
+                                  className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-transparent"
+                                >
+                                  0
+                                </span>
+                              </span>
+                            </button>
+                            <span
                               aria-hidden="true"
-                              className="size-3.5 shrink-0"
+                              className="inline-flex size-7 shrink-0"
                             />
-                            <span className="min-w-0 flex-1 truncate">
-                              {t("New chat")}
-                            </span>
-                          </button>
+                          </div>
                         ) : null}
                         {workspace.chats.length > 0 ? (
                           workspace.chats.map((chat) => {
@@ -2737,30 +2813,77 @@ export function App() {
               tabIndex={0}
             />
             {taskGraph?.exists && taskGraph.tasks.length ? (
-              <div className="min-h-0 flex-1 border-b border-stone-200/80">
-                <TaskGraphPanel
-                  error={taskGraphError}
-                  isLoading={isLoadingTaskGraph}
-                  taskGraph={taskGraph}
+              <div
+                className="diff-panel-split flex min-h-0 flex-1 flex-col"
+                ref={diffPanelSplitRef}
+              >
+                <div className="task-graph-panel-slot min-h-0">
+                  <TaskGraphPanel
+                    error={taskGraphError}
+                    isLoading={isLoadingTaskGraph}
+                    taskGraph={taskGraph}
+                  />
+                </div>
+                <div
+                  aria-label={t("Resize task graph and git diff panels")}
+                  aria-orientation="horizontal"
+                  className="diff-panel-row-resizer group relative h-3 shrink-0 cursor-row-resize border-y border-stone-200/80 bg-stone-100/70"
+                  onKeyDown={(event) => {
+                    if (event.key === "ArrowUp") {
+                      event.preventDefault();
+                      setTaskGraphPanelHeightPercent((current) =>
+                        Math.max(current - 5, 24),
+                      );
+                    }
+
+                    if (event.key === "ArrowDown") {
+                      event.preventDefault();
+                      setTaskGraphPanelHeightPercent((current) =>
+                        Math.min(current + 5, 76),
+                      );
+                    }
+                  }}
+                  onPointerDown={() => setIsResizingTaskGraphPanel(true)}
+                  role="separator"
+                  tabIndex={0}
+                >
+                  <span className="absolute left-1/2 top-1/2 h-1 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-stone-300 transition-colors group-hover:bg-teal-500/70" />
+                </div>
+                <div className="git-diff-panel-slot min-h-0">
+                  <GitDiffPanel
+                    diffError={diffError}
+                    diffText={selectedDiffText}
+                    files={gitDiff?.files ?? []}
+                    isLoading={isLoadingDiff}
+                    onClose={() => setIsDiffPanelOpen(false)}
+                    onRefresh={() => {
+                      if (activeWorkspace?.id) {
+                        void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+                      }
+                    }}
+                    onSelectFile={setSelectedDiffPath}
+                    selectedPath={selectedDiffPath}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="min-h-0 flex-1">
+                <GitDiffPanel
+                  diffError={diffError}
+                  diffText={selectedDiffText}
+                  files={gitDiff?.files ?? []}
+                  isLoading={isLoadingDiff}
+                  onClose={() => setIsDiffPanelOpen(false)}
+                  onRefresh={() => {
+                    if (activeWorkspace?.id) {
+                      void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+                    }
+                  }}
+                  onSelectFile={setSelectedDiffPath}
+                  selectedPath={selectedDiffPath}
                 />
               </div>
-            ) : null}
-            <div className="min-h-0 flex-1">
-              <GitDiffPanel
-                diffError={diffError}
-                diffText={selectedDiffText}
-                files={gitDiff?.files ?? []}
-                isLoading={isLoadingDiff}
-                onClose={() => setIsDiffPanelOpen(false)}
-                onRefresh={() => {
-                  if (activeWorkspace?.id) {
-                    void loadGitDiff(activeWorkspace.id, selectedDiffPath);
-                  }
-                }}
-                onSelectFile={setSelectedDiffPath}
-                selectedPath={selectedDiffPath}
-              />
-            </div>
+            )}
           </div>
         </aside>
         ) : null}
@@ -8923,18 +9046,18 @@ function workspaceNameFromPath(path: string) {
 }
 
 function workspaceMenuClass(active: boolean) {
-  return `flex min-w-0 items-center gap-1 rounded-lg px-1 transition-colors ${
+  return `flex min-w-0 items-center gap-1 rounded-xl border px-1.5 py-1 transition-colors ${
     active
-      ? "bg-teal-50 text-teal-950 shadow-sm ring-1 ring-teal-100"
-      : "text-stone-700 hover:bg-white/80 hover:text-stone-950"
+      ? "border-teal-200 bg-teal-50 text-teal-950 shadow-sm"
+      : "border-transparent bg-stone-100/60 text-stone-700 hover:border-stone-200 hover:bg-white/90 hover:text-stone-950"
   }`;
 }
 
 function chatItemClass(active: boolean) {
-  return `flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium ${
+  return `flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-xs font-medium ${
     active
-      ? "bg-white text-stone-950 shadow-sm"
-      : "text-stone-600 hover:bg-white/80 hover:text-stone-950"
+      ? "border-teal-100 bg-white text-stone-950 shadow-sm"
+      : "border-transparent text-stone-600 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
   }`;
 }
 

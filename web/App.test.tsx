@@ -39,6 +39,22 @@ const workspace = {
   terminalShell: "powershell",
 };
 
+const secondaryWorkspace = {
+  chats: [
+    {
+      createdAt: "2026-06-05T12:00:00Z",
+      id: "side-chat-1",
+      title: "Side note",
+      updatedAt: "2026-06-05T12:05:00Z",
+    },
+  ],
+  id: "workspace-2",
+  name: "Side project",
+  path: "C:\\Users\\fonla\\Documents\\Repos\\SideProject",
+  pinned: false,
+  terminalShell: "powershell",
+};
+
 const settings = {
   configuredModels: [
     {
@@ -438,7 +454,7 @@ describe("App verification surfaces", () => {
     render(<App />);
 
     expect(await screen.findAllByText("Default")).not.toHaveLength(0);
-    expect(screen.getByText("Tool run")).toBeInTheDocument();
+    expect(screen.getAllByText("Tool run").length).toBeGreaterThan(0);
 
     await userEvent.click(screen.getByText("Tool run"));
 
@@ -567,6 +583,22 @@ describe("App verification surfaces", () => {
       "aria-current",
       "page",
     );
+  });
+
+  it("keeps the active chat workspace as the only expanded workspace", async () => {
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    const defaultToggle = screen.getByRole("button", { name: "Default" });
+    const sideToggle = screen.getByRole("button", { name: "Side project" });
+    await userEvent.click(sideToggle);
+
+    expect(defaultToggle).toHaveAttribute("aria-expanded", "true");
+    expect(sideToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getAllByText("Tool run").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Side note")).not.toBeInTheDocument();
   });
 
   it("opens center chat tabs and closes tabs without deleting chat history", async () => {
@@ -936,6 +968,19 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("README.md diff is visible")).toBeInTheDocument();
     expect(screen.getByText("Git diff")).toBeInTheDocument();
     expect(screen.getByText(/\+hello/)).toBeInTheDocument();
+
+    const splitHandle = screen.getByRole("separator", {
+      name: "Resize task graph and git diff panels",
+    });
+    const appShell = document.querySelector(".app-shell") as HTMLElement;
+    splitHandle.focus();
+    await userEvent.keyboard("{ArrowDown}");
+
+    await waitFor(() => {
+      expect(appShell.style.getPropertyValue("--task-graph-panel-height")).toBe(
+        "53%",
+      );
+    });
   });
 
   it("opens the task graph sidebar when a task graph refresh arrives", async () => {
@@ -1006,7 +1051,10 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
   }
 
   if (path === "/api/workspaces") {
-    return jsonResponse({ activeWorkspaceId: workspace.id, workspaces: [workspace] });
+    return jsonResponse({
+      activeWorkspaceId: workspace.id,
+      workspaces: [workspace, secondaryWorkspace],
+    });
   }
 
   if (path === "/api/native/select-directory") {
@@ -1018,6 +1066,7 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
       activeWorkspaceId: "new-workspace",
       workspaces: [
         workspace,
+        secondaryWorkspace,
         {
           chats: [],
           id: "new-workspace",
@@ -1127,6 +1176,7 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
           ...workspace,
           chats: workspace.chats.filter((chat) => chat.id !== "chat-1"),
         },
+        secondaryWorkspace,
       ],
     });
   }
