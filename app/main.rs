@@ -29,8 +29,8 @@ use axum::{
 use chrono::{Local, SecondsFormat, Utc};
 use foco_agent::{
     ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo, build_system_prompt,
-    calculate_context_budget, detect_same_file_write_conflicts, estimate_json_tokens,
-    estimate_text_tokens, pack_context, plan_context_compression,
+    calculate_context_budget, context_compression_trigger_tokens, detect_same_file_write_conflicts,
+    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{
@@ -485,6 +485,10 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/chat/stream",
             post(stream_chat_response),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/context-usage",
+            post(context_usage),
         )
         .route(
             "/api/chat/questions/{question_id}/answer",
@@ -1552,6 +1556,23 @@ async fn stream_chat_response(
     ))
 }
 
+async fn context_usage(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<ContextUsageRequest>,
+) -> Result<Json<ContextUsageResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let prompt_context = prepare_prompt_context(
+        &state,
+        &config,
+        &workspace_id,
+        request.into_prompt_request(),
+    )
+    .await?;
+
+    Ok(Json(context_usage_response(&prompt_context)?))
+}
+
 async fn answer_question(
     State(state): State<AppState>,
     AxumPath(question_id): AxumPath<String>,
@@ -2045,6 +2066,59 @@ struct ChatStreamRequest {
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
     message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextUsageRequest {
+    chat_id: Option<String>,
+    model_id: String,
+    thinking_level: Option<String>,
+    skill_ids: Option<Vec<String>>,
+    draft_message: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextUsageResponse {
+    used_message_tokens: u64,
+    available_message_tokens: u64,
+    usage_percent: u64,
+    compression_trigger_tokens: u64,
+    compression_trigger_percent: u64,
+    will_compress_on_next_send: bool,
+}
+
+struct PromptContextRequest {
+    chat_id: Option<String>,
+    model_id: String,
+    thinking_level: Option<String>,
+    skill_ids: Option<Vec<String>>,
+    message: Option<String>,
+}
+
+impl ChatStreamRequest {
+    fn into_prompt_request(self) -> PromptContextRequest {
+        PromptContextRequest {
+            chat_id: self.chat_id,
+            model_id: self.model_id,
+            thinking_level: self.thinking_level,
+            skill_ids: self.skill_ids,
+            message: Some(self.message),
+        }
+    }
+}
+
+impl ContextUsageRequest {
+    fn into_prompt_request(self) -> PromptContextRequest {
+        PromptContextRequest {
+            chat_id: self.chat_id,
+            model_id: self.model_id,
+            thinking_level: self.thinking_level,
+            skill_ids: self.skill_ids,
+            message: optional_trimmed_string(self.draft_message),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2544,6 +2618,23 @@ struct PreparedChatContext {
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
     active_tool_start_index: usize,
+}
+
+struct PreparedPromptContext {
+    workspace_id: String,
+    workspace_path: PathBuf,
+    model_id: String,
+    provider_id: String,
+    provider_config: ProviderConnectionConfig,
+    provider_request: NeutralChatRequest,
+    context_budget: foco_agent::ContextBudget,
+    compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
+    message_source_sequences: Vec<Option<i64>>,
+    active_tool_start_index: usize,
+    chat_id: Option<String>,
+    raw_message: Option<String>,
+    message: Option<String>,
+    next_message_sequence: i64,
 }
 
 struct CapturedAuditEvent {
@@ -3182,24 +3273,20 @@ impl PreparedChatContext {
     }
 }
 
-async fn prepare_chat_context(
+async fn prepare_prompt_context(
     state: &AppState,
     config: &GlobalConfig,
     workspace_id: &str,
-    request: ChatStreamRequest,
-) -> Result<PreparedChatContext, ApiError> {
+    request: PromptContextRequest,
+) -> Result<PreparedPromptContext, ApiError> {
     let workspace_id = workspace_id.trim();
-    let raw_message = request.message.trim();
     let model_id = request.model_id.trim();
     let thinking_level = optional_trimmed_string(request.thinking_level);
     let requested_skill_ids = request.skill_ids;
+    let raw_message = optional_trimmed_string(request.message);
 
     if workspace_id.is_empty() {
         return Err(ApiError::bad_request("workspace id must not be empty"));
-    }
-
-    if raw_message.is_empty() {
-        return Err(ApiError::bad_request("message must not be empty"));
     }
 
     if model_id.is_empty() {
@@ -3274,15 +3361,18 @@ async fn prepare_chat_context(
         .await
         .map_err(ApiError::from_mcp_error)?;
     let mcp_tools = state.mcp_registry.tool_definitions(&workspace.id).await;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
-    let message = message_with_selected_skills(
-        &state.user_profile_dir,
-        config,
-        &workspace.id,
-        requested_skill_ids,
-        raw_message,
-    )?;
+    let message = match raw_message.as_deref() {
+        Some(raw_message) => Some(message_with_selected_skills(
+            &state.user_profile_dir,
+            config,
+            &workspace.id,
+            requested_skill_ids,
+            raw_message,
+        )?),
+        None => None,
+    };
     let chat_id = optional_trimmed_string(request.chat_id);
     let is_new_chat = chat_id.is_none();
     let chat_id = match chat_id {
@@ -3296,38 +3386,23 @@ async fn prepare_chat_context(
                     "chat was not found: {chat_id}"
                 )));
             }
-            chat_id
+            Some(chat_id)
         }
-        None => {
-            let chat_id = unique_id("chat");
-            database
-                .insert_chat(&chat_id, &chat_title(raw_message))
-                .map_err(ApiError::from_workspace_error)?;
-            chat_id
-        }
+        None => None,
     };
-    let existing_messages = database
-        .messages_for_chat(&chat_id)
-        .map_err(ApiError::from_workspace_error)?;
-    let compression_snapshots = database
-        .context_compression_snapshots_for_chat(&chat_id)
-        .map_err(ApiError::from_workspace_error)?;
+    let existing_messages = match chat_id.as_deref() {
+        Some(chat_id) => database
+            .messages_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?,
+        None => Vec::new(),
+    };
+    let compression_snapshots = match chat_id.as_deref() {
+        Some(chat_id) => database
+            .context_compression_snapshots_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?,
+        None => Vec::new(),
+    };
     let user_sequence = next_message_sequence(&existing_messages);
-    let assistant_sequence = user_sequence + 1;
-    let user_message_id = unique_id("msg-user");
-    let assistant_message_id = unique_id("msg-assistant");
-    let llm_request_id = unique_id("llm");
-
-    database
-        .insert_message(NewMessage {
-            id: &user_message_id,
-            chat_id: &chat_id,
-            role: "user",
-            content: &message,
-            sequence: user_sequence,
-            metadata_json: Some("{}"),
-        })
-        .map_err(ApiError::from_workspace_error)?;
 
     let builtin_tool_definitions = builtin_tool_definitions();
     let mut neutral_tools = builtin_tool_definitions
@@ -3418,8 +3493,10 @@ async fn prepare_chat_context(
             message_source_sequences.push(Some(sequence));
         }
     }
-    neutral_messages.push(neutral_text_message(NeutralChatRole::User, message.clone()));
-    message_source_sequences.push(Some(user_sequence));
+    if let Some(message) = &message {
+        neutral_messages.push(neutral_text_message(NeutralChatRole::User, message.clone()));
+        message_source_sequences.push(Some(user_sequence));
+    }
     let active_tool_start_index = neutral_messages.len();
 
     let provider_request = NeutralChatRequest {
@@ -3429,32 +3506,91 @@ async fn prepare_chat_context(
         thinking_level: thinking_level.or_else(|| model.thinking_level.clone()),
         max_output_tokens: Some(max_output_tokens),
     };
-    let request_body_json = serde_json::to_string(&provider_request).map_err(|source| {
-        ApiError::internal(format!(
-            "failed to serialize provider-neutral chat request: {source}"
-        ))
-    })?;
-
-    Ok(PreparedChatContext {
+    Ok(PreparedPromptContext {
         workspace_id: workspace.id.clone(),
         workspace_path: workspace.path.clone(),
         chat_id,
         provider_id: provider.id.clone(),
         model_id: model.id.clone(),
+        provider_config,
+        provider_request,
+        context_budget,
+        compression_snapshots,
+        message_source_sequences,
+        active_tool_start_index,
+        raw_message,
+        message,
+        next_message_sequence: user_sequence,
+    })
+}
+
+async fn prepare_chat_context(
+    state: &AppState,
+    config: &GlobalConfig,
+    workspace_id: &str,
+    request: ChatStreamRequest,
+) -> Result<PreparedChatContext, ApiError> {
+    let prompt_context =
+        prepare_prompt_context(state, config, workspace_id, request.into_prompt_request()).await?;
+    let raw_message = prompt_context
+        .raw_message
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("message must not be empty"))?;
+    let message = prompt_context
+        .message
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("message must not be empty"))?;
+    let user_sequence = prompt_context.next_message_sequence;
+    let assistant_sequence = user_sequence + 1;
+    let user_message_id = unique_id("msg-user");
+    let assistant_message_id = unique_id("msg-assistant");
+    let llm_request_id = unique_id("llm");
+    let mut database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let chat_id = match prompt_context.chat_id.clone() {
+        Some(chat_id) => chat_id,
+        None => {
+            let chat_id = unique_id("chat");
+            database
+                .insert_chat(&chat_id, &chat_title(raw_message))
+                .map_err(ApiError::from_workspace_error)?;
+            chat_id
+        }
+    };
+
+    database
+        .insert_message(NewMessage {
+            id: &user_message_id,
+            chat_id: &chat_id,
+            role: "user",
+            content: message,
+            sequence: user_sequence,
+            metadata_json: Some("{}"),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    let request_body_json = serialize_provider_request(&prompt_context.provider_request)?;
+
+    Ok(PreparedChatContext {
+        workspace_id: prompt_context.workspace_id,
+        workspace_path: prompt_context.workspace_path,
+        chat_id,
+        provider_id: prompt_context.provider_id,
+        model_id: prompt_context.model_id,
         user_message_id,
         assistant_message_id,
         llm_request_id,
         assistant_sequence,
-        provider_config,
-        provider_request,
+        provider_config: prompt_context.provider_config,
+        provider_request: prompt_context.provider_request,
         mcp_registry: state.mcp_registry.clone(),
         question_registry: state.question_registry.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
-        context_budget,
+        context_budget: prompt_context.context_budget,
         request_body_json,
-        compression_snapshots,
-        message_source_sequences,
-        active_tool_start_index,
+        compression_snapshots: prompt_context.compression_snapshots,
+        message_source_sequences: prompt_context.message_source_sequences,
+        active_tool_start_index: prompt_context.active_tool_start_index,
     })
 }
 
@@ -4343,6 +4479,50 @@ fn pack_items_from_message_groups(groups: &[ContextMessageGroup]) -> Vec<Context
             must_keep: group.must_keep,
         })
         .collect()
+}
+
+fn context_usage_response(
+    context: &PreparedPromptContext,
+) -> Result<ContextUsageResponse, ApiError> {
+    let message_groups = context_message_groups(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        context.active_tool_start_index,
+    )?;
+    let pack_items = pack_items_from_message_groups(&message_groups);
+    let used_message_tokens = pack_items
+        .iter()
+        .map(|item| item.estimated_tokens)
+        .sum::<u64>();
+    let available_message_tokens = context.context_budget.available_message_tokens;
+    let compression_trigger_tokens = context_compression_trigger_tokens(available_message_tokens);
+    let usage_percent = percentage_ceil(used_message_tokens, available_message_tokens);
+    let compression_trigger_percent =
+        percentage_ceil(compression_trigger_tokens, available_message_tokens);
+    let will_compress_on_next_send = plan_context_compression(
+        &pack_items,
+        available_message_tokens,
+        active_tool_start_group_index(&message_groups, context.active_tool_start_index),
+        CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES,
+    )
+    .is_some();
+
+    Ok(ContextUsageResponse {
+        used_message_tokens,
+        available_message_tokens,
+        usage_percent,
+        compression_trigger_tokens,
+        compression_trigger_percent,
+        will_compress_on_next_send,
+    })
+}
+
+fn percentage_ceil(value: u64, total: u64) -> u64 {
+    if total == 0 {
+        0
+    } else {
+        value.saturating_mul(100).div_ceil(total)
+    }
 }
 
 fn active_tool_start_group_index(
@@ -8674,6 +8854,71 @@ Use the existing product UI conventions.
             assert_eq!(stored_messages[0].content, expected_message);
         }
 
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
+    async fn context_usage_preview_does_not_persist_chat_messages() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-context-usage-workspace-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-context-usage-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 10_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+
+        let prompt_context = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                thinking_level: None,
+                skill_ids: None,
+                message: Some("Preview usage".to_string()),
+            },
+        )
+        .await
+        .expect("prompt context");
+        let usage = context_usage_response(&prompt_context).expect("context usage");
+
+        assert!(usage.used_message_tokens > 0);
+        assert_eq!(
+            usage.compression_trigger_tokens,
+            context_compression_trigger_tokens(usage.available_message_tokens)
+        );
+        assert_eq!(usage.compression_trigger_percent, 80);
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        assert!(database.chats().expect("chat list").is_empty());
+
+        drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
         remove_dir_if_exists(&profile_dir);
     }

@@ -135,6 +135,15 @@ type ModelMetadataResponse = {
   configuredModels: ConfiguredModelSummary[];
 };
 
+type ContextUsageResponse = {
+  usedMessageTokens: number;
+  availableMessageTokens: number;
+  usagePercent: number;
+  compressionTriggerTokens: number;
+  compressionTriggerPercent: number;
+  willCompressOnNextSend: boolean;
+};
+
 type ModelFormState = {
   displayName: string;
   enabled: boolean;
@@ -698,6 +707,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Cancel run": "取消运行",
     "Send message": "发送消息",
     Send: "发送",
+    "Context usage": "上下文使用量",
+    "Context usage {percent}%": "上下文使用量 {percent}%",
+    "Context compression may run on the next send":
+      "下次发送可能会触发上下文压缩",
     "Git branch": "Git 分支",
     "Switch to branch {name}": "切换到分支 {name}",
     "No branches": "暂无分支",
@@ -1106,6 +1119,8 @@ export function App() {
     useState<QuestionRequestSummary | null>(null);
   const [isAnsweringQuestion, setIsAnsweringQuestion] = useState(false);
   const [questionError, setQuestionError] = useState<string | null>(null);
+  const [contextUsage, setContextUsage] = useState<ContextUsageResponse | null>(null);
+  const [isLoadingContextUsage, setIsLoadingContextUsage] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const activeRunAbortRef = useRef<AbortController | null>(null);
   const activeChatKeyRef = useRef<string | null>(null);
@@ -1207,6 +1222,63 @@ export function App() {
       setIsLoadingSettings(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (isGlobalView || !activeWorkspace || !selectedModelId) {
+      setContextUsage(null);
+      setIsLoadingContextUsage(false);
+      return;
+    }
+
+    const abortController = new AbortController();
+    const timeoutId = window.setTimeout(() => {
+      setIsLoadingContextUsage(true);
+      void requestJson<ContextUsageResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/context-usage`,
+        {
+          body: JSON.stringify({
+            chatId: activeChatId,
+            draftMessage: draftMessage.trim() || null,
+            modelId: selectedModelId,
+            skillIds: selectedSkillIds.length ? selectedSkillIds : null,
+            thinkingLevel: selectedThinkingLevel || null,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+          signal: abortController.signal,
+        },
+      )
+        .then((data) => {
+          setContextUsage(data);
+        })
+        .catch((requestError) => {
+          if (requestError instanceof DOMException && requestError.name === "AbortError") {
+            return;
+          }
+
+          setContextUsage(null);
+        })
+        .finally(() => {
+          if (!abortController.signal.aborted) {
+            setIsLoadingContextUsage(false);
+          }
+        });
+    }, 300);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+      abortController.abort();
+      setIsLoadingContextUsage(false);
+    };
+  }, [
+    activeChatId,
+    activeWorkspace,
+    draftMessage,
+    isGlobalView,
+    selectedModelId,
+    selectedSkillIds,
+    selectedThinkingLevel,
+  ]);
 
   const loadGitDiff = useCallback(async (workspaceId: string, path: string | null) => {
     setIsLoadingDiff(true);
@@ -2747,8 +2819,10 @@ export function App() {
               availableModels={availableModels}
               branchError={branchError}
               chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
+              contextUsage={contextUsage}
               draftMessage={draftMessage}
               gitBranches={gitBranches}
+              isLoadingContextUsage={isLoadingContextUsage}
               isLoadingSettings={isLoadingSettings}
               isLoadingBranches={isLoadingBranches}
               isSendingMessage={isSendingMessage}
@@ -3598,8 +3672,10 @@ function ChatPanel({
   branchError,
   chatScrollKey,
   canRetryRun,
+  contextUsage,
   draftMessage,
   gitBranches,
+  isLoadingContextUsage,
   isLoadingBranches,
   isLoadingSettings,
   isSendingMessage,
@@ -3624,8 +3700,10 @@ function ChatPanel({
   branchError: string | null;
   chatScrollKey: string;
   canRetryRun: boolean;
+  contextUsage: ContextUsageResponse | null;
   draftMessage: string;
   gitBranches: GitBranchesResponse | null;
+  isLoadingContextUsage: boolean;
   isLoadingBranches: boolean;
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
@@ -3963,10 +4041,15 @@ function ChatPanel({
                 <RefreshCw aria-hidden="true" className="size-4" />
               </button>
             ) : null}
+              <ContextUsageCircle
+                isLoading={isLoadingContextUsage}
+                className="ml-auto"
+                usage={contextUsage}
+              />
               {isSendingMessage ? (
                 <button
                   aria-label={t("Cancel run")}
-                  className="composer-run-button ml-auto inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                  className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
                   onClick={onCancelRun}
                   title={t("Cancel run")}
                   type="button"
@@ -3976,7 +4059,7 @@ function ChatPanel({
               ) : (
                 <button
                   aria-label={t("Send message")}
-                  className="composer-run-button ml-auto inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                  className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
                   disabled={!draftMessage.trim() || !selectedModelId}
                   title={t("Send")}
                   type="submit"
@@ -3993,6 +4076,53 @@ function ChatPanel({
           ) : null}
         </form>
       </div>
+    </div>
+  );
+}
+
+function ContextUsageCircle({
+  className = "",
+  isLoading,
+  usage,
+}: {
+  className?: string;
+  isLoading: boolean;
+  usage: ContextUsageResponse | null;
+}) {
+  const { t } = useI18n();
+  const percent = usage?.usagePercent ?? null;
+  const percentLabel = percent ?? 0;
+  const boundedPercent =
+    percent === null ? 0 : Math.max(0, Math.min(100, percent));
+  const title =
+    usage === null
+      ? t("Context usage")
+      : usage.willCompressOnNextSend
+        ? `${t("Context usage {percent}%", { percent: percentLabel })}. ${t(
+            "Context compression may run on the next send",
+          )}`
+        : t("Context usage {percent}%", { percent: percentLabel });
+  const tone =
+    usage?.willCompressOnNextSend ||
+    (usage !== null && percent !== null && percent >= usage.compressionTriggerPercent)
+      ? "context-usage-circle-critical"
+      : percent !== null && percent >= 70
+        ? "context-usage-circle-warn"
+        : "context-usage-circle-normal";
+
+  return (
+    <div
+      aria-label={title}
+      className={`context-usage-circle ${tone} ${
+        isLoading ? "context-usage-circle-loading" : ""
+      } ${className}`}
+      role="status"
+      style={{
+        "--context-usage-percent": `${boundedPercent}%`,
+      } as CSSProperties}
+      title={title}
+    >
+      {percent === null ? "--" : `${percent}%`}
     </div>
   );
 }

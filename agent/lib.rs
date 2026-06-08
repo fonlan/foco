@@ -342,7 +342,7 @@ fn normalize_workspace_path(path: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn context_compression_trigger_tokens(available_tokens: u64) -> u64 {
+pub fn context_compression_trigger_tokens(available_tokens: u64) -> u64 {
     available_tokens.saturating_mul(CONTEXT_COMPRESSION_TRIGGER_NUMERATOR)
         / CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR
 }

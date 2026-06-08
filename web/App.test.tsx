@@ -437,6 +437,15 @@ const taskGraph = {
   updatedAt: "2026-06-05T10:05:00Z",
 };
 
+const contextUsage = {
+  availableMessageTokens: 110960,
+  compressionTriggerPercent: 80,
+  compressionTriggerTokens: 88768,
+  usagePercent: 47,
+  usedMessageTokens: 52340,
+  willCompressOnNextSend: false,
+};
+
 let activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null =
   null;
 let terminalSessionCounter = 0;
@@ -525,6 +534,32 @@ describe("App verification surfaces", () => {
     expect(branchDetails).toHaveAttribute("open");
     await user.click(document.body);
     expect(branchDetails).not.toHaveAttribute("open");
+  });
+
+  it("shows context usage beside the send button", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "continue");
+
+    const usage = await screen.findByRole("status", {
+      name: "Context usage 47%",
+    });
+    expect(usage).toHaveTextContent("47%");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/workspaces/workspace-1/context-usage",
+      expect.objectContaining({
+        body: JSON.stringify({
+          chatId: "chat-1",
+          draftMessage: "continue",
+          modelId: "gpt-test",
+          skillIds: null,
+          thinkingLevel: null,
+        }),
+        method: "POST",
+      }),
+    );
   });
 
   it("waits for a streaming Mermaid fence to close before rendering", async () => {
@@ -1135,6 +1170,10 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
 
   if (path === "/api/workspaces/workspace-1/git/diff") {
     return jsonResponse(gitDiff);
+  }
+
+  if (path === "/api/workspaces/workspace-1/context-usage") {
+    return jsonResponse(contextUsage);
   }
 
   if (path === "/api/workspaces/workspace-1/terminal/session") {
