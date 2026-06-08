@@ -86,10 +86,10 @@ npm run frontend
 ```
 
 On Windows release builds, double-clicking `foco.exe` starts the local HTTP
-server in the background and keeps Foco in the system tray. Use the tray menu to
-open the local web UI in the browser or quit Foco cleanly. When the configured
-listen address is `0.0.0.0`, Open Foco still opens `127.0.0.1` for local browser
-access.
+server in the background and keeps Foco in the system tray. The tray menu
+labels follow the configured app language. Use the tray menu to open the local
+web UI in the browser or quit Foco cleanly. When the configured listen address
+is `0.0.0.0`, Open Foco opens `127.0.0.1` for local browser access.
 
 The repository-root `foco.svg` is the single icon source. Vite publishes it as
 the web favicon and the browser UI logo, and Windows builds generate and embed

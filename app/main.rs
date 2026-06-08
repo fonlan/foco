@@ -80,6 +80,9 @@ use crate::git_backend::{
     git_status_response, is_git_workspace, switch_git_branch as switch_git_branch_in_workspace,
 };
 
+#[cfg(all(windows, not(debug_assertions)))]
+use std::sync::atomic::AtomicU32;
+
 mod git_backend;
 mod logging;
 mod terminal;
@@ -111,6 +114,38 @@ const TRAY_OPEN_ITEM_ID: &str = "foco-open-ui";
 #[cfg(all(windows, not(debug_assertions)))]
 const TRAY_QUIT_ITEM_ID: &str = "foco-quit";
 
+#[cfg(all(windows, not(debug_assertions)))]
+#[derive(Clone)]
+struct TrayMenuUpdateNotifier {
+    sender: std::sync::mpsc::Sender<TrayMenuLabels>,
+    thread_id: Arc<AtomicU32>,
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+impl TrayMenuUpdateNotifier {
+    fn notify(&self, labels: TrayMenuLabels) -> Result<(), String> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_NULL};
+
+        let thread_id = self.thread_id.load(Ordering::SeqCst);
+        if thread_id == 0 {
+            return Err("tray menu message thread is not ready".to_string());
+        }
+
+        self.sender
+            .send(labels)
+            .map_err(|_| "tray menu update receiver is closed".to_string())?;
+        let posted = unsafe { PostThreadMessageW(thread_id, WM_NULL, 0, 0) };
+        if posted == 0 {
+            return Err(format!(
+                "failed to wake tray menu message loop: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     config: Arc<Mutex<GlobalConfig>>,
@@ -123,6 +158,8 @@ struct AppState {
     mcp_registry: Arc<McpRegistry>,
     question_registry: QuestionRegistry,
     _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
+    #[cfg(all(windows, not(debug_assertions)))]
+    tray_menu_update_notifier: TrayMenuUpdateNotifier,
 }
 
 #[derive(Clone, Default)]
@@ -396,7 +433,10 @@ async fn run_entrypoint() -> AppResult<()> {
     }
 }
 
-async fn run_server_until_shutdown(shutdown_rx: Option<watch::Receiver<bool>>) -> AppResult<()> {
+async fn run_server_until_shutdown(
+    shutdown_rx: Option<watch::Receiver<bool>>,
+    #[cfg(all(windows, not(debug_assertions)))] tray_menu_update_notifier: TrayMenuUpdateNotifier,
+) -> AppResult<()> {
     let loaded_config = load_or_create_global_config()?;
     logging::init(&loaded_config.paths.logs_dir)?;
 
@@ -436,6 +476,8 @@ async fn run_server_until_shutdown(shutdown_rx: Option<watch::Receiver<bool>>) -
         mcp_registry: mcp_registry.clone(),
         question_registry: QuestionRegistry::default(),
         _code_graph_watchers: Arc::new(code_graph_watchers),
+        #[cfg(all(windows, not(debug_assertions)))]
+        tray_menu_update_notifier,
     };
     let app = app_router(state);
     let listener = TcpListener::bind(addr).await?;
@@ -542,6 +584,13 @@ fn run_windows_tray_entrypoint() -> AppResult<()> {
     let loaded_config = load_or_create_global_config()?;
     let addr = local_addr(&loaded_config.config)?;
     let ui_url = format!("http://{}", browser_addr_for_listen_addr(addr));
+    let labels = tray_menu_labels(&loaded_config.config.app.language)?;
+    let (tray_menu_update_tx, tray_menu_update_rx) = std::sync::mpsc::channel();
+    let tray_menu_thread_id = Arc::new(AtomicU32::new(0));
+    let tray_menu_update_notifier = TrayMenuUpdateNotifier {
+        sender: tray_menu_update_tx,
+        thread_id: tray_menu_thread_id.clone(),
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let runtime_thread = std::thread::Builder::new()
         .name("foco-http-runtime".to_string())
@@ -550,13 +599,22 @@ fn run_windows_tray_entrypoint() -> AppResult<()> {
                 .enable_all()
                 .build()
                 .expect("failed to build Foco HTTP runtime");
-            if let Err(error) = runtime.block_on(run_server_until_shutdown(Some(shutdown_rx))) {
+            if let Err(error) = runtime.block_on(run_server_until_shutdown(
+                Some(shutdown_rx),
+                tray_menu_update_notifier,
+            )) {
                 eprintln!("Foco server failed: {error}");
                 std::process::exit(1);
             }
         })?;
 
-    run_windows_tray_loop(ui_url, shutdown_tx)?;
+    run_windows_tray_loop(
+        ui_url,
+        shutdown_tx,
+        labels,
+        tray_menu_update_rx,
+        tray_menu_thread_id,
+    )?;
     runtime_thread
         .join()
         .map_err(|_| "Foco HTTP runtime thread panicked")?;
@@ -632,18 +690,27 @@ async fn shutdown_signal(
 fn run_windows_tray_loop(
     ui_url: String,
     shutdown_tx: watch::Sender<bool>,
+    labels: TrayMenuLabels,
+    tray_menu_update_rx: std::sync::mpsc::Receiver<TrayMenuLabels>,
+    tray_menu_thread_id: Arc<AtomicU32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use tray_icon::{
         TrayIconBuilder,
         menu::{Menu, MenuItem, PredefinedMenuItem},
     };
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_QUIT,
+        DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, TranslateMessage, WM_QUIT,
     };
 
+    let mut message = MSG::default();
+    unsafe {
+        PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_NOREMOVE);
+        tray_menu_thread_id.store(GetCurrentThreadId(), Ordering::SeqCst);
+    }
     let tray_menu = Menu::new();
-    let open_item = MenuItem::with_id(TRAY_OPEN_ITEM_ID, "Open Foco", true, None);
-    let quit_item = MenuItem::with_id(TRAY_QUIT_ITEM_ID, "Quit Foco", true, None);
+    let open_item = MenuItem::with_id(TRAY_OPEN_ITEM_ID, labels.open, true, None);
+    let quit_item = MenuItem::with_id(TRAY_QUIT_ITEM_ID, labels.quit, true, None);
     let separator = PredefinedMenuItem::separator();
     tray_menu.append_items(&[&open_item, &separator, &quit_item])?;
     let _tray_icon = TrayIconBuilder::new()
@@ -654,8 +721,8 @@ fn run_windows_tray_loop(
 
     loop {
         drain_tray_events(&ui_url, &shutdown_tx);
+        drain_tray_menu_updates(&tray_menu_update_rx, &open_item, &quit_item);
 
-        let mut message = MSG::default();
         let message_result = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };
         if message_result == -1 {
             return Err(Box::new(std::io::Error::last_os_error()));
@@ -671,6 +738,18 @@ fn run_windows_tray_loop(
     }
 
     Ok(())
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn drain_tray_menu_updates(
+    tray_menu_update_rx: &std::sync::mpsc::Receiver<TrayMenuLabels>,
+    open_item: &tray_icon::menu::MenuItem,
+    quit_item: &tray_icon::menu::MenuItem,
+) {
+    while let Ok(labels) = tray_menu_update_rx.try_recv() {
+        open_item.set_text(labels.open);
+        quit_item.set_text(labels.quit);
+    }
 }
 
 #[cfg(all(windows, not(debug_assertions)))]
@@ -1067,6 +1146,7 @@ async fn save_general_settings(
     Json(request): Json<ManualGeneralSettingsRequest>,
 ) -> Result<Response, ApiError> {
     let mut config = config_snapshot(&state)?;
+    let current_language = config.app.language.clone();
     let should_set_auth_cookie = request
         .password
         .as_ref()
@@ -1075,8 +1155,10 @@ async fn save_general_settings(
 
     config.app.web_server = normalize_web_server_settings(&config.app.web_server, &request)?;
     config.app.language = normalize_app_language(&request.language)?;
+    validate_tray_menu_language(&config.app.language)?;
 
     save_config(&state, config.clone())?;
+    notify_tray_menu_language_change(&state, &current_language, &config.app.language)?;
 
     let response = settings_response(&state, &config).await?;
     if should_set_auth_cookie {
@@ -1093,6 +1175,43 @@ async fn save_general_settings(
     }
 
     Ok(response.into_response())
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn validate_tray_menu_language(language: &str) -> Result<(), ApiError> {
+    tray_menu_labels(language)
+        .map(|_| ())
+        .map_err(ApiError::internal)
+}
+
+#[cfg(any(not(windows), debug_assertions))]
+fn validate_tray_menu_language(_language: &str) -> Result<(), ApiError> {
+    Ok(())
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn notify_tray_menu_language_change(
+    state: &AppState,
+    current_language: &str,
+    next_language: &str,
+) -> Result<(), ApiError> {
+    if current_language == next_language {
+        return Ok(());
+    }
+
+    state
+        .tray_menu_update_notifier
+        .notify(tray_menu_labels(next_language).map_err(ApiError::internal)?)
+        .map_err(ApiError::internal)
+}
+
+#[cfg(any(not(windows), debug_assertions))]
+fn notify_tray_menu_language_change(
+    _state: &AppState,
+    _current_language: &str,
+    _next_language: &str,
+) -> Result<(), ApiError> {
+    Ok(())
 }
 
 async fn save_manual_provider(
@@ -7519,6 +7638,31 @@ fn parse_port(value: &str) -> Result<u16, String> {
 }
 
 #[cfg(any(test, all(windows, not(debug_assertions))))]
+#[derive(Debug, PartialEq, Eq)]
+struct TrayMenuLabels {
+    open: &'static str,
+    quit: &'static str,
+}
+
+#[cfg(any(test, all(windows, not(debug_assertions))))]
+fn tray_menu_labels(language: &str) -> Result<TrayMenuLabels, String> {
+    match language {
+        "zh-CN" => Ok(TrayMenuLabels {
+            open: "打开 Foco",
+            quit: "退出 Foco",
+        }),
+        "en" => Ok(TrayMenuLabels {
+            open: "Open Foco",
+            quit: "Quit Foco",
+        }),
+        _ => Err(format!(
+            "app language '{language}' is unsupported; expected one of {}",
+            SUPPORTED_APP_LANGUAGES.join(", ")
+        )),
+    }
+}
+
+#[cfg(any(test, all(windows, not(debug_assertions))))]
 fn browser_addr_for_listen_addr(addr: SocketAddr) -> SocketAddr {
     let host = match addr.ip() {
         IpAddr::V4(ip) if ip.octets() == [0, 0, 0, 0] => IpAddr::from([127, 0, 0, 1]),
@@ -7687,6 +7831,28 @@ mod tests {
             browser_addr_for_listen_addr(SocketAddr::from(([192, 168, 1, 10], 3210))).to_string(),
             "192.168.1.10:3210"
         );
+    }
+
+    #[test]
+    fn tray_menu_labels_follow_app_language() {
+        assert_eq!(
+            tray_menu_labels("en").expect("English tray labels"),
+            TrayMenuLabels {
+                open: "Open Foco",
+                quit: "Quit Foco",
+            }
+        );
+        assert_eq!(
+            tray_menu_labels("zh-CN").expect("Chinese tray labels"),
+            TrayMenuLabels {
+                open: "打开 Foco",
+                quit: "退出 Foco",
+            }
+        );
+
+        let error = tray_menu_labels("fr").expect_err("unsupported language should fail");
+
+        assert!(error.contains("app language 'fr' is unsupported"));
     }
 
     #[test]
