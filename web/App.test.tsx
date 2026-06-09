@@ -813,6 +813,25 @@ describe("App verification surfaces", () => {
     expect(branchDetails).not.toHaveAttribute("open");
   });
 
+  it("keeps Shift+Enter in the composer as a newline", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const user = userEvent.setup();
+    render(<App />);
+
+    const composer = await screen.findByPlaceholderText("Message Foco");
+    await user.click(composer);
+    await user.keyboard("Line one{Shift>}{Enter}{/Shift}Line two");
+
+    expect(composer).toHaveValue("Line one\nLine two");
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/chat/stream",
+      ),
+    ).toBe(false);
+  });
+
   it("shows context usage beside the send button", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);

@@ -4722,6 +4722,7 @@ function ChatPanel({
                 if (
                   event.key !== "Enter" ||
                   event.ctrlKey ||
+                  event.shiftKey ||
                   event.nativeEvent.isComposing
                 ) {
                   return;
