@@ -13,6 +13,8 @@ use foco_providers::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::memory::global_memory_database_path;
+
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_WORKSPACE_ID: &str = "default";
 pub const DEFAULT_WORKSPACE_NAME: &str = "Default";
@@ -70,6 +72,7 @@ pub struct FocoPaths {
     pub user_profile_dir: PathBuf,
     pub root_dir: PathBuf,
     pub config_file: PathBuf,
+    pub memory_database_file: PathBuf,
     pub workspace_dir: PathBuf,
     pub logs_dir: PathBuf,
 }
@@ -93,6 +96,7 @@ impl FocoPaths {
         Self {
             user_profile_dir,
             config_file: root_dir.join("config.json"),
+            memory_database_file: global_memory_database_path(&root_dir),
             workspace_dir: root_dir.join("workspace"),
             logs_dir: root_dir.join("logs"),
             root_dir,
@@ -1369,6 +1373,10 @@ mod tests {
 
         assert!(loaded.paths.root_dir.is_dir());
         assert!(loaded.paths.config_file.is_file());
+        assert_eq!(
+            loaded.paths.memory_database_file,
+            loaded.paths.root_dir.join("memory.sqlite")
+        );
         assert!(loaded.paths.workspace_dir.is_dir());
         assert_eq!(
             loaded.config.app.active_workspace_id,

@@ -49,6 +49,15 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "code_graph_file_hashes",
         "code_graph_parse_status",
         "task_graphs",
+        "hook_runs",
+        "memory_sources",
+        "memory_facts",
+        "memory_fact_sources",
+        "memory_edges",
+        "memory_fts_data",
+        "memory_fts_index",
+        "memory_profiles",
+        "memory_extraction_jobs",
     ] {
         assert!(
             table_exists(&connection, table),
@@ -115,6 +124,52 @@ fn backs_up_existing_database_before_migration() {
         .expect("backup entries");
     assert_eq!(backups.len(), 1);
     assert!(backups[0].path().is_file());
+}
+
+#[test]
+fn chat_memory_facts_cascade_when_chat_is_deleted() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Memory chat")
+        .expect("chat insert");
+
+    {
+        let connection = Connection::open(database.database_path()).expect("open database");
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("enable foreign keys");
+        connection
+            .execute_batch(
+                "INSERT INTO memory_sources
+                    (id, scope, chat_id, source_type, source_id, title, content, metadata_json, created_at, updated_at)
+                 VALUES
+                    ('source-1', 'chat', 'chat-1', 'manual_note', NULL, 'Note', 'Remember this session fact.', '{}', '2026-06-09T00:00:00Z', '2026-06-09T00:00:00Z');
+                 INSERT INTO memory_facts
+                    (id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest, metadata_json, created_at, updated_at)
+                 VALUES
+                    ('fact-1', 'chat', 'chat-1', 'active', 'user_note', 'Remember this session fact.', 1.0, 0, 1, '{}', '2026-06-09T00:00:00Z', '2026-06-09T00:00:00Z');
+                 INSERT INTO memory_fact_sources (fact_id, source_id)
+                 VALUES ('fact-1', 'source-1');
+                 INSERT INTO memory_fts_data
+                    (fact_id, scope, chat_id, status, kind, title, body, updated_at)
+                 VALUES
+                    ('fact-1', 'chat', 'chat-1', 'active', 'user_note', 'user_note', 'Remember this session fact.', '2026-06-09T00:00:00Z');",
+            )
+            .expect("memory rows");
+        assert_eq!(table_count(&connection, "memory_facts"), 1);
+        assert_eq!(table_count(&connection, "memory_fts_index"), 1);
+    }
+
+    assert!(database.delete_chat("chat-1").expect("chat delete"));
+
+    let connection = Connection::open(database.database_path()).expect("open database");
+    assert_eq!(table_count(&connection, "memory_facts"), 0);
+    assert_eq!(table_count(&connection, "memory_fact_sources"), 0);
+    assert_eq!(table_count(&connection, "memory_fts_data"), 0);
+    assert_eq!(table_count(&connection, "memory_fts_index"), 0);
 }
 
 #[test]
@@ -1005,4 +1060,12 @@ fn table_exists(connection: &Connection, table: &str) -> bool {
             |row| row.get::<_, bool>(0),
         )
         .expect("table exists query")
+}
+
+fn table_count(connection: &Connection, table: &str) -> i64 {
+    connection
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .expect("table count query")
 }

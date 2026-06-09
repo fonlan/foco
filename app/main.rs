@@ -54,6 +54,7 @@ use foco_store::{
         load_workspace_hook_config, save_global_config, save_workspace_hook_config,
         workspace_hook_config_path,
     },
+    memory::MemoryDatabase,
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
         parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
@@ -462,6 +463,14 @@ async fn run_server_until_shutdown(
         config = %loaded_config.config.to_redacted_log_json()?,
         "loaded global config"
     );
+
+    let global_memory_database =
+        MemoryDatabase::open_or_create_global_at(&loaded_config.paths.memory_database_file)?;
+    tracing::info!(
+        path = %global_memory_database.database_path().display(),
+        "initialized global memory database"
+    );
+    drop(global_memory_database);
 
     let workspace_databases = initialize_workspace_databases(&loaded_config.config.workspaces)?;
     tracing::info!(

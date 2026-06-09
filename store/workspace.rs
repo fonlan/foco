@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::WorkspaceConfig;
+use crate::memory::WORKSPACE_MEMORY_SCHEMA_SQL;
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 6;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 7;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -39,6 +40,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 6,
         sql: MIGRATION_006,
+    },
+    Migration {
+        version: 7,
+        sql: WORKSPACE_MEMORY_SCHEMA_SQL,
     },
 ];
 
