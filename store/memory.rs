@@ -785,6 +785,41 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn extraction_jobs(
+        &self,
+        status: Option<MemoryExtractionJobStatus>,
+        limit: u32,
+    ) -> Result<Vec<MemoryExtractionJobRecord>, MemoryDatabaseError> {
+        if self.kind == MemoryDatabaseKind::Global {
+            return Ok(Vec::new());
+        }
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, scope, chat_id, status, model_id, input_json, output_json,
+                        error_message, created_at, started_at, completed_at
+                 FROM memory_extraction_jobs
+                 WHERE (?1 IS NULL OR status = ?1)
+                 ORDER BY created_at DESC, id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(
+                params![status.map(MemoryExtractionJobStatus::as_str), limit],
+                memory_extraction_job_from_row,
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn fact(&self, id: &str) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("id", id)?;
         self.connection
@@ -2394,6 +2429,11 @@ mod tests {
                 .expect("output json")["password"],
             "[REDACTED]"
         );
+        let all_failed = memory
+            .extraction_jobs(Some(MemoryExtractionJobStatus::Failed), 10)
+            .expect("all failed jobs");
+        assert_eq!(all_failed.len(), 1);
+        assert_eq!(all_failed[0].id, "job-1");
 
         assert!(
             memory

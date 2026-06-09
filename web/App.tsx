@@ -291,8 +291,21 @@ type MemorySourceRecord = {
   updatedAt: string;
 };
 
+type MemoryExtractionJobSummary = {
+  id: string;
+  scope: string;
+  chatId: string | null;
+  status: string;
+  modelId: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+};
+
 type MemoryListResponse = {
   memories: MemoryFactRecord[];
+  extractionJobs: MemoryExtractionJobSummary[];
 };
 
 type MemoryMutationResponse = {
@@ -1145,6 +1158,9 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No memory sources": "暂无记忆来源",
     "Edit memory": "编辑记忆",
     "Save memory": "保存记忆",
+    "Extraction failures": "抽取失败",
+    "No extraction failures": "暂无抽取失败",
+    "Memory extraction failed": "记忆抽取失败",
     "Web service listen address": "Web 服务监听地址",
     "Provider credentials and connection checks": "供应商凭据与连接检查",
     "Workspace-scoped MCP server runtimes": "工作区级 MCP 服务运行时",
@@ -7016,6 +7032,9 @@ function SettingsPanel({
   const [editMemoryForm, setEditMemoryForm] =
     useState<ManualMemoryFormState>(() => emptyManualMemoryForm());
   const [memories, setMemories] = useState<MemoryFactRecord[]>([]);
+  const [memoryExtractionJobs, setMemoryExtractionJobs] = useState<
+    MemoryExtractionJobSummary[]
+  >([]);
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
   const [memorySources, setMemorySources] = useState<MemorySourceRecord[]>([]);
   const [workspaceForm, setWorkspaceForm] = useState<WorkspaceFormState>(() =>
@@ -7334,6 +7353,7 @@ function SettingsPanel({
         `/api/memory?${params.toString()}`,
       );
       setMemories(data.memories);
+      setMemoryExtractionJobs(data.extractionJobs ?? []);
       setSelectedMemoryId((current) =>
         current && data.memories.some((memory) => memory.id === current)
           ? current
@@ -9434,6 +9454,47 @@ function SettingsPanel({
                     </button>
                   ))
                 )}
+              </div>
+              <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                <div className="flex items-center gap-2">
+                  <CircleAlert aria-hidden="true" className="size-4 text-rose-700" />
+                  <h4 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+                    {t("Extraction failures")}
+                  </h4>
+                </div>
+                <div className="mt-2 grid gap-2">
+                  {memoryExtractionJobs.length === 0 ? (
+                    <div className="text-sm text-stone-500">
+                      {t("No extraction failures")}
+                    </div>
+                  ) : (
+                    memoryExtractionJobs.map((job) => (
+                      <div
+                        className="rounded-lg border border-rose-100 bg-white px-3 py-2"
+                        key={job.id}
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          <CapabilityPill label={job.status} ok={false} />
+                          <CapabilityPill
+                            label={job.modelId ?? t("Default")}
+                            ok={false}
+                          />
+                          {job.chatId ? (
+                            <span className="text-xs font-semibold text-stone-500">
+                              {job.chatId}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="mt-2 text-sm font-semibold text-rose-700">
+                          {job.errorMessage ?? t("Memory extraction failed")}
+                        </div>
+                        <div className="mt-1 text-xs text-stone-500">
+                          {job.completedAt ?? job.startedAt ?? job.createdAt}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
               </div>
               {selectedMemory ? (
                 <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">

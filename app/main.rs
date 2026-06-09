@@ -2173,6 +2173,21 @@ struct MemorySourcesQuery {
 #[serde(rename_all = "camelCase")]
 struct MemoryListResponse {
     memories: Vec<MemoryFactRecord>,
+    extraction_jobs: Vec<MemoryExtractionJobSummary>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryExtractionJobSummary {
+    id: String,
+    scope: String,
+    chat_id: Option<String>,
+    status: String,
+    model_id: Option<String>,
+    error_message: Option<String>,
+    created_at: String,
+    started_at: Option<String>,
+    completed_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2225,8 +2240,18 @@ async fn memory_list(
             .list_facts_for_scope(chat_id.as_deref(), status, limit)
             .map_err(ApiError::from_memory_error)?
     };
+    let extraction_jobs = memory_extraction_job_summaries(
+        scope,
+        &database,
+        chat_id.as_deref(),
+        MemoryExtractionJobStatus::Failed,
+        20,
+    )?;
 
-    Ok(Json(MemoryListResponse { memories }))
+    Ok(Json(MemoryListResponse {
+        memories,
+        extraction_jobs,
+    }))
 }
 
 async fn create_manual_memory(
@@ -2279,6 +2304,39 @@ async fn create_manual_memory(
         .map_err(ApiError::from_memory_error)?;
 
     Ok(Json(MemoryMutationResponse { memory }))
+}
+
+fn memory_extraction_job_summaries(
+    scope: MemoryScope,
+    database: &MemoryDatabase,
+    chat_id: Option<&str>,
+    status: MemoryExtractionJobStatus,
+    limit: u32,
+) -> Result<Vec<MemoryExtractionJobSummary>, ApiError> {
+    let jobs = match scope {
+        MemoryScope::Global => Vec::new(),
+        MemoryScope::Chat => database
+            .extraction_jobs_for_scope(chat_id, Some(status), limit)
+            .map_err(ApiError::from_memory_error)?,
+        MemoryScope::Workspace => database
+            .extraction_jobs(Some(status), limit)
+            .map_err(ApiError::from_memory_error)?,
+    };
+
+    Ok(jobs
+        .into_iter()
+        .map(|job| MemoryExtractionJobSummary {
+            id: job.id,
+            scope: job.scope,
+            chat_id: job.chat_id,
+            status: job.status,
+            model_id: job.model_id,
+            error_message: job.error_message,
+            created_at: job.created_at,
+            started_at: job.started_at,
+            completed_at: job.completed_at,
+        })
+        .collect())
 }
 
 async fn update_memory_status(
@@ -3758,6 +3816,7 @@ struct PreparedChatContext {
     context_budget: foco_agent::ContextBudget,
     global_config: GlobalConfig,
     memory_settings: MemorySettings,
+    memory_target_status: MemoryStatus,
     request_body_json: String,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
@@ -3804,6 +3863,7 @@ struct MemoryExtractionTask {
     user_message_id: String,
     assistant_message_id: String,
     model_id: String,
+    target_status: MemoryStatus,
     config: GlobalConfig,
 }
 
@@ -5117,6 +5177,7 @@ async fn prepare_chat_context(
         context_budget: prompt_context.context_budget,
         global_config: config.clone(),
         memory_settings: config.memory.clone(),
+        memory_target_status: memory_target_status_for_prompt(raw_message),
         request_body_json,
         compression_snapshots: prompt_context.compression_snapshots,
         message_source_sequences: prompt_context.message_source_sequences,
@@ -6283,7 +6344,7 @@ fn queue_memory_extraction_job(
         .unwrap_or(&context.model_id);
     let input_json = json!({
         "trigger": "chat_completed",
-        "targetStatus": "pending",
+        "targetStatus": context.memory_target_status.as_str(),
         "workspaceId": context.workspace_id,
         "chatId": context.chat_id,
         "runId": context.llm_request_id,
@@ -6323,6 +6384,7 @@ fn queue_memory_extraction_job(
             user_message_id: context.user_message_id.clone(),
             assistant_message_id: context.assistant_message_id.clone(),
             model_id: model_id.to_string(),
+            target_status: context.memory_target_status,
             config: context.global_config.clone(),
         };
         handle.spawn(async move {
@@ -6336,6 +6398,19 @@ fn queue_memory_extraction_job(
     }
 
     Ok(())
+}
+
+fn memory_target_status_for_prompt(message: &str) -> MemoryStatus {
+    let normalized = message.trim().to_ascii_lowercase();
+
+    if normalized.starts_with("remember this")
+        || normalized.starts_with("remember:")
+        || normalized.starts_with("please remember")
+    {
+        MemoryStatus::Active
+    } else {
+        MemoryStatus::Pending
+    }
 }
 
 async fn run_memory_extraction_job(task: MemoryExtractionTask) -> Result<(), ApiError> {
@@ -6868,7 +6943,7 @@ fn store_extracted_memory_facts(
                 id: &fact_id,
                 scope: fact.scope,
                 chat_id: (fact.scope == MemoryScope::Chat).then_some(task.chat_id.as_str()),
-                status: MemoryStatus::Pending,
+                status: task.target_status,
                 kind: fact.kind,
                 fact: &fact.fact,
                 confidence: fact.confidence,
@@ -13139,6 +13214,7 @@ description: Project memory.
                 retention_days: None,
                 extraction_model_id: Some("extract-model".to_string()),
             },
+            memory_target_status: MemoryStatus::Pending,
             request_body_json: "{}".to_string(),
             compression_snapshots: Vec::new(),
             message_source_sequences: vec![Some(0)],
@@ -13266,6 +13342,53 @@ description: Project memory.
     }
 
     #[test]
+    fn memory_list_summarizes_failed_extraction_jobs() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-job-summary-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Failed extraction")
+                .expect("chat insert");
+        }
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        memory_database
+            .insert_extraction_job(NewMemoryExtractionJob {
+                id: "job-1",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                status: MemoryExtractionJobStatus::Failed,
+                model_id: Some("model-1"),
+                input_json: r#"{"safe":"ok"}"#,
+                output_json: None,
+                error_message: Some("malformed memory extraction JSON"),
+            })
+            .expect("failed job insert");
+
+        let summaries = memory_extraction_job_summaries(
+            MemoryScope::Workspace,
+            &memory_database,
+            None,
+            MemoryExtractionJobStatus::Failed,
+            10,
+        )
+        .expect("job summaries");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "job-1");
+        assert_eq!(
+            summaries[0].error_message.as_deref(),
+            Some("malformed memory extraction JSON")
+        );
+
+        drop(memory_database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
     fn memory_extraction_validates_required_fact_fields() {
         let output = parse_memory_extraction_output(json!({
             "facts": [{
@@ -13330,6 +13453,7 @@ description: Project memory.
             user_message_id: "user-1".to_string(),
             assistant_message_id: "assistant-1".to_string(),
             model_id: "model-1".to_string(),
+            target_status: MemoryStatus::Pending,
             config: GlobalConfig::first_run(workspace_dir.clone()),
         };
         let evidence = vec![MemoryExtractionEvidenceCandidate {
@@ -13372,6 +13496,86 @@ description: Project memory.
             .expect("fact sources");
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].source_id.as_deref(), Some("user-1"));
+
+        drop(memory_database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn explicit_remember_this_extraction_stores_active_facts() {
+        assert_eq!(
+            memory_target_status_for_prompt("remember this: prefer concise replies"),
+            MemoryStatus::Active
+        );
+        assert_eq!(
+            memory_target_status_for_prompt("please remember I use Foco"),
+            MemoryStatus::Active
+        );
+        assert_eq!(
+            memory_target_status_for_prompt("we discussed a preference"),
+            MemoryStatus::Pending
+        );
+
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-remember-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Explicit memory")
+                .expect("chat insert");
+        }
+        let task = MemoryExtractionTask {
+            job_id: "job-1".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            workspace_path: workspace_dir.clone(),
+            global_memory_database_file: workspace_dir.join("global-memory.sqlite"),
+            chat_id: "chat-1".to_string(),
+            run_id: "run-1".to_string(),
+            user_message_id: "user-1".to_string(),
+            assistant_message_id: "assistant-1".to_string(),
+            model_id: "model-1".to_string(),
+            target_status: MemoryStatus::Active,
+            config: GlobalConfig::first_run(workspace_dir.clone()),
+        };
+        let evidence = vec![MemoryExtractionEvidenceCandidate {
+            evidence_id: "user_message".to_string(),
+            source_type: MemorySourceType::ChatMessage,
+            source_id: "user-1".to_string(),
+            title: "User message".to_string(),
+            content: "Remember this: prefer concise replies.".to_string(),
+            metadata: json!({"role":"user"}),
+        }];
+        let output = parse_memory_extraction_output(json!({
+            "facts": [{
+                "scope": "chat",
+                "kind": "preference",
+                "fact": "Prefer concise replies.",
+                "confidence": 0.9,
+                "relationCandidates": [],
+                "evidenceReferences": [{
+                    "evidenceId": "user_message",
+                    "quote": "prefer concise replies"
+                }]
+            }]
+        }))
+        .expect("valid extraction JSON");
+
+        store_extracted_memory_facts(&task, &evidence, &output).expect("store extracted facts");
+
+        let memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        let active_facts = memory_database
+            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Active, 10)
+            .expect("active facts");
+        let pending_facts = memory_database
+            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Pending, 10)
+            .expect("pending facts");
+
+        assert_eq!(active_facts.len(), 1);
+        assert_eq!(active_facts[0].fact, "Prefer concise replies.");
+        assert!(pending_facts.is_empty());
 
         drop(memory_database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");

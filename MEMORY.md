@@ -142,11 +142,11 @@ memory graph in Foco. It is not the runtime memory store.
 - [x] Store extracted facts as `pending` by default.
 - [x] Allow direct `active` writes only for explicit user memory requests.
 - [x] Record extraction job status: `queued`, `running`, `completed`, `failed`.
-- [ ] Surface extraction failures in the Memory UI.
+- [x] Surface extraction failures in the Memory UI.
 - [x] Redact secrets before storing extraction input/output.
 - [x] Add tests for malformed extraction JSON.
 - [x] Add tests for missing evidence rejection.
-- [ ] Add tests for explicit "remember this" behavior.
+- [x] Add tests for explicit "remember this" behavior.
 
 ## Phase 6 - Graph Maintenance
 

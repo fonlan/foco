@@ -231,6 +231,18 @@ const memorySource = {
   updatedAt: "2026-06-09T02:00:00Z",
 };
 
+const memoryExtractionJob = {
+  chatId: "chat-test",
+  completedAt: "2026-06-09T02:10:00Z",
+  createdAt: "2026-06-09T02:09:00Z",
+  errorMessage: "malformed memory extraction JSON",
+  id: "memory-job-1",
+  modelId: "gpt-test",
+  scope: "chat",
+  startedAt: "2026-06-09T02:09:30Z",
+  status: "failed",
+};
+
 const aiStatistics = {
   page: 1,
   pageSize: 50,
@@ -1131,6 +1143,7 @@ describe("App verification surfaces", () => {
     expect(await screen.findByText("Memory settings")).toBeInTheDocument();
     expect((await screen.findAllByText(activeMemory.fact)).length).toBeGreaterThan(0);
     expect(await screen.findByText(memorySource.content)).toBeInTheDocument();
+    expect(await screen.findByText(memoryExtractionJob.errorMessage)).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText("Enable memory"));
     await userEvent.selectOptions(screen.getByLabelText("Extraction mode"), "pending_review");
@@ -1619,6 +1632,7 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   if (path === "/api/memory") {
     const status = requestUrl.searchParams.get("status");
     return jsonResponse({
+      extractionJobs: [memoryExtractionJob],
       memories: status === "pending" ? [pendingMemory] : [activeMemory],
     });
   }
