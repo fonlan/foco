@@ -865,6 +865,7 @@ type ViewMode = "chat" | "settings" | "stats";
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
+const WORKSPACE_CHAT_HISTORY_PAGE_SIZE = 10;
 const MAX_CHAT_ATTACHMENTS = 6;
 const MAX_CHAT_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024;
@@ -943,6 +944,9 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Add workspace": "添加工作区",
     "Collapse chat history": "收起聊天历史",
     "Expand chat history": "展开聊天历史",
+    "Show {count} more chats": "继续展开 {count} 个会话",
+    "Show {count} more chats in {name}": "在 {name} 中继续展开 {count} 个会话",
+    "{count} hidden chats": "还有 {count} 个会话",
     "New chat": "新建聊天",
     "New chat in {name}": "在 {name} 中新建聊天",
     "Delete chat": "删除聊天",
@@ -1542,6 +1546,9 @@ export function App() {
   const [expandedWorkspaceId, setExpandedWorkspaceId] = useState<string | null>(
     null,
   );
+  const [workspaceChatVisibleCounts, setWorkspaceChatVisibleCounts] = useState<
+    Record<string, number>
+  >({});
   const [viewMode, setViewMode] = useState<ViewMode>("chat");
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [workspaceDialogRevision, setWorkspaceDialogRevision] = useState(0);
@@ -2962,6 +2969,15 @@ export function App() {
     );
   }
 
+  function showMoreWorkspaceChats(workspaceId: string) {
+    setWorkspaceChatVisibleCounts((current) => ({
+      ...current,
+      [workspaceId]:
+        (current[workspaceId] ?? WORKSPACE_CHAT_HISTORY_PAGE_SIZE) +
+        WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
+    }));
+  }
+
   function openWorkspaceDialog() {
     setWorkspaceName("");
     setWorkspacePath("");
@@ -3214,148 +3230,212 @@ export function App() {
             <nav className="panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3">
               {workspaces.length ? (
                 workspaces.map((workspace) => {
-                const isExpanded = expandedWorkspaceId === workspace.id;
-                const isActive = workspace.id === activeWorkspace?.id;
-                const isNewChatActive = isActive && activeChatId === null;
+                  const isExpanded = expandedWorkspaceId === workspace.id;
+                  const isActive = workspace.id === activeWorkspace?.id;
+                  const isNewChatActive = isActive && activeChatId === null;
+                  const selectedChatIndex =
+                    isActive && activeChatId
+                      ? workspace.chats.findIndex(
+                          (chat) => chat.id === activeChatId,
+                        )
+                      : -1;
+                  const configuredVisibleChatCount =
+                    workspaceChatVisibleCounts[workspace.id] ??
+                    WORKSPACE_CHAT_HISTORY_PAGE_SIZE;
+                  const visibleChatCount =
+                    selectedChatIndex >= configuredVisibleChatCount
+                      ? selectedChatIndex + 1
+                      : configuredVisibleChatCount;
+                  const visibleChats = workspace.chats.slice(0, visibleChatCount);
+                  const hiddenChatCount = Math.max(
+                    workspace.chats.length - visibleChats.length,
+                    0,
+                  );
+                  const nextVisibleChatCount = Math.min(
+                    WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
+                    hiddenChatCount,
+                  );
 
-                return (
-                  <div className="mb-1.5" key={workspace.id}>
-                    <div className={workspaceMenuClass(isActive)}>
-                      <button
-                        aria-expanded={isExpanded}
-                        className={workspaceItemClass(isActive)}
-                        onClick={() => toggleWorkspace(workspace.id)}
-                        title={
-                          isExpanded
-                            ? t("Collapse chat history")
-                            : t("Expand chat history")
-                        }
-                        type="button"
-                      >
-                        <WorkspaceIcon
-                          className="size-4 shrink-0 rounded object-cover"
-                          fallbackClassName="size-4 shrink-0"
-                          logoUrl={workspace.logoUrl}
-                        />
-                        <span className="min-w-0 flex-1 truncate text-left">
-                          {workspace.name}
-                        </span>
-                      </button>
-                      <button
-                        aria-label={t("New chat in {name}", {
-                          name: workspace.name,
-                        })}
-                        className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-stone-500 hover:text-teal-800"
-                        onClick={() => startNewWorkspaceChat(workspace.id)}
-                        title={t("New chat")}
-                        type="button"
-                      >
-                        <Plus aria-hidden="true" className="size-4" />
-                      </button>
-                    </div>
-                    {isExpanded ? (
-                      <div className="ml-4 mt-1 space-y-1 border-l border-stone-200/80 pl-2">
-                        {isNewChatActive ? (
-                          <div className="group flex min-w-0 items-center gap-1">
-                            <button
-                              aria-current="page"
-                              className={chatItemClass(true)}
-                              onClick={() => startNewWorkspaceChat(workspace.id)}
-                              type="button"
-                            >
-                              <MessageSquare
-                                aria-hidden="true"
-                                className="size-3.5 shrink-0"
-                              />
-                              <span className="min-w-0 flex-1">
-                                <span className="block truncate">
-                                  {t("New chat")}
-                                </span>
-                                <span
-                                  aria-hidden="true"
-                                  className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-transparent"
-                                >
-                                  0
-                                </span>
-                              </span>
-                            </button>
-                            <span
-                              aria-hidden="true"
-                              className="inline-flex size-7 shrink-0"
-                            />
-                          </div>
-                        ) : null}
-                        {workspace.chats.length > 0 ? (
-                          workspace.chats.map((chat) => {
-                            const isChatRunning =
-                              runningChatKey === chatRunKey(workspace.id, chat.id);
-                            const isChatActive =
-                              activeWorkspace?.id === workspace.id &&
-                              activeChatId === chat.id;
-
-                            return (
-                              <div
-                                className="group flex min-w-0 items-center gap-1"
-                                key={chat.id}
+                  return (
+                    <div className="mb-1.5" key={workspace.id}>
+                      <div className={workspaceMenuClass(isActive)}>
+                        <button
+                          aria-expanded={isExpanded}
+                          className={workspaceItemClass(isActive)}
+                          onClick={() => toggleWorkspace(workspace.id)}
+                          title={
+                            isExpanded
+                              ? t("Collapse chat history")
+                              : t("Expand chat history")
+                          }
+                          type="button"
+                        >
+                          <WorkspaceIcon
+                            className="size-4 shrink-0 rounded object-cover"
+                            fallbackClassName="size-4 shrink-0"
+                            logoUrl={workspace.logoUrl}
+                          />
+                          <span className="min-w-0 flex-1 truncate text-left">
+                            {workspace.name}
+                          </span>
+                        </button>
+                        <button
+                          aria-label={t("New chat in {name}", {
+                            name: workspace.name,
+                          })}
+                          className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-stone-500 hover:text-teal-800"
+                          onClick={() => startNewWorkspaceChat(workspace.id)}
+                          title={t("New chat")}
+                          type="button"
+                        >
+                          <Plus aria-hidden="true" className="size-4" />
+                        </button>
+                      </div>
+                      {isExpanded ? (
+                        <div className="ml-4 mt-1 space-y-1 border-l border-stone-200/80 pl-2">
+                          {isNewChatActive ? (
+                            <div className="group flex min-w-0 items-center gap-1">
+                              <button
+                                aria-current="page"
+                                className={chatItemClass(true)}
+                                onClick={() => startNewWorkspaceChat(workspace.id)}
+                                type="button"
                               >
-                                <button
-                                  aria-current={
-                                    isChatActive ? "page" : undefined
-                                  }
-                                  className={chatItemClass(isChatActive)}
-                                  onClick={() =>
-                                    selectWorkspaceChat(workspace.id, chat.id)
-                                  }
-                                  type="button"
-                                >
-                                  {isChatRunning ? (
-                                    <LoaderCircle
-                                      aria-hidden="true"
-                                      className="size-3.5 shrink-0 animate-spin text-teal-700"
-                                    />
-                                  ) : (
-                                    <MessageSquare
+                                <MessageSquare
+                                  aria-hidden="true"
+                                  className="size-3.5 shrink-0"
+                                />
+                                <span className="min-w-0 flex-1">
+                                  <span className="block truncate">
+                                    {t("New chat")}
+                                  </span>
+                                  <span
+                                    aria-hidden="true"
+                                    className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-transparent"
+                                  >
+                                    0
+                                  </span>
+                                </span>
+                              </button>
+                              <span
+                                aria-hidden="true"
+                                className="inline-flex size-7 shrink-0"
+                              />
+                            </div>
+                          ) : null}
+                          {workspace.chats.length > 0 ? (
+                            <>
+                              {visibleChats.map((chat) => {
+                                const isChatRunning =
+                                  runningChatKey ===
+                                  chatRunKey(workspace.id, chat.id);
+                                const isChatActive =
+                                  activeWorkspace?.id === workspace.id &&
+                                  activeChatId === chat.id;
+
+                                return (
+                                  <div
+                                    className="group flex min-w-0 items-center gap-1"
+                                    key={chat.id}
+                                  >
+                                    <button
+                                      aria-current={
+                                        isChatActive ? "page" : undefined
+                                      }
+                                      className={chatItemClass(isChatActive)}
+                                      onClick={() =>
+                                        selectWorkspaceChat(workspace.id, chat.id)
+                                      }
+                                      type="button"
+                                    >
+                                      {isChatRunning ? (
+                                        <LoaderCircle
+                                          aria-hidden="true"
+                                          className="size-3.5 shrink-0 animate-spin text-teal-700"
+                                        />
+                                      ) : (
+                                        <MessageSquare
+                                          aria-hidden="true"
+                                          className="size-3.5 shrink-0"
+                                        />
+                                      )}
+                                      <span className="min-w-0 flex-1">
+                                        <span className="block truncate">
+                                          {chat.title}
+                                        </span>
+                                        <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-stone-400">
+                                          {formatChatCreatedAt(chat.createdAt)}
+                                        </span>
+                                      </span>
+                                    </button>
+                                    <button
+                                      aria-label={t("Delete chat {title}", {
+                                        title: chat.title,
+                                      })}
+                                      className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
+                                      onClick={() =>
+                                        requestDeleteWorkspaceChat(workspace, chat)
+                                      }
+                                      title={t("Delete chat")}
+                                      type="button"
+                                    >
+                                      <Trash2
+                                        aria-hidden="true"
+                                        className="size-3.5"
+                                      />
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                              {hiddenChatCount > 0 ? (
+                                <div className="group flex min-w-0 items-center gap-1">
+                                  <button
+                                    aria-label={t(
+                                      "Show {count} more chats in {name}",
+                                      {
+                                        count: nextVisibleChatCount,
+                                        name: workspace.name,
+                                      },
+                                    )}
+                                    className="flex min-h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-stone-500 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
+                                    onClick={() =>
+                                      showMoreWorkspaceChats(workspace.id)
+                                    }
+                                    type="button"
+                                  >
+                                    <ChevronDown
                                       aria-hidden="true"
                                       className="size-3.5 shrink-0"
                                     />
-                                  )}
-                                  <span className="min-w-0 flex-1">
-                                    <span className="block truncate">
-                                      {chat.title}
+                                    <span className="min-w-0 flex-1">
+                                      <span className="block truncate">
+                                        {t("Show {count} more chats", {
+                                          count: nextVisibleChatCount,
+                                        })}
+                                      </span>
+                                      <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-stone-400">
+                                        {t("{count} hidden chats", {
+                                          count: hiddenChatCount,
+                                        })}
+                                      </span>
                                     </span>
-                                    <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-stone-400">
-                                      {formatChatCreatedAt(chat.createdAt)}
-                                    </span>
-                                  </span>
-                                </button>
-                                <button
-                                  aria-label={t("Delete chat {title}", {
-                                    title: chat.title,
-                                  })}
-                                  className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
-                                  onClick={() =>
-                                    requestDeleteWorkspaceChat(workspace, chat)
-                                  }
-                                  title={t("Delete chat")}
-                                  type="button"
-                                >
-                                  <Trash2
+                                  </button>
+                                  <span
                                     aria-hidden="true"
-                                    className="size-3.5"
+                                    className="inline-flex size-7 shrink-0"
                                   />
-                                </button>
-                              </div>
-                            );
-                          })
-                        ) : !isNewChatActive ? (
-                          <div className="rounded-lg px-2 py-1.5 text-xs text-stone-500">
-                            {t("No chats")}
-                          </div>
-                        ) : null}
-                      </div>
-                    ) : null}
-                  </div>
-                );
+                                </div>
+                              ) : null}
+                            </>
+                          ) : !isNewChatActive ? (
+                            <div className="rounded-lg px-2 py-1.5 text-xs text-stone-500">
+                              {t("No chats")}
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
                 })
               ) : (
                 <div className="mx-2 rounded-lg border border-dashed border-stone-300 bg-white/60 px-3 py-4 text-sm text-stone-500">

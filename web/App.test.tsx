@@ -31,6 +31,12 @@ const workspace = {
       title: "Second chat",
       updatedAt: "2026-06-05T11:05:00Z",
     },
+    ...Array.from({ length: 10 }, (_, index) => ({
+      createdAt: `2026-06-04T${String(10 - index).padStart(2, "0")}:00:00Z`,
+      id: `older-chat-${index + 1}`,
+      title: `Older chat ${index + 1}`,
+      updatedAt: `2026-06-04T${String(10 - index).padStart(2, "0")}:05:00Z`,
+    })),
   ],
   id: "workspace-1",
   logoUrl: "/api/workspaces/workspace-1/logo?v=1",
@@ -1053,6 +1059,22 @@ describe("App verification surfaces", () => {
     await userEvent.click(sideToggle);
     expect(sideToggle).toHaveAttribute("aria-expanded", "true");
     expect(await screen.findByText("Side note")).toBeInTheDocument();
+  });
+
+  it("shows only the first 10 workspace chats until the menu item expands more", async () => {
+    render(<App />);
+
+    expect(await screen.findByText("Older chat 8")).toBeInTheDocument();
+    expect(screen.queryByText("Older chat 9")).not.toBeInTheDocument();
+    expect(screen.getByText("2 hidden chats")).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Show 2 more chats in Default" }),
+    );
+
+    expect(screen.getByText("Older chat 9")).toBeInTheDocument();
+    expect(screen.getByText("Older chat 10")).toBeInTheDocument();
+    expect(screen.queryByText("2 hidden chats")).not.toBeInTheDocument();
   });
 
   it("opens center chat tabs and closes tabs without deleting chat history", async () => {
