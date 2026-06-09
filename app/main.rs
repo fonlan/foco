@@ -118,6 +118,11 @@ const MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT: u32 = 12;
 const MEMORY_PROFILE_REFRESH_FACT_LIMIT: u32 = 32;
 const MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX: &str = "Foco memory profile context:";
 const MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX: &str = "Foco retrieved memory context:";
+const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
+const MEMORY_WRITE_TOOL_NAME: &str = "memory_write";
+const DEFAULT_MEMORY_TOOL_TIMEOUT_MS: u64 = 10_000;
+const MAX_MEMORY_TOOL_TIMEOUT_MS: u64 = 120_000;
+const MAX_MEMORY_TOOL_SEARCH_LIMIT: u32 = 50;
 const MEMORY_EXTRACTION_TOOL_NAME: &str = "submit_memory_extraction";
 const MEMORY_EXTRACTION_TIMEOUT_MS: u64 = 60_000;
 const MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 2048;
@@ -4003,6 +4008,78 @@ impl RetrievedMemorySource {
 }
 
 #[derive(Clone)]
+struct MemoryToolContext {
+    enabled: bool,
+    workspace_path: PathBuf,
+    global_memory_database_file: PathBuf,
+    chat_id: String,
+    run_id: String,
+    tool_call_id: String,
+    target_status: MemoryStatus,
+    memory_settings: MemorySettings,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryToolSearchScope {
+    Global,
+    Workspace,
+    Chat,
+    Auto,
+}
+
+impl MemoryToolSearchScope {
+    fn parse(value: &str) -> Result<Self, ApiError> {
+        match value.trim() {
+            "global" => Ok(Self::Global),
+            "workspace" => Ok(Self::Workspace),
+            "chat" => Ok(Self::Chat),
+            "auto" => Ok(Self::Auto),
+            other => Err(ApiError::bad_request(format!(
+                "unknown memory search scope: {other}"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+            Self::Chat => "chat",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MemorySearchToolInput {
+    query: String,
+    scope: String,
+    limit: Option<u32>,
+    include_related: Option<bool>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MemoryWriteToolInput {
+    scope: String,
+    kind: String,
+    fact: String,
+    confidence: Option<f64>,
+    pinned: Option<bool>,
+    reason: Option<String>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+struct MemorySearchMatch {
+    fact: MemoryFactRecord,
+    match_source: String,
+    source_count: i64,
+}
+
+#[derive(Clone)]
 struct MemoryExtractionTask {
     job_id: String,
     workspace_id: String,
@@ -4711,6 +4788,16 @@ impl PreparedChatContext {
                                     self.provider_config.clone(),
                                     self.question_registry.clone(),
                                     question_event_tx,
+                                    MemoryToolContext {
+                                        enabled: self.memory_settings.enabled,
+                                        workspace_path: self.workspace_path.clone(),
+                                        global_memory_database_file: self.memory_database_file.clone(),
+                                        chat_id: self.chat_id.clone(),
+                                        run_id: self.llm_request_id.clone(),
+                                        tool_call_id: String::new(),
+                                        target_status: self.memory_target_status,
+                                        memory_settings: self.memory_settings.clone(),
+                                    },
                                     &self.workspace_id,
                                     &self.workspace_path,
                                     &self.chat_id,
@@ -5062,11 +5149,17 @@ async fn prepare_prompt_context(
     let user_sequence = next_message_sequence(&existing_messages);
 
     let builtin_tool_definitions = builtin_tool_definitions();
+    let memory_tool_definitions = if config.memory.enabled {
+        memory_tool_definitions()
+    } else {
+        Vec::new()
+    };
     let mut neutral_tools = builtin_tool_definitions
         .iter()
         .cloned()
         .map(neutral_tool_definition)
         .collect::<Vec<_>>();
+    neutral_tools.extend(memory_tool_definitions.iter().cloned());
     neutral_tools.extend(mcp_tools.iter().map(neutral_mcp_tool_definition));
     let tool_prompt_infos = builtin_tool_definitions
         .iter()
@@ -5074,6 +5167,10 @@ async fn prepare_prompt_context(
             name: tool.name.to_string(),
             description: tool.description.to_string(),
         })
+        .chain(memory_tool_definitions.iter().map(|tool| ToolPromptInfo {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+        }))
         .chain(mcp_tools.iter().map(|tool| ToolPromptInfo {
             name: tool.name.clone(),
             description: format!(
@@ -6973,6 +7070,478 @@ fn memory_extraction_provider_request(
     })
 }
 
+fn memory_tool_definitions() -> Vec<NeutralToolDefinition> {
+    vec![
+        NeutralToolDefinition {
+            name: MEMORY_SEARCH_TOOL_NAME.to_string(),
+            description: "Search active Foco memories in global, workspace, current chat, or automatic combined scope. Returns fact ids, scope, source counts, and match source."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search text for memory facts. Must not be empty."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "workspace", "chat", "auto"],
+                        "description": "Search scope. chat means current chat only; workspace means current workspace only; auto combines current chat, workspace, and global."
+                    },
+                    "limit": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "maximum": MAX_MEMORY_TOOL_SEARCH_LIMIT,
+                        "description": "Maximum direct matches per searched scope. Null uses the default."
+                    },
+                    "includeRelated": {
+                        "type": ["boolean", "null"],
+                        "description": "When true, include graph-related active memories linked to direct matches."
+                    },
+                    "timeoutMs": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "maximum": MAX_MEMORY_TOOL_TIMEOUT_MS,
+                        "description": "Tool timeout in milliseconds. Null uses the default."
+                    }
+                },
+                "required": ["query", "scope", "limit", "includeRelated", "timeoutMs"]
+            }),
+            strict: true,
+        },
+        NeutralToolDefinition {
+            name: MEMORY_WRITE_TOOL_NAME.to_string(),
+            description: "Write a Foco memory fact with a source note. Facts are pending unless the user's current prompt explicitly asked Foco to remember it."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "scope": {
+                        "type": "string",
+                        "enum": ["global", "workspace", "chat"],
+                        "description": "Memory storage scope."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["preference", "project_fact", "project_decision", "procedure", "constraint", "episode", "user_note"],
+                        "description": "Memory kind."
+                    },
+                    "fact": {
+                        "type": "string",
+                        "description": "Atomic memory fact text. Must not be empty."
+                    },
+                    "confidence": {
+                        "type": ["number", "null"],
+                        "minimum": 0,
+                        "maximum": 1
+                    },
+                    "pinned": {
+                        "type": ["boolean", "null"]
+                    },
+                    "reason": {
+                        "type": ["string", "null"],
+                        "description": "Brief reason this fact should be saved."
+                    },
+                    "timeoutMs": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "maximum": MAX_MEMORY_TOOL_TIMEOUT_MS,
+                        "description": "Tool timeout in milliseconds. Null uses the default."
+                    }
+                },
+                "required": ["scope", "kind", "fact", "confidence", "pinned", "reason", "timeoutMs"]
+            }),
+            strict: true,
+        },
+    ]
+}
+
+fn is_memory_tool_name(tool_name: &str) -> bool {
+    matches!(tool_name, MEMORY_SEARCH_TOOL_NAME | MEMORY_WRITE_TOOL_NAME)
+}
+
+fn memory_tool_timeout_ms(arguments: &Value) -> Result<u64, String> {
+    match arguments.get("timeoutMs") {
+        Some(Value::Null) | None => Ok(DEFAULT_MEMORY_TOOL_TIMEOUT_MS),
+        Some(Value::Number(timeout_ms)) => {
+            let timeout_ms = timeout_ms
+                .as_u64()
+                .ok_or_else(|| "timeoutMs must be an integer or null".to_string())?;
+            if timeout_ms == 0 || timeout_ms > MAX_MEMORY_TOOL_TIMEOUT_MS {
+                Err(format!(
+                    "timeoutMs must be between 1 and {MAX_MEMORY_TOOL_TIMEOUT_MS} milliseconds"
+                ))
+            } else {
+                Ok(timeout_ms)
+            }
+        }
+        Some(_) => Err("timeoutMs must be an integer or null".to_string()),
+    }
+}
+
+fn execute_memory_tool(
+    context: &MemoryToolContext,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    if !context.enabled {
+        return Err("memory tools are disabled in settings".to_string());
+    }
+
+    match tool_name {
+        MEMORY_SEARCH_TOOL_NAME => {
+            let input =
+                serde_json::from_value::<MemorySearchToolInput>(arguments).map_err(|source| {
+                    format!("memory_search arguments do not match schema: {source}")
+                })?;
+            execute_memory_search_tool(context, input).map_err(|error| error.message)
+        }
+        MEMORY_WRITE_TOOL_NAME => {
+            let input =
+                serde_json::from_value::<MemoryWriteToolInput>(arguments).map_err(|source| {
+                    format!("memory_write arguments do not match schema: {source}")
+                })?;
+            execute_memory_write_tool(context, input).map_err(|error| error.message)
+        }
+        other => Err(format!("unknown memory tool: {other}")),
+    }
+}
+
+fn execute_memory_search_tool(
+    context: &MemoryToolContext,
+    input: MemorySearchToolInput,
+) -> Result<Value, ApiError> {
+    memory_tool_timeout_ms_from_input(input.timeout_ms)?;
+    let query = normalized_required_text("query", &input.query)?;
+    let search_query = memory_fts_query(&query).ok_or_else(|| {
+        ApiError::bad_request("memory_search query must contain at least one searchable term")
+    })?;
+    let scope = MemoryToolSearchScope::parse(&input.scope)?;
+    let limit = input
+        .limit
+        .unwrap_or(10)
+        .clamp(1, MAX_MEMORY_TOOL_SEARCH_LIMIT);
+    let include_related = input.include_related.unwrap_or(false);
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+
+    match scope {
+        MemoryToolSearchScope::Global => {
+            let mut database =
+                MemoryDatabase::open_or_create_global_at(&context.global_memory_database_file)
+                    .map_err(ApiError::from_memory_error)?;
+            expire_due_memories(&mut database)?;
+            collect_memory_search_matches(
+                &mut database,
+                &search_query,
+                MemoryToolSearchScope::Global,
+                None,
+                limit,
+                include_related,
+                &mut seen,
+                &mut matches,
+            )?;
+        }
+        MemoryToolSearchScope::Workspace => {
+            let mut database =
+                MemoryDatabase::open_workspace_at(workspace_database_path(&context.workspace_path))
+                    .map_err(ApiError::from_memory_error)?;
+            expire_due_memories(&mut database)?;
+            collect_memory_search_matches(
+                &mut database,
+                &search_query,
+                MemoryToolSearchScope::Workspace,
+                None,
+                limit,
+                include_related,
+                &mut seen,
+                &mut matches,
+            )?;
+        }
+        MemoryToolSearchScope::Chat => {
+            let mut database =
+                MemoryDatabase::open_workspace_at(workspace_database_path(&context.workspace_path))
+                    .map_err(ApiError::from_memory_error)?;
+            expire_due_memories(&mut database)?;
+            collect_memory_search_matches(
+                &mut database,
+                &search_query,
+                MemoryToolSearchScope::Chat,
+                Some(&context.chat_id),
+                limit,
+                include_related,
+                &mut seen,
+                &mut matches,
+            )?;
+        }
+        MemoryToolSearchScope::Auto => {
+            let mut workspace_database =
+                MemoryDatabase::open_workspace_at(workspace_database_path(&context.workspace_path))
+                    .map_err(ApiError::from_memory_error)?;
+            expire_due_memories(&mut workspace_database)?;
+            collect_memory_search_matches(
+                &mut workspace_database,
+                &search_query,
+                MemoryToolSearchScope::Chat,
+                Some(&context.chat_id),
+                limit,
+                include_related,
+                &mut seen,
+                &mut matches,
+            )?;
+            collect_memory_search_matches(
+                &mut workspace_database,
+                &search_query,
+                MemoryToolSearchScope::Workspace,
+                None,
+                limit,
+                include_related,
+                &mut seen,
+                &mut matches,
+            )?;
+
+            let mut global_database =
+                MemoryDatabase::open_or_create_global_at(&context.global_memory_database_file)
+                    .map_err(ApiError::from_memory_error)?;
+            expire_due_memories(&mut global_database)?;
+            collect_memory_search_matches(
+                &mut global_database,
+                &search_query,
+                MemoryToolSearchScope::Global,
+                None,
+                limit,
+                include_related,
+                &mut seen,
+                &mut matches,
+            )?;
+        }
+    }
+
+    let fact_ids = matches
+        .iter()
+        .map(|item| item.fact.id.clone())
+        .collect::<Vec<_>>();
+    let total_source_count = matches.iter().map(|item| item.source_count).sum::<i64>();
+    let memories = matches
+        .into_iter()
+        .map(|item| {
+            json!({
+                "id": item.fact.id,
+                "scope": item.fact.scope,
+                "chatId": item.fact.chat_id,
+                "status": item.fact.status,
+                "kind": item.fact.kind,
+                "fact": item.fact.fact,
+                "confidence": item.fact.confidence,
+                "pinned": item.fact.pinned,
+                "isLatest": item.fact.is_latest,
+                "updatedAt": item.fact.updated_at,
+                "sourceCount": item.source_count,
+                "matchSource": item.match_source,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "summary": {
+            "scope": scope.as_str(),
+            "count": memories.len(),
+            "factIds": fact_ids,
+            "sourceCount": total_source_count,
+        },
+        "memories": memories,
+    }))
+}
+
+fn collect_memory_search_matches(
+    database: &mut MemoryDatabase,
+    query: &str,
+    scope: MemoryToolSearchScope,
+    chat_id: Option<&str>,
+    limit: u32,
+    include_related: bool,
+    seen: &mut HashSet<(String, String)>,
+    matches: &mut Vec<MemorySearchMatch>,
+) -> Result<(), ApiError> {
+    let chat_filter = if scope == MemoryToolSearchScope::Chat {
+        chat_id
+    } else {
+        None
+    };
+    let direct_facts = database
+        .search_active_facts_for_scope(query, chat_filter, limit)
+        .map_err(ApiError::from_memory_error)?;
+    let direct_facts = direct_facts
+        .into_iter()
+        .filter(|fact| memory_search_fact_matches_scope(fact, scope, chat_id))
+        .collect::<Vec<_>>();
+    let direct_ids = direct_facts
+        .iter()
+        .map(|fact| fact.id.clone())
+        .collect::<Vec<_>>();
+
+    for fact in direct_facts {
+        push_memory_search_match(database, fact, "direct", seen, matches)?;
+    }
+
+    if include_related {
+        let related_facts = database
+            .related_active_facts(
+                &direct_ids,
+                MEMORY_CONTEXT_EDGE_EXPANSION_DEPTH,
+                MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT,
+            )
+            .map_err(ApiError::from_memory_error)?;
+        for fact in related_facts {
+            push_memory_search_match(database, fact, "related", seen, matches)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn memory_search_fact_matches_scope(
+    fact: &MemoryFactRecord,
+    scope: MemoryToolSearchScope,
+    chat_id: Option<&str>,
+) -> bool {
+    match scope {
+        MemoryToolSearchScope::Global => fact.scope == "global",
+        MemoryToolSearchScope::Workspace => fact.scope == "workspace",
+        MemoryToolSearchScope::Chat => fact.scope == "chat" && fact.chat_id.as_deref() == chat_id,
+        MemoryToolSearchScope::Auto => true,
+    }
+}
+
+fn push_memory_search_match(
+    database: &MemoryDatabase,
+    fact: MemoryFactRecord,
+    match_source: &str,
+    seen: &mut HashSet<(String, String)>,
+    matches: &mut Vec<MemorySearchMatch>,
+) -> Result<(), ApiError> {
+    if !seen.insert((fact.scope.clone(), fact.id.clone())) {
+        return Ok(());
+    }
+    let source_count = database
+        .source_count_for_fact(&fact.id)
+        .map_err(ApiError::from_memory_error)?;
+    matches.push(MemorySearchMatch {
+        fact,
+        match_source: match_source.to_string(),
+        source_count,
+    });
+    Ok(())
+}
+
+fn execute_memory_write_tool(
+    context: &MemoryToolContext,
+    input: MemoryWriteToolInput,
+) -> Result<Value, ApiError> {
+    memory_tool_timeout_ms_from_input(input.timeout_ms)?;
+    let scope = MemoryScope::parse(input.scope.trim()).map_err(ApiError::from_memory_error)?;
+    let kind = MemoryKind::parse(input.kind.trim()).map_err(ApiError::from_memory_error)?;
+    let fact = normalized_required_text("fact", &input.fact)?;
+    let reason = normalized_optional_text(input.reason);
+    let chat_id = (scope == MemoryScope::Chat).then_some(context.chat_id.as_str());
+    let mut database = match scope {
+        MemoryScope::Global => {
+            MemoryDatabase::open_or_create_global_at(&context.global_memory_database_file)
+        }
+        MemoryScope::Workspace | MemoryScope::Chat => {
+            MemoryDatabase::open_workspace_at(workspace_database_path(&context.workspace_path))
+        }
+    }
+    .map_err(ApiError::from_memory_error)?;
+    let source_id = unique_id("memory-source");
+    let memory_id = unique_id("memory-fact");
+    let metadata_json = serde_json::to_string(&json!({
+        "source": MEMORY_WRITE_TOOL_NAME,
+        "runId": &context.run_id,
+        "toolCallId": &context.tool_call_id,
+        "reason": reason,
+    }))
+    .map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize memory tool metadata: {source}"
+        ))
+    })?;
+    let source_content = match reason.as_deref() {
+        Some(reason) => format!("{fact}\n\nReason: {reason}"),
+        None => fact.clone(),
+    };
+    database
+        .insert_source(NewMemorySource {
+            id: &source_id,
+            scope,
+            chat_id,
+            source_type: MemorySourceType::ManualNote,
+            source_id: Some(&context.tool_call_id),
+            title: "Agent memory write",
+            content: &source_content,
+            metadata_json: &metadata_json,
+        })
+        .map_err(ApiError::from_memory_error)?;
+    database
+        .insert_fact(NewMemoryFact {
+            id: &memory_id,
+            scope,
+            chat_id,
+            status: context.target_status,
+            kind,
+            fact: &fact,
+            confidence: input.confidence,
+            pinned: input.pinned.unwrap_or(false),
+            source_ids: &[source_id.as_str()],
+            metadata_json: &metadata_json,
+        })
+        .map_err(ApiError::from_memory_error)?;
+    apply_memory_expiration_to_fact(&mut database, &memory_id, &context.memory_settings)?;
+    refresh_memory_profile(&mut database, scope, chat_id)?;
+    let memory = database
+        .fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| ApiError::internal(format!("memory fact was not found: {memory_id}")))?;
+    let source_count = database
+        .source_count_for_fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?;
+
+    Ok(json!({
+        "summary": {
+            "scope": memory.scope,
+            "status": memory.status,
+            "factIds": [memory.id],
+            "sourceCount": source_count,
+        },
+        "memory": {
+            "id": memory.id,
+            "scope": memory.scope,
+            "chatId": memory.chat_id,
+            "status": memory.status,
+            "kind": memory.kind,
+            "fact": memory.fact,
+            "confidence": memory.confidence,
+            "pinned": memory.pinned,
+            "isLatest": memory.is_latest,
+            "updatedAt": memory.updated_at,
+            "sourceCount": source_count,
+        }
+    }))
+}
+
+fn memory_tool_timeout_ms_from_input(timeout_ms: Option<u64>) -> Result<u64, ApiError> {
+    let timeout_ms = timeout_ms.unwrap_or(DEFAULT_MEMORY_TOOL_TIMEOUT_MS);
+    if timeout_ms == 0 || timeout_ms > MAX_MEMORY_TOOL_TIMEOUT_MS {
+        Err(ApiError::bad_request(format!(
+            "timeoutMs must be between 1 and {MAX_MEMORY_TOOL_TIMEOUT_MS} milliseconds"
+        )))
+    } else {
+        Ok(timeout_ms)
+    }
+}
+
 fn memory_extraction_tool_definition() -> NeutralToolDefinition {
     NeutralToolDefinition {
         name: MEMORY_EXTRACTION_TOOL_NAME.to_string(),
@@ -7653,6 +8222,7 @@ async fn execute_tool_calls_parallel(
     provider_config: ProviderConnectionConfig,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
+    memory_tool_context: MemoryToolContext,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -7675,6 +8245,7 @@ async fn execute_tool_calls_parallel(
                     provider_config.clone(),
                     question_registry.clone(),
                     question_event_tx.clone(),
+                    memory_tool_context.clone(),
                     workspace_id,
                     workspace_path,
                     chat_id,
@@ -7702,6 +8273,7 @@ async fn execute_tool_calls_parallel(
         let provider_config = provider_config.clone();
         let question_registry = question_registry.clone();
         let question_event_tx = question_event_tx.clone();
+        let memory_tool_context = memory_tool_context.clone();
 
         tokio::spawn(async move {
             execute_tool_call(
@@ -7711,6 +8283,7 @@ async fn execute_tool_calls_parallel(
                 provider_config,
                 question_registry,
                 question_event_tx,
+                memory_tool_context,
                 &workspace_id,
                 &workspace_path,
                 &chat_id,
@@ -7741,6 +8314,7 @@ async fn execute_tool_call(
     provider_config: ProviderConnectionConfig,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
+    mut memory_tool_context: MemoryToolContext,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -7750,6 +8324,7 @@ async fn execute_tool_call(
     tool_call: NeutralToolCall,
 ) -> ToolHookOutcome {
     let started_at_text = utc_timestamp();
+    memory_tool_context.tool_call_id = tool_call.call_id.clone();
     let tool_execution = execute_tool(
         mcp_registry,
         hook_runtime.clone(),
@@ -7757,6 +8332,7 @@ async fn execute_tool_call(
         &provider_config,
         question_registry,
         question_event_tx,
+        memory_tool_context,
         workspace_id,
         workspace_path,
         chat_id,
@@ -7820,6 +8396,7 @@ async fn execute_tool(
     provider_config: &ProviderConnectionConfig,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
+    memory_tool_context: MemoryToolContext,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -8033,6 +8610,47 @@ async fn execute_tool(
         merge_hook_summaries(&mut hook_summary, ask_question.hook_summary);
         return ToolExecutionWithHooks {
             execution: ask_question.execution,
+            hook_summary,
+        };
+    }
+
+    if is_memory_tool_name(tool_name) {
+        let timeout_ms = match memory_tool_timeout_ms(&arguments) {
+            Ok(timeout_ms) => timeout_ms,
+            Err(error) => {
+                return ToolExecutionWithHooks {
+                    execution: ToolExecution {
+                        output: json!({ "error": error }),
+                        is_error: true,
+                    },
+                    hook_summary,
+                };
+            }
+        };
+        let tool_name = tool_name.to_string();
+        let worker_tool_name = tool_name.clone();
+        let worker = tokio::task::spawn_blocking(move || {
+            execute_memory_tool(&memory_tool_context, &worker_tool_name, arguments)
+        });
+        let execution = timeout(Duration::from_millis(timeout_ms), worker)
+            .await
+            .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
+            .and_then(|result| {
+                result.map_err(|source| format!("tool execution worker failed: {source}"))
+            });
+        let execution = match execution {
+            Ok(Ok(output)) => ToolExecution {
+                output,
+                is_error: false,
+            },
+            Ok(Err(error)) | Err(error) => ToolExecution {
+                output: json!({ "error": error }),
+                is_error: true,
+            },
+        };
+
+        return ToolExecutionWithHooks {
+            execution,
             hook_summary,
         };
     }
@@ -8707,7 +9325,10 @@ fn merge_hook_summaries(target: &mut HookRunSummary, source: HookRunSummary) {
 fn tool_call_requires_sequential_execution(tool_call: &NeutralToolCall) -> bool {
     matches!(
         tool_call.name.as_str(),
-        ASK_QUESTION_TOOL | CREATE_TASK_GRAPH_TOOL | UPDATE_TASK_GRAPH_TOOL
+        ASK_QUESTION_TOOL
+            | CREATE_TASK_GRAPH_TOOL
+            | UPDATE_TASK_GRAPH_TOOL
+            | MEMORY_WRITE_TOOL_NAME
     )
 }
 
@@ -12574,6 +13195,8 @@ fn verify_frontend_assets() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+
     use foco_store::config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
     #[test]
@@ -13721,6 +14344,195 @@ description: Project memory.
     }
 
     #[test]
+    fn memory_tool_schemas_are_strict_and_require_all_properties() {
+        for tool in memory_tool_definitions() {
+            assert!(tool.strict, "{} must be strict", tool.name);
+            assert_strict_schema_object(&tool.name, &tool.input_schema);
+        }
+    }
+
+    #[test]
+    fn memory_write_tool_uses_target_status_and_sources() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-write-tool-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let context = memory_tool_test_context(&workspace_dir, MemoryStatus::Pending);
+
+        let output = execute_memory_write_tool(
+            &context,
+            MemoryWriteToolInput {
+                scope: "chat".to_string(),
+                kind: "preference".to_string(),
+                fact: "Prefer compact implementation notes.".to_string(),
+                confidence: Some(0.8),
+                pinned: Some(true),
+                reason: Some("User preference from this run.".to_string()),
+                timeout_ms: None,
+            },
+        )
+        .expect("write memory");
+
+        assert_eq!(output["summary"]["status"], "pending");
+        assert_eq!(output["summary"]["scope"], "chat");
+        assert_eq!(output["summary"]["sourceCount"], 1);
+
+        let database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+        let facts = database
+            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Pending, 10)
+            .expect("pending facts");
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].fact, "Prefer compact implementation notes.");
+        assert!(facts[0].pinned);
+        let sources = database
+            .sources_for_fact(&facts[0].id)
+            .expect("fact sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_type, "manual_note");
+        assert_eq!(sources[0].source_id.as_deref(), Some("tool-call-1"));
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn memory_write_tool_allows_active_when_prompt_requested_memory() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-write-active-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let context = memory_tool_test_context(&workspace_dir, MemoryStatus::Active);
+
+        let output = execute_memory_write_tool(
+            &context,
+            MemoryWriteToolInput {
+                scope: "workspace".to_string(),
+                kind: "project_fact".to_string(),
+                fact: "Phase 7 exposes memory tools to the agent.".to_string(),
+                confidence: None,
+                pinned: None,
+                reason: None,
+                timeout_ms: None,
+            },
+        )
+        .expect("write active memory");
+
+        assert_eq!(output["summary"]["status"], "active");
+        let database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+        let facts = database
+            .list_facts_for_scope(None, MemoryStatus::Active, 10)
+            .expect("active facts");
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].scope, "workspace");
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn memory_tool_execution_rejects_when_memory_disabled() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-tool-disabled-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut context = memory_tool_test_context(&workspace_dir, MemoryStatus::Active);
+        context.enabled = false;
+
+        let error = execute_memory_tool(
+            &context,
+            MEMORY_WRITE_TOOL_NAME,
+            json!({
+                "scope": "workspace",
+                "kind": "project_fact",
+                "fact": "This should not be saved.",
+                "confidence": null,
+                "pinned": null,
+                "reason": null,
+                "timeoutMs": null
+            }),
+        )
+        .expect_err("disabled memory tool should fail");
+
+        assert_eq!(error, "memory tools are disabled in settings");
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn memory_search_tool_respects_scope_and_reports_sources() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-search-tool-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let context = memory_tool_test_context(&workspace_dir, MemoryStatus::Active);
+        seed_memory_tool_fact(
+            &context,
+            MemoryScope::Global,
+            None,
+            "global-fact-1",
+            "Global phoenix keyword memory.",
+        );
+        seed_memory_tool_fact(
+            &context,
+            MemoryScope::Workspace,
+            None,
+            "workspace-fact-1",
+            "Workspace phoenix keyword memory.",
+        );
+        seed_memory_tool_fact(
+            &context,
+            MemoryScope::Chat,
+            Some("chat-1"),
+            "chat-fact-1",
+            "Chat phoenix keyword memory.",
+        );
+
+        let chat_output = execute_memory_search_tool(
+            &context,
+            MemorySearchToolInput {
+                query: "phoenix".to_string(),
+                scope: "chat".to_string(),
+                limit: Some(10),
+                include_related: Some(false),
+                timeout_ms: None,
+            },
+        )
+        .expect("chat search");
+        let chat_memories = chat_output["memories"].as_array().expect("chat memories");
+
+        assert_eq!(chat_memories.len(), 1);
+        assert_eq!(chat_memories[0]["scope"], "chat");
+        assert_eq!(chat_memories[0]["id"], "chat-fact-1");
+        assert_eq!(chat_memories[0]["sourceCount"], 1);
+
+        let auto_output = execute_memory_search_tool(
+            &context,
+            MemorySearchToolInput {
+                query: "phoenix".to_string(),
+                scope: "auto".to_string(),
+                limit: Some(10),
+                include_related: Some(false),
+                timeout_ms: None,
+            },
+        )
+        .expect("auto search");
+        let ids = auto_output["summary"]["factIds"]
+            .as_array()
+            .expect("fact ids")
+            .iter()
+            .map(|id| id.as_str().expect("id").to_string())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            ids,
+            BTreeSet::from([
+                "chat-fact-1".to_string(),
+                "global-fact-1".to_string(),
+                "workspace-fact-1".to_string(),
+            ])
+        );
+        assert_eq!(auto_output["summary"]["sourceCount"], 3);
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
     fn memory_extraction_validates_required_fact_fields() {
         let output = parse_memory_extraction_output(json!({
             "facts": [{
@@ -14403,6 +15215,71 @@ Use the existing product UI conventions.
     }
 
     #[tokio::test]
+    async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-tools-disabled-test"));
+        let profile_dir =
+            env::temp_dir().join(unique_id("foco-memory-tools-disabled-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.memory.enabled = false;
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        let context = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                thinking_level: None,
+                skill_ids: None,
+                message: Some("hello".to_string()),
+                attachments: Vec::new(),
+            },
+            false,
+        )
+        .await
+        .expect("prompt context");
+        let tool_names = context
+            .provider_request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(!tool_names.contains(MEMORY_SEARCH_TOOL_NAME));
+        assert!(!tool_names.contains(MEMORY_WRITE_TOOL_NAME));
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
     async fn prepare_prompt_context_injects_memory_context_after_system_prompt() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-memory-prompt-workspace-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-memory-prompt-profile-test"));
@@ -14859,6 +15736,122 @@ description: Project memory.
     fn remove_dir_if_exists(path: &Path) {
         if path.exists() {
             fs::remove_dir_all(path).expect("remove test directory");
+        }
+    }
+
+    fn assert_strict_schema_object(tool_name: &str, schema: &Value) {
+        let schema_object = schema.as_object().expect("schema object");
+        if schema_object.get("type") == Some(&Value::String("object".to_string())) {
+            assert_eq!(
+                schema_object.get("additionalProperties"),
+                Some(&Value::Bool(false)),
+                "{tool_name} object schema must reject unknown properties"
+            );
+            let properties = schema_object
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("properties object");
+            let required = schema_object
+                .get("required")
+                .and_then(Value::as_array)
+                .expect("required array");
+            let property_names = properties
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let required_names = required
+                .iter()
+                .map(|name| name.as_str().expect("required name"))
+                .collect::<BTreeSet<_>>();
+
+            assert_eq!(
+                required_names, property_names,
+                "{tool_name} required keys must match object properties"
+            );
+        }
+
+        if let Some(properties) = schema_object.get("properties").and_then(Value::as_object) {
+            for value in properties.values() {
+                assert_strict_schema_children(tool_name, value);
+            }
+        }
+    }
+
+    fn assert_strict_schema_children(tool_name: &str, schema: &Value) {
+        if schema.get("type") == Some(&Value::String("object".to_string())) {
+            assert_strict_schema_object(tool_name, schema);
+        }
+        if let Some(items) = schema.get("items") {
+            assert_strict_schema_children(tool_name, items);
+        }
+    }
+
+    fn memory_tool_test_context(
+        workspace_dir: &Path,
+        target_status: MemoryStatus,
+    ) -> MemoryToolContext {
+        let mut workspace_database =
+            WorkspaceDatabase::open_or_create(workspace_dir).expect("workspace database");
+        workspace_database
+            .insert_chat("chat-1", "Memory tool test")
+            .expect("chat insert");
+        drop(workspace_database);
+
+        MemoryToolContext {
+            enabled: true,
+            workspace_path: workspace_dir.to_path_buf(),
+            global_memory_database_file: workspace_dir.join("global-memory.sqlite"),
+            chat_id: "chat-1".to_string(),
+            run_id: "run-1".to_string(),
+            tool_call_id: "tool-call-1".to_string(),
+            target_status,
+            memory_settings: MemorySettings {
+                enabled: true,
+                extraction_mode: "pending_review".to_string(),
+                extraction_model_id: None,
+                retention_days: None,
+            },
+        }
+    }
+
+    fn seed_memory_tool_fact(
+        context: &MemoryToolContext,
+        scope: MemoryScope,
+        chat_id: Option<&str>,
+        fact_id: &str,
+        fact: &str,
+    ) {
+        let source_id = format!("{fact_id}-source");
+        match scope {
+            MemoryScope::Global => {
+                let mut database =
+                    MemoryDatabase::open_or_create_global_at(&context.global_memory_database_file)
+                        .expect("global memory database");
+                insert_test_memory_fact(
+                    &mut database,
+                    &source_id,
+                    fact_id,
+                    scope,
+                    chat_id,
+                    fact,
+                    false,
+                );
+            }
+            MemoryScope::Workspace | MemoryScope::Chat => {
+                let mut database = MemoryDatabase::open_workspace_at(workspace_database_path(
+                    &context.workspace_path,
+                ))
+                .expect("workspace memory database");
+                insert_test_memory_fact(
+                    &mut database,
+                    &source_id,
+                    fact_id,
+                    scope,
+                    chat_id,
+                    fact,
+                    false,
+                );
+            }
         }
     }
 

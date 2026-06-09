@@ -166,16 +166,16 @@ memory graph in Foco. It is not the runtime memory store.
 
 ## Phase 7 - Agent Tools
 
-- [ ] Add `memory_search` tool.
-- [ ] Add `memory_write` tool.
-- [ ] Make `memory_write` create `pending` facts unless the user explicitly
+- [x] Add `memory_search` tool.
+- [x] Add `memory_write` tool.
+- [x] Make `memory_write` create `pending` facts unless the user explicitly
       requested saving a memory.
 - [ ] Add `memory_update` only if edit/promotion flows need agent access.
-- [ ] Keep tool schemas compatible with strict OpenAI Responses requirements.
-- [ ] Include `timeoutMs` in memory tools where required by current tool rules.
-- [ ] Add tool result summaries that show scope, fact ids, and source counts.
-- [ ] Add tests for tool schema strictness.
-- [ ] Add tests for tool permission and scope behavior.
+- [x] Keep tool schemas compatible with strict OpenAI Responses requirements.
+- [x] Include `timeoutMs` in memory tools where required by current tool rules.
+- [x] Add tool result summaries that show scope, fact ids, and source counts.
+- [x] Add tests for tool schema strictness.
+- [x] Add tests for tool permission and scope behavior.
 
 ## Phase 8 - Verification and Release
 

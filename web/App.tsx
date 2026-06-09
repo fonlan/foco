@@ -13722,6 +13722,19 @@ function toolCallDetailText(toolCall: ChatToolCallSummary) {
     }
   }
 
+  if (toolCall.name === "memory_search") {
+    const scope = textField(input, "scope");
+    const query = textField(input, "query");
+    return compactToolText([scope, query].filter(Boolean).join(" | "));
+  }
+
+  if (toolCall.name === "memory_write") {
+    const scope = textField(input, "scope");
+    const kind = textField(input, "kind");
+    const fact = textField(input, "fact");
+    return compactToolText([scope, kind, fact].filter(Boolean).join(" | "));
+  }
+
   const parts = [
     textField(input, "path"),
     textField(input, "query"),
