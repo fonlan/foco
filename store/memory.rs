@@ -413,6 +413,9 @@ impl MemoryDatabase {
         if updated > 0 {
             let updated_fact = fact_by_id(&transaction, &database_path, fact.id)?;
             upsert_fact_record_fts_data(&transaction, &database_path, &updated_fact)?;
+            if fact.status == Some(MemoryStatus::Active) {
+                apply_update_relation_effects(&transaction, &database_path, fact.id, &now)?;
+            }
         }
 
         transaction
@@ -522,8 +525,13 @@ impl MemoryDatabase {
             });
         }
         let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
-        self.connection
+        transaction
             .execute(
                 "INSERT INTO memory_edges
                     (id, source_fact_id, target_fact_id, relation, metadata_json, created_at)
@@ -537,7 +545,15 @@ impl MemoryDatabase {
                     now,
                 ],
             )
-            .map_err(|source| sqlite_error(&self.database_path, source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        if edge.relation == MemoryRelationKind::Updates {
+            apply_update_relation_effects(&transaction, &database_path, edge.source_fact_id, &now)?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
     }
@@ -1863,6 +1879,75 @@ fn update_relation_would_cycle(
     Ok(found.is_some())
 }
 
+fn apply_update_relation_effects(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    source_fact_id: &str,
+    now: &str,
+) -> Result<(), MemoryDatabaseError> {
+    let source_status: String = transaction
+        .query_row(
+            "SELECT status FROM memory_facts WHERE id = ?1",
+            params![source_fact_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    if source_status != MemoryStatus::Active.as_str() {
+        return Ok(());
+    }
+
+    let target_ids = update_relation_target_chain(transaction, database_path, source_fact_id)?;
+    for target_id in target_ids {
+        transaction
+            .execute(
+                "UPDATE memory_facts
+                 SET is_latest = 0,
+                     status = CASE
+                         WHEN status IN ('active', 'pending') THEN 'superseded'
+                         ELSE status
+                     END,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![target_id, now],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        let updated_fact = fact_by_id(transaction, database_path, &target_id)?;
+        upsert_fact_record_fts_data(transaction, database_path, &updated_fact)?;
+    }
+
+    Ok(())
+}
+
+fn update_relation_target_chain(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    source_fact_id: &str,
+) -> Result<Vec<String>, MemoryDatabaseError> {
+    let mut statement = transaction
+        .prepare(
+            "WITH RECURSIVE update_chain(fact_id) AS (
+                SELECT target_fact_id
+                FROM memory_edges
+                WHERE source_fact_id = ?1 AND relation = 'updates'
+                UNION
+                SELECT e.target_fact_id
+                FROM memory_edges e
+                JOIN update_chain c ON e.source_fact_id = c.fact_id
+                WHERE e.relation = 'updates'
+             )
+             SELECT fact_id
+             FROM update_chain
+             ORDER BY fact_id ASC",
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let rows = statement
+        .query_map(params![source_fact_id], |row| row.get(0))
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    collect_rows(rows, database_path)
+}
+
 fn ensure_memory_schema_exists(
     connection: &Connection,
     database_path: &Path,
@@ -2646,6 +2731,186 @@ mod tests {
                 .expect("workspace fact")
                 .scope,
             "workspace"
+        );
+    }
+
+    #[test]
+    fn updates_relation_supersedes_active_update_chain() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Memory updates")
+                .expect("chat insert");
+        }
+
+        let mut memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        memory
+            .insert_source(NewMemorySource {
+                id: "source-1",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Manual note",
+                content: "Update chain source.",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        for (id, status, fact) in [
+            ("fact-old", MemoryStatus::Active, "Old memory fact."),
+            ("fact-mid", MemoryStatus::Active, "Middle memory fact."),
+            ("fact-new", MemoryStatus::Pending, "New memory fact."),
+        ] {
+            memory
+                .insert_fact(NewMemoryFact {
+                    id,
+                    scope: MemoryScope::Chat,
+                    chat_id: Some("chat-1"),
+                    status,
+                    kind: MemoryKind::ProjectFact,
+                    fact,
+                    confidence: Some(0.9),
+                    pinned: false,
+                    source_ids: &["source-1"],
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+        memory
+            .insert_edge(NewMemoryEdge {
+                id: "edge-mid-old",
+                source_fact_id: "fact-mid",
+                target_fact_id: "fact-old",
+                relation: MemoryRelationKind::Updates,
+                metadata_json: "{}",
+            })
+            .expect("mid updates old");
+        memory
+            .insert_edge(NewMemoryEdge {
+                id: "edge-new-mid",
+                source_fact_id: "fact-new",
+                target_fact_id: "fact-mid",
+                relation: MemoryRelationKind::Updates,
+                metadata_json: "{}",
+            })
+            .expect("new updates mid");
+
+        assert_eq!(
+            memory
+                .fact("fact-old")
+                .expect("old lookup")
+                .expect("old fact")
+                .status,
+            "superseded"
+        );
+        assert!(
+            memory
+                .fact("fact-mid")
+                .expect("mid lookup")
+                .expect("mid fact")
+                .is_latest
+        );
+
+        assert!(
+            memory
+                .set_fact_status("fact-new", MemoryStatus::Active)
+                .expect("approve new fact")
+        );
+        let old = memory
+            .fact("fact-old")
+            .expect("old lookup")
+            .expect("old fact");
+        let mid = memory
+            .fact("fact-mid")
+            .expect("mid lookup")
+            .expect("mid fact");
+        let new = memory
+            .fact("fact-new")
+            .expect("new lookup")
+            .expect("new fact");
+
+        assert_eq!(old.status, "superseded");
+        assert!(!old.is_latest);
+        assert_eq!(mid.status, "superseded");
+        assert!(!mid.is_latest);
+        assert_eq!(new.status, "active");
+        assert!(new.is_latest);
+    }
+
+    #[test]
+    fn non_updates_relations_do_not_supersede_targets_and_self_edges_fail() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Memory relations")
+                .expect("chat insert");
+        }
+
+        let mut memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        memory
+            .insert_source(NewMemorySource {
+                id: "source-1",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Manual note",
+                content: "Relation source.",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        for id in ["fact-a", "fact-b"] {
+            memory
+                .insert_fact(NewMemoryFact {
+                    id,
+                    scope: MemoryScope::Chat,
+                    chat_id: Some("chat-1"),
+                    status: MemoryStatus::Active,
+                    kind: MemoryKind::ProjectFact,
+                    fact: "Relation fact.",
+                    confidence: Some(0.9),
+                    pinned: false,
+                    source_ids: &["source-1"],
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+        memory
+            .insert_edge(NewMemoryEdge {
+                id: "edge-extends",
+                source_fact_id: "fact-b",
+                target_fact_id: "fact-a",
+                relation: MemoryRelationKind::Extends,
+                metadata_json: "{}",
+            })
+            .expect("extends edge");
+
+        let target = memory
+            .fact("fact-a")
+            .expect("target lookup")
+            .expect("target fact");
+        assert_eq!(target.status, "active");
+        assert!(target.is_latest);
+        assert!(
+            memory
+                .insert_edge(NewMemoryEdge {
+                    id: "edge-self",
+                    source_fact_id: "fact-a",
+                    target_fact_id: "fact-a",
+                    relation: MemoryRelationKind::Derives,
+                    metadata_json: "{}",
+                })
+                .expect_err("self edge should fail")
+                .to_string()
+                .contains("cannot target the same fact")
         );
     }
 }
