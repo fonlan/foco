@@ -56,8 +56,8 @@ use foco_store::{
     },
     memory::{
         MemoryDatabase, MemoryDatabaseError, MemoryExtractionJobStatus, MemoryFactRecord,
-        MemoryKind, MemoryScope, MemorySourceRecord, MemoryStatus, NewMemoryExtractionJob,
-        NewMemoryFact, NewMemorySource, UpdateMemoryFact,
+        MemoryKind, MemoryScope, MemorySourceRecord, MemorySourceType, MemoryStatus,
+        NewMemoryExtractionJob, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
@@ -115,6 +115,10 @@ const MEMORY_CONTEXT_FACT_LIMIT: u32 = 24;
 const MEMORY_CONTEXT_PROFILE_LIMIT: u32 = 8;
 const MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX: &str = "Foco memory profile context:";
 const MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX: &str = "Foco retrieved memory context:";
+const MEMORY_EXTRACTION_TOOL_NAME: &str = "submit_memory_extraction";
+const MEMORY_EXTRACTION_TIMEOUT_MS: u64 = 60_000;
+const MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 2048;
+const MEMORY_EXTRACTION_SYSTEM_PROMPT: &str = "Extract only durable, user-reviewable memory facts from the provided completed chat turn evidence. Use the submit_memory_extraction tool exactly once. Do not return prose. Include a fact only when it is directly supported by one or more provided evidenceIds. If there is nothing worth remembering, submit {\"facts\":[]}. Suggested scopes mean: global for user-wide stable preferences, workspace for project-specific durable facts, chat for session-specific details.";
 const MAX_CHAT_ATTACHMENTS: usize = 6;
 const MAX_CHAT_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES: u64 = 24 * 1024 * 1024;
@@ -3736,6 +3740,7 @@ enum ChatSseEvent {
 struct PreparedChatContext {
     workspace_id: String,
     workspace_path: PathBuf,
+    memory_database_file: PathBuf,
     chat_id: String,
     provider_id: String,
     model_id: String,
@@ -3751,6 +3756,7 @@ struct PreparedChatContext {
     question_registry: QuestionRegistry,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
+    global_config: GlobalConfig,
     memory_settings: MemorySettings,
     request_body_json: String,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
@@ -3785,6 +3791,73 @@ struct MemoryPromptContext {
     retrieved_message: Option<NeutralChatMessage>,
     context_tokens: u64,
     budget_tokens: u64,
+}
+
+#[derive(Clone)]
+struct MemoryExtractionTask {
+    job_id: String,
+    workspace_id: String,
+    workspace_path: PathBuf,
+    global_memory_database_file: PathBuf,
+    chat_id: String,
+    run_id: String,
+    user_message_id: String,
+    assistant_message_id: String,
+    model_id: String,
+    config: GlobalConfig,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryExtractionEvidenceCandidate {
+    evidence_id: String,
+    source_type: MemorySourceType,
+    source_id: String,
+    title: String,
+    content: String,
+    metadata: Value,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MemoryExtractionOutput {
+    facts: Vec<ExtractedMemoryFact>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExtractedMemoryFact {
+    scope: String,
+    kind: String,
+    fact: String,
+    confidence: Option<f64>,
+    relation_candidates: Vec<ExtractedMemoryRelationCandidate>,
+    evidence_references: Vec<ExtractedMemoryEvidenceReference>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExtractedMemoryRelationCandidate {
+    relation: String,
+    target_fact_id: Option<String>,
+    target_fact: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExtractedMemoryEvidenceReference {
+    evidence_id: String,
+    quote: Option<String>,
+}
+
+#[derive(Debug)]
+struct ValidatedExtractedMemoryFact {
+    scope: MemoryScope,
+    kind: MemoryKind,
+    fact: String,
+    confidence: Option<f64>,
+    evidence_ids: Vec<String>,
+    metadata_json: String,
 }
 
 struct CapturedAuditEvent {
@@ -5026,6 +5099,7 @@ async fn prepare_chat_context(
     Ok(PreparedChatContext {
         workspace_id: prompt_context.workspace_id,
         workspace_path: prompt_context.workspace_path,
+        memory_database_file: state.memory_database_file.clone(),
         chat_id,
         provider_id: prompt_context.provider_id,
         model_id: prompt_context.model_id,
@@ -5041,6 +5115,7 @@ async fn prepare_chat_context(
         question_registry: state.question_registry.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget: prompt_context.context_budget,
+        global_config: config.clone(),
         memory_settings: config.memory.clone(),
         request_body_json,
         compression_snapshots: prompt_context.compression_snapshots,
@@ -6235,7 +6310,663 @@ fn queue_memory_extraction_job(
             output_json: None,
             error_message: None,
         })
-        .map_err(ApiError::from_memory_error)
+        .map_err(ApiError::from_memory_error)?;
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let task = MemoryExtractionTask {
+            job_id: job_id.clone(),
+            workspace_id: context.workspace_id.clone(),
+            workspace_path: context.workspace_path.clone(),
+            global_memory_database_file: context.memory_database_file.clone(),
+            chat_id: context.chat_id.clone(),
+            run_id: context.llm_request_id.clone(),
+            user_message_id: context.user_message_id.clone(),
+            assistant_message_id: context.assistant_message_id.clone(),
+            model_id: model_id.to_string(),
+            config: context.global_config.clone(),
+        };
+        handle.spawn(async move {
+            if let Err(error) = run_memory_extraction_job(task).await {
+                tracing::warn!(
+                    error = %error.message,
+                    "memory extraction job worker failed"
+                );
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn run_memory_extraction_job(task: MemoryExtractionTask) -> Result<(), ApiError> {
+    let workspace_memory_path = workspace_database_path(&task.workspace_path);
+    let mut workspace_memory_database = MemoryDatabase::open_workspace_at(&workspace_memory_path)
+        .map_err(ApiError::from_memory_error)?;
+    workspace_memory_database
+        .mark_extraction_job_running(&task.job_id)
+        .map_err(ApiError::from_memory_error)?;
+    drop(workspace_memory_database);
+
+    let extraction_result = run_memory_extraction_job_inner(&task).await;
+    let mut workspace_memory_database = MemoryDatabase::open_workspace_at(&workspace_memory_path)
+        .map_err(ApiError::from_memory_error)?;
+
+    match extraction_result {
+        Ok(output_json) => {
+            workspace_memory_database
+                .complete_extraction_job(&task.job_id, &output_json)
+                .map_err(ApiError::from_memory_error)?;
+        }
+        Err(error) => {
+            workspace_memory_database
+                .fail_extraction_job(&task.job_id, &error.message, None)
+                .map_err(ApiError::from_memory_error)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_memory_extraction_job_inner(task: &MemoryExtractionTask) -> Result<String, ApiError> {
+    let workspace_database = WorkspaceDatabase::open_or_create(&task.workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let evidence_candidates = memory_extraction_evidence_candidates(
+        &workspace_database,
+        &task.chat_id,
+        &task.run_id,
+        &task.user_message_id,
+        &task.assistant_message_id,
+    )?;
+    let (provider_id, provider_config, max_output_tokens) =
+        extraction_provider_for_model(&task.config, &task.model_id)?;
+    let request = memory_extraction_provider_request(
+        &task.model_id,
+        &task.workspace_id,
+        &task.chat_id,
+        &task.run_id,
+        &provider_id,
+        max_output_tokens,
+        &evidence_candidates,
+    )?;
+    let tool_arguments = call_memory_extraction_provider(&provider_config, request).await?;
+    let output = parse_memory_extraction_output(tool_arguments)?;
+    store_extracted_memory_facts(task, &evidence_candidates, &output)?;
+    serde_json::to_string(&output).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize memory extraction output: {source}"
+        ))
+    })
+}
+
+fn memory_extraction_evidence_candidates(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    run_id: &str,
+    user_message_id: &str,
+    assistant_message_id: &str,
+) -> Result<Vec<MemoryExtractionEvidenceCandidate>, ApiError> {
+    let messages = database
+        .messages_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let mut evidence = Vec::new();
+    let mut found_user_message = false;
+    let mut found_assistant_message = false;
+
+    for message in messages {
+        if message.id == user_message_id {
+            found_user_message = true;
+            evidence.push(MemoryExtractionEvidenceCandidate {
+                evidence_id: "user_message".to_string(),
+                source_type: MemorySourceType::ChatMessage,
+                source_id: message.id,
+                title: "User message".to_string(),
+                content: message.content,
+                metadata: json!({
+                    "role": &message.role,
+                    "sequence": message.sequence,
+                    "createdAt": &message.created_at,
+                }),
+            });
+            continue;
+        }
+
+        if message.id == assistant_message_id {
+            found_assistant_message = true;
+            evidence.push(MemoryExtractionEvidenceCandidate {
+                evidence_id: "assistant_message".to_string(),
+                source_type: MemorySourceType::AssistantMessage,
+                source_id: message.id.clone(),
+                title: "Assistant message".to_string(),
+                content: message.content.clone(),
+                metadata: json!({
+                    "role": &message.role,
+                    "sequence": message.sequence,
+                    "createdAt": &message.created_at,
+                }),
+            });
+            let tool_calls = database
+                .tool_calls_for_message(&message.id)
+                .map_err(ApiError::from_workspace_error)?;
+            for (index, tool_call) in tool_calls
+                .into_iter()
+                .filter(|tool_call| tool_call.run_id == run_id)
+                .enumerate()
+            {
+                let call_evidence_id = format!("tool_call_{index}");
+                evidence.push(MemoryExtractionEvidenceCandidate {
+                    evidence_id: call_evidence_id,
+                    source_type: MemorySourceType::ToolCall,
+                    source_id: tool_call.id.clone(),
+                    title: format!("Tool call {}", tool_call.tool_name),
+                    content: tool_call.input_json.clone(),
+                    metadata: json!({
+                        "toolName": &tool_call.tool_name,
+                        "status": &tool_call.status,
+                        "startedAt": &tool_call.started_at,
+                        "completedAt": &tool_call.completed_at,
+                    }),
+                });
+
+                if let Some(result) = tool_call.result {
+                    evidence.push(MemoryExtractionEvidenceCandidate {
+                        evidence_id: format!("tool_result_{index}"),
+                        source_type: MemorySourceType::ToolResult,
+                        source_id: result.id,
+                        title: format!("Tool result {}", tool_call.tool_name),
+                        content: result.output_json,
+                        metadata: json!({
+                            "toolCallId": &tool_call.id,
+                            "toolName": &tool_call.tool_name,
+                            "isError": result.is_error,
+                            "createdAt": &result.created_at,
+                        }),
+                    });
+                }
+            }
+        }
+    }
+
+    if !found_user_message || !found_assistant_message {
+        return Err(ApiError::internal(
+            "memory extraction evidence was not found for completed chat run",
+        ));
+    }
+
+    Ok(evidence)
+}
+
+fn extraction_provider_for_model(
+    config: &GlobalConfig,
+    model_id: &str,
+) -> Result<(String, ProviderConnectionConfig, u32), ApiError> {
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("memory extraction model was not found: {model_id}"))
+        })?;
+
+    if !model.enabled {
+        return Err(ApiError::bad_request(format!(
+            "memory extraction model '{}' is disabled",
+            model.id
+        )));
+    }
+    let limits = model.limits.as_ref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "memory extraction model '{}' is missing limits",
+            model.id
+        ))
+    })?;
+
+    let provider_id = model.active_provider_id.as_deref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "memory extraction model '{}' has no active provider selected",
+            model.id
+        ))
+    })?;
+    if !model.provider_ids.iter().any(|id| id == provider_id) {
+        return Err(ApiError::bad_request(format!(
+            "active provider '{}' is not associated with memory extraction model '{}'",
+            provider_id, model.id
+        )));
+    }
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "memory extraction provider '{}' was not found",
+                provider_id
+            ))
+        })?;
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "memory extraction provider '{}' is disabled",
+            provider.id
+        )));
+    }
+
+    let max_output_tokens = u32::try_from(limits.max_output_tokens)
+        .map_err(|_| {
+            ApiError::bad_request(format!(
+                "memory extraction model '{}' max output tokens exceed u32: {}",
+                model.id, limits.max_output_tokens
+            ))
+        })?
+        .min(MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS);
+
+    Ok((
+        provider.id.clone(),
+        provider_connection_config(provider)?,
+        max_output_tokens,
+    ))
+}
+
+fn memory_extraction_provider_request(
+    model_id: &str,
+    workspace_id: &str,
+    chat_id: &str,
+    run_id: &str,
+    provider_id: &str,
+    max_output_tokens: u32,
+    evidence: &[MemoryExtractionEvidenceCandidate],
+) -> Result<NeutralChatRequest, ApiError> {
+    let evidence_json = serde_json::to_string_pretty(
+        &evidence
+            .iter()
+            .map(|item| {
+                json!({
+                    "evidenceId": &item.evidence_id,
+                    "sourceType": item.source_type.as_str(),
+                    "sourceId": &item.source_id,
+                    "title": &item.title,
+                    "content": &item.content,
+                    "metadata": &item.metadata,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|source| {
+        ApiError::internal(format!("failed to serialize extraction evidence: {source}"))
+    })?;
+
+    Ok(NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages: vec![
+            neutral_text_message(
+                NeutralChatRole::System,
+                MEMORY_EXTRACTION_SYSTEM_PROMPT.to_string(),
+            ),
+            neutral_text_message(
+                NeutralChatRole::User,
+                format!(
+                    "workspaceId: {workspace_id}\nchatId: {chat_id}\nrunId: {run_id}\nproviderId: {provider_id}\n\nEvidence JSON:\n{evidence_json}"
+                ),
+            ),
+        ],
+        tools: vec![memory_extraction_tool_definition()],
+        thinking_level: None,
+        max_output_tokens: Some(max_output_tokens),
+    })
+}
+
+fn memory_extraction_tool_definition() -> NeutralToolDefinition {
+    NeutralToolDefinition {
+        name: MEMORY_EXTRACTION_TOOL_NAME.to_string(),
+        description: "Submit extracted Foco memory facts with direct source evidence references."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "facts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "scope": {
+                                "type": "string",
+                                "enum": ["global", "workspace", "chat"],
+                                "description": "Suggested storage scope for the fact."
+                            },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["preference", "project_fact", "project_decision", "procedure", "constraint", "episode"],
+                                "description": "Memory kind. Do not use user_note for automatic extraction."
+                            },
+                            "fact": {
+                                "type": "string",
+                                "description": "Atomic durable fact text, directly supported by evidence."
+                            },
+                            "confidence": {
+                                "type": ["number", "null"],
+                                "minimum": 0,
+                                "maximum": 1
+                            },
+                            "relationCandidates": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "relation": {
+                                            "type": "string",
+                                            "enum": ["updates", "extends", "derives"]
+                                        },
+                                        "targetFactId": {
+                                            "type": ["string", "null"]
+                                        },
+                                        "targetFact": {
+                                            "type": ["string", "null"]
+                                        },
+                                        "reason": {
+                                            "type": ["string", "null"]
+                                        }
+                                    },
+                                    "required": ["relation", "targetFactId", "targetFact", "reason"]
+                                }
+                            },
+                            "evidenceReferences": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "evidenceId": {
+                                            "type": "string",
+                                            "description": "Must match one of the provided evidenceIds."
+                                        },
+                                        "quote": {
+                                            "type": ["string", "null"]
+                                        }
+                                    },
+                                    "required": ["evidenceId", "quote"]
+                                }
+                            }
+                        },
+                        "required": ["scope", "kind", "fact", "confidence", "relationCandidates", "evidenceReferences"]
+                    }
+                }
+            },
+            "required": ["facts"]
+        }),
+        strict: true,
+    }
+}
+
+async fn call_memory_extraction_provider(
+    provider_config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+) -> Result<Value, ApiError> {
+    let mut stream = timeout(
+        Duration::from_millis(MEMORY_EXTRACTION_TIMEOUT_MS),
+        stream_chat(provider_config, request),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::internal(format!(
+            "memory extraction timed out after {MEMORY_EXTRACTION_TIMEOUT_MS} ms"
+        ))
+    })?
+    .map_err(ApiError::from_provider_config_error)?;
+    let mut output_text = String::new();
+    let mut tool_arguments = None;
+
+    loop {
+        let Some(event) = timeout(
+            Duration::from_millis(MEMORY_EXTRACTION_TIMEOUT_MS),
+            stream.next_event(),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::internal(format!(
+                "memory extraction timed out after {MEMORY_EXTRACTION_TIMEOUT_MS} ms"
+            ))
+        })?
+        else {
+            break;
+        };
+
+        match event.map_err(ApiError::from_provider_config_error)? {
+            NeutralChatStreamEvent::Start
+            | NeutralChatStreamEvent::ReasoningDelta { .. }
+            | NeutralChatStreamEvent::ThoughtSignatureDelta { .. }
+            | NeutralChatStreamEvent::Usage { .. } => {}
+            NeutralChatStreamEvent::TextDelta { delta } => output_text.push_str(&delta),
+            NeutralChatStreamEvent::ToolCall { tool_call } => {
+                if tool_call.name != MEMORY_EXTRACTION_TOOL_NAME {
+                    return Err(ApiError::internal(format!(
+                        "memory extraction called unsupported tool '{}'",
+                        tool_call.name
+                    )));
+                }
+                tool_arguments = Some(tool_call.arguments);
+            }
+            NeutralChatStreamEvent::Complete {
+                tool_calls, text, ..
+            } => {
+                if tool_arguments.is_none() {
+                    for tool_call in tool_calls {
+                        if tool_call.name != MEMORY_EXTRACTION_TOOL_NAME {
+                            return Err(ApiError::internal(format!(
+                                "memory extraction completed with unsupported tool '{}'",
+                                tool_call.name
+                            )));
+                        }
+                        tool_arguments = Some(tool_call.arguments);
+                    }
+                }
+                if !text.trim().is_empty() {
+                    output_text.push_str(&text);
+                }
+                break;
+            }
+            NeutralChatStreamEvent::Error { message } => {
+                return Err(ApiError::internal(format!(
+                    "memory extraction stream error: {message}"
+                )));
+            }
+        }
+    }
+
+    tool_arguments.ok_or_else(|| {
+        let text = output_text.trim();
+        if text.is_empty() {
+            ApiError::internal("memory extraction did not call submit tool")
+        } else {
+            ApiError::internal(format!(
+                "memory extraction returned text instead of submit tool call: {text}"
+            ))
+        }
+    })
+}
+
+fn parse_memory_extraction_output(value: Value) -> Result<MemoryExtractionOutput, ApiError> {
+    serde_json::from_value(value).map_err(|source| {
+        ApiError::bad_request(format!("malformed memory extraction JSON: {source}"))
+    })
+}
+
+fn store_extracted_memory_facts(
+    task: &MemoryExtractionTask,
+    evidence_candidates: &[MemoryExtractionEvidenceCandidate],
+    output: &MemoryExtractionOutput,
+) -> Result<(), ApiError> {
+    let evidence_by_id = evidence_candidates
+        .iter()
+        .map(|item| (item.evidence_id.as_str(), item))
+        .collect::<HashMap<_, _>>();
+    let validated_facts = validate_extracted_memory_facts(output, &evidence_by_id)?;
+    if validated_facts.is_empty() {
+        return Ok(());
+    }
+
+    let mut global_memory_database: Option<MemoryDatabase> = None;
+    let mut workspace_memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&task.workspace_path))
+            .map_err(ApiError::from_memory_error)?;
+
+    for fact in validated_facts {
+        let source_ids = fact
+            .evidence_ids
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("{}-source-{index}", unique_id("memory-source")))
+            .collect::<Vec<_>>();
+        let source_id_refs = source_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let database = match fact.scope {
+            MemoryScope::Global => {
+                if global_memory_database.is_none() {
+                    global_memory_database = Some(
+                        MemoryDatabase::open_or_create_global_at(&task.global_memory_database_file)
+                            .map_err(ApiError::from_memory_error)?,
+                    );
+                }
+                global_memory_database
+                    .as_mut()
+                    .expect("global memory database should be initialized")
+            }
+            MemoryScope::Workspace | MemoryScope::Chat => &mut workspace_memory_database,
+        };
+
+        for (index, evidence_id) in fact.evidence_ids.iter().enumerate() {
+            let evidence = evidence_by_id
+                .get(evidence_id.as_str())
+                .expect("validated evidence id should exist");
+            let source_metadata_json = serde_json::to_string(&json!({
+                "extractionJobId": &task.job_id,
+                "evidenceId": &evidence.evidence_id,
+                "runId": &task.run_id,
+                "metadata": &evidence.metadata,
+            }))
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to serialize memory source metadata: {source}"
+                ))
+            })?;
+            database
+                .insert_source(NewMemorySource {
+                    id: &source_ids[index],
+                    scope: fact.scope,
+                    chat_id: (fact.scope == MemoryScope::Chat).then_some(task.chat_id.as_str()),
+                    source_type: evidence.source_type,
+                    source_id: Some(&evidence.source_id),
+                    title: &evidence.title,
+                    content: &evidence.content,
+                    metadata_json: &source_metadata_json,
+                })
+                .map_err(ApiError::from_memory_error)?;
+        }
+
+        let fact_id = unique_id("memory-fact");
+        database
+            .insert_fact(NewMemoryFact {
+                id: &fact_id,
+                scope: fact.scope,
+                chat_id: (fact.scope == MemoryScope::Chat).then_some(task.chat_id.as_str()),
+                status: MemoryStatus::Pending,
+                kind: fact.kind,
+                fact: &fact.fact,
+                confidence: fact.confidence,
+                pinned: false,
+                source_ids: &source_id_refs,
+                metadata_json: &fact.metadata_json,
+            })
+            .map_err(ApiError::from_memory_error)?;
+    }
+
+    Ok(())
+}
+
+fn validate_extracted_memory_facts(
+    output: &MemoryExtractionOutput,
+    evidence_by_id: &HashMap<&str, &MemoryExtractionEvidenceCandidate>,
+) -> Result<Vec<ValidatedExtractedMemoryFact>, ApiError> {
+    let mut validated = Vec::with_capacity(output.facts.len());
+
+    for (index, fact) in output.facts.iter().enumerate() {
+        let scope = MemoryScope::parse(fact.scope.trim()).map_err(ApiError::from_memory_error)?;
+        let kind = MemoryKind::parse(fact.kind.trim()).map_err(ApiError::from_memory_error)?;
+        if kind == MemoryKind::UserNote {
+            return Err(ApiError::bad_request(format!(
+                "extracted fact {index} must not use user_note kind"
+            )));
+        }
+        let fact_text = fact.fact.trim();
+        if fact_text.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "extracted fact {index} text must not be empty"
+            )));
+        }
+        if let Some(confidence) = fact.confidence
+            && !(0.0..=1.0).contains(&confidence)
+        {
+            return Err(ApiError::bad_request(format!(
+                "extracted fact {index} confidence must be between 0 and 1"
+            )));
+        }
+        if fact.evidence_references.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "extracted fact {index} must include at least one evidence reference"
+            )));
+        }
+
+        let mut evidence_ids = Vec::new();
+        for reference in &fact.evidence_references {
+            let evidence_id = reference.evidence_id.trim();
+            if evidence_id.is_empty() {
+                return Err(ApiError::bad_request(format!(
+                    "extracted fact {index} evidence id must not be empty"
+                )));
+            }
+            if !evidence_by_id.contains_key(evidence_id) {
+                return Err(ApiError::bad_request(format!(
+                    "extracted fact {index} references unknown evidence id '{evidence_id}'"
+                )));
+            }
+            if !evidence_ids.iter().any(|id| id == evidence_id) {
+                evidence_ids.push(evidence_id.to_string());
+            }
+        }
+
+        for relation in &fact.relation_candidates {
+            if !matches!(
+                relation.relation.as_str(),
+                "updates" | "extends" | "derives"
+            ) {
+                return Err(ApiError::bad_request(format!(
+                    "extracted fact {index} has unsupported relation '{}'",
+                    relation.relation
+                )));
+            }
+        }
+
+        let metadata_json = serde_json::to_string(&json!({
+            "source": "memory_extraction",
+            "relationCandidates": &fact.relation_candidates,
+            "evidenceReferences": &fact.evidence_references,
+        }))
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to serialize extracted memory metadata: {source}"
+            ))
+        })?;
+
+        validated.push(ValidatedExtractedMemoryFact {
+            scope,
+            kind,
+            fact: fact_text.to_string(),
+            confidence: fact.confidence,
+            evidence_ids,
+            metadata_json,
+        });
+    }
+
+    Ok(validated)
 }
 
 fn neutral_text_message(role: NeutralChatRole, content: String) -> NeutralChatMessage {
@@ -12364,6 +13095,7 @@ description: Project memory.
         let context = PreparedChatContext {
             workspace_id: "workspace-1".to_string(),
             workspace_path: workspace_dir.clone(),
+            memory_database_file: workspace_dir.join("global-memory.sqlite"),
             chat_id: "chat-1".to_string(),
             provider_id: "openai-responses".to_string(),
             model_id: "gpt-5.4".to_string(),
@@ -12400,6 +13132,7 @@ description: Project memory.
                 safety_tokens: 0,
                 available_message_tokens: 984,
             },
+            global_config: GlobalConfig::first_run(workspace_dir.clone()),
             memory_settings: MemorySettings {
                 enabled: true,
                 extraction_mode: "pending_review".to_string(),
@@ -12477,6 +13210,169 @@ description: Project memory.
         );
 
         drop(database);
+        drop(memory_database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn memory_extraction_rejects_malformed_json() {
+        let error = parse_memory_extraction_output(json!({
+            "facts": [{
+                "scope": "chat",
+                "kind": "preference",
+                "fact": "Prefer concise replies.",
+                "confidence": 0.8,
+                "evidenceReferences": []
+            }]
+        }))
+        .expect_err("missing relationCandidates should fail");
+
+        assert!(error.message.contains("malformed memory extraction JSON"));
+    }
+
+    #[test]
+    fn memory_extraction_rejects_missing_evidence() {
+        let output = parse_memory_extraction_output(json!({
+            "facts": [{
+                "scope": "chat",
+                "kind": "preference",
+                "fact": "Prefer concise replies.",
+                "confidence": 0.8,
+                "relationCandidates": [],
+                "evidenceReferences": [{
+                    "evidenceId": "missing",
+                    "quote": "concise"
+                }]
+            }]
+        }))
+        .expect("valid extraction JSON");
+        let evidence = vec![MemoryExtractionEvidenceCandidate {
+            evidence_id: "user_message".to_string(),
+            source_type: MemorySourceType::ChatMessage,
+            source_id: "user-1".to_string(),
+            title: "User message".to_string(),
+            content: "Please keep replies concise.".to_string(),
+            metadata: json!({}),
+        }];
+        let evidence_by_id = evidence
+            .iter()
+            .map(|item| (item.evidence_id.as_str(), item))
+            .collect::<HashMap<_, _>>();
+
+        let error = validate_extracted_memory_facts(&output, &evidence_by_id)
+            .expect_err("unknown evidence id should fail");
+
+        assert!(error.message.contains("unknown evidence id 'missing'"));
+    }
+
+    #[test]
+    fn memory_extraction_validates_required_fact_fields() {
+        let output = parse_memory_extraction_output(json!({
+            "facts": [{
+                "scope": "chat",
+                "kind": "preference",
+                "fact": "Prefer concise replies.",
+                "confidence": 0.8,
+                "relationCandidates": [{
+                    "relation": "derives",
+                    "targetFactId": null,
+                    "targetFact": null,
+                    "reason": "User asked for concise replies."
+                }],
+                "evidenceReferences": [{
+                    "evidenceId": "user_message",
+                    "quote": "concise"
+                }]
+            }]
+        }))
+        .expect("valid extraction JSON");
+        let evidence = vec![MemoryExtractionEvidenceCandidate {
+            evidence_id: "user_message".to_string(),
+            source_type: MemorySourceType::ChatMessage,
+            source_id: "user-1".to_string(),
+            title: "User message".to_string(),
+            content: "Please keep replies concise.".to_string(),
+            metadata: json!({}),
+        }];
+        let evidence_by_id = evidence
+            .iter()
+            .map(|item| (item.evidence_id.as_str(), item))
+            .collect::<HashMap<_, _>>();
+
+        let facts = validate_extracted_memory_facts(&output, &evidence_by_id)
+            .expect("valid extracted fact");
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].scope, MemoryScope::Chat);
+        assert_eq!(facts[0].kind, MemoryKind::Preference);
+        assert_eq!(facts[0].evidence_ids, vec!["user_message"]);
+        assert!(facts[0].metadata_json.contains("relationCandidates"));
+    }
+
+    #[test]
+    fn memory_extraction_stores_pending_facts_with_sources() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-extract-store-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Memory extraction")
+                .expect("chat insert");
+        }
+        let task = MemoryExtractionTask {
+            job_id: "job-1".to_string(),
+            workspace_id: "workspace-1".to_string(),
+            workspace_path: workspace_dir.clone(),
+            global_memory_database_file: workspace_dir.join("global-memory.sqlite"),
+            chat_id: "chat-1".to_string(),
+            run_id: "run-1".to_string(),
+            user_message_id: "user-1".to_string(),
+            assistant_message_id: "assistant-1".to_string(),
+            model_id: "model-1".to_string(),
+            config: GlobalConfig::first_run(workspace_dir.clone()),
+        };
+        let evidence = vec![MemoryExtractionEvidenceCandidate {
+            evidence_id: "user_message".to_string(),
+            source_type: MemorySourceType::ChatMessage,
+            source_id: "user-1".to_string(),
+            title: "User message".to_string(),
+            content: "Remember that I prefer concise replies.".to_string(),
+            metadata: json!({"role":"user"}),
+        }];
+        let output = parse_memory_extraction_output(json!({
+            "facts": [{
+                "scope": "chat",
+                "kind": "preference",
+                "fact": "Prefer concise replies.",
+                "confidence": 0.9,
+                "relationCandidates": [],
+                "evidenceReferences": [{
+                    "evidenceId": "user_message",
+                    "quote": "prefer concise replies"
+                }]
+            }]
+        }))
+        .expect("valid extraction JSON");
+
+        store_extracted_memory_facts(&task, &evidence, &output).expect("store extracted facts");
+
+        let memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        let facts = memory_database
+            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Pending, 10)
+            .expect("pending facts");
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].fact, "Prefer concise replies.");
+        assert_eq!(facts[0].status, "pending");
+        let sources = memory_database
+            .sources_for_fact(&facts[0].id)
+            .expect("fact sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_id.as_deref(), Some("user-1"));
+
         drop(memory_database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }

@@ -637,6 +637,9 @@ impl MemoryDatabase {
         self.validate_scope(job.scope)?;
         validate_extraction_job(&job)?;
         let now = now_timestamp();
+        let input_json = redact_memory_json(job.input_json, "memory_extraction_jobs.input_json")?;
+        let output_json =
+            redact_optional_memory_json(job.output_json, "memory_extraction_jobs.output_json")?;
 
         self.connection
             .execute(
@@ -649,8 +652,8 @@ impl MemoryDatabase {
                     job.chat_id,
                     job.status.as_str(),
                     job.model_id,
-                    job.input_json,
-                    job.output_json,
+                    input_json,
+                    output_json,
                     job.error_message,
                     now,
                 ],
@@ -658,6 +661,78 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
         Ok(())
+    }
+
+    pub fn mark_extraction_job_running(&mut self, id: &str) -> Result<bool, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        let now = now_timestamp();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE memory_extraction_jobs
+                 SET status = 'running',
+                     started_at = COALESCE(started_at, ?2),
+                     completed_at = NULL,
+                     error_message = NULL
+                 WHERE id = ?1",
+                params![id, now],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(changed > 0)
+    }
+
+    pub fn complete_extraction_job(
+        &mut self,
+        id: &str,
+        output_json: &str,
+    ) -> Result<bool, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        let output_json = redact_memory_json(output_json, "memory_extraction_jobs.output_json")?;
+        let now = now_timestamp();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE memory_extraction_jobs
+                 SET status = 'completed',
+                     output_json = ?2,
+                     error_message = NULL,
+                     started_at = COALESCE(started_at, ?3),
+                     completed_at = ?3
+                 WHERE id = ?1",
+                params![id, output_json, now],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(changed > 0)
+    }
+
+    pub fn fail_extraction_job(
+        &mut self,
+        id: &str,
+        error_message: &str,
+        output_json: Option<&str>,
+    ) -> Result<bool, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        require_non_empty("error_message", error_message)?;
+        let output_json =
+            redact_optional_memory_json(output_json, "memory_extraction_jobs.output_json")?;
+        let now = now_timestamp();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE memory_extraction_jobs
+                 SET status = 'failed',
+                     output_json = ?2,
+                     error_message = ?3,
+                     started_at = COALESCE(started_at, ?4),
+                     completed_at = ?4
+                 WHERE id = ?1",
+                params![id, output_json, error_message, now],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(changed > 0)
     }
 
     pub fn extraction_jobs_for_scope(
@@ -1576,6 +1651,58 @@ fn validate_json(field: &'static str, value: &str) -> Result<(), MemoryDatabaseE
         .map_err(|source| MemoryDatabaseError::InvalidMemoryJson { field, source })
 }
 
+fn redact_optional_memory_json(
+    value: Option<&str>,
+    field: &'static str,
+) -> Result<Option<String>, MemoryDatabaseError> {
+    value
+        .map(|json| redact_memory_json(json, field))
+        .transpose()
+}
+
+fn redact_memory_json(value: &str, field: &'static str) -> Result<String, MemoryDatabaseError> {
+    let mut parsed: Value = serde_json::from_str(value)
+        .map_err(|source| MemoryDatabaseError::InvalidMemoryJson { field, source })?;
+
+    redact_memory_json_value(&mut parsed);
+
+    serde_json::to_string(&parsed)
+        .map_err(|source| MemoryDatabaseError::InvalidMemoryJson { field, source })
+}
+
+fn redact_memory_json_value(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if is_secret_memory_key(key) {
+                    *value = Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_memory_json_value(value);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_memory_json_value(item);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn is_secret_memory_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| *character != '-' && *character != '_')
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+
+    normalized == "authorization"
+        || normalized.contains("apikey")
+        || normalized.contains("cookie")
+        || normalized.contains("password")
+}
+
 fn memory_fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFactRecord> {
     Ok(MemoryFactRecord {
         id: row.get(0)?,
@@ -2204,6 +2331,92 @@ mod tests {
         assert_eq!(jobs[0].id, "job-1");
         assert_eq!(jobs[0].status, "queued");
         assert_eq!(jobs[0].model_id.as_deref(), Some("model-1"));
+    }
+
+    #[test]
+    fn workspace_extraction_jobs_update_status_and_redact_json() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Extraction chat")
+                .expect("chat insert");
+        }
+
+        let mut memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        memory
+            .insert_extraction_job(NewMemoryExtractionJob {
+                id: "job-1",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                status: MemoryExtractionJobStatus::Queued,
+                model_id: Some("model-1"),
+                input_json: r#"{"headers":{"authorization":"Bearer sk-secret"},"safe":"ok"}"#,
+                output_json: None,
+                error_message: None,
+            })
+            .expect("job insert");
+
+        assert!(
+            memory
+                .mark_extraction_job_running("job-1")
+                .expect("mark running")
+        );
+        assert!(
+            memory
+                .fail_extraction_job(
+                    "job-1",
+                    "provider failed",
+                    Some(r#"{"password":"secret","facts":[]}"#)
+                )
+                .expect("mark failed")
+        );
+        let failed = memory
+            .extraction_jobs_for_scope(Some("chat-1"), Some(MemoryExtractionJobStatus::Failed), 10)
+            .expect("failed jobs");
+
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, "failed");
+        assert_eq!(failed[0].error_message.as_deref(), Some("provider failed"));
+        assert!(failed[0].started_at.is_some());
+        assert!(failed[0].completed_at.is_some());
+        assert!(!failed[0].input_json.contains("sk-secret"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&failed[0].input_json).expect("input json")["headers"]["authorization"],
+            "[REDACTED]"
+        );
+        assert!(!failed[0].output_json.as_deref().unwrap().contains("secret"));
+        assert_eq!(
+            serde_json::from_str::<Value>(failed[0].output_json.as_deref().unwrap())
+                .expect("output json")["password"],
+            "[REDACTED]"
+        );
+
+        assert!(
+            memory
+                .complete_extraction_job("job-1", r#"{"apiKey":"sk-secret","facts":[]}"#)
+                .expect("mark completed")
+        );
+        let completed = memory
+            .extraction_jobs_for_scope(
+                Some("chat-1"),
+                Some(MemoryExtractionJobStatus::Completed),
+                10,
+            )
+            .expect("completed jobs");
+
+        assert_eq!(completed.len(), 1);
+        assert!(completed[0].error_message.is_none());
+        assert!(
+            !completed[0]
+                .output_json
+                .as_deref()
+                .unwrap()
+                .contains("sk-secret")
+        );
     }
 
     #[test]

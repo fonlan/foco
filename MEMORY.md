@@ -135,17 +135,17 @@ memory graph in Foco. It is not the runtime memory store.
 
 - [x] Queue memory extraction after a chat run completes.
 - [x] Do not run extraction during SSE streaming.
-- [ ] Use the existing provider-neutral provider path for extraction.
-- [ ] Build a strict JSON extraction schema.
-- [ ] Require extracted facts to include scope suggestion, kind, fact text,
+- [x] Use the existing provider-neutral provider path for extraction.
+- [x] Build a strict JSON extraction schema.
+- [x] Require extracted facts to include scope suggestion, kind, fact text,
       confidence, relation candidates, and evidence references.
-- [ ] Store extracted facts as `pending` by default.
-- [ ] Allow direct `active` writes only for explicit user memory requests.
-- [ ] Record extraction job status: `queued`, `running`, `completed`, `failed`.
+- [x] Store extracted facts as `pending` by default.
+- [x] Allow direct `active` writes only for explicit user memory requests.
+- [x] Record extraction job status: `queued`, `running`, `completed`, `failed`.
 - [ ] Surface extraction failures in the Memory UI.
-- [ ] Redact secrets before storing extraction input/output.
-- [ ] Add tests for malformed extraction JSON.
-- [ ] Add tests for missing evidence rejection.
+- [x] Redact secrets before storing extraction input/output.
+- [x] Add tests for malformed extraction JSON.
+- [x] Add tests for missing evidence rejection.
 - [ ] Add tests for explicit "remember this" behavior.
 
 ## Phase 6 - Graph Maintenance
