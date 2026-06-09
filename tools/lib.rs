@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use foco_store::workspace::{
     CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
     CodeGraphSymbolRelationRecord, TaskGraphFilter, TaskGraphRecord, TaskGraphTask,
@@ -49,6 +52,8 @@ const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_TASK_GRAPH_TIMEOUT_MS: u64 = 10_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 static RIPGREP_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1741,11 +1746,16 @@ fn run_command_with_timeout(
     timeout: Duration,
 ) -> Result<Output, ToolRuntimeError> {
     let command_label = command_label(command, args);
-    let mut child = Command::new(command)
+    let mut command_process = Command::new(command);
+    command_process
         .args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    command_process.creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = command_process
         .spawn()
         .map_err(|source| ToolRuntimeError::Command {
             command: command_label.clone(),
