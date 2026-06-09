@@ -77,20 +77,20 @@ memory graph in Foco. It is not the runtime memory store.
 
 ## Phase 2 - Store API
 
-- [ ] Implement insert/update/delete methods for memory sources.
-- [ ] Implement insert/update/delete methods for memory facts.
-- [ ] Implement source evidence linking.
-- [ ] Implement fact status transitions.
-- [ ] Implement fact promotion from chat to workspace and from workspace to
+- [x] Implement insert/update/delete methods for memory sources.
+- [x] Implement insert/update/delete methods for memory facts.
+- [x] Implement source evidence linking.
+- [x] Implement fact status transitions.
+- [x] Implement fact promotion from chat to workspace and from workspace to
       global.
-- [ ] Implement FTS upsert/delete helpers.
-- [ ] Implement relation insertion with validation.
-- [ ] Reject relation cycles only where they would break update chains.
-- [ ] Implement profile read/write methods.
-- [ ] Implement search by scope cascade.
-- [ ] Add tests for source evidence requirements.
-- [ ] Add tests for chat deletion cascading session memories.
-- [ ] Add tests for workspace facts surviving chat deletion.
+- [x] Implement FTS upsert/delete helpers.
+- [x] Implement relation insertion with validation.
+- [x] Reject relation cycles only where they would break update chains.
+- [x] Implement profile read/write methods.
+- [x] Implement search by scope cascade.
+- [x] Add tests for source evidence requirements.
+- [x] Add tests for chat deletion cascading session memories.
+- [x] Add tests for workspace facts surviving chat deletion.
 
 ## Phase 3 - Manual API and UI
 

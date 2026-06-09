@@ -123,6 +123,7 @@ impl MemoryRelationKind {
 pub struct MemoryDatabase {
     database_path: PathBuf,
     connection: Connection,
+    kind: MemoryDatabaseKind,
 }
 
 impl MemoryDatabase {
@@ -144,6 +145,7 @@ impl MemoryDatabase {
         Ok(Self {
             database_path,
             connection,
+            kind: MemoryDatabaseKind::Global,
         })
     }
 
@@ -151,6 +153,18 @@ impl MemoryDatabase {
         foco_root_dir: impl AsRef<Path>,
     ) -> Result<Self, MemoryDatabaseError> {
         Self::open_or_create_global_at(global_memory_database_path(foco_root_dir))
+    }
+
+    pub fn open_workspace_at(database_path: impl AsRef<Path>) -> Result<Self, MemoryDatabaseError> {
+        let database_path = database_path.as_ref().to_path_buf();
+        let connection = open_connection(&database_path)?;
+        ensure_memory_schema_exists(&connection, &database_path)?;
+
+        Ok(Self {
+            database_path,
+            connection,
+            kind: MemoryDatabaseKind::Workspace,
+        })
     }
 
     pub fn database_path(&self) -> &Path {
@@ -165,7 +179,7 @@ impl MemoryDatabase {
         &mut self,
         source: NewMemorySource<'_>,
     ) -> Result<(), MemoryDatabaseError> {
-        validate_global_scope(source.scope)?;
+        self.validate_scope(source.scope)?;
         validate_source(&source)?;
         let now = now_timestamp();
 
@@ -192,8 +206,61 @@ impl MemoryDatabase {
         Ok(())
     }
 
+    pub fn update_source(
+        &mut self,
+        source: UpdateMemorySource<'_>,
+    ) -> Result<bool, MemoryDatabaseError> {
+        validate_source_update(&source)?;
+        let now = now_timestamp();
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE memory_sources
+                 SET title = COALESCE(?2, title),
+                     content = COALESCE(?3, content),
+                     metadata_json = COALESCE(?4, metadata_json),
+                     updated_at = ?5
+                 WHERE id = ?1",
+                params![
+                    source.id,
+                    source.title,
+                    source.content,
+                    source.metadata_json,
+                    now,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(updated > 0)
+    }
+
+    pub fn delete_source(&mut self, id: &str) -> Result<bool, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        let linked_count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_fact_sources WHERE source_id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        if linked_count > 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("memory source '{id}' is still linked to {linked_count} fact(s)"),
+            });
+        }
+
+        let deleted = self
+            .connection
+            .execute("DELETE FROM memory_sources WHERE id = ?1", params![id])
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(deleted > 0)
+    }
+
     pub fn insert_fact(&mut self, fact: NewMemoryFact<'_>) -> Result<(), MemoryDatabaseError> {
-        validate_global_scope(fact.scope)?;
+        self.validate_scope(fact.scope)?;
         validate_fact(&fact)?;
 
         let database_path = self.database_path.clone();
@@ -243,8 +310,162 @@ impl MemoryDatabase {
         Ok(())
     }
 
+    pub fn update_fact(&mut self, fact: UpdateMemoryFact<'_>) -> Result<bool, MemoryDatabaseError> {
+        validate_fact_update(&fact)?;
+        if let Some(scope) = fact.scope {
+            self.validate_scope(scope)?;
+        }
+
+        let database_path = self.database_path.clone();
+        let now = now_timestamp();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let updated = transaction
+            .execute(
+                "UPDATE memory_facts
+                 SET scope = COALESCE(?2, scope),
+                     chat_id = COALESCE(?3, chat_id),
+                     status = COALESCE(?4, status),
+                     kind = COALESCE(?5, kind),
+                     fact = COALESCE(?6, fact),
+                     confidence = COALESCE(?7, confidence),
+                     pinned = COALESCE(?8, pinned),
+                     is_latest = COALESCE(?9, is_latest),
+                     expires_at = COALESCE(?10, expires_at),
+                     metadata_json = COALESCE(?11, metadata_json),
+                     updated_at = ?12
+                 WHERE id = ?1",
+                params![
+                    fact.id,
+                    fact.scope.map(MemoryScope::as_str),
+                    fact.chat_id,
+                    fact.status.map(MemoryStatus::as_str),
+                    fact.kind.map(MemoryKind::as_str),
+                    fact.fact,
+                    fact.confidence,
+                    fact.pinned.map(bool_to_i64),
+                    fact.is_latest.map(bool_to_i64),
+                    fact.expires_at,
+                    fact.metadata_json,
+                    now,
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        if updated > 0 {
+            let updated_fact = fact_by_id(&transaction, &database_path, fact.id)?;
+            upsert_fact_record_fts_data(&transaction, &database_path, &updated_fact)?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(updated > 0)
+    }
+
+    pub fn set_fact_status(
+        &mut self,
+        id: &str,
+        status: MemoryStatus,
+    ) -> Result<bool, MemoryDatabaseError> {
+        self.update_fact(UpdateMemoryFact {
+            id,
+            status: Some(status),
+            ..UpdateMemoryFact::default()
+        })
+    }
+
+    pub fn delete_fact(&mut self, id: &str) -> Result<bool, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        transaction
+            .execute(
+                "DELETE FROM memory_fts_data WHERE fact_id = ?1",
+                params![id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let deleted = transaction
+            .execute("DELETE FROM memory_facts WHERE id = ?1", params![id])
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(deleted > 0)
+    }
+
+    pub fn link_fact_source(
+        &mut self,
+        fact_id: &str,
+        source_id: &str,
+    ) -> Result<(), MemoryDatabaseError> {
+        require_non_empty("fact_id", fact_id)?;
+        require_non_empty("source_id", source_id)?;
+        self.connection
+            .execute(
+                "INSERT OR IGNORE INTO memory_fact_sources (fact_id, source_id)
+                 VALUES (?1, ?2)",
+                params![fact_id, source_id],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(())
+    }
+
+    pub fn unlink_fact_source(
+        &mut self,
+        fact_id: &str,
+        source_id: &str,
+    ) -> Result<bool, MemoryDatabaseError> {
+        require_non_empty("fact_id", fact_id)?;
+        require_non_empty("source_id", source_id)?;
+        let fact = self
+            .fact(fact_id)?
+            .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("memory fact was not found: {fact_id}"),
+            })?;
+        let source_count = self.source_count_for_fact(fact_id)?;
+
+        if fact.kind != MemoryKind::UserNote.as_str() && source_count <= 1 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "non-user_note facts must keep at least one source".to_string(),
+            });
+        }
+
+        let deleted = self
+            .connection
+            .execute(
+                "DELETE FROM memory_fact_sources WHERE fact_id = ?1 AND source_id = ?2",
+                params![fact_id, source_id],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(deleted > 0)
+    }
+
     pub fn insert_edge(&mut self, edge: NewMemoryEdge<'_>) -> Result<(), MemoryDatabaseError> {
         validate_edge(&edge)?;
+        if edge.relation == MemoryRelationKind::Updates
+            && update_relation_would_cycle(
+                &self.connection,
+                &self.database_path,
+                edge.source_fact_id,
+                edge.target_fact_id,
+            )?
+        {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "updates relation would create a cycle".to_string(),
+            });
+        }
         let now = now_timestamp();
 
         self.connection
@@ -266,6 +487,52 @@ impl MemoryDatabase {
         Ok(())
     }
 
+    pub fn upsert_profile(
+        &mut self,
+        profile: NewMemoryProfile<'_>,
+    ) -> Result<(), MemoryDatabaseError> {
+        self.validate_scope(profile.scope)?;
+        validate_profile(&profile)?;
+        let now = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO memory_profiles
+                    (id, scope, chat_id, profile_text, metadata_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    profile_text = excluded.profile_text,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at",
+                params![
+                    profile.id,
+                    profile.scope.as_str(),
+                    profile.chat_id,
+                    profile.profile_text,
+                    profile.metadata_json,
+                    now,
+                    now,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(())
+    }
+
+    pub fn profile(&self, id: &str) -> Result<Option<MemoryProfileRecord>, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        self.connection
+            .query_row(
+                "SELECT id, scope, chat_id, profile_text, metadata_json, created_at, updated_at
+                 FROM memory_profiles
+                 WHERE id = ?1",
+                params![id],
+                memory_profile_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.database_path, source))
+    }
+
     pub fn fact(&self, id: &str) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("id", id)?;
         self.connection
@@ -279,6 +546,49 @@ impl MemoryDatabase {
             )
             .optional()
             .map_err(|source| sqlite_error(&self.database_path, source))
+    }
+
+    pub fn source(&self, id: &str) -> Result<Option<MemorySourceRecord>, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        self.connection
+            .query_row(
+                "SELECT id, scope, chat_id, source_type, source_id, title, content,
+                        metadata_json, created_at, updated_at
+                 FROM memory_sources
+                 WHERE id = ?1",
+                params![id],
+                memory_source_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.database_path, source))
+    }
+
+    pub fn sources_for_fact(
+        &self,
+        fact_id: &str,
+    ) -> Result<Vec<MemorySourceRecord>, MemoryDatabaseError> {
+        require_non_empty("fact_id", fact_id)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT s.id, s.scope, s.chat_id, s.source_type, s.source_id, s.title, s.content,
+                        s.metadata_json, s.created_at, s.updated_at
+                 FROM memory_sources s
+                 JOIN memory_fact_sources fs ON fs.source_id = s.id
+                 WHERE fs.fact_id = ?1
+                 ORDER BY s.created_at ASC, s.id ASC",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(params![fact_id], memory_source_from_row)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn source_count_for_fact(&self, fact_id: &str) -> Result<i64, MemoryDatabaseError> {
+        require_non_empty("fact_id", fact_id)?;
+        source_count_for_fact(&self.connection, &self.database_path, fact_id)
     }
 
     pub fn search_active_facts(
@@ -313,6 +623,189 @@ impl MemoryDatabase {
 
         collect_rows(rows, &self.database_path)
     }
+
+    pub fn search_active_facts_for_scope(
+        &self,
+        query: &str,
+        chat_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        require_non_empty("query", query)?;
+        if let Some(chat_id) = chat_id {
+            require_non_empty("chat_id", chat_id)?;
+        }
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let (filter_sql, chat_param) = match self.kind {
+            MemoryDatabaseKind::Global => ("f.scope = 'global'", None),
+            MemoryDatabaseKind::Workspace if chat_id.is_some() => (
+                "(f.scope = 'chat' AND f.chat_id = ?2) OR f.scope = 'workspace'",
+                chat_id,
+            ),
+            MemoryDatabaseKind::Workspace => ("f.scope = 'workspace'", None),
+        };
+        let sql = format!(
+            "SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
+                    f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at, f.updated_at
+             FROM memory_fts_index
+             JOIN memory_facts f ON f.id = memory_fts_index.fact_id
+             WHERE memory_fts_index MATCH ?1
+               AND ({filter_sql})
+               AND f.status = 'active'
+               AND f.is_latest = 1
+             ORDER BY
+               CASE WHEN f.scope = 'chat' THEN 0 WHEN f.scope = 'workspace' THEN 1 ELSE 2 END,
+               bm25(memory_fts_index),
+               f.pinned DESC,
+               f.updated_at DESC
+             LIMIT ?3"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(params![query, chat_param, limit], memory_fact_from_row)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn promote_fact(
+        &mut self,
+        source_fact_id: &str,
+        promoted_fact_id: &str,
+        target_scope: MemoryScope,
+        target_chat_id: Option<&str>,
+    ) -> Result<MemoryFactRecord, MemoryDatabaseError> {
+        self.validate_scope(target_scope)?;
+        let fact =
+            self.fact(source_fact_id)?
+                .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!("memory fact was not found: {source_fact_id}"),
+                })?;
+        let sources = self.sources_for_fact(source_fact_id)?;
+
+        for (index, source) in sources.iter().enumerate() {
+            self.insert_source(NewMemorySource {
+                id: &promoted_source_id(promoted_fact_id, index),
+                scope: target_scope,
+                chat_id: target_chat_id,
+                source_type: memory_source_type_from_str(&source.source_type)?,
+                source_id: source.source_id.as_deref(),
+                title: &source.title,
+                content: &source.content,
+                metadata_json: &source.metadata_json,
+            })?;
+        }
+
+        let promoted_source_ids = promoted_source_ids(promoted_fact_id, sources.len());
+        let promoted_source_refs = promoted_source_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        self.insert_fact(NewMemoryFact {
+            id: promoted_fact_id,
+            scope: target_scope,
+            chat_id: target_chat_id,
+            status: memory_status_from_str(&fact.status)?,
+            kind: memory_kind_from_str(&fact.kind)?,
+            fact: &fact.fact,
+            confidence: fact.confidence,
+            pinned: fact.pinned,
+            source_ids: &promoted_source_refs,
+            metadata_json: &fact.metadata_json,
+        })?;
+
+        self.fact(promoted_fact_id)?
+            .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("promoted memory fact was not found: {promoted_fact_id}"),
+            })
+    }
+
+    pub fn promote_fact_to_database(
+        &self,
+        source_fact_id: &str,
+        target: &mut MemoryDatabase,
+        promoted_fact_id: &str,
+        target_scope: MemoryScope,
+        target_chat_id: Option<&str>,
+    ) -> Result<MemoryFactRecord, MemoryDatabaseError> {
+        target.validate_scope(target_scope)?;
+        let fact =
+            self.fact(source_fact_id)?
+                .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!("memory fact was not found: {source_fact_id}"),
+                })?;
+        let sources = self.sources_for_fact(source_fact_id)?;
+
+        for (index, source) in sources.iter().enumerate() {
+            target.insert_source(NewMemorySource {
+                id: &promoted_source_id(promoted_fact_id, index),
+                scope: target_scope,
+                chat_id: target_chat_id,
+                source_type: memory_source_type_from_str(&source.source_type)?,
+                source_id: source.source_id.as_deref(),
+                title: &source.title,
+                content: &source.content,
+                metadata_json: &source.metadata_json,
+            })?;
+        }
+
+        let promoted_source_ids = promoted_source_ids(promoted_fact_id, sources.len());
+        let promoted_source_refs = promoted_source_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        target.insert_fact(NewMemoryFact {
+            id: promoted_fact_id,
+            scope: target_scope,
+            chat_id: target_chat_id,
+            status: memory_status_from_str(&fact.status)?,
+            kind: memory_kind_from_str(&fact.kind)?,
+            fact: &fact.fact,
+            confidence: fact.confidence,
+            pinned: fact.pinned,
+            source_ids: &promoted_source_refs,
+            metadata_json: &fact.metadata_json,
+        })?;
+
+        target
+            .fact(promoted_fact_id)?
+            .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("promoted memory fact was not found: {promoted_fact_id}"),
+            })
+    }
+
+    fn validate_scope(&self, scope: MemoryScope) -> Result<(), MemoryDatabaseError> {
+        match (self.kind, scope) {
+            (MemoryDatabaseKind::Global, MemoryScope::Global)
+            | (MemoryDatabaseKind::Workspace, MemoryScope::Workspace | MemoryScope::Chat) => Ok(()),
+            (MemoryDatabaseKind::Global, MemoryScope::Workspace | MemoryScope::Chat) => {
+                Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!(
+                        "global memory database only accepts global scope, got '{}'",
+                        scope.as_str()
+                    ),
+                })
+            }
+            (MemoryDatabaseKind::Workspace, MemoryScope::Global) => {
+                Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: "workspace memory database does not accept global scope".to_string(),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryDatabaseKind {
+    Global,
+    Workspace,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -325,6 +818,14 @@ pub struct NewMemorySource<'a> {
     pub title: &'a str,
     pub content: &'a str,
     pub metadata_json: &'a str,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UpdateMemorySource<'a> {
+    pub id: &'a str,
+    pub title: Option<&'a str>,
+    pub content: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -341,6 +842,21 @@ pub struct NewMemoryFact<'a> {
     pub metadata_json: &'a str,
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct UpdateMemoryFact<'a> {
+    pub id: &'a str,
+    pub scope: Option<MemoryScope>,
+    pub chat_id: Option<&'a str>,
+    pub status: Option<MemoryStatus>,
+    pub kind: Option<MemoryKind>,
+    pub fact: Option<&'a str>,
+    pub confidence: Option<f64>,
+    pub pinned: Option<bool>,
+    pub is_latest: Option<bool>,
+    pub expires_at: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewMemoryEdge<'a> {
     pub id: &'a str,
@@ -348,6 +864,29 @@ pub struct NewMemoryEdge<'a> {
     pub target_fact_id: &'a str,
     pub relation: MemoryRelationKind,
     pub metadata_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewMemoryProfile<'a> {
+    pub id: &'a str,
+    pub scope: MemoryScope,
+    pub chat_id: Option<&'a str>,
+    pub profile_text: &'a str,
+    pub metadata_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemorySourceRecord {
+    pub id: String,
+    pub scope: String,
+    pub chat_id: Option<String>,
+    pub source_type: String,
+    pub source_id: Option<String>,
+    pub title: String,
+    pub content: String,
+    pub metadata_json: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -362,6 +901,17 @@ pub struct MemoryFactRecord {
     pub pinned: bool,
     pub is_latest: bool,
     pub expires_at: Option<String>,
+    pub metadata_json: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryProfileRecord {
+    pub id: String,
+    pub scope: String,
+    pub chat_id: Option<String>,
+    pub profile_text: String,
     pub metadata_json: String,
     pub created_at: String,
     pub updated_at: String,
@@ -552,15 +1102,36 @@ fn upsert_fact_fts_data(
     Ok(())
 }
 
-fn validate_global_scope(scope: MemoryScope) -> Result<(), MemoryDatabaseError> {
-    if scope != MemoryScope::Global {
-        return Err(MemoryDatabaseError::InvalidMemoryInput {
-            message: format!(
-                "global memory database only accepts global scope, got '{}'",
-                scope.as_str()
-            ),
-        });
-    }
+fn upsert_fact_record_fts_data(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    fact: &MemoryFactRecord,
+) -> Result<(), MemoryDatabaseError> {
+    transaction
+        .execute(
+            "INSERT INTO memory_fts_data
+                (fact_id, scope, chat_id, status, kind, title, body, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(fact_id) DO UPDATE SET
+                scope = excluded.scope,
+                chat_id = excluded.chat_id,
+                status = excluded.status,
+                kind = excluded.kind,
+                title = excluded.title,
+                body = excluded.body,
+                updated_at = excluded.updated_at",
+            params![
+                fact.id,
+                fact.scope,
+                fact.chat_id,
+                fact.status,
+                fact.kind,
+                fact.kind,
+                fact.fact,
+                fact.updated_at,
+            ],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
 
     Ok(())
 }
@@ -577,6 +1148,27 @@ fn validate_source(source: &NewMemorySource<'_>) -> Result<(), MemoryDatabaseErr
         });
     }
     validate_json("metadata_json", source.metadata_json)
+}
+
+fn validate_source_update(source: &UpdateMemorySource<'_>) -> Result<(), MemoryDatabaseError> {
+    require_non_empty("id", source.id)?;
+    if source.title.is_none() && source.content.is_none() && source.metadata_json.is_none() {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "source update must change at least one field".to_string(),
+        });
+    }
+    if let Some(content) = source.content
+        && content.trim().is_empty()
+    {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "content must not be empty".to_string(),
+        });
+    }
+    if let Some(metadata_json) = source.metadata_json {
+        validate_json("metadata_json", metadata_json)?;
+    }
+
+    Ok(())
 }
 
 fn validate_fact(fact: &NewMemoryFact<'_>) -> Result<(), MemoryDatabaseError> {
@@ -605,6 +1197,47 @@ fn validate_fact(fact: &NewMemoryFact<'_>) -> Result<(), MemoryDatabaseError> {
     validate_json("metadata_json", fact.metadata_json)
 }
 
+fn validate_fact_update(fact: &UpdateMemoryFact<'_>) -> Result<(), MemoryDatabaseError> {
+    require_non_empty("id", fact.id)?;
+    if fact.scope.is_none()
+        && fact.chat_id.is_none()
+        && fact.status.is_none()
+        && fact.kind.is_none()
+        && fact.fact.is_none()
+        && fact.confidence.is_none()
+        && fact.pinned.is_none()
+        && fact.is_latest.is_none()
+        && fact.expires_at.is_none()
+        && fact.metadata_json.is_none()
+    {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "fact update must change at least one field".to_string(),
+        });
+    }
+    if let Some(scope) = fact.scope {
+        validate_scope_chat_id(scope, fact.chat_id)?;
+    }
+    if let Some(text) = fact.fact
+        && text.trim().is_empty()
+    {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "fact must not be empty".to_string(),
+        });
+    }
+    if let Some(confidence) = fact.confidence
+        && !(0.0..=1.0).contains(&confidence)
+    {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("confidence must be between 0 and 1, got {confidence}"),
+        });
+    }
+    if let Some(metadata_json) = fact.metadata_json {
+        validate_json("metadata_json", metadata_json)?;
+    }
+
+    Ok(())
+}
+
 fn validate_edge(edge: &NewMemoryEdge<'_>) -> Result<(), MemoryDatabaseError> {
     require_non_empty("id", edge.id)?;
     require_non_empty("source_fact_id", edge.source_fact_id)?;
@@ -615,6 +1248,12 @@ fn validate_edge(edge: &NewMemoryEdge<'_>) -> Result<(), MemoryDatabaseError> {
         });
     }
     validate_json("metadata_json", edge.metadata_json)
+}
+
+fn validate_profile(profile: &NewMemoryProfile<'_>) -> Result<(), MemoryDatabaseError> {
+    require_non_empty("id", profile.id)?;
+    validate_scope_chat_id(profile.scope, profile.chat_id)?;
+    validate_json("metadata_json", profile.metadata_json)
 }
 
 fn validate_scope_chat_id(
@@ -667,6 +1306,174 @@ fn memory_fact_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryFactR
         created_at: row.get(11)?,
         updated_at: row.get(12)?,
     })
+}
+
+fn memory_source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySourceRecord> {
+    Ok(MemorySourceRecord {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        chat_id: row.get(2)?,
+        source_type: row.get(3)?,
+        source_id: row.get(4)?,
+        title: row.get(5)?,
+        content: row.get(6)?,
+        metadata_json: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+    })
+}
+
+fn memory_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryProfileRecord> {
+    Ok(MemoryProfileRecord {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        chat_id: row.get(2)?,
+        profile_text: row.get(3)?,
+        metadata_json: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
+fn fact_by_id(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    id: &str,
+) -> Result<MemoryFactRecord, MemoryDatabaseError> {
+    transaction
+        .query_row(
+            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                    expires_at, metadata_json, created_at, updated_at
+             FROM memory_facts
+             WHERE id = ?1",
+            params![id],
+            memory_fact_from_row,
+        )
+        .map_err(|source| sqlite_error(database_path, source))
+}
+
+fn source_count_for_fact(
+    connection: &Connection,
+    database_path: &Path,
+    fact_id: &str,
+) -> Result<i64, MemoryDatabaseError> {
+    connection
+        .query_row(
+            "SELECT COUNT(*) FROM memory_fact_sources WHERE fact_id = ?1",
+            params![fact_id],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))
+}
+
+fn update_relation_would_cycle(
+    connection: &Connection,
+    database_path: &Path,
+    source_fact_id: &str,
+    target_fact_id: &str,
+) -> Result<bool, MemoryDatabaseError> {
+    let found: Option<i64> = connection
+        .query_row(
+            "WITH RECURSIVE update_chain(fact_id) AS (
+                SELECT target_fact_id
+                FROM memory_edges
+                WHERE source_fact_id = ?1 AND relation = 'updates'
+                UNION
+                SELECT e.target_fact_id
+                FROM memory_edges e
+                JOIN update_chain c ON e.source_fact_id = c.fact_id
+                WHERE e.relation = 'updates'
+             )
+             SELECT 1
+             FROM update_chain
+             WHERE fact_id = ?2
+             LIMIT 1",
+            params![target_fact_id, source_fact_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    Ok(found.is_some())
+}
+
+fn ensure_memory_schema_exists(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<(), MemoryDatabaseError> {
+    let exists: bool = connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'memory_facts'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    if !exists {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!(
+                "{} does not contain the memory schema; run workspace migrations first",
+                database_path.display()
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn memory_status_from_str(value: &str) -> Result<MemoryStatus, MemoryDatabaseError> {
+    match value {
+        "pending" => Ok(MemoryStatus::Pending),
+        "active" => Ok(MemoryStatus::Active),
+        "superseded" => Ok(MemoryStatus::Superseded),
+        "expired" => Ok(MemoryStatus::Expired),
+        "rejected" => Ok(MemoryStatus::Rejected),
+        _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("unknown memory status: {value}"),
+        }),
+    }
+}
+
+fn memory_kind_from_str(value: &str) -> Result<MemoryKind, MemoryDatabaseError> {
+    match value {
+        "preference" => Ok(MemoryKind::Preference),
+        "project_fact" => Ok(MemoryKind::ProjectFact),
+        "project_decision" => Ok(MemoryKind::ProjectDecision),
+        "procedure" => Ok(MemoryKind::Procedure),
+        "constraint" => Ok(MemoryKind::Constraint),
+        "episode" => Ok(MemoryKind::Episode),
+        "user_note" => Ok(MemoryKind::UserNote),
+        _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("unknown memory kind: {value}"),
+        }),
+    }
+}
+
+fn memory_source_type_from_str(value: &str) -> Result<MemorySourceType, MemoryDatabaseError> {
+    match value {
+        "chat_message" => Ok(MemorySourceType::ChatMessage),
+        "assistant_message" => Ok(MemorySourceType::AssistantMessage),
+        "tool_call" => Ok(MemorySourceType::ToolCall),
+        "tool_result" => Ok(MemorySourceType::ToolResult),
+        "context_snapshot" => Ok(MemorySourceType::ContextSnapshot),
+        "manual_note" => Ok(MemorySourceType::ManualNote),
+        "imported_document" => Ok(MemorySourceType::ImportedDocument),
+        _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("unknown memory source type: {value}"),
+        }),
+    }
+}
+
+fn promoted_source_id(promoted_fact_id: &str, index: usize) -> String {
+    format!("{promoted_fact_id}:source:{index}")
+}
+
+fn promoted_source_ids(promoted_fact_id: &str, count: usize) -> Vec<String> {
+    (0..count)
+        .map(|index| promoted_source_id(promoted_fact_id, index))
+        .collect()
 }
 
 fn collect_rows<T>(
@@ -977,6 +1784,7 @@ CREATE INDEX memory_extraction_jobs_created_idx ON memory_extraction_jobs (creat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::{WorkspaceDatabase, workspace_database_path};
 
     #[test]
     fn global_database_creates_memory_schema() {
@@ -1055,5 +1863,195 @@ mod tests {
             .expect_err("missing source should fail");
 
         assert!(error.to_string().contains("at least one source"));
+    }
+
+    #[test]
+    fn workspace_memory_api_promotes_and_preserves_workspace_facts() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Memory chat")
+                .expect("chat insert");
+        }
+
+        let database_path = workspace_database_path(workspace.path());
+        let mut memory =
+            MemoryDatabase::open_workspace_at(&database_path).expect("workspace memory database");
+        memory
+            .insert_source(NewMemorySource {
+                id: "source-1",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Original note",
+                content: "Use workspace memory API for scoped facts.",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        memory
+            .insert_source(NewMemorySource {
+                id: "source-2",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Extra note",
+                content: "Extra source can be removed after unlink.",
+                metadata_json: "{}",
+            })
+            .expect("second source insert");
+        memory
+            .insert_fact(NewMemoryFact {
+                id: "fact-1",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                status: MemoryStatus::Pending,
+                kind: MemoryKind::ProjectFact,
+                fact: "Use memory API for scoped facts.",
+                confidence: Some(0.9),
+                pinned: false,
+                source_ids: &["source-1"],
+                metadata_json: "{}",
+            })
+            .expect("fact insert");
+
+        memory
+            .link_fact_source("fact-1", "source-2")
+            .expect("link source");
+        assert!(
+            memory
+                .unlink_fact_source("fact-1", "source-2")
+                .expect("unlink source")
+        );
+        assert!(
+            memory
+                .delete_source("source-2")
+                .expect("delete unlinked source")
+        );
+        assert!(
+            memory
+                .delete_source("source-1")
+                .expect_err("linked source delete should fail")
+                .to_string()
+                .contains("still linked")
+        );
+
+        assert!(
+            memory
+                .update_source(UpdateMemorySource {
+                    id: "source-1",
+                    title: Some("Updated note"),
+                    ..UpdateMemorySource::default()
+                })
+                .expect("source update")
+        );
+        assert!(
+            memory
+                .update_fact(UpdateMemoryFact {
+                    id: "fact-1",
+                    status: Some(MemoryStatus::Active),
+                    fact: Some("Use the workspace memory API for scoped facts."),
+                    pinned: Some(true),
+                    ..UpdateMemoryFact::default()
+                })
+                .expect("fact update")
+        );
+
+        let chat_results = memory
+            .search_active_facts_for_scope("workspace", Some("chat-1"), 10)
+            .expect("chat scoped search");
+        assert_eq!(chat_results[0].id, "fact-1");
+
+        memory
+            .upsert_profile(NewMemoryProfile {
+                id: "chat-profile",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                profile_text: "Chat prefers scoped memory facts.",
+                metadata_json: "{}",
+            })
+            .expect("profile upsert");
+        assert_eq!(
+            memory
+                .profile("chat-profile")
+                .expect("profile")
+                .expect("profile row")
+                .profile_text,
+            "Chat prefers scoped memory facts."
+        );
+
+        let promoted = memory
+            .promote_fact("fact-1", "fact-workspace", MemoryScope::Workspace, None)
+            .expect("chat to workspace promotion");
+        assert_eq!(promoted.scope, "workspace");
+
+        memory
+            .insert_edge(NewMemoryEdge {
+                id: "edge-1",
+                source_fact_id: "fact-workspace",
+                target_fact_id: "fact-1",
+                relation: MemoryRelationKind::Updates,
+                metadata_json: "{}",
+            })
+            .expect("updates edge");
+        assert!(
+            memory
+                .insert_edge(NewMemoryEdge {
+                    id: "edge-2",
+                    source_fact_id: "fact-1",
+                    target_fact_id: "fact-workspace",
+                    relation: MemoryRelationKind::Updates,
+                    metadata_json: "{}",
+                })
+                .expect_err("updates cycle should fail")
+                .to_string()
+                .contains("cycle")
+        );
+
+        let profile = tempfile::tempdir().expect("profile");
+        let mut global =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        memory
+            .promote_fact_to_database(
+                "fact-workspace",
+                &mut global,
+                "fact-global",
+                MemoryScope::Global,
+                None,
+            )
+            .expect("workspace to global promotion");
+        assert_eq!(
+            global
+                .search_active_facts("workspace", 10)
+                .expect("global search")[0]
+                .id,
+            "fact-global"
+        );
+
+        drop(memory);
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            assert!(
+                workspace_database
+                    .delete_chat("chat-1")
+                    .expect("chat delete")
+            );
+        }
+
+        let memory =
+            MemoryDatabase::open_workspace_at(&database_path).expect("workspace memory database");
+        assert!(memory.fact("fact-1").expect("chat fact lookup").is_none());
+        assert_eq!(
+            memory
+                .fact("fact-workspace")
+                .expect("workspace fact lookup")
+                .expect("workspace fact")
+                .scope,
+            "workspace"
+        );
     }
 }
