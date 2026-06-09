@@ -103,48 +103,89 @@ mod hooks;
 mod logging;
 mod terminal;
 
+// Environment variable used to override the configured web server port for one startup.
 const PORT_ENV: &str = "FOCO_PORT";
+// Environment variable used to override the configured web server host for one startup.
 const HOST_ENV: &str = "FOCO_HOST";
+// Maximum number of model continuation rounds allowed while executing tool calls in one run.
 const MAX_AGENT_TOOL_ROUNDS: usize = 128;
+// Number of newest chat messages kept verbatim when older history is compressed.
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
+// Maximum characters kept from each covered message inside a compression snapshot summary.
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
+// Maximum compressed message entries shown in a single snapshot prompt summary.
 const CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES: usize = 16;
+// Prefix used to identify injected context compression snapshot messages.
 const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
+// Percent of the model context budget reserved for memory profile and retrieved facts.
 const MEMORY_CONTEXT_BUDGET_PERCENT: u64 = 12;
+// Maximum active memory facts considered when building query-specific memory context.
 const MEMORY_CONTEXT_FACT_LIMIT: u32 = 24;
+// Maximum generated memory profile records considered for prompt injection.
 const MEMORY_CONTEXT_PROFILE_LIMIT: u32 = 8;
+// Graph traversal depth used when expanding retrieved memory facts through edges.
 const MEMORY_CONTEXT_EDGE_EXPANSION_DEPTH: u32 = 1;
+// Maximum related memory facts added during graph edge expansion.
 const MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT: u32 = 12;
+// Maximum active facts used when refreshing the generated memory profile.
 const MEMORY_PROFILE_REFRESH_FACT_LIMIT: u32 = 32;
+// Prefix used to identify injected memory profile context messages.
 const MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX: &str = "Foco memory profile context:";
+// Prefix used to identify injected query-specific retrieved memory messages.
 const MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX: &str = "Foco retrieved memory context:";
+// Agent tool name exposed for searching memory facts.
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
+// Agent tool name exposed for writing manual memory notes.
 const MEMORY_WRITE_TOOL_NAME: &str = "memory_write";
+// Default timeout for memory tools when the caller does not provide timeoutMs.
 const DEFAULT_MEMORY_TOOL_TIMEOUT_MS: u64 = 10_000;
+// Upper bound accepted for memory tool timeoutMs.
 const MAX_MEMORY_TOOL_TIMEOUT_MS: u64 = 120_000;
+// Upper bound accepted for memory_search result limits.
 const MAX_MEMORY_TOOL_SEARCH_LIMIT: u32 = 50;
+// Tool name the model must call to return extracted memory facts.
 const MEMORY_EXTRACTION_TOOL_NAME: &str = "submit_memory_extraction";
+// Timeout for the background model call that extracts durable memory facts.
 const MEMORY_EXTRACTION_TIMEOUT_MS: u64 = 60_000;
+// Maximum output tokens allowed for the memory extraction model request.
 const MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 2048;
+// System prompt for the memory extraction request that forces evidence-backed tool output only.
 const MEMORY_EXTRACTION_SYSTEM_PROMPT: &str = "Extract only durable, user-reviewable memory facts from the provided completed chat turn evidence. Use the submit_memory_extraction tool exactly once. Do not return prose. Include a fact only when it is directly supported by one or more provided evidenceIds. If there is nothing worth remembering, submit {\"facts\":[]}. Suggested scopes mean: global for user-wide stable preferences, workspace for project-specific durable facts, chat for session-specific details.";
+// Maximum number of attachments allowed on one chat or context-usage request.
 const MAX_CHAT_ATTACHMENTS: usize = 6;
+// Maximum size allowed for a single chat attachment.
 const MAX_CHAT_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+// Maximum combined size allowed for all attachments in one request.
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES: u64 = 24 * 1024 * 1024;
+// HTTP request body limit for endpoints that accept chat attachments.
 const CHAT_ATTACHMENT_BODY_LIMIT_BYTES: usize = 40 * 1024 * 1024;
+// Maximum accepted workspace logo image size.
 const MAX_WORKSPACE_LOGO_BYTES: u64 = 2 * 1024 * 1024;
+// HTTP request body limit for workspace logo upload and save endpoints.
 const WORKSPACE_LOGO_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+// File extensions accepted for persisted workspace logo images.
 const WORKSPACE_LOGO_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+// Prefix used to identify injected AGENTS.md instruction messages.
 const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
+// Prefix used to identify injected enabled skill front matter messages.
 const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
     "Enabled skill front matter loaded from configured skills";
+// Prefix used to identify injected environment context messages.
 const ENVIRONMENT_CONTEXT_MESSAGE_PREFIX: &str = "Environment context for this chat";
+// Cancellation reason recorded when active runs stop because the application is shutting down.
 const SHUTDOWN_MESSAGE: &str = "app shutdown requested";
+// Name of the browser authentication cookie.
 const AUTH_COOKIE_NAME: &str = "foco_auth";
+// Algorithm marker prepended to stored password hashes.
 const PASSWORD_HASH_PREFIX: &str = "sha256";
+// GitHub API endpoint used to find the latest ripgrep release for auto-install.
 const RIPGREP_RELEASE_API_URL: &str =
     "https://api.github.com/repos/BurntSushi/ripgrep/releases/latest";
+// Temporary archive filename used while downloading ripgrep.
 const RIPGREP_DOWNLOAD_ARCHIVE_NAME: &str = "ripgrep-download.tmp";
+// Temporary directory name used while extracting a downloaded ripgrep archive.
 const RIPGREP_EXTRACT_DIR_NAME: &str = "ripgrep-extract";
+// Process-wide counter used by unique_id to keep IDs distinct within the same millisecond.
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -154,8 +195,10 @@ type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 struct WebAssets;
 
 #[cfg(all(windows, not(debug_assertions)))]
+// Stable tray menu item id for opening the browser UI from the Windows tray icon.
 const TRAY_OPEN_ITEM_ID: &str = "foco-open-ui";
 #[cfg(all(windows, not(debug_assertions)))]
+// Stable tray menu item id for quitting the Windows tray application.
 const TRAY_QUIT_ITEM_ID: &str = "foco-quit";
 
 #[cfg(all(windows, not(debug_assertions)))]
