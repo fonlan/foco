@@ -113,6 +113,8 @@ const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
 const MEMORY_CONTEXT_BUDGET_PERCENT: u64 = 12;
 const MEMORY_CONTEXT_FACT_LIMIT: u32 = 24;
 const MEMORY_CONTEXT_PROFILE_LIMIT: u32 = 8;
+const MEMORY_CONTEXT_EDGE_EXPANSION_DEPTH: u32 = 1;
+const MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT: u32 = 12;
 const MEMORY_PROFILE_REFRESH_FACT_LIMIT: u32 = 32;
 const MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX: &str = "Foco memory profile context:";
 const MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX: &str = "Foco retrieved memory context:";
@@ -3801,6 +3803,7 @@ struct ChatMessageSummary {
     tool_calls: Vec<ChatToolCallSummary>,
     parts: Vec<ChatMessagePart>,
     metrics: Option<ChatReplyMetrics>,
+    memories_used: Vec<ChatMemoryUsedSummary>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -3831,6 +3834,18 @@ struct ChatReplyMetrics {
     total_latency_ms: Option<i64>,
     first_token_latency_ms: Option<i64>,
     output_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatMemoryUsedSummary {
+    id: String,
+    scope: String,
+    chat_id: Option<String>,
+    kind: String,
+    fact: String,
+    pinned: bool,
+    source: String,
 }
 
 #[derive(Serialize)]
@@ -3886,6 +3901,7 @@ enum ChatSseEvent {
         usage: Option<NeutralUsage>,
         stop_reason: Option<String>,
         metrics: ChatReplyMetrics,
+        memories_used: Vec<ChatMemoryUsedSummary>,
     },
     Error {
         message: String,
@@ -3913,6 +3929,7 @@ struct PreparedChatContext {
     context_budget: foco_agent::ContextBudget,
     global_config: GlobalConfig,
     memory_settings: MemorySettings,
+    memories_used: Vec<ChatMemoryUsedSummary>,
     memory_target_status: MemoryStatus,
     request_body_json: String,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
@@ -3932,6 +3949,7 @@ struct PreparedPromptContext {
     context_budget: foco_agent::ContextBudget,
     memory_context_tokens: u64,
     memory_budget_tokens: u64,
+    memories_used: Vec<ChatMemoryUsedSummary>,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
     active_tool_start_index: usize,
@@ -3945,8 +3963,43 @@ struct PreparedPromptContext {
 struct MemoryPromptContext {
     profile_message: Option<NeutralChatMessage>,
     retrieved_message: Option<NeutralChatMessage>,
+    memories_used: Vec<ChatMemoryUsedSummary>,
     context_tokens: u64,
     budget_tokens: u64,
+}
+
+struct RetrievedMemoryContext {
+    message: Option<NeutralChatMessage>,
+    memories_used: Vec<ChatMemoryUsedSummary>,
+}
+
+#[derive(Clone)]
+struct RetrievedMemoryFact {
+    fact: MemoryFactRecord,
+    source: RetrievedMemorySource,
+    rank: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetrievedMemorySource {
+    Direct,
+    Related,
+}
+
+impl RetrievedMemorySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Related => "related",
+        }
+    }
+
+    fn rank(self) -> u8 {
+        match self {
+            Self::Direct => 0,
+            Self::Related => 1,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -4527,6 +4580,7 @@ impl PreparedChatContext {
                                     usage: final_usage.clone(),
                                     stop_reason: stop_reason.clone(),
                                     metrics,
+                                    memories_used: self.memories_used.clone(),
                                 };
                                 let session_end_summary = session_end_hook(
                                     &self,
@@ -5142,6 +5196,7 @@ async fn prepare_prompt_context(
         context_budget,
         memory_context_tokens: memory_context.context_tokens,
         memory_budget_tokens: memory_context.budget_tokens,
+        memories_used: memory_context.memories_used,
         compression_snapshots,
         message_source_sequences,
         active_tool_start_index,
@@ -5282,6 +5337,7 @@ async fn prepare_chat_context(
         context_budget: prompt_context.context_budget,
         global_config: config.clone(),
         memory_settings: config.memory.clone(),
+        memories_used: prompt_context.memories_used,
         memory_target_status: memory_target_status_for_prompt(raw_message),
         request_body_json,
         compression_snapshots: prompt_context.compression_snapshots,
@@ -5314,6 +5370,7 @@ fn memory_prompt_context(
         return Ok(MemoryPromptContext {
             profile_message: None,
             retrieved_message: None,
+            memories_used: Vec::new(),
             context_tokens: 0,
             budget_tokens,
         });
@@ -5340,7 +5397,7 @@ fn memory_prompt_context(
         chat_id,
         &mut remaining_tokens,
     )?;
-    let retrieved_message = retrieved_memory_context_message(
+    let retrieved_context = retrieved_memory_context_message(
         &mut global_memory,
         &mut workspace_memory,
         chat_id,
@@ -5351,14 +5408,16 @@ fn memory_prompt_context(
         .as_ref()
         .map(neutral_message_estimated_tokens)
         .unwrap_or(0)
-        + retrieved_message
+        + retrieved_context
+            .message
             .as_ref()
             .map(neutral_message_estimated_tokens)
             .unwrap_or(0);
 
     Ok(MemoryPromptContext {
         profile_message,
-        retrieved_message,
+        retrieved_message: retrieved_context.message,
+        memories_used: retrieved_context.memories_used,
         context_tokens,
         budget_tokens,
     })
@@ -5425,46 +5484,100 @@ fn retrieved_memory_context_message(
     chat_id: Option<&str>,
     query_text: Option<&str>,
     remaining_tokens: &mut u64,
-) -> Result<Option<NeutralChatMessage>, ApiError> {
+) -> Result<RetrievedMemoryContext, ApiError> {
     let search_query = query_text.and_then(memory_fts_query);
-    let mut facts = Vec::new();
-    facts.extend(match search_query.as_deref() {
+    let workspace_facts = match search_query.as_deref() {
         Some(query) => workspace_memory
             .search_active_facts_for_scope(query, chat_id, MEMORY_CONTEXT_FACT_LIMIT)
             .map_err(ApiError::from_memory_error)?,
         None => workspace_memory
             .list_active_facts_for_scope(chat_id, MEMORY_CONTEXT_FACT_LIMIT)
             .map_err(ApiError::from_memory_error)?,
-    });
-    facts.extend(match search_query.as_deref() {
+    };
+    let global_facts = match search_query.as_deref() {
         Some(query) => global_memory
             .search_active_facts_for_scope(query, None, MEMORY_CONTEXT_FACT_LIMIT)
             .map_err(ApiError::from_memory_error)?,
         None => global_memory
             .list_active_facts_for_scope(None, MEMORY_CONTEXT_FACT_LIMIT)
             .map_err(ApiError::from_memory_error)?,
-    });
-    facts.sort_by(memory_fact_prompt_order);
-    facts.dedup_by(|left, right| left.id == right.id && left.scope == right.scope);
+    };
+    let mut facts = ranked_memory_facts(workspace_facts, global_facts);
+    let workspace_seed_ids = facts
+        .iter()
+        .filter(|fact| fact.fact.scope != "global")
+        .map(|fact| fact.fact.id.clone())
+        .collect::<Vec<_>>();
+    let global_seed_ids = facts
+        .iter()
+        .filter(|fact| fact.fact.scope == "global")
+        .map(|fact| fact.fact.id.clone())
+        .collect::<Vec<_>>();
+    let related_rank_start = facts.len();
+    facts.extend(
+        workspace_memory
+            .related_active_facts(
+                &workspace_seed_ids,
+                MEMORY_CONTEXT_EDGE_EXPANSION_DEPTH,
+                MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT,
+            )
+            .map_err(ApiError::from_memory_error)?
+            .into_iter()
+            .enumerate()
+            .map(|(index, fact)| RetrievedMemoryFact {
+                fact,
+                source: RetrievedMemorySource::Related,
+                rank: related_rank_start + index,
+            }),
+    );
+    let global_related_rank_start = facts.len();
+    facts.extend(
+        global_memory
+            .related_active_facts(
+                &global_seed_ids,
+                MEMORY_CONTEXT_EDGE_EXPANSION_DEPTH,
+                MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT,
+            )
+            .map_err(ApiError::from_memory_error)?
+            .into_iter()
+            .enumerate()
+            .map(|(index, fact)| RetrievedMemoryFact {
+                fact,
+                source: RetrievedMemorySource::Related,
+                rank: global_related_rank_start + index,
+            }),
+    );
+    facts.sort_by(retrieved_memory_fact_order);
+    let mut seen_fact_keys = HashSet::new();
+    facts.retain(|fact| seen_fact_keys.insert((fact.fact.scope.clone(), fact.fact.id.clone())));
 
     if facts.is_empty() {
-        return Ok(None);
+        return Ok(RetrievedMemoryContext {
+            message: None,
+            memories_used: Vec::new(),
+        });
     }
 
     let prefix_tokens = estimate_text_tokens(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX);
     if prefix_tokens > *remaining_tokens {
-        return Ok(None);
+        return Ok(RetrievedMemoryContext {
+            message: None,
+            memories_used: Vec::new(),
+        });
     }
     *remaining_tokens = remaining_tokens.saturating_sub(prefix_tokens);
     let mut content = String::from(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX);
-    for fact in facts {
+    let mut memories_used = Vec::new();
+    for retrieved_fact in facts {
+        let fact = &retrieved_fact.fact;
         let entry = format!(
-            "\n\n- id: {}\n  scope: {}\n  chatId: {}\n  kind: {}\n  pinned: {}\n  updatedAt: {}\n  fact: {}",
+            "\n\n- id: {}\n  scope: {}\n  chatId: {}\n  kind: {}\n  pinned: {}\n  source: {}\n  updatedAt: {}\n  fact: {}",
             fact.id,
             fact.scope,
             fact.chat_id.as_deref().unwrap_or("n/a"),
             fact.kind,
             fact.pinned,
+            retrieved_fact.source.as_str(),
             fact.updated_at,
             markdown_safe_single_line(&fact.fact)
         );
@@ -5473,14 +5586,21 @@ fn retrieved_memory_context_message(
             break;
         }
         content.push_str(&entry);
+        memories_used.push(chat_memory_used_summary(&retrieved_fact));
         *remaining_tokens = remaining_tokens.saturating_sub(entry_tokens);
     }
 
     if content == MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX {
-        return Ok(None);
+        return Ok(RetrievedMemoryContext {
+            message: None,
+            memories_used: Vec::new(),
+        });
     }
 
-    Ok(Some(neutral_text_message(NeutralChatRole::System, content)))
+    Ok(RetrievedMemoryContext {
+        message: Some(neutral_text_message(NeutralChatRole::System, content)),
+        memories_used,
+    })
 }
 
 fn memory_fts_query(text: &str) -> Option<String> {
@@ -5525,6 +5645,33 @@ fn push_memory_fts_term(terms: &mut Vec<String>, seen: &mut HashSet<String>, cur
     current.clear();
 }
 
+fn ranked_memory_facts(
+    workspace_facts: Vec<MemoryFactRecord>,
+    global_facts: Vec<MemoryFactRecord>,
+) -> Vec<RetrievedMemoryFact> {
+    workspace_facts
+        .into_iter()
+        .chain(global_facts)
+        .enumerate()
+        .map(|(rank, fact)| RetrievedMemoryFact {
+            fact,
+            source: RetrievedMemorySource::Direct,
+            rank,
+        })
+        .collect()
+}
+
+fn retrieved_memory_fact_order(
+    left: &RetrievedMemoryFact,
+    right: &RetrievedMemoryFact,
+) -> std::cmp::Ordering {
+    left.source
+        .rank()
+        .cmp(&right.source.rank())
+        .then_with(|| left.rank.cmp(&right.rank))
+        .then_with(|| memory_fact_prompt_order(&left.fact, &right.fact))
+}
+
 fn memory_fact_prompt_order(
     left: &MemoryFactRecord,
     right: &MemoryFactRecord,
@@ -5533,6 +5680,13 @@ fn memory_fact_prompt_order(
         .pinned
         .cmp(&left.pinned)
         .then_with(|| memory_fact_scope_rank(left).cmp(&memory_fact_scope_rank(right)))
+        .then_with(|| right.is_latest.cmp(&left.is_latest))
+        .then_with(|| {
+            right
+                .confidence
+                .partial_cmp(&left.confidence)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .then_with(|| right.updated_at.cmp(&left.updated_at))
         .then_with(|| left.id.cmp(&right.id))
 }
@@ -5543,6 +5697,20 @@ fn memory_fact_scope_rank(fact: &MemoryFactRecord) -> u8 {
         "workspace" => 1,
         "global" => 2,
         _ => 3,
+    }
+}
+
+fn chat_memory_used_summary(retrieved_fact: &RetrievedMemoryFact) -> ChatMemoryUsedSummary {
+    let fact = &retrieved_fact.fact;
+
+    ChatMemoryUsedSummary {
+        id: fact.id.clone(),
+        scope: fact.scope.clone(),
+        chat_id: fact.chat_id.clone(),
+        kind: fact.kind.clone(),
+        fact: fact.fact.clone(),
+        pinned: fact.pinned,
+        source: retrieved_fact.source.as_str().to_string(),
     }
 }
 
@@ -6387,7 +6555,8 @@ fn persist_chat_result(
     }
 
     if let Some(assistant_text) = assistant_text {
-        let metadata_json = assistant_message_metadata_json(assistant_reasoning)?;
+        let metadata_json =
+            assistant_message_metadata_json(assistant_reasoning, &context.memories_used)?;
         database
             .insert_message(NewMessage {
                 id: &context.assistant_message_id,
@@ -11446,12 +11615,45 @@ fn assistant_reasoning_from_metadata(metadata_json: &str) -> Result<Option<Strin
     Ok(non_empty_string(reasoning))
 }
 
-fn assistant_message_metadata_json(reasoning: Option<&str>) -> Result<String, ApiError> {
-    let Some(reasoning) = reasoning else {
-        return Ok("{}".to_string());
+fn assistant_memories_used_from_metadata(
+    metadata_json: &str,
+) -> Result<Vec<ChatMemoryUsedSummary>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
+    let Some(memories_used) = metadata.get("memoriesUsed") else {
+        return Ok(Vec::new());
     };
 
-    serde_json::to_string(&json!({ "reasoning": reasoning })).map_err(|source| {
+    if memories_used.is_null() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_value::<Vec<ChatMemoryUsedSummary>>(memories_used.clone()).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to parse assistant message metadata.memoriesUsed: {source}"
+        ))
+    })
+}
+
+fn assistant_message_metadata_json(
+    reasoning: Option<&str>,
+    memories_used: &[ChatMemoryUsedSummary],
+) -> Result<String, ApiError> {
+    if reasoning.is_none() && memories_used.is_empty() {
+        return Ok("{}".to_string());
+    }
+
+    let mut metadata = serde_json::Map::new();
+    if let Some(reasoning) = reasoning {
+        metadata.insert(
+            "reasoning".to_string(),
+            Value::String(reasoning.to_string()),
+        );
+    }
+    if !memories_used.is_empty() {
+        metadata.insert("memoriesUsed".to_string(), json!(memories_used));
+    }
+
+    serde_json::to_string(&Value::Object(metadata)).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize assistant message metadata: {source}"
         ))
@@ -11773,6 +11975,11 @@ fn chat_message_summary(
     } else {
         None
     };
+    let memories_used = if message.role == "assistant" {
+        assistant_memories_used_from_metadata(&message.metadata_json)?
+    } else {
+        Vec::new()
+    };
     let parts = chat_message_parts(
         &message,
         reasoning.as_deref(),
@@ -11793,6 +12000,7 @@ fn chat_message_summary(
         tool_calls,
         parts,
         metrics,
+        memories_used,
     })
 }
 
@@ -13336,6 +13544,7 @@ description: Project memory.
                 retention_days: None,
                 extraction_model_id: Some("extract-model".to_string()),
             },
+            memories_used: Vec::new(),
             memory_target_status: MemoryStatus::Pending,
             request_body_json: "{}".to_string(),
             compression_snapshots: Vec::new(),
@@ -13371,6 +13580,7 @@ description: Project memory.
                 first_token_latency_ms: Some(100),
                 output_tokens: Some(5),
             },
+            memories_used: Vec::new(),
         });
 
         persist_chat_result(
@@ -13720,7 +13930,9 @@ description: Project memory.
                 role: "assistant",
                 content: "Done.",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    r#"{"memoriesUsed":[{"id":"fact-1","scope":"workspace","chatId":null,"kind":"project_fact","fact":"Use memory graph retrieval.","pinned":false,"source":"direct"}]}"#,
+                ),
             })
             .expect("assistant message insert");
         database
@@ -13774,6 +13986,9 @@ description: Project memory.
         assert_eq!(metrics.total_latency_ms, Some(2000));
         assert_eq!(metrics.first_token_latency_ms, Some(250));
         assert_eq!(metrics.output_tokens, Some(40));
+        assert_eq!(summary.memories_used.len(), 1);
+        assert_eq!(summary.memories_used[0].id, "fact-1");
+        assert_eq!(summary.memories_used[0].source, "direct");
 
         drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -14264,6 +14479,24 @@ Use the existing product UI conventions.
                 "Workspace renderer work should share prompt assembly.",
                 false,
             );
+            insert_test_memory_fact(
+                &mut memory,
+                "source-related-renderer",
+                "fact-related-renderer",
+                MemoryScope::Workspace,
+                None,
+                "Graph-linked memory is pulled through adjacent edges.",
+                false,
+            );
+            memory
+                .insert_edge(foco_store::memory::NewMemoryEdge {
+                    id: "edge-related-renderer",
+                    source_fact_id: "fact-chat-renderer",
+                    target_fact_id: "fact-related-renderer",
+                    relation: foco_store::memory::MemoryRelationKind::Extends,
+                    metadata_json: "{}",
+                })
+                .expect("memory edge insert");
         }
         {
             let mut memory = MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
@@ -14331,7 +14564,26 @@ Use the existing product UI conventions.
         assert!(
             messages[2]
                 .content
+                .contains("Graph-linked memory is pulled through adjacent edges.")
+        );
+        assert!(messages[2].content.contains("source: direct"));
+        assert!(messages[2].content.contains("source: related"));
+        assert!(
+            messages[2]
+                .content
                 .contains("Global renderer memory should be available.")
+        );
+        assert!(
+            context
+                .memories_used
+                .iter()
+                .any(|memory| memory.id == "fact-chat-renderer" && memory.source == "direct")
+        );
+        assert!(
+            context
+                .memories_used
+                .iter()
+                .any(|memory| memory.id == "fact-related-renderer" && memory.source == "related")
         );
         assert!(context.memory_context_tokens > 0);
         assert!(context.memory_context_tokens <= context.memory_budget_tokens);

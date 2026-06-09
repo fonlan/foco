@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fmt, fs, io,
     path::{Path, PathBuf},
 };
@@ -990,6 +991,26 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))
     }
 
+    fn active_latest_fact(
+        &self,
+        id: &str,
+    ) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        self.connection
+            .query_row(
+                "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                        expires_at, metadata_json, created_at, updated_at
+                 FROM memory_facts
+                 WHERE id = ?1
+                   AND status = 'active'
+                   AND is_latest = 1",
+                params![id],
+                memory_fact_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.database_path, source))
+    }
+
     pub fn source(&self, id: &str) -> Result<Option<MemorySourceRecord>, MemoryDatabaseError> {
         require_non_empty("id", id)?;
         self.connection
@@ -1055,7 +1076,12 @@ impl MemoryDatabase {
                  WHERE memory_fts_index MATCH ?1
                    AND f.status = 'active'
                    AND f.is_latest = 1
-                 ORDER BY bm25(memory_fts_index), f.pinned DESC, f.updated_at DESC
+                 ORDER BY bm25(memory_fts_index),
+                          f.pinned DESC,
+                          f.updated_at DESC,
+                          COALESCE(f.confidence, -1.0) DESC,
+                          f.is_latest DESC,
+                          f.id ASC
                  LIMIT ?2",
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
@@ -1103,7 +1129,10 @@ impl MemoryDatabase {
                CASE WHEN f.scope = 'chat' THEN 0 WHEN f.scope = 'workspace' THEN 1 ELSE 2 END,
                bm25(memory_fts_index),
                f.pinned DESC,
-               f.updated_at DESC
+               f.updated_at DESC,
+               COALESCE(f.confidence, -1.0) DESC,
+               f.is_latest DESC,
+               f.id ASC
              LIMIT ?3"
         );
         let mut statement = self
@@ -1115,6 +1144,62 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
         collect_rows(rows, &self.database_path)
+    }
+
+    pub fn related_active_facts(
+        &self,
+        seed_fact_ids: &[String],
+        max_depth: u32,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+        if max_depth == 0 || seed_fact_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut seen = HashSet::new();
+        let mut frontier = Vec::new();
+        for fact_id in seed_fact_ids {
+            require_non_empty("seed_fact_id", fact_id)?;
+            if seen.insert(fact_id.clone()) {
+                frontier.push(fact_id.clone());
+            }
+        }
+
+        let mut related = Vec::new();
+        for _ in 0..max_depth {
+            if frontier.is_empty() || related.len() >= limit as usize {
+                break;
+            }
+
+            let mut next_frontier = Vec::new();
+            for fact_id in frontier {
+                let neighbor_ids =
+                    related_fact_ids(&self.connection, &self.database_path, &fact_id)?;
+                for neighbor_id in neighbor_ids {
+                    if !seen.insert(neighbor_id.clone()) {
+                        continue;
+                    }
+                    next_frontier.push(neighbor_id.clone());
+                    if let Some(fact) = self.active_latest_fact(&neighbor_id)? {
+                        related.push(fact);
+                        if related.len() >= limit as usize {
+                            break;
+                        }
+                    }
+                }
+                if related.len() >= limit as usize {
+                    break;
+                }
+            }
+            frontier = next_frontier;
+        }
+
+        Ok(related)
     }
 
     pub fn list_active_facts_for_scope(
@@ -2058,6 +2143,29 @@ fn source_count_for_fact(
             |row| row.get(0),
         )
         .map_err(|source| sqlite_error(database_path, source))
+}
+
+fn related_fact_ids(
+    connection: &Connection,
+    database_path: &Path,
+    fact_id: &str,
+) -> Result<Vec<String>, MemoryDatabaseError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT CASE
+                        WHEN source_fact_id = ?1 THEN target_fact_id
+                        ELSE source_fact_id
+                    END AS related_fact_id
+             FROM memory_edges
+             WHERE source_fact_id = ?1 OR target_fact_id = ?1
+             ORDER BY relation ASC, related_fact_id ASC",
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let rows = statement
+        .query_map(params![fact_id], |row| row.get(0))
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    collect_rows(rows, database_path)
 }
 
 fn derives_edge_metadata(
@@ -3537,5 +3645,70 @@ mod tests {
             )
             .expect("edge count");
         assert_eq!(edge_count, 0);
+    }
+
+    #[test]
+    fn related_active_facts_expands_edges_without_returning_inactive_targets() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut memory =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+
+        memory
+            .insert_source(NewMemorySource {
+                id: "source-1",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Manual note",
+                content: "Related memory source.",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        for (id, status, fact) in [
+            ("fact-seed", MemoryStatus::Active, "Seed memory fact."),
+            ("fact-related", MemoryStatus::Active, "Related memory fact."),
+            (
+                "fact-superseded",
+                MemoryStatus::Superseded,
+                "Superseded related fact.",
+            ),
+        ] {
+            memory
+                .insert_fact(NewMemoryFact {
+                    id,
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    status,
+                    kind: MemoryKind::ProjectFact,
+                    fact,
+                    confidence: Some(0.8),
+                    pinned: false,
+                    source_ids: &["source-1"],
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+        for (edge_id, target_id) in [
+            ("edge-related", "fact-related"),
+            ("edge-superseded", "fact-superseded"),
+        ] {
+            memory
+                .insert_edge(NewMemoryEdge {
+                    id: edge_id,
+                    source_fact_id: "fact-seed",
+                    target_fact_id: target_id,
+                    relation: MemoryRelationKind::Extends,
+                    metadata_json: "{}",
+                })
+                .expect("edge insert");
+        }
+
+        let related = memory
+            .related_active_facts(&["fact-seed".to_string()], 1, 10)
+            .expect("related facts");
+
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].id, "fact-related");
     }
 }

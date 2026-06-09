@@ -4,6 +4,7 @@ import {
   ArrowUp,
   BarChart3,
   Bot,
+  Brain,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -692,6 +693,7 @@ type ChatMessageSummary = {
   toolCalls: ChatToolCallSummary[];
   parts: ChatMessagePart[];
   metrics: ChatReplyMetrics | null;
+  memoriesUsed: ChatMemoryUsedSummary[];
 };
 
 type ChatMessagesResponse = {
@@ -742,6 +744,16 @@ type ChatReplyMetrics = {
   outputTokens: number | null;
 };
 
+type ChatMemoryUsedSummary = {
+  id: string;
+  scope: string;
+  chatId: string | null;
+  kind: string;
+  fact: string;
+  pinned: boolean;
+  source: string;
+};
+
 type QuestionOptionSummary = {
   label: string;
   value: string;
@@ -783,6 +795,7 @@ type ChatStreamEvent =
       usage?: ChatUsage | null;
       stopReason?: string | null;
       metrics: ChatReplyMetrics;
+      memoriesUsed: ChatMemoryUsedSummary[];
     }
   | {
       type: "toolCall";
@@ -1454,6 +1467,7 @@ type ShellMessage = {
   toolCalls: ChatToolCallSummary[];
   parts: ChatMessagePart[];
   metrics: ChatReplyMetrics | null;
+  memoriesUsed: ChatMemoryUsedSummary[];
 };
 
 type OpenChatTab = {
@@ -2591,6 +2605,7 @@ export function App() {
         toolCalls: [],
         parts: localUserParts,
         metrics: null,
+        memoriesUsed: [],
       },
       {
         id: localAssistantId,
@@ -2601,6 +2616,7 @@ export function App() {
         toolCalls: [],
         parts: [],
         metrics: null,
+        memoriesUsed: [],
       },
     ]);
     setDraftMessage("");
@@ -2848,6 +2864,7 @@ export function App() {
                     content: streamEvent.message,
                     parts: [{ type: "text", text: streamEvent.message }],
                     metrics: null,
+                    memoriesUsed: [],
                     status: "error",
                   }
                 : message,
@@ -4476,6 +4493,9 @@ function ChatPanel({
                       />
                     ) : null}
                     {!isUser && message.metrics ? (
+                      <MemoriesUsedBlock memories={message.memoriesUsed} />
+                    ) : null}
+                    {!isUser && message.metrics ? (
                       <ChatReplyMetricsLine metrics={message.metrics} />
                     ) : null}
                   </div>
@@ -5126,6 +5146,44 @@ function ChatReplyMetricsLine({ metrics }: { metrics: ChatReplyMetrics }) {
         </span>
       ))}
     </div>
+  );
+}
+
+function MemoriesUsedBlock({ memories }: { memories: ChatMemoryUsedSummary[] }) {
+  const { t } = useI18n();
+  if (!memories.length) {
+    return null;
+  }
+
+  return (
+    <details className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-2 text-xs text-stone-600">
+      <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-stone-600 marker:hidden">
+        <Brain aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <span>{t("Memories used")}</span>
+        <span className="rounded-full bg-white px-1.5 py-0.5 text-[10px] text-stone-500">
+          {memories.length}
+        </span>
+        <ChevronDown aria-hidden="true" className="ml-auto size-3.5 shrink-0" />
+      </summary>
+      <div className="mt-2 space-y-2">
+        {memories.map((memory) => (
+          <div
+            className="min-w-0 rounded-md border border-stone-100 bg-white px-2.5 py-2"
+            key={`${memory.scope}-${memory.id}`}
+          >
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-semibold uppercase tracking-normal text-stone-400">
+              <span>{memory.scope}</span>
+              <span>{memory.kind}</span>
+              <span>{memory.source}</span>
+              {memory.pinned ? <span>{t("Pinned")}</span> : null}
+            </div>
+            <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-stone-700">
+              {memory.fact}
+            </div>
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -13497,6 +13555,7 @@ function completedAssistantMessage(
     ...message,
     content: streamEvent.text,
     metrics: streamEvent.metrics,
+    memoriesUsed: streamEvent.memoriesUsed,
     reasoning: nextReasoning,
     status: undefined,
     parts: parts.length
@@ -14269,6 +14328,9 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       "stop_reason",
     );
     const metrics = parseRequiredChatReplyMetrics(fieldValue(value, "metrics"));
+    const memoriesUsed = parseChatMemoriesUsed(
+      fieldValue(value, "memoriesUsed", "memories_used"),
+    );
 
     if (!chatId || !assistantMessageId || text === null) {
       return null;
@@ -14278,7 +14340,8 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       reasoning === false ||
       usage === false ||
       stopReason === false ||
-      metrics === false
+      metrics === false ||
+      memoriesUsed === false
     ) {
       return null;
     }
@@ -14292,6 +14355,7 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       usage,
       stopReason,
       metrics,
+      memoriesUsed,
     };
   }
 
@@ -14548,12 +14612,70 @@ function parseChatToolCallSummary(value: unknown): ChatToolCallSummary | null {
   return normalizedToolCallSummary({ id, name, status, input, output, isError });
 }
 
+function parseChatMemoriesUsed(
+  value: unknown,
+): ChatMemoryUsedSummary[] | false {
+  if (typeof value === "undefined" || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return false;
+  }
+
+  const memories = value.map(parseChatMemoryUsedSummary);
+  return memories.some((memory) => memory === null)
+    ? false
+    : (memories as ChatMemoryUsedSummary[]);
+}
+
+function parseChatMemoryUsedSummary(
+  value: unknown,
+): ChatMemoryUsedSummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const id = stringField(value, "id");
+  const scope = stringField(value, "scope");
+  const chatId = optionalNullableStringField(value, "chatId", "chat_id");
+  const kind = stringField(value, "kind");
+  const fact = stringField(value, "fact");
+  const pinned = fieldValue(value, "pinned");
+  const source = stringField(value, "source");
+
+  if (
+    !id ||
+    !scope ||
+    chatId === false ||
+    !kind ||
+    !fact ||
+    typeof pinned !== "boolean" ||
+    !source
+  ) {
+    return null;
+  }
+
+  return {
+    chatId: chatId ?? null,
+    fact,
+    id,
+    kind,
+    pinned,
+    scope,
+    source,
+  };
+}
+
 function normalizeChatMessageSummary(
   message: ChatMessageSummary,
 ): ChatMessageSummary {
   const metrics = parseOptionalChatReplyMetrics(message.metrics);
   if (metrics === false) {
     throw new Error("chat message metrics are invalid");
+  }
+  const memoriesUsed = parseChatMemoriesUsed(message.memoriesUsed);
+  if (memoriesUsed === false) {
+    throw new Error("chat message memoriesUsed are invalid");
   }
 
   const toolCalls = Array.isArray(message.toolCalls)
@@ -14566,6 +14688,7 @@ function normalizeChatMessageSummary(
   const normalizedMessage = {
     ...message,
     metrics,
+    memoriesUsed,
     toolCalls,
     parts,
   };

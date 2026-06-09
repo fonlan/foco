@@ -109,7 +109,7 @@ memory graph in Foco. It is not the runtime memory store.
 - [x] Add a pending review queue.
 - [x] Add filters for global, workspace, and chat memories.
 - [x] Add a compact source/evidence viewer.
-- [ ] Add a chat-side "memories used" view after prompt injection exists.
+- [x] Add a chat-side "memories used" view after prompt injection exists.
 
 ## Phase 4 - Retrieval and Prompt Injection
 
@@ -123,9 +123,9 @@ memory graph in Foco. It is not the runtime memory store.
       tokens.
 - [x] Prioritize pinned facts, active profile facts, current chat facts,
       workspace facts, then global facts.
-- [ ] Rank FTS matches by textual relevance, scope, recency, confidence,
+- [x] Rank FTS matches by textual relevance, scope, recency, confidence,
       pinned status, and `is_latest`.
-- [ ] Expand search results through graph edges within a small bounded depth.
+- [x] Expand search results through graph edges within a small bounded depth.
 - [x] Exclude superseded facts unless the query explicitly asks for history.
 - [x] Add tests proving context usage does not persist memories.
 - [x] Add tests proving injected memory order is stable.

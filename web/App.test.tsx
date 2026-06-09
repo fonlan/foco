@@ -413,6 +413,7 @@ const chatMessages = {
     {
       content: "Please inspect README.",
       id: "message-user",
+      memoriesUsed: [],
       metrics: null,
       parts: [{ text: "Please inspect README.", type: "text" }],
       reasoning: null,
@@ -422,6 +423,17 @@ const chatMessages = {
     {
       content: "Done.",
       id: "message-assistant",
+      memoriesUsed: [
+        {
+          chatId: null,
+          fact: "Use memory graph retrieval.",
+          id: "fact-1",
+          kind: "project_fact",
+          pinned: false,
+          scope: "workspace",
+          source: "direct",
+        },
+      ],
       metrics: {
         firstTokenLatencyMs: 250,
         modelId: "gpt-test",
@@ -468,6 +480,7 @@ const secondChatMessages = {
     {
       content: "Second question.",
       id: "message-user-2",
+      memoriesUsed: [],
       metrics: null,
       parts: [{ text: "Second question.", type: "text" }],
       reasoning: null,
@@ -477,6 +490,7 @@ const secondChatMessages = {
     {
       content: "Second answer.",
       id: "message-assistant-2",
+      memoriesUsed: [],
       metrics: null,
       parts: [{ text: "Second answer.", type: "text" }],
       reasoning: null,
@@ -697,6 +711,8 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("Total time: 2,000 ms")).toBeInTheDocument();
     expect(screen.getByText("tokens/s: 20")).toBeInTheDocument();
     expect(screen.getByText("First token latency: 250 ms")).toBeInTheDocument();
+    await userEvent.click(screen.getByText("Memories used"));
+    expect(screen.getByText("Use memory graph retrieval.")).toBeInTheDocument();
   });
 
   it("closes composer menus when clicking outside", async () => {
