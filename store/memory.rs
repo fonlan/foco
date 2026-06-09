@@ -7,6 +7,7 @@ use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
 use serde_json::Value;
+use serde_json::json;
 
 pub const GLOBAL_MEMORY_DATABASE_FILE: &str = "memory.sqlite";
 pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 1;
@@ -461,6 +462,34 @@ impl MemoryDatabase {
         Ok(deleted > 0)
     }
 
+    pub fn hard_delete_fact(&mut self, id: &str) -> Result<bool, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let source_ids = source_ids_for_fact(&transaction, &database_path, id)?;
+
+        transaction
+            .execute(
+                "DELETE FROM memory_fts_data WHERE fact_id = ?1",
+                params![id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let deleted = transaction
+            .execute("DELETE FROM memory_facts WHERE id = ?1", params![id])
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if deleted > 0 {
+            delete_unlinked_sources(&transaction, &database_path, &source_ids)?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(deleted > 0)
+    }
+
     pub fn link_fact_source(
         &mut self,
         fact_id: &str,
@@ -530,6 +559,18 @@ impl MemoryDatabase {
             .connection
             .transaction()
             .map_err(|source| sqlite_error(&database_path, source))?;
+        let metadata_json = if edge.relation == MemoryRelationKind::Derives {
+            Some(derives_edge_metadata(
+                &transaction,
+                &database_path,
+                edge.source_fact_id,
+                edge.target_fact_id,
+                edge.metadata_json,
+            )?)
+        } else {
+            None
+        };
+        let edge_metadata_json = metadata_json.as_deref().unwrap_or(edge.metadata_json);
 
         transaction
             .execute(
@@ -541,7 +582,7 @@ impl MemoryDatabase {
                     edge.source_fact_id,
                     edge.target_fact_id,
                     edge.relation.as_str(),
-                    edge.metadata_json,
+                    edge_metadata_json,
                     now,
                 ],
             )
@@ -556,6 +597,104 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
+    }
+
+    pub fn refresh_profile_from_active_facts(
+        &mut self,
+        scope: MemoryScope,
+        chat_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Option<MemoryProfileRecord>, MemoryDatabaseError> {
+        self.validate_scope(scope)?;
+        validate_scope_chat_id(scope, chat_id)?;
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let facts = self.latest_active_facts_for_exact_scope(scope, chat_id, limit)?;
+        let profile_id = profile_id_for_scope(scope, chat_id);
+        if facts.is_empty() {
+            self.connection
+                .execute(
+                    "DELETE FROM memory_profiles WHERE id = ?1",
+                    params![profile_id],
+                )
+                .map_err(|source| sqlite_error(&self.database_path, source))?;
+            return Ok(None);
+        }
+
+        let source_fact_ids = facts
+            .iter()
+            .map(|fact| fact.id.as_str())
+            .collect::<Vec<_>>();
+        let mut source_links = Vec::new();
+        for fact in &facts {
+            let mut source_ids = self
+                .sources_for_fact(&fact.id)?
+                .into_iter()
+                .map(|source| source.id)
+                .collect::<Vec<_>>();
+            source_ids.sort();
+            source_links.push(json!({
+                "factId": &fact.id,
+                "sourceIds": source_ids,
+            }));
+        }
+        let profile_text = facts
+            .iter()
+            .map(memory_profile_fact_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let metadata_json = serde_json::to_string(&json!({
+            "sourceFactIds": source_fact_ids,
+            "sourceLinks": source_links,
+            "sourceFactCount": facts.len(),
+            "algorithm": "active-latest-facts-v1",
+        }))
+        .map_err(|source| MemoryDatabaseError::InvalidMemoryJson {
+            field: "metadata_json",
+            source,
+        })?;
+
+        self.upsert_profile(NewMemoryProfile {
+            id: &profile_id,
+            scope,
+            chat_id,
+            profile_text: &profile_text,
+            metadata_json: &metadata_json,
+        })?;
+        self.profile(&profile_id)
+    }
+
+    pub fn expire_due_facts(&mut self, now: &str) -> Result<u64, MemoryDatabaseError> {
+        require_non_empty("now", now)?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let fact_ids = due_unexpired_fact_ids(&transaction, &database_path, now)?;
+
+        for fact_id in &fact_ids {
+            transaction
+                .execute(
+                    "UPDATE memory_facts
+                     SET status = 'expired',
+                         updated_at = ?2
+                     WHERE id = ?1",
+                    params![fact_id, now],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let updated_fact = fact_by_id(&transaction, &database_path, fact_id)?;
+            upsert_fact_record_fts_data(&transaction, &database_path, &updated_fact)?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(fact_ids.len() as u64)
     }
 
     pub fn upsert_profile(
@@ -1029,6 +1168,36 @@ impl MemoryDatabase {
         let rows = statement
             .query_map(
                 params![chat_param, limit, status.as_str()],
+                memory_fact_from_row,
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    fn latest_active_facts_for_exact_scope(
+        &self,
+        scope: MemoryScope,
+        chat_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                        expires_at, metadata_json, created_at, updated_at
+                 FROM memory_facts
+                 WHERE scope = ?1
+                   AND ((?2 IS NULL AND chat_id IS NULL) OR chat_id = ?2)
+                   AND status = 'active'
+                   AND is_latest = 1
+                 ORDER BY pinned DESC, kind ASC, lower(fact) ASC, id ASC
+                 LIMIT ?3",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(
+                params![scope.as_str(), chat_id, limit],
                 memory_fact_from_row,
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
@@ -1834,6 +2003,49 @@ fn fact_by_id(
         .map_err(|source| sqlite_error(database_path, source))
 }
 
+fn source_ids_for_fact(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    fact_id: &str,
+) -> Result<Vec<String>, MemoryDatabaseError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT source_id
+             FROM memory_fact_sources
+             WHERE fact_id = ?1
+             ORDER BY source_id ASC",
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let rows = statement
+        .query_map(params![fact_id], |row| row.get(0))
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    collect_rows(rows, database_path)
+}
+
+fn delete_unlinked_sources(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    source_ids: &[String],
+) -> Result<(), MemoryDatabaseError> {
+    for source_id in source_ids {
+        transaction
+            .execute(
+                "DELETE FROM memory_sources
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM memory_fact_sources
+                       WHERE source_id = ?1
+                   )",
+                params![source_id],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+    }
+
+    Ok(())
+}
+
 fn source_count_for_fact(
     connection: &Connection,
     database_path: &Path,
@@ -1846,6 +2058,123 @@ fn source_count_for_fact(
             |row| row.get(0),
         )
         .map_err(|source| sqlite_error(database_path, source))
+}
+
+fn derives_edge_metadata(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    source_fact_id: &str,
+    target_fact_id: &str,
+    metadata_json: &str,
+) -> Result<String, MemoryDatabaseError> {
+    require_fact_exists(transaction, database_path, source_fact_id)?;
+    require_fact_exists(transaction, database_path, target_fact_id)?;
+    let source_source_ids = source_ids_for_fact(transaction, database_path, source_fact_id)?;
+    let target_source_ids = source_ids_for_fact(transaction, database_path, target_fact_id)?;
+
+    if source_source_ids.is_empty() && target_source_ids.is_empty() {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "derives relation requires source or target evidence".to_string(),
+        });
+    }
+
+    let parsed: Value = serde_json::from_str(metadata_json).map_err(|source| {
+        MemoryDatabaseError::InvalidMemoryJson {
+            field: "metadata_json",
+            source,
+        }
+    })?;
+    let mut metadata = match parsed {
+        Value::Object(object) => object,
+        other => {
+            let mut object = serde_json::Map::new();
+            object.insert("metadata".to_string(), other);
+            object
+        }
+    };
+    metadata.insert(
+        "sourceFactId".to_string(),
+        Value::String(source_fact_id.to_string()),
+    );
+    metadata.insert(
+        "targetFactId".to_string(),
+        Value::String(target_fact_id.to_string()),
+    );
+    metadata.insert("sourceSourceIds".to_string(), json!(source_source_ids));
+    metadata.insert("targetSourceIds".to_string(), json!(target_source_ids));
+
+    serde_json::to_string(&Value::Object(metadata)).map_err(|source| {
+        MemoryDatabaseError::InvalidMemoryJson {
+            field: "metadata_json",
+            source,
+        }
+    })
+}
+
+fn require_fact_exists(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    fact_id: &str,
+) -> Result<(), MemoryDatabaseError> {
+    let exists: Option<i64> = transaction
+        .query_row(
+            "SELECT 1 FROM memory_facts WHERE id = ?1",
+            params![fact_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    if exists.is_none() {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("memory fact was not found: {fact_id}"),
+        });
+    }
+
+    Ok(())
+}
+
+fn due_unexpired_fact_ids(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    now: &str,
+) -> Result<Vec<String>, MemoryDatabaseError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT id
+             FROM memory_facts
+             WHERE status IN ('active', 'pending')
+               AND expires_at IS NOT NULL
+               AND expires_at <= ?1
+             ORDER BY id ASC",
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let rows = statement
+        .query_map(params![now], |row| row.get(0))
+        .map_err(|source| sqlite_error(database_path, source))?;
+
+    collect_rows(rows, database_path)
+}
+
+fn profile_id_for_scope(scope: MemoryScope, chat_id: Option<&str>) -> String {
+    match scope {
+        MemoryScope::Global => "memory-profile:global".to_string(),
+        MemoryScope::Workspace => "memory-profile:workspace".to_string(),
+        MemoryScope::Chat => format!(
+            "memory-profile:chat:{}",
+            chat_id.expect("chat profile id requires chat id")
+        ),
+    }
+}
+
+fn memory_profile_fact_line(fact: &MemoryFactRecord) -> String {
+    let pinned = if fact.pinned { " pinned" } else { "" };
+    format!(
+        "- {}{}: {}",
+        fact.kind,
+        pinned,
+        fact.fact.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
 }
 
 fn update_relation_would_cycle(
@@ -2892,6 +3221,15 @@ mod tests {
                 metadata_json: "{}",
             })
             .expect("extends edge");
+        memory
+            .insert_edge(NewMemoryEdge {
+                id: "edge-derives",
+                source_fact_id: "fact-b",
+                target_fact_id: "fact-a",
+                relation: MemoryRelationKind::Derives,
+                metadata_json: r#"{"reason":"inferred from the target fact"}"#,
+            })
+            .expect("derives edge");
 
         let target = memory
             .fact("fact-a")
@@ -2899,6 +3237,20 @@ mod tests {
             .expect("target fact");
         assert_eq!(target.status, "active");
         assert!(target.is_latest);
+        let derives_metadata: String = memory
+            .connection
+            .query_row(
+                "SELECT metadata_json FROM memory_edges WHERE id = 'edge-derives'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("derives metadata");
+        let derives_metadata =
+            serde_json::from_str::<Value>(&derives_metadata).expect("derives metadata json");
+        assert_eq!(derives_metadata["sourceFactId"], "fact-b");
+        assert_eq!(derives_metadata["targetFactId"], "fact-a");
+        assert_eq!(derives_metadata["sourceSourceIds"], json!(["source-1"]));
+        assert_eq!(derives_metadata["targetSourceIds"], json!(["source-1"]));
         assert!(
             memory
                 .insert_edge(NewMemoryEdge {
@@ -2912,5 +3264,278 @@ mod tests {
                 .to_string()
                 .contains("cannot target the same fact")
         );
+    }
+
+    #[test]
+    fn profile_refresh_uses_active_latest_facts_in_deterministic_source_linked_order() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Memory profile")
+                .expect("chat insert");
+        }
+
+        let mut memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        for (id, content) in [
+            ("source-a", "Pinned preference source."),
+            ("source-z", "Project fact source."),
+            ("source-pending", "Pending fact source."),
+            ("source-old", "Superseded fact source."),
+        ] {
+            memory
+                .insert_source(NewMemorySource {
+                    id,
+                    scope: MemoryScope::Chat,
+                    chat_id: Some("chat-1"),
+                    source_type: MemorySourceType::ManualNote,
+                    source_id: None,
+                    title: "Manual note",
+                    content,
+                    metadata_json: "{}",
+                })
+                .expect("source insert");
+        }
+        for (id, status, kind, fact, pinned, source_id) in [
+            (
+                "fact-z",
+                MemoryStatus::Active,
+                MemoryKind::ProjectFact,
+                "Workspace uses a local memory graph.",
+                false,
+                "source-z",
+            ),
+            (
+                "fact-a",
+                MemoryStatus::Active,
+                MemoryKind::Preference,
+                "Prefer concise memory summaries.",
+                true,
+                "source-a",
+            ),
+            (
+                "fact-pending",
+                MemoryStatus::Pending,
+                MemoryKind::ProjectFact,
+                "Pending facts stay out of profile summaries.",
+                false,
+                "source-pending",
+            ),
+            (
+                "fact-old",
+                MemoryStatus::Superseded,
+                MemoryKind::ProjectFact,
+                "Superseded facts stay out of profile summaries.",
+                false,
+                "source-old",
+            ),
+        ] {
+            memory
+                .insert_fact(NewMemoryFact {
+                    id,
+                    scope: MemoryScope::Chat,
+                    chat_id: Some("chat-1"),
+                    status,
+                    kind,
+                    fact,
+                    confidence: Some(0.9),
+                    pinned,
+                    source_ids: &[source_id],
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+
+        let profile = memory
+            .refresh_profile_from_active_facts(MemoryScope::Chat, Some("chat-1"), 10)
+            .expect("profile refresh")
+            .expect("profile row");
+        let refreshed_again = memory
+            .refresh_profile_from_active_facts(MemoryScope::Chat, Some("chat-1"), 10)
+            .expect("second profile refresh")
+            .expect("profile row");
+
+        assert_eq!(profile.id, "memory-profile:chat:chat-1");
+        assert_eq!(profile.profile_text, refreshed_again.profile_text);
+        assert_eq!(
+            profile.profile_text,
+            "- preference pinned: Prefer concise memory summaries.\n- project_fact: Workspace uses a local memory graph."
+        );
+        assert!(!profile.profile_text.contains("Pending facts"));
+        assert!(!profile.profile_text.contains("Superseded facts"));
+        let metadata =
+            serde_json::from_str::<Value>(&profile.metadata_json).expect("profile metadata json");
+        assert_eq!(metadata["sourceFactIds"], json!(["fact-a", "fact-z"]));
+        assert_eq!(
+            metadata["sourceLinks"],
+            json!([
+                {"factId":"fact-a","sourceIds":["source-a"]},
+                {"factId":"fact-z","sourceIds":["source-z"]}
+            ])
+        );
+        assert_eq!(metadata["algorithm"], "active-latest-facts-v1");
+    }
+
+    #[test]
+    fn expired_facts_leave_active_search_and_hard_delete_removes_orphaned_graph_rows() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut memory =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+
+        for (id, content) in [
+            ("source-expired", "Expired memory source."),
+            ("source-delete", "Forget-only source."),
+            ("source-shared", "Shared source."),
+        ] {
+            memory
+                .insert_source(NewMemorySource {
+                    id,
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    source_type: MemorySourceType::ManualNote,
+                    source_id: None,
+                    title: "Manual note",
+                    content,
+                    metadata_json: "{}",
+                })
+                .expect("source insert");
+        }
+        for (id, fact, source_ids) in [
+            (
+                "fact-expired",
+                "This stale memory should expire.",
+                vec!["source-expired"],
+            ),
+            (
+                "fact-delete",
+                "This forget memory should be hard deleted.",
+                vec!["source-delete", "source-shared"],
+            ),
+            (
+                "fact-keep",
+                "This retained memory keeps the shared source.",
+                vec!["source-shared"],
+            ),
+            (
+                "fact-pending-expired",
+                "This pending stale memory should expire.",
+                vec!["source-expired"],
+            ),
+        ] {
+            memory
+                .insert_fact(NewMemoryFact {
+                    id,
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    status: if id == "fact-pending-expired" {
+                        MemoryStatus::Pending
+                    } else {
+                        MemoryStatus::Active
+                    },
+                    kind: MemoryKind::ProjectFact,
+                    fact,
+                    confidence: Some(0.9),
+                    pinned: false,
+                    source_ids: &source_ids,
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+        memory
+            .update_fact(UpdateMemoryFact {
+                id: "fact-expired",
+                expires_at: Some("2020-01-01T00:00:00.000Z"),
+                ..UpdateMemoryFact::default()
+            })
+            .expect("set expiration");
+        memory
+            .update_fact(UpdateMemoryFact {
+                id: "fact-pending-expired",
+                expires_at: Some("2020-01-01T00:00:00.000Z"),
+                ..UpdateMemoryFact::default()
+            })
+            .expect("set pending expiration");
+        memory
+            .insert_edge(NewMemoryEdge {
+                id: "edge-delete",
+                source_fact_id: "fact-keep",
+                target_fact_id: "fact-delete",
+                relation: MemoryRelationKind::Extends,
+                metadata_json: "{}",
+            })
+            .expect("edge insert");
+
+        assert_eq!(
+            memory
+                .expire_due_facts("2026-06-09T00:00:00.000Z")
+                .expect("expire due facts"),
+            2
+        );
+        assert_eq!(
+            memory
+                .fact("fact-expired")
+                .expect("expired lookup")
+                .expect("expired fact")
+                .status,
+            "expired"
+        );
+        assert_eq!(
+            memory
+                .fact("fact-pending-expired")
+                .expect("pending expired lookup")
+                .expect("pending expired fact")
+                .status,
+            "expired"
+        );
+        assert!(
+            memory
+                .search_active_facts("stale", 10)
+                .expect("active search")
+                .is_empty()
+        );
+
+        assert!(
+            memory
+                .hard_delete_fact("fact-delete")
+                .expect("hard delete fact")
+        );
+        assert!(
+            memory
+                .fact("fact-delete")
+                .expect("deleted lookup")
+                .is_none()
+        );
+        assert!(
+            memory
+                .source("source-delete")
+                .expect("orphan source")
+                .is_none()
+        );
+        assert!(
+            memory
+                .source("source-shared")
+                .expect("shared source")
+                .is_some()
+        );
+        assert!(
+            memory
+                .search_active_facts("forget", 10)
+                .expect("deleted fts search")
+                .is_empty()
+        );
+        let edge_count: i64 = memory
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM memory_edges
+                 WHERE source_fact_id = 'fact-delete' OR target_fact_id = 'fact-delete'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("edge count");
+        assert_eq!(edge_count, 0);
     }
 }

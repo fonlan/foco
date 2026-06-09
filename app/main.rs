@@ -27,7 +27,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use chrono::{Local, SecondsFormat, Utc};
+use chrono::{Duration as ChronoDuration, Local, SecondsFormat, Utc};
 use foco_agent::{
     ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo, build_system_prompt,
     calculate_context_budget, context_compression_trigger_tokens, detect_same_file_write_conflicts,
@@ -113,6 +113,7 @@ const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
 const MEMORY_CONTEXT_BUDGET_PERCENT: u64 = 12;
 const MEMORY_CONTEXT_FACT_LIMIT: u32 = 24;
 const MEMORY_CONTEXT_PROFILE_LIMIT: u32 = 8;
+const MEMORY_PROFILE_REFRESH_FACT_LIMIT: u32 = 32;
 const MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX: &str = "Foco memory profile context:";
 const MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX: &str = "Foco retrieved memory context:";
 const MEMORY_EXTRACTION_TOOL_NAME: &str = "submit_memory_extraction";
@@ -2219,12 +2220,21 @@ async fn memory_list(
         .transpose()
         .map_err(ApiError::from_memory_error)?
         .unwrap_or(MemoryStatus::Active);
-    let database = open_memory_database(&state, &config, scope, query.workspace_id.as_deref())?;
+    let mut database = open_memory_database(&state, &config, scope, query.workspace_id.as_deref())?;
     let query_text = normalized_optional_text(query.query);
 
     if scope == MemoryScope::Chat && chat_id.is_none() {
         return Err(ApiError::bad_request("chat memory listing requires chatId"));
     }
+
+    expire_due_memories(&mut database)?;
+    refresh_memory_profile(
+        &mut database,
+        scope,
+        (scope == MemoryScope::Chat)
+            .then_some(chat_id.as_deref())
+            .flatten(),
+    )?;
 
     let memories = if let Some(query_text) = query_text {
         if status != MemoryStatus::Active {
@@ -2299,6 +2309,8 @@ async fn create_manual_memory(
             metadata_json: &metadata_json,
         })
         .map_err(ApiError::from_memory_error)?;
+    apply_memory_expiration_to_fact(&mut database, &memory_id, &config.memory)?;
+    refresh_memory_profile(&mut database, scope, chat_id.as_deref())?;
     let memory = database
         .fact(&memory_id)
         .map_err(ApiError::from_memory_error)?;
@@ -2339,6 +2351,52 @@ fn memory_extraction_job_summaries(
         .collect())
 }
 
+fn refresh_memory_profile(
+    database: &mut MemoryDatabase,
+    scope: MemoryScope,
+    chat_id: Option<&str>,
+) -> Result<(), ApiError> {
+    database
+        .refresh_profile_from_active_facts(scope, chat_id, MEMORY_PROFILE_REFRESH_FACT_LIMIT)
+        .map(|_| ())
+        .map_err(ApiError::from_memory_error)
+}
+
+fn expire_due_memories(database: &mut MemoryDatabase) -> Result<u64, ApiError> {
+    database
+        .expire_due_facts(&current_memory_timestamp())
+        .map_err(ApiError::from_memory_error)
+}
+
+fn apply_memory_expiration_to_fact(
+    database: &mut MemoryDatabase,
+    memory_id: &str,
+    memory_settings: &MemorySettings,
+) -> Result<(), ApiError> {
+    if let Some(expires_at) = memory_expiration_timestamp(memory_settings) {
+        database
+            .update_fact(UpdateMemoryFact {
+                id: memory_id,
+                expires_at: Some(&expires_at),
+                ..UpdateMemoryFact::default()
+            })
+            .map_err(ApiError::from_memory_error)?;
+    }
+
+    Ok(())
+}
+
+fn memory_expiration_timestamp(memory_settings: &MemorySettings) -> Option<String> {
+    memory_settings.retention_days.map(|days| {
+        (Utc::now() + ChronoDuration::days(i64::from(days)))
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    })
+}
+
+fn current_memory_timestamp() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
 async fn update_memory_status(
     State(state): State<AppState>,
     Json(request): Json<MemoryStatusRequest>,
@@ -2356,6 +2414,11 @@ async fn update_memory_status(
     let memory = database
         .fact(&memory_id)
         .map_err(ApiError::from_memory_error)?;
+    if let Some(memory) = &memory {
+        let memory_scope =
+            MemoryScope::parse(&memory.scope).map_err(ApiError::from_memory_error)?;
+        refresh_memory_profile(&mut database, memory_scope, memory.chat_id.as_deref())?;
+    }
 
     Ok(Json(MemoryMutationResponse { memory }))
 }
@@ -2394,6 +2457,11 @@ async fn edit_memory(
     let memory = database
         .fact(&memory_id)
         .map_err(ApiError::from_memory_error)?;
+    if let Some(memory) = &memory {
+        let memory_scope =
+            MemoryScope::parse(&memory.scope).map_err(ApiError::from_memory_error)?;
+        refresh_memory_profile(&mut database, memory_scope, memory.chat_id.as_deref())?;
+    }
 
     Ok(Json(MemoryMutationResponse { memory }))
 }
@@ -2407,10 +2475,18 @@ async fn forget_memory(
     let memory_id = normalized_required_text("memoryId", &request.memory_id)?;
     let mut database =
         open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
+    let existing_memory = database
+        .fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?;
 
     database
-        .delete_fact(&memory_id)
+        .hard_delete_fact(&memory_id)
         .map_err(ApiError::from_memory_error)?;
+    if let Some(memory) = &existing_memory {
+        let memory_scope =
+            MemoryScope::parse(&memory.scope).map_err(ApiError::from_memory_error)?;
+        refresh_memory_profile(&mut database, memory_scope, memory.chat_id.as_deref())?;
+    }
 
     Ok(Json(MemoryMutationResponse { memory: None }))
 }
@@ -2440,14 +2516,24 @@ async fn promote_memory(
         && source_scope != MemoryScope::Global
         && same_workspace
     {
-        source_database
+        let memory = source_database
             .promote_fact(
                 &memory_id,
                 &target_memory_id,
                 target_scope,
                 target_chat_id.as_deref(),
             )
+            .map_err(ApiError::from_memory_error)?;
+        apply_memory_expiration_to_fact(&mut source_database, &target_memory_id, &config.memory)?;
+        refresh_memory_profile(
+            &mut source_database,
+            target_scope,
+            target_chat_id.as_deref(),
+        )?;
+        source_database
+            .fact(&target_memory_id)
             .map_err(ApiError::from_memory_error)?
+            .unwrap_or(memory)
     } else {
         let mut target_database = open_memory_database(
             &state,
@@ -2455,7 +2541,7 @@ async fn promote_memory(
             target_scope,
             request.target_workspace_id.as_deref(),
         )?;
-        source_database
+        let memory = source_database
             .promote_fact_to_database(
                 &memory_id,
                 &mut target_database,
@@ -2463,7 +2549,17 @@ async fn promote_memory(
                 target_scope,
                 target_chat_id.as_deref(),
             )
+            .map_err(ApiError::from_memory_error)?;
+        apply_memory_expiration_to_fact(&mut target_database, &target_memory_id, &config.memory)?;
+        refresh_memory_profile(
+            &mut target_database,
+            target_scope,
+            target_chat_id.as_deref(),
+        )?;
+        target_database
+            .fact(&target_memory_id)
             .map_err(ApiError::from_memory_error)?
+            .unwrap_or(memory)
     };
 
     Ok(Json(MemoryMutationResponse {
@@ -2512,6 +2608,7 @@ async fn context_usage(
         &config,
         &workspace_id,
         request.into_prompt_request(),
+        false,
     )
     .await?;
 
@@ -4780,6 +4877,7 @@ async fn prepare_prompt_context(
     config: &GlobalConfig,
     workspace_id: &str,
     request: PromptContextRequest,
+    allow_memory_mutation: bool,
 ) -> Result<PreparedPromptContext, ApiError> {
     let workspace_id = workspace_id.trim();
     let model_id = request.model_id.trim();
@@ -4967,6 +5065,7 @@ async fn prepare_prompt_context(
         chat_id.as_deref(),
         raw_message.as_deref(),
         &context_budget,
+        allow_memory_mutation,
     )?;
     let mut neutral_messages = Vec::with_capacity(
         existing_messages.len()
@@ -5059,8 +5158,14 @@ async fn prepare_chat_context(
     workspace_id: &str,
     request: ChatStreamRequest,
 ) -> Result<PreparedChatContext, ApiError> {
-    let prompt_context =
-        prepare_prompt_context(state, config, workspace_id, request.into_prompt_request()).await?;
+    let prompt_context = prepare_prompt_context(
+        state,
+        config,
+        workspace_id,
+        request.into_prompt_request(),
+        true,
+    )
+    .await?;
     let raw_message = prompt_context.raw_message.as_deref().unwrap_or("");
     let message = prompt_context
         .message
@@ -5194,6 +5299,7 @@ fn memory_prompt_context(
     chat_id: Option<&str>,
     query_text: Option<&str>,
     context_budget: &foco_agent::ContextBudget,
+    allow_memory_mutation: bool,
 ) -> Result<MemoryPromptContext, ApiError> {
     let budget_tokens = if config.memory.enabled {
         context_budget
@@ -5216,6 +5322,16 @@ fn memory_prompt_context(
     let mut workspace_memory =
         open_memory_database(state, config, MemoryScope::Workspace, Some(&workspace.id))?;
     let mut global_memory = open_memory_database(state, config, MemoryScope::Global, None)?;
+
+    if allow_memory_mutation {
+        expire_due_memories(&mut workspace_memory)?;
+        refresh_memory_profile(&mut workspace_memory, MemoryScope::Workspace, None)?;
+        if let Some(chat_id) = chat_id {
+            refresh_memory_profile(&mut workspace_memory, MemoryScope::Chat, Some(chat_id))?;
+        }
+        expire_due_memories(&mut global_memory)?;
+        refresh_memory_profile(&mut global_memory, MemoryScope::Global, None)?;
+    }
 
     let mut remaining_tokens = budget_tokens;
     let profile_message = memory_profile_context_message(
@@ -6952,6 +7068,12 @@ fn store_extracted_memory_facts(
                 metadata_json: &fact.metadata_json,
             })
             .map_err(ApiError::from_memory_error)?;
+        apply_memory_expiration_to_fact(database, &fact_id, &task.config.memory)?;
+        refresh_memory_profile(
+            database,
+            fact.scope,
+            (fact.scope == MemoryScope::Chat).then_some(task.chat_id.as_str()),
+        )?;
     }
 
     Ok(())
@@ -14176,6 +14298,7 @@ Use the existing product UI conventions.
                 message: Some("renderer prompt assembly".to_string()),
                 attachments: Vec::new(),
             },
+            false,
         )
         .await
         .expect("prompt context");
@@ -14287,6 +14410,7 @@ Use the existing product UI conventions.
                 message: Some("Preview usage".to_string()),
                 attachments: Vec::new(),
             },
+            false,
         )
         .await
         .expect("prompt context");

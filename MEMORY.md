@@ -153,16 +153,16 @@ memory graph in Foco. It is not the runtime memory store.
 - [x] Implement `updates` relation behavior.
 - [x] Mark older updated facts as `superseded` when the new fact is approved.
 - [x] Implement `extends` relation behavior without superseding the target.
-- [ ] Implement `derives` relation behavior for facts inferred from sources or
+- [x] Implement `derives` relation behavior for facts inferred from sources or
       other facts.
 - [x] Maintain `is_latest` for update chains.
-- [ ] Implement profile refresh from active facts.
-- [ ] Keep profile updates deterministic and source-linked.
-- [ ] Add retention handling for expired facts.
-- [ ] Add hard delete for user-triggered forget.
+- [x] Implement profile refresh from active facts.
+- [x] Keep profile updates deterministic and source-linked.
+- [x] Add retention handling for expired facts.
+- [x] Add hard delete for user-triggered forget.
 - [x] Add tests for update chains.
 - [x] Add tests for relation validation.
-- [ ] Add tests for profile refresh.
+- [x] Add tests for profile refresh.
 
 ## Phase 7 - Agent Tools
 
