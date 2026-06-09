@@ -258,6 +258,8 @@ pub struct GlobalConfig {
     pub app: AppSettings,
     #[serde(default)]
     pub hooks: HookConfig,
+    #[serde(default)]
+    pub memory: MemorySettings,
     pub providers: Vec<ProviderSettings>,
     pub models: Vec<ModelSettings>,
     pub mcp: McpConfig,
@@ -275,6 +277,7 @@ impl GlobalConfig {
                 web_server: WebServerSettings::default(),
             },
             hooks: HookConfig::default(),
+            memory: MemorySettings::default(),
             providers: Vec::new(),
             models: Vec::new(),
             mcp: McpConfig {
@@ -315,6 +318,7 @@ impl GlobalConfig {
         validate_app_language(config_path, &self.app.language)?;
         validate_web_server_settings(config_path, &self.app.web_server)?;
         validate_hook_config(config_path, "hooks", &self.hooks)?;
+        validate_memory_settings(config_path, &self.memory, &self.models)?;
         require_non_empty_list(config_path, "workspaces", self.workspaces.len())?;
 
         let mut workspace_ids = HashSet::new();
@@ -629,6 +633,30 @@ pub struct HookConfig {
     pub hooks: HookEventMap,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemorySettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_memory_extraction_mode")]
+    pub extraction_mode: String,
+    #[serde(default)]
+    pub retention_days: Option<u32>,
+    #[serde(default)]
+    pub extraction_model_id: Option<String>,
+}
+
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            extraction_mode: default_memory_extraction_mode(),
+            retention_days: None,
+            extraction_model_id: None,
+        }
+    }
+}
+
 pub type HookEventMap = std::collections::BTreeMap<String, Vec<HookMatcherGroup>>;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -698,6 +726,10 @@ fn default_true() -> bool {
 
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn default_memory_extraction_mode() -> String {
+    "manual".to_string()
 }
 
 impl Default for WebServerSettings {
@@ -1081,6 +1113,39 @@ fn validate_password_hash(
             config_path,
             "app.web_server.password_hash digest must be 32 bytes of hex",
         );
+    }
+
+    Ok(())
+}
+
+fn validate_memory_settings(
+    config_path: Option<&Path>,
+    settings: &MemorySettings,
+    models: &[ModelSettings],
+) -> Result<(), ConfigError> {
+    match settings.extraction_mode.as_str() {
+        "manual" | "pending_review" | "disabled" => {}
+        other => {
+            return invalid_config(
+                config_path,
+                format!("memory.extraction_mode has unsupported value '{other}'"),
+            );
+        }
+    }
+
+    if settings.retention_days == Some(0) {
+        return invalid_config(config_path, "memory.retention_days must be greater than 0");
+    }
+
+    if let Some(model_id) = &settings.extraction_model_id {
+        require_non_empty(config_path, "memory.extraction_model_id", model_id)?;
+
+        if !models.iter().any(|model| model.id == *model_id) {
+            return invalid_config(
+                config_path,
+                format!("memory.extraction_model_id references missing model '{model_id}'"),
+            );
+        }
     }
 
     Ok(())

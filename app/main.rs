@@ -47,10 +47,10 @@ use foco_providers::{
 use foco_store::{
     config::{
         ApiProxySettings, DEFAULT_TERMINAL_SHELL, GlobalConfig, HookConfig, HookEventMap,
-        McpServerConfig, ModelLimits, ModelSettings, ProviderSettings, SKILL_SCOPE_GLOBAL,
-        SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
-        SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings, UNSUPPORTED_HOOK_EVENTS,
-        WebServerSettings, WorkspaceConfig, load_or_create_global_config,
+        McpServerConfig, MemorySettings, ModelLimits, ModelSettings, ProviderSettings,
+        SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES,
+        SUPPORTED_APP_LANGUAGES, SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings,
+        UNSUPPORTED_HOOK_EVENTS, WebServerSettings, WorkspaceConfig, load_or_create_global_config,
         load_workspace_hook_config, save_global_config, save_workspace_hook_config,
         workspace_hook_config_path,
     },
@@ -554,6 +554,7 @@ fn app_router(state: AppState) -> Router {
         .route("/api/native/select-files", post(select_files))
         .route("/api/settings", get(settings))
         .route("/api/settings/general", post(save_general_settings))
+        .route("/api/settings/memory", post(save_memory_settings))
         .route("/api/memory", get(memory_list))
         .route("/api/memory/manual", post(create_manual_memory))
         .route("/api/memory/status", post(update_memory_status))
@@ -1570,6 +1571,32 @@ async fn save_general_settings(
     Ok(response.into_response())
 }
 
+async fn save_memory_settings(
+    State(state): State<AppState>,
+    Json(request): Json<ManualMemorySettingsRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let extraction_model_id = request
+        .extraction_model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    config.memory = MemorySettings {
+        enabled: request.enabled,
+        extraction_mode: request.extraction_mode.trim().to_string(),
+        retention_days: request.retention_days,
+        extraction_model_id,
+    };
+    config
+        .validate(Some(&state.config_file))
+        .map_err(ApiError::from_config_error)?;
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
 #[cfg(all(windows, not(debug_assertions)))]
 fn validate_tray_menu_language(language: &str) -> Result<(), ApiError> {
     tray_menu_labels(language)
@@ -2065,6 +2092,7 @@ struct MemoryListQuery {
     workspace_id: Option<String>,
     chat_id: Option<String>,
     query: Option<String>,
+    status: Option<String>,
     limit: Option<u32>,
 }
 
@@ -2157,6 +2185,15 @@ async fn memory_list(
     let scope = MemoryScope::parse(query.scope.trim()).map_err(ApiError::from_memory_error)?;
     let chat_id = normalized_optional_text(query.chat_id);
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let status = query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(MemoryStatus::parse)
+        .transpose()
+        .map_err(ApiError::from_memory_error)?
+        .unwrap_or(MemoryStatus::Active);
     let database = open_memory_database(&state, &config, scope, query.workspace_id.as_deref())?;
     let query_text = normalized_optional_text(query.query);
 
@@ -2165,12 +2202,17 @@ async fn memory_list(
     }
 
     let memories = if let Some(query_text) = query_text {
+        if status != MemoryStatus::Active {
+            return Err(ApiError::bad_request(
+                "memory search currently supports active memories only",
+            ));
+        }
         database
             .search_active_facts_for_scope(&query_text, chat_id.as_deref(), limit)
             .map_err(ApiError::from_memory_error)?
     } else {
         database
-            .list_active_facts_for_scope(chat_id.as_deref(), limit)
+            .list_facts_for_scope(chat_id.as_deref(), status, limit)
             .map_err(ApiError::from_memory_error)?
     };
 
@@ -2861,6 +2903,15 @@ struct ManualGeneralSettingsRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ManualMemorySettingsRequest {
+    enabled: bool,
+    extraction_mode: String,
+    retention_days: Option<u32>,
+    extraction_model_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ManualApiProxySettingsRequest {
     enabled: bool,
     proxy_type: String,
@@ -3117,6 +3168,7 @@ struct TerminalSocketQuery {
 #[serde(rename_all = "camelCase")]
 struct SettingsResponse {
     general: GeneralSettingsSummary,
+    memory: MemorySettingsSummary,
     workspaces: Vec<ConfiguredWorkspaceSummary>,
     terminal_shells: Vec<TerminalShellSummary>,
     provider_kinds: Vec<ProviderKindSummary>,
@@ -3135,6 +3187,23 @@ struct GeneralSettingsSummary {
     language: String,
     hook_audit_enabled: bool,
     supported_languages: Vec<AppLanguageSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemorySettingsSummary {
+    enabled: bool,
+    extraction_mode: String,
+    retention_days: Option<u32>,
+    extraction_model_id: Option<String>,
+    extraction_modes: Vec<MemoryExtractionModeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryExtractionModeSummary {
+    value: &'static str,
+    label: &'static str,
 }
 
 #[derive(Serialize)]
@@ -8325,6 +8394,26 @@ async fn settings_response(
                     name: app_language_name(*language),
                 })
                 .collect(),
+        },
+        memory: MemorySettingsSummary {
+            enabled: config.memory.enabled,
+            extraction_mode: config.memory.extraction_mode.clone(),
+            retention_days: config.memory.retention_days,
+            extraction_model_id: config.memory.extraction_model_id.clone(),
+            extraction_modes: vec![
+                MemoryExtractionModeSummary {
+                    value: "manual",
+                    label: "Manual",
+                },
+                MemoryExtractionModeSummary {
+                    value: "pending_review",
+                    label: "Pending review",
+                },
+                MemoryExtractionModeSummary {
+                    value: "disabled",
+                    label: "Disabled",
+                },
+            ],
         },
         workspaces: config
             .workspaces

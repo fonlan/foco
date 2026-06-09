@@ -94,7 +94,7 @@ memory graph in Foco. It is not the runtime memory store.
 
 ## Phase 3 - Manual API and UI
 
-- [ ] Add memory settings to global config: enabled flag, extraction mode,
+- [x] Add memory settings to global config: enabled flag, extraction mode,
       retention settings, and optional dedicated extraction model id.
 - [x] Add API to list memories by scope.
 - [x] Add API to search memories.
@@ -105,10 +105,10 @@ memory graph in Foco. It is not the runtime memory store.
 - [x] Add API to forget memory.
 - [x] Add API to promote memory.
 - [x] Add API to show memory sources.
-- [ ] Add a Memory settings tab.
-- [ ] Add a pending review queue.
-- [ ] Add filters for global, workspace, and chat memories.
-- [ ] Add a compact source/evidence viewer.
+- [x] Add a Memory settings tab.
+- [x] Add a pending review queue.
+- [x] Add filters for global, workspace, and chat memories.
+- [x] Add a compact source/evidence viewer.
 - [ ] Add a chat-side "memories used" view after prompt injection exists.
 
 ## Phase 4 - Retrieval and Prompt Injection

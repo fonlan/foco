@@ -704,6 +704,15 @@ impl MemoryDatabase {
         chat_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.list_facts_for_scope(chat_id, MemoryStatus::Active, limit)
+    }
+
+    pub fn list_facts_for_scope(
+        &self,
+        chat_id: Option<&str>,
+        status: MemoryStatus,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
         if let Some(chat_id) = chat_id {
             require_non_empty("chat_id", chat_id)?;
         }
@@ -726,7 +735,7 @@ impl MemoryDatabase {
                     expires_at, metadata_json, created_at, updated_at
              FROM memory_facts
              WHERE ({filter_sql})
-               AND status = 'active'
+               AND status = ?3
                AND is_latest = 1
              ORDER BY
                CASE WHEN scope = 'chat' THEN 0 WHEN scope = 'workspace' THEN 1 ELSE 2 END,
@@ -739,7 +748,10 @@ impl MemoryDatabase {
             .prepare(&sql)
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let rows = statement
-            .query_map(params![chat_param, limit], memory_fact_from_row)
+            .query_map(
+                params![chat_param, limit, status.as_str()],
+                memory_fact_from_row,
+            )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
         collect_rows(rows, &self.database_path)

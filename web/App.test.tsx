@@ -89,6 +89,17 @@ const settings = {
       passwordEnabled: false,
     },
   },
+  memory: {
+    enabled: false,
+    extractionMode: "manual",
+    extractionModelId: null,
+    extractionModes: [
+      { label: "Manual", value: "manual" },
+      { label: "Pending review", value: "pending_review" },
+      { label: "Disabled", value: "disabled" },
+    ],
+    retentionDays: null,
+  },
   mcpServers: [
     {
       args: ["serve"],
@@ -181,6 +192,43 @@ const settings = {
       terminalShell: workspace.terminalShell,
     },
   ],
+};
+
+const activeMemory = {
+  chatId: null,
+  confidence: null,
+  createdAt: "2026-06-09T02:00:00Z",
+  expiresAt: null,
+  fact: "Stored test preference",
+  id: "memory-active-1",
+  isLatest: true,
+  kind: "preference",
+  metadataJson: "{}",
+  pinned: true,
+  scope: "global",
+  status: "active",
+  updatedAt: "2026-06-09T02:05:00Z",
+};
+
+const pendingMemory = {
+  ...activeMemory,
+  fact: "Pending extracted memory",
+  id: "memory-pending-1",
+  pinned: false,
+  status: "pending",
+};
+
+const memorySource = {
+  chatId: null,
+  content: "Manual source content",
+  createdAt: "2026-06-09T02:00:00Z",
+  id: "memory-source-1",
+  metadataJson: "{}",
+  scope: "global",
+  sourceId: null,
+  sourceType: "manual_note",
+  title: "Manual memory",
+  updatedAt: "2026-06-09T02:00:00Z",
 };
 
 const aiStatistics = {
@@ -1071,6 +1119,95 @@ describe("App verification surfaces", () => {
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
   });
 
+  it("saves memory settings and manages manual memories", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+
+    expect(await screen.findByText("Memory settings")).toBeInTheDocument();
+    expect((await screen.findAllByText(activeMemory.fact)).length).toBeGreaterThan(0);
+    expect(await screen.findByText(memorySource.content)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText("Enable memory"));
+    await userEvent.selectOptions(screen.getByLabelText("Extraction mode"), "pending_review");
+    await userEvent.type(screen.getByLabelText("Retention days"), "30");
+    await userEvent.selectOptions(screen.getByLabelText("Extraction model"), "gpt-test");
+    await userEvent.click(screen.getByRole("button", { name: "Save memory settings" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/settings/memory",
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
+        enabled: true,
+        extractionMode: "pending_review",
+        extractionModelId: "gpt-test",
+        retentionDays: 30,
+      });
+    });
+
+    await userEvent.type(
+      screen.getAllByLabelText("Memory fact")[0],
+      "Remember local memory graph.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Create memory" }));
+
+    await waitFor(() => {
+      const createCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/memory/manual",
+      );
+      expect(createCall).toBeDefined();
+      expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({
+        chatId: null,
+        fact: "Remember local memory graph.",
+        kind: "user_note",
+        pinned: false,
+        scope: "global",
+        workspaceId: null,
+      });
+    });
+
+    const editFactInput = screen.getAllByLabelText("Memory fact")[1];
+    await userEvent.clear(editFactInput);
+    await userEvent.type(editFactInput, "Updated memory preference.");
+    await userEvent.click(screen.getByRole("button", { name: "Save memory" }));
+
+    await waitFor(() => {
+      const editCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/memory/edit",
+      );
+      expect(editCall).toBeDefined();
+      expect(JSON.parse(String(editCall?.[1]?.body))).toEqual({
+        fact: "Updated memory preference.",
+        kind: "preference",
+        memoryId: activeMemory.id,
+        pinned: true,
+        scope: "global",
+        workspaceId: null,
+      });
+    });
+
+    await userEvent.selectOptions(screen.getByLabelText("Memory status"), "pending");
+    expect((await screen.findAllByText(pendingMemory.fact)).length).toBeGreaterThan(0);
+    await userEvent.click(screen.getByRole("button", { name: "Approve memory" }));
+
+    await waitFor(() => {
+      const statusCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/memory/status",
+      );
+      expect(statusCall).toBeDefined();
+      expect(JSON.parse(String(statusCall?.[1]?.body))).toEqual({
+        memoryId: pendingMemory.id,
+        scope: "global",
+        status: "active",
+        workspaceId: null,
+      });
+    });
+  });
+
   it("shows translated hook settings and imports Claude hooks by target scope", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
@@ -1398,6 +1535,7 @@ describe("App verification surfaces", () => {
 async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const url = typeof input === "string" ? input : input.toString();
   const path = url.startsWith("http://127.0.0.1") ? new URL(url).pathname : url.split("?")[0];
+  const requestUrl = new URL(url, "http://127.0.0.1");
 
   if (path === "/api/auth/status") {
     return jsonResponse({ authenticated: true, enabled: false });
@@ -1461,6 +1599,40 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
 
   if (path === "/api/settings/general") {
     return jsonResponse(savedSettings.general);
+  }
+
+  if (path === "/api/settings/memory") {
+    return jsonResponse({
+      ...settings,
+      memory: {
+        ...settings.memory,
+        enabled: true,
+        extractionMode: "pending_review",
+        extractionModelId: "gpt-test",
+        retentionDays: 30,
+      },
+    });
+  }
+
+  if (path === "/api/memory") {
+    const status = requestUrl.searchParams.get("status");
+    return jsonResponse({
+      memories: status === "pending" ? [pendingMemory] : [activeMemory],
+    });
+  }
+
+  if (path === "/api/memory/sources") {
+    return jsonResponse({ sources: [memorySource] });
+  }
+
+  if (
+    path === "/api/memory/manual" ||
+    path === "/api/memory/edit" ||
+    path === "/api/memory/status" ||
+    path === "/api/memory/forget" ||
+    path === "/api/memory/promote"
+  ) {
+    return jsonResponse({ memory: activeMemory });
   }
 
   if (path === "/api/hooks") {
