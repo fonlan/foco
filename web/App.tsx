@@ -2860,14 +2860,7 @@ export function App() {
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message)
-                ? {
-                    ...message,
-                    content: streamEvent.message,
-                    parts: [{ type: "text", text: streamEvent.message }],
-                    metrics: null,
-                    memoriesUsed: [],
-                    status: "error",
-                  }
+                ? assistantMessageWithAppendedError(message, streamEvent.message)
                 : message,
             ),
           );
@@ -2890,12 +2883,7 @@ export function App() {
       setMessagesForChatKey(runMessagesKey, (current) =>
         current.map((item) =>
           isCurrentAssistantMessage(item)
-            ? {
-                ...item,
-                content: message,
-                parts: [{ type: "text", text: message }],
-                status: "error",
-              }
+            ? assistantMessageWithAppendedError(item, message)
             : item,
         ),
       );
@@ -13567,6 +13555,30 @@ function completedAssistantMessage(
           reasoning: nextReasoning,
           status: undefined,
         }),
+  };
+}
+
+function assistantMessageWithAppendedError(
+  message: ShellMessage,
+  errorText: string,
+): ShellMessage {
+  const hasVisibleContent =
+    Boolean(message.content || message.reasoning || message.parts.length) ||
+    message.toolCalls.length > 0;
+  const separator = hasVisibleContent ? "\n\n" : "";
+  const existingParts = message.parts.length
+    ? message.parts
+    : fallbackMessageParts(message);
+
+  return {
+    ...message,
+    content: message.content
+      ? `${message.content}${separator}${errorText}`
+      : errorText,
+    parts: appendTextPart(existingParts, `${separator}${errorText}`),
+    metrics: null,
+    memoriesUsed: [],
+    status: hasVisibleContent ? undefined : "error",
   };
 }
 

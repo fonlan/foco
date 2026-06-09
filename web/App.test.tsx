@@ -864,6 +864,34 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("appends stream errors after already rendered assistant text", async () => {
+    render(<App />);
+
+    await userEvent.type(await screen.findByPlaceholderText("Message Foco"), "debug");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Partial answer.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        message: "agent run exceeded 128 tool continuation rounds",
+        type: "error",
+      });
+    });
+
+    expect(await screen.findByText("Partial answer.")).toBeInTheDocument();
+    expect(
+      screen.getByText("agent run exceeded 128 tool continuation rounds"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
   it("shows hook blocking notifications in the active chat", async () => {
     render(<App />);
 

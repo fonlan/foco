@@ -105,7 +105,7 @@ mod terminal;
 
 const PORT_ENV: &str = "FOCO_PORT";
 const HOST_ENV: &str = "FOCO_HOST";
-const MAX_AGENT_TOOL_ROUNDS: usize = 8;
+const MAX_AGENT_TOOL_ROUNDS: usize = 128;
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES: usize = 16;
@@ -6651,7 +6651,7 @@ fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
-    if let Some(assistant_text) = assistant_text {
+    let assistant_message_id = if let Some(assistant_text) = assistant_text {
         let metadata_json =
             assistant_message_metadata_json(assistant_reasoning, &context.memories_used)?;
         database
@@ -6664,7 +6664,10 @@ fn persist_chat_result(
                 metadata_json: Some(&metadata_json),
             })
             .map_err(ApiError::from_workspace_error)?;
-    }
+        Some(context.assistant_message_id.as_str())
+    } else {
+        None
+    };
 
     for tool_call in tool_calls {
         let input_json = serde_json::to_string(&tool_call.input).map_err(|source| {
@@ -6680,7 +6683,7 @@ fn persist_chat_result(
                 id: &tool_call.id,
                 chat_id: &context.chat_id,
                 run_id: &context.llm_request_id,
-                message_id: Some(&context.assistant_message_id),
+                message_id: assistant_message_id,
                 tool_name: &tool_call.name,
                 input_json: &input_json,
                 status: if tool_call.is_error {
@@ -14267,6 +14270,131 @@ description: Project memory.
 
         drop(database);
         drop(memory_database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn persist_failed_chat_result_keeps_tool_calls_without_assistant_message() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-failed-tool-call-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            database
+                .insert_chat("chat-1", "Failed tool chat")
+                .expect("chat insert");
+        }
+        let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
+        let mcp_registry = Arc::new(McpRegistry::default());
+        let context = PreparedChatContext {
+            workspace_id: "workspace-1".to_string(),
+            workspace_path: workspace_dir.clone(),
+            memory_database_file: workspace_dir.join("global-memory.sqlite"),
+            chat_id: "chat-1".to_string(),
+            provider_id: "openai-responses".to_string(),
+            model_id: "gpt-5.4".to_string(),
+            user_message_id: "user-1".to_string(),
+            assistant_message_id: "assistant-1".to_string(),
+            llm_request_id: "request-1".to_string(),
+            assistant_sequence: 1,
+            provider_config: ProviderConnectionConfig {
+                kind: foco_providers::ProviderKind::OpenAiResponses,
+                base_url: None,
+                api_key: Some("test-key".to_string()),
+                proxy_url: None,
+            },
+            provider_request: NeutralChatRequest {
+                model_id: "gpt-5.4".to_string(),
+                messages: vec![neutral_text_message(
+                    NeutralChatRole::User,
+                    "Hello".to_string(),
+                )],
+                tools: Vec::new(),
+                thinking_level: None,
+                max_output_tokens: Some(16),
+            },
+            hook_runtime: HookRuntime::new(mcp_registry.clone()),
+            global_hooks: HookConfig::default(),
+            mcp_registry,
+            question_registry: QuestionRegistry::default(),
+            app_shutdown_rx,
+            context_budget: foco_agent::ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 16,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: 984,
+            },
+            global_config: GlobalConfig::first_run(workspace_dir.clone()),
+            memory_settings: MemorySettings {
+                enabled: false,
+                extraction_mode: "manual".to_string(),
+                retention_days: None,
+                extraction_model_id: None,
+            },
+            memories_used: Vec::new(),
+            memory_target_status: MemoryStatus::Pending,
+            request_body_json: "{}".to_string(),
+            compression_snapshots: Vec::new(),
+            message_source_sequences: vec![Some(0)],
+            active_tool_start_index: 1,
+            hook_context_messages: Vec::new(),
+            hook_notifications: Vec::new(),
+        };
+        let outcome = ChatAuditOutcome {
+            first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
+            completed_at: "2026-06-06T09:00:01Z".to_string(),
+            first_token_latency_ms: Some(100),
+            total_latency_ms: 1_000,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            status_code: None,
+            final_state: "failed",
+            response_body_json: Some(
+                r#"{"error":"agent run exceeded 128 tool continuation rounds"}"#.to_string(),
+            ),
+        };
+        let event = captured_event(&ChatSseEvent::Error {
+            message: "agent run exceeded 128 tool continuation rounds".to_string(),
+        });
+        let tool_calls = vec![ExecutedToolCall {
+            id: "tool-call-1".to_string(),
+            name: "read_file".to_string(),
+            input: json!({ "path": "README.md" }),
+            output: json!({ "content": "hello" }),
+            is_error: false,
+            started_at: "2026-06-06T09:00:00Z".to_string(),
+            completed_at: "2026-06-06T09:00:01Z".to_string(),
+        }];
+
+        persist_chat_result(
+            &context,
+            "2026-06-06T09:00:00Z",
+            outcome,
+            &[event],
+            None,
+            None,
+            &tool_calls,
+        )
+        .expect("failed chat result with tool calls should persist");
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let request = database
+            .llm_request("request-1")
+            .expect("llm request read")
+            .expect("llm request");
+        let messages = database
+            .messages_for_chat("chat-1")
+            .expect("chat messages read");
+
+        assert_eq!(request.final_state, "failed");
+        assert!(messages.is_empty());
+
+        drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }
 
