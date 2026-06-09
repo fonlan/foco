@@ -109,6 +109,11 @@ const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES: usize = 16;
 const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
+const MEMORY_CONTEXT_BUDGET_PERCENT: u64 = 12;
+const MEMORY_CONTEXT_FACT_LIMIT: u32 = 24;
+const MEMORY_CONTEXT_PROFILE_LIMIT: u32 = 8;
+const MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX: &str = "Foco memory profile context:";
+const MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX: &str = "Foco retrieved memory context:";
 const MAX_CHAT_ATTACHMENTS: usize = 6;
 const MAX_CHAT_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES: u64 = 24 * 1024 * 1024;
@@ -3081,6 +3086,8 @@ struct ChatAttachmentPart {
 struct ContextUsageResponse {
     used_message_tokens: u64,
     available_message_tokens: u64,
+    memory_context_tokens: u64,
+    memory_budget_tokens: u64,
     usage_percent: u64,
     compression_trigger_tokens: u64,
     compression_trigger_percent: u64,
@@ -3759,6 +3766,8 @@ struct PreparedPromptContext {
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
     context_budget: foco_agent::ContextBudget,
+    memory_context_tokens: u64,
+    memory_budget_tokens: u64,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
     active_tool_start_index: usize,
@@ -3767,6 +3776,13 @@ struct PreparedPromptContext {
     message: Option<String>,
     attachments: Vec<NeutralChatAttachment>,
     next_message_sequence: i64,
+}
+
+struct MemoryPromptContext {
+    profile_message: Option<NeutralChatMessage>,
+    retrieved_message: Option<NeutralChatMessage>,
+    context_tokens: u64,
+    budget_tokens: u64,
 }
 
 struct CapturedAuditEvent {
@@ -4809,17 +4825,35 @@ async fn prepare_prompt_context(
     } else {
         Vec::new()
     };
+    let memory_context = memory_prompt_context(
+        state,
+        config,
+        workspace,
+        chat_id.as_deref(),
+        raw_message.as_deref(),
+        &context_budget,
+    )?;
     let mut neutral_messages = Vec::with_capacity(
         existing_messages.len()
             + compression_snapshots.len()
             + agents_messages.len()
             + environment_messages.len()
             + skill_messages.len()
+            + usize::from(memory_context.profile_message.is_some())
+            + usize::from(memory_context.retrieved_message.is_some())
             + 2,
     );
     let mut message_source_sequences = Vec::with_capacity(neutral_messages.capacity());
     neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
     message_source_sequences.push(None);
+    if let Some(profile_message) = memory_context.profile_message {
+        neutral_messages.push(profile_message);
+        message_source_sequences.push(None);
+    }
+    if let Some(retrieved_message) = memory_context.retrieved_message {
+        neutral_messages.push(retrieved_message);
+        message_source_sequences.push(None);
+    }
     for snapshot in &compression_snapshots {
         neutral_messages.push(compression_snapshot_message(snapshot));
         message_source_sequences.push(None);
@@ -4872,6 +4906,8 @@ async fn prepare_prompt_context(
         provider_config,
         provider_request,
         context_budget,
+        memory_context_tokens: memory_context.context_tokens,
+        memory_budget_tokens: memory_context.budget_tokens,
         compression_snapshots,
         message_source_sequences,
         active_tool_start_index,
@@ -5010,6 +5046,249 @@ async fn prepare_chat_context(
         hook_context_messages,
         hook_notifications,
     })
+}
+
+fn memory_prompt_context(
+    state: &AppState,
+    config: &GlobalConfig,
+    workspace: &WorkspaceConfig,
+    chat_id: Option<&str>,
+    query_text: Option<&str>,
+    context_budget: &foco_agent::ContextBudget,
+) -> Result<MemoryPromptContext, ApiError> {
+    let budget_tokens = if config.memory.enabled {
+        context_budget
+            .available_message_tokens
+            .saturating_mul(MEMORY_CONTEXT_BUDGET_PERCENT)
+            / 100
+    } else {
+        0
+    };
+
+    if !config.memory.enabled || budget_tokens == 0 {
+        return Ok(MemoryPromptContext {
+            profile_message: None,
+            retrieved_message: None,
+            context_tokens: 0,
+            budget_tokens,
+        });
+    }
+
+    let mut workspace_memory =
+        open_memory_database(state, config, MemoryScope::Workspace, Some(&workspace.id))?;
+    let mut global_memory = open_memory_database(state, config, MemoryScope::Global, None)?;
+
+    let mut remaining_tokens = budget_tokens;
+    let profile_message = memory_profile_context_message(
+        &global_memory,
+        &workspace_memory,
+        chat_id,
+        &mut remaining_tokens,
+    )?;
+    let retrieved_message = retrieved_memory_context_message(
+        &mut global_memory,
+        &mut workspace_memory,
+        chat_id,
+        query_text,
+        &mut remaining_tokens,
+    )?;
+    let context_tokens = profile_message
+        .as_ref()
+        .map(neutral_message_estimated_tokens)
+        .unwrap_or(0)
+        + retrieved_message
+            .as_ref()
+            .map(neutral_message_estimated_tokens)
+            .unwrap_or(0);
+
+    Ok(MemoryPromptContext {
+        profile_message,
+        retrieved_message,
+        context_tokens,
+        budget_tokens,
+    })
+}
+
+fn memory_profile_context_message(
+    global_memory: &MemoryDatabase,
+    workspace_memory: &MemoryDatabase,
+    chat_id: Option<&str>,
+    remaining_tokens: &mut u64,
+) -> Result<Option<NeutralChatMessage>, ApiError> {
+    let mut profiles = Vec::new();
+    profiles.extend(
+        workspace_memory
+            .profiles_for_scope(chat_id, MEMORY_CONTEXT_PROFILE_LIMIT)
+            .map_err(ApiError::from_memory_error)?,
+    );
+    profiles.extend(
+        global_memory
+            .profiles_for_scope(None, MEMORY_CONTEXT_PROFILE_LIMIT)
+            .map_err(ApiError::from_memory_error)?,
+    );
+
+    if profiles.is_empty() {
+        return Ok(None);
+    }
+
+    let prefix_tokens = estimate_text_tokens(MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX);
+    if prefix_tokens > *remaining_tokens {
+        return Ok(None);
+    }
+    *remaining_tokens = remaining_tokens.saturating_sub(prefix_tokens);
+    let mut content = String::from(MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX);
+    for profile in profiles {
+        if profile.profile_text.trim().is_empty() {
+            continue;
+        }
+
+        let entry = format!(
+            "\n\n- scope: {}\n  chatId: {}\n  updatedAt: {}\n  profile: {}",
+            profile.scope,
+            profile.chat_id.as_deref().unwrap_or("n/a"),
+            profile.updated_at,
+            markdown_safe_single_line(&profile.profile_text)
+        );
+        let entry_tokens = estimate_text_tokens(&entry);
+        if entry_tokens > *remaining_tokens {
+            break;
+        }
+        content.push_str(&entry);
+        *remaining_tokens = remaining_tokens.saturating_sub(entry_tokens);
+    }
+
+    if content == MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX {
+        return Ok(None);
+    }
+
+    Ok(Some(neutral_text_message(NeutralChatRole::System, content)))
+}
+
+fn retrieved_memory_context_message(
+    global_memory: &mut MemoryDatabase,
+    workspace_memory: &mut MemoryDatabase,
+    chat_id: Option<&str>,
+    query_text: Option<&str>,
+    remaining_tokens: &mut u64,
+) -> Result<Option<NeutralChatMessage>, ApiError> {
+    let search_query = query_text.and_then(memory_fts_query);
+    let mut facts = Vec::new();
+    facts.extend(match search_query.as_deref() {
+        Some(query) => workspace_memory
+            .search_active_facts_for_scope(query, chat_id, MEMORY_CONTEXT_FACT_LIMIT)
+            .map_err(ApiError::from_memory_error)?,
+        None => workspace_memory
+            .list_active_facts_for_scope(chat_id, MEMORY_CONTEXT_FACT_LIMIT)
+            .map_err(ApiError::from_memory_error)?,
+    });
+    facts.extend(match search_query.as_deref() {
+        Some(query) => global_memory
+            .search_active_facts_for_scope(query, None, MEMORY_CONTEXT_FACT_LIMIT)
+            .map_err(ApiError::from_memory_error)?,
+        None => global_memory
+            .list_active_facts_for_scope(None, MEMORY_CONTEXT_FACT_LIMIT)
+            .map_err(ApiError::from_memory_error)?,
+    });
+    facts.sort_by(memory_fact_prompt_order);
+    facts.dedup_by(|left, right| left.id == right.id && left.scope == right.scope);
+
+    if facts.is_empty() {
+        return Ok(None);
+    }
+
+    let prefix_tokens = estimate_text_tokens(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX);
+    if prefix_tokens > *remaining_tokens {
+        return Ok(None);
+    }
+    *remaining_tokens = remaining_tokens.saturating_sub(prefix_tokens);
+    let mut content = String::from(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX);
+    for fact in facts {
+        let entry = format!(
+            "\n\n- id: {}\n  scope: {}\n  chatId: {}\n  kind: {}\n  pinned: {}\n  updatedAt: {}\n  fact: {}",
+            fact.id,
+            fact.scope,
+            fact.chat_id.as_deref().unwrap_or("n/a"),
+            fact.kind,
+            fact.pinned,
+            fact.updated_at,
+            markdown_safe_single_line(&fact.fact)
+        );
+        let entry_tokens = estimate_text_tokens(&entry);
+        if entry_tokens > *remaining_tokens {
+            break;
+        }
+        content.push_str(&entry);
+        *remaining_tokens = remaining_tokens.saturating_sub(entry_tokens);
+    }
+
+    if content == MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX {
+        return Ok(None);
+    }
+
+    Ok(Some(neutral_text_message(NeutralChatRole::System, content)))
+}
+
+fn memory_fts_query(text: &str) -> Option<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let mut seen = HashSet::new();
+
+    for character in text.chars() {
+        if character.is_alphanumeric() {
+            current.extend(character.to_lowercase());
+            if current.chars().count() >= 64 {
+                push_memory_fts_term(&mut terms, &mut seen, &mut current);
+            }
+        } else {
+            push_memory_fts_term(&mut terms, &mut seen, &mut current);
+        }
+
+        if terms.len() >= 12 {
+            break;
+        }
+    }
+    push_memory_fts_term(&mut terms, &mut seen, &mut current);
+
+    if terms.is_empty() {
+        None
+    } else {
+        Some(
+            terms
+                .into_iter()
+                .map(|term| format!("\"{term}\""))
+                .collect::<Vec<_>>()
+                .join(" OR "),
+        )
+    }
+}
+
+fn push_memory_fts_term(terms: &mut Vec<String>, seen: &mut HashSet<String>, current: &mut String) {
+    let term = current.trim();
+    if term.chars().count() >= 2 && seen.insert(term.to_string()) {
+        terms.push(term.to_string());
+    }
+    current.clear();
+}
+
+fn memory_fact_prompt_order(
+    left: &MemoryFactRecord,
+    right: &MemoryFactRecord,
+) -> std::cmp::Ordering {
+    right
+        .pinned
+        .cmp(&left.pinned)
+        .then_with(|| memory_fact_scope_rank(left).cmp(&memory_fact_scope_rank(right)))
+        .then_with(|| right.updated_at.cmp(&left.updated_at))
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+fn memory_fact_scope_rank(fact: &MemoryFactRecord) -> u8 {
+    match fact.scope.as_str() {
+        "chat" => 0,
+        "workspace" => 1,
+        "global" => 2,
+        _ => 3,
+    }
 }
 
 fn neutral_messages_from_record(
@@ -6081,6 +6360,8 @@ fn context_usage_response(
     Ok(ContextUsageResponse {
         used_message_tokens,
         available_message_tokens,
+        memory_context_tokens: context.memory_context_tokens,
+        memory_budget_tokens: context.memory_budget_tokens,
         usage_percent,
         compression_trigger_tokens,
         compression_trigger_percent,
@@ -12611,6 +12892,166 @@ Use the existing product UI conventions.
     }
 
     #[tokio::test]
+    async fn prepare_prompt_context_injects_memory_context_after_system_prompt() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-prompt-workspace-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-memory-prompt-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.memory.enabled = true;
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Memory prompt chat")
+                .expect("chat insert");
+        }
+        {
+            let mut memory =
+                MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                    .expect("workspace memory database");
+            upsert_test_memory_profile(
+                &mut memory,
+                "profile-chat",
+                MemoryScope::Chat,
+                Some("chat-1"),
+                "Chat profile memory.",
+            );
+            upsert_test_memory_profile(
+                &mut memory,
+                "profile-workspace",
+                MemoryScope::Workspace,
+                None,
+                "Workspace profile memory.",
+            );
+            insert_test_memory_fact(
+                &mut memory,
+                "source-chat-renderer",
+                "fact-chat-renderer",
+                MemoryScope::Chat,
+                Some("chat-1"),
+                "Use the renderer pipeline for preview bugs.",
+                false,
+            );
+            insert_test_memory_fact(
+                &mut memory,
+                "source-workspace-renderer",
+                "fact-workspace-renderer",
+                MemoryScope::Workspace,
+                None,
+                "Workspace renderer work should share prompt assembly.",
+                false,
+            );
+        }
+        {
+            let mut memory = MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+                .expect("global memory database");
+            upsert_test_memory_profile(
+                &mut memory,
+                "profile-global",
+                MemoryScope::Global,
+                None,
+                "Global profile memory.",
+            );
+            insert_test_memory_fact(
+                &mut memory,
+                "source-global-renderer",
+                "fact-global-renderer",
+                MemoryScope::Global,
+                None,
+                "Global renderer memory should be available.",
+                false,
+            );
+        }
+
+        let context = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                chat_id: Some("chat-1".to_string()),
+                model_id: "model".to_string(),
+                thinking_level: None,
+                skill_ids: None,
+                message: Some("renderer prompt assembly".to_string()),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("prompt context");
+        let messages = &context.provider_request.messages;
+
+        assert!(messages[0].content.contains("You are Foco"));
+        assert!(
+            messages[1]
+                .content
+                .contains(MEMORY_PROFILE_CONTEXT_MESSAGE_PREFIX)
+        );
+        assert!(messages[1].content.contains("Chat profile memory."));
+        assert!(messages[1].content.contains("Workspace profile memory."));
+        assert!(messages[1].content.contains("Global profile memory."));
+        assert!(
+            messages[2]
+                .content
+                .contains(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX)
+        );
+        assert!(
+            messages[2]
+                .content
+                .contains("Use the renderer pipeline for preview bugs.")
+        );
+        assert!(
+            messages[2]
+                .content
+                .contains("Workspace renderer work should share prompt assembly.")
+        );
+        assert!(
+            messages[2]
+                .content
+                .contains("Global renderer memory should be available.")
+        );
+        assert!(context.memory_context_tokens > 0);
+        assert!(context.memory_context_tokens <= context.memory_budget_tokens);
+        assert_eq!(
+            context.memory_budget_tokens,
+            context
+                .context_budget
+                .available_message_tokens
+                .saturating_mul(MEMORY_CONTEXT_BUDGET_PERCENT)
+                / 100
+        );
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
     async fn context_usage_preview_does_not_persist_chat_messages() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-context-usage-workspace-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-context-usage-profile-test"));
@@ -12618,6 +13059,7 @@ Use the existing product UI conventions.
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
 
         let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.memory.enabled = true;
         config.providers.push(ProviderSettings {
             id: "provider".to_string(),
             name: "Provider".to_string(),
@@ -12643,6 +13085,21 @@ Use the existing product UI conventions.
             }),
         });
         let state = test_app_state(config.clone(), profile_dir.clone());
+        {
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            let mut memory =
+                MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                    .expect("workspace memory database");
+            insert_test_memory_fact(
+                &mut memory,
+                "source-context",
+                "fact-context",
+                MemoryScope::Workspace,
+                None,
+                "Preview usage should include workspace memory.",
+                false,
+            );
+        }
 
         let prompt_context = prepare_prompt_context(
             &state,
@@ -12662,6 +13119,15 @@ Use the existing product UI conventions.
         let usage = context_usage_response(&prompt_context).expect("context usage");
 
         assert!(usage.used_message_tokens > 0);
+        assert!(usage.memory_context_tokens > 0);
+        assert_eq!(
+            usage.memory_context_tokens,
+            prompt_context.memory_context_tokens
+        );
+        assert_eq!(
+            usage.memory_budget_tokens,
+            prompt_context.memory_budget_tokens
+        );
         assert_eq!(
             usage.compression_trigger_tokens,
             context_compression_trigger_tokens(usage.available_message_tokens)
@@ -12671,8 +13137,19 @@ Use the existing product UI conventions.
         let database =
             WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
         assert!(database.chats().expect("chat list").is_empty());
+        let memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        assert_eq!(
+            memory_database
+                .list_active_facts_for_scope(None, 10)
+                .expect("workspace memories")
+                .len(),
+            1
+        );
 
         drop(database);
+        drop(memory_database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
         remove_dir_if_exists(&profile_dir);
     }
@@ -12835,6 +13312,61 @@ description: Project memory.
         }
     }
 
+    fn insert_test_memory_fact(
+        database: &mut MemoryDatabase,
+        source_id: &str,
+        fact_id: &str,
+        scope: MemoryScope,
+        chat_id: Option<&str>,
+        fact: &str,
+        pinned: bool,
+    ) {
+        database
+            .insert_source(NewMemorySource {
+                id: source_id,
+                scope,
+                chat_id,
+                source_type: foco_store::memory::MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Test memory",
+                content: fact,
+                metadata_json: "{}",
+            })
+            .expect("memory source insert");
+        database
+            .insert_fact(NewMemoryFact {
+                id: fact_id,
+                scope,
+                chat_id,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::ProjectFact,
+                fact,
+                confidence: None,
+                pinned,
+                source_ids: &[source_id],
+                metadata_json: "{}",
+            })
+            .expect("memory fact insert");
+    }
+
+    fn upsert_test_memory_profile(
+        database: &mut MemoryDatabase,
+        profile_id: &str,
+        scope: MemoryScope,
+        chat_id: Option<&str>,
+        profile_text: &str,
+    ) {
+        database
+            .upsert_profile(foco_store::memory::NewMemoryProfile {
+                id: profile_id,
+                scope,
+                chat_id,
+                profile_text,
+                metadata_json: "{}",
+            })
+            .expect("memory profile upsert");
+    }
+
     fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         let (terminal_shutdown_tx, _) = broadcast::channel(1);
         let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
@@ -12843,6 +13375,9 @@ description: Project memory.
         AppState {
             config: Arc::new(Mutex::new(config)),
             config_file: user_profile_dir.join(".foco").join("config.json"),
+            memory_database_file: foco_store::memory::global_memory_database_path(
+                user_profile_dir.join(".foco"),
+            ),
             model_metadata_file: user_profile_dir.join(".foco").join("models.dev.json"),
             user_profile_dir,
             terminal_registry: terminal::TerminalRegistry::default(),

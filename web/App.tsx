@@ -146,6 +146,8 @@ type ModelMetadataResponse = {
 type ContextUsageResponse = {
   usedMessageTokens: number;
   availableMessageTokens: number;
+  memoryContextTokens: number;
+  memoryBudgetTokens: number;
   usagePercent: number;
   compressionTriggerTokens: number;
   compressionTriggerPercent: number;

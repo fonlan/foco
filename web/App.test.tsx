@@ -510,6 +510,8 @@ const contextUsage = {
   availableMessageTokens: 110960,
   compressionTriggerPercent: 80,
   compressionTriggerTokens: 88768,
+  memoryBudgetTokens: 13315,
+  memoryContextTokens: 120,
   usagePercent: 47,
   usedMessageTokens: 52340,
   willCompressOnNextSend: false,

@@ -557,6 +557,48 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))
     }
 
+    pub fn profiles_for_scope(
+        &self,
+        chat_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryProfileRecord>, MemoryDatabaseError> {
+        if let Some(chat_id) = chat_id {
+            require_non_empty("chat_id", chat_id)?;
+        }
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let (filter_sql, chat_param) = match self.kind {
+            MemoryDatabaseKind::Global => ("scope = 'global'", None),
+            MemoryDatabaseKind::Workspace if chat_id.is_some() => (
+                "(scope = 'chat' AND chat_id = ?1) OR scope = 'workspace'",
+                chat_id,
+            ),
+            MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
+        };
+        let sql = format!(
+            "SELECT id, scope, chat_id, profile_text, metadata_json, created_at, updated_at
+             FROM memory_profiles
+             WHERE ({filter_sql})
+             ORDER BY
+               CASE WHEN scope = 'chat' THEN 0 WHEN scope = 'workspace' THEN 1 ELSE 2 END,
+               updated_at DESC
+             LIMIT ?2"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(params![chat_param, limit], memory_profile_from_row)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn fact(&self, id: &str) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("id", id)?;
         self.connection

@@ -113,23 +113,23 @@ memory graph in Foco. It is not the runtime memory store.
 
 ## Phase 4 - Retrieval and Prompt Injection
 
-- [ ] Extend prompt preparation to retrieve memory context.
-- [ ] Insert memory profile context immediately after the system prompt.
-- [ ] Insert query-specific retrieved memories after the profile context.
-- [ ] Keep memory injection inside the same path used by chat streaming and
+- [x] Extend prompt preparation to retrieve memory context.
+- [x] Insert memory profile context immediately after the system prompt.
+- [x] Insert query-specific retrieved memories after the profile context.
+- [x] Keep memory injection inside the same path used by chat streaming and
       context usage.
-- [ ] Add memory token accounting to context usage response.
-- [ ] Add a fixed memory budget, initially 10-15 percent of available message
+- [x] Add memory token accounting to context usage response.
+- [x] Add a fixed memory budget, initially 10-15 percent of available message
       tokens.
-- [ ] Prioritize pinned facts, active profile facts, current chat facts,
+- [x] Prioritize pinned facts, active profile facts, current chat facts,
       workspace facts, then global facts.
 - [ ] Rank FTS matches by textual relevance, scope, recency, confidence,
       pinned status, and `is_latest`.
 - [ ] Expand search results through graph edges within a small bounded depth.
-- [ ] Exclude superseded facts unless the query explicitly asks for history.
-- [ ] Add tests proving context usage does not persist memories.
-- [ ] Add tests proving injected memory order is stable.
-- [ ] Add tests proving memory token budget is enforced.
+- [x] Exclude superseded facts unless the query explicitly asks for history.
+- [x] Add tests proving context usage does not persist memories.
+- [x] Add tests proving injected memory order is stable.
+- [x] Add tests proving memory token budget is enforced.
 
 ## Phase 5 - Extraction Jobs
 
