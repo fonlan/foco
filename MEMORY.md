@@ -96,15 +96,15 @@ memory graph in Foco. It is not the runtime memory store.
 
 - [ ] Add memory settings to global config: enabled flag, extraction mode,
       retention settings, and optional dedicated extraction model id.
-- [ ] Add API to list memories by scope.
-- [ ] Add API to search memories.
-- [ ] Add API to create manual memory.
-- [ ] Add API to approve pending memory.
-- [ ] Add API to reject pending memory.
-- [ ] Add API to edit memory text and metadata.
-- [ ] Add API to forget memory.
-- [ ] Add API to promote memory.
-- [ ] Add API to show memory sources.
+- [x] Add API to list memories by scope.
+- [x] Add API to search memories.
+- [x] Add API to create manual memory.
+- [x] Add API to approve pending memory.
+- [x] Add API to reject pending memory.
+- [x] Add API to edit memory text and metadata.
+- [x] Add API to forget memory.
+- [x] Add API to promote memory.
+- [x] Add API to show memory sources.
 - [ ] Add a Memory settings tab.
 - [ ] Add a pending review queue.
 - [ ] Add filters for global, workspace, and chat memories.

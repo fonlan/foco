@@ -54,7 +54,10 @@ use foco_store::{
         load_workspace_hook_config, save_global_config, save_workspace_hook_config,
         workspace_hook_config_path,
     },
-    memory::MemoryDatabase,
+    memory::{
+        MemoryDatabase, MemoryDatabaseError, MemoryFactRecord, MemoryKind, MemoryScope,
+        MemorySourceRecord, MemoryStatus, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
+    },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
         parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
@@ -65,6 +68,7 @@ use foco_store::{
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
         NewTerminalSession, NewToolCall, NewToolResult, TaskGraphFilter, TaskGraphRecord,
         TaskGraphTask, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
+        workspace_database_path,
     },
 };
 use foco_tools::{
@@ -168,6 +172,7 @@ impl TrayMenuUpdateNotifier {
 struct AppState {
     config: Arc<Mutex<GlobalConfig>>,
     config_file: PathBuf,
+    memory_database_file: PathBuf,
     model_metadata_file: PathBuf,
     user_profile_dir: PathBuf,
     terminal_registry: terminal::TerminalRegistry,
@@ -496,6 +501,7 @@ async fn run_server_until_shutdown(
     let state = AppState {
         config: Arc::new(Mutex::new(loaded_config.config)),
         config_file: loaded_config.paths.config_file,
+        memory_database_file: loaded_config.paths.memory_database_file,
         model_metadata_file: loaded_config.paths.root_dir.join("models.dev.json"),
         user_profile_dir: loaded_config.paths.user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
@@ -548,6 +554,13 @@ fn app_router(state: AppState) -> Router {
         .route("/api/native/select-files", post(select_files))
         .route("/api/settings", get(settings))
         .route("/api/settings/general", post(save_general_settings))
+        .route("/api/memory", get(memory_list))
+        .route("/api/memory/manual", post(create_manual_memory))
+        .route("/api/memory/status", post(update_memory_status))
+        .route("/api/memory/edit", post(edit_memory))
+        .route("/api/memory/forget", post(forget_memory))
+        .route("/api/memory/promote", post(promote_memory))
+        .route("/api/memory/sources", get(memory_sources))
         .route("/api/hooks", get(hooks_settings))
         .route("/api/hooks/global", post(save_global_hooks))
         .route("/api/hooks/workspace", post(save_workspace_hooks))
@@ -2043,6 +2056,324 @@ async fn save_model_order(
     save_config(&state, config.clone())?;
 
     settings_response(&state, &config).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryListQuery {
+    scope: String,
+    workspace_id: Option<String>,
+    chat_id: Option<String>,
+    query: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualMemoryRequest {
+    scope: String,
+    workspace_id: Option<String>,
+    chat_id: Option<String>,
+    kind: String,
+    fact: String,
+    confidence: Option<f64>,
+    pinned: Option<bool>,
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryStatusRequest {
+    scope: String,
+    workspace_id: Option<String>,
+    memory_id: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditMemoryRequest {
+    scope: String,
+    workspace_id: Option<String>,
+    memory_id: String,
+    fact: Option<String>,
+    kind: Option<String>,
+    confidence: Option<f64>,
+    pinned: Option<bool>,
+    metadata: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForgetMemoryRequest {
+    scope: String,
+    workspace_id: Option<String>,
+    memory_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PromoteMemoryRequest {
+    scope: String,
+    workspace_id: Option<String>,
+    memory_id: String,
+    target_scope: String,
+    target_workspace_id: Option<String>,
+    target_chat_id: Option<String>,
+    target_memory_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemorySourcesQuery {
+    scope: String,
+    workspace_id: Option<String>,
+    memory_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryListResponse {
+    memories: Vec<MemoryFactRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryMutationResponse {
+    memory: Option<MemoryFactRecord>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemorySourcesResponse {
+    sources: Vec<MemorySourceRecord>,
+}
+
+async fn memory_list(
+    State(state): State<AppState>,
+    Query(query): Query<MemoryListQuery>,
+) -> Result<Json<MemoryListResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let scope = MemoryScope::parse(query.scope.trim()).map_err(ApiError::from_memory_error)?;
+    let chat_id = normalized_optional_text(query.chat_id);
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let database = open_memory_database(&state, &config, scope, query.workspace_id.as_deref())?;
+    let query_text = normalized_optional_text(query.query);
+
+    if scope == MemoryScope::Chat && chat_id.is_none() {
+        return Err(ApiError::bad_request("chat memory listing requires chatId"));
+    }
+
+    let memories = if let Some(query_text) = query_text {
+        database
+            .search_active_facts_for_scope(&query_text, chat_id.as_deref(), limit)
+            .map_err(ApiError::from_memory_error)?
+    } else {
+        database
+            .list_active_facts_for_scope(chat_id.as_deref(), limit)
+            .map_err(ApiError::from_memory_error)?
+    };
+
+    Ok(Json(MemoryListResponse { memories }))
+}
+
+async fn create_manual_memory(
+    State(state): State<AppState>,
+    Json(request): Json<ManualMemoryRequest>,
+) -> Result<Json<MemoryMutationResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let scope = MemoryScope::parse(request.scope.trim()).map_err(ApiError::from_memory_error)?;
+    let kind = MemoryKind::parse(request.kind.trim()).map_err(ApiError::from_memory_error)?;
+    let chat_id = normalized_optional_text(request.chat_id);
+    let mut database =
+        open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
+    let fact = request.fact.trim().to_string();
+
+    if fact.is_empty() {
+        return Err(ApiError::bad_request("memory fact must not be empty"));
+    }
+
+    let metadata_json = memory_metadata_json(request.metadata)?;
+    let source_id = unique_id("memory-source");
+    let memory_id = unique_id("memory-fact");
+    database
+        .insert_source(NewMemorySource {
+            id: &source_id,
+            scope,
+            chat_id: chat_id.as_deref(),
+            source_type: foco_store::memory::MemorySourceType::ManualNote,
+            source_id: None,
+            title: "Manual memory",
+            content: &fact,
+            metadata_json: &metadata_json,
+        })
+        .map_err(ApiError::from_memory_error)?;
+    database
+        .insert_fact(NewMemoryFact {
+            id: &memory_id,
+            scope,
+            chat_id: chat_id.as_deref(),
+            status: MemoryStatus::Active,
+            kind,
+            fact: &fact,
+            confidence: request.confidence,
+            pinned: request.pinned.unwrap_or(false),
+            source_ids: &[source_id.as_str()],
+            metadata_json: &metadata_json,
+        })
+        .map_err(ApiError::from_memory_error)?;
+    let memory = database
+        .fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?;
+
+    Ok(Json(MemoryMutationResponse { memory }))
+}
+
+async fn update_memory_status(
+    State(state): State<AppState>,
+    Json(request): Json<MemoryStatusRequest>,
+) -> Result<Json<MemoryMutationResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let scope = MemoryScope::parse(request.scope.trim()).map_err(ApiError::from_memory_error)?;
+    let status = MemoryStatus::parse(request.status.trim()).map_err(ApiError::from_memory_error)?;
+    let memory_id = normalized_required_text("memoryId", &request.memory_id)?;
+    let mut database =
+        open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
+
+    database
+        .set_fact_status(&memory_id, status)
+        .map_err(ApiError::from_memory_error)?;
+    let memory = database
+        .fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?;
+
+    Ok(Json(MemoryMutationResponse { memory }))
+}
+
+async fn edit_memory(
+    State(state): State<AppState>,
+    Json(request): Json<EditMemoryRequest>,
+) -> Result<Json<MemoryMutationResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let scope = MemoryScope::parse(request.scope.trim()).map_err(ApiError::from_memory_error)?;
+    let memory_id = normalized_required_text("memoryId", &request.memory_id)?;
+    let fact = normalized_optional_text(request.fact);
+    let metadata_json = optional_memory_metadata_json(request.metadata)?;
+    let kind = request
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(MemoryKind::parse)
+        .transpose()
+        .map_err(ApiError::from_memory_error)?;
+    let mut database =
+        open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
+
+    database
+        .update_fact(UpdateMemoryFact {
+            id: &memory_id,
+            kind,
+            fact: fact.as_deref(),
+            confidence: request.confidence,
+            pinned: request.pinned,
+            metadata_json: metadata_json.as_deref(),
+            ..UpdateMemoryFact::default()
+        })
+        .map_err(ApiError::from_memory_error)?;
+    let memory = database
+        .fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?;
+
+    Ok(Json(MemoryMutationResponse { memory }))
+}
+
+async fn forget_memory(
+    State(state): State<AppState>,
+    Json(request): Json<ForgetMemoryRequest>,
+) -> Result<Json<MemoryMutationResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let scope = MemoryScope::parse(request.scope.trim()).map_err(ApiError::from_memory_error)?;
+    let memory_id = normalized_required_text("memoryId", &request.memory_id)?;
+    let mut database =
+        open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
+
+    database
+        .delete_fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?;
+
+    Ok(Json(MemoryMutationResponse { memory: None }))
+}
+
+async fn promote_memory(
+    State(state): State<AppState>,
+    Json(request): Json<PromoteMemoryRequest>,
+) -> Result<Json<MemoryMutationResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let source_scope =
+        MemoryScope::parse(request.scope.trim()).map_err(ApiError::from_memory_error)?;
+    let target_scope =
+        MemoryScope::parse(request.target_scope.trim()).map_err(ApiError::from_memory_error)?;
+    let memory_id = normalized_required_text("memoryId", &request.memory_id)?;
+    let target_memory_id = normalized_optional_text(request.target_memory_id)
+        .unwrap_or_else(|| unique_id("memory-fact"));
+    let target_chat_id = normalized_optional_text(request.target_chat_id);
+    let same_workspace = request.workspace_id == request.target_workspace_id;
+    let mut source_database = open_memory_database(
+        &state,
+        &config,
+        source_scope,
+        request.workspace_id.as_deref(),
+    )?;
+
+    let memory = if target_scope != MemoryScope::Global
+        && source_scope != MemoryScope::Global
+        && same_workspace
+    {
+        source_database
+            .promote_fact(
+                &memory_id,
+                &target_memory_id,
+                target_scope,
+                target_chat_id.as_deref(),
+            )
+            .map_err(ApiError::from_memory_error)?
+    } else {
+        let mut target_database = open_memory_database(
+            &state,
+            &config,
+            target_scope,
+            request.target_workspace_id.as_deref(),
+        )?;
+        source_database
+            .promote_fact_to_database(
+                &memory_id,
+                &mut target_database,
+                &target_memory_id,
+                target_scope,
+                target_chat_id.as_deref(),
+            )
+            .map_err(ApiError::from_memory_error)?
+    };
+
+    Ok(Json(MemoryMutationResponse {
+        memory: Some(memory),
+    }))
+}
+
+async fn memory_sources(
+    State(state): State<AppState>,
+    Query(query): Query<MemorySourcesQuery>,
+) -> Result<Json<MemorySourcesResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let scope = MemoryScope::parse(query.scope.trim()).map_err(ApiError::from_memory_error)?;
+    let memory_id = normalized_required_text("memoryId", &query.memory_id)?;
+    let database = open_memory_database(&state, &config, scope, query.workspace_id.as_deref())?;
+    let sources = database
+        .sources_for_fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?;
+
+    Ok(Json(MemorySourcesResponse { sources }))
 }
 
 async fn stream_chat_response(
@@ -7230,6 +7561,14 @@ impl ApiError {
         }
     }
 
+    fn from_memory_error(error: MemoryDatabaseError) -> Self {
+        match error {
+            MemoryDatabaseError::InvalidMemoryInput { .. }
+            | MemoryDatabaseError::InvalidMemoryJson { .. } => Self::bad_request(error.to_string()),
+            _ => Self::internal(error.to_string()),
+        }
+    }
+
     fn from_model_metadata_error(error: ModelMetadataError) -> Self {
         Self::internal(error.to_string())
     }
@@ -7908,6 +8247,59 @@ fn save_config(state: &AppState, config: GlobalConfig) -> Result<(), ApiError> {
     *stored_config = config;
 
     Ok(())
+}
+
+fn open_memory_database(
+    state: &AppState,
+    config: &GlobalConfig,
+    scope: MemoryScope,
+    workspace_id: Option<&str>,
+) -> Result<MemoryDatabase, ApiError> {
+    match scope {
+        MemoryScope::Global => {
+            MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+                .map_err(ApiError::from_memory_error)
+        }
+        MemoryScope::Workspace | MemoryScope::Chat => {
+            let workspace_id = workspace_id.ok_or_else(|| {
+                ApiError::bad_request(format!("{} memory requires workspaceId", scope.as_str()))
+            })?;
+            let workspace = workspace_by_id(config, workspace_id)?;
+            WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)?;
+
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
+                .map_err(ApiError::from_memory_error)
+        }
+    }
+}
+
+fn normalized_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalized_required_text(field: &str, value: &str) -> Result<String, ApiError> {
+    let value = value.trim();
+
+    if value.is_empty() {
+        return Err(ApiError::bad_request(format!("{field} must not be empty")));
+    }
+
+    Ok(value.to_string())
+}
+
+fn memory_metadata_json(metadata: Option<Value>) -> Result<String, ApiError> {
+    serde_json::to_string(&metadata.unwrap_or_else(|| json!({}))).map_err(|source| {
+        ApiError::bad_request(format!("memory metadata must be valid JSON: {source}"))
+    })
+}
+
+fn optional_memory_metadata_json(metadata: Option<Value>) -> Result<Option<String>, ApiError> {
+    metadata
+        .map(|value| memory_metadata_json(Some(value)))
+        .transpose()
 }
 
 async fn settings_response(

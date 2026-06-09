@@ -5,6 +5,7 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::Serialize;
 use serde_json::Value;
 
 pub const GLOBAL_MEMORY_DATABASE_FILE: &str = "memory.sqlite";
@@ -30,6 +31,17 @@ impl MemoryScope {
             Self::Chat => "chat",
         }
     }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        match value {
+            "global" => Ok(Self::Global),
+            "workspace" => Ok(Self::Workspace),
+            "chat" => Ok(Self::Chat),
+            _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("unknown memory scope: {value}"),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,6 +62,10 @@ impl MemoryStatus {
             Self::Expired => "expired",
             Self::Rejected => "rejected",
         }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        memory_status_from_str(value)
     }
 }
 
@@ -76,6 +92,10 @@ impl MemoryKind {
             Self::UserNote => "user_note",
         }
     }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        memory_kind_from_str(value)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +120,10 @@ impl MemorySourceType {
             Self::ManualNote => "manual_note",
             Self::ImportedDocument => "imported_document",
         }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        memory_source_type_from_str(value)
     }
 }
 
@@ -675,6 +699,52 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn list_active_facts_for_scope(
+        &self,
+        chat_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        if let Some(chat_id) = chat_id {
+            require_non_empty("chat_id", chat_id)?;
+        }
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let (filter_sql, chat_param) = match self.kind {
+            MemoryDatabaseKind::Global => ("scope = 'global'", None),
+            MemoryDatabaseKind::Workspace if chat_id.is_some() => (
+                "(scope = 'chat' AND chat_id = ?1) OR scope = 'workspace'",
+                chat_id,
+            ),
+            MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
+        };
+        let sql = format!(
+            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                    expires_at, metadata_json, created_at, updated_at
+             FROM memory_facts
+             WHERE ({filter_sql})
+               AND status = 'active'
+               AND is_latest = 1
+             ORDER BY
+               CASE WHEN scope = 'chat' THEN 0 WHEN scope = 'workspace' THEN 1 ELSE 2 END,
+               pinned DESC,
+               updated_at DESC
+             LIMIT ?2"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(params![chat_param, limit], memory_fact_from_row)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn promote_fact(
         &mut self,
         source_fact_id: &str,
@@ -875,7 +945,7 @@ pub struct NewMemoryProfile<'a> {
     pub metadata_json: &'a str,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MemorySourceRecord {
     pub id: String,
     pub scope: String,
@@ -889,7 +959,7 @@ pub struct MemorySourceRecord {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MemoryFactRecord {
     pub id: String,
     pub scope: String,
@@ -906,7 +976,7 @@ pub struct MemoryFactRecord {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MemoryProfileRecord {
     pub id: String,
     pub scope: String,
