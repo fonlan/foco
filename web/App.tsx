@@ -35,6 +35,7 @@ import {
   SlidersHorizontal,
   Terminal,
   Trash2,
+  Upload,
   User,
   Webhook,
   Wrench,
@@ -47,6 +48,7 @@ import "@xterm/xterm/css/xterm.css";
 import {
   Children,
   CSSProperties,
+  ChangeEvent as ReactChangeEvent,
   DragEvent as ReactDragEvent,
   FormEvent,
   ClipboardEvent as ReactClipboardEvent,
@@ -79,6 +81,7 @@ type WorkspaceSummary = {
   id: string;
   name: string;
   path: string;
+  logoUrl: string | null;
   pinned: boolean;
   terminalShell: string;
   chats: ChatSummary[];
@@ -219,6 +222,7 @@ type ConfiguredWorkspaceSummary = {
   id: string;
   name: string;
   path: string;
+  logoUrl: string | null;
   pinned: boolean;
   terminalShell: string;
   isDefault: boolean;
@@ -838,6 +842,12 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Workspace configuration": "工作区配置",
     "Close workspace configuration": "关闭工作区配置",
     "Edit workspace": "编辑工作区",
+    "Workspace icon": "工作区图标",
+    "Custom icon": "自定义图标",
+    "Folder icon": "文件夹图标",
+    "Clear workspace icon": "清除工作区图标",
+    "Workspace icon file": "工作区图标文件",
+    "Upload icon": "上传图标",
     "Workspace list": "工作区列表",
     "Terminal shell": "终端 Shell",
     "Pinned workspace": "置顶工作区",
@@ -1323,6 +1333,7 @@ type OpenChatTab = {
 
 type ChatTabSummary = OpenChatTab & {
   title: string;
+  workspaceLogoUrl: string | null;
   workspaceName: string;
 };
 
@@ -3025,7 +3036,11 @@ export function App() {
                         }
                         type="button"
                       >
-                        <Folder aria-hidden="true" className="size-4 shrink-0" />
+                        <WorkspaceIcon
+                          className="size-4 shrink-0 rounded object-cover"
+                          fallbackClassName="size-4 shrink-0"
+                          logoUrl={workspace.logoUrl}
+                        />
                         <span className="min-w-0 flex-1 truncate text-left">
                           {workspace.name}
                         </span>
@@ -4042,8 +4057,13 @@ function ChatTabBar({
                   <span className="block truncate text-sm font-semibold leading-5">
                     {title}
                   </span>
-                  <span className="block truncate text-[11px] font-medium leading-4 text-stone-400">
-                    {tab.workspaceName}
+                  <span className="flex min-w-0 items-center gap-1 text-[11px] font-medium leading-4 text-stone-400">
+                    <WorkspaceIcon
+                      className="size-3 shrink-0 rounded-sm object-cover"
+                      fallbackClassName="size-3 shrink-0"
+                      logoUrl={tab.workspaceLogoUrl}
+                    />
+                    <span className="min-w-0 truncate">{tab.workspaceName}</span>
                   </span>
                 </button>
                 <span className="ml-1 inline-flex size-7 shrink-0 items-center justify-center">
@@ -6913,6 +6933,7 @@ function SettingsPanel({
   const [isSavingLanguage, setIsSavingLanguage] = useState(false);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [isSavingWorkspaceOrder, setIsSavingWorkspaceOrder] = useState(false);
+  const [isSavingWorkspaceLogo, setIsSavingWorkspaceLogo] = useState(false);
   const [isSelectingWorkspaceFormPath, setIsSelectingWorkspaceFormPath] =
     useState(false);
   const [isSavingProvider, setIsSavingProvider] = useState(false);
@@ -6930,6 +6951,7 @@ function SettingsPanel({
   const [workspaceOrderPreview, setWorkspaceOrderPreview] = useState<
     string[] | null
   >(null);
+  const workspaceLogoInputRef = useRef<HTMLInputElement | null>(null);
   const [providerTests, setProviderTests] = useState<
     Record<string, ProviderTestState>
   >({});
@@ -7645,6 +7667,77 @@ function SettingsPanel({
     } finally {
       setIsSelectingWorkspaceFormPath(false);
     }
+  }
+
+  async function saveWorkspaceLogo(contentBase64: string) {
+    if (!editingWorkspace) {
+      return;
+    }
+
+    setIsSavingWorkspaceLogo(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>(
+        `/api/workspaces/${encodeURIComponent(editingWorkspace.id)}/logo`,
+        {
+          body: JSON.stringify({ contentBase64 }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setSettings(data);
+      onSettingsChange(data);
+      await onWorkspacesChange();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingWorkspaceLogo(false);
+    }
+  }
+
+  async function clearWorkspaceLogo() {
+    if (!editingWorkspace?.logoUrl) {
+      return;
+    }
+
+    setIsSavingWorkspaceLogo(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>(
+        `/api/workspaces/${encodeURIComponent(editingWorkspace.id)}/logo`,
+        { method: "DELETE" },
+      );
+      setSettings(data);
+      onSettingsChange(data);
+      await onWorkspacesChange();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingWorkspaceLogo(false);
+    }
+  }
+
+  async function uploadWorkspaceLogoFile(file: File) {
+    try {
+      const contentBase64 = await fileToBase64(file);
+      await saveWorkspaceLogo(contentBase64);
+    } catch (readError) {
+      setError(errorMessage(readError));
+    }
+  }
+
+  function handleWorkspaceLogoFileChange(
+    event: ReactChangeEvent<HTMLInputElement>,
+  ) {
+    const file = event.target.files?.[0] ?? null;
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+
+    void uploadWorkspaceLogoFile(file);
   }
 
   function handleWorkspaceDragStart(
@@ -8688,6 +8781,63 @@ function SettingsPanel({
                       </button>
                     </div>
                   </label>
+                  <div className="rounded-lg border border-stone-200 bg-stone-50/80 p-3">
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <WorkspaceIcon
+                          className="size-10 rounded-lg border border-stone-200 bg-white object-cover p-1"
+                          fallbackClassName="size-10 rounded-lg border border-stone-200 bg-white p-2 text-teal-700"
+                          logoUrl={editingWorkspace?.logoUrl ?? null}
+                        />
+                        <div className="min-w-0">
+                          <span className="block text-sm font-semibold text-stone-800">
+                            {t("Workspace icon")}
+                          </span>
+                          <span className="block truncate text-xs text-stone-500">
+                            {editingWorkspace?.logoUrl
+                              ? t("Custom icon")
+                              : t("Folder icon")}
+                          </span>
+                        </div>
+                      </div>
+                      <button
+                        aria-label={t("Clear workspace icon")}
+                        className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:text-stone-300"
+                        disabled={isSavingWorkspaceLogo || !editingWorkspace?.logoUrl}
+                        onClick={() => void clearWorkspaceLogo()}
+                        title={t("Clear workspace icon")}
+                        type="button"
+                      >
+                        {isSavingWorkspaceLogo ? (
+                          <LoaderCircle
+                            aria-hidden="true"
+                            className="size-4 animate-spin"
+                          />
+                        ) : (
+                          <Trash2 aria-hidden="true" className="size-4" />
+                        )}
+                      </button>
+                    </div>
+                    <input
+                      aria-label={t("Workspace icon file")}
+                      accept="image/png,image/jpeg,image/webp,image/gif"
+                      className="sr-only"
+                      onChange={handleWorkspaceLogoFileChange}
+                      ref={workspaceLogoInputRef}
+                      type="file"
+                    />
+                    <button
+                      aria-label={t("Upload icon")}
+                      className="mt-2 inline-flex h-9 items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                      disabled={isSavingWorkspaceLogo}
+                      onClick={() => workspaceLogoInputRef.current?.click()}
+                      title={t("Upload icon")}
+                      type="button"
+                    >
+                      <Upload aria-hidden="true" className="size-3.5" />
+                      {t("Upload icon")}
+                    </button>
+                  </div>
                   <label className="block">
                     <span className="mb-1.5 block text-xs font-semibold text-stone-600">
                       {t("Terminal shell")}
@@ -11102,6 +11252,33 @@ function FocoLogoMark() {
   );
 }
 
+function WorkspaceIcon({
+  className = "size-4 shrink-0 rounded object-cover",
+  fallbackClassName = "size-4 shrink-0",
+  logoUrl,
+}: {
+  className?: string;
+  fallbackClassName?: string;
+  logoUrl: string | null | undefined;
+}) {
+  const [failedLogoUrl, setFailedLogoUrl] = useState<string | null>(null);
+  const shouldShowLogo = Boolean(logoUrl && failedLogoUrl !== logoUrl);
+
+  if (shouldShowLogo && logoUrl) {
+    return (
+      <img
+        alt=""
+        aria-hidden="true"
+        className={className}
+        onError={() => setFailedLogoUrl(logoUrl)}
+        src={logoUrl}
+      />
+    );
+  }
+
+  return <Folder aria-hidden="true" className={fallbackClassName} />;
+}
+
 function workspaceItemClass(active: boolean) {
   return `flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-sm font-semibold ${
     active ? "text-teal-950" : "text-stone-700"
@@ -11141,6 +11318,7 @@ function hydrateChatTab(
   return {
     ...tab,
     title: chat?.title ?? tab.fallbackTitle,
+    workspaceLogoUrl: workspace?.logoUrl ?? null,
     workspaceName: workspace?.name ?? tab.fallbackWorkspaceName,
   };
 }
@@ -12022,6 +12200,10 @@ function messageWithSelectedSkills(
     .map((skill) => `[$${skill.name}](${skill.path})`);
 
   return links.length ? `${links.join(" ")} ${message}` : message;
+}
+
+async function fileToBase64(file: File): Promise<string> {
+  return arrayBufferToBase64(await file.arrayBuffer());
 }
 
 async function fileToComposerAttachment(file: File): Promise<ComposerAttachment> {

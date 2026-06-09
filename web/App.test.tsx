@@ -33,6 +33,7 @@ const workspace = {
     },
   ],
   id: "workspace-1",
+  logoUrl: "/api/workspaces/workspace-1/logo?v=1",
   name: "Default",
   path: "C:\\Users\\fonla\\.foco\\workspace",
   pinned: false,
@@ -49,6 +50,7 @@ const secondaryWorkspace = {
     },
   ],
   id: "workspace-2",
+  logoUrl: null,
   name: "Side project",
   path: "C:\\Users\\fonla\\Documents\\Repos\\SideProject",
   pinned: false,
@@ -174,6 +176,7 @@ const settings = {
       isDefault: true,
       name: workspace.name,
       path: workspace.path,
+      logoUrl: workspace.logoUrl,
       pinned: workspace.pinned,
       terminalShell: workspace.terminalShell,
     },
@@ -996,6 +999,45 @@ describe("App verification surfaces", () => {
     expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
   });
 
+  it("uploads and clears a workspace icon in workspace settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getAllByRole("button", { name: "Workspaces" })[1]);
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit workspace Default" }),
+    );
+
+    const iconInput = await screen.findByLabelText("Workspace icon file");
+    await userEvent.upload(
+      iconInput,
+      new File([new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])], "logo.png", {
+        type: "image/png",
+      }),
+    );
+
+    await waitFor(() => {
+      const uploadCall = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          url === "/api/workspaces/workspace-1/logo" && init?.method === "POST",
+      );
+      expect(uploadCall).toBeDefined();
+      expect(JSON.parse(String(uploadCall?.[1]?.body))).toEqual({
+        contentBase64: expect.any(String),
+      });
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Clear workspace icon" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-1/logo",
+        expect.objectContaining({ method: "DELETE" }),
+      );
+    });
+  });
+
   it("shows settings sections for providers, models, MCP servers, and skills", async () => {
     render(<App />);
 
@@ -1353,7 +1395,7 @@ describe("App verification surfaces", () => {
   });
 });
 
-async function mockFetch(input: RequestInfo | URL): Promise<Response> {
+async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const url = typeof input === "string" ? input : input.toString();
   const path = url.startsWith("http://127.0.0.1") ? new URL(url).pathname : url.split("?")[0];
 
@@ -1403,6 +1445,7 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
         {
           chats: [],
           id: "new-workspace",
+          logoUrl: null,
           name: "New Workspace",
           path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
           pinned: false,
@@ -1440,6 +1483,21 @@ async function mockFetch(input: RequestInfo | URL): Promise<Response> {
 
   if (path === "/api/workspaces/manual" || path === "/api/workspaces/order") {
     return jsonResponse(savedSettings.workspace);
+  }
+
+  if (path === "/api/workspaces/workspace-1/logo") {
+    return jsonResponse({
+      ...settings,
+      workspaces: [
+        {
+          ...settings.workspaces[0],
+          logoUrl:
+            init?.method === "DELETE"
+              ? null
+              : "/api/workspaces/workspace-1/logo?v=2",
+        },
+      ],
+    });
   }
 
   if (path === "/api/model-metadata") {

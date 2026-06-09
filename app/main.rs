@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use axum::{
@@ -108,6 +108,9 @@ const MAX_CHAT_ATTACHMENTS: usize = 6;
 const MAX_CHAT_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES: u64 = 24 * 1024 * 1024;
 const CHAT_ATTACHMENT_BODY_LIMIT_BYTES: usize = 40 * 1024 * 1024;
+const MAX_WORKSPACE_LOGO_BYTES: u64 = 2 * 1024 * 1024;
+const WORKSPACE_LOGO_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+const WORKSPACE_LOGO_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
 const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
     "Enabled skill front matter loaded from configured skills";
@@ -525,6 +528,13 @@ fn app_router(state: AppState) -> Router {
         .route("/api/workspaces/add", post(add_workspace))
         .route("/api/workspaces/manual", post(save_workspace_settings))
         .route("/api/workspaces/order", post(save_workspace_order))
+        .route(
+            "/api/workspaces/{workspace_id}/logo",
+            get(workspace_logo)
+                .post(save_workspace_logo)
+                .delete(clear_workspace_logo)
+                .layer(DefaultBodyLimit::max(WORKSPACE_LOGO_BODY_LIMIT_BYTES)),
+        )
         .route("/api/native/select-directory", post(select_directory))
         .route("/api/native/select-files", post(select_files))
         .route("/api/settings", get(settings))
@@ -1091,6 +1101,62 @@ async fn save_workspace_order(
     reorder_workspaces(&mut config.workspaces, request.workspace_ids)?;
     group_pinned_workspaces(&mut config.workspaces);
     save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
+async fn workspace_logo(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let Some(logo) = workspace_logo_file(&workspace.path)? else {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("workspace logo was not found"))
+            .expect("workspace logo response is valid"));
+    };
+    let (bytes, _) = read_workspace_logo_file(&logo.path)?;
+    let kind = workspace_logo_kind(&bytes)?;
+    if kind != logo.kind {
+        return Err(ApiError::bad_request(format!(
+            "workspace logo changed while it was being read: {}",
+            logo.path.display()
+        )));
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, kind.content_type)
+        .header(header::CACHE_CONTROL, "private, max-age=60")
+        .body(Body::from(bytes))
+        .expect("workspace logo response is valid"))
+}
+
+async fn save_workspace_logo(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<WorkspaceLogoRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let bytes = workspace_logo_request_bytes(&request)?;
+    let kind = workspace_logo_kind(&bytes)?;
+
+    save_workspace_logo_file(&workspace.path, &bytes, kind)?;
+
+    settings_response(&state, &config).await
+}
+
+async fn clear_workspace_logo(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+
+    clear_workspace_logo_file(&workspace.path)?;
 
     settings_response(&state, &config).await
 }
@@ -2397,6 +2463,12 @@ struct ManualWorkspaceRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WorkspaceLogoRequest {
+    content_base64: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceOrderRequest {
     workspace_ids: Vec<String>,
 }
@@ -2421,6 +2493,19 @@ struct NativeSelectedFile {
     content_type: String,
     size_bytes: u64,
     content_base64: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WorkspaceLogoKind {
+    extension: &'static str,
+    content_type: &'static str,
+}
+
+#[derive(Debug)]
+struct WorkspaceLogoFile {
+    path: PathBuf,
+    kind: WorkspaceLogoKind,
+    version: String,
 }
 
 #[derive(Deserialize)]
@@ -2749,6 +2834,7 @@ struct ConfiguredWorkspaceSummary {
     id: String,
     name: String,
     path: String,
+    logo_url: Option<String>,
     pinned: bool,
     terminal_shell: String,
     is_default: bool,
@@ -2978,6 +3064,7 @@ struct WorkspaceSummary {
     id: String,
     name: String,
     path: String,
+    logo_url: Option<String>,
     pinned: bool,
     terminal_shell: String,
     chats: Vec<ChatSummary>,
@@ -7515,6 +7602,238 @@ fn native_selected_files_from_paths(
     Ok(files)
 }
 
+fn workspace_logo_request_bytes(request: &WorkspaceLogoRequest) -> Result<Vec<u8>, ApiError> {
+    let content_base64 = request
+        .content_base64
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let Some(content_base64) = content_base64 else {
+        return Err(ApiError::bad_request(
+            "workspace logo request must include contentBase64",
+        ));
+    };
+
+    if content_base64.starts_with("data:") {
+        return Err(ApiError::bad_request(
+            "workspace logo contentBase64 must be raw base64, not a data URL",
+        ));
+    }
+
+    let bytes = general_purpose::STANDARD
+        .decode(content_base64)
+        .map_err(|source| {
+            ApiError::bad_request(format!(
+                "workspace logo contentBase64 is invalid base64: {source}"
+            ))
+        })?;
+    validate_workspace_logo_size(bytes.len() as u64)?;
+    Ok(bytes)
+}
+
+fn workspace_logo_url(workspace: &WorkspaceConfig) -> Result<Option<String>, ApiError> {
+    Ok(workspace_logo_file(&workspace.path)?
+        .map(|logo| format!("/api/workspaces/{}/logo?v={}", workspace.id, logo.version)))
+}
+
+fn workspace_logo_file(workspace_path: &Path) -> Result<Option<WorkspaceLogoFile>, ApiError> {
+    let logo_dir = workspace_path.join(".foco");
+    if !logo_dir.exists() {
+        return Ok(None);
+    }
+    if !logo_dir.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "workspace logo directory is not a directory: {}",
+            logo_dir.display()
+        )));
+    }
+
+    for extension in WORKSPACE_LOGO_EXTENSIONS {
+        let path = logo_dir.join(format!("logo.{extension}"));
+        if !path.exists() {
+            continue;
+        }
+
+        let (bytes, metadata) = read_workspace_logo_file(&path)?;
+        let kind = workspace_logo_kind(&bytes)?;
+        if !workspace_logo_extension_matches(extension, kind) {
+            return Err(ApiError::bad_request(format!(
+                "workspace logo extension .{} does not match detected {}: {}",
+                extension,
+                kind.content_type,
+                path.display()
+            )));
+        }
+
+        return Ok(Some(WorkspaceLogoFile {
+            path,
+            kind,
+            version: workspace_logo_version(&metadata),
+        }));
+    }
+
+    Ok(None)
+}
+
+fn save_workspace_logo_file(
+    workspace_path: &Path,
+    bytes: &[u8],
+    kind: WorkspaceLogoKind,
+) -> Result<(), ApiError> {
+    validate_workspace_logo_size(bytes.len() as u64)?;
+
+    let logo_dir = workspace_path.join(".foco");
+    fs::create_dir_all(&logo_dir).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to create workspace logo directory {}: {}",
+            logo_dir.display(),
+            source
+        ))
+    })?;
+
+    remove_workspace_logo_files(&logo_dir)?;
+
+    let target = logo_dir.join(format!("logo.{}", kind.extension));
+    fs::write(&target, bytes).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to write workspace logo {}: {}",
+            target.display(),
+            source
+        ))
+    })
+}
+
+fn clear_workspace_logo_file(workspace_path: &Path) -> Result<(), ApiError> {
+    let logo_dir = workspace_path.join(".foco");
+    if !logo_dir.exists() {
+        return Ok(());
+    }
+    if !logo_dir.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "workspace logo directory is not a directory: {}",
+            logo_dir.display()
+        )));
+    }
+
+    remove_workspace_logo_files(&logo_dir)
+}
+
+fn remove_workspace_logo_files(logo_dir: &Path) -> Result<(), ApiError> {
+    for extension in WORKSPACE_LOGO_EXTENSIONS {
+        let path = logo_dir.join(format!("logo.{extension}"));
+        if !path.exists() {
+            continue;
+        }
+        if !path.is_file() {
+            return Err(ApiError::bad_request(format!(
+                "workspace logo path must be a file: {}",
+                path.display()
+            )));
+        }
+        fs::remove_file(&path).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to remove old workspace logo {}: {}",
+                path.display(),
+                source
+            ))
+        })?;
+    }
+
+    Ok(())
+}
+
+fn read_workspace_logo_file(path: &Path) -> Result<(Vec<u8>, fs::Metadata), ApiError> {
+    let metadata = fs::metadata(path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "workspace logo file is not readable: {}: {}",
+            path.display(),
+            source
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "workspace logo path must be a file: {}",
+            path.display()
+        )));
+    }
+    validate_workspace_logo_size(metadata.len())?;
+
+    let bytes = fs::read(path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read workspace logo {}: {}",
+            path.display(),
+            source
+        ))
+    })?;
+    Ok((bytes, metadata))
+}
+
+fn validate_workspace_logo_size(size_bytes: u64) -> Result<(), ApiError> {
+    if size_bytes == 0 {
+        return Err(ApiError::bad_request(
+            "workspace logo file must not be empty",
+        ));
+    }
+    if size_bytes > MAX_WORKSPACE_LOGO_BYTES {
+        return Err(ApiError::bad_request(format!(
+            "workspace logo exceeds the {} byte limit",
+            MAX_WORKSPACE_LOGO_BYTES
+        )));
+    }
+
+    Ok(())
+}
+
+fn workspace_logo_kind(bytes: &[u8]) -> Result<WorkspaceLogoKind, ApiError> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
+        return Ok(WorkspaceLogoKind {
+            extension: "png",
+            content_type: "image/png",
+        });
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Ok(WorkspaceLogoKind {
+            extension: "jpg",
+            content_type: "image/jpeg",
+        });
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Ok(WorkspaceLogoKind {
+            extension: "gif",
+            content_type: "image/gif",
+        });
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Ok(WorkspaceLogoKind {
+            extension: "webp",
+            content_type: "image/webp",
+        });
+    }
+
+    Err(ApiError::bad_request(
+        "workspace logo must be a PNG, JPEG, WebP, or GIF image",
+    ))
+}
+
+fn workspace_logo_extension_matches(extension: &str, kind: WorkspaceLogoKind) -> bool {
+    match kind.extension {
+        "jpg" => extension == "jpg" || extension == "jpeg",
+        detected => extension == detected,
+    }
+}
+
+fn workspace_logo_version(metadata: &fs::Metadata) -> String {
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+
+    format!("{modified_ms}-{}", metadata.len())
+}
+
 fn attachment_content_type_for_path(path: &Path) -> String {
     let extension = path
         .extension()
@@ -7610,7 +7929,7 @@ async fn settings_response(
             .workspaces
             .iter()
             .map(configured_workspace_summary)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
         terminal_shells: terminal_shell_summaries(),
         provider_kinds: vec![
             ProviderKindSummary {
@@ -7876,15 +8195,18 @@ fn default_hook_provider(
     )
 }
 
-fn configured_workspace_summary(workspace: &WorkspaceConfig) -> ConfiguredWorkspaceSummary {
-    ConfiguredWorkspaceSummary {
+fn configured_workspace_summary(
+    workspace: &WorkspaceConfig,
+) -> Result<ConfiguredWorkspaceSummary, ApiError> {
+    Ok(ConfiguredWorkspaceSummary {
         id: workspace.id.clone(),
         name: workspace.name.clone(),
         path: display_path(&workspace.path),
+        logo_url: workspace_logo_url(workspace)?,
         pinned: workspace.pinned,
         terminal_shell: workspace.terminal_shell.clone(),
         is_default: workspace.id == foco_store::config::DEFAULT_WORKSPACE_ID,
-    }
+    })
 }
 
 fn terminal_shell_summaries() -> Vec<TerminalShellSummary> {
@@ -8700,6 +9022,7 @@ fn workspace_response_from_config(
             id: workspace.id.clone(),
             name: workspace.name.clone(),
             path: display_path(&workspace.path),
+            logo_url: workspace_logo_url(workspace)?,
             pinned: workspace.pinned,
             terminal_shell: workspace.terminal_shell.clone(),
             chats,
@@ -11105,6 +11428,99 @@ description: Project memory.
         }
 
         drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn workspace_logo_file_detects_manual_logo_png() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-test"));
+        let logo_dir = workspace_dir.join(".foco");
+        fs::create_dir_all(&logo_dir).expect("logo directory");
+        fs::write(logo_dir.join("logo.png"), b"\x89PNG\r\n\x1A\nlogo").expect("write manual logo");
+
+        let logo = workspace_logo_file(&workspace_dir)
+            .expect("logo lookup")
+            .expect("manual logo");
+        assert_eq!(logo.kind.content_type, "image/png");
+        assert_eq!(
+            logo.path.file_name().and_then(|name| name.to_str()),
+            Some("logo.png")
+        );
+
+        let mut workspace = test_workspace_config("workspace-1");
+        workspace.path = workspace_dir.clone();
+        let logo_url = workspace_logo_url(&workspace)
+            .expect("logo url lookup")
+            .expect("logo url");
+        assert!(logo_url.starts_with("/api/workspaces/workspace-1/logo?v="));
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn save_workspace_logo_file_uses_detected_extension_and_removes_old_logo() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-save-test"));
+        let logo_dir = workspace_dir.join(".foco");
+        fs::create_dir_all(&logo_dir).expect("logo directory");
+        fs::write(logo_dir.join("logo.png"), b"\x89PNG\r\n\x1A\nold").expect("write old logo");
+        let jpeg = &[0xFF, 0xD8, 0xFF, 0xE0, b'l', b'o', b'g', b'o'];
+        let kind = workspace_logo_kind(jpeg).expect("jpeg kind");
+
+        save_workspace_logo_file(&workspace_dir, jpeg, kind).expect("save logo");
+
+        assert!(!logo_dir.join("logo.png").exists());
+        assert!(logo_dir.join("logo.jpg").exists());
+        let logo = workspace_logo_file(&workspace_dir)
+            .expect("logo lookup")
+            .expect("saved logo");
+        assert_eq!(logo.kind.content_type, "image/jpeg");
+        assert_eq!(
+            logo.path.file_name().and_then(|name| name.to_str()),
+            Some("logo.jpg")
+        );
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn clear_workspace_logo_file_removes_logo_candidates() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-clear-test"));
+        let logo_dir = workspace_dir.join(".foco");
+        fs::create_dir_all(&logo_dir).expect("logo directory");
+        fs::write(logo_dir.join("logo.png"), b"\x89PNG\r\n\x1A\nold").expect("write png logo");
+        fs::write(
+            logo_dir.join("logo.jpg"),
+            [0xFF, 0xD8, 0xFF, 0xE0, b'l', b'o', b'g', b'o'],
+        )
+        .expect("write jpeg logo");
+
+        clear_workspace_logo_file(&workspace_dir).expect("clear logo");
+
+        assert!(!logo_dir.join("logo.png").exists());
+        assert!(!logo_dir.join("logo.jpg").exists());
+        assert!(
+            workspace_logo_file(&workspace_dir)
+                .expect("logo lookup")
+                .is_none()
+        );
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn workspace_logo_file_rejects_extension_type_mismatch() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-mismatch-test"));
+        let logo_dir = workspace_dir.join(".foco");
+        fs::create_dir_all(&logo_dir).expect("logo directory");
+        fs::write(
+            logo_dir.join("logo.png"),
+            [0xFF, 0xD8, 0xFF, 0xE0, b'l', b'o', b'g', b'o'],
+        )
+        .expect("write mismatched logo");
+
+        let error = workspace_logo_file(&workspace_dir).expect_err("mismatch should fail");
+        assert!(error.message.contains("does not match"));
+
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }
 
