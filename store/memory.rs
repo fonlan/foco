@@ -144,6 +144,37 @@ impl MemoryRelationKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryExtractionJobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl MemoryExtractionJobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("unknown memory extraction job status: {value}"),
+            }),
+        }
+    }
+}
+
 pub struct MemoryDatabase {
     database_path: PathBuf,
     connection: Connection,
@@ -599,6 +630,86 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn insert_extraction_job(
+        &mut self,
+        job: NewMemoryExtractionJob<'_>,
+    ) -> Result<(), MemoryDatabaseError> {
+        self.validate_scope(job.scope)?;
+        validate_extraction_job(&job)?;
+        let now = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO memory_extraction_jobs
+                    (id, scope, chat_id, status, model_id, input_json, output_json, error_message, created_at, started_at, completed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, NULL)",
+                params![
+                    job.id,
+                    job.scope.as_str(),
+                    job.chat_id,
+                    job.status.as_str(),
+                    job.model_id,
+                    job.input_json,
+                    job.output_json,
+                    job.error_message,
+                    now,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(())
+    }
+
+    pub fn extraction_jobs_for_scope(
+        &self,
+        chat_id: Option<&str>,
+        status: Option<MemoryExtractionJobStatus>,
+        limit: u32,
+    ) -> Result<Vec<MemoryExtractionJobRecord>, MemoryDatabaseError> {
+        if let Some(chat_id) = chat_id {
+            require_non_empty("chat_id", chat_id)?;
+        }
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let (filter_sql, chat_param) = match self.kind {
+            MemoryDatabaseKind::Global => ("scope = 'global'", None),
+            MemoryDatabaseKind::Workspace if chat_id.is_some() => (
+                "(scope = 'chat' AND chat_id = ?1) OR scope = 'workspace'",
+                chat_id,
+            ),
+            MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
+        };
+        let sql = format!(
+            "SELECT id, scope, chat_id, status, model_id, input_json, output_json,
+                    error_message, created_at, started_at, completed_at
+             FROM memory_extraction_jobs
+             WHERE ({filter_sql})
+               AND (?2 IS NULL OR status = ?2)
+             ORDER BY created_at DESC, id ASC
+             LIMIT ?3"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    chat_param,
+                    status.map(MemoryExtractionJobStatus::as_str),
+                    limit
+                ],
+                memory_extraction_job_from_row,
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn fact(&self, id: &str) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("id", id)?;
         self.connection
@@ -999,6 +1110,18 @@ pub struct NewMemoryProfile<'a> {
     pub metadata_json: &'a str,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewMemoryExtractionJob<'a> {
+    pub id: &'a str,
+    pub scope: MemoryScope,
+    pub chat_id: Option<&'a str>,
+    pub status: MemoryExtractionJobStatus,
+    pub model_id: Option<&'a str>,
+    pub input_json: &'a str,
+    pub output_json: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MemorySourceRecord {
     pub id: String,
@@ -1039,6 +1162,21 @@ pub struct MemoryProfileRecord {
     pub metadata_json: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MemoryExtractionJobRecord {
+    pub id: String,
+    pub scope: String,
+    pub chat_id: Option<String>,
+    pub status: String,
+    pub model_id: Option<String>,
+    pub input_json: String,
+    pub output_json: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1380,6 +1518,30 @@ fn validate_profile(profile: &NewMemoryProfile<'_>) -> Result<(), MemoryDatabase
     validate_json("metadata_json", profile.metadata_json)
 }
 
+fn validate_extraction_job(job: &NewMemoryExtractionJob<'_>) -> Result<(), MemoryDatabaseError> {
+    require_non_empty("id", job.id)?;
+    validate_scope_chat_id(job.scope, job.chat_id)?;
+    validate_json("input_json", job.input_json)?;
+    if let Some(model_id) = job.model_id {
+        require_non_empty("model_id", model_id)?;
+    }
+    if let Some(output_json) = job.output_json {
+        validate_json("output_json", output_json)?;
+    }
+    if let Some(error_message) = job.error_message {
+        require_non_empty("error_message", error_message)?;
+    }
+    if job.status == MemoryExtractionJobStatus::Queued
+        && (job.output_json.is_some() || job.error_message.is_some())
+    {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "queued memory extraction job must not include output or error".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 fn validate_scope_chat_id(
     scope: MemoryScope,
     chat_id: Option<&str>,
@@ -1456,6 +1618,24 @@ fn memory_profile_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryPr
         metadata_json: row.get(4)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
+    })
+}
+
+fn memory_extraction_job_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MemoryExtractionJobRecord> {
+    Ok(MemoryExtractionJobRecord {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        chat_id: row.get(2)?,
+        status: row.get(3)?,
+        model_id: row.get(4)?,
+        input_json: row.get(5)?,
+        output_json: row.get(6)?,
+        error_message: row.get(7)?,
+        created_at: row.get(8)?,
+        started_at: row.get(9)?,
+        completed_at: row.get(10)?,
     })
 }
 
@@ -1987,6 +2167,43 @@ mod tests {
             .expect_err("missing source should fail");
 
         assert!(error.to_string().contains("at least one source"));
+    }
+
+    #[test]
+    fn workspace_extraction_jobs_round_trip_queued_status() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Extraction chat")
+                .expect("chat insert");
+        }
+
+        let mut memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        memory
+            .insert_extraction_job(NewMemoryExtractionJob {
+                id: "job-1",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                status: MemoryExtractionJobStatus::Queued,
+                model_id: Some("model-1"),
+                input_json: r#"{"trigger":"chat_completed"}"#,
+                output_json: None,
+                error_message: None,
+            })
+            .expect("job insert");
+
+        let jobs = memory
+            .extraction_jobs_for_scope(Some("chat-1"), Some(MemoryExtractionJobStatus::Queued), 10)
+            .expect("queued jobs");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "job-1");
+        assert_eq!(jobs[0].status, "queued");
+        assert_eq!(jobs[0].model_id.as_deref(), Some("model-1"));
     }
 
     #[test]

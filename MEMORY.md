@@ -133,8 +133,8 @@ memory graph in Foco. It is not the runtime memory store.
 
 ## Phase 5 - Extraction Jobs
 
-- [ ] Queue memory extraction after a chat run completes.
-- [ ] Do not run extraction during SSE streaming.
+- [x] Queue memory extraction after a chat run completes.
+- [x] Do not run extraction during SSE streaming.
 - [ ] Use the existing provider-neutral provider path for extraction.
 - [ ] Build a strict JSON extraction schema.
 - [ ] Require extracted facts to include scope suggestion, kind, fact text,

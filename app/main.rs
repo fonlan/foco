@@ -55,8 +55,9 @@ use foco_store::{
         workspace_hook_config_path,
     },
     memory::{
-        MemoryDatabase, MemoryDatabaseError, MemoryFactRecord, MemoryKind, MemoryScope,
-        MemorySourceRecord, MemoryStatus, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
+        MemoryDatabase, MemoryDatabaseError, MemoryExtractionJobStatus, MemoryFactRecord,
+        MemoryKind, MemoryScope, MemorySourceRecord, MemoryStatus, NewMemoryExtractionJob,
+        NewMemoryFact, NewMemorySource, UpdateMemoryFact,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
@@ -3750,6 +3751,7 @@ struct PreparedChatContext {
     question_registry: QuestionRegistry,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
+    memory_settings: MemorySettings,
     request_body_json: String,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
@@ -5039,6 +5041,7 @@ async fn prepare_chat_context(
         question_registry: state.question_registry.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget: prompt_context.context_budget,
+        memory_settings: config.memory.clone(),
         request_body_json,
         compression_snapshots: prompt_context.compression_snapshots,
         message_source_sequences: prompt_context.message_source_sequences,
@@ -6182,7 +6185,57 @@ fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
+    queue_memory_extraction_job(context, outcome.final_state)?;
+
     Ok(())
+}
+
+fn queue_memory_extraction_job(
+    context: &PreparedChatContext,
+    final_state: &str,
+) -> Result<(), ApiError> {
+    if final_state != "succeeded"
+        || !context.memory_settings.enabled
+        || context.memory_settings.extraction_mode != "pending_review"
+    {
+        return Ok(());
+    }
+
+    let model_id = context
+        .memory_settings
+        .extraction_model_id
+        .as_deref()
+        .unwrap_or(&context.model_id);
+    let input_json = json!({
+        "trigger": "chat_completed",
+        "targetStatus": "pending",
+        "workspaceId": context.workspace_id,
+        "chatId": context.chat_id,
+        "runId": context.llm_request_id,
+        "userMessageId": context.user_message_id,
+        "assistantMessageId": context.assistant_message_id,
+        "chatModelId": context.model_id,
+        "extractionModelId": model_id,
+        "providerId": context.provider_id,
+    })
+    .to_string();
+    let mut memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&context.workspace_path))
+            .map_err(ApiError::from_memory_error)?;
+    let job_id = unique_id("memory-extraction");
+
+    memory_database
+        .insert_extraction_job(NewMemoryExtractionJob {
+            id: &job_id,
+            scope: MemoryScope::Chat,
+            chat_id: Some(&context.chat_id),
+            status: MemoryExtractionJobStatus::Queued,
+            model_id: Some(model_id),
+            input_json: &input_json,
+            output_json: None,
+            error_message: None,
+        })
+        .map_err(ApiError::from_memory_error)
 }
 
 fn neutral_text_message(role: NeutralChatRole, content: String) -> NeutralChatMessage {
@@ -12347,6 +12400,12 @@ description: Project memory.
                 safety_tokens: 0,
                 available_message_tokens: 984,
             },
+            memory_settings: MemorySettings {
+                enabled: true,
+                extraction_mode: "pending_review".to_string(),
+                retention_days: None,
+                extraction_model_id: Some("extract-model".to_string()),
+            },
             request_body_json: "{}".to_string(),
             compression_snapshots: Vec::new(),
             message_source_sequences: vec![Some(0)],
@@ -12402,8 +12461,23 @@ description: Project memory.
             .expect("llm request");
 
         assert_eq!(request.status_code, Some(200));
+        let memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        let jobs = memory_database
+            .extraction_jobs_for_scope(Some("chat-1"), Some(MemoryExtractionJobStatus::Queued), 10)
+            .expect("memory extraction jobs");
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].model_id.as_deref(), Some("extract-model"));
+        assert!(
+            jobs[0]
+                .input_json
+                .contains("\"assistantMessageId\":\"assistant-1\"")
+        );
 
         drop(database);
+        drop(memory_database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }
 
