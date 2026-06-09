@@ -75,7 +75,7 @@ use foco_store::{
 use foco_tools::{
     ASK_QUESTION_TOOL, CREATE_TASK_GRAPH_TOOL, PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
     SLEEP_TOOL, ToolExecution, UPDATE_TASK_GRAPH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions,
-    builtin_tool_timeout_ms, execute_builtin_tool_for_chat,
+    builtin_tool_timeout_ms, execute_builtin_tool_for_chat, set_ripgrep_path,
 };
 use futures_util::future::join_all;
 use rust_embed::Embed;
@@ -83,7 +83,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 use crate::git_backend::{
@@ -141,6 +141,10 @@ const ENVIRONMENT_CONTEXT_MESSAGE_PREFIX: &str = "Environment context for this c
 const SHUTDOWN_MESSAGE: &str = "app shutdown requested";
 const AUTH_COOKIE_NAME: &str = "foco_auth";
 const PASSWORD_HASH_PREFIX: &str = "sha256";
+const RIPGREP_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/BurntSushi/ripgrep/releases/latest";
+const RIPGREP_DOWNLOAD_ARCHIVE_NAME: &str = "ripgrep-download.tmp";
+const RIPGREP_EXTRACT_DIR_NAME: &str = "ripgrep-extract";
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -192,6 +196,8 @@ struct AppState {
     config_file: PathBuf,
     memory_database_file: PathBuf,
     model_metadata_file: PathBuf,
+    ripgrep_install_lock: Arc<AsyncMutex<()>>,
+    ripgrep_status: Arc<Mutex<RipgrepStatus>>,
     user_profile_dir: PathBuf,
     terminal_registry: terminal::TerminalRegistry,
     terminal_shutdown_tx: broadcast::Sender<()>,
@@ -202,6 +208,13 @@ struct AppState {
     _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
     #[cfg(all(windows, not(debug_assertions)))]
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
+}
+
+#[derive(Clone, Debug)]
+struct RipgrepStatus {
+    available: bool,
+    path: Option<PathBuf>,
+    install_dir: PathBuf,
 }
 
 #[derive(Clone, Default)]
@@ -504,6 +517,19 @@ async fn run_server_until_shutdown(
     let mcp_registry = Arc::new(McpRegistry::default());
     sync_all_mcp_workspaces(&mcp_registry, &loaded_config.config).await?;
     let hook_runtime = HookRuntime::new(mcp_registry.clone());
+    let ripgrep_status = detect_ripgrep(&loaded_config.paths.root_dir);
+    set_ripgrep_path(ripgrep_status.path.clone());
+    if ripgrep_status.available {
+        tracing::info!(
+            path = ?ripgrep_status.path,
+            "ripgrep executable is available"
+        );
+    } else {
+        tracing::warn!(
+            install_dir = %ripgrep_status.install_dir.display(),
+            "ripgrep executable was not found"
+        );
+    }
 
     let addr = local_addr(&loaded_config.config)?;
     verify_frontend_assets()?;
@@ -521,6 +547,8 @@ async fn run_server_until_shutdown(
         config_file: loaded_config.paths.config_file,
         memory_database_file: loaded_config.paths.memory_database_file,
         model_metadata_file: loaded_config.paths.root_dir.join("models.dev.json"),
+        ripgrep_install_lock: Arc::new(AsyncMutex::new(())),
+        ripgrep_status: Arc::new(Mutex::new(ripgrep_status)),
         user_profile_dir: loaded_config.paths.user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
@@ -570,6 +598,7 @@ fn app_router(state: AppState) -> Router {
         )
         .route("/api/native/select-directory", post(select_directory))
         .route("/api/native/select-files", post(select_files))
+        .route("/api/native/install-ripgrep", post(install_ripgrep))
         .route("/api/settings", get(settings))
         .route("/api/settings/general", post(save_general_settings))
         .route("/api/settings/memory", post(save_memory_settings))
@@ -1212,6 +1241,32 @@ async fn select_files() -> Result<Json<SelectFilesResponse>, ApiError> {
     let files = native_select_files()?;
 
     Ok(Json(SelectFilesResponse { files }))
+}
+
+async fn install_ripgrep(
+    State(state): State<AppState>,
+) -> Result<Json<InstallRipgrepResponse>, ApiError> {
+    let _install_guard = state.ripgrep_install_lock.lock().await;
+    let install_dir = {
+        let status = state
+            .ripgrep_status
+            .lock()
+            .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
+        status.install_dir.clone()
+    };
+    let status = download_and_install_ripgrep(&install_dir).await?;
+    set_ripgrep_path(status.path.clone());
+    {
+        let mut current = state
+            .ripgrep_status
+            .lock()
+            .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
+        *current = status.clone();
+    }
+
+    Ok(Json(InstallRipgrepResponse {
+        ripgrep: ripgrep_tool_summary(&status),
+    }))
 }
 
 fn normalize_web_server_settings(
@@ -3342,6 +3397,7 @@ struct TerminalSocketQuery {
 #[serde(rename_all = "camelCase")]
 struct SettingsResponse {
     general: GeneralSettingsSummary,
+    native_tools: NativeToolsSummary,
     memory: MemorySettingsSummary,
     workspaces: Vec<ConfiguredWorkspaceSummary>,
     terminal_shells: Vec<TerminalShellSummary>,
@@ -3352,6 +3408,37 @@ struct SettingsResponse {
     mcp_transports: Vec<McpTransportSummary>,
     mcp_servers: Vec<ConfiguredMcpServerSummary>,
     skills: SkillsSettingsSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeToolsSummary {
+    ripgrep: RipgrepToolSummary,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RipgrepToolSummary {
+    available: bool,
+    path: Option<String>,
+    install_dir: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallRipgrepResponse {
+    ripgrep: RipgrepToolSummary,
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseResponse {
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 #[derive(Serialize)]
@@ -9768,6 +9855,334 @@ fn validate_workspace_path(path: &str) -> Result<PathBuf, ApiError> {
     Ok(path)
 }
 
+fn detect_ripgrep(foco_root_dir: &Path) -> RipgrepStatus {
+    let install_dir = ripgrep_install_dir(foco_root_dir);
+    let path = installed_ripgrep_path(&install_dir)
+        .filter(|path| ripgrep_executable_works(path))
+        .or_else(find_system_ripgrep);
+
+    RipgrepStatus {
+        available: path.is_some(),
+        path,
+        install_dir,
+    }
+}
+
+fn ripgrep_install_dir(foco_root_dir: &Path) -> PathBuf {
+    foco_root_dir.join("bin")
+}
+
+fn installed_ripgrep_path(install_dir: &Path) -> Option<PathBuf> {
+    let candidate = install_dir.join(ripgrep_executable_name());
+
+    candidate.is_file().then_some(candidate)
+}
+
+fn find_system_ripgrep() -> Option<PathBuf> {
+    ["rg", "ripgrep"].into_iter().find_map(|command| {
+        find_command_in_path(command).filter(|path| ripgrep_executable_works(path))
+    })
+}
+
+fn find_command_in_path(command: &str) -> Option<PathBuf> {
+    let command_path = Path::new(command);
+    if command_path.components().count() > 1 {
+        return command_path.is_file().then(|| command_path.to_path_buf());
+    }
+
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths).find_map(|dir| {
+            command_candidate_names(command)
+                .into_iter()
+                .map(|name| dir.join(name))
+                .find(|candidate| candidate.is_file())
+        })
+    })
+}
+
+fn command_candidate_names(command: &str) -> Vec<String> {
+    if cfg!(windows) && Path::new(command).extension().is_none() {
+        vec![
+            format!("{command}.exe"),
+            format!("{command}.cmd"),
+            format!("{command}.bat"),
+        ]
+    } else {
+        vec![command.to_string()]
+    }
+}
+
+fn ripgrep_executable_name() -> &'static str {
+    if cfg!(windows) { "rg.exe" } else { "rg" }
+}
+
+fn ripgrep_executable_works(path: &Path) -> bool {
+    Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+async fn download_and_install_ripgrep(install_dir: &Path) -> Result<RipgrepStatus, ApiError> {
+    fs::create_dir_all(install_dir).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to create ripgrep install directory {}: {source}",
+            install_dir.display()
+        ))
+    })?;
+
+    let asset = select_ripgrep_asset(fetch_latest_ripgrep_release().await?.assets)?;
+    let archive_path = install_dir.join(RIPGREP_DOWNLOAD_ARCHIVE_NAME);
+    let extract_dir = install_dir.join(RIPGREP_EXTRACT_DIR_NAME);
+    download_file(&asset.browser_download_url, &archive_path).await?;
+
+    if extract_dir.exists() {
+        fs::remove_dir_all(&extract_dir).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to clear temporary ripgrep extraction directory {}: {source}",
+                extract_dir.display()
+            ))
+        })?;
+    }
+    fs::create_dir_all(&extract_dir).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to create temporary ripgrep extraction directory {}: {source}",
+            extract_dir.display()
+        ))
+    })?;
+
+    extract_ripgrep_archive(&asset.name, &archive_path, &extract_dir)?;
+    let extracted_rg = find_extracted_ripgrep(&extract_dir).ok_or_else(|| {
+        ApiError::internal(format!(
+            "ripgrep archive '{}' did not contain {}",
+            asset.name,
+            ripgrep_executable_name()
+        ))
+    })?;
+    if !ripgrep_executable_works(&extracted_rg) {
+        return Err(ApiError::internal(format!(
+            "downloaded ripgrep executable failed --version: {}",
+            extracted_rg.display()
+        )));
+    }
+
+    let final_path = install_dir.join(ripgrep_executable_name());
+    fs::copy(&extracted_rg, &final_path).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to install ripgrep to {}: {source}",
+            final_path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    set_executable_permissions(&final_path)?;
+
+    let _ = fs::remove_file(&archive_path);
+    let _ = fs::remove_dir_all(&extract_dir);
+
+    if !ripgrep_executable_works(&final_path) {
+        return Err(ApiError::internal(format!(
+            "installed ripgrep executable failed --version: {}",
+            final_path.display()
+        )));
+    }
+
+    Ok(RipgrepStatus {
+        available: true,
+        path: Some(final_path),
+        install_dir: install_dir.to_path_buf(),
+    })
+}
+
+async fn fetch_latest_ripgrep_release() -> Result<GithubReleaseResponse, ApiError> {
+    reqwest::Client::new()
+        .get(RIPGREP_RELEASE_API_URL)
+        .header(reqwest::header::USER_AGENT, "foco")
+        .send()
+        .await
+        .map_err(|source| ApiError::internal(format!("failed to fetch ripgrep release: {source}")))?
+        .error_for_status()
+        .map_err(|source| ApiError::internal(format!("ripgrep release request failed: {source}")))?
+        .json::<GithubReleaseResponse>()
+        .await
+        .map_err(|source| ApiError::internal(format!("failed to parse ripgrep release: {source}")))
+}
+
+async fn download_file(url: &str, destination: &Path) -> Result<(), ApiError> {
+    let bytes = reqwest::Client::new()
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "foco")
+        .send()
+        .await
+        .map_err(|source| ApiError::internal(format!("failed to download ripgrep: {source}")))?
+        .error_for_status()
+        .map_err(|source| ApiError::internal(format!("ripgrep download failed: {source}")))?
+        .bytes()
+        .await
+        .map_err(|source| {
+            ApiError::internal(format!("failed to read ripgrep download: {source}"))
+        })?;
+
+    fs::write(destination, bytes).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to save ripgrep download to {}: {source}",
+            destination.display()
+        ))
+    })
+}
+
+fn select_ripgrep_asset(assets: Vec<GithubReleaseAsset>) -> Result<GithubReleaseAsset, ApiError> {
+    let target = ripgrep_asset_target()?;
+    let archive_suffix = if cfg!(windows) { ".zip" } else { ".tar.gz" };
+
+    assets
+        .into_iter()
+        .find(|asset| {
+            let name = asset.name.as_str();
+            name.starts_with("ripgrep-")
+                && name.contains(target)
+                && name.ends_with(archive_suffix)
+                && !name.ends_with(".sha256")
+        })
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "no ripgrep release asset matched platform target '{target}'"
+            ))
+        })
+}
+
+fn ripgrep_asset_target() -> Result<&'static str, ApiError> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-musl"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        (os, arch) => Err(ApiError::internal(format!(
+            "automatic ripgrep download is unsupported on {os}/{arch}"
+        ))),
+    }
+}
+
+fn extract_ripgrep_archive(
+    asset_name: &str,
+    archive_path: &Path,
+    extract_dir: &Path,
+) -> Result<(), ApiError> {
+    if asset_name.ends_with(".tar.gz") {
+        let archive_file = fs::File::open(archive_path).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to open ripgrep archive {}: {source}",
+                archive_path.display()
+            ))
+        })?;
+        let decoder = flate2::read::GzDecoder::new(archive_file);
+        let mut archive = tar::Archive::new(decoder);
+        archive.unpack(extract_dir).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to extract ripgrep archive {}: {source}",
+                archive_path.display()
+            ))
+        })?;
+        return Ok(());
+    }
+
+    if asset_name.ends_with(".zip") {
+        return extract_zip_with_powershell(archive_path, extract_dir);
+    }
+
+    Err(ApiError::internal(format!(
+        "unsupported ripgrep archive format: {asset_name}"
+    )))
+}
+
+fn extract_zip_with_powershell(archive_path: &Path, extract_dir: &Path) -> Result<(), ApiError> {
+    let output = Command::new("powershell.exe")
+        .env("FOCO_RIPGREP_ARCHIVE", archive_path)
+        .env("FOCO_RIPGREP_EXTRACT_DIR", extract_dir)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "Expand-Archive -LiteralPath $env:FOCO_RIPGREP_ARCHIVE -DestinationPath $env:FOCO_RIPGREP_EXTRACT_DIR -Force",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to launch PowerShell to extract ripgrep: {source}"
+            ))
+        })?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(ApiError::internal(format!(
+        "failed to extract ripgrep archive{}",
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        }
+    )))
+}
+
+fn find_extracted_ripgrep(extract_dir: &Path) -> Option<PathBuf> {
+    find_file_by_name(extract_dir, ripgrep_executable_name())
+}
+
+fn find_file_by_name(root: &Path, file_name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().is_some_and(|name| name == file_name) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file_by_name(&path, file_name) {
+                return Some(found);
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(unix)]
+fn set_executable_permissions(path: &Path) -> Result<(), ApiError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to read ripgrep permissions {}: {source}",
+                path.display()
+            ))
+        })?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to set ripgrep executable permissions {}: {source}",
+            path.display()
+        ))
+    })
+}
+
+fn ripgrep_tool_summary(status: &RipgrepStatus) -> RipgrepToolSummary {
+    RipgrepToolSummary {
+        available: status.available,
+        path: status.path.as_deref().map(display_path),
+        install_dir: display_path(&status.install_dir),
+    }
+}
+
 fn native_select_directory() -> Result<Option<String>, ApiError> {
     if !(cfg!(windows) || is_wsl_environment()) {
         return Err(ApiError::bad_request(
@@ -10469,6 +10884,15 @@ async fn settings_response(
                     name: app_language_name(*language),
                 })
                 .collect(),
+        },
+        native_tools: NativeToolsSummary {
+            ripgrep: {
+                let status = state
+                    .ripgrep_status
+                    .lock()
+                    .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
+                ripgrep_tool_summary(&status)
+            },
         },
         memory: MemorySettingsSummary {
             enabled: config.memory.enabled,
@@ -13371,6 +13795,62 @@ mod tests {
     }
 
     #[test]
+    fn select_ripgrep_asset_skips_checksum_assets() {
+        let target = ripgrep_asset_target().expect("supported test platform");
+        let suffix = if cfg!(windows) { ".zip" } else { ".tar.gz" };
+        let selected = select_ripgrep_asset(vec![
+            GithubReleaseAsset {
+                name: format!("ripgrep-1.0.0-{target}{suffix}.sha256"),
+                browser_download_url: "https://example.test/checksum".to_string(),
+            },
+            GithubReleaseAsset {
+                name: format!("ripgrep-1.0.0-{target}{suffix}"),
+                browser_download_url: "https://example.test/archive".to_string(),
+            },
+        ])
+        .expect("ripgrep asset");
+
+        assert_eq!(
+            selected.browser_download_url,
+            "https://example.test/archive"
+        );
+    }
+
+    #[test]
+    fn detect_ripgrep_prefers_foco_bin() {
+        let root = tempfile::tempdir().expect("foco root");
+        let install_dir = ripgrep_install_dir(root.path());
+        fs::create_dir_all(&install_dir).expect("install dir");
+        let fake_rg = install_dir.join(ripgrep_executable_name());
+
+        #[cfg(windows)]
+        {
+            let Some(system_rg) = find_system_ripgrep() else {
+                return;
+            };
+            fs::copy(system_rg, &fake_rg).expect("fake rg");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::write(
+                &fake_rg,
+                "#!/bin/sh\n[ \"$1\" = \"--version\" ] && exit 0\nexit 1\n",
+            )
+            .expect("fake rg");
+            let mut permissions = fs::metadata(&fake_rg).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&fake_rg, permissions).expect("permissions");
+        }
+
+        let status = detect_ripgrep(root.path());
+
+        assert!(status.available);
+        assert_eq!(status.path.as_deref(), Some(fake_rg.as_path()));
+        assert_eq!(status.install_dir, install_dir);
+    }
+
+    #[test]
     fn parse_skill_markdown_requires_description() {
         let error = parse_skill_markdown(
             Path::new("SKILL.md"),
@@ -16105,14 +16585,17 @@ description: Project memory.
         let (terminal_shutdown_tx, _) = broadcast::channel(1);
         let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
         let mcp_registry = Arc::new(McpRegistry::default());
+        let foco_root_dir = user_profile_dir.join(".foco");
 
         AppState {
             config: Arc::new(Mutex::new(config)),
-            config_file: user_profile_dir.join(".foco").join("config.json"),
+            config_file: foco_root_dir.join("config.json"),
             memory_database_file: foco_store::memory::global_memory_database_path(
-                user_profile_dir.join(".foco"),
+                foco_root_dir.clone(),
             ),
-            model_metadata_file: user_profile_dir.join(".foco").join("models.dev.json"),
+            model_metadata_file: foco_root_dir.join("models.dev.json"),
+            ripgrep_install_lock: Arc::new(AsyncMutex::new(())),
+            ripgrep_status: Arc::new(Mutex::new(detect_ripgrep(&foco_root_dir))),
             user_profile_dir,
             terminal_registry: terminal::TerminalRegistry::default(),
             terminal_shutdown_tx,

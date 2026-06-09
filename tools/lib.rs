@@ -3,6 +3,7 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
+    sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -48,6 +49,7 @@ const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_TASK_GRAPH_TIMEOUT_MS: u64 = 10_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
+static RIPGREP_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +86,12 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         run_command_definition(),
         sleep_definition(),
     ]
+}
+
+pub fn set_ripgrep_path(path: Option<PathBuf>) {
+    let state = RIPGREP_PATH.get_or_init(|| Mutex::new(None));
+    let mut current = state.lock().expect("ripgrep path lock poisoned");
+    *current = path;
 }
 
 pub fn execute_builtin_tool(
@@ -406,8 +414,9 @@ fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         pattern.to_string(),
         path.to_string_lossy().to_string(),
     ];
+    let rg_command = ripgrep_command();
     let output = run_command_with_timeout(
-        "rg",
+        &rg_command,
         &rg_args,
         workspace_path,
         Duration::from_millis(timeout_ms),
@@ -426,7 +435,7 @@ fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         }
 
         return Err(ToolRuntimeError::CommandFailed {
-            command: "rg".to_string(),
+            command: rg_command,
             status: output.status.code(),
             stderr,
         });
@@ -483,6 +492,14 @@ fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         "truncated": truncated,
         "timeoutMs": timeout_ms
     }))
+}
+
+fn ripgrep_command() -> String {
+    RIPGREP_PATH
+        .get()
+        .and_then(|state| state.lock().ok().and_then(|path| path.clone()))
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "rg".to_string())
 }
 
 fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
@@ -3046,6 +3063,16 @@ mod tests {
         );
         assert_eq!(completed.output["tasks"][0]["id"], "probe");
         assert_eq!(completed.output["tasks"][0]["subtasks"], json!([]));
+    }
+
+    #[test]
+    fn ripgrep_command_uses_configured_path() {
+        let configured = PathBuf::from("/tmp/foco-rg");
+        set_ripgrep_path(Some(configured.clone()));
+
+        assert_eq!(ripgrep_command(), configured.to_string_lossy());
+
+        set_ripgrep_path(None);
     }
 
     #[test]

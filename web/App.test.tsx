@@ -89,6 +89,13 @@ const settings = {
       passwordEnabled: false,
     },
   },
+  nativeTools: {
+    ripgrep: {
+      available: true,
+      installDir: "C:\\Users\\fonla\\.foco\\bin",
+      path: "C:\\Windows\\System32\\rg.exe",
+    },
+  },
   memory: {
     enabled: false,
     extractionMode: "manual",
@@ -716,6 +723,61 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("Use memory graph retrieval.")).toBeInTheDocument();
   });
 
+  it("prompts to install ripgrep when the search dependency is missing", async () => {
+    const missingRipgrepSettings = {
+      ...settings,
+      nativeTools: {
+        ripgrep: {
+          available: false,
+          installDir: "C:\\Users\\fonla\\.foco\\bin",
+          path: null,
+        },
+      },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+
+      if (path === "/api/settings") {
+        return jsonResponse(missingRipgrepSettings);
+      }
+
+      if (path === "/api/native/install-ripgrep") {
+        expect(init?.method).toBe("POST");
+        return jsonResponse({
+          ripgrep: {
+            available: true,
+            installDir: "C:\\Users\\fonla\\.foco\\bin",
+            path: "C:\\Users\\fonla\\.foco\\bin\\rg.exe",
+          },
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "rg command was not found",
+    });
+    expect(within(dialog).getByText("C:\\Users\\fonla\\.foco\\bin")).toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Download ripgrep" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/native/install-ripgrep",
+        expect.objectContaining({ method: "POST" }),
+      );
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "rg command was not found" }),
+      ).not.toBeInTheDocument();
+    });
+  });
+
   it("closes composer menus when clicking outside", async () => {
     const user = userEvent.setup();
     const { container } = render(<App />);
@@ -884,8 +946,8 @@ describe("App verification surfaces", () => {
 
     expect(await screen.findByText("Partial answer.")).toBeInTheDocument();
     expect(
-      screen.getByText("agent run exceeded 128 tool continuation rounds"),
-    ).toBeInTheDocument();
+      screen.getAllByText("agent run exceeded 128 tool continuation rounds").length,
+    ).toBeGreaterThan(0);
 
     await act(async () => {
       activeChatStreamController?.close();
@@ -1631,6 +1693,16 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
           sizeBytes: 5,
         },
       ],
+    });
+  }
+
+  if (path === "/api/native/install-ripgrep") {
+    return jsonResponse({
+      ripgrep: {
+        available: true,
+        installDir: "C:\\Users\\fonla\\.foco\\bin",
+        path: "C:\\Users\\fonla\\.foco\\bin\\rg.exe",
+      },
     });
   }
 

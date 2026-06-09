@@ -11,6 +11,7 @@ import {
   ChevronRight,
   CircleAlert,
   Copy,
+  Download,
   Eye,
   EyeOff,
   FileText,
@@ -195,6 +196,20 @@ type WebServerSettingsSummary = {
   passwordEnabled: boolean;
 };
 
+type RipgrepToolSummary = {
+  available: boolean;
+  path: string | null;
+  installDir: string;
+};
+
+type NativeToolsSummary = {
+  ripgrep: RipgrepToolSummary;
+};
+
+type InstallRipgrepResponse = {
+  ripgrep: RipgrepToolSummary;
+};
+
 type ApiProxyTypeSummary = {
   proxyType: string;
   label: string;
@@ -251,6 +266,7 @@ type TerminalShellSummary = {
 
 type SettingsResponse = {
   general: GeneralSettingsSummary;
+  nativeTools: NativeToolsSummary;
   memory: MemorySettingsSummary;
   workspaces: ConfiguredWorkspaceSummary[];
   terminalShells: TerminalShellSummary[];
@@ -991,6 +1007,13 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Attachments exceed the {size} total limit.":
       "附件总大小超过 {size} 限制。",
     "Run cancelled.": "运行已取消。",
+    "rg command was not found": "未找到 rg 命令",
+    "Foco uses ripgrep for full-text search. Install it into {path} so the search_text tool can run.":
+      "Foco 使用 ripgrep 执行全文搜索。请将它安装到 {path}，这样 search_text 工具才能运行。",
+    "Download ripgrep": "下载 ripgrep",
+    "Installing ripgrep...": "正在安装 ripgrep...",
+    "Dismiss ripgrep warning": "关闭 ripgrep 提示",
+    "ripgrep was installed.": "ripgrep 已安装。",
     "Foco needs your answer": "Foco 需要你的回答",
     "Waiting for your answer": "正在等待你的回答",
     "Custom answer": "手动输入",
@@ -1582,6 +1605,11 @@ export function App() {
   const [questionError, setQuestionError] = useState<string | null>(null);
   const [contextUsage, setContextUsage] = useState<ContextUsageResponse | null>(null);
   const [isLoadingContextUsage, setIsLoadingContextUsage] = useState(false);
+  const [isRipgrepDialogDismissed, setIsRipgrepDialogDismissed] = useState(false);
+  const [isInstallingRipgrep, setIsInstallingRipgrep] = useState(false);
+  const [ripgrepInstallError, setRipgrepInstallError] = useState<string | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
   const activeRunAbortRef = useRef<AbortController | null>(null);
   const activeChatKeyRef = useRef<string | null>(null);
@@ -1681,6 +1709,36 @@ export function App() {
       setError(errorMessage(requestError));
     } finally {
       setIsLoadingSettings(false);
+    }
+  }, []);
+
+  const handleInstallRipgrep = useCallback(async () => {
+    setIsInstallingRipgrep(true);
+    setRipgrepInstallError(null);
+
+    try {
+      const data = await requestJson<InstallRipgrepResponse>(
+        "/api/native/install-ripgrep",
+        {
+          method: "POST",
+        },
+      );
+      setSettings((current) =>
+        current
+          ? {
+              ...current,
+              nativeTools: {
+                ...current.nativeTools,
+                ripgrep: data.ripgrep,
+              },
+            }
+          : current,
+      );
+      setIsRipgrepDialogDismissed(true);
+    } catch (requestError) {
+      setRipgrepInstallError(errorMessage(requestError));
+    } finally {
+      setIsInstallingRipgrep(false);
     }
   }, []);
 
@@ -3567,8 +3625,118 @@ export function App() {
           question={pendingQuestion}
         />
       ) : null}
+      {settings && !settings.nativeTools.ripgrep.available && !isRipgrepDialogDismissed ? (
+        <RipgrepMissingDialog
+          error={ripgrepInstallError}
+          installDir={settings.nativeTools.ripgrep.installDir}
+          isInstalling={isInstallingRipgrep}
+          onClose={() => setIsRipgrepDialogDismissed(true)}
+          onInstall={() => void handleInstallRipgrep()}
+        />
+      ) : null}
     </main>
     </I18nContext.Provider>
+  );
+}
+
+function RipgrepMissingDialog({
+  error,
+  installDir,
+  isInstalling,
+  onClose,
+  onInstall,
+}: {
+  error: string | null;
+  installDir: string;
+  isInstalling: boolean;
+  onClose: () => void;
+  onInstall: () => void;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
+      role="presentation"
+    >
+      <section
+        aria-labelledby="ripgrep-dialog-title"
+        aria-modal="true"
+        className="w-full max-w-lg overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        role="dialog"
+      >
+        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <CircleAlert
+              aria-hidden="true"
+              className="size-5 shrink-0 text-amber-600"
+            />
+            <div className="min-w-0">
+              <h2
+                className="truncate text-base font-semibold text-stone-950"
+                id="ripgrep-dialog-title"
+              >
+                {t("rg command was not found")}
+              </h2>
+              <p className="mt-1 truncate text-xs font-medium text-stone-500">
+                {installDir}
+              </p>
+            </div>
+          </div>
+          <button
+            aria-label={t("Dismiss ripgrep warning")}
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            onClick={onClose}
+            title={t("Close")}
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </div>
+
+        <div className="space-y-4 px-4 py-4">
+          <p className="text-sm leading-6 text-stone-700">
+            {t(
+              "Foco uses ripgrep for full-text search. Install it into {path} so the search_text tool can run.",
+              { path: installDir },
+            )}
+          </p>
+          {error ? (
+            <p className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700">
+              {error}
+            </p>
+          ) : null}
+          <div className="flex justify-end gap-2">
+            <button
+              aria-label={t("Cancel")}
+              className="inline-flex size-11 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+              onClick={onClose}
+              title={t("Cancel")}
+              type="button"
+            >
+              <X aria-hidden="true" className="size-4" />
+            </button>
+            <button
+              aria-label={t("Download ripgrep")}
+              className="inline-flex size-11 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+              disabled={isInstalling}
+              onClick={onInstall}
+              title={isInstalling ? t("Installing ripgrep...") : t("Download ripgrep")}
+              type="button"
+            >
+              {isInstalling ? (
+                <LoaderCircle
+                  aria-hidden="true"
+                  className="size-4 animate-spin"
+                />
+              ) : (
+                <Download aria-hidden="true" className="size-4" />
+              )}
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
   );
 }
 
