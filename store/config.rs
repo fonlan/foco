@@ -1124,7 +1124,7 @@ fn validate_memory_settings(
     models: &[ModelSettings],
 ) -> Result<(), ConfigError> {
     match settings.extraction_mode.as_str() {
-        "manual" | "pending_review" | "disabled" => {}
+        "manual" | "pending_review" | "automatic" | "disabled" => {}
         other => {
             return invalid_config(
                 config_path,
@@ -1886,6 +1886,19 @@ mod tests {
         let reloaded = load_global_config(&loaded.paths.config_file).expect("config reload");
 
         assert_eq!(reloaded.workspaces[0].name, "Renamed Workspace");
+    }
+
+    #[test]
+    fn automatic_memory_extraction_mode_can_be_saved() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.memory.enabled = true;
+        loaded.config.memory.extraction_mode = "automatic".to_string();
+
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("automatic memory extraction mode should save");
     }
 
     #[test]

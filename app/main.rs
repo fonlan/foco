@@ -6712,13 +6712,14 @@ fn queue_memory_extraction_job(
     context: &PreparedChatContext,
     final_state: &str,
 ) -> Result<(), ApiError> {
-    if final_state != "succeeded"
-        || !context.memory_settings.enabled
-        || context.memory_settings.extraction_mode != "pending_review"
-    {
+    if final_state != "succeeded" || !should_queue_memory_extraction(&context.memory_settings) {
         return Ok(());
     }
 
+    let target_status = memory_extraction_target_status(
+        &context.memory_settings.extraction_mode,
+        context.memory_target_status,
+    );
     let model_id = context
         .memory_settings
         .extraction_model_id
@@ -6726,7 +6727,7 @@ fn queue_memory_extraction_job(
         .unwrap_or(&context.model_id);
     let input_json = json!({
         "trigger": "chat_completed",
-        "targetStatus": context.memory_target_status.as_str(),
+        "targetStatus": target_status.as_str(),
         "workspaceId": context.workspace_id,
         "chatId": context.chat_id,
         "runId": context.llm_request_id,
@@ -6766,7 +6767,7 @@ fn queue_memory_extraction_job(
             user_message_id: context.user_message_id.clone(),
             assistant_message_id: context.assistant_message_id.clone(),
             model_id: model_id.to_string(),
-            target_status: context.memory_target_status,
+            target_status,
             config: context.global_config.clone(),
         };
         handle.spawn(async move {
@@ -6780,6 +6781,25 @@ fn queue_memory_extraction_job(
     }
 
     Ok(())
+}
+
+fn should_queue_memory_extraction(settings: &MemorySettings) -> bool {
+    settings.enabled
+        && matches!(
+            settings.extraction_mode.as_str(),
+            "pending_review" | "automatic"
+        )
+}
+
+fn memory_extraction_target_status(
+    extraction_mode: &str,
+    prompt_target_status: MemoryStatus,
+) -> MemoryStatus {
+    if extraction_mode == "automatic" {
+        MemoryStatus::Active
+    } else {
+        prompt_target_status
+    }
 }
 
 fn memory_target_status_for_prompt(message: &str) -> MemoryStatus {
@@ -10460,6 +10480,10 @@ async fn settings_response(
                 MemoryExtractionModeSummary {
                     value: "pending_review",
                     label: "Pending review",
+                },
+                MemoryExtractionModeSummary {
+                    value: "automatic",
+                    label: "Automatic",
                 },
                 MemoryExtractionModeSummary {
                     value: "disabled",
@@ -14234,6 +14258,7 @@ description: Project memory.
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].model_id.as_deref(), Some("extract-model"));
+        assert!(jobs[0].input_json.contains("\"targetStatus\":\"pending\""));
         assert!(
             jobs[0]
                 .input_json
@@ -14723,6 +14748,44 @@ description: Project memory.
 
         drop(memory_database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn automatic_memory_extraction_targets_active_facts() {
+        let pending_review_settings = MemorySettings {
+            enabled: true,
+            extraction_mode: "pending_review".to_string(),
+            retention_days: None,
+            extraction_model_id: None,
+        };
+        let automatic_settings = MemorySettings {
+            enabled: true,
+            extraction_mode: "automatic".to_string(),
+            retention_days: None,
+            extraction_model_id: None,
+        };
+        let manual_settings = MemorySettings {
+            enabled: true,
+            extraction_mode: "manual".to_string(),
+            retention_days: None,
+            extraction_model_id: None,
+        };
+
+        assert!(should_queue_memory_extraction(&pending_review_settings));
+        assert!(should_queue_memory_extraction(&automatic_settings));
+        assert!(!should_queue_memory_extraction(&manual_settings));
+        assert_eq!(
+            memory_extraction_target_status("pending_review", MemoryStatus::Pending),
+            MemoryStatus::Pending
+        );
+        assert_eq!(
+            memory_extraction_target_status("pending_review", MemoryStatus::Active),
+            MemoryStatus::Active
+        );
+        assert_eq!(
+            memory_extraction_target_status("automatic", MemoryStatus::Pending),
+            MemoryStatus::Active
+        );
     }
 
     #[test]

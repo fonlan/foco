@@ -1152,6 +1152,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Refresh memories": "刷新记忆",
     "No memories": "暂无记忆",
     "Pending review": "待审核",
+    Automatic: "自动",
     "Manual": "手动",
     Disabled: "已禁用",
     "Workspace memory": "工作区记忆",

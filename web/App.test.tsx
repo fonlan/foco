@@ -96,6 +96,7 @@ const settings = {
     extractionModes: [
       { label: "Manual", value: "manual" },
       { label: "Pending review", value: "pending_review" },
+      { label: "Automatic", value: "automatic" },
       { label: "Disabled", value: "disabled" },
     ],
     retentionDays: null,
@@ -1162,7 +1163,7 @@ describe("App verification surfaces", () => {
     expect(await screen.findByText(memoryExtractionJob.errorMessage)).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText("Enable memory"));
-    await userEvent.selectOptions(screen.getByLabelText("Extraction mode"), "pending_review");
+    await userEvent.selectOptions(screen.getByLabelText("Extraction mode"), "automatic");
     await userEvent.type(screen.getByLabelText("Retention days"), "30");
     await userEvent.selectOptions(screen.getByLabelText("Extraction model"), "gpt-test");
     await userEvent.click(screen.getByRole("button", { name: "Save memory settings" }));
@@ -1174,7 +1175,7 @@ describe("App verification surfaces", () => {
       expect(saveCall).toBeDefined();
       expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
         enabled: true,
-        extractionMode: "pending_review",
+        extractionMode: "automatic",
         extractionModelId: "gpt-test",
         retentionDays: 30,
       });
