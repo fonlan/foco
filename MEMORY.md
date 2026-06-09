@@ -5,39 +5,39 @@ memory graph in Foco. It is not the runtime memory store.
 
 ## Goals
 
-- [ ] Provide local memory graph support with three scopes: global, workspace,
+- [x] Provide local memory graph support with three scopes: global, workspace,
       and chat session.
-- [ ] Store workspace and chat session memories in each workspace database:
+- [x] Store workspace and chat session memories in each workspace database:
       `<workspace>/.foco/foco.sqlite`.
-- [ ] Store global memories locally under the Foco user profile, preferably in
+- [x] Store global memories locally under the Foco user profile, preferably in
       `%USERPROFILE%/.foco/memory.sqlite`, not inside `config.json`.
-- [ ] Keep memories traceable to source evidence such as chat messages, tool
+- [x] Keep memories traceable to source evidence such as chat messages, tool
       calls, tool results, user notes, or imported documents.
-- [ ] Inject relevant memories into prompt assembly through the same path used
+- [x] Inject relevant memories into prompt assembly through the same path used
       by chat streaming and context usage.
-- [ ] Make memory extraction explicit, reviewable, auditable, and removable.
+- [x] Make memory extraction explicit, reviewable, auditable, and removable.
 
 ## Non-Goals for the First Version
 
-- [ ] Do not call the hosted Supermemory API.
-- [ ] Do not introduce a separate vector database in the MVP.
-- [ ] Do not scan the entire workspace into memory automatically.
-- [ ] Do not merge context compression snapshots with long-term memories.
-- [ ] Do not silently save model-inferred facts without source evidence.
-- [ ] Do not make memory extraction failures block the main chat response.
+- [x] Do not call the hosted Supermemory API.
+- [x] Do not introduce a separate vector database in the MVP.
+- [x] Do not scan the entire workspace into memory automatically.
+- [x] Do not merge context compression snapshots with long-term memories.
+- [x] Do not silently save model-inferred facts without source evidence.
+- [x] Do not make memory extraction failures block the main chat response.
 
 ## Design Decisions
 
-- [ ] Use fact nodes rather than a generic triple store.
-- [ ] Use `memory_sources` for raw evidence and `memory_facts` for atomic,
+- [x] Use fact nodes rather than a generic triple store.
+- [x] Use `memory_sources` for raw evidence and `memory_facts` for atomic,
       model-usable facts.
-- [ ] Use `memory_edges` only for a small initial relation set:
+- [x] Use `memory_edges` only for a small initial relation set:
       `updates`, `extends`, and `derives`.
-- [ ] Use SQLite FTS5 for MVP search and ranking.
-- [ ] Add embeddings later only after the FTS + graph model is verified.
-- [ ] Treat session memory as chat-owned data. Deleting a chat should delete
+- [x] Use SQLite FTS5 for MVP search and ranking.
+- [x] Add embeddings later only after the FTS + graph model is verified.
+- [x] Treat session memory as chat-owned data. Deleting a chat should delete
       unpromoted session memories.
-- [ ] Allow explicit promotion from chat session memory to workspace or global
+- [x] Allow explicit promotion from chat session memory to workspace or global
       memory.
 
 ## Phase 0 - Scope and Contracts
@@ -53,7 +53,7 @@ memory graph in Foco. It is not the runtime memory store.
       source.
 - [x] Define that memory search excludes `superseded`, `expired`, and
       `rejected` by default.
-- [ ] Define that context usage preview must never create or mutate memory data.
+- [x] Define that context usage preview must never create or mutate memory data.
 
 ## Phase 1 - Storage
 
@@ -170,7 +170,8 @@ memory graph in Foco. It is not the runtime memory store.
 - [x] Add `memory_write` tool.
 - [x] Make `memory_write` create `pending` facts unless the user explicitly
       requested saving a memory.
-- [ ] Add `memory_update` only if edit/promotion flows need agent access.
+- [x] Leave `memory_update` out because edit/promotion flows remain user/API
+      owned and do not need agent tool access.
 - [x] Keep tool schemas compatible with strict OpenAI Responses requirements.
 - [x] Include `timeoutMs` in memory tools where required by current tool rules.
 - [x] Add tool result summaries that show scope, fact ids, and source counts.
@@ -179,36 +180,41 @@ memory graph in Foco. It is not the runtime memory store.
 
 ## Phase 8 - Verification and Release
 
-- [ ] Run `cargo fmt --all -- --check`.
-- [ ] Run `cargo check --workspace`.
-- [ ] Run focused store tests.
-- [ ] Run focused app tests for prompt preparation and context usage.
-- [ ] Run `npm run typecheck -w web`.
-- [ ] Run focused web tests for Memory UI.
-- [ ] Run `npm test` before considering the feature complete.
-- [ ] Update `AGENTS.md` with durable memory graph behavior only after the
+- [x] Run `cargo fmt --all -- --check`.
+- [x] Run `cargo check --workspace`.
+- [x] Run focused store tests.
+- [x] Run focused app tests for prompt preparation and context usage.
+- [x] Run `npm run typecheck -w web`.
+- [x] Run focused web tests for Memory UI.
+- [x] Run `npm test` before considering the feature complete.
+- [x] Update `AGENTS.md` with durable memory graph behavior only after the
       implementation is verified.
 
 ## Open Questions
 
-- [ ] Should automatic extraction be off by default or on with pending review?
-- [ ] Should global memory be searchable from every workspace by default?
-- [ ] Should workspace memory be exportable/importable with the workspace?
-- [ ] Should explicit user commands such as "remember" bypass pending review?
-- [ ] Should memory profiles be rebuilt synchronously on approval or queued as
-      background jobs?
-- [ ] Should memory extraction use the active chat model or a dedicated model
-      setting?
+- [x] Automatic extraction is off by default: memory defaults disabled and
+      extraction mode defaults to `manual`; `pending_review` is opt-in.
+- [x] Global memory is searchable from every workspace by default when memory is
+      enabled.
+- [x] Workspace memory is portable with the workspace because workspace/chat
+      facts live in `<workspace>/.foco/foco.sqlite`; no separate export/import
+      flow is part of the MVP.
+- [x] Explicit user commands such as "remember" bypass pending review and write
+      active facts.
+- [x] Memory profiles are rebuilt synchronously on approval, edit, promote,
+      retention expiry, extraction storage, and agent memory writes.
+- [x] Memory extraction uses the active chat model unless
+      `memory.extraction_model_id` points to a dedicated enabled model.
 
 ## Acceptance Criteria
 
-- [ ] A user can manually create global, workspace, and chat memory.
-- [ ] Workspace and chat memories are persisted in the workspace SQLite file.
-- [ ] Global memories are persisted locally outside `config.json`.
-- [ ] Relevant memories are included in prompt assembly with token accounting.
-- [ ] Context usage preview includes memory cost without mutating memory state.
-- [ ] Extracted memories remain reviewable and traceable to sources.
-- [ ] Superseded memories are not retrieved by default.
-- [ ] Deleting a chat deletes unpromoted chat session memories.
-- [ ] Forgetting a memory removes it from search, prompt injection, and profile
+- [x] A user can manually create global, workspace, and chat memory.
+- [x] Workspace and chat memories are persisted in the workspace SQLite file.
+- [x] Global memories are persisted locally outside `config.json`.
+- [x] Relevant memories are included in prompt assembly with token accounting.
+- [x] Context usage preview includes memory cost without mutating memory state.
+- [x] Extracted memories remain reviewable and traceable to sources.
+- [x] Superseded memories are not retrieved by default.
+- [x] Deleting a chat deletes unpromoted chat session memories.
+- [x] Forgetting a memory removes it from search, prompt injection, and profile
       generation.
