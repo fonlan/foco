@@ -775,6 +775,7 @@ describe("App verification surfaces", () => {
   beforeEach(() => {
     activeChatStreamController = null;
     terminalSessionCounter = 0;
+    window.history.replaceState(null, "", "/");
     document.documentElement.removeAttribute("data-foco-theme");
     mermaidMock.initialize.mockClear();
     mermaidMock.render.mockClear();
@@ -888,6 +889,33 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("First token latency: 250 ms")).toBeInTheDocument();
     await userEvent.click(screen.getByText("Memories used"));
     expect(screen.getByText("Use memory graph retrieval.")).toBeInTheDocument();
+  });
+
+  it("opens a settings section from the URL and writes section changes back to the URL", async () => {
+    window.history.replaceState(null, "", "/settings/models");
+    render(<App />);
+
+    expect(await screen.findByText("Model settings")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/settings/models");
+
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "General" }));
+
+    expect(await screen.findByText("General settings")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/settings/general");
+  });
+
+  it("opens a chat from the URL and writes chat selection changes back to the URL", async () => {
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    render(<App />);
+
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/workspace-1/chat-1");
+
+    await userEvent.click(screen.getByText("Second chat"));
+
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/workspace-1/chat-2");
   });
 
   it("resizes the workspace sidebar from the panel splitter", async () => {

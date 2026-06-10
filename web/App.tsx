@@ -879,6 +879,10 @@ type SettingsSection =
   | "workspaces";
 type ViewMode = "chat" | "settings" | "stats";
 type ContextPanelTab = "task" | "git" | "memory";
+type BrowserRoute =
+  | { viewMode: "chat"; workspaceId: string | null; chatId: string | null }
+  | { viewMode: "settings"; section: SettingsSection }
+  | { viewMode: "stats" };
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
@@ -889,6 +893,16 @@ const MAX_CHAT_ATTACHMENTS = 6;
 const MAX_CHAT_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024;
 const SAVED_PASSWORD_MASK = "********";
+const SETTINGS_SECTION_IDS: SettingsSection[] = [
+  "general",
+  "workspaces",
+  "hooks",
+  "memory",
+  "providers",
+  "models",
+  "mcp",
+  "skills",
+];
 const AI_STATS_COLUMN_IDS = [
   "requestTime",
   "workspace",
@@ -1581,6 +1595,7 @@ type QuestionAnswerSubmission = {
 };
 
 export function App() {
+  const [initialBrowserRoute] = useState(() => currentBrowserRoute());
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
   const [authPassword, setAuthPassword] = useState("");
   const [isCheckingAuth, setIsCheckingAuth] = useState(true);
@@ -1593,7 +1608,14 @@ export function App() {
   const [workspaceChatVisibleCounts, setWorkspaceChatVisibleCounts] = useState<
     Record<string, number>
   >({});
-  const [viewMode, setViewMode] = useState<ViewMode>("chat");
+  const [viewMode, setViewMode] = useState<ViewMode>(
+    initialBrowserRoute.viewMode,
+  );
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>(
+    initialBrowserRoute.viewMode === "settings"
+      ? initialBrowserRoute.section
+      : "general",
+  );
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [workspaceDialogRevision, setWorkspaceDialogRevision] = useState(0);
   const [workspaceName, setWorkspaceName] = useState("");
@@ -1676,6 +1698,8 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const activeRunAbortRef = useRef<AbortController | null>(null);
   const activeChatKeyRef = useRef<string | null>(null);
+  const applyBrowserRouteRef = useRef<(route: BrowserRoute) => void>(() => {});
+  const hasAppliedInitialBrowserRouteRef = useRef(false);
   const hasManuallySelectedModelRef = useRef(false);
   const workspaceSidebarRef = useRef<HTMLElement | null>(null);
 
@@ -1717,6 +1741,9 @@ export function App() {
     : false;
   const isGlobalView = viewMode === "settings" || viewMode === "stats";
   const showContextPanel = !isGlobalView && isContextPanelOpen;
+  const canUseApp = Boolean(
+    authStatus && (!authStatus.enabled || authStatus.authenticated),
+  );
   const canLogout = Boolean(settings?.general.webServer.passwordEnabled);
   const language = settings?.general.language ?? "en";
   const theme = settings?.general.theme ?? "light";
@@ -1736,6 +1763,26 @@ export function App() {
       ),
     );
   }, []);
+  const updateBrowserRoute = useCallback(
+    (route: BrowserRoute, mode: "push" | "replace" = "push") => {
+      if (typeof window === "undefined") {
+        return;
+      }
+
+      const nextPath = browserPathForRoute(route);
+      if (window.location.pathname === nextPath) {
+        return;
+      }
+
+      if (mode === "replace") {
+        window.history.replaceState(null, "", nextPath);
+        return;
+      }
+
+      window.history.pushState(null, "", nextPath);
+    },
+    [],
+  );
 
   useEffect(() => {
     document.documentElement.lang = language;
@@ -1991,13 +2038,13 @@ export function App() {
   }, [loadAuthStatus]);
 
   useEffect(() => {
-    if (!authStatus?.authenticated) {
+    if (!canUseApp) {
       return;
     }
 
     void refreshWorkspaces();
     void loadSettings();
-  }, [authStatus?.authenticated, loadSettings, refreshWorkspaces]);
+  }, [canUseApp, loadSettings, refreshWorkspaces]);
 
   useEffect(() => {
     if (!activeWorkspace?.id) {
@@ -2228,6 +2275,11 @@ export function App() {
       setWorkspaces(data.workspaces);
       setActiveWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
       setExpandedWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
+      updateBrowserRoute({
+        chatId: null,
+        viewMode: "chat",
+        workspaceId: createdWorkspace?.id ?? data.activeWorkspaceId,
+      });
       setWorkspaceName("");
       setWorkspacePath("");
       setIsWorkspaceDialogOpen(false);
@@ -2331,7 +2383,11 @@ export function App() {
     });
   }
 
-  async function loadChatMessages(workspaceId: string, chatId: string) {
+  async function loadChatMessages(
+    workspaceId: string,
+    chatId: string,
+    options: { updateUrl?: boolean } = {},
+  ) {
     setError(null);
 
     try {
@@ -2349,17 +2405,24 @@ export function App() {
       setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
       setViewMode("chat");
       setIsMobileWorkspaceOpen(false);
+      if (options.updateUrl !== false) {
+        updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
+      }
     } catch (requestError) {
       setError(errorMessage(requestError));
     }
   }
 
-  function selectWorkspaceChat(workspaceId: string, chatId: string) {
+  function selectWorkspaceChat(
+    workspaceId: string,
+    chatId: string,
+    options: { updateUrl?: boolean } = {},
+  ) {
     const chatKey = chatRunKey(workspaceId, chatId);
     const cachedMessages = chatMessagesByKey[chatKey];
 
     if (!cachedMessages) {
-      void loadChatMessages(workspaceId, chatId);
+      void loadChatMessages(workspaceId, chatId, options);
       return;
     }
 
@@ -2371,9 +2434,15 @@ export function App() {
     setMessages(cachedMessages);
     setViewMode("chat");
     setIsMobileWorkspaceOpen(false);
+    if (options.updateUrl !== false) {
+      updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
+    }
   }
 
-  function startNewWorkspaceChat(workspaceId: string) {
+  function startNewWorkspaceChat(
+    workspaceId: string,
+    options: { updateUrl?: boolean } = {},
+  ) {
     setExpandedWorkspaceId(workspaceId);
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
@@ -2382,6 +2451,9 @@ export function App() {
     setSelectedDiffPath(null);
     setViewMode("chat");
     setIsMobileWorkspaceOpen(false);
+    if (options.updateUrl !== false) {
+      updateBrowserRoute({ chatId: null, viewMode: "chat", workspaceId });
+    }
   }
 
   function openChatTab(workspaceId: string, chatId: string) {
@@ -2433,6 +2505,11 @@ export function App() {
     setActiveChatId(null);
     activeChatKeyRef.current = null;
     setMessages([]);
+    updateBrowserRoute({
+      chatId: null,
+      viewMode: "chat",
+      workspaceId: activeWorkspaceId || workspaceId,
+    });
   }
 
   function requestDeleteWorkspaceChat(workspace: WorkspaceSummary, chat: ChatSummary) {
@@ -2483,6 +2560,11 @@ export function App() {
         setActiveWorkspaceId(workspaceId);
         setActiveChatId(null);
         setMessages([]);
+        updateBrowserRoute({
+          chatId: null,
+          viewMode: "chat",
+          workspaceId,
+        });
       }
 
       setRetryRunRequest((current) =>
@@ -2763,6 +2845,11 @@ export function App() {
     const retryRequest = retryRunRequest;
     setActiveWorkspaceId(retryRequest.workspaceId);
     setActiveChatId(retryRequest.chatId);
+    updateBrowserRoute({
+      chatId: retryRequest.chatId,
+      viewMode: "chat",
+      workspaceId: retryRequest.workspaceId,
+    });
     hasManuallySelectedModelRef.current = true;
     setSelectedModelId(retryRequest.modelId);
     setSelectedProviderId(retryRequest.providerId);
@@ -2775,6 +2862,103 @@ export function App() {
     hasManuallySelectedModelRef.current = true;
     setSelectedModelId(modelId);
   }
+
+  function currentChatBrowserRoute(): BrowserRoute {
+    return {
+      chatId: activeChatId,
+      viewMode: "chat",
+      workspaceId: activeWorkspace?.id ?? (activeWorkspaceId || null),
+    };
+  }
+
+  function openSettingsSection(section: SettingsSection) {
+    setSettingsSection(section);
+    setViewMode("settings");
+    setIsMobileWorkspaceOpen(false);
+    updateBrowserRoute({ section, viewMode: "settings" });
+  }
+
+  function openStatsView() {
+    setViewMode("stats");
+    setIsMobileWorkspaceOpen(false);
+    updateBrowserRoute({ viewMode: "stats" });
+  }
+
+  function openCurrentChatView() {
+    setViewMode("chat");
+    updateBrowserRoute(currentChatBrowserRoute());
+  }
+
+  function openWorkspacePicker() {
+    setViewMode("chat");
+    setIsMobileWorkspaceOpen(true);
+    updateBrowserRoute(currentChatBrowserRoute());
+  }
+
+  function applyBrowserRoute(route: BrowserRoute) {
+    if (route.viewMode === "settings") {
+      setSettingsSection(route.section);
+      setViewMode("settings");
+      setIsMobileWorkspaceOpen(false);
+      return;
+    }
+
+    if (route.viewMode === "stats") {
+      setViewMode("stats");
+      setIsMobileWorkspaceOpen(false);
+      return;
+    }
+
+    setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
+    if (!route.workspaceId) {
+      setActiveChatId(null);
+      activeChatKeyRef.current = null;
+      setMessages([]);
+      return;
+    }
+
+    if (!workspaces.some((workspace) => workspace.id === route.workspaceId)) {
+      setError(`Workspace not found: ${route.workspaceId}`);
+      return;
+    }
+
+    if (route.chatId) {
+      selectWorkspaceChat(route.workspaceId, route.chatId, {
+        updateUrl: false,
+      });
+      return;
+    }
+
+    startNewWorkspaceChat(route.workspaceId, { updateUrl: false });
+  }
+
+  applyBrowserRouteRef.current = applyBrowserRoute;
+
+  useEffect(() => {
+    if (
+      !canUseApp ||
+      isLoading ||
+      hasAppliedInitialBrowserRouteRef.current
+    ) {
+      return;
+    }
+
+    hasAppliedInitialBrowserRouteRef.current = true;
+    applyBrowserRoute(initialBrowserRoute);
+    updateBrowserRoute(initialBrowserRoute, "replace");
+  }, [canUseApp, initialBrowserRoute, isLoading, updateBrowserRoute]);
+
+  useEffect(() => {
+    function handlePopState() {
+      applyBrowserRouteRef.current(currentBrowserRoute());
+    }
+
+    window.addEventListener("popstate", handlePopState);
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, []);
 
   function handleCancelRun() {
     activeRunAbortRef.current?.abort();
@@ -2929,6 +3113,11 @@ export function App() {
           ) {
             setActiveChatId(streamEvent.chatId);
             activeChatKeyRef.current = currentRunningChatKey;
+            updateBrowserRoute({
+              chatId: streamEvent.chatId,
+              viewMode: "chat",
+              workspaceId: request.workspaceId,
+            });
           }
           setRunningChatKey(currentRunningChatKey);
           void refreshWorkspaces();
@@ -3260,13 +3449,10 @@ export function App() {
             isSavingTheme={isSavingTheme}
             onAddWorkspace={openWorkspaceDialog}
             onLogout={handleLogout}
-            onOpenSettings={() => setViewMode("settings")}
-            onOpenStats={() => setViewMode("stats")}
-            onOpenWorkspace={() => {
-              setViewMode("chat");
-              setIsMobileWorkspaceOpen(true);
-            }}
-            onReturnHome={() => setViewMode("chat")}
+            onOpenSettings={() => openSettingsSection("general")}
+            onOpenStats={openStatsView}
+            onOpenWorkspace={openWorkspacePicker}
+            onReturnHome={openCurrentChatView}
             onToggleTheme={() =>
               void saveAppTheme(theme === "dark" ? "light" : "dark")
             }
@@ -3276,7 +3462,9 @@ export function App() {
             {viewMode === "settings" ? (
               <SettingsPanel
                 canLogout={canLogout}
+                activeSection={settingsSection}
                 onAddWorkspace={openWorkspaceDialog}
+                onActiveSectionChange={openSettingsSection}
                 onLogout={handleLogout}
                 onSettingsChange={setSettings}
                 onWorkspacesChange={refreshWorkspaces}
@@ -3314,13 +3502,10 @@ export function App() {
           isSavingTheme={isSavingTheme}
           onAddWorkspace={openWorkspaceDialog}
           onLogout={handleLogout}
-          onOpenSettings={() => setViewMode("settings")}
-          onOpenStats={() => setViewMode("stats")}
-          onOpenWorkspace={() => {
-            setViewMode("chat");
-            setIsMobileWorkspaceOpen(true);
-          }}
-          onReturnHome={() => setViewMode("chat")}
+          onOpenSettings={() => openSettingsSection("general")}
+          onOpenStats={openStatsView}
+          onOpenWorkspace={openWorkspacePicker}
+          onReturnHome={openCurrentChatView}
           onToggleTheme={() =>
             void saveAppTheme(theme === "dark" ? "light" : "dark")
           }
@@ -8075,23 +8260,25 @@ function InlineGitDiffNotice({ children }: { children: ReactNode }) {
 }
 
 function SettingsPanel({
+  activeSection,
   canLogout,
   onAddWorkspace,
+  onActiveSectionChange,
   onLogout,
   onSettingsChange,
   onWorkspacesChange,
   workspaceDialogRevision,
 }: {
+  activeSection: SettingsSection;
   canLogout: boolean;
   onAddWorkspace: () => void;
+  onActiveSectionChange: (section: SettingsSection) => void;
   onLogout: () => Promise<void>;
   onSettingsChange: (settings: SettingsResponse) => void;
   onWorkspacesChange: () => Promise<void>;
   workspaceDialogRevision: number;
 }) {
   const { t } = useI18n();
-  const [activeSection, setActiveSection] =
-    useState<SettingsSection>("general");
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isProviderDialogOpen, setIsProviderDialogOpen] = useState(false);
   const [isModelDialogOpen, setIsModelDialogOpen] = useState(false);
@@ -8604,7 +8791,7 @@ function SettingsPanel({
 
   function startAddingProviderFromModel() {
     setIsModelDialogOpen(false);
-    setActiveSection("providers");
+    onActiveSectionChange("providers");
     startAddingProvider();
   }
 
@@ -9940,49 +10127,49 @@ function SettingsPanel({
             active={activeSection === "general"}
             icon={Globe}
             label={t("General")}
-            onClick={() => setActiveSection("general")}
+            onClick={() => onActiveSectionChange("general")}
           />
           <SettingsNavButton
             active={activeSection === "workspaces"}
             icon={Folder}
             label={t("Workspaces")}
-            onClick={() => setActiveSection("workspaces")}
+            onClick={() => onActiveSectionChange("workspaces")}
           />
           <SettingsNavButton
             active={activeSection === "hooks"}
             icon={Webhook}
             label={t("Hooks")}
-            onClick={() => setActiveSection("hooks")}
+            onClick={() => onActiveSectionChange("hooks")}
           />
           <SettingsNavButton
             active={activeSection === "memory"}
             icon={Bot}
             label={t("Memory")}
-            onClick={() => setActiveSection("memory")}
+            onClick={() => onActiveSectionChange("memory")}
           />
           <SettingsNavButton
             active={activeSection === "providers"}
             icon={PlugZap}
             label={t("Providers")}
-            onClick={() => setActiveSection("providers")}
+            onClick={() => onActiveSectionChange("providers")}
           />
           <SettingsNavButton
             active={activeSection === "models"}
             icon={SlidersHorizontal}
             label={t("Models")}
-            onClick={() => setActiveSection("models")}
+            onClick={() => onActiveSectionChange("models")}
           />
           <SettingsNavButton
             active={activeSection === "mcp"}
             icon={Server}
             label={t("MCP")}
-            onClick={() => setActiveSection("mcp")}
+            onClick={() => onActiveSectionChange("mcp")}
           />
           <SettingsNavButton
             active={activeSection === "skills"}
             icon={Wrench}
             label={t("Skills")}
-            onClick={() => setActiveSection("skills")}
+            onClick={() => onActiveSectionChange("skills")}
           />
           </nav>
         </aside>
@@ -15236,6 +15423,82 @@ function formatChatCreatedAt(value: string) {
     month: "short",
     year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
   }).format(date);
+}
+
+function currentBrowserRoute(): BrowserRoute {
+  if (typeof window === "undefined") {
+    return { chatId: null, viewMode: "chat", workspaceId: null };
+  }
+
+  return browserRouteFromPathname(window.location.pathname);
+}
+
+function browserRouteFromPathname(pathname: string): BrowserRoute {
+  const segments = pathname
+    .split("/")
+    .filter(Boolean)
+    .map(decodePathSegment);
+
+  if (segments[0] === "settings") {
+    const section = settingsSectionFromPathSegment(segments[1]);
+    return { section, viewMode: "settings" };
+  }
+
+  if (segments[0] === "stats") {
+    return { viewMode: "stats" };
+  }
+
+  if (segments.length >= 2) {
+    return {
+      chatId: segments[1],
+      viewMode: "chat",
+      workspaceId: segments[0],
+    };
+  }
+
+  if (segments.length === 1) {
+    return { chatId: null, viewMode: "chat", workspaceId: segments[0] };
+  }
+
+  return { chatId: null, viewMode: "chat", workspaceId: null };
+}
+
+function browserPathForRoute(route: BrowserRoute) {
+  if (route.viewMode === "settings") {
+    return `/settings/${route.section}`;
+  }
+
+  if (route.viewMode === "stats") {
+    return "/stats";
+  }
+
+  if (route.workspaceId && route.chatId) {
+    return `/${encodeURIComponent(route.workspaceId)}/${encodeURIComponent(
+      route.chatId,
+    )}`;
+  }
+
+  if (route.workspaceId) {
+    return `/${encodeURIComponent(route.workspaceId)}`;
+  }
+
+  return "/";
+}
+
+function decodePathSegment(segment: string) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+function settingsSectionFromPathSegment(
+  segment: string | undefined,
+): SettingsSection {
+  return SETTINGS_SECTION_IDS.includes(segment as SettingsSection)
+    ? (segment as SettingsSection)
+    : "general";
 }
 
 function chatRunKey(workspaceId: string, chatId: string) {
