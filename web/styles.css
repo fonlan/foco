@@ -518,6 +518,7 @@ summary:focus-visible {
 .context-usage-circle {
   --context-usage-ring: var(--foco-accent);
   --context-usage-track: var(--foco-panel-muted);
+  --context-usage-fill: var(--foco-panel);
   display: inline-flex;
   position: relative;
   width: 2rem;
@@ -527,7 +528,7 @@ summary:focus-visible {
   justify-content: center;
   border-radius: 999px;
   background:
-    radial-gradient(circle at center, #fff 0 58%, transparent 60%),
+    radial-gradient(circle at center, var(--context-usage-fill) 0 58%, transparent 60%),
     conic-gradient(
       var(--context-usage-ring) var(--context-usage-percent, 0%),
       var(--context-usage-track) 0
