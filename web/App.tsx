@@ -712,6 +712,7 @@ type ChatMessageSummary = {
   id: string;
   role: "assistant" | "user";
   content: string;
+  createdAt: string;
   reasoning: string | null;
   toolCalls: ChatToolCallSummary[];
   parts: ChatMessagePart[];
@@ -1058,6 +1059,8 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Remove skill": "移除技能",
     "Remove skill {name}": "移除技能 {name}",
     "Message Foco": "给 Foco 发送消息",
+    "Copy message": "复制消息",
+    "Copied message": "已复制消息",
     "Select skill {name}": "选择技能 {name}",
     "Skill is disabled": "技能已禁用",
     "Skill locations": "技能位置",
@@ -1509,6 +1512,7 @@ type ShellMessage = {
   id: string;
   role: "assistant" | "user";
   content: string;
+  createdAt: string;
   reasoning: string | null;
   status?: "error" | "streaming";
   toolCalls: ChatToolCallSummary[];
@@ -2764,6 +2768,7 @@ export function App() {
       `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const localUserId = `local-user-${runKey}`;
     const localAssistantId = `local-assistant-${runKey}`;
+    const localCreatedAt = new Date().toISOString();
     const visibleUserContent = messageWithSelectedSkills(
       detectedSkills,
       request.skillIds,
@@ -2789,6 +2794,7 @@ export function App() {
         id: localUserId,
         role: "user",
         content: visibleUserContent,
+        createdAt: localCreatedAt,
         reasoning: null,
         toolCalls: [],
         parts: localUserParts,
@@ -2799,6 +2805,7 @@ export function App() {
         id: localAssistantId,
         role: "assistant",
         content: "",
+        createdAt: localCreatedAt,
         reasoning: null,
         status: "streaming",
         toolCalls: [],
@@ -4853,7 +4860,9 @@ function ChatPanel({
   const messageScrollContentRef = useRef<HTMLDivElement>(null);
   const messageScrollEndRef = useRef<HTMLDivElement>(null);
   const messageTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const copiedMessageTimerRef = useRef<number | null>(null);
   const shouldLockMessageScrollRef = useRef(true);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const skillQuery = activeSkillQuery(draftMessage);
   const selectedSkillSet = new Set(selectedSkillIds);
   const selectedSkills = selectedSkillIds
@@ -4932,6 +4941,14 @@ function ChatPanel({
     return () => observer.disconnect();
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (copiedMessageTimerRef.current !== null) {
+        window.clearTimeout(copiedMessageTimerRef.current);
+      }
+    };
+  }, []);
+
   function handleMessageScroll() {
     const element = messageScrollRef.current;
     if (!element) {
@@ -4975,6 +4992,26 @@ function ChatPanel({
     onAddPastedImageAttachments(imageFiles);
   }
 
+  async function handleCopyMessage(messageId: string, text: string) {
+    if (!text) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      return;
+    }
+    setCopiedMessageId(messageId);
+    if (copiedMessageTimerRef.current !== null) {
+      window.clearTimeout(copiedMessageTimerRef.current);
+    }
+    copiedMessageTimerRef.current = window.setTimeout(() => {
+      setCopiedMessageId((current) => (current === messageId ? null : current));
+      copiedMessageTimerRef.current = null;
+    }, 1600);
+  }
+
   return (
     <div className="chat-panel flex min-h-0 flex-1 flex-col overflow-hidden">
       <div
@@ -4988,85 +5025,121 @@ function ChatPanel({
         >
           {messages.length ? (
             messages.map((message) => {
-            const isUser = message.role === "user";
-            const parts = message.parts.length
-              ? message.parts
-              : fallbackMessageParts(message);
-            const authorLabel = isUser ? "You" : "Foco Agent";
+              const isUser = message.role === "user";
+              const parts = message.parts.length
+                ? message.parts
+                : fallbackMessageParts(message);
+              const authorLabel = isUser ? "You" : "Foco Agent";
+              const createdAtLabel = formatChatCreatedAt(message.createdAt);
+              const copyText = messageCopyText(message, parts);
+              const copyLabel =
+                copiedMessageId === message.id
+                  ? t("Copied message")
+                  : t("Copy message");
 
-            return (
-              <div
-                className={`message-row flex ${isUser ? "message-row-user" : "message-row-agent"}`}
-                key={message.id}
-              >
+              return (
                 <div
-                  className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
-                    isUser
-                      ? "message-bubble-user flex-row rounded-tr-md"
-                      : "message-bubble-assistant flex-row rounded-tl-md"
-                  }`}
-                  style={{
-                    backgroundColor: isUser
-                      ? "var(--foco-user-surface)"
-                      : "var(--foco-panel)",
-                    borderColor: isUser
-                      ? "var(--foco-user-border)"
-                      : "var(--foco-border)",
-                  }}
+                  className={`message-row flex ${isUser ? "message-row-user" : "message-row-agent"}`}
+                  key={message.id}
                 >
-                  <div
-                    className={`message-avatar mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${
-                      isUser
-                        ? "bg-teal-950/45 text-white"
-                        : "bg-stone-100 text-stone-700"
-                    }`}
-                  >
-                    {isUser ? (
-                      <User aria-hidden="true" className="size-4" />
-                    ) : (
-                      <Bot aria-hidden="true" className="size-4" />
-                    )}
-                  </div>
-                  <div className="min-w-0 flex-1 space-y-3">
-                    <div className="message-author-row">
-                      <span>{authorLabel}</span>
-                      {!isUser ? (
-                        <button
-                          aria-label={t("Message actions")}
-                          className="message-action-menu"
-                          title={t("Message actions")}
-                          type="button"
-                        >
-                          <MoreHorizontal aria-hidden="true" className="size-4" />
-                        </button>
-                      ) : null}
+                  <div className="message-card-shell">
+                    <div
+                      className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
+                        isUser
+                          ? "message-bubble-user flex-row rounded-tr-md"
+                          : "message-bubble-assistant flex-row rounded-tl-md"
+                      }`}
+                      style={{
+                        backgroundColor: isUser
+                          ? "var(--foco-user-surface)"
+                          : "var(--foco-panel)",
+                        borderColor: isUser
+                          ? "var(--foco-user-border)"
+                          : "var(--foco-border)",
+                      }}
+                    >
+                      <div
+                        className={`message-avatar mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${
+                          isUser
+                            ? "bg-teal-950/45 text-white"
+                            : "bg-stone-100 text-stone-700"
+                        }`}
+                      >
+                        {isUser ? (
+                          <User aria-hidden="true" className="size-4" />
+                        ) : (
+                          <Bot aria-hidden="true" className="size-4" />
+                        )}
+                      </div>
+                      <div className="min-w-0 flex-1 space-y-3">
+                        <div className="message-author-row">
+                          <span className="message-author-meta">
+                            <span>{authorLabel}</span>
+                            <time
+                              className="message-created-at"
+                              dateTime={message.createdAt}
+                              title={message.createdAt}
+                            >
+                              {createdAtLabel}
+                            </time>
+                          </span>
+                          {!isUser ? (
+                            <button
+                              aria-label={t("Message actions")}
+                              className="message-action-menu"
+                              title={t("Message actions")}
+                              type="button"
+                            >
+                              <MoreHorizontal
+                                aria-hidden="true"
+                                className="size-4"
+                              />
+                            </button>
+                          ) : null}
+                        </div>
+                        {parts.length ? (
+                          parts.map((part, partIndex) => (
+                            <MessagePartBlock
+                              isError={message.status === "error"}
+                              isStreaming={message.status === "streaming"}
+                              isUser={isUser}
+                              key={`${message.id}-part-${partIndex}`}
+                              part={part}
+                            />
+                          ))
+                        ) : message.status === "streaming" ? (
+                          <LoaderCircle
+                            aria-hidden="true"
+                            className="size-4 animate-spin"
+                          />
+                        ) : null}
+                        {!isUser && message.metrics ? (
+                          <MemoriesUsedBlock memories={message.memoriesUsed} />
+                        ) : null}
+                        {!isUser && message.metrics ? (
+                          <ChatReplyMetricsLine metrics={message.metrics} />
+                        ) : null}
+                      </div>
                     </div>
-                    {parts.length ? (
-                      parts.map((part, partIndex) => (
-                        <MessagePartBlock
-                          isError={message.status === "error"}
-                          isStreaming={message.status === "streaming"}
-                          isUser={isUser}
-                          key={`${message.id}-part-${partIndex}`}
-                          part={part}
-                        />
-                      ))
-                    ) : message.status === "streaming" ? (
-                      <LoaderCircle
-                        aria-hidden="true"
-                        className="size-4 animate-spin"
-                      />
-                    ) : null}
-                    {!isUser && message.metrics ? (
-                      <MemoriesUsedBlock memories={message.memoriesUsed} />
-                    ) : null}
-                    {!isUser && message.metrics ? (
-                      <ChatReplyMetricsLine metrics={message.metrics} />
-                    ) : null}
+                    <button
+                      aria-label={copyLabel}
+                      className="message-copy-button"
+                      disabled={!copyText}
+                      onClick={() =>
+                        void handleCopyMessage(message.id, copyText)
+                      }
+                      title={copyLabel}
+                      type="button"
+                    >
+                      {copiedMessageId === message.id ? (
+                        <CheckCircle2 aria-hidden="true" className="size-3.5" />
+                      ) : (
+                        <Copy aria-hidden="true" className="size-3.5" />
+                      )}
+                    </button>
                   </div>
                 </div>
-              </div>
-            );
+              );
             })
           ) : (
             <div className="empty-chat-state mx-auto flex min-h-[22rem] w-full max-w-xl flex-col items-center justify-center rounded-2xl border border-dashed border-stone-300 bg-white/60 px-6 py-10 text-center shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
@@ -14564,6 +14637,30 @@ function fallbackMessageParts(
     })),
   );
   return parts;
+}
+
+function messageCopyText(
+  message: ShellMessage,
+  parts: ChatMessagePart[],
+): string {
+  const content = message.content.trim();
+  if (content) {
+    return message.content;
+  }
+
+  return parts
+    .map((part) => {
+      if (part.type === "text" || part.type === "reasoning") {
+        return part.text;
+      }
+      if (part.type === "attachment") {
+        return part.attachment.path ?? part.attachment.name;
+      }
+      return `${part.toolCall.name} ${part.toolCall.status}`.trim();
+    })
+    .map((partText) => partText.trim())
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 function normalizedToolCallSummary(

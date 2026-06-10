@@ -470,6 +470,7 @@ const chatMessages = {
   messages: [
     {
       content: "Please inspect README.",
+      createdAt: "2026-06-10T08:00:00.000Z",
       id: "message-user",
       memoriesUsed: [],
       metrics: null,
@@ -480,6 +481,7 @@ const chatMessages = {
     },
     {
       content: "Done.",
+      createdAt: "2026-06-10T08:00:02.000Z",
       id: "message-assistant",
       memoriesUsed: [
         {
@@ -537,6 +539,7 @@ const secondChatMessages = {
   messages: [
     {
       content: "Second question.",
+      createdAt: "2026-06-10T09:00:00.000Z",
       id: "message-user-2",
       memoriesUsed: [],
       metrics: null,
@@ -547,6 +550,7 @@ const secondChatMessages = {
     },
     {
       content: "Second answer.",
+      createdAt: "2026-06-10T09:00:02.000Z",
       id: "message-assistant-2",
       memoriesUsed: [],
       metrics: null,
@@ -726,6 +730,12 @@ describe("App verification surfaces", () => {
     terminalSessionCounter = 0;
     mermaidMock.initialize.mockClear();
     mermaidMock.render.mockClear();
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: vi.fn().mockResolvedValue(undefined),
+      },
+    });
     vi.stubGlobal("fetch", vi.fn(mockFetch));
   });
 
@@ -757,6 +767,34 @@ describe("App verification surfaces", () => {
     expect(assistantBubble?.getAttribute("style")).toContain(
       "border-color: var(--foco-border)",
     );
+    expect(userBubble?.querySelector("time")).toHaveAttribute(
+      "dateTime",
+      "2026-06-10T08:00:00.000Z",
+    );
+    expect(assistantBubble?.querySelector("time")).toHaveAttribute(
+      "dateTime",
+      "2026-06-10T08:00:02.000Z",
+    );
+    const userRow = userBubble?.closest(".message-row") as HTMLElement | null;
+    const assistantRow = assistantBubble?.closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    if (!userRow || !assistantRow) {
+      throw new Error("Expected message rows");
+    }
+    await userEvent.click(
+      within(userRow).getByRole("button", { name: "Copy message" }),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+      "Please inspect README.",
+    );
+    expect(
+      within(userRow).getByRole("button", { name: "Copied message" }),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(assistantRow).getByRole("button", { name: "Copy message" }),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("Done.");
     const reasoningToggle = screen.getByRole("button", {
       name: "Expand thinking",
     });
