@@ -719,9 +719,19 @@ describe("App verification surfaces", () => {
     const assistantBubble = screen.getByText("Done.").closest(".message-bubble");
     expect(userBubble).toHaveClass("message-bubble-user");
     expect(userBubble).not.toHaveClass("bg-teal-800", "text-white");
-    expect(userBubble).toHaveStyle({ backgroundColor: "#d9f4ee" });
+    expect(userBubble?.getAttribute("style")).toContain(
+      "background-color: var(--foco-user-surface)",
+    );
+    expect(userBubble?.getAttribute("style")).toContain(
+      "border-color: var(--foco-user-border)",
+    );
     expect(assistantBubble).toHaveClass("message-bubble-assistant");
-    expect(assistantBubble).toHaveStyle({ backgroundColor: "#ffffff" });
+    expect(assistantBubble?.getAttribute("style")).toContain(
+      "background-color: var(--foco-panel)",
+    );
+    expect(assistantBubble?.getAttribute("style")).toContain(
+      "border-color: var(--foco-border)",
+    );
     const reasoningToggle = screen.getByRole("button", {
       name: "Expand thinking",
     });

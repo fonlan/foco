@@ -4986,9 +4986,11 @@ function ChatPanel({
                       : "message-bubble-assistant flex-row rounded-tl-md"
                   }`}
                   style={{
-                    backgroundColor: isUser ? "#d9f4ee" : "#ffffff",
+                    backgroundColor: isUser
+                      ? "var(--foco-user-surface)"
+                      : "var(--foco-panel)",
                     borderColor: isUser
-                      ? "rgba(20, 118, 103, 0.42)"
+                      ? "var(--foco-user-border)"
                       : "var(--foco-border)",
                   }}
                 >
