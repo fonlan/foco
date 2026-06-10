@@ -980,13 +980,15 @@ body,
   height: 2.25rem;
   align-items: center;
   justify-content: center;
+  overflow: hidden;
+  padding: 0;
   border-radius: 0.625rem;
 }
 
 .foco-nav-logo-button .foco-logo-mark {
-  width: 1.75rem;
-  height: 1.75rem;
-  border-radius: 0.5rem;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
   box-shadow: none;
 }
 
@@ -2446,12 +2448,18 @@ summary:focus-visible {
   background: rgba(255, 255, 255, 0.08);
 }
 
-.foco-nav-logo-button .foco-logo-mark,
 .foco-logo-mark {
   background: #ffffff;
   box-shadow:
     0 10px 24px rgba(0, 0, 0, 0.22),
     0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
+.foco-nav-logo-button .foco-logo-mark {
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  box-shadow: none;
 }
 
 .foco-nav-rail-button {
