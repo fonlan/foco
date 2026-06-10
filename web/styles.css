@@ -1850,6 +1850,8 @@ body,
   align-items: center;
   gap: 0.375rem;
   border-top: 1px solid var(--foco-border);
+  border-bottom-right-radius: inherit;
+  border-bottom-left-radius: inherit;
   background: var(--foco-panel-soft);
   padding: 0.375rem 0.5rem;
 }
