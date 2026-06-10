@@ -109,6 +109,8 @@ const PORT_ENV: &str = "FOCO_PORT";
 const HOST_ENV: &str = "FOCO_HOST";
 // Maximum number of model continuation rounds allowed while executing tool calls in one run.
 const MAX_AGENT_TOOL_ROUNDS: usize = 128;
+// Maximum identical tool-call batches allowed before treating the run as a loop.
+const MAX_REPEATED_TOOL_CALL_BATCHES: usize = 3;
 // Number of newest chat messages kept verbatim when older history is compressed.
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 // Maximum characters kept from each covered message inside a compression snapshot summary.
@@ -4353,6 +4355,60 @@ struct ToolHookOutcome {
     hook_summary: HookRunSummary,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct ToolCallLoopSignature {
+    name: String,
+    arguments: Value,
+}
+
+#[derive(Default)]
+struct RepeatedToolCallDetector {
+    previous_batch: Option<Vec<ToolCallLoopSignature>>,
+    consecutive_count: usize,
+}
+
+impl RepeatedToolCallDetector {
+    fn check(&mut self, tool_calls: &[NeutralToolCall]) -> Result<(), String> {
+        let batch = tool_call_loop_signatures(tool_calls);
+        if self.previous_batch.as_ref() == Some(&batch) {
+            self.consecutive_count += 1;
+        } else {
+            self.previous_batch = Some(batch);
+            self.consecutive_count = 1;
+        }
+
+        if self.consecutive_count < MAX_REPEATED_TOOL_CALL_BATCHES {
+            return Ok(());
+        }
+
+        let tool_names = self
+            .previous_batch
+            .as_ref()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|signature| signature.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+
+        Err(format!(
+            "agent run repeated the same tool call batch {MAX_REPEATED_TOOL_CALL_BATCHES} times ({tool_names}); possible tool-call loop"
+        ))
+    }
+}
+
+fn tool_call_loop_signatures(tool_calls: &[NeutralToolCall]) -> Vec<ToolCallLoopSignature> {
+    tool_calls
+        .iter()
+        .map(|tool_call| ToolCallLoopSignature {
+            name: tool_call.name.clone(),
+            arguments: tool_call.arguments.clone(),
+        })
+        .collect()
+}
+
 struct ToolExecutionWithHooks {
     execution: ToolExecution,
     hook_summary: HookRunSummary,
@@ -4389,6 +4445,7 @@ impl PreparedChatContext {
             let mut first_token_at = None;
             let mut first_token_latency_ms = None;
             let mut seen_tool_call_ids = HashSet::new();
+            let mut repeated_tool_call_detector = RepeatedToolCallDetector::default();
             let mut executed_tool_calls = Vec::new();
             let mut provider_completions = Vec::new();
             let mut total_usage = NeutralUsage::default();
@@ -4907,6 +4964,31 @@ impl PreparedChatContext {
                             let pending_tool_calls = pending_tool_calls(&tool_calls);
                             if let Err(error) = detect_same_file_write_conflicts(&pending_tool_calls) {
                                 let message = error.to_string();
+                                let event = ChatSseEvent::Error {
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+
+                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
+                                    let event = ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                    yield Ok(sse_event(&event));
+                                } else {
+                                    yield Ok(sse_event(&event));
+                                }
+
+                                return;
+                            }
+                            if let Err(message) = repeated_tool_call_detector.check(&tool_calls) {
                                 let event = ChatSseEvent::Error {
                                     message: message.clone(),
                                 };
@@ -13737,6 +13819,15 @@ mod tests {
 
     use foco_store::config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
+    fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
+        NeutralToolCall {
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            arguments,
+            thought_signatures: None,
+        }
+    }
+
     #[test]
     fn password_hash_verifies_only_matching_password() {
         let password_hash = hash_password("secret").expect("password hash");
@@ -13784,6 +13875,83 @@ mod tests {
         let error = tray_menu_labels("fr").expect_err("unsupported language should fail");
 
         assert!(error.contains("app language 'fr' is unsupported"));
+    }
+
+    #[test]
+    fn repeated_tool_call_detector_rejects_third_identical_batch() {
+        let mut detector = RepeatedToolCallDetector::default();
+
+        assert!(
+            detector
+                .check(&[test_neutral_tool_call(
+                    "call-1",
+                    "read_file",
+                    json!({ "path": "README.md" }),
+                )])
+                .is_ok()
+        );
+        assert!(
+            detector
+                .check(&[test_neutral_tool_call(
+                    "call-2",
+                    "read_file",
+                    json!({ "path": "README.md" }),
+                )])
+                .is_ok()
+        );
+
+        let error = detector
+            .check(&[test_neutral_tool_call(
+                "call-3",
+                "read_file",
+                json!({ "path": "README.md" }),
+            )])
+            .expect_err("third identical batch should be rejected");
+
+        assert!(error.contains("agent run repeated the same tool call batch 3 times"));
+        assert!(error.contains("read_file"));
+    }
+
+    #[test]
+    fn repeated_tool_call_detector_resets_when_arguments_change() {
+        let mut detector = RepeatedToolCallDetector::default();
+
+        assert!(
+            detector
+                .check(&[test_neutral_tool_call(
+                    "call-1",
+                    "read_file",
+                    json!({ "path": "README.md" }),
+                )])
+                .is_ok()
+        );
+        assert!(
+            detector
+                .check(&[test_neutral_tool_call(
+                    "call-2",
+                    "read_file",
+                    json!({ "path": "README.md" }),
+                )])
+                .is_ok()
+        );
+        assert!(
+            detector
+                .check(&[test_neutral_tool_call(
+                    "call-3",
+                    "read_file",
+                    json!({ "path": "CHANGELOG.md" }),
+                )])
+                .is_ok()
+        );
+        assert!(
+            detector
+                .check(&[test_neutral_tool_call(
+                    "call-4",
+                    "read_file",
+                    json!({ "path": "CHANGELOG.md" }),
+                )])
+                .is_ok()
+        );
     }
 
     #[test]
