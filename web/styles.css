@@ -2331,15 +2331,18 @@ body,
   height: 100dvh;
   min-height: 0;
   overflow: hidden;
+  grid-template-areas: "nav main";
   grid-template-columns: 3rem minmax(0, 1fr);
   background: var(--foco-canvas);
 }
 
 .global-shell .foco-nav-rail {
+  grid-area: nav;
   display: flex;
 }
 
 .global-main-panel {
+  grid-area: main;
   height: 100%;
   min-height: 0;
   overflow: hidden;
