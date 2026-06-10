@@ -2,7 +2,7 @@ use std::{
     fmt, fs, io,
     io::Read,
     path::{Component, Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::{Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
@@ -119,9 +119,25 @@ pub fn execute_builtin_tool_for_chat(
             is_error: false,
         },
         Err(error) => ToolExecution {
-            output: json!({ "error": error.to_string() }),
+            output: tool_error_output(&error),
             is_error: true,
         },
+    }
+}
+
+fn tool_error_output(error: &ToolRuntimeError) -> Value {
+    match error {
+        ToolRuntimeError::CommandTimedOut {
+            command,
+            pid,
+            timeout_ms,
+        } => json!({
+            "error": error.to_string(),
+            "command": command,
+            "pid": pid,
+            "timeoutMs": timeout_ms
+        }),
+        _ => json!({ "error": error.to_string() }),
     }
 }
 
@@ -720,6 +736,7 @@ fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         "command": command,
         "args": args,
         "cwd": relative_workspace_path(workspace_path, &cwd)?,
+        "pid": output.pid,
         "status": output.status.code(),
         "success": output.status.success(),
         "stdout": stdout,
@@ -1744,7 +1761,7 @@ fn run_command_with_timeout(
     args: &[String],
     cwd: &Path,
     timeout: Duration,
-) -> Result<Output, ToolRuntimeError> {
+) -> Result<CommandRunOutput, ToolRuntimeError> {
     let command_label = command_label(command, args);
     let mut command_process = Command::new(command);
     command_process
@@ -1761,6 +1778,7 @@ fn run_command_with_timeout(
             command: command_label.clone(),
             source,
         })?;
+    let pid = child.id();
     let stdout = child.stdout.take().ok_or_else(|| {
         ToolRuntimeError::InvalidArguments("failed to capture stdout".to_string())
     })?;
@@ -1779,7 +1797,8 @@ fn run_command_with_timeout(
                 source,
             })?
         {
-            return Ok(Output {
+            return Ok(CommandRunOutput {
+                pid,
                 status,
                 stdout: join_command_reader(&command_label, stdout_handle)?,
                 stderr: join_command_reader(&command_label, stderr_handle)?,
@@ -1795,12 +1814,20 @@ fn run_command_with_timeout(
 
             return Err(ToolRuntimeError::CommandTimedOut {
                 command: command_label,
+                pid,
                 timeout_ms,
             });
         }
 
         thread::sleep(Duration::from_millis(COMMAND_WAIT_POLL_MS));
     }
+}
+
+struct CommandRunOutput {
+    pid: u32,
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 fn read_command_pipe<T>(mut pipe: T) -> thread::JoinHandle<io::Result<Vec<u8>>>
@@ -2610,6 +2637,7 @@ enum ToolRuntimeError {
     },
     CommandTimedOut {
         command: String,
+        pid: u32,
         timeout_ms: u64,
     },
     CommandFailed {
@@ -2647,8 +2675,12 @@ impl fmt::Display for ToolRuntimeError {
             }
             Self::CommandTimedOut {
                 command,
+                pid,
                 timeout_ms,
-            } => write!(formatter, "{command} timed out after {timeout_ms} ms"),
+            } => write!(
+                formatter,
+                "{command} (pid {pid}) timed out after {timeout_ms} ms"
+            ),
             Self::CommandFailed {
                 command,
                 status,
@@ -3460,6 +3492,14 @@ mod tests {
         assert!(!status.is_error);
         assert!(!diff.is_error);
         assert!(
+            status.output["pid"].as_u64().expect("status pid") > 0,
+            "run_command should include the spawned process pid"
+        );
+        assert!(
+            diff.output["pid"].as_u64().expect("diff pid") > 0,
+            "run_command should include the spawned process pid"
+        );
+        assert!(
             status.output["stdout"]
                 .as_str()
                 .expect("status")
@@ -3499,6 +3539,10 @@ mod tests {
         );
 
         assert!(result.is_error);
+        assert!(
+            result.output["pid"].as_u64().expect("timeout pid") > 0,
+            "timed out run_command should include the spawned process pid"
+        );
         assert!(
             result
                 .output
