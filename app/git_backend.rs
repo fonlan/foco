@@ -301,10 +301,7 @@ fn unstaged_diff_text(
         .map_err(|source| ApiError::internal(format!("failed to read git index: {source}")))?;
     let mut diff = String::new();
 
-    for entry in entries
-        .iter()
-        .filter(|entry| entry.worktree_status != ' ' && entry.worktree_status != '?')
-    {
+    for entry in entries.iter().filter(|entry| entry.worktree_status != ' ') {
         let old = blob_from_index(repo, &index, &entry.repo_path)?;
         let new = blob_from_worktree(repo, &entry.repo_path)?;
         append_file_diff(
@@ -333,7 +330,7 @@ fn append_file_diff(
     }
 
     output.push_str(&format!("diff --git a/{repo_path} b/{repo_path}\n"));
-    if old.contains(&0) || new.contains(&0) {
+    if is_binary_or_non_text(old) || is_binary_or_non_text(new) {
         output.push_str(&format!(
             "Binary files a/{repo_path} and b/{repo_path} differ\n"
         ));
@@ -365,6 +362,10 @@ fn append_file_diff(
     output.push_str(&String::from_utf8_lossy(&hunks));
 
     Ok(())
+}
+
+fn is_binary_or_non_text(bytes: &[u8]) -> bool {
+    bytes.contains(&0) || std::str::from_utf8(bytes).is_err()
 }
 
 fn blob_from_tree(
@@ -604,4 +605,27 @@ fn repo_path_to_path_buf(repo_path: &str) -> PathBuf {
 
 fn path_to_slash_string(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_includes_untracked_text_files() {
+        let temp = tempfile::tempdir().expect("temp repo");
+        gix::init(temp.path()).expect("init git repo");
+        std::fs::write(temp.path().join("note.txt"), "new note\n").expect("write untracked file");
+
+        let response =
+            git_diff_response(temp.path(), Some("note.txt".to_string())).expect("read git diff");
+
+        assert_eq!(response.files.len(), 1);
+        assert_eq!(response.files[0].index_status, "?");
+        assert_eq!(response.files[0].worktree_status, "?");
+        assert!(response.diff.contains("diff --git a/note.txt b/note.txt"));
+        assert!(response.diff.contains("--- /dev/null"));
+        assert!(response.diff.contains("+++ b/note.txt"));
+        assert!(response.diff.contains("+new note"));
+    }
 }

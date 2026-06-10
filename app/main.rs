@@ -5224,10 +5224,7 @@ async fn prepare_prompt_context(
         .iter()
         .find(|provider| provider.id == active_provider_id)
         .ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "provider '{}' was not found",
-                active_provider_id
-            ))
+            ApiError::bad_request(format!("provider '{}' was not found", active_provider_id))
         })?;
 
     if !provider.enabled {
@@ -15982,6 +15979,7 @@ Use the existing product UI conventions.
             PromptContextRequest {
                 chat_id: None,
                 model_id: "model".to_string(),
+                provider_id: None,
                 thinking_level: None,
                 skill_ids: None,
                 message: Some("hello".to_string()),
@@ -16129,6 +16127,7 @@ Use the existing product UI conventions.
             PromptContextRequest {
                 chat_id: Some("chat-1".to_string()),
                 model_id: "model".to_string(),
+                provider_id: None,
                 thinking_level: None,
                 skill_ids: None,
                 message: Some("renderer prompt assembly".to_string()),
@@ -16260,6 +16259,7 @@ Use the existing product UI conventions.
             PromptContextRequest {
                 chat_id: None,
                 model_id: "model".to_string(),
+                provider_id: None,
                 thinking_level: None,
                 skill_ids: None,
                 message: Some("Preview usage".to_string()),

@@ -428,17 +428,42 @@ const savedModelMetadata = {
 };
 
 const gitDiff = {
-  diff: "diff --git a/README.md b/README.md\n+hello\n",
+  diff: [
+    "diff --git a/README.md b/README.md",
+    "--- a/README.md",
+    "+++ b/README.md",
+    "@@ -1 +1 @@",
+    "-hello",
+    "+hello world",
+    "diff --git a/new-note.txt b/new-note.txt",
+    "--- /dev/null",
+    "+++ b/new-note.txt",
+    "@@ -0,0 +1 @@",
+    "+new note",
+    "diff --git a/asset.bin b/asset.bin",
+    "Binary files a/asset.bin and b/asset.bin differ",
+    "",
+  ].join("\n"),
   files: [
     {
       indexStatus: "M",
       path: "README.md",
       worktreeStatus: "M",
     },
+    {
+      indexStatus: "?",
+      path: "new-note.txt",
+      worktreeStatus: "?",
+    },
+    {
+      indexStatus: " ",
+      path: "asset.bin",
+      worktreeStatus: "M",
+    },
   ],
   path: null,
   stagedDiff: "",
-  status: " M README.md\n",
+  status: " M README.md\n?? new-note.txt\n M asset.bin\n",
 };
 
 const chatMessages = {
@@ -1788,7 +1813,12 @@ describe("App verification surfaces", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
     expect(await screen.findByText("README.md")).toBeInTheDocument();
-    expect(screen.getByText(/\+hello/)).toBeInTheDocument();
+    expect(screen.queryByText(/hello world/)).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /README\.md M/ }));
+
+    expect(await screen.findByText(/hello world/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /new-note\.txt U/ })).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Open terminal" }));
 
@@ -1851,17 +1881,37 @@ describe("App verification surfaces", () => {
 
     expect(await screen.findByText("Inspect workspace changes")).toBeInTheDocument();
     expect(screen.getByText("README.md diff is visible")).toBeInTheDocument();
-    expect(screen.queryByText(/\+hello/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/hello world/)).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
     expect(screen.getByText("Git diff")).toBeInTheDocument();
-    expect(screen.getByText(/\+hello/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /README\.md M/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /new-note\.txt U/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /asset\.bin M/ })).toBeInTheDocument();
+    expect(screen.queryByText(/hello world/)).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: /README\.md M/ }));
+
+    expect(await screen.findByText(/hello world/)).toBeInTheDocument();
     expect(screen.queryByText("Inspect workspace changes")).not.toBeInTheDocument();
 
     await act(async () => {
       activeChatStreamController?.close();
     });
+  });
+
+  it("shows an inline diff notice for binary changed files", async () => {
+    render(<App />);
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Git" }));
+    await userEvent.click(await screen.findByRole("button", { name: /asset\.bin M/ }));
+
+    expect(
+      await screen.findByText("Inline diff is unavailable for binary or non-text files."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Binary files a/asset.bin and b/asset.bin differ")).not.toBeInTheDocument();
   });
 
   it("opens the task graph sidebar when a task graph refresh arrives", async () => {
@@ -2109,7 +2159,26 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
 
   if (path === "/api/workspaces/workspace-1/git/diff") {
-    return jsonResponse(gitDiff);
+    const selectedPath = requestUrl.searchParams.get("path");
+    if (!selectedPath) {
+      return jsonResponse(gitDiff);
+    }
+
+    const file = gitDiff.files.find((summary) => summary.path === selectedPath);
+    const escapedPath = selectedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const sectionMatch = gitDiff.diff.match(
+      new RegExp(`diff --git a/${escapedPath} b/${escapedPath}[\\s\\S]*?(?=diff --git a/|$)`),
+    );
+
+    return jsonResponse({
+      ...gitDiff,
+      diff: sectionMatch?.[0] ?? "",
+      files: gitDiff.files,
+      path: selectedPath,
+      status: file
+        ? `${file.indexStatus}${file.worktreeStatus} ${file.path}\n`
+        : gitDiff.status,
+    });
   }
 
   if (path === "/api/workspaces/workspace-1/context-usage") {

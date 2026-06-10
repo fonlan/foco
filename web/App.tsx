@@ -1169,6 +1169,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "All changed files": "全部变更文件",
     "No changes": "无变更",
     "No diff": "无 diff",
+    Staged: "已暂存",
+    Unstaged: "未暂存",
+    "Inline diff is unavailable for binary or non-text files.":
+      "二进制或非文本文件无法展示 inline diff。",
     General: "常规",
     Providers: "供应商",
     Models: "模型",
@@ -1678,7 +1682,6 @@ export function App() {
     [settings],
   );
   const thinkingLevels = settings?.thinkingLevels ?? [];
-  const selectedDiffText = formatDiffText(gitDiff);
   const isTerminalOpen = activeWorkspace
     ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
     : false;
@@ -1861,17 +1864,7 @@ export function App() {
         `/api/workspaces/${encodeURIComponent(workspaceId)}/git/diff${query}`,
       );
       setGitDiff(data);
-      setSelectedDiffPath((current) => {
-        if (path) {
-          return path;
-        }
-
-        if (current && data.files.some((file) => file.path === current)) {
-          return current;
-        }
-
-        return null;
-      });
+      setSelectedDiffPath(path && data.files.some((file) => file.path === path) ? path : null);
     } catch (requestError) {
       setGitDiff(null);
       setDiffError(errorMessage(requestError));
@@ -3622,7 +3615,7 @@ export function App() {
               contextMemories={contextMemories}
               contextMemoryError={contextMemoryError}
               diffError={diffError}
-              diffText={selectedDiffText}
+              diffResponse={gitDiff}
               files={gitDiff?.files ?? []}
               isLoadingDiff={isLoadingDiff}
               isLoadingContextMemories={isLoadingContextMemories}
@@ -7399,7 +7392,7 @@ function ContextPanel({
   contextMemories,
   contextMemoryError,
   diffError,
-  diffText,
+  diffResponse,
   files,
   isLoadingContextMemories,
   isLoadingDiff,
@@ -7415,7 +7408,7 @@ function ContextPanel({
   contextMemories: ContextMemoryState;
   contextMemoryError: string | null;
   diffError: string | null;
-  diffText: string;
+  diffResponse: GitDiffResponse | null;
   files: GitStatusFileSummary[];
   isLoadingContextMemories: boolean;
   isLoadingDiff: boolean;
@@ -7470,7 +7463,7 @@ function ContextPanel({
           <div className="min-h-0 flex-1">
             <GitDiffPanel
               diffError={diffError}
-              diffText={diffText}
+              diffResponse={diffResponse}
               files={files}
               isLoading={isLoadingDiff}
               onRefresh={onRefreshDiff}
@@ -7681,7 +7674,7 @@ function TaskGraphTaskItem({
 
 function GitDiffPanel({
   diffError,
-  diffText,
+  diffResponse,
   files,
   isLoading,
   onRefresh,
@@ -7689,7 +7682,7 @@ function GitDiffPanel({
   selectedPath,
 }: {
   diffError: string | null;
-  diffText: string;
+  diffResponse: GitDiffResponse | null;
   files: GitStatusFileSummary[];
   isLoading: boolean;
   onRefresh: () => void;
@@ -7697,6 +7690,7 @@ function GitDiffPanel({
   selectedPath: string | null;
 }) {
   const { t } = useI18n();
+  const diffSections = parseGitDiffSections(diffResponse);
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col">
@@ -7736,7 +7730,7 @@ function GitDiffPanel({
         </div>
       ) : null}
 
-      <div className="border-b border-stone-200/80 px-3 py-3">
+      <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3">
         <button
           className={diffFileButtonClass(selectedPath === null)}
           onClick={() => onSelectFile(null)}
@@ -7745,23 +7739,42 @@ function GitDiffPanel({
           <span className="truncate">{t("All changed files")}</span>
           <span className="text-xs text-stone-500">{files.length}</span>
         </button>
-        <div className="panel-scroll mt-2 max-h-56 space-y-1 overflow-y-auto">
+        <div className="mt-2 space-y-1">
           {files.length ? (
-            files.map((file) => (
-              <button
-                className={diffFileButtonClass(selectedPath === file.path)}
-                key={file.path}
-                onClick={() => onSelectFile(file.path)}
-                type="button"
-              >
-                <span className="min-w-0 flex-1 truncate text-left">
-                  {file.path}
-                </span>
-                <span className="shrink-0 rounded-md bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600">
-                  {statusLabel(file)}
-                </span>
-              </button>
-            ))
+            files.map((file) => {
+              const isExpanded = selectedPath === file.path;
+              const label = statusLabel(file);
+
+              return (
+                <div key={file.path}>
+                  <button
+                    aria-label={`${file.path} ${label}`}
+                    className={diffFileButtonClass(isExpanded)}
+                    onClick={() => onSelectFile(isExpanded ? null : file.path)}
+                    type="button"
+                  >
+                    {isExpanded ? (
+                      <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
+                    ) : (
+                      <ChevronRight aria-hidden="true" className="size-3.5 shrink-0" />
+                    )}
+                    <span className="min-w-0 flex-1 truncate text-left">
+                      {file.path}
+                    </span>
+                    <span className="shrink-0 rounded-md bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600">
+                      {label}
+                    </span>
+                  </button>
+                  {isExpanded ? (
+                    <InlineGitDiff
+                      isLoading={isLoading}
+                      path={file.path}
+                      sections={diffSections}
+                    />
+                  ) : null}
+                </div>
+              );
+            })
           ) : (
             <div className="rounded-lg border border-dashed border-stone-300 bg-stone-50/80 px-3 py-3 text-sm text-stone-500">
               {t("No changes")}
@@ -7769,12 +7782,88 @@ function GitDiffPanel({
           )}
         </div>
       </div>
+    </div>
+  );
+}
 
-      <div className="panel-scroll min-h-0 flex-1 overflow-auto bg-[#16130f]">
-        <pre className="min-h-full whitespace-pre-wrap break-words px-4 py-4 font-mono text-[11px] leading-5 text-stone-100">
-          {diffText || t("No diff")}
-        </pre>
+function InlineGitDiff({
+  isLoading,
+  path,
+  sections,
+}: {
+  isLoading: boolean;
+  path: string;
+  sections: GitDiffSection[];
+}) {
+  const { t } = useI18n();
+  const matchingSections = sections
+    .map((section) => ({
+      ...section,
+      files: section.files.filter((file) => file.path === path),
+    }))
+    .filter((section) => section.files.length > 0);
+
+  if (isLoading) {
+    return (
+      <div className="ml-5 mt-1 flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 py-3 text-xs font-medium text-stone-500">
+        <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+        {t("Loading...")}
       </div>
+    );
+  }
+
+  if (!matchingSections.length) {
+    return (
+      <div className="ml-5 mt-1">
+        <InlineGitDiffNotice>
+          {t("Inline diff is unavailable for binary or non-text files.")}
+        </InlineGitDiffNotice>
+      </div>
+    );
+  }
+
+  return (
+    <div className="ml-5 mt-1 space-y-2">
+      {matchingSections.map((section) => (
+        <div key={section.kind} className="space-y-2">
+          <div className="text-[11px] font-semibold uppercase text-stone-500">
+            {t(section.kind === "staged" ? "Staged" : "Unstaged")}
+          </div>
+          {section.files.map((file) =>
+            file.isBinary || file.lines.length === 0 ? (
+              <InlineGitDiffNotice key={`${section.kind}-${file.path}`}>
+                {t("Inline diff is unavailable for binary or non-text files.")}
+              </InlineGitDiffNotice>
+            ) : (
+              <div
+                className="overflow-x-auto rounded-lg border border-stone-200 bg-white py-2 font-mono text-[11px] leading-5 shadow-sm"
+                key={`${section.kind}-${file.path}`}
+              >
+                {file.lines.map((line, index) => (
+                  <div
+                    className={diffLineClass(line.kind)}
+                    key={`${section.kind}-${file.path}-${index}`}
+                  >
+                    <span className="select-none pr-2 text-stone-400">
+                      {line.prefix}
+                    </span>
+                    <span>{line.text || " "}</span>
+                  </div>
+                ))}
+              </div>
+            ),
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function InlineGitDiffNotice({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-3 text-xs font-medium text-stone-500">
+      <FileText aria-hidden="true" className="size-3.5 shrink-0" />
+      <span>{children}</span>
     </div>
   );
 }
@@ -14859,30 +14948,167 @@ function priceText(value: number | null) {
   return value === null ? "n/a" : `$${value}`;
 }
 
-function formatDiffText(diff: GitDiffResponse | null) {
-  if (!diff) {
+function statusLabel(file: GitStatusFileSummary) {
+  const statuses = [file.indexStatus, file.worktreeStatus]
+    .map(normalizeGitStatus)
+    .filter(Boolean);
+  const uniqueStatuses = [...new Set(statuses)];
+
+  return uniqueStatuses.length ? uniqueStatuses.join("") : ".";
+}
+
+function normalizeGitStatus(status: string) {
+  const trimmed = status.trim();
+  if (!trimmed) {
     return "";
   }
 
-  const parts: string[] = [];
-
-  if (diff.stagedDiff.trim()) {
-    parts.push(`# staged\n${diff.stagedDiff.trimEnd()}`);
-  }
-
-  if (diff.diff.trim()) {
-    parts.push(`# unstaged\n${diff.diff.trimEnd()}`);
-  }
-
-  if (!parts.length && diff.status.trim()) {
-    parts.push(diff.status.trimEnd());
-  }
-
-  return parts.join("\n\n");
+  return trimmed === "?" ? "U" : trimmed;
 }
 
-function statusLabel(file: GitStatusFileSummary) {
-  return `${file.indexStatus}${file.worktreeStatus}`.replaceAll(" ", ".");
+type GitDiffSection = {
+  kind: "staged" | "unstaged";
+  files: GitDiffFile[];
+};
+
+type GitDiffFile = {
+  isBinary: boolean;
+  lines: GitDiffLine[];
+  path: string;
+};
+
+type GitDiffLine = {
+  kind: "add" | "context" | "hunk" | "meta" | "remove";
+  prefix: string;
+  text: string;
+};
+
+function parseGitDiffSections(diff: GitDiffResponse | null): GitDiffSection[] {
+  if (!diff) {
+    return [];
+  }
+
+  return [
+    { kind: "staged" as const, text: diff.stagedDiff },
+    { kind: "unstaged" as const, text: diff.diff },
+  ]
+    .map(({ kind, text }) => ({
+      kind,
+      files: parseGitDiffFiles(text),
+    }))
+    .filter((section) => section.files.length > 0);
+}
+
+function parseGitDiffFiles(diffText: string): GitDiffFile[] {
+  const files: GitDiffFile[] = [];
+  let current: GitDiffFile | null = null;
+
+  for (const line of diffText.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      if (current) {
+        files.push(current);
+      }
+      current = {
+        isBinary: false,
+        lines: [],
+        path: pathFromDiffHeader(line) ?? "",
+      };
+      continue;
+    }
+
+    if (!current) {
+      continue;
+    }
+
+    if (line.startsWith("Binary files ")) {
+      current.isBinary = true;
+      continue;
+    }
+
+    if (line.startsWith("--- ") || line.startsWith("+++ ")) {
+      const path = pathFromDiffMarker(line);
+      if (path) {
+        current.path = path;
+      }
+      continue;
+    }
+
+    if (line.startsWith("@@")) {
+      current.lines.push({ kind: "hunk", prefix: "", text: line });
+      continue;
+    }
+
+    if (line.startsWith("+")) {
+      current.lines.push({ kind: "add", prefix: "+", text: line.slice(1) });
+      continue;
+    }
+
+    if (line.startsWith("-")) {
+      current.lines.push({ kind: "remove", prefix: "-", text: line.slice(1) });
+      continue;
+    }
+
+    if (line.startsWith(" ")) {
+      current.lines.push({ kind: "context", prefix: " ", text: line.slice(1) });
+      continue;
+    }
+
+    if (line.startsWith("\\")) {
+      current.lines.push({ kind: "meta", prefix: "", text: line });
+    }
+  }
+
+  if (current) {
+    files.push(current);
+  }
+
+  return files.filter((file) => file.path);
+}
+
+function pathFromDiffHeader(line: string) {
+  const prefix = "diff --git a/";
+  if (!line.startsWith(prefix)) {
+    return null;
+  }
+
+  const rest = line.slice(prefix.length);
+  const nextMarker = rest.indexOf(" b/");
+  return nextMarker >= 0 ? rest.slice(0, nextMarker) : rest;
+}
+
+function pathFromDiffMarker(line: string) {
+  const marker = line.slice(4);
+  if (marker === "/dev/null") {
+    return null;
+  }
+
+  if (marker.startsWith("a/") || marker.startsWith("b/")) {
+    return marker.slice(2);
+  }
+
+  return marker;
+}
+
+function diffLineClass(kind: GitDiffLine["kind"]) {
+  const base = "flex min-w-max px-3";
+
+  if (kind === "add") {
+    return `${base} bg-emerald-50 text-emerald-950`;
+  }
+
+  if (kind === "remove") {
+    return `${base} bg-rose-50 text-rose-950`;
+  }
+
+  if (kind === "hunk") {
+    return `${base} bg-sky-50 text-sky-900`;
+  }
+
+  if (kind === "meta") {
+    return `${base} text-stone-500`;
+  }
+
+  return `${base} text-stone-700`;
 }
 
 function terminalStatusText(
