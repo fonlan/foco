@@ -39,6 +39,8 @@ import {
   Server,
   Settings,
   SlidersHorizontal,
+  SquareTerminal,
+  SunMoon,
   Terminal,
   Trash2,
   Upload,
@@ -2047,12 +2049,16 @@ export function App() {
       setIsResizingDiffPanel(false);
     }
 
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
     document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
     window.addEventListener("pointermove", handlePointerMove);
     window.addEventListener("pointerup", handlePointerUp);
 
     return () => {
-      document.body.style.cursor = "";
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
@@ -3239,7 +3245,7 @@ export function App() {
             <div className="workspace-sidebar-header flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
               <div className="min-w-0">
                 <span className="workspace-sidebar-title">
-                  WORKSPACES
+                  {t("Workspaces")}
                 </span>
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
@@ -3532,7 +3538,7 @@ export function App() {
                           isTerminalOpen ? "terminal-status-dot-running" : ""
                         }`}
                       />
-                      <Terminal aria-hidden="true" className="size-4" />
+                      <SquareTerminal aria-hidden="true" className="size-4" />
                     </button>
                     <button
                       aria-label={
@@ -3619,7 +3625,7 @@ export function App() {
             <div
               aria-label={t("Resize context panel")}
               aria-orientation="vertical"
-              className="absolute bottom-0 left-0 top-0 z-10 hidden w-1 cursor-col-resize bg-transparent hover:bg-teal-500/40 lg:block"
+              className="context-sidebar-splitter absolute bottom-0 left-0 top-0 z-10 hidden w-1 cursor-col-resize bg-transparent hover:bg-teal-500/40 lg:block"
               onKeyDown={(event) => {
                 if (event.key === "ArrowLeft") {
                   event.preventDefault();
@@ -3635,7 +3641,10 @@ export function App() {
                   );
                 }
               }}
-              onPointerDown={() => setIsResizingDiffPanel(true)}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                setIsResizingDiffPanel(true);
+              }}
               role="separator"
               tabIndex={0}
             />
@@ -4705,7 +4714,7 @@ function FocoNavRail({
         />
         <NavRailButton
           active={false}
-          icon={Globe}
+          icon={SunMoon}
           label={t("Theme")}
           onClick={onReturnHome}
         />
@@ -4973,9 +4982,15 @@ function ChatPanel({
                 <div
                   className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
                     isUser
-                      ? "message-bubble-user flex-row rounded-tr-md border-teal-700 bg-teal-800 text-white"
-                      : "message-bubble-assistant flex-row rounded-tl-md border-stone-200 bg-white/90 text-stone-900"
+                      ? "message-bubble-user flex-row rounded-tr-md"
+                      : "message-bubble-assistant flex-row rounded-tl-md"
                   }`}
+                  style={{
+                    backgroundColor: isUser ? "#d9f4ee" : "#ffffff",
+                    borderColor: isUser
+                      ? "rgba(20, 118, 103, 0.42)"
+                      : "var(--foco-border)",
+                  }}
                 >
                   <div
                     className={`message-avatar mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${
@@ -9596,7 +9611,12 @@ function SettingsPanel({
   return (
     <div className="settings-shell panel-scroll min-h-0 flex-1 overflow-y-auto">
       <div className="settings-layout grid">
-        <aside className="settings-section-nav-card border-stone-200 bg-white p-2">
+        <aside className="settings-section-nav-card flex min-h-0 flex-col border-stone-200 bg-white p-2">
+          <div className="settings-sidebar-header workspace-sidebar-header flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
+            <div className="min-w-0">
+              <span className="workspace-sidebar-title">{t("Settings")}</span>
+            </div>
+          </div>
           <nav
             aria-label={t("Settings")}
             className="settings-section-nav flex flex-col gap-1.5"

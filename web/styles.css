@@ -1220,6 +1220,11 @@ summary:focus-visible {
   background: var(--foco-panel-muted);
 }
 
+.context-sidebar-splitter {
+  touch-action: none;
+  user-select: none;
+}
+
 .terminal-panel {
   border-color: #172033;
   background: #0d1320;
@@ -2467,9 +2472,19 @@ body,
 .message-bubble-user,
 .message-bubble-assistant {
   border-color: var(--foco-border);
-  background: var(--foco-panel);
   color: var(--foco-text);
   box-shadow: 0 10px 26px rgba(17, 24, 39, 0.035);
+}
+
+.message-bubble-assistant {
+  border-color: var(--foco-border);
+  background: #ffffff;
+}
+
+.message-bubble-user {
+  border-color: rgba(20, 118, 103, 0.42);
+  background: #d9f4ee;
+  box-shadow: 0 12px 30px rgba(20, 118, 103, 0.12);
 }
 
 .message-bubble-user .message-avatar,
@@ -2559,12 +2574,19 @@ body,
   border-width: 0 1px 0 0;
   border-radius: 0;
   background: #ffffff;
+  padding: 0;
   box-shadow: none;
 }
 
+.settings-sidebar-header {
+  flex: 0 0 var(--foco-header-height);
+}
+
 .settings-section-nav {
-  height: 100%;
-  padding-top: 0.5rem;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 0.5rem;
 }
 
 .settings-layout > .min-w-0 {
@@ -2629,6 +2651,8 @@ body,
   .message-composer-control-row > .composer-branch-select {
     width: 2rem;
     min-width: 2rem;
+    max-width: 2rem;
+    flex: 0 0 2rem;
     padding-inline: 0;
     justify-content: center;
   }

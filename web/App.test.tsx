@@ -713,6 +713,15 @@ describe("App verification surfaces", () => {
     await userEvent.click(screen.getByText("Tool run"));
 
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    const userBubble = screen
+      .getByText("Please inspect README.")
+      .closest(".message-bubble");
+    const assistantBubble = screen.getByText("Done.").closest(".message-bubble");
+    expect(userBubble).toHaveClass("message-bubble-user");
+    expect(userBubble).not.toHaveClass("bg-teal-800", "text-white");
+    expect(userBubble).toHaveStyle({ backgroundColor: "#d9f4ee" });
+    expect(assistantBubble).toHaveClass("message-bubble-assistant");
+    expect(assistantBubble).toHaveStyle({ backgroundColor: "#ffffff" });
     const reasoningToggle = screen.getByRole("button", {
       name: "Expand thinking",
     });
@@ -793,6 +802,29 @@ describe("App verification surfaces", () => {
 
     await waitFor(() => {
       expect(document.body.style.cursor).toBe("");
+    });
+  });
+
+  it("keeps context panel resize from selecting panel text", async () => {
+    render(<App />);
+
+    const splitter = await screen.findByRole("separator", {
+      name: "Resize context panel",
+    });
+
+    fireEvent.pointerDown(splitter, { clientX: 900, pointerId: 1 });
+
+    await waitFor(() => {
+      expect(document.body.style.cursor).toBe("col-resize");
+      expect(document.body.style.userSelect).toBe("none");
+    });
+
+    fireEvent.pointerMove(window, { clientX: 880 });
+    fireEvent.pointerUp(window);
+
+    await waitFor(() => {
+      expect(document.body.style.cursor).toBe("");
+      expect(document.body.style.userSelect).toBe("");
     });
   });
 
@@ -1379,6 +1411,9 @@ describe("App verification surfaces", () => {
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
     expect(screen.getByRole("navigation", { name: "Foco" })).toBeInTheDocument();
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    const settingsSidebar = settingsNav.closest("aside");
+    expect(settingsSidebar).not.toBeNull();
+    expect(within(settingsSidebar as HTMLElement).getByText("Settings")).toBeInTheDocument();
     expect(await screen.findByText("General settings")).toBeInTheDocument();
     expect(screen.getByText("127.0.0.1:3210")).toBeInTheDocument();
     expect(screen.getByText("Password is disabled")).toBeInTheDocument();
