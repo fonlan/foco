@@ -1005,7 +1005,6 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Close context panel": "关闭右侧面板",
     "Open context panel": "打开右侧面板",
     "Resize context panel": "调整右侧面板宽度",
-    "Close git diff": "关闭 Git diff",
     "Open git diff": "打开 Git diff",
     "Cancel the current run before deleting this chat.":
       "删除此聊天前请先取消当前运行。",
@@ -3620,9 +3619,6 @@ export function App() {
               isLoadingDiff={isLoadingDiff}
               isLoadingContextMemories={isLoadingContextMemories}
               isLoadingTaskGraph={isLoadingTaskGraph}
-              onCloseGit={() => {
-                setIsContextPanelOpen(false);
-              }}
               onRefreshDiff={() => {
                 if (activeWorkspace?.id) {
                   void loadGitDiff(activeWorkspace.id, selectedDiffPath);
@@ -7392,7 +7388,6 @@ function ContextPanel({
   isLoadingContextMemories,
   isLoadingDiff,
   isLoadingTaskGraph,
-  onCloseGit,
   onRefreshDiff,
   onSelectDiffFile,
   onTabChange,
@@ -7409,7 +7404,6 @@ function ContextPanel({
   isLoadingContextMemories: boolean;
   isLoadingDiff: boolean;
   isLoadingTaskGraph: boolean;
-  onCloseGit: () => void;
   onRefreshDiff: () => void;
   onSelectDiffFile: (path: string | null) => void;
   onTabChange: (tab: ContextPanelTab) => void;
@@ -7463,7 +7457,6 @@ function ContextPanel({
               diffText={diffText}
               files={files}
               isLoading={isLoadingDiff}
-              onClose={onCloseGit}
               onRefresh={onRefreshDiff}
               onSelectFile={onSelectDiffFile}
               selectedPath={selectedPath}
@@ -7675,7 +7668,6 @@ function GitDiffPanel({
   diffText,
   files,
   isLoading,
-  onClose,
   onRefresh,
   onSelectFile,
   selectedPath,
@@ -7684,7 +7676,6 @@ function GitDiffPanel({
   diffText: string;
   files: GitStatusFileSummary[];
   isLoading: boolean;
-  onClose: () => void;
   onRefresh: () => void;
   onSelectFile: (path: string | null) => void;
   selectedPath: string | null;
@@ -7693,10 +7684,10 @@ function GitDiffPanel({
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col">
-      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-4">
+      <div className="flex min-h-[var(--foco-header-height)] items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
-            <GitCompare aria-hidden="true" className="size-5" />
+          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
+            <GitCompare aria-hidden="true" className="size-4" />
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{t("Git diff")}</h2>
@@ -7708,7 +7699,7 @@ function GitDiffPanel({
         <div className="flex shrink-0 gap-2">
           <button
             aria-label={t("Refresh diff")}
-            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+            className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
             disabled={isLoading}
             onClick={onRefresh}
             title={t("Refresh diff")}
@@ -7719,15 +7710,6 @@ function GitDiffPanel({
             ) : (
               <RefreshCw aria-hidden="true" className="size-4" />
             )}
-          </button>
-          <button
-            aria-label={t("Close git diff")}
-            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-            onClick={onClose}
-            title={t("Close git diff")}
-            type="button"
-          >
-            <X aria-hidden="true" className="size-4" />
           </button>
         </div>
       </div>
