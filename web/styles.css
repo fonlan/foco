@@ -975,11 +975,52 @@ summary:focus-visible {
 }
 
 .chat-tabs {
+  display: flex;
+  align-items: center;
   min-width: 0;
+  overflow: hidden;
+}
+
+.chat-tab-scroll-button {
+  display: inline-flex;
+  width: 2rem;
+  min-width: 2rem;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+  border: 0 solid var(--foco-border);
+  background: #ffffff;
+  color: var(--foco-text-muted);
+}
+
+.chat-tab-scroll-button:first-child {
+  border-right-width: 1px;
+}
+
+.chat-tab-scroll-button:last-child {
+  border-left-width: 1px;
+}
+
+.chat-tab-scroll-button:disabled {
+  color: rgba(120, 113, 108, 0.35);
+  cursor: default;
+}
+
+.chat-tab-scroll-button:not(:disabled):hover {
+  background: var(--foco-panel-soft);
+  color: var(--foco-accent-strong);
 }
 
 .chat-tab-list {
   gap: 0.375rem;
+  scrollbar-gutter: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.chat-tab-list::-webkit-scrollbar {
+  height: 0;
+  width: 0;
 }
 
 .chat-tab-item {
@@ -2317,6 +2358,14 @@ body,
   height: 100%;
   gap: 0;
   padding-bottom: 0;
+  scrollbar-gutter: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.chat-tab-list::-webkit-scrollbar {
+  height: 0;
+  width: 0;
 }
 
 .chat-tab-item {

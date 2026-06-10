@@ -60,6 +60,7 @@ import {
   ClipboardEvent as ReactClipboardEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
+  WheelEvent as ReactWheelEvent,
   createContext,
   isValidElement,
   useCallback,
@@ -961,6 +962,8 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Cancel chat deletion": "取消删除聊天",
     "Confirm delete chat": "确认删除聊天",
     "Close chat tab {title}": "关闭会话标签 {title}",
+    "Scroll chat tabs left": "向左滚动会话标签",
+    "Scroll chat tabs right": "向右滚动会话标签",
     "Chat is running": "会话运行中",
     "No chats": "暂无聊天",
     "No open chats": "暂无打开的会话",
@@ -4381,12 +4384,139 @@ function ChatTabBar({
   tabs: ChatTabSummary[];
 }) {
   const { t } = useI18n();
+  const tabsContainerRef = useRef<HTMLDivElement>(null);
+  const tabListRef = useRef<HTMLDivElement>(null);
+  const [scrollState, setScrollState] = useState({
+    canScrollLeft: false,
+    canScrollRight: false,
+    hasOverflow: false,
+  });
+
+  const updateScrollState = useCallback(() => {
+    const element = tabListRef.current;
+    if (!element) {
+      setScrollState({
+        canScrollLeft: false,
+        canScrollRight: false,
+        hasOverflow: false,
+      });
+      return;
+    }
+
+    const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
+    const availableWidth = tabsContainerRef.current?.clientWidth ?? element.clientWidth;
+    const hasOverflow = element.scrollWidth > availableWidth + 1;
+    if (!hasOverflow && element.scrollLeft !== 0) {
+      element.scrollLeft = 0;
+    }
+
+    const scrollLeft = hasOverflow ? element.scrollLeft : 0;
+    const nextState = {
+      canScrollLeft: scrollLeft > 1,
+      canScrollRight: scrollLeft < maxScrollLeft - 1,
+      hasOverflow,
+    };
+
+    setScrollState((current) =>
+      current.canScrollLeft === nextState.canScrollLeft &&
+      current.canScrollRight === nextState.canScrollRight &&
+      current.hasOverflow === nextState.hasOverflow
+        ? current
+        : nextState,
+    );
+  }, []);
+
+  useLayoutEffect(() => {
+    updateScrollState();
+  }, [tabs, updateScrollState]);
+
+  useEffect(() => {
+    const element = tabListRef.current;
+    const container = tabsContainerRef.current;
+    if (!element || !container) {
+      return undefined;
+    }
+
+    const handleResize = () => updateScrollState();
+    const resizeObserver =
+      typeof ResizeObserver === "undefined"
+        ? null
+        : new ResizeObserver(handleResize);
+
+    resizeObserver?.observe(container);
+    resizeObserver?.observe(element);
+    window.addEventListener("resize", handleResize);
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [updateScrollState]);
+
+  function scrollTabs(direction: -1 | 1) {
+    const element = tabListRef.current;
+    if (!element) {
+      return;
+    }
+
+    element.scrollBy({
+      behavior: "smooth",
+      left: direction * Math.max(180, Math.floor(element.clientWidth * 0.7)),
+    });
+  }
+
+  function handleWheel(event: ReactWheelEvent<HTMLDivElement>) {
+    const element = tabListRef.current;
+    if (!element) {
+      return;
+    }
+
+    const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
+    if (maxScrollLeft <= 0) {
+      return;
+    }
+
+    const rawDelta =
+      Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+    if (rawDelta === 0) {
+      return;
+    }
+
+    const deltaUnit =
+      event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? element.clientWidth : 1;
+    const nextScrollLeft = Math.min(
+      maxScrollLeft,
+      Math.max(0, element.scrollLeft + rawDelta * deltaUnit),
+    );
+
+    if (nextScrollLeft === element.scrollLeft) {
+      return;
+    }
+
+    event.preventDefault();
+    element.scrollLeft = nextScrollLeft;
+    updateScrollState();
+  }
 
   return (
-    <div className="chat-tabs min-w-0 flex-1">
+    <div className="chat-tabs min-w-0 flex-1" ref={tabsContainerRef}>
+      {scrollState.hasOverflow ? (
+        <button
+          aria-label={t("Scroll chat tabs left")}
+          className="chat-tab-scroll-button"
+          disabled={!scrollState.canScrollLeft}
+          onClick={() => scrollTabs(-1)}
+          title={t("Scroll chat tabs left")}
+          type="button"
+        >
+          <ChevronLeft aria-hidden="true" className="size-4" />
+        </button>
+      ) : null}
       <div
         aria-label={t("Chat")}
-        className="chat-tab-list panel-scroll flex min-w-0 gap-1 overflow-x-auto"
+        className="chat-tab-list panel-scroll flex min-w-0 flex-1 gap-1 overflow-x-auto"
+        onScroll={updateScrollState}
+        onWheel={handleWheel}
+        ref={tabListRef}
         role="tablist"
       >
         {tabs.length ? (
@@ -4454,6 +4584,18 @@ function ChatTabBar({
           </div>
         )}
       </div>
+      {scrollState.hasOverflow ? (
+        <button
+          aria-label={t("Scroll chat tabs right")}
+          className="chat-tab-scroll-button"
+          disabled={!scrollState.canScrollRight}
+          onClick={() => scrollTabs(1)}
+          title={t("Scroll chat tabs right")}
+          type="button"
+        >
+          <ChevronRight aria-hidden="true" className="size-4" />
+        </button>
+      ) : null}
     </div>
   );
 }

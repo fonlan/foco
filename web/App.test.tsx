@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1133,6 +1133,60 @@ describe("App verification surfaces", () => {
       within(tabList).getByRole("tab", { name: /Second chat/ }),
     ).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText("Tool run")).toBeInTheDocument();
+  });
+
+  it("shows chat tab scroll controls only when tabs overflow and supports wheel scrolling", async () => {
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(screen.getByText("Second chat"));
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    const tabsContainer = tabList.parentElement;
+    if (!tabsContainer) {
+      throw new Error("Expected chat tab list to have a container");
+    }
+    expect(
+      screen.queryByRole("button", { name: "Scroll chat tabs left" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Scroll chat tabs right" }),
+    ).not.toBeInTheDocument();
+
+    Object.defineProperties(tabsContainer, {
+      clientWidth: { configurable: true, value: 360 },
+    });
+    Object.defineProperties(tabList, {
+      clientWidth: { configurable: true, value: 300 },
+      scrollWidth: { configurable: true, value: 340 },
+    });
+    fireEvent.scroll(tabList);
+    expect(
+      screen.queryByRole("button", { name: "Scroll chat tabs left" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Scroll chat tabs right" }),
+    ).not.toBeInTheDocument();
+
+    Object.defineProperties(tabList, {
+      clientWidth: { configurable: true, value: 180 },
+      scrollWidth: { configurable: true, value: 720 },
+    });
+    tabList.scrollLeft = 0;
+    fireEvent.scroll(tabList);
+
+    const leftButton = await screen.findByRole("button", {
+      name: "Scroll chat tabs left",
+    });
+    const rightButton = screen.getByRole("button", {
+      name: "Scroll chat tabs right",
+    });
+    expect(leftButton).toBeDisabled();
+    expect(rightButton).toBeEnabled();
+
+    fireEvent.wheel(tabList, { deltaY: 120 });
+    expect(tabList.scrollLeft).toBe(120);
+    await waitFor(() => expect(leftButton).toBeEnabled());
   });
 
   it("asks for confirmation before deleting a chat", async () => {
