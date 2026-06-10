@@ -3025,11 +3025,7 @@ async fn create_terminal_session(
     let workspace = workspace_by_id(&config, &workspace_id)?;
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
-    let working_directory = database
-        .latest_terminal_working_directory()
-        .map_err(ApiError::from_workspace_error)?
-        .map(|path| terminal::shell_path(Path::new(&path)).display().to_string())
-        .unwrap_or_else(|| terminal::shell_path(&workspace.path).display().to_string());
+    let working_directory = terminal::shell_path(&workspace.path).display().to_string();
 
     if !Path::new(&working_directory).is_dir() {
         return Err(ApiError::bad_request(format!(
@@ -15655,6 +15651,54 @@ description: Project memory.
         fs::remove_dir_all(existing_workspace_dir).expect("remove existing workspace directory");
         fs::remove_dir_all(new_workspace_dir).expect("remove new workspace directory");
         fs::remove_dir_all(profile_dir).expect("remove profile directory");
+    }
+
+    #[tokio::test]
+    async fn create_terminal_session_defaults_to_workspace_directory() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-terminal-workspace-test"));
+        let nested_dir = workspace_dir.join("nested");
+        let profile_dir = env::temp_dir().join(unique_id("foco-terminal-profile-test"));
+
+        fs::create_dir_all(&nested_dir).expect("nested workspace directory");
+
+        let config = GlobalConfig::first_run(workspace_dir.clone());
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        let previous_directory = terminal::shell_path(&nested_dir).display().to_string();
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            database
+                .upsert_terminal_session(NewTerminalSession {
+                    id: "terminal-previous",
+                    name: "Previous Terminal",
+                    working_directory: &previous_directory,
+                    metadata_json: None,
+                })
+                .expect("previous terminal session");
+            database
+                .close_terminal_session("terminal-previous")
+                .expect("close previous terminal session");
+        }
+
+        let Json(response) =
+            create_terminal_session(State(state), AxumPath(config.workspaces[0].id.clone()))
+                .await
+                .expect("terminal session response");
+        let expected_directory = terminal::shell_path(&workspace_dir).display().to_string();
+
+        assert_eq!(response.working_directory, expected_directory);
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let stored_session = database
+            .terminal_session(&response.id)
+            .expect("stored terminal session")
+            .expect("terminal session exists");
+
+        assert_eq!(stored_session.working_directory, expected_directory);
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
     }
 
     #[tokio::test]
