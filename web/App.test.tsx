@@ -798,8 +798,10 @@ describe("App verification surfaces", () => {
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
     const userBubble = screen
       .getByText("Please inspect README.")
-      .closest(".message-bubble");
-    const assistantBubble = screen.getByText("Done.").closest(".message-bubble");
+      .closest(".message-bubble") as HTMLElement | null;
+    const assistantBubble = screen
+      .getByText("Done.")
+      .closest(".message-bubble") as HTMLElement | null;
     expect(userBubble).toHaveClass("message-bubble-user");
     expect(userBubble).not.toHaveClass("bg-teal-800", "text-white");
     expect(userBubble?.getAttribute("style")).toContain(
@@ -827,21 +829,31 @@ describe("App verification surfaces", () => {
     const assistantRow = assistantBubble?.closest(
       ".message-row",
     ) as HTMLElement | null;
-    if (!userRow || !assistantRow) {
+    if (!userBubble || !assistantBubble || !userRow || !assistantRow) {
       throw new Error("Expected message rows");
     }
-    await userEvent.click(
-      within(userRow).getByRole("button", { name: "Copy message" }),
+    const userCopyButton = within(userBubble).getByRole(
+      "button",
+      { name: "Copy message" },
     );
+    const assistantCopyButton = within(assistantBubble).getByRole(
+      "button",
+      { name: "Copy message" },
+    );
+    expect(userCopyButton.closest(".message-author-row")).toBe(
+      userBubble?.querySelector(".message-author-row"),
+    );
+    expect(assistantCopyButton.closest(".message-author-row")).toBe(
+      assistantBubble?.querySelector(".message-author-row"),
+    );
+    await userEvent.click(userCopyButton);
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
       "Please inspect README.",
     );
     expect(
       within(userRow).getByRole("button", { name: "Copied message" }),
     ).toBeInTheDocument();
-    await userEvent.click(
-      within(assistantRow).getByRole("button", { name: "Copy message" }),
-    );
+    await userEvent.click(assistantCopyButton);
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith("Done.");
     const reasoningToggle = screen.getByRole("button", {
       name: "Expand thinking",

@@ -1367,37 +1367,17 @@ body,
   color: var(--foco-text-muted);
 }
 
-.message-action-menu:hover {
+.message-action-menu:hover:not(:disabled) {
   background: var(--foco-panel-muted);
   color: var(--foco-text);
 }
 
-.message-copy-button {
-  display: inline-flex;
-  width: 2rem;
-  height: 2rem;
-  margin-top: 0.35rem;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--foco-border);
-  border-radius: 0.5rem;
-  background: var(--foco-panel);
-  color: var(--foco-text-muted);
-  box-shadow: var(--foco-shadow-soft);
-}
-
-.message-copy-button:hover:not(:disabled) {
-  border-color: var(--foco-accent-line);
-  background: var(--foco-panel-muted);
-  color: var(--foco-primary);
-}
-
-.message-copy-button:focus-visible {
+.message-action-menu:focus-visible {
   outline: 2px solid var(--foco-primary);
   outline-offset: 2px;
 }
 
-.message-copy-button:disabled {
+.message-action-menu:disabled {
   cursor: not-allowed;
   opacity: 0.45;
 }
@@ -2679,7 +2659,7 @@ summary:focus-visible {
   color: var(--foco-text);
 }
 
-.message-action-menu:hover {
+.message-action-menu:hover:not(:disabled) {
   background: var(--foco-panel-muted);
 }
 

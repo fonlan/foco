@@ -29,7 +29,6 @@ import {
   LogOut,
   LoaderCircle,
   MessageSquare,
-  MoreHorizontal,
   PanelRight,
   Pencil,
   PlugZap,
@@ -5168,19 +5167,25 @@ function ChatPanel({
                               {createdAtLabel}
                             </time>
                           </span>
-                          {!isUser ? (
-                            <button
-                              aria-label={t("Message actions")}
-                              className="message-action-menu"
-                              title={t("Message actions")}
-                              type="button"
-                            >
-                              <MoreHorizontal
+                          <button
+                            aria-label={copyLabel}
+                            className="message-action-menu"
+                            disabled={!copyText}
+                            onClick={() =>
+                              void handleCopyMessage(message.id, copyText)
+                            }
+                            title={copyLabel}
+                            type="button"
+                          >
+                            {copiedMessageId === message.id ? (
+                              <CheckCircle2
                                 aria-hidden="true"
-                                className="size-4"
+                                className="size-3.5"
                               />
-                            </button>
-                          ) : null}
+                            ) : (
+                              <Copy aria-hidden="true" className="size-3.5" />
+                            )}
+                          </button>
                         </div>
                         {parts.length ? (
                           parts.map((part, partIndex) => (
@@ -5206,22 +5211,6 @@ function ChatPanel({
                         ) : null}
                       </div>
                     </div>
-                    <button
-                      aria-label={copyLabel}
-                      className="message-copy-button"
-                      disabled={!copyText}
-                      onClick={() =>
-                        void handleCopyMessage(message.id, copyText)
-                      }
-                      title={copyLabel}
-                      type="button"
-                    >
-                      {copiedMessageId === message.id ? (
-                        <CheckCircle2 aria-hidden="true" className="size-3.5" />
-                      ) : (
-                        <Copy aria-hidden="true" className="size-3.5" />
-                      )}
-                    </button>
                   </div>
                 </div>
               );
