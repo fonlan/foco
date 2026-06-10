@@ -24,6 +24,8 @@ pub const DEFAULT_WEB_SERVER_HOST: &str = "127.0.0.1";
 pub const DEFAULT_WEB_SERVER_PORT: u16 = 3210;
 pub const DEFAULT_APP_LANGUAGE: &str = "en";
 pub const SUPPORTED_APP_LANGUAGES: &[&str] = &["zh-CN", "en"];
+pub const DEFAULT_APP_THEME: &str = "light";
+pub const SUPPORTED_APP_THEMES: &[&str] = &["light", "dark"];
 pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
 pub const SUPPORTED_API_PROXY_TYPES: &[&str] = &[HTTP_PROXY_KIND, SOCKS_PROXY_KIND];
@@ -274,6 +276,7 @@ impl GlobalConfig {
             app: AppSettings {
                 active_workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
                 language: DEFAULT_APP_LANGUAGE.to_string(),
+                theme: DEFAULT_APP_THEME.to_string(),
                 web_server: WebServerSettings::default(),
             },
             hooks: HookConfig::default(),
@@ -316,6 +319,7 @@ impl GlobalConfig {
             &self.app.active_workspace_id,
         )?;
         validate_app_language(config_path, &self.app.language)?;
+        validate_app_theme(config_path, &self.app.theme)?;
         validate_web_server_settings(config_path, &self.app.web_server)?;
         validate_hook_config(config_path, "hooks", &self.hooks)?;
         validate_memory_settings(config_path, &self.memory, &self.models)?;
@@ -579,12 +583,18 @@ pub struct AppSettings {
     pub active_workspace_id: String,
     #[serde(default = "default_app_language")]
     pub language: String,
+    #[serde(default = "default_app_theme")]
+    pub theme: String,
     #[serde(default)]
     pub web_server: WebServerSettings,
 }
 
 fn default_app_language() -> String {
     DEFAULT_APP_LANGUAGE.to_string()
+}
+
+fn default_app_theme() -> String {
+    DEFAULT_APP_THEME.to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1347,6 +1357,20 @@ fn validate_app_language(config_path: Option<&Path>, language: &str) -> Result<(
     )
 }
 
+fn validate_app_theme(config_path: Option<&Path>, theme: &str) -> Result<(), ConfigError> {
+    if SUPPORTED_APP_THEMES.contains(&theme) {
+        return Ok(());
+    }
+
+    invalid_config(
+        config_path,
+        format!(
+            "app.theme '{theme}' is unsupported; expected one of {}",
+            SUPPORTED_APP_THEMES.join(", ")
+        ),
+    )
+}
+
 fn validate_terminal_shell(
     config_path: Option<&Path>,
     field: &str,
@@ -1448,6 +1472,7 @@ mod tests {
             DEFAULT_WORKSPACE_ID.to_string()
         );
         assert_eq!(loaded.config.app.language, DEFAULT_APP_LANGUAGE);
+        assert_eq!(loaded.config.app.theme, DEFAULT_APP_THEME);
         assert_eq!(loaded.config.app.web_server, WebServerSettings::default());
         assert_eq!(loaded.config.workspaces.len(), 1);
         assert_eq!(loaded.config.workspaces[0].name, DEFAULT_WORKSPACE_NAME);
@@ -1602,6 +1627,7 @@ mod tests {
         let loaded = load_global_config(&paths.config_file).expect("legacy config should load");
 
         assert_eq!(loaded.app.language, DEFAULT_APP_LANGUAGE);
+        assert_eq!(loaded.app.theme, DEFAULT_APP_THEME);
         assert_eq!(loaded.app.web_server, WebServerSettings::default());
         assert!(!loaded.workspaces[0].pinned);
         assert_eq!(loaded.workspaces[0].terminal_shell, DEFAULT_TERMINAL_SHELL);
@@ -1733,6 +1759,26 @@ mod tests {
             error
                 .to_string()
                 .contains("app.language 'fr' is unsupported")
+        );
+    }
+
+    #[test]
+    fn load_rejects_unsupported_app_theme() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.app.theme = "sepia".to_string();
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("unsupported theme should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("app.theme 'sepia' is unsupported")
         );
     }
 

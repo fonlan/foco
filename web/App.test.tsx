@@ -84,11 +84,17 @@ const settings = {
     },
   ],
   general: {
+    hookAuditEnabled: false,
     language: "en",
     supportedLanguages: [
       { id: "en", name: "English" },
       { id: "zh-CN", name: "简体中文" },
     ],
+    supportedThemes: [
+      { id: "light", name: "Light" },
+      { id: "dark", name: "Dark" },
+    ],
+    theme: "light",
     webServer: {
       listenHost: "127.0.0.1",
       listenPort: 3210,
@@ -724,10 +730,52 @@ let activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | nu
   null;
 let terminalSessionCounter = 0;
 
+function savedGeneralSettings(init?: RequestInit) {
+  const body =
+    typeof init?.body === "string"
+      ? (JSON.parse(init.body) as Record<string, unknown>)
+      : {};
+
+  return {
+    ...settings,
+    general: {
+      ...settings.general,
+      hookAuditEnabled:
+        typeof body.hookAuditEnabled === "boolean"
+          ? body.hookAuditEnabled
+          : settings.general.hookAuditEnabled,
+      language:
+        body.language === "zh-CN" || body.language === "en"
+          ? body.language
+          : settings.general.language,
+      theme:
+        body.theme === "dark" || body.theme === "light"
+          ? body.theme
+          : settings.general.theme,
+      webServer: {
+        ...settings.general.webServer,
+        listenHost:
+          typeof body.listenHost === "string"
+            ? body.listenHost
+            : settings.general.webServer.listenHost,
+        listenPort:
+          typeof body.listenPort === "number"
+            ? body.listenPort
+            : settings.general.webServer.listenPort,
+        passwordEnabled:
+          typeof body.password === "string" && body.password.length > 0
+            ? true
+            : settings.general.webServer.passwordEnabled,
+      },
+    },
+  };
+}
+
 describe("App verification surfaces", () => {
   beforeEach(() => {
     activeChatStreamController = null;
     terminalSessionCounter = 0;
+    document.documentElement.removeAttribute("data-foco-theme");
     mermaidMock.initialize.mockClear();
     mermaidMock.render.mockClear();
     Object.defineProperty(navigator, "clipboard", {
@@ -1647,6 +1695,52 @@ describe("App verification surfaces", () => {
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
   });
 
+  it("toggles the app theme from the nav rail", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Switch to dark theme" }),
+    );
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/general",
+        expect.objectContaining({
+          body: expect.stringContaining('"theme":"dark"'),
+          method: "POST",
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(document.documentElement.dataset.focoTheme).toBe("dark");
+    });
+  });
+
+  it("saves the app theme from general settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.selectOptions(
+      await screen.findByRole("combobox", { name: /Theme/ }),
+      "dark",
+    );
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/general",
+        expect.objectContaining({
+          body: expect.stringContaining('"theme":"dark"'),
+          method: "POST",
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(document.documentElement.dataset.focoTheme).toBe("dark");
+    });
+  });
+
   it("saves memory settings and manages manual memories", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
@@ -2171,7 +2265,7 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
 
   if (path === "/api/settings/general") {
-    return jsonResponse(savedSettings.general);
+    return jsonResponse(savedGeneralSettings(init));
   }
 
   if (path === "/api/settings/memory") {

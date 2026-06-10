@@ -813,6 +813,120 @@ summary:focus-visible {
   --foco-shadow-raised: 0 18px 46px rgba(17, 32, 51, 0.12);
   --foco-shadow-accent: 0 14px 32px rgba(20, 117, 103, 0.16);
   --foco-focus-ring: 0 0 0 3px rgba(20, 117, 103, 0.18);
+  --foco-sidebar-gradient: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.88),
+    rgba(248, 251, 252, 0.96)
+  );
+  --foco-header-surface: rgba(248, 251, 252, 0.92);
+  --foco-row-hover: rgba(255, 255, 255, 0.72);
+  --foco-chat-row-hover: rgba(255, 255, 255, 0.76);
+  --foco-active-surface-gradient: linear-gradient(
+    180deg,
+    #ffffff,
+    var(--foco-panel-selected)
+  );
+  --foco-active-inset-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.82);
+  --foco-toolbar-surface: rgba(255, 255, 255, 0.92);
+  --foco-main-panel-gradient: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.54),
+    rgba(238, 243, 246, 0.72)
+  );
+  --foco-row-border: rgba(210, 221, 228, 0.72);
+  --foco-empty-surface: rgba(255, 255, 255, 0.84);
+  --foco-composer-shell-gradient: linear-gradient(
+    180deg,
+    rgba(238, 243, 246, 0),
+    var(--foco-canvas)
+  );
+  --foco-composer-top-shadow: 0 1px 0 rgba(255, 255, 255, 0.85);
+  --foco-context-tabs-surface: rgba(255, 255, 255, 0.72);
+  --foco-graph-line: rgba(210, 221, 228, 0.76);
+  --foco-settings-main-gradient: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.48),
+    rgba(238, 243, 246, 0.62)
+  );
+  --foco-settings-card-surface: rgba(255, 255, 255, 0.88);
+}
+
+html[data-foco-theme="dark"] {
+  color-scheme: dark;
+  --foco-canvas: #0f1417;
+  --foco-canvas-raised: #151b1e;
+  --foco-rail: #080d10;
+  --foco-rail-soft: #10181c;
+  --foco-sidebar: #12191c;
+  --foco-panel: #171e22;
+  --foco-panel-soft: #11181c;
+  --foco-panel-muted: #222c30;
+  --foco-panel-selected: #142f2b;
+  --foco-border: #2a373c;
+  --foco-border-strong: #39494f;
+  --foco-border-active: #328f83;
+  --foco-text: #e8eeee;
+  --foco-text-muted: #a9b6bb;
+  --foco-text-faint: #7c898f;
+  --foco-primary: #1f7d72;
+  --foco-primary-hover: #27978a;
+  --foco-accent: #39b7a8;
+  --foco-accent-hover: #4fd0c0;
+  --foco-accent-strong: #94e5db;
+  --foco-accent-soft: rgba(57, 183, 168, 0.17);
+  --foco-accent-muted: rgba(57, 183, 168, 0.26);
+  --foco-accent-line: #328f83;
+  --foco-user-surface: #123d38;
+  --foco-user-border: #328f83;
+  --foco-user-avatar: #39b7a8;
+  --foco-success: #7fd59a;
+  --foco-success-soft: rgba(34, 197, 94, 0.16);
+  --foco-warning: #f1c66d;
+  --foco-warning-soft: rgba(245, 158, 11, 0.16);
+  --foco-error: #fb7185;
+  --foco-error-soft: rgba(244, 63, 94, 0.16);
+  --foco-danger: #fb7185;
+  --foco-shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.28);
+  --foco-shadow-soft: 0 12px 30px rgba(0, 0, 0, 0.34);
+  --foco-shadow-raised: 0 20px 54px rgba(0, 0, 0, 0.46);
+  --foco-shadow-accent: 0 14px 34px rgba(12, 96, 86, 0.28);
+  --foco-focus-ring: 0 0 0 3px rgba(57, 183, 168, 0.28);
+  --foco-sidebar-gradient: linear-gradient(
+    180deg,
+    rgba(24, 31, 34, 0.96),
+    rgba(17, 24, 27, 0.98)
+  );
+  --foco-header-surface: rgba(19, 26, 29, 0.92);
+  --foco-row-hover: rgba(255, 255, 255, 0.055);
+  --foco-chat-row-hover: rgba(255, 255, 255, 0.05);
+  --foco-active-surface-gradient: linear-gradient(
+    180deg,
+    rgba(34, 52, 50, 0.95),
+    var(--foco-panel-selected)
+  );
+  --foco-active-inset-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  --foco-toolbar-surface: rgba(19, 26, 29, 0.94);
+  --foco-main-panel-gradient: linear-gradient(
+    180deg,
+    rgba(21, 28, 31, 0.72),
+    rgba(13, 18, 21, 0.9)
+  );
+  --foco-row-border: rgba(45, 59, 64, 0.72);
+  --foco-empty-surface: rgba(21, 28, 31, 0.86);
+  --foco-composer-shell-gradient: linear-gradient(
+    180deg,
+    rgba(13, 18, 21, 0),
+    var(--foco-canvas)
+  );
+  --foco-composer-top-shadow: 0 1px 0 rgba(255, 255, 255, 0.05);
+  --foco-context-tabs-surface: rgba(21, 28, 31, 0.78);
+  --foco-graph-line: rgba(65, 82, 86, 0.48);
+  --foco-settings-main-gradient: linear-gradient(
+    180deg,
+    rgba(21, 28, 31, 0.66),
+    rgba(13, 18, 21, 0.84)
+  );
+  --foco-settings-card-surface: rgba(21, 28, 31, 0.9);
 }
 
 body,
@@ -2374,15 +2488,13 @@ summary:focus-visible {
 .workspace-sidebar,
 .settings-section-nav-card {
   border-right: 1px solid var(--foco-border);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(248, 251, 252, 0.96)),
-    var(--foco-sidebar);
+  background: var(--foco-sidebar-gradient), var(--foco-sidebar);
 }
 
 .workspace-sidebar-header,
 .settings-sidebar-header {
   border-bottom-color: var(--foco-border);
-  background: rgba(248, 251, 252, 0.92);
+  background: var(--foco-header-surface);
 }
 
 .workspace-sidebar-title,
@@ -2403,17 +2515,15 @@ summary:focus-visible {
 
 .workspace-menu:hover {
   border-color: var(--foco-border);
-  background: rgba(255, 255, 255, 0.72);
+  background: var(--foco-row-hover);
 }
 
 .workspace-menu-active {
   overflow: hidden;
   border-color: var(--foco-border-active);
-  background:
-    linear-gradient(180deg, #ffffff, var(--foco-panel-selected)),
-    var(--foco-accent-soft);
+  background: var(--foco-active-surface-gradient), var(--foco-accent-soft);
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.82),
+    var(--foco-active-inset-shadow),
     0 12px 28px rgba(20, 117, 103, 0.13);
 }
 
@@ -2467,7 +2577,7 @@ summary:focus-visible {
 
 .chat-item:hover {
   border-color: var(--foco-border);
-  background: rgba(255, 255, 255, 0.76);
+  background: var(--foco-chat-row-hover);
   color: var(--foco-text);
 }
 
@@ -2483,7 +2593,7 @@ summary:focus-visible {
 .app-toolbar,
 .chat-tab-list {
   border-bottom-color: var(--foco-border);
-  background: rgba(255, 255, 255, 0.92);
+  background: var(--foco-toolbar-surface);
 }
 
 .chat-tab-item {
@@ -2527,9 +2637,7 @@ summary:focus-visible {
 .app-main-panel,
 .message-list,
 .global-main-panel {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.54), rgba(238, 243, 246, 0.72)),
-    var(--foco-canvas);
+  background: var(--foco-main-panel-gradient), var(--foco-canvas);
 }
 
 .message-stack {
@@ -2537,7 +2645,7 @@ summary:focus-visible {
 }
 
 .message-row {
-  border-bottom-color: rgba(210, 221, 228, 0.72);
+  border-bottom-color: var(--foco-row-border);
 }
 
 .message-bubble {
@@ -2613,20 +2721,20 @@ summary:focus-visible {
 
 .empty-chat-state {
   border-color: var(--foco-border-strong);
-  background: rgba(255, 255, 255, 0.84);
+  background: var(--foco-empty-surface);
   box-shadow: var(--foco-shadow-soft);
 }
 
 .composer-shell {
   border-top-color: var(--foco-border);
-  background: linear-gradient(180deg, rgba(238, 243, 246, 0), var(--foco-canvas));
+  background: var(--foco-composer-shell-gradient);
 }
 
 .composer-surface {
   border-color: var(--foco-border-strong);
   background: var(--foco-panel);
   box-shadow:
-    0 1px 0 rgba(255, 255, 255, 0.85),
+    var(--foco-composer-top-shadow),
     0 12px 34px rgba(17, 32, 51, 0.1);
   transition:
     border-color 150ms ease,
@@ -2704,7 +2812,7 @@ summary:focus-visible {
 
 .context-panel-tabs {
   border-bottom-color: var(--foco-border);
-  background: rgba(255, 255, 255, 0.72);
+  background: var(--foco-context-tabs-surface);
 }
 
 .context-panel-tab {
@@ -2723,10 +2831,10 @@ summary:focus-visible {
 .context-graph-canvas {
   border-color: var(--foco-border);
   background:
-    linear-gradient(rgba(210, 221, 228, 0.76) 1px, transparent 1px) 0 0 / 32px
+    linear-gradient(var(--foco-graph-line) 1px, transparent 1px) 0 0 / 32px
       32px,
-    linear-gradient(90deg, rgba(210, 221, 228, 0.76) 1px, transparent 1px) 0 0 /
-      32px 32px,
+    linear-gradient(90deg, var(--foco-graph-line) 1px, transparent 1px) 0 0 / 32px
+      32px,
     var(--foco-panel);
 }
 
@@ -2769,15 +2877,13 @@ summary:focus-visible {
 }
 
 .settings-layout > .min-w-0 {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.48), rgba(238, 243, 246, 0.62)),
-    var(--foco-canvas);
+  background: var(--foco-settings-main-gradient), var(--foco-canvas);
 }
 
 .settings-layout section.rounded-2xl,
 .settings-layout .rounded-2xl.border {
   border-color: var(--foco-border);
-  background: rgba(255, 255, 255, 0.88);
+  background: var(--foco-settings-card-surface);
   box-shadow: var(--foco-shadow-soft);
 }
 

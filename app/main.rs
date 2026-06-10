@@ -49,10 +49,10 @@ use foco_store::{
         ApiProxySettings, DEFAULT_TERMINAL_SHELL, GlobalConfig, HookConfig, HookEventMap,
         McpServerConfig, MemorySettings, ModelLimits, ModelSettings, ProviderSettings,
         SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES,
-        SUPPORTED_APP_LANGUAGES, SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings,
-        UNSUPPORTED_HOOK_EVENTS, WebServerSettings, WorkspaceConfig, load_or_create_global_config,
-        load_workspace_hook_config, save_global_config, save_workspace_hook_config,
-        workspace_hook_config_path,
+        SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_HOOK_EVENTS,
+        SUPPORTED_TERMINAL_SHELLS, SkillSettings, UNSUPPORTED_HOOK_EVENTS, WebServerSettings,
+        WorkspaceConfig, load_or_create_global_config, load_workspace_hook_config,
+        save_global_config, save_workspace_hook_config, workspace_hook_config_path,
     },
     memory::{
         MemoryDatabase, MemoryDatabaseError, MemoryExtractionJobStatus, MemoryFactRecord,
@@ -1404,10 +1404,31 @@ fn normalize_app_language(language: &str) -> Result<String, ApiError> {
     )))
 }
 
+fn normalize_app_theme(theme: &str) -> Result<String, ApiError> {
+    let theme = theme.trim();
+
+    if SUPPORTED_APP_THEMES.contains(&theme) {
+        return Ok(theme.to_string());
+    }
+
+    Err(ApiError::bad_request(format!(
+        "app theme '{theme}' is unsupported; expected one of {}",
+        SUPPORTED_APP_THEMES.join(", ")
+    )))
+}
+
 fn app_language_name(language: &str) -> &'static str {
     match language {
         "zh-CN" => "简体中文",
         "en" => "English",
+        _ => "Unknown",
+    }
+}
+
+fn app_theme_name(theme: &str) -> &'static str {
+    match theme {
+        "light" => "Light",
+        "dark" => "Dark",
         _ => "Unknown",
     }
 }
@@ -1662,6 +1683,7 @@ async fn save_general_settings(
 
     config.app.web_server = normalize_web_server_settings(&config.app.web_server, &request)?;
     config.app.language = normalize_app_language(&request.language)?;
+    config.app.theme = normalize_app_theme(&request.theme)?;
     if let Some(hook_audit_enabled) = request.hook_audit_enabled {
         config.hooks.audit_enabled = hook_audit_enabled;
     }
@@ -3162,6 +3184,7 @@ struct ManualGeneralSettingsRequest {
     listen_host: String,
     listen_port: u32,
     language: String,
+    theme: String,
     hook_audit_enabled: Option<bool>,
     password: Option<String>,
     clear_password: Option<bool>,
@@ -3490,8 +3513,10 @@ struct GithubReleaseAsset {
 struct GeneralSettingsSummary {
     web_server: WebServerSettingsSummary,
     language: String,
+    theme: String,
     hook_audit_enabled: bool,
     supported_languages: Vec<AppLanguageSummary>,
+    supported_themes: Vec<AppThemeSummary>,
 }
 
 #[derive(Serialize)]
@@ -3538,6 +3563,13 @@ struct WebServerSettingsSummary {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AppLanguageSummary {
+    id: &'static str,
+    name: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppThemeSummary {
     id: &'static str,
     name: &'static str,
 }
@@ -10922,12 +10954,20 @@ async fn settings_response(
                 password_enabled: web_auth_enabled(config),
             },
             language: config.app.language.clone(),
+            theme: config.app.theme.clone(),
             hook_audit_enabled: config.hooks.audit_enabled,
             supported_languages: SUPPORTED_APP_LANGUAGES
                 .iter()
                 .map(|language| AppLanguageSummary {
                     id: *language,
                     name: app_language_name(*language),
+                })
+                .collect(),
+            supported_themes: SUPPORTED_APP_THEMES
+                .iter()
+                .map(|theme| AppThemeSummary {
+                    id: *theme,
+                    name: app_theme_name(*theme),
                 })
                 .collect(),
         },
@@ -13760,6 +13800,7 @@ mod tests {
                 clear_password: None,
                 hook_audit_enabled: None,
                 language: "en".to_string(),
+                theme: "light".to_string(),
                 listen_host: "0.0.0.0".to_string(),
                 listen_port: 3211,
                 password: None,
@@ -13774,6 +13815,7 @@ mod tests {
                 clear_password: None,
                 hook_audit_enabled: None,
                 language: "en".to_string(),
+                theme: "light".to_string(),
                 listen_host: "127.0.0.1".to_string(),
                 listen_port: 3210,
                 password: Some("new-password".to_string()),
@@ -13794,6 +13836,7 @@ mod tests {
                 clear_password: Some(true),
                 hook_audit_enabled: None,
                 language: "en".to_string(),
+                theme: "light".to_string(),
                 listen_host: "127.0.0.1".to_string(),
                 listen_port: 3210,
                 password: Some("ignored".to_string()),

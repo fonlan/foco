@@ -230,9 +230,15 @@ type ApiProxySettingsSummary = {
 };
 
 type AppLanguageId = "en" | "zh-CN";
+type AppThemeId = "light" | "dark";
 
 type AppLanguageSummary = {
   id: AppLanguageId;
+  name: string;
+};
+
+type AppThemeSummary = {
+  id: AppThemeId;
   name: string;
 };
 
@@ -240,6 +246,8 @@ type GeneralSettingsSummary = {
   hookAuditEnabled: boolean;
   language: AppLanguageId;
   supportedLanguages: AppLanguageSummary[];
+  supportedThemes: AppThemeSummary[];
+  theme: AppThemeId;
   webServer: WebServerSettingsSummary;
 };
 
@@ -380,6 +388,7 @@ type GeneralFormState = {
   listenHost: string;
   listenPort: string;
   password: string;
+  theme: AppThemeId;
 };
 
 type AuthStatusResponse = {
@@ -1253,6 +1262,11 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
       "设置密码后，浏览器访问需要先登录。",
     "Clear browser password": "清除浏览器密码",
     Language: "语言",
+    Theme: "主题",
+    Light: "浅色",
+    Dark: "深色",
+    "Switch to light theme": "切换到浅色主题",
+    "Switch to dark theme": "切换到深色主题",
     "Save general settings": "保存常规设置",
     Save: "保存",
     "Reload general settings": "重新加载常规设置",
@@ -1265,6 +1279,8 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
       "已保存的 host 和端口会在后端下次启动时生效。",
     "Language changes apply immediately after saving.":
       "语言设置保存后会立即生效。",
+    "Theme changes apply immediately after saving.":
+      "主题设置保存后会立即生效。",
     "Hook settings": "Hook 设置",
     "Global and workspace lifecycle hooks": "全局与工作区生命周期 Hook",
     "Hook run detail": "Hook 运行详情",
@@ -1643,6 +1659,7 @@ export function App() {
     useState<RetryRunRequest | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
+  const [isSavingTheme, setIsSavingTheme] = useState(false);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [isSelectingWorkspacePath, setIsSelectingWorkspacePath] = useState(false);
   const [isSelectingAttachments, setIsSelectingAttachments] = useState(false);
@@ -1703,6 +1720,7 @@ export function App() {
   const showContextPanel = !isGlobalView && isContextPanelOpen;
   const canLogout = Boolean(settings?.general.webServer.passwordEnabled);
   const language = settings?.general.language ?? "en";
+  const theme = settings?.general.theme ?? "light";
   const t = useCallback<Translate>(
     (key, values) => translate(key, values, language),
     [language],
@@ -1723,6 +1741,10 @@ export function App() {
   useEffect(() => {
     document.documentElement.lang = language;
   }, [language]);
+
+  useEffect(() => {
+    document.documentElement.dataset.focoTheme = theme;
+  }, [theme]);
 
   useEffect(() => {
     activeChatKeyRef.current =
@@ -3126,6 +3148,47 @@ export function App() {
     setIsWorkspaceDialogOpen(true);
   }
 
+  async function saveAppTheme(nextTheme: AppThemeId) {
+    if (!settings || settings.general.theme === nextTheme) {
+      return;
+    }
+
+    const previousTheme = settings.general.theme;
+    setSettings((current) =>
+      current
+        ? { ...current, general: { ...current.general, theme: nextTheme } }
+        : current,
+    );
+    setIsSavingTheme(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings/general", {
+        body: JSON.stringify({
+          clearPassword: false,
+          hookAuditEnabled: settings.general.hookAuditEnabled,
+          language: settings.general.language,
+          listenHost: settings.general.webServer.listenHost,
+          listenPort: settings.general.webServer.listenPort,
+          password: null,
+          theme: nextTheme,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setSettings((current) =>
+        current
+          ? { ...current, general: { ...current.general, theme: previousTheme } }
+          : current,
+      );
+    } finally {
+      setIsSavingTheme(false);
+    }
+  }
+
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsLoggingIn(true);
@@ -3195,6 +3258,7 @@ export function App() {
           <FocoNavRail
             activeMode={viewMode}
             canLogout={canLogout}
+            isSavingTheme={isSavingTheme}
             onAddWorkspace={openWorkspaceDialog}
             onLogout={handleLogout}
             onOpenSettings={() => setViewMode("settings")}
@@ -3204,6 +3268,10 @@ export function App() {
               setIsMobileWorkspaceOpen(true);
             }}
             onReturnHome={() => setViewMode("chat")}
+            onToggleTheme={() =>
+              void saveAppTheme(theme === "dark" ? "light" : "dark")
+            }
+            theme={theme}
           />
           <section className="global-main-panel min-w-0">
             {viewMode === "settings" ? (
@@ -3244,6 +3312,7 @@ export function App() {
         <FocoNavRail
           activeMode={viewMode}
           canLogout={canLogout}
+          isSavingTheme={isSavingTheme}
           onAddWorkspace={openWorkspaceDialog}
           onLogout={handleLogout}
           onOpenSettings={() => setViewMode("settings")}
@@ -3253,6 +3322,10 @@ export function App() {
             setIsMobileWorkspaceOpen(true);
           }}
           onReturnHome={() => setViewMode("chat")}
+          onToggleTheme={() =>
+            void saveAppTheme(theme === "dark" ? "light" : "dark")
+          }
+          theme={theme}
         />
         <aside
           className={`workspace-sidebar relative border-stone-200/80 lg:border-r ${
@@ -4665,23 +4738,31 @@ function ChatTabBar({
 function FocoNavRail({
   activeMode,
   canLogout,
+  isSavingTheme,
   onAddWorkspace,
   onLogout,
   onOpenSettings,
   onOpenStats,
   onOpenWorkspace,
   onReturnHome,
+  onToggleTheme,
+  theme,
 }: {
   activeMode: ViewMode;
   canLogout: boolean;
+  isSavingTheme: boolean;
   onAddWorkspace: () => void;
   onLogout: () => Promise<void>;
   onOpenSettings: () => void;
   onOpenStats: () => void;
   onOpenWorkspace: () => void;
   onReturnHome: () => void;
+  onToggleTheme: () => void;
+  theme: AppThemeId;
 }) {
   const { t } = useI18n();
+  const themeLabel =
+    theme === "dark" ? t("Switch to light theme") : t("Switch to dark theme");
 
   return (
     <nav aria-label="Foco" className="foco-nav-rail">
@@ -4740,10 +4821,11 @@ function FocoNavRail({
           onClick={onAddWorkspace}
         />
         <NavRailButton
-          active={false}
+          active={theme === "dark"}
+          disabled={isSavingTheme}
           icon={SunMoon}
-          label={t("Theme")}
-          onClick={onReturnHome}
+          label={themeLabel}
+          onClick={onToggleTheme}
         />
         {canLogout ? (
           <NavRailButton
@@ -4760,11 +4842,13 @@ function FocoNavRail({
 
 function NavRailButton({
   active,
+  disabled = false,
   icon: Icon,
   label,
   onClick,
 }: {
   active: boolean;
+  disabled?: boolean;
   icon: LucideIcon;
   label: string;
   onClick: () => void;
@@ -4773,6 +4857,7 @@ function NavRailButton({
     <button
       aria-label={label}
       className={`foco-nav-rail-button ${active ? "foco-nav-rail-button-active" : ""}`}
+      disabled={disabled}
       onClick={onClick}
       title={label}
       type="button"
@@ -8092,6 +8177,7 @@ function SettingsPanel({
   const [isSavingMemory, setIsSavingMemory] = useState(false);
   const [isClearingPassword, setIsClearingPassword] = useState(false);
   const [isSavingLanguage, setIsSavingLanguage] = useState(false);
+  const [isSavingTheme, setIsSavingTheme] = useState(false);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [isSavingWorkspaceOrder, setIsSavingWorkspaceOrder] = useState(false);
   const [isSavingWorkspaceLogo, setIsSavingWorkspaceLogo] = useState(false);
@@ -8257,6 +8343,7 @@ function SettingsPanel({
       listenHost: data.general.webServer.listenHost,
       listenPort: String(data.general.webServer.listenPort),
       password: "",
+      theme: data.general.theme,
     });
   }
 
@@ -8645,6 +8732,7 @@ function SettingsPanel({
           hookAuditEnabled: generalForm.hookAuditEnabled,
           language: generalForm.language,
           password: password.trim() ? password : null,
+          theme: generalForm.theme,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -8681,6 +8769,7 @@ function SettingsPanel({
           listenPort: settings.general.webServer.listenPort,
           language,
           password: null,
+          theme: settings.general.theme,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -8690,15 +8779,58 @@ function SettingsPanel({
       setGeneralForm((current) => ({
         ...current,
         language: data.general.language,
+        theme: data.general.theme,
       }));
     } catch (requestError) {
       setError(errorMessage(requestError));
       setGeneralForm((current) => ({
         ...current,
         language: settings.general.language,
+        theme: settings.general.theme,
       }));
     } finally {
       setIsSavingLanguage(false);
+    }
+  }
+
+  async function saveThemeSetting(theme: AppThemeId) {
+    setGeneralForm((current) => ({
+      ...current,
+      theme,
+    }));
+
+    if (!settings) {
+      return;
+    }
+
+    setIsSavingTheme(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings/general", {
+        body: JSON.stringify({
+          clearPassword: false,
+          hookAuditEnabled: settings.general.hookAuditEnabled,
+          listenHost: settings.general.webServer.listenHost,
+          listenPort: settings.general.webServer.listenPort,
+          language: settings.general.language,
+          password: null,
+          theme,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncGeneralForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setGeneralForm((current) => ({
+        ...current,
+        theme: settings.general.theme,
+      }));
+    } finally {
+      setIsSavingTheme(false);
     }
   }
 
@@ -8719,6 +8851,7 @@ function SettingsPanel({
           listenPort: settings.general.webServer.listenPort,
           language: settings.general.language,
           password: null,
+          theme: settings.general.theme,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -9456,6 +9589,7 @@ function SettingsPanel({
           listenPort: settings.general.webServer.listenPort,
           language: settings.general.language,
           password: null,
+          theme: settings.general.theme,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -10080,6 +10214,28 @@ function SettingsPanel({
               </select>
               <span className="mt-1 block text-xs text-stone-500">
                 {t("Language changes apply immediately after saving.")}
+              </span>
+            </label>
+            <label className="mt-4 block">
+              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                {t("Theme")}
+              </span>
+              <select
+                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                disabled={isSavingTheme || isLoadingSettings}
+                onChange={(event) =>
+                  void saveThemeSetting(event.target.value as AppThemeId)
+                }
+                value={generalForm.theme}
+              >
+                {(settings?.general.supportedThemes ?? []).map((theme) => (
+                  <option key={theme.id} value={theme.id}>
+                    {t(theme.name)}
+                  </option>
+                ))}
+              </select>
+              <span className="mt-1 block text-xs text-stone-500">
+                {t("Theme changes apply immediately after saving.")}
               </span>
             </label>
             <div className="mt-4 flex flex-wrap gap-2">
@@ -13575,6 +13731,7 @@ function emptyGeneralForm(): GeneralFormState {
     listenHost: "127.0.0.1",
     listenPort: "3210",
     password: "",
+    theme: "light",
   };
 }
 
