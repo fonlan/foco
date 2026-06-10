@@ -5949,53 +5949,54 @@ function ToolCallBlock({ toolCall }: { toolCall: ChatToolCallSummary }) {
   const detailText = toolCallDetailText(toolCall);
 
   return (
-    <div className="min-w-0 border-t border-stone-200 pt-2">
-      <details className="group min-w-0">
-        <summary className="flex cursor-pointer list-none items-start gap-2 text-xs font-semibold text-stone-700 marker:hidden">
-          <Wrench aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-teal-700" />
-          <span className="min-w-0 flex-1">
-            <span className="block truncate">{toolCall.name}</span>
-            <span
-              className="mt-0.5 block truncate font-mono text-[11px] font-medium leading-4 text-stone-500"
-              title={detailText}
-            >
-              {detailText}
-            </span>
-          </span>
+    <details className="tool-call-block group min-w-0">
+      <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
+        <Wrench aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <span className="min-w-0 shrink-0 truncate">{toolCall.name}</span>
+        {detailText ? (
+          <span className="shrink-0 text-stone-300">·</span>
+        ) : null}
+        {detailText ? (
           <span
-            className={`shrink-0 rounded-md px-1.5 py-0.5 text-[11px] ${
-              toolCall.isError
-                ? "bg-rose-50 text-rose-700"
-                : "bg-stone-100 text-stone-600"
-            }`}
+            className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-stone-500"
+            title={detailText}
           >
-            {toolStatusText(toolCall, t)}
+            {detailText}
           </span>
-        </summary>
-        <div className="mt-2 grid gap-2 text-xs text-stone-600">
+        ) : null}
+        <span
+          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${
+            toolCall.isError
+              ? "bg-rose-50 text-rose-700"
+              : "bg-stone-100 text-stone-600"
+          }`}
+        >
+          {toolStatusText(toolCall, t)}
+        </span>
+      </summary>
+      <div className="mt-2 grid gap-2 text-xs text-stone-600">
+        <div className="min-w-0">
+          <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
+          <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
+            {formatJsonValue(input)}
+          </pre>
+        </div>
+        {toolCall.output !== null ? (
           <div className="min-w-0">
-            <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
-            <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
-              {formatJsonValue(input)}
+            <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
+            <pre
+              className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
+                toolCall.isError
+                  ? "border-rose-200 text-rose-700"
+                  : "border-stone-200"
+              }`}
+            >
+              {formatJsonValue(toolCall.output)}
             </pre>
           </div>
-          {toolCall.output !== null ? (
-            <div className="min-w-0">
-              <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
-              <pre
-                className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
-                  toolCall.isError
-                    ? "border-rose-200 text-rose-700"
-                    : "border-stone-200"
-                }`}
-              >
-                {formatJsonValue(toolCall.output)}
-              </pre>
-            </div>
-          ) : null}
-        </div>
-      </details>
-    </div>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
