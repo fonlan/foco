@@ -1632,6 +1632,9 @@ export function App() {
   );
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [runningChatKey, setRunningChatKey] = useState<string | null>(null);
+  const [failedChatKeySet, setFailedChatKeySet] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [retryRunRequest, setRetryRunRequest] =
     useState<RetryRunRequest | null>(null);
   const [isLoading, setIsLoading] = useState(true);
@@ -1665,6 +1668,13 @@ export function App() {
   const chatTabs = useMemo(
     () => openChatTabs.map((tab) => hydrateChatTab(tab, workspaces)),
     [openChatTabs, workspaces],
+  );
+  const openChatKeySet = useMemo(
+    () =>
+      new Set(
+        openChatTabs.map((tab) => chatRunKey(tab.workspaceId, tab.chatId)),
+      ),
+    [openChatTabs],
   );
   const availableModels = useMemo(
     () =>
@@ -2026,6 +2036,16 @@ export function App() {
     setPendingDeleteChat((current) =>
       current && workspaceHasChat(workspaces, current) ? current : null,
     );
+
+    setFailedChatKeySet((current) => {
+      const next = new Set(
+        [...current].filter((chatKey) => {
+          const parsed = parseChatRunKey(chatKey);
+          return parsed ? workspaceHasChat(workspaces, parsed) : false;
+        }),
+      );
+      return next.size === current.size ? current : next;
+    });
   }, [workspaces]);
 
   useEffect(() => {
@@ -2266,6 +2286,26 @@ export function App() {
     });
   }
 
+  function setChatRunFailed(chatKey: string | null, failed: boolean) {
+    if (!chatKey || chatKey.includes(":pending:")) {
+      return;
+    }
+
+    setFailedChatKeySet((current) => {
+      if (current.has(chatKey) === failed) {
+        return current;
+      }
+
+      const next = new Set(current);
+      if (failed) {
+        next.add(chatKey);
+      } else {
+        next.delete(chatKey);
+      }
+      return next;
+    });
+  }
+
   async function loadChatMessages(workspaceId: string, chatId: string) {
     setError(null);
 
@@ -2347,6 +2387,7 @@ export function App() {
         (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
       ),
     );
+    setChatRunFailed(chatKey, false);
     removeMessagesForChatKey(chatKey);
 
     if (activeWorkspaceId !== workspaceId || activeChatId !== chatId) {
@@ -2741,6 +2782,7 @@ export function App() {
     const abortController = new AbortController();
 
     activeChatKeyRef.current = runMessagesKey;
+    setChatRunFailed(runMessagesKey, false);
     setMessagesForChatKey(runMessagesKey, (current) => [
       ...current,
       {
@@ -2814,6 +2856,7 @@ export function App() {
             request.workspaceId,
             streamEvent.chatId,
           );
+          setChatRunFailed(currentRunningChatKey, false);
           openChatTab(request.workspaceId, streamEvent.chatId);
           if (runMessagesKey !== currentRunningChatKey) {
             moveMessagesForChatKey(runMessagesKey, currentRunningChatKey, (current) =>
@@ -2898,6 +2941,7 @@ export function App() {
         }
 
         if (streamEvent.type === "complete") {
+          setChatRunFailed(runMessagesKey, false);
           setRetryRunRequest(null);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -3000,6 +3044,10 @@ export function App() {
         }
 
         if (streamEvent.type === "error") {
+          setChatRunFailed(runMessagesKey, true);
+          setRunningChatKey((current) =>
+            current === currentRunningChatKey ? null : current,
+          );
           setError(streamEvent.message);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -3019,6 +3067,9 @@ export function App() {
       const wasCancelled =
         requestError instanceof DOMException && requestError.name === "AbortError";
       const message = wasCancelled ? t("Run cancelled.") : errorMessage(requestError);
+      if (!wasCancelled) {
+        setChatRunFailed(runMessagesKey, true);
+      }
       setError(message);
       setPendingQuestion(null);
       setQuestionError(null);
@@ -3342,9 +3393,20 @@ export function App() {
                           {workspace.chats.length > 0 ? (
                             <>
                               {visibleChats.map((chat) => {
+                                const chatKey = chatRunKey(workspace.id, chat.id);
                                 const isChatRunning =
-                                  runningChatKey ===
-                                  chatRunKey(workspace.id, chat.id);
+                                  runningChatKey === chatKey;
+                                const isChatOpen = openChatKeySet.has(chatKey);
+                                const isChatFailed =
+                                  isChatOpen && failedChatKeySet.has(chatKey);
+                                let statusDotClass = "session-status-dot-idle";
+                                if (isChatRunning) {
+                                  statusDotClass = "session-status-dot-running";
+                                } else if (isChatFailed) {
+                                  statusDotClass = "session-status-dot-error";
+                                } else if (isChatOpen) {
+                                  statusDotClass = "session-status-dot-open";
+                                }
                                 const isChatActive =
                                   activeWorkspace?.id === workspace.id &&
                                   activeChatId === chat.id;
@@ -3366,11 +3428,7 @@ export function App() {
                                      >
                                       <span
                                         aria-hidden="true"
-                                        className={`session-status-dot ${
-                                          isChatRunning
-                                            ? "session-status-dot-running"
-                                            : "session-status-dot-idle"
-                                        }`}
+                                        className={`session-status-dot ${statusDotClass}`}
                                       />
                                       <span className="min-w-0 flex-1">
                                         <span className="block truncate">
@@ -14939,6 +14997,18 @@ function formatChatCreatedAt(value: string) {
 
 function chatRunKey(workspaceId: string, chatId: string) {
   return `${workspaceId}:${chatId}`;
+}
+
+function parseChatRunKey(chatKey: string) {
+  const separatorIndex = chatKey.indexOf(":");
+  if (separatorIndex <= 0 || separatorIndex === chatKey.length - 1) {
+    return null;
+  }
+
+  return {
+    workspaceId: chatKey.slice(0, separatorIndex),
+    chatId: chatKey.slice(separatorIndex + 1),
+  };
 }
 
 function pendingChatRunKey(workspaceId: string, runKey: string) {

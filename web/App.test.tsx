@@ -1289,6 +1289,98 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("Tool run")).toBeInTheDocument();
   });
 
+  it("reflects chat tab and running state in workspace chat dots", async () => {
+    render(<App />);
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyTitle = await within(workspaceList).findByText("Tool run");
+    const historyButton = historyTitle.closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+
+    const statusDot = () => historyButton.querySelector(".session-status-dot");
+    expect(statusDot()).toHaveClass("session-status-dot-idle");
+
+    await userEvent.click(historyButton);
+    await screen.findByText("Please inspect README.");
+    expect(statusDot()).toHaveClass("session-status-dot-open");
+
+    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "continue");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(statusDot()).toHaveClass("session-status-dot-running"),
+    );
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+
+    await waitFor(() =>
+      expect(statusDot()).toHaveClass("session-status-dot-open"),
+    );
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    await userEvent.click(
+      within(tabList).getByRole("button", { name: "Close chat tab Tool run" }),
+    );
+
+    expect(statusDot()).toHaveClass("session-status-dot-idle");
+  });
+
+  it("marks workspace chat dots red after an interrupted stream", async () => {
+    render(<App />);
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyTitle = await within(workspaceList).findByText("Tool run");
+    const historyButton = historyTitle.closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+
+    const statusDot = () => historyButton.querySelector(".session-status-dot");
+
+    await userEvent.click(historyButton);
+    await screen.findByText("Please inspect README.");
+    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "continue");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() =>
+      expect(statusDot()).toHaveClass("session-status-dot-running"),
+    );
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        message: "network disconnected",
+        type: "error",
+      });
+    });
+
+    await waitFor(() =>
+      expect(statusDot()).toHaveClass("session-status-dot-error"),
+    );
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+
+    await waitFor(() =>
+      expect(statusDot()).toHaveClass("session-status-dot-error"),
+    );
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    await userEvent.click(
+      within(tabList).getByRole("button", { name: "Close chat tab Tool run" }),
+    );
+
+    expect(statusDot()).toHaveClass("session-status-dot-idle");
+  });
+
   it("shows chat tab scroll controls only when tabs overflow and supports wheel scrolling", async () => {
     render(<App />);
 
