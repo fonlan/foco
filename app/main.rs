@@ -3305,6 +3305,7 @@ struct DeleteSettingsItemRequest {
 struct ChatStreamRequest {
     chat_id: Option<String>,
     model_id: String,
+    provider_id: Option<String>,
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
     message: String,
@@ -3317,6 +3318,7 @@ struct ChatStreamRequest {
 struct ContextUsageRequest {
     chat_id: Option<String>,
     model_id: String,
+    provider_id: Option<String>,
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
     draft_message: Option<String>,
@@ -3362,6 +3364,7 @@ struct ContextUsageResponse {
 struct PromptContextRequest {
     chat_id: Option<String>,
     model_id: String,
+    provider_id: Option<String>,
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
     message: Option<String>,
@@ -3373,6 +3376,7 @@ impl ChatStreamRequest {
         PromptContextRequest {
             chat_id: self.chat_id,
             model_id: self.model_id,
+            provider_id: self.provider_id,
             thinking_level: self.thinking_level,
             skill_ids: self.skill_ids,
             message: Some(self.message),
@@ -3386,6 +3390,7 @@ impl ContextUsageRequest {
         PromptContextRequest {
             chat_id: self.chat_id,
             model_id: self.model_id,
+            provider_id: self.provider_id,
             thinking_level: self.thinking_level,
             skill_ids: self.skill_ids,
             message: optional_trimmed_string(self.draft_message),
@@ -5152,6 +5157,7 @@ async fn prepare_prompt_context(
 ) -> Result<PreparedPromptContext, ApiError> {
     let workspace_id = workspace_id.trim();
     let model_id = request.model_id.trim();
+    let requested_provider_id = optional_trimmed_string(request.provider_id);
     let thinking_level = optional_trimmed_string(request.thinking_level);
     let requested_skill_ids = request.skill_ids;
     let raw_message = optional_trimmed_string(request.message);
@@ -5192,12 +5198,15 @@ async fn prepare_prompt_context(
             model.id, limits.max_output_tokens
         ))
     })?;
-    let active_provider_id = model.active_provider_id.as_deref().ok_or_else(|| {
-        ApiError::bad_request(format!(
-            "model '{}' has no active provider selected",
-            model.id
-        ))
-    })?;
+    let active_provider_id = requested_provider_id
+        .as_deref()
+        .or(model.active_provider_id.as_deref())
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "model '{}' has no active provider selected",
+                model.id
+            ))
+        })?;
 
     if !model
         .provider_ids
@@ -5205,7 +5214,7 @@ async fn prepare_prompt_context(
         .any(|provider_id| provider_id == active_provider_id)
     {
         return Err(ApiError::bad_request(format!(
-            "active provider '{}' is not associated with model '{}'",
+            "provider '{}' is not associated with model '{}'",
             active_provider_id, model.id
         )));
     }
@@ -5216,7 +5225,7 @@ async fn prepare_prompt_context(
         .find(|provider| provider.id == active_provider_id)
         .ok_or_else(|| {
             ApiError::bad_request(format!(
-                "active provider '{}' was not found",
+                "provider '{}' was not found",
                 active_provider_id
             ))
         })?;
@@ -15716,6 +15725,7 @@ Search memory before repo work.
             ChatStreamRequest {
                 chat_id: None,
                 model_id: "model".to_string(),
+                provider_id: None,
                 thinking_level: None,
                 skill_ids: None,
                 message: "Hello".to_string(),
@@ -15797,6 +15807,7 @@ Search memory before repo work.
             ChatStreamRequest {
                 chat_id: Some(new_context.chat_id.clone()),
                 model_id: "model".to_string(),
+                provider_id: None,
                 thinking_level: None,
                 skill_ids: None,
                 message: "Next".to_string(),
@@ -15896,6 +15907,7 @@ Use the existing product UI conventions.
             ChatStreamRequest {
                 chat_id: None,
                 model_id: "model".to_string(),
+                provider_id: None,
                 thinking_level: None,
                 skill_ids: Some(vec!["workspace:default:web-design-guidelines".to_string()]),
                 message: "Settings single-column layout.".to_string(),

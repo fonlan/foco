@@ -22,11 +22,15 @@ import {
   GitCompare,
   Globe,
   GripVertical,
+  Home,
   KeyRound,
   ListChecks,
   Lock,
+  LogOut,
   LoaderCircle,
   MessageSquare,
+  MoreHorizontal,
+  PanelRight,
   Pencil,
   PlugZap,
   Plus,
@@ -862,6 +866,7 @@ type SettingsSection =
   | "skills"
   | "workspaces";
 type ViewMode = "chat" | "settings" | "stats";
+type ContextPanelTab = "task" | "git" | "memory";
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
@@ -994,6 +999,9 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Close terminal": "关闭终端",
     "Close terminal {number}": "关闭终端 {number}",
     "Open terminal": "打开终端",
+    "Close context panel": "关闭右侧面板",
+    "Open context panel": "打开右侧面板",
+    "Resize context panel": "调整右侧面板宽度",
     "Close git diff": "关闭 Git diff",
     "Open git diff": "打开 Git diff",
     "Cancel the current run before deleting this chat.":
@@ -1524,8 +1532,14 @@ type RetryRunRequest = {
   content: string;
   attachments: ChatAttachmentPayload[];
   modelId: string;
+  providerId: string;
   thinkingLevel: string;
   skillIds: string[];
+};
+
+type ContextMemoryState = {
+  global: MemoryFactRecord[];
+  workspace: MemoryFactRecord[];
 };
 
 type QuestionAnswerSubmission = {
@@ -1568,6 +1582,7 @@ export function App() {
   >({});
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
+  const [selectedProviderId, setSelectedProviderId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [gitBranches, setGitBranches] = useState<GitBranchesResponse | null>(null);
@@ -1577,13 +1592,11 @@ export function App() {
   const [isBranchDialogOpen, setIsBranchDialogOpen] = useState(false);
   const [newBranchName, setNewBranchName] = useState("");
   const [isSavingBranch, setIsSavingBranch] = useState(false);
-  const [isDiffPanelOpen, setIsDiffPanelOpen] = useState(false);
-  const [diffPanelWidth, setDiffPanelWidth] = useState(400);
+  const [isContextPanelOpen, setIsContextPanelOpen] = useState(true);
+  const [contextPanelTab, setContextPanelTab] =
+    useState<ContextPanelTab>("task");
+  const [diffPanelWidth, setDiffPanelWidth] = useState(420);
   const [isResizingDiffPanel, setIsResizingDiffPanel] = useState(false);
-  const [taskGraphPanelHeightPercent, setTaskGraphPanelHeightPercent] =
-    useState(48);
-  const [isResizingTaskGraphPanel, setIsResizingTaskGraphPanel] =
-    useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(288);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [isMobileWorkspaceOpen, setIsMobileWorkspaceOpen] = useState(false);
@@ -1597,6 +1610,15 @@ export function App() {
   const [taskGraph, setTaskGraph] = useState<TaskGraphResponse | null>(null);
   const [isLoadingTaskGraph, setIsLoadingTaskGraph] = useState(false);
   const [taskGraphError, setTaskGraphError] = useState<string | null>(null);
+  const [contextMemories, setContextMemories] = useState<ContextMemoryState>({
+    global: [],
+    workspace: [],
+  });
+  const [isLoadingContextMemories, setIsLoadingContextMemories] =
+    useState(false);
+  const [contextMemoryError, setContextMemoryError] = useState<string | null>(
+    null,
+  );
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [runningChatKey, setRunningChatKey] = useState<string | null>(null);
   const [retryRunRequest, setRetryRunRequest] =
@@ -1621,7 +1643,6 @@ export function App() {
   const activeRunAbortRef = useRef<AbortController | null>(null);
   const activeChatKeyRef = useRef<string | null>(null);
   const hasManuallySelectedModelRef = useRef(false);
-  const diffPanelSplitRef = useRef<HTMLDivElement | null>(null);
 
   const activeWorkspace = useMemo(
     () =>
@@ -1654,7 +1675,7 @@ export function App() {
     ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
     : false;
   const isGlobalView = viewMode === "settings" || viewMode === "stats";
-  const showDiffPanel = !isGlobalView && isDiffPanelOpen;
+  const showContextPanel = !isGlobalView && isContextPanelOpen;
   const canLogout = Boolean(settings?.general.webServer.passwordEnabled);
   const language = settings?.general.language ?? "en";
   const t = useCallback<Translate>(
@@ -1767,6 +1788,7 @@ export function App() {
             chatId: activeChatId,
             draftMessage: draftMessage.trim() || null,
             modelId: selectedModelId,
+            providerId: selectedProviderId || null,
             skillIds: selectedSkillIds.length ? selectedSkillIds : null,
             thinkingLevel: selectedThinkingLevel || null,
           }),
@@ -1804,6 +1826,7 @@ export function App() {
     draftMessage,
     isGlobalView,
     selectedModelId,
+    selectedProviderId,
     selectedSkillIds,
     selectedThinkingLevel,
   ]);
@@ -1834,6 +1857,41 @@ export function App() {
       setDiffError(errorMessage(requestError));
     } finally {
       setIsLoadingDiff(false);
+    }
+  }, []);
+
+  const loadContextMemories = useCallback(async (workspaceId: string) => {
+    setIsLoadingContextMemories(true);
+    setContextMemoryError(null);
+
+    try {
+      const globalParams = new URLSearchParams({
+        limit: "20",
+        scope: "global",
+        status: "active",
+      });
+      const workspaceParams = new URLSearchParams({
+        limit: "20",
+        scope: "workspace",
+        status: "active",
+        workspaceId,
+      });
+      const [globalData, workspaceData] = await Promise.all([
+        requestJson<MemoryListResponse>(`/api/memory?${globalParams.toString()}`),
+        requestJson<MemoryListResponse>(
+          `/api/memory?${workspaceParams.toString()}`,
+        ),
+      ]);
+
+      setContextMemories({
+        global: globalData.memories,
+        workspace: workspaceData.memories,
+      });
+    } catch (requestError) {
+      setContextMemories({ global: [], workspace: [] });
+      setContextMemoryError(errorMessage(requestError));
+    } finally {
+      setIsLoadingContextMemories(false);
     }
   }, []);
 
@@ -1901,12 +1959,18 @@ export function App() {
       return;
     }
 
-    if (!isDiffPanelOpen) {
+    if (!isContextPanelOpen || contextPanelTab !== "git") {
       return;
     }
 
     void loadGitDiff(activeWorkspace.id, selectedDiffPath);
-  }, [activeWorkspace?.id, isDiffPanelOpen, loadGitDiff, selectedDiffPath]);
+  }, [
+    activeWorkspace?.id,
+    contextPanelTab,
+    isContextPanelOpen,
+    loadGitDiff,
+    selectedDiffPath,
+  ]);
 
   useEffect(() => {
     if (!activeWorkspace?.id || !activeChatId) {
@@ -1920,6 +1984,14 @@ export function App() {
     setTaskGraphError(null);
     void loadTaskGraph(activeWorkspace.id, activeChatId);
   }, [activeChatId, activeWorkspace?.id, loadTaskGraph]);
+
+  useEffect(() => {
+    if (contextPanelTab !== "memory" || !activeWorkspace?.id) {
+      return;
+    }
+
+    void loadContextMemories(activeWorkspace.id);
+  }, [activeWorkspace?.id, contextPanelTab, loadContextMemories]);
 
   useEffect(() => {
     if (!activeWorkspace?.id) {
@@ -1993,47 +2065,6 @@ export function App() {
   }, [isResizingSidebar]);
 
   useEffect(() => {
-    if (!isResizingTaskGraphPanel) {
-      return;
-    }
-
-    function handlePointerMove(event: PointerEvent) {
-      const container = diffPanelSplitRef.current;
-      if (!container) {
-        return;
-      }
-
-      const rect = container.getBoundingClientRect();
-      if (rect.height <= 0) {
-        return;
-      }
-
-      const nextHeight = ((event.clientY - rect.top) / rect.height) * 100;
-      setTaskGraphPanelHeightPercent(
-        Math.min(Math.max(nextHeight, 24), 76),
-      );
-    }
-
-    function handlePointerUp() {
-      setIsResizingTaskGraphPanel(false);
-    }
-
-    const previousCursor = document.body.style.cursor;
-    const previousUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-
-    return () => {
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousUserSelect;
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-    };
-  }, [isResizingTaskGraphPanel]);
-
-  useEffect(() => {
     if (!workspaces.length) {
       setExpandedWorkspaceId(null);
       return;
@@ -2078,6 +2109,31 @@ export function App() {
       (model) => model.id === selectedModelId,
     );
     setSelectedThinkingLevel(selectedModel?.thinkingLevel ?? "");
+  }, [availableModels, selectedModelId]);
+
+  useEffect(() => {
+    const selectedModel = availableModels.find(
+      (model) => model.id === selectedModelId,
+    );
+
+    setSelectedProviderId((current) => {
+      if (!selectedModel?.providerIds.length) {
+        return "";
+      }
+
+      if (current && selectedModel.providerIds.includes(current)) {
+        return current;
+      }
+
+      if (
+        selectedModel.activeProviderId &&
+        selectedModel.providerIds.includes(selectedModel.activeProviderId)
+      ) {
+        return selectedModel.activeProviderId;
+      }
+
+      return selectedModel.providerIds[0] ?? "";
+    });
   }, [availableModels, selectedModelId]);
 
   useEffect(() => {
@@ -2416,7 +2472,7 @@ export function App() {
       setGitBranches(data);
       setSelectedGitBranch(data.currentBranch ?? "");
 
-      if (isDiffPanelOpen) {
+      if (isContextPanelOpen && contextPanelTab === "git") {
         void loadGitDiff(activeWorkspace.id, selectedDiffPath);
       }
     } catch (requestError) {
@@ -2457,7 +2513,7 @@ export function App() {
       setNewBranchName("");
       setIsBranchDialogOpen(false);
 
-      if (isDiffPanelOpen) {
+      if (isContextPanelOpen && contextPanelTab === "git") {
         void loadGitDiff(activeWorkspace.id, selectedDiffPath);
       }
     } catch (requestError) {
@@ -2595,6 +2651,11 @@ export function App() {
       return;
     }
 
+    if (!selectedProviderId) {
+      setError(t("Select a provider before sending."));
+      return;
+    }
+
     const skillIds = [...selectedSkillIds];
     setSelectedSkillIds([]);
     setDraftAttachments([]);
@@ -2604,6 +2665,7 @@ export function App() {
       chatId: activeChatId,
       content,
       modelId: selectedModelId,
+      providerId: selectedProviderId,
       skillIds,
       thinkingLevel: selectedThinkingLevel,
       workspaceId: activeWorkspace.id,
@@ -2620,6 +2682,7 @@ export function App() {
     setActiveChatId(retryRequest.chatId);
     hasManuallySelectedModelRef.current = true;
     setSelectedModelId(retryRequest.modelId);
+    setSelectedProviderId(retryRequest.providerId);
     setSelectedSkillIds(retryRequest.skillIds);
     setSelectedThinkingLevel(retryRequest.thinkingLevel);
     await runChatMessage(retryRequest);
@@ -2710,6 +2773,7 @@ export function App() {
             message: request.content,
             attachments: request.attachments,
             modelId: request.modelId,
+            providerId: request.providerId,
             skillIds: request.skillIds.length ? request.skillIds : null,
             thinkingLevel: request.thinkingLevel || null,
           }),
@@ -2911,7 +2975,8 @@ export function App() {
             activeKey ===
             chatRunKey(streamEvent.workspaceId, streamEvent.chatId)
           ) {
-            setIsDiffPanelOpen(true);
+            setContextPanelTab("task");
+            setIsContextPanelOpen(true);
             void loadTaskGraph(streamEvent.workspaceId, streamEvent.chatId);
           }
           return;
@@ -3049,90 +3114,47 @@ export function App() {
 
   return (
     <I18nContext.Provider value={{ language, t }}>
-    <main className="app-root text-stone-950">
+    <main className="app-root foco-workbench text-stone-950">
       {isGlobalView ? (
-        <section className="flex h-full min-h-0 flex-col">
-          <header className="shrink-0 border-b border-stone-200/80 bg-white/85 px-4 py-3 backdrop-blur">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex min-w-0 items-center gap-3">
-                <FocoLogoMark />
-                <div className="min-w-0">
-                  <span className="block truncate text-lg font-semibold">
-                    Foco
-                  </span>
-                  <span className="block truncate text-xs text-stone-500">
-                    {t("Local workspace")}
-                  </span>
-                </div>
-              </div>
-              <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-                <button
-                  aria-label={t("Workspaces")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                  onClick={() => setViewMode("chat")}
-                  title={t("Workspaces")}
-                  type="button"
-                >
-                  <Folder aria-hidden="true" className="size-4" />
-                </button>
-                <div className="flex rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
-                  <NavButton
-                    active={viewMode === "settings"}
-                    icon={Settings}
-                    label={t("Settings")}
-                    onClick={() => setViewMode("settings")}
-                  />
-                  <NavButton
-                    active={viewMode === "stats"}
-                    icon={BarChart3}
-                    label={t("Stats")}
-                    onClick={() => setViewMode("stats")}
-                  />
-                </div>
-                <button
-                  aria-label={t("Refresh workspaces")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
-                  disabled={isLoading}
-                  onClick={() => void refreshWorkspaces()}
-                  title={t("Refresh workspaces")}
-                  type="button"
-                >
-                  {isLoading ? (
-                    <LoaderCircle
-                      aria-hidden="true"
-                      className="size-4 animate-spin"
-                    />
-                  ) : (
-                    <RefreshCw aria-hidden="true" className="size-4" />
-                  )}
-                </button>
-              </div>
-            </div>
-          </header>
-          {viewMode === "settings" ? (
-            <SettingsPanel
-              canLogout={canLogout}
-              onAddWorkspace={openWorkspaceDialog}
-              onLogout={handleLogout}
-              onSettingsChange={setSettings}
-              onWorkspacesChange={refreshWorkspaces}
-              workspaceDialogRevision={workspaceDialogRevision}
-            />
-          ) : (
-            <ApiStatsPanel
-              settings={settings}
-              workspaces={workspaces}
-            />
-          )}
-        </section>
+        <div className="global-shell">
+          <FocoNavRail
+            activeMode={viewMode}
+            canLogout={canLogout}
+            onAddWorkspace={openWorkspaceDialog}
+            onLogout={handleLogout}
+            onOpenSettings={() => setViewMode("settings")}
+            onOpenStats={() => setViewMode("stats")}
+            onOpenWorkspace={() => {
+              setViewMode("chat");
+              setIsMobileWorkspaceOpen(true);
+            }}
+            onReturnHome={() => setViewMode("chat")}
+          />
+          <section className="global-main-panel min-w-0">
+            {viewMode === "settings" ? (
+              <SettingsPanel
+                canLogout={canLogout}
+                onAddWorkspace={openWorkspaceDialog}
+                onLogout={handleLogout}
+                onSettingsChange={setSettings}
+                onWorkspacesChange={refreshWorkspaces}
+                workspaceDialogRevision={workspaceDialogRevision}
+              />
+            ) : (
+              <ApiStatsPanel
+                settings={settings}
+                workspaces={workspaces}
+              />
+            )}
+          </section>
+        </div>
       ) : (
         <div
-          className={`app-shell ${showDiffPanel ? "app-shell-with-diff" : ""}`}
+          className={`app-shell ${showContextPanel ? "app-shell-with-context" : ""}`}
           style={
             {
               "--diff-panel-width": `${diffPanelWidth}px`,
               "--sidebar-width": `${sidebarWidth}px`,
-              "--task-graph-panel-height": `${taskGraphPanelHeightPercent}%`,
             } as CSSProperties
           }
         >
@@ -3144,6 +3166,19 @@ export function App() {
             type="button"
           />
         ) : null}
+        <FocoNavRail
+          activeMode={viewMode}
+          canLogout={canLogout}
+          onAddWorkspace={openWorkspaceDialog}
+          onLogout={handleLogout}
+          onOpenSettings={() => setViewMode("settings")}
+          onOpenStats={() => setViewMode("stats")}
+          onOpenWorkspace={() => {
+            setViewMode("chat");
+            setIsMobileWorkspaceOpen(true);
+          }}
+          onReturnHome={() => setViewMode("chat")}
+        />
         <aside
           className={`workspace-sidebar relative border-stone-200/80 lg:border-r ${
             isMobileWorkspaceOpen ? "workspace-sidebar-mobile-open" : ""
@@ -3169,17 +3204,11 @@ export function App() {
             tabIndex={0}
           />
           <div className="flex h-full min-h-0 flex-col">
-            <div className="flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
-              <div className="flex min-w-0 items-center gap-3">
-                <FocoLogoMark />
-                <div className="min-w-0">
-                  <span className="block truncate text-lg font-semibold">
-                    Foco
-                  </span>
-                  <span className="mt-1 block truncate text-xs text-stone-500">
-                    {t("Local workspace")}
-                  </span>
-                </div>
+            <div className="workspace-sidebar-header flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
+              <div className="min-w-0">
+                <span className="workspace-sidebar-title">
+                  WORKSPACES
+                </span>
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
                 <button
@@ -3191,33 +3220,6 @@ export function App() {
                 >
                   <X aria-hidden="true" className="size-4" />
                 </button>
-                <button
-                  aria-label={t("Settings")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                  onClick={() => setViewMode("settings")}
-                  title={t("Settings")}
-                  type="button"
-                >
-                  <Settings aria-hidden="true" className="size-4" />
-                </button>
-                <button
-                  aria-label={t("Stats")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                  onClick={() => setViewMode("stats")}
-                  title={t("Stats")}
-                  type="button"
-                >
-                  <BarChart3 aria-hidden="true" className="size-4" />
-                </button>
-                <button
-                  aria-label={t("Add workspace")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                  onClick={() => openWorkspaceDialog()}
-                  title={t("Add workspace")}
-                  type="button"
-                >
-                  <FolderPlus aria-hidden="true" className="size-4" />
-                </button>
               </div>
             </div>
 
@@ -3227,7 +3229,10 @@ export function App() {
               </div>
             ) : null}
 
-            <nav className="panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3">
+            <nav
+              aria-label={t("Workspace list")}
+              className="workspace-nav panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3"
+            >
               {workspaces.length ? (
                 workspaces.map((workspace) => {
                   const isExpanded = expandedWorkspaceId === workspace.id;
@@ -3270,6 +3275,17 @@ export function App() {
                           }
                           type="button"
                         >
+                          {isExpanded ? (
+                            <ChevronDown
+                              aria-hidden="true"
+                              className="workspace-expand-icon"
+                            />
+                          ) : (
+                            <ChevronRight
+                              aria-hidden="true"
+                              className="workspace-expand-icon"
+                            />
+                          )}
                           <WorkspaceIcon
                             className="size-4 shrink-0 rounded object-cover"
                             fallbackClassName="size-4 shrink-0"
@@ -3347,18 +3363,15 @@ export function App() {
                                         selectWorkspaceChat(workspace.id, chat.id)
                                       }
                                       type="button"
-                                    >
-                                      {isChatRunning ? (
-                                        <LoaderCircle
-                                          aria-hidden="true"
-                                          className="size-3.5 shrink-0 animate-spin text-teal-700"
-                                        />
-                                      ) : (
-                                        <MessageSquare
-                                          aria-hidden="true"
-                                          className="size-3.5 shrink-0"
-                                        />
-                                      )}
+                                     >
+                                      <span
+                                        aria-hidden="true"
+                                        className={`session-status-dot ${
+                                          isChatRunning
+                                            ? "session-status-dot-running"
+                                            : "session-status-dot-idle"
+                                        }`}
+                                      />
                                       <span className="min-w-0 flex-1">
                                         <span className="block truncate">
                                           {chat.title}
@@ -3447,7 +3460,7 @@ export function App() {
         </aside>
 
         <section className="app-main-panel flex min-w-0 flex-col">
-              <header className="shrink-0 border-b border-stone-200/80 bg-white/80 px-3 py-2 backdrop-blur sm:px-4">
+              <header className="app-toolbar shrink-0 border-b border-stone-200/80 bg-white/80 backdrop-blur">
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <button
                     aria-label={t("Workspaces")}
@@ -3466,48 +3479,50 @@ export function App() {
                     runningChatKey={runningChatKey}
                     tabs={chatTabs}
                   />
-                  <div className="chat-header-actions flex flex-wrap items-center gap-2">
-                    <div className="flex overflow-x-auto rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
-                      <button
-                        aria-label={
-                          isDiffPanelOpen ? t("Close git diff") : t("Open git diff")
-                        }
-                        className={`inline-flex size-9 items-center justify-center rounded-lg ${
-                          isDiffPanelOpen
-                            ? "bg-white text-teal-900 shadow-sm"
-                            : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
+                  <div className="chat-header-actions">
+                    <button
+                      aria-label={
+                        isTerminalOpen ? t("Close terminal") : t("Open terminal")
+                      }
+                      className={`chat-toolbar-button terminal-toolbar-button ${
+                        isTerminalOpen ? "chat-toolbar-button-active" : ""
+                      } disabled:cursor-not-allowed disabled:text-stone-400`}
+                      disabled={!activeWorkspace}
+                      onClick={toggleWorkspaceTerminal}
+                      title={
+                        isTerminalOpen ? t("Terminal (1)") : t("Terminal")
+                      }
+                      type="button"
+                    >
+                      <span
+                        aria-hidden="true"
+                        className={`terminal-status-dot ${
+                          isTerminalOpen ? "terminal-status-dot-running" : ""
                         }`}
-                        onClick={() => setIsDiffPanelOpen((current) => !current)}
-                        title={
-                          isDiffPanelOpen ? t("Close git diff") : t("Open git diff")
-                        }
-                        type="button"
-                      >
-                        <GitCompare aria-hidden="true" className="size-4" />
-                      </button>
-                    </div>
-                    <div className="flex rounded-xl border border-stone-200 bg-stone-100/80 p-1 shadow-inner">
-                      <button
-                        aria-label={
-                          isTerminalOpen
-                            ? t("Close terminal")
-                            : t("Open terminal")
-                        }
-                        className={`inline-flex size-9 items-center justify-center rounded-lg ${
-                          isTerminalOpen
-                            ? "bg-white text-teal-900 shadow-sm"
-                            : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
-                        } disabled:cursor-not-allowed disabled:text-stone-400`}
-                        disabled={!activeWorkspace}
-                        onClick={toggleWorkspaceTerminal}
-                        title={
-                          isTerminalOpen ? t("Close terminal") : t("Open terminal")
-                        }
-                        type="button"
-                      >
-                        <Terminal aria-hidden="true" className="size-4" />
-                      </button>
-                    </div>
+                      />
+                      <Terminal aria-hidden="true" className="size-4" />
+                    </button>
+                    <button
+                      aria-label={
+                        isContextPanelOpen
+                          ? t("Close context panel")
+                          : t("Open context panel")
+                      }
+                      className={`chat-toolbar-button ${
+                        isContextPanelOpen ? "chat-toolbar-button-active" : ""
+                      }`}
+                      onClick={() => {
+                        setIsContextPanelOpen((current) => !current);
+                      }}
+                      title={
+                        isContextPanelOpen
+                          ? t("Close context panel")
+                          : t("Open context panel")
+                      }
+                      type="button"
+                    >
+                      <PanelRight aria-hidden="true" className="size-4" />
+                    </button>
                   </div>
                 </div>
               </header>
@@ -3533,6 +3548,7 @@ export function App() {
               onSelectAttachments={() => void handleSelectDraftAttachments()}
               onCancelRun={handleCancelRun}
               onModelChange={handleChatModelChange}
+              onProviderChange={setSelectedProviderId}
               onRemoveAttachment={handleRemoveDraftAttachment}
               onRemoveSkill={removeSelectedSkill}
               onRetryRun={() => void handleRetryRun()}
@@ -3542,8 +3558,10 @@ export function App() {
               canRetryRun={retryRunRequest !== null && !isSendingMessage}
               selectedGitBranch={selectedGitBranch}
               selectedModelId={selectedModelId}
+              selectedProviderId={selectedProviderId}
               selectedSkillIds={selectedSkillIds}
               selectedThinkingLevel={selectedThinkingLevel}
+              providers={settings?.providers ?? []}
               skills={detectedSkills}
               thinkingLevels={thinkingLevels}
             />
@@ -3563,11 +3581,11 @@ export function App() {
           ) : null}
         </section>
 
-        {showDiffPanel ? (
-        <aside className="diff-sidebar min-w-0 border-stone-200/80 lg:border-l">
+        {showContextPanel ? (
+        <aside className="context-sidebar diff-sidebar min-w-0 border-stone-200/80 lg:border-l">
           <div className="relative flex h-full min-h-0 min-w-0 flex-col">
             <div
-              aria-label={t("Resize git diff panel")}
+              aria-label={t("Resize context panel")}
               aria-orientation="vertical"
               className="absolute bottom-0 left-0 top-0 z-10 hidden w-1 cursor-col-resize bg-transparent hover:bg-teal-500/40 lg:block"
               onKeyDown={(event) => {
@@ -3589,78 +3607,33 @@ export function App() {
               role="separator"
               tabIndex={0}
             />
-            {taskGraph?.exists && taskGraph.tasks.length ? (
-              <div
-                className="diff-panel-split flex min-h-0 flex-1 flex-col"
-                ref={diffPanelSplitRef}
-              >
-                <div className="task-graph-panel-slot min-h-0">
-                  <TaskGraphPanel
-                    error={taskGraphError}
-                    isLoading={isLoadingTaskGraph}
-                    taskGraph={taskGraph}
-                  />
-                </div>
-                <div
-                  aria-label={t("Resize task graph and git diff panels")}
-                  aria-orientation="horizontal"
-                  className="diff-panel-row-resizer group relative h-3 shrink-0 cursor-row-resize border-y border-stone-200/80 bg-stone-100/70"
-                  onKeyDown={(event) => {
-                    if (event.key === "ArrowUp") {
-                      event.preventDefault();
-                      setTaskGraphPanelHeightPercent((current) =>
-                        Math.max(current - 5, 24),
-                      );
-                    }
-
-                    if (event.key === "ArrowDown") {
-                      event.preventDefault();
-                      setTaskGraphPanelHeightPercent((current) =>
-                        Math.min(current + 5, 76),
-                      );
-                    }
-                  }}
-                  onPointerDown={() => setIsResizingTaskGraphPanel(true)}
-                  role="separator"
-                  tabIndex={0}
-                >
-                  <span className="absolute left-1/2 top-1/2 h-1 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-stone-300 transition-colors group-hover:bg-teal-500/70" />
-                </div>
-                <div className="git-diff-panel-slot min-h-0">
-                  <GitDiffPanel
-                    diffError={diffError}
-                    diffText={selectedDiffText}
-                    files={gitDiff?.files ?? []}
-                    isLoading={isLoadingDiff}
-                    onClose={() => setIsDiffPanelOpen(false)}
-                    onRefresh={() => {
-                      if (activeWorkspace?.id) {
-                        void loadGitDiff(activeWorkspace.id, selectedDiffPath);
-                      }
-                    }}
-                    onSelectFile={setSelectedDiffPath}
-                    selectedPath={selectedDiffPath}
-                  />
-                </div>
-              </div>
-            ) : (
-              <div className="min-h-0 flex-1">
-                <GitDiffPanel
-                  diffError={diffError}
-                  diffText={selectedDiffText}
-                  files={gitDiff?.files ?? []}
-                  isLoading={isLoadingDiff}
-                  onClose={() => setIsDiffPanelOpen(false)}
-                  onRefresh={() => {
-                    if (activeWorkspace?.id) {
-                      void loadGitDiff(activeWorkspace.id, selectedDiffPath);
-                    }
-                  }}
-                  onSelectFile={setSelectedDiffPath}
-                  selectedPath={selectedDiffPath}
-                />
-              </div>
-            )}
+            <ContextPanel
+              activeTab={contextPanelTab}
+              contextMemories={contextMemories}
+              contextMemoryError={contextMemoryError}
+              diffError={diffError}
+              diffText={selectedDiffText}
+              files={gitDiff?.files ?? []}
+              isLoadingDiff={isLoadingDiff}
+              isLoadingContextMemories={isLoadingContextMemories}
+              isLoadingTaskGraph={isLoadingTaskGraph}
+              onCloseGit={() => {
+                setIsContextPanelOpen(false);
+              }}
+              onRefreshDiff={() => {
+                if (activeWorkspace?.id) {
+                  void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+                }
+              }}
+              onSelectDiffFile={setSelectedDiffPath}
+              onTabChange={(tab) => {
+                setContextPanelTab(tab);
+                setIsContextPanelOpen(true);
+              }}
+              selectedPath={selectedDiffPath}
+              taskGraph={taskGraph}
+              taskGraphError={taskGraphError}
+            />
           </div>
         </aside>
         ) : null}
@@ -4410,7 +4383,7 @@ function ChatTabBar({
   const { t } = useI18n();
 
   return (
-    <div className="min-w-0 flex-1">
+    <div className="chat-tabs min-w-0 flex-1">
       <div
         aria-label={t("Chat")}
         className="chat-tab-list panel-scroll flex min-w-0 gap-1 overflow-x-auto"
@@ -4485,6 +4458,126 @@ function ChatTabBar({
   );
 }
 
+function FocoNavRail({
+  activeMode,
+  canLogout,
+  onAddWorkspace,
+  onLogout,
+  onOpenSettings,
+  onOpenStats,
+  onOpenWorkspace,
+  onReturnHome,
+}: {
+  activeMode: ViewMode;
+  canLogout: boolean;
+  onAddWorkspace: () => void;
+  onLogout: () => Promise<void>;
+  onOpenSettings: () => void;
+  onOpenStats: () => void;
+  onOpenWorkspace: () => void;
+  onReturnHome: () => void;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <nav aria-label="Foco" className="foco-nav-rail">
+      <div className="foco-nav-rail-main">
+        <button
+          aria-label="Foco"
+          className="foco-nav-logo-button"
+          onClick={onReturnHome}
+          title="Foco"
+          type="button"
+        >
+          <FocoLogoMark />
+        </button>
+        <NavRailButton
+          active={activeMode === "chat"}
+          icon={Home}
+          label={t("Home")}
+          onClick={onReturnHome}
+        />
+        <NavRailButton
+          active={activeMode === "chat"}
+          icon={Folder}
+          label={t("Workspaces")}
+          onClick={onOpenWorkspace}
+        />
+        <NavRailButton
+          active={activeMode === "stats"}
+          icon={Activity}
+          label={t("Usage")}
+          onClick={onOpenStats}
+        />
+        <NavRailButton
+          active={false}
+          icon={Brain}
+          label={t("Memory")}
+          onClick={onReturnHome}
+        />
+        <NavRailButton
+          active={false}
+          icon={Wrench}
+          label={t("Skills")}
+          onClick={onOpenSettings}
+        />
+        <NavRailButton
+          active={activeMode === "settings"}
+          icon={Settings}
+          label={t("Settings")}
+          onClick={onOpenSettings}
+        />
+      </div>
+      <div className="foco-nav-rail-bottom">
+        <NavRailButton
+          active={false}
+          icon={FolderPlus}
+          label={t("Add workspace")}
+          onClick={onAddWorkspace}
+        />
+        <NavRailButton
+          active={false}
+          icon={Globe}
+          label={t("Theme")}
+          onClick={onReturnHome}
+        />
+        {canLogout ? (
+          <NavRailButton
+            active={false}
+            icon={LogOut}
+            label={t("Logout")}
+            onClick={() => void onLogout()}
+          />
+        ) : null}
+      </div>
+    </nav>
+  );
+}
+
+function NavRailButton({
+  active,
+  icon: Icon,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  icon: LucideIcon;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      aria-label={label}
+      className={`foco-nav-rail-button ${active ? "foco-nav-rail-button-active" : ""}`}
+      onClick={onClick}
+      title={label}
+      type="button"
+    >
+      <Icon aria-hidden="true" className="size-4" />
+    </button>
+  );
+}
+
 function ChatPanel({
   availableModels,
   branchError,
@@ -4505,6 +4598,7 @@ function ChatPanel({
   onCancelRun,
   onDraftMessageChange,
   onModelChange,
+  onProviderChange,
   onRemoveAttachment,
   onRemoveSkill,
   onRetryRun,
@@ -4514,8 +4608,10 @@ function ChatPanel({
   onToggleSkill,
   selectedGitBranch,
   selectedModelId,
+  selectedProviderId,
   selectedSkillIds,
   selectedThinkingLevel,
+  providers,
   skills,
   thinkingLevels,
 }: {
@@ -4538,6 +4634,7 @@ function ChatPanel({
   onCancelRun: () => void;
   onDraftMessageChange: (value: string) => void;
   onModelChange: (value: string) => void;
+  onProviderChange: (value: string) => void;
   onRemoveAttachment: (attachmentId: string) => void;
   onRemoveSkill: (skillId: string) => void;
   onRetryRun: () => void;
@@ -4547,8 +4644,10 @@ function ChatPanel({
   onToggleSkill: (skillId: string) => void;
   selectedGitBranch: string;
   selectedModelId: string;
+  selectedProviderId: string;
   selectedSkillIds: string[];
   selectedThinkingLevel: string;
+  providers: ConfiguredProviderSummary[];
   skills: ConfiguredSkillSummary[];
   thinkingLevels: ThinkingLevelSummary[];
 }) {
@@ -4567,6 +4666,16 @@ function ChatPanel({
     label: model.displayName,
     value: model.id,
   }));
+  const selectedModel =
+    availableModels.find((model) => model.id === selectedModelId) ?? null;
+  const providersById = new Map(providers.map((provider) => [provider.id, provider]));
+  const providerOptions = (selectedModel?.providerIds ?? []).map((providerId) => {
+    const provider = providersById.get(providerId);
+    return {
+      label: provider?.name ?? providerId,
+      value: providerId,
+    };
+  });
   const thinkingOptions = [
     { label: t("Model default"), value: "" },
     ...thinkingLevels.map((level) => ({
@@ -4670,14 +4779,14 @@ function ChatPanel({
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div className="chat-panel flex min-h-0 flex-1 flex-col overflow-hidden">
       <div
-        className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4"
+        className="message-list panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4"
         onScroll={handleMessageScroll}
         ref={messageScrollRef}
       >
         <div
-          className="mx-auto flex w-full max-w-5xl flex-col gap-4"
+          className="message-stack mx-auto flex w-full max-w-5xl flex-col gap-4"
           ref={messageScrollContentRef}
         >
           {messages.length ? (
@@ -4686,21 +4795,22 @@ function ChatPanel({
             const parts = message.parts.length
               ? message.parts
               : fallbackMessageParts(message);
+            const authorLabel = isUser ? "You" : "Foco Agent";
 
             return (
               <div
-                className={`flex ${isUser ? "justify-end" : "justify-start"}`}
+                className={`message-row flex ${isUser ? "message-row-user" : "message-row-agent"}`}
                 key={message.id}
               >
                 <div
-                  className={`flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
+                  className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
                     isUser
-                      ? "flex-row-reverse rounded-tr-md border-teal-700 bg-teal-800 text-white"
-                      : "flex-row rounded-tl-md border-stone-200 bg-white/90 text-stone-900"
+                      ? "message-bubble-user flex-row rounded-tr-md border-teal-700 bg-teal-800 text-white"
+                      : "message-bubble-assistant flex-row rounded-tl-md border-stone-200 bg-white/90 text-stone-900"
                   }`}
                 >
                   <div
-                    className={`mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${
+                    className={`message-avatar mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${
                       isUser
                         ? "bg-teal-950/45 text-white"
                         : "bg-stone-100 text-stone-700"
@@ -4713,6 +4823,19 @@ function ChatPanel({
                     )}
                   </div>
                   <div className="min-w-0 flex-1 space-y-3">
+                    <div className="message-author-row">
+                      <span>{authorLabel}</span>
+                      {!isUser ? (
+                        <button
+                          aria-label={t("Message actions")}
+                          className="message-action-menu"
+                          title={t("Message actions")}
+                          type="button"
+                        >
+                          <MoreHorizontal aria-hidden="true" className="size-4" />
+                        </button>
+                      ) : null}
+                    </div>
                     {parts.length ? (
                       parts.map((part, partIndex) => (
                         <MessagePartBlock
@@ -4741,7 +4864,7 @@ function ChatPanel({
             );
             })
           ) : (
-            <div className="mx-auto flex min-h-[22rem] w-full max-w-xl flex-col items-center justify-center rounded-2xl border border-dashed border-stone-300 bg-white/60 px-6 py-10 text-center shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+            <div className="empty-chat-state mx-auto flex min-h-[22rem] w-full max-w-xl flex-col items-center justify-center rounded-2xl border border-dashed border-stone-300 bg-white/60 px-6 py-10 text-center shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
               <div className="inline-flex size-11 items-center justify-center rounded-2xl bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]">
                 <Bot aria-hidden="true" className="size-5" />
               </div>
@@ -4757,9 +4880,9 @@ function ChatPanel({
         <div aria-hidden="true" className="h-px" ref={messageScrollEndRef} />
       </div>
 
-      <div className="shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
+      <div className="composer-shell shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
         <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
-          <div className="relative rounded-xl border border-stone-300 bg-white">
+          <div className="composer-surface relative rounded-xl border border-stone-300 bg-white">
             {selectedSkills.length ? (
               <div className="flex flex-wrap gap-1.5 px-3 pt-2">
                 {selectedSkills.map((skill) => (
@@ -4816,7 +4939,7 @@ function ChatPanel({
                 event.currentTarget.form?.requestSubmit();
               }}
               onPaste={handlePaste}
-              placeholder={t("Message Foco")}
+              placeholder={t("Ask Foco anything...")}
               ref={messageTextareaRef}
               value={draftMessage}
             />
@@ -4860,13 +4983,13 @@ function ChatPanel({
               </div>
             ) : null}
             <div
-              className={`message-composer-actions flex flex-wrap items-center gap-2 border-t border-stone-100 px-2 py-2 ${
+              className={`message-composer-control-row ${
                 canRetryRun ? "message-composer-actions-with-retry" : ""
               }`}
             >
               <button
                 aria-label={t("Add attachment")}
-                className="composer-attach-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                className="composer-tool-button"
                 disabled={isSendingMessage || isSelectingAttachments}
                 onClick={onSelectAttachments}
                 title={t("Add attachment")}
@@ -4889,6 +5012,21 @@ function ChatPanel({
                 selectedValue={selectedModelId}
               />
               <ComposerSelectMenu
+                ariaLabel={t("Provider")}
+                className="composer-provider-select max-w-full"
+                disabled={
+                  isLoadingSettings ||
+                  isSendingMessage ||
+                  !selectedModelId ||
+                  !providerOptions.length
+                }
+                emptyLabel={t("Provider")}
+                icon={Server}
+                onChange={onProviderChange}
+                options={providerOptions}
+                selectedValue={selectedProviderId}
+              />
+              <ComposerSelectMenu
                 ariaLabel={t("Thinking")}
                 className="composer-thinking-select max-w-full"
                 disabled={isSendingMessage}
@@ -4906,20 +5044,20 @@ function ChatPanel({
                 isLoading={isLoadingBranches}
                 onChange={onBranchChange}
               />
-            {canRetryRun ? (
-              <button
-                aria-label={t("Retry last run")}
-                className="composer-retry-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                onClick={onRetryRun}
-                title={t("Retry last run")}
-                type="button"
-              >
-                <RefreshCw aria-hidden="true" className="size-4" />
-              </button>
-            ) : null}
+              {canRetryRun ? (
+                <button
+                  aria-label={t("Retry last run")}
+                  className="composer-retry-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                  onClick={onRetryRun}
+                  title={t("Retry last run")}
+                  type="button"
+                >
+                  <RefreshCw aria-hidden="true" className="size-4" />
+                </button>
+              ) : null}
+              <span aria-hidden="true" className="composer-control-spacer" />
               <ContextUsageCircle
                 isLoading={isLoadingContextUsage}
-                className="ml-auto"
                 usage={contextUsage}
               />
               {isSendingMessage ? (
@@ -4946,7 +5084,7 @@ function ChatPanel({
                   <Send aria-hidden="true" className="size-4" />
                 </button>
               )}
-          </div>
+            </div>
           </div>
           {branchError ? (
             <div className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
@@ -4970,7 +5108,7 @@ function ContextUsageCircle({
 }) {
   const { t } = useI18n();
   const percent = usage?.usagePercent ?? null;
-  const percentLabel = percent ?? 0;
+  const percentLabel = percent === null ? 0 : Math.round(percent);
   const boundedPercent =
     percent === null ? 0 : Math.max(0, Math.min(100, percent));
   const title =
@@ -5001,7 +5139,7 @@ function ContextUsageCircle({
       } as CSSProperties}
       title={title}
     >
-      {percent === null ? "--" : `${percent}%`}
+      {percent === null ? "--" : `${percentLabel}%`}
     </div>
   );
 }
@@ -5054,7 +5192,9 @@ function ComposerSelectMenu({
         title={selectedLabel}
       >
         <Icon aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-        <span className="min-w-0 flex-1 truncate">{selectedLabel}</span>
+        <span className="composer-select-label min-w-0 flex-1 truncate">
+          {selectedLabel}
+        </span>
         <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
       </summary>
       <div className="composer-select-popover absolute bottom-full left-0 z-20 mb-2 w-64 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
@@ -5112,7 +5252,7 @@ function BranchSelector({
         className="composer-branch-select inline-flex h-8 max-w-full items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-400"
       >
         <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
-        <span className="min-w-0 flex-1 truncate" />
+        <span className="composer-select-label min-w-0 flex-1 truncate" />
       </div>
     );
   }
@@ -5134,7 +5274,9 @@ function BranchSelector({
         title={t("Git branch")}
       >
         <GitBranch aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-        <span className="min-w-0 flex-1 truncate">{currentBranch}</span>
+        <span className="composer-select-label min-w-0 flex-1 truncate">
+          {currentBranch}
+        </span>
         {isLoading ? (
           <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
         ) : (
@@ -7096,6 +7238,218 @@ function TaskGraphPanel({
       </div>
     </div>
   );
+}
+
+function ContextPanel({
+  activeTab,
+  contextMemories,
+  contextMemoryError,
+  diffError,
+  diffText,
+  files,
+  isLoadingContextMemories,
+  isLoadingDiff,
+  isLoadingTaskGraph,
+  onCloseGit,
+  onRefreshDiff,
+  onSelectDiffFile,
+  onTabChange,
+  selectedPath,
+  taskGraph,
+  taskGraphError,
+}: {
+  activeTab: ContextPanelTab;
+  contextMemories: ContextMemoryState;
+  contextMemoryError: string | null;
+  diffError: string | null;
+  diffText: string;
+  files: GitStatusFileSummary[];
+  isLoadingContextMemories: boolean;
+  isLoadingDiff: boolean;
+  isLoadingTaskGraph: boolean;
+  onCloseGit: () => void;
+  onRefreshDiff: () => void;
+  onSelectDiffFile: (path: string | null) => void;
+  onTabChange: (tab: ContextPanelTab) => void;
+  selectedPath: string | null;
+  taskGraph: TaskGraphResponse | null;
+  taskGraphError: string | null;
+}) {
+  const { t } = useI18n();
+  const tabs: { id: ContextPanelTab; label: string; icon: LucideIcon }[] = [
+    { id: "task", label: "Task", icon: ListChecks },
+    { id: "git", label: "Git", icon: GitCompare },
+    { id: "memory", label: "Memory", icon: Brain },
+  ];
+
+  return (
+    <section className="context-panel flex h-full min-h-0 min-w-0 flex-col">
+      <div className="context-panel-tabs panel-scroll" role="tablist">
+        {tabs.map((tab) => {
+          const Icon = tab.icon;
+          const isActive = activeTab === tab.id;
+
+          return (
+            <button
+              aria-selected={isActive}
+              className={`context-panel-tab ${isActive ? "context-panel-tab-active" : ""}`}
+              key={tab.id}
+              onClick={() => onTabChange(tab.id)}
+              role="tab"
+              type="button"
+            >
+              <Icon aria-hidden="true" className="size-3.5" />
+              <span>{t(tab.label)}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="min-h-0 flex-1">
+        {activeTab === "task" ? (
+          <ContextTaskGraphTab
+            error={taskGraphError}
+            isLoading={isLoadingTaskGraph}
+            taskGraph={taskGraph}
+          />
+        ) : null}
+
+        {activeTab === "git" ? (
+          <div className="min-h-0 flex-1">
+            <GitDiffPanel
+              diffError={diffError}
+              diffText={diffText}
+              files={files}
+              isLoading={isLoadingDiff}
+              onClose={onCloseGit}
+              onRefresh={onRefreshDiff}
+              onSelectFile={onSelectDiffFile}
+              selectedPath={selectedPath}
+            />
+          </div>
+        ) : null}
+
+        {activeTab === "memory" ? (
+          <ContextMemoryTab
+            error={contextMemoryError}
+            isLoading={isLoadingContextMemories}
+            memories={contextMemories}
+          />
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function ContextTaskGraphTab({
+  error,
+  isLoading,
+  taskGraph,
+}: {
+  error: string | null;
+  isLoading: boolean;
+  taskGraph: TaskGraphResponse | null;
+}) {
+  const { t } = useI18n();
+
+  if (taskGraph?.exists && taskGraph.tasks.length) {
+    return (
+      <TaskGraphPanel
+        error={error}
+        isLoading={isLoading}
+        taskGraph={taskGraph}
+      />
+    );
+  }
+
+  return (
+    <div className="context-empty-state">
+      <ListChecks aria-hidden="true" className="size-5" />
+      <h2>{t("Task graph")}</h2>
+      <p>{t("No task graph for the active session yet.")}</p>
+    </div>
+  );
+}
+
+function ContextMemoryTab({
+  error,
+  isLoading,
+  memories,
+}: {
+  error: string | null;
+  isLoading: boolean;
+  memories: ContextMemoryState;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div className="context-list-panel panel-scroll">
+      {isLoading ? (
+        <div className="context-empty-state">
+          <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+          <h2>{t("Memory")}</h2>
+          <p>{t("Loading...")}</p>
+        </div>
+      ) : error ? (
+        <div className="context-empty-state">
+          <Brain aria-hidden="true" className="size-5" />
+          <h2>{t("Memory")}</h2>
+          <p>{error}</p>
+        </div>
+      ) : (
+        <>
+          <ContextMemoryGroup
+            emptyLabel={t("No memories")}
+            label={t("Global memory")}
+            memories={memories.global}
+          />
+          <ContextMemoryGroup
+            emptyLabel={t("No memories")}
+            label={t("Workspace memory")}
+            memories={memories.workspace}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+function ContextMemoryGroup({
+  emptyLabel,
+  label,
+  memories,
+}: {
+  emptyLabel: string;
+  label: string;
+  memories: MemoryFactRecord[];
+}) {
+  return (
+    <div className="context-memory-group">
+      <div className="context-panel-section-title">{label}</div>
+      {memories.length ? (
+        memories.map((memory) => (
+          <article className="context-memory-item" key={memory.id}>
+            <div className="context-memory-item-header">
+              <span className="context-memory-kind">{memory.kind}</span>
+              {memory.pinned ? (
+                <span className="context-memory-pin">pinned</span>
+              ) : null}
+            </div>
+            <p>{memory.fact}</p>
+            <small>
+              {memory.scope} · {formatTaskGraphDate(memory.updatedAt)}
+            </small>
+          </article>
+        ))
+      ) : (
+        <div className="context-empty-inline">{emptyLabel}</div>
+      )}
+    </div>
+  );
+}
+
+function flattenTaskGraphTasks(tasks: TaskGraphTask[]): TaskGraphTask[] {
+  return tasks.flatMap((task) => [task, ...flattenTaskGraphTasks(task.subtasks)]);
 }
 
 function TaskGraphTaskItem({
@@ -9086,9 +9440,9 @@ function SettingsPanel({
   }
 
   return (
-    <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
-      <div className="settings-layout mx-auto grid max-w-7xl gap-4 lg:grid-cols-[13rem_minmax(0,1fr)]">
-        <aside className="settings-section-nav-card rounded-2xl border border-stone-200 bg-white/85 p-2 shadow-[0_18px_42px_rgba(75,63,42,0.07)] lg:self-start">
+    <div className="settings-shell panel-scroll min-h-0 flex-1 overflow-y-auto">
+      <div className="settings-layout grid">
+        <aside className="settings-section-nav-card border-stone-200 bg-white p-2">
           <nav
             aria-label={t("Settings")}
             className="settings-section-nav flex flex-col gap-1.5"
@@ -12476,37 +12830,9 @@ function SettingsPanel({
   );
 }
 
-function NavButton({
-  active,
-  icon: Icon,
-  label,
-  onClick,
-}: {
-  active: boolean;
-  icon: LucideIcon;
-  label: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      aria-label={label}
-      className={`inline-flex size-9 items-center justify-center rounded-lg ${
-        active
-          ? "bg-white text-teal-900 shadow-sm"
-          : "text-stone-600 hover:bg-white/60 hover:text-stone-950"
-      }`}
-      onClick={onClick}
-      title={label}
-      type="button"
-    >
-      <Icon aria-hidden="true" className="size-4" />
-    </button>
-  );
-}
-
 function FocoLogoMark() {
   return (
-    <span className="inline-flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-[0_10px_24px_rgba(15,118,110,0.2)] ring-1 ring-stone-200/80">
+    <span className="foco-logo-mark inline-flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-[0_10px_24px_rgba(15,118,110,0.2)] ring-1 ring-stone-200/80">
       <img
         alt=""
         aria-hidden="true"
@@ -12545,8 +12871,8 @@ function WorkspaceIcon({
 }
 
 function workspaceItemClass(active: boolean) {
-  return `flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-sm font-semibold ${
-    active ? "text-teal-950" : "text-stone-700"
+  return `workspace-item flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-sm font-semibold ${
+    active ? "workspace-item-active text-teal-950" : "text-stone-700"
   }`;
 }
 
@@ -12558,17 +12884,17 @@ function workspaceNameFromPath(path: string) {
 }
 
 function workspaceMenuClass(active: boolean) {
-  return `flex min-w-0 items-center gap-1 rounded-xl border px-1.5 py-1 transition-colors ${
+  return `workspace-menu flex min-w-0 items-center gap-1 rounded-xl border px-1.5 py-1 transition-colors ${
     active
-      ? "border-teal-200 bg-teal-50 text-teal-950 shadow-sm"
+      ? "workspace-menu-active border-teal-200 bg-teal-50 text-teal-950 shadow-sm"
       : "border-transparent bg-stone-100/60 text-stone-700 hover:border-stone-200 hover:bg-white/90 hover:text-stone-950"
   }`;
 }
 
 function chatItemClass(active: boolean) {
-  return `flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-xs font-medium ${
+  return `chat-item flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-xs font-medium ${
     active
-      ? "border-teal-100 bg-white text-stone-950 shadow-sm"
+      ? "chat-item-active border-teal-100 bg-white text-stone-950 shadow-sm"
       : "border-transparent text-stone-600 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
   }`;
 }
@@ -12613,9 +12939,9 @@ function workspaceHasChat(
 }
 
 function diffFileButtonClass(active: boolean) {
-  return `flex min-h-9 w-full min-w-0 items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-sm ${
+  return `diff-file-button flex min-h-9 w-full min-w-0 items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-sm ${
     active
-      ? "bg-teal-50 text-teal-950 shadow-sm"
+      ? "diff-file-button-active bg-teal-50 text-teal-950 shadow-sm"
       : "text-stone-700 hover:bg-stone-50 hover:text-stone-950"
   }`;
 }

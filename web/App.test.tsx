@@ -77,7 +77,7 @@ const settings = {
       metadataRefreshedAt: null,
       metadataSourceUrl: null,
       missingLimits: [],
-      providerIds: ["openai"],
+      providerIds: ["openai", "anthropic"],
       supportsThinking: true,
       thinkingLevel: null,
       warnings: [],
@@ -170,6 +170,25 @@ const settings = {
       kind: "openai-chat",
       kindLabel: "OpenAI Chat",
       name: "OpenAI",
+      warnings: [],
+    },
+    {
+      apiProxy: {
+        enabled: false,
+        proxyType: "http",
+        supportedTypes: [
+          { label: "HTTP", proxyType: "http" },
+          { label: "SOCKS", proxyType: "socks" },
+        ],
+        url: "",
+      },
+      baseUrl: "https://api.anthropic.test/v1",
+      enabled: true,
+      hasApiKey: true,
+      id: "anthropic",
+      kind: "openai-chat",
+      kindLabel: "OpenAI Chat",
+      name: "Anthropic",
       warnings: [],
     },
   ],
@@ -824,7 +843,7 @@ describe("App verification surfaces", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    const composer = await screen.findByPlaceholderText("Message Foco");
+    const composer = await screen.findByPlaceholderText("Ask Foco anything...");
     await user.click(composer);
     await user.keyboard("Line one{Shift>}{Enter}{/Shift}Line two");
 
@@ -843,7 +862,7 @@ describe("App verification surfaces", () => {
     render(<App />);
 
     await userEvent.click(await screen.findByText("Tool run"));
-    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "continue");
+    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "continue");
 
     const usage = await screen.findByRole("status", {
       name: "Context usage 47%",
@@ -857,6 +876,7 @@ describe("App verification surfaces", () => {
           chatId: "chat-1",
           draftMessage: "continue",
           modelId: "gpt-test",
+          providerId: "openai",
           skillIds: null,
           thinkingLevel: null,
         }),
@@ -873,7 +893,9 @@ describe("App verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Add attachment" }));
     expect(await screen.findByText("note.txt")).toBeInTheDocument();
 
-    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "Review it");
+    await userEvent.click(screen.getByLabelText("Provider"));
+    await userEvent.click(screen.getByRole("button", { name: "Provider: Anthropic" }));
+    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "Review it");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => {
@@ -903,6 +925,7 @@ describe("App verification surfaces", () => {
           }),
         ],
         message: "Review it",
+        providerId: "anthropic",
       }),
     );
     expect(body.attachments[0]).not.toHaveProperty("contentBase64");
@@ -917,7 +940,7 @@ describe("App verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
-    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "diagram");
+    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "diagram");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await act(async () => {
@@ -954,7 +977,7 @@ describe("App verification surfaces", () => {
   it("appends stream errors after already rendered assistant text", async () => {
     render(<App />);
 
-    await userEvent.type(await screen.findByPlaceholderText("Message Foco"), "debug");
+    await userEvent.type(await screen.findByPlaceholderText("Ask Foco anything..."), "debug");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await act(async () => {
@@ -982,7 +1005,7 @@ describe("App verification surfaces", () => {
   it("shows hook blocking notifications in the active chat", async () => {
     render(<App />);
 
-    await userEvent.type(await screen.findByPlaceholderText("Message Foco"), "danger");
+    await userEvent.type(await screen.findByPlaceholderText("Ask Foco anything..."), "danger");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await act(async () => {
@@ -1158,7 +1181,7 @@ describe("App verification surfaces", () => {
       within(tabList).getByRole("button", { name: "Close chat tab Tool run" }),
     ).toBeInTheDocument();
 
-    await userEvent.type(screen.getByPlaceholderText("Message Foco"), "continue");
+    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "continue");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     expect(
@@ -1252,23 +1275,25 @@ describe("App verification surfaces", () => {
     render(<App />);
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    expect(screen.getByRole("navigation", { name: "Foco" })).toBeInTheDocument();
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
     expect(await screen.findByText("General settings")).toBeInTheDocument();
     expect(screen.getByText("127.0.0.1:3210")).toBeInTheDocument();
     expect(screen.getByText("Password is disabled")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Providers" }));
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
     expect(screen.getByText("Configured providers")).toBeInTheDocument();
     expect(screen.getByText("OpenAI")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
     expect(screen.getByText("Model settings")).toBeInTheDocument();
     expect(screen.getByText("GPT Test")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "MCP" }));
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "MCP" }));
     expect(screen.getByText("MCP servers")).toBeInTheDocument();
     expect(screen.getByText("CodeGraph")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
     expect(screen.getByText("Detected skills")).toBeInTheDocument();
     expect(screen.getByText("Skill locations")).toBeInTheDocument();
     expect(
@@ -1286,7 +1311,8 @@ describe("App verification surfaces", () => {
     render(<App />);
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Memory" }));
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
 
     expect(await screen.findByText("Memory settings")).toBeInTheDocument();
     expect((await screen.findAllByText(activeMemory.fact)).length).toBeGreaterThan(0);
@@ -1531,7 +1557,8 @@ describe("App verification surfaces", () => {
       );
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "MCP" }));
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "MCP" }));
     await userEvent.click(screen.getByRole("button", { name: "Add MCP server" }));
     await userEvent.type(screen.getByLabelText("Name"), "Test MCP");
     await userEvent.type(screen.getByLabelText("Command"), "foco-test-mcp");
@@ -1547,7 +1574,7 @@ describe("App verification surfaces", () => {
       );
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "Skills" }));
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
     await userEvent.click(screen.getByLabelText("Enable skill gitmemo"));
 
     await waitFor(() => {
@@ -1564,12 +1591,15 @@ describe("App verification surfaces", () => {
     });
   });
 
-  it("opens the git diff panel and terminal panel for the active workspace", async () => {
+  it("toggles the context panel and opens the terminal panel for the active workspace", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
 
     await screen.findAllByText("Default");
-    await userEvent.click(screen.getByRole("button", { name: "Open git diff" }));
+    await userEvent.click(screen.getByRole("button", { name: "Close context panel" }));
+    expect(screen.queryByRole("tab", { name: "Task" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Open context panel" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
     expect(await screen.findByText("README.md")).toBeInTheDocument();
     expect(screen.getByText(/\+hello/)).toBeInTheDocument();
@@ -1618,36 +1648,40 @@ describe("App verification surfaces", () => {
     });
   });
 
-  it("shows the active chat task graph above the git diff panel", async () => {
+  it("keeps task graph and git diff in separate context tabs", async () => {
     render(<App />);
 
-    await userEvent.click(await screen.findByText("Tool run"));
-    await userEvent.click(screen.getByRole("button", { name: "Open git diff" }));
+    await userEvent.type(await screen.findByPlaceholderText("Ask Foco anything..."), "plan");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
 
-    expect(await screen.findByText("Task graph")).toBeInTheDocument();
-    expect(screen.getByText("Inspect workspace changes")).toBeInTheDocument();
+    await act(async () => {
+      enqueueChatStreamEvent({
+        chatId: "chat-1",
+        type: "taskGraphRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
+
+    expect(await screen.findByText("Inspect workspace changes")).toBeInTheDocument();
     expect(screen.getByText("README.md diff is visible")).toBeInTheDocument();
+    expect(screen.queryByText(/\+hello/)).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("tab", { name: "Git" }));
+
     expect(screen.getByText("Git diff")).toBeInTheDocument();
     expect(screen.getByText(/\+hello/)).toBeInTheDocument();
+    expect(screen.queryByText("Inspect workspace changes")).not.toBeInTheDocument();
 
-    const splitHandle = screen.getByRole("separator", {
-      name: "Resize task graph and git diff panels",
-    });
-    const appShell = document.querySelector(".app-shell") as HTMLElement;
-    splitHandle.focus();
-    await userEvent.keyboard("{ArrowDown}");
-
-    await waitFor(() => {
-      expect(appShell.style.getPropertyValue("--task-graph-panel-height")).toBe(
-        "53%",
-      );
+    await act(async () => {
+      activeChatStreamController?.close();
     });
   });
 
   it("opens the task graph sidebar when a task graph refresh arrives", async () => {
     render(<App />);
 
-    await userEvent.type(await screen.findByPlaceholderText("Message Foco"), "plan");
+    await userEvent.type(await screen.findByPlaceholderText("Ask Foco anything..."), "plan");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(activeChatStreamController).not.toBeNull());
 
@@ -1661,7 +1695,7 @@ describe("App verification surfaces", () => {
 
     expect(await screen.findByText("Task graph")).toBeInTheDocument();
     expect(screen.getByText("Inspect workspace changes")).toBeInTheDocument();
-    expect(screen.getByText("Git diff")).toBeInTheDocument();
+    expect(screen.queryByText("Git diff")).not.toBeInTheDocument();
 
     await act(async () => {
       activeChatStreamController?.close();
@@ -1671,7 +1705,7 @@ describe("App verification surfaces", () => {
   it("shows AI statistics and request details", async () => {
     render(<App />);
 
-    await userEvent.click((await screen.findAllByRole("button", { name: "Stats" }))[0]);
+    await userEvent.click((await screen.findAllByRole("button", { name: "Usage" }))[0]);
 
     expect(await screen.findByText("API statistics")).toBeInTheDocument();
     expect(screen.getByText("Request audit")).toBeInTheDocument();
