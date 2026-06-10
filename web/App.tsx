@@ -3275,7 +3275,6 @@ export function App() {
                 workspaces.map((workspace) => {
                   const isExpanded = expandedWorkspaceId === workspace.id;
                   const isActive = workspace.id === activeWorkspace?.id;
-                  const isNewChatActive = isActive && activeChatId === null;
                   const selectedChatIndex =
                     isActive && activeChatId
                       ? workspace.chats.findIndex(
@@ -3347,36 +3346,6 @@ export function App() {
                       </div>
                       {isExpanded ? (
                         <div className="ml-4 mt-1 space-y-1 border-l border-stone-200/80 pl-2">
-                          {isNewChatActive ? (
-                            <div className="group flex min-w-0 items-center gap-1">
-                              <button
-                                aria-current="page"
-                                className={chatItemClass(true)}
-                                onClick={() => startNewWorkspaceChat(workspace.id)}
-                                type="button"
-                              >
-                                <MessageSquare
-                                  aria-hidden="true"
-                                  className="size-3.5 shrink-0"
-                                />
-                                <span className="min-w-0 flex-1">
-                                  <span className="block truncate">
-                                    {t("New chat")}
-                                  </span>
-                                  <span
-                                    aria-hidden="true"
-                                    className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-transparent"
-                                  >
-                                    0
-                                  </span>
-                                </span>
-                              </button>
-                              <span
-                                aria-hidden="true"
-                                className="inline-flex size-7 shrink-0"
-                              />
-                            </div>
-                          ) : null}
                           {workspace.chats.length > 0 ? (
                             <>
                               {visibleChats.map((chat) => {
@@ -3478,11 +3447,11 @@ export function App() {
                                 </div>
                               ) : null}
                             </>
-                          ) : !isNewChatActive ? (
+                          ) : (
                             <div className="rounded-lg px-2 py-1.5 text-xs text-stone-500">
                               {t("No chats")}
                             </div>
-                          ) : null}
+                          )}
                         </div>
                       ) : null}
                     </div>

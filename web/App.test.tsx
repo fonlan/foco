@@ -1120,7 +1120,7 @@ describe("App verification surfaces", () => {
     });
   });
 
-  it("expands a collapsed workspace after starting a workspace chat", async () => {
+  it("expands a collapsed workspace without adding a placeholder chat row", async () => {
     render(<App />);
 
     const workspaceToggle = await screen.findByRole("button", { name: "Default" });
@@ -1133,10 +1133,49 @@ describe("App verification surfaces", () => {
     );
 
     expect(workspaceToggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("button", { name: "New chat" })).toHaveAttribute(
-      "aria-current",
-      "page",
+    expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
+  });
+
+  it("sends a workspace plus chat as a new chat request", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "New chat in Default" }),
     );
+    expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
+
+    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "Fresh task");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-1/chat/stream",
+        ),
+      ).toBe(true);
+    });
+    const chatStreamCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+
+    expect(JSON.parse(String(chatStreamCall?.[1]?.body))).toEqual(
+      expect.objectContaining({
+        chatId: null,
+        message: "Fresh task",
+      }),
+    );
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
   });
 
   it("opens the selected chat workspace and collapses the previous workspace", async () => {
