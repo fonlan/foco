@@ -872,6 +872,8 @@ type ContextPanelTab = "task" | "git" | "memory";
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
 const WORKSPACE_CHAT_HISTORY_PAGE_SIZE = 10;
+const WORKSPACE_SIDEBAR_MIN_WIDTH = 232;
+const WORKSPACE_SIDEBAR_MAX_WIDTH = 420;
 const MAX_CHAT_ATTACHMENTS = 6;
 const MAX_CHAT_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024;
@@ -1004,6 +1006,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Open terminal": "打开终端",
     "Close context panel": "关闭右侧面板",
     "Open context panel": "打开右侧面板",
+    "Resize workspace sidebar": "调整工作区面板宽度",
     "Resize context panel": "调整右侧面板宽度",
     "Open git diff": "打开 Git diff",
     "Cancel the current run before deleting this chat.":
@@ -1645,6 +1648,7 @@ export function App() {
   const activeRunAbortRef = useRef<AbortController | null>(null);
   const activeChatKeyRef = useRef<string | null>(null);
   const hasManuallySelectedModelRef = useRef(false);
+  const workspaceSidebarRef = useRef<HTMLElement | null>(null);
 
   const activeWorkspace = useMemo(
     () =>
@@ -1684,6 +1688,18 @@ export function App() {
     (key, values) => translate(key, values, language),
     [language],
   );
+  const updateSidebarWidthFromClientX = useCallback((clientX: number) => {
+    const sidebarLeft =
+      workspaceSidebarRef.current?.getBoundingClientRect().left ?? 0;
+    const nextWidth = clientX - sidebarLeft;
+
+    setSidebarWidth(
+      Math.min(
+        Math.max(nextWidth, WORKSPACE_SIDEBAR_MIN_WIDTH),
+        WORKSPACE_SIDEBAR_MAX_WIDTH,
+      ),
+    );
+  }, []);
 
   useEffect(() => {
     document.documentElement.lang = language;
@@ -2048,7 +2064,7 @@ export function App() {
     }
 
     function handlePointerMove(event: PointerEvent) {
-      setSidebarWidth(Math.min(Math.max(event.clientX, 232), 420));
+      updateSidebarWidthFromClientX(event.clientX);
     }
 
     function handlePointerUp() {
@@ -2064,7 +2080,7 @@ export function App() {
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
-  }, [isResizingSidebar]);
+  }, [isResizingSidebar, updateSidebarWidthFromClientX]);
 
   useEffect(() => {
     if (!workspaces.length) {
@@ -3185,23 +3201,37 @@ export function App() {
           className={`workspace-sidebar relative border-stone-200/80 lg:border-r ${
             isMobileWorkspaceOpen ? "workspace-sidebar-mobile-open" : ""
           }`}
+          ref={workspaceSidebarRef}
         >
           <div
             aria-label={t("Resize workspace sidebar")}
             aria-orientation="vertical"
-            className="absolute bottom-0 right-0 top-0 z-10 hidden w-1 cursor-col-resize bg-transparent hover:bg-teal-500/40 lg:block"
+            aria-valuemax={WORKSPACE_SIDEBAR_MAX_WIDTH}
+            aria-valuemin={WORKSPACE_SIDEBAR_MIN_WIDTH}
+            aria-valuenow={sidebarWidth}
+            className={`workspace-sidebar-splitter cursor-col-resize ${
+              isResizingSidebar ? "workspace-sidebar-splitter-active" : ""
+            }`}
             onKeyDown={(event) => {
               if (event.key === "ArrowLeft") {
                 event.preventDefault();
-                setSidebarWidth((current) => Math.max(current - 24, 232));
+                setSidebarWidth((current) =>
+                  Math.max(current - 24, WORKSPACE_SIDEBAR_MIN_WIDTH),
+                );
               }
 
               if (event.key === "ArrowRight") {
                 event.preventDefault();
-                setSidebarWidth((current) => Math.min(current + 24, 420));
+                setSidebarWidth((current) =>
+                  Math.min(current + 24, WORKSPACE_SIDEBAR_MAX_WIDTH),
+                );
               }
             }}
-            onPointerDown={() => setIsResizingSidebar(true)}
+            onPointerDown={(event) => {
+              event.preventDefault();
+              updateSidebarWidthFromClientX(event.clientX);
+              setIsResizingSidebar(true);
+            }}
             role="separator"
             tabIndex={0}
           />

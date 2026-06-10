@@ -748,6 +748,54 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("Use memory graph retrieval.")).toBeInTheDocument();
   });
 
+  it("resizes the workspace sidebar from the panel splitter", async () => {
+    render(<App />);
+
+    const splitter = await screen.findByRole("separator", {
+      name: "Resize workspace sidebar",
+    });
+    const sidebar = splitter.closest(".workspace-sidebar") as HTMLElement | null;
+    const appShell = splitter.closest(".app-shell") as HTMLElement | null;
+
+    if (!sidebar || !appShell) {
+      throw new Error("Expected workspace sidebar splitter inside app shell");
+    }
+
+    expect(splitter).not.toHaveClass("hidden");
+    expect(splitter).not.toHaveClass("lg:block");
+
+    vi.spyOn(sidebar, "getBoundingClientRect").mockReturnValue({
+      bottom: 800,
+      height: 800,
+      left: 48,
+      right: 336,
+      toJSON: () => ({}),
+      top: 0,
+      width: 288,
+      x: 48,
+      y: 0,
+    } as DOMRect);
+
+    fireEvent.pointerDown(splitter, { clientX: 336, pointerId: 1 });
+
+    await waitFor(() => {
+      expect(document.body.style.cursor).toBe("col-resize");
+    });
+
+    fireEvent.pointerMove(window, { clientX: 348 });
+
+    await waitFor(() => {
+      expect(appShell.style.getPropertyValue("--sidebar-width")).toBe("300px");
+      expect(splitter).toHaveAttribute("aria-valuenow", "300");
+    });
+
+    fireEvent.pointerUp(window);
+
+    await waitFor(() => {
+      expect(document.body.style.cursor).toBe("");
+    });
+  });
+
   it("prompts to install ripgrep when the search dependency is missing", async () => {
     const missingRipgrepSettings = {
       ...settings,

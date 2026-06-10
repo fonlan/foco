@@ -1602,6 +1602,47 @@ body,
   box-shadow: none;
 }
 
+.workspace-sidebar-splitter {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  width: 0.5rem;
+  touch-action: none;
+  user-select: none;
+}
+
+.workspace-sidebar-splitter::before {
+  position: absolute;
+  top: 0.5rem;
+  bottom: 0.5rem;
+  right: 0;
+  width: 1px;
+  content: "";
+  background: var(--foco-border-strong);
+  transition:
+    background 120ms ease,
+    width 120ms ease;
+}
+
+.workspace-sidebar-splitter:hover::before,
+.workspace-sidebar-splitter:focus-visible::before,
+.workspace-sidebar-splitter-active::before {
+  width: 2px;
+  background: var(--foco-accent);
+}
+
+.workspace-sidebar-splitter:focus-visible {
+  outline: none;
+}
+
+@media (max-width: 767px) {
+  .workspace-sidebar-splitter {
+    display: none;
+  }
+}
+
 .workspace-sidebar::before {
   content: none;
 }
