@@ -886,7 +886,7 @@ type BrowserRoute =
 
 const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
-const WORKSPACE_CHAT_HISTORY_PAGE_SIZE = 10;
+const WORKSPACE_CHAT_HISTORY_PAGE_SIZE = 5;
 const WORKSPACE_SIDEBAR_MIN_WIDTH = 232;
 const WORKSPACE_SIDEBAR_MAX_WIDTH = 420;
 const MAX_CHAT_ATTACHMENTS = 6;
@@ -2889,12 +2889,6 @@ export function App() {
     updateBrowserRoute(currentChatBrowserRoute());
   }
 
-  function openWorkspacePicker() {
-    setViewMode("chat");
-    setIsMobileWorkspaceOpen(true);
-    updateBrowserRoute(currentChatBrowserRoute());
-  }
-
   function applyBrowserRoute(route: BrowserRoute) {
     if (route.viewMode === "settings") {
       setSettingsSection(route.section);
@@ -3451,7 +3445,6 @@ export function App() {
             onLogout={handleLogout}
             onOpenSettings={() => openSettingsSection("general")}
             onOpenStats={openStatsView}
-            onOpenWorkspace={openWorkspacePicker}
             onReturnHome={openCurrentChatView}
             onToggleTheme={() =>
               void saveAppTheme(theme === "dark" ? "light" : "dark")
@@ -3504,7 +3497,6 @@ export function App() {
           onLogout={handleLogout}
           onOpenSettings={() => openSettingsSection("general")}
           onOpenStats={openStatsView}
-          onOpenWorkspace={openWorkspacePicker}
           onReturnHome={openCurrentChatView}
           onToggleTheme={() =>
             void saveAppTheme(theme === "dark" ? "light" : "dark")
@@ -4930,7 +4922,6 @@ function FocoNavRail({
   onLogout,
   onOpenSettings,
   onOpenStats,
-  onOpenWorkspace,
   onReturnHome,
   onToggleTheme,
   theme,
@@ -4942,7 +4933,6 @@ function FocoNavRail({
   onLogout: () => Promise<void>;
   onOpenSettings: () => void;
   onOpenStats: () => void;
-  onOpenWorkspace: () => void;
   onReturnHome: () => void;
   onToggleTheme: () => void;
   theme: AppThemeId;
@@ -4968,12 +4958,6 @@ function FocoNavRail({
           icon={Home}
           label={t("Home")}
           onClick={onReturnHome}
-        />
-        <NavRailButton
-          active={activeMode === "chat"}
-          icon={Folder}
-          label={t("Workspaces")}
-          onClick={onOpenWorkspace}
         />
         <NavRailButton
           active={activeMode === "stats"}

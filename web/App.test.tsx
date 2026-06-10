@@ -1364,20 +1364,21 @@ describe("App verification surfaces", () => {
     expect(await screen.findByText("Side note")).toBeInTheDocument();
   });
 
-  it("shows only the first 10 workspace chats until the menu item expands more", async () => {
+  it("shows only the first 5 workspace chats until the menu item expands more", async () => {
     render(<App />);
 
-    expect(await screen.findByText("Older chat 8")).toBeInTheDocument();
-    expect(screen.queryByText("Older chat 9")).not.toBeInTheDocument();
-    expect(screen.getByText("2 hidden chats")).toBeInTheDocument();
+    expect(await screen.findByText("Older chat 3")).toBeInTheDocument();
+    expect(screen.queryByText("Older chat 4")).not.toBeInTheDocument();
+    expect(screen.getByText("7 hidden chats")).toBeInTheDocument();
 
     await userEvent.click(
-      screen.getByRole("button", { name: "Show 2 more chats in Default" }),
+      screen.getByRole("button", { name: "Show 5 more chats in Default" }),
     );
 
-    expect(screen.getByText("Older chat 9")).toBeInTheDocument();
-    expect(screen.getByText("Older chat 10")).toBeInTheDocument();
-    expect(screen.queryByText("2 hidden chats")).not.toBeInTheDocument();
+    expect(screen.getByText("Older chat 4")).toBeInTheDocument();
+    expect(screen.getByText("Older chat 8")).toBeInTheDocument();
+    expect(screen.queryByText("Older chat 9")).not.toBeInTheDocument();
+    expect(screen.getByText("2 hidden chats")).toBeInTheDocument();
   });
 
   it("opens center chat tabs and closes tabs without deleting chat history", async () => {
@@ -1664,7 +1665,7 @@ describe("App verification surfaces", () => {
     render(<App />);
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getAllByRole("button", { name: "Workspaces" })[1]);
+    await userEvent.click(screen.getByRole("button", { name: "Workspaces" }));
     await userEvent.click(
       await screen.findByRole("button", { name: "Edit workspace Default" }),
     );
