@@ -1523,12 +1523,18 @@ summary:focus-visible {
   --foco-warning: #f59e0b;
   --foco-error: #ef4444;
   --foco-header-height: 2.75rem;
+  --foco-font-ui: 0.8125rem;
+  --foco-font-body: 0.84375rem;
+  --foco-font-compact: 0.75rem;
+  --foco-font-micro: 0.6875rem;
+  --foco-line-body: 1.55;
 }
 
 body,
 .foco-workbench,
 .app-root {
   background: var(--foco-canvas);
+  font-size: var(--foco-font-ui);
 }
 
 .app-shell {
@@ -1662,7 +1668,7 @@ body,
 .workspace-sidebar-title {
   display: block;
   color: var(--foco-text-muted);
-  font-size: 0.72rem;
+  font-size: var(--foco-font-micro);
   font-weight: 700;
   letter-spacing: 0.08em;
 }
@@ -1684,11 +1690,11 @@ body,
 }
 
 .workspace-item {
-  height: 2rem;
+  height: 1.875rem;
   gap: 0.375rem;
   padding-inline: 0.375rem;
   color: var(--foco-text);
-  font-size: 0.8125rem;
+  font-size: var(--foco-font-compact);
 }
 
 .workspace-expand-icon {
@@ -1699,8 +1705,8 @@ body,
 }
 
 .workspace-menu > button:last-child {
-  width: 1.75rem;
-  height: 1.75rem;
+  width: 1.625rem;
+  height: 1.625rem;
 }
 
 .workspace-nav .ml-4 {
@@ -1708,10 +1714,10 @@ body,
 }
 
 .chat-item {
-  min-height: 2.5rem;
+  min-height: 2.25rem;
   border-radius: 0.5rem;
   border-color: transparent;
-  padding: 0.375rem 0.5rem;
+  padding: 0.3125rem 0.45rem;
   color: var(--foco-text-muted);
 }
 
@@ -1769,12 +1775,18 @@ body,
 .chat-tab-item {
   position: relative;
   height: var(--foco-header-height);
-  min-width: 12.5rem;
-  max-width: 16rem;
+  min-width: 11.5rem;
+  max-width: 15rem;
   border-width: 0 1px 0 0;
   border-radius: 0;
   border-color: var(--foco-border);
   background: #ffffff;
+  font-size: var(--foco-font-ui);
+}
+
+.chat-tab-item .text-sm {
+  font-size: var(--foco-font-ui);
+  line-height: 1.25;
 }
 
 .chat-tab-item:has([aria-selected="true"]) {
@@ -1922,7 +1934,7 @@ body,
 .composer-shell {
   border-color: var(--foco-border);
   background: #ffffff;
-  padding: 0.75rem 1.5rem;
+  padding: 0.625rem 1.25rem;
 }
 
 .composer-shell form {
@@ -1936,9 +1948,10 @@ body,
 }
 
 .message-composer-textarea {
-  min-height: 5rem;
-  padding: 0.75rem 0.875rem;
-  font-size: 0.875rem;
+  min-height: 4.25rem;
+  padding: 0.625rem 0.75rem;
+  font-size: var(--foco-font-ui);
+  line-height: 1.5;
 }
 
 .message-composer-tool-row,
@@ -1946,9 +1959,9 @@ body,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.625rem;
+  gap: 0.5rem;
   border-top: 1px solid var(--foco-border);
-  padding: 0.5rem;
+  padding: 0.375rem 0.5rem;
 }
 
 .composer-tool-group,
@@ -1961,15 +1974,15 @@ body,
 
 .composer-tool-button {
   display: inline-flex;
-  min-width: 1.875rem;
-  height: 1.875rem;
+  min-width: 1.75rem;
+  height: 1.75rem;
   align-items: center;
   justify-content: center;
   border: 1px solid var(--foco-border);
   border-radius: 0.4375rem;
   background: #ffffff;
   color: var(--foco-text);
-  font-size: 0.75rem;
+  font-size: var(--foco-font-micro);
   font-weight: 600;
 }
 
@@ -1996,9 +2009,9 @@ body,
 
 .context-usage-circle {
   display: inline-flex;
-  width: 1.75rem;
-  height: 1.75rem;
-  flex-basis: 1.75rem;
+  width: 1.625rem;
+  height: 1.625rem;
+  flex-basis: 1.625rem;
   align-items: center;
   justify-content: center;
   color: var(--foco-accent-strong);
@@ -2008,8 +2021,8 @@ body,
 }
 
 .composer-run-button {
-  width: 1.875rem;
-  height: 1.875rem;
+  width: 1.75rem;
+  height: 1.75rem;
   border-radius: 0.4375rem;
   background: var(--foco-accent);
   box-shadow: none;
@@ -2038,11 +2051,11 @@ body,
   display: inline-flex;
   min-height: 100%;
   align-items: center;
-  gap: 0.375rem;
+  gap: 0.3125rem;
   border-bottom: 2px solid transparent;
-  padding: 0 0.5rem;
+  padding: 0 0.4375rem;
   color: var(--foco-text-muted);
-  font-size: 0.75rem;
+  font-size: var(--foco-font-compact);
   font-weight: 600;
 }
 
@@ -2068,14 +2081,14 @@ body,
 
 .context-empty-state h2 {
   color: var(--foco-text);
-  font-size: 0.875rem;
+  font-size: var(--foco-font-ui);
   font-weight: 650;
 }
 
 .context-empty-state p,
 .context-empty-inline {
   color: var(--foco-text-muted);
-  font-size: 0.8125rem;
+  font-size: var(--foco-font-compact);
 }
 
 .context-graph-panel,
@@ -2084,7 +2097,7 @@ body,
   height: 100%;
   min-height: 0;
   overflow-y: auto;
-  padding: 0.875rem;
+  padding: 0.75rem;
 }
 
 .context-graph-canvas {
@@ -2109,27 +2122,27 @@ body,
   border: 1px solid var(--foco-border);
   border-radius: 0.625rem;
   background: #ffffff;
-  padding: 0.5rem 0.625rem;
+  padding: 0.45rem 0.55rem;
   box-shadow: 0 12px 28px rgba(17, 24, 39, 0.08);
 }
 
 .context-graph-node strong,
 .context-list-item strong {
   color: var(--foco-text);
-  font-size: 0.8125rem;
+  font-size: var(--foco-font-compact);
   font-weight: 650;
 }
 
 .context-graph-node small,
 .context-list-item small {
   color: var(--foco-text-muted);
-  font-size: 0.72rem;
+  font-size: var(--foco-font-micro);
 }
 
 .context-panel-section-title {
-  margin: 0.75rem 0 0.5rem;
+  margin: 0.625rem 0 0.375rem;
   color: var(--foco-text-muted);
-  font-size: 0.72rem;
+  font-size: var(--foco-font-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -2137,29 +2150,29 @@ body,
 
 .context-list-item {
   display: flex;
-  gap: 0.625rem;
+  gap: 0.5rem;
   align-items: flex-start;
-  padding: 0.5rem 0;
+  padding: 0.375rem 0;
 }
 
 .context-list-item-card {
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.375rem;
   border: 1px solid var(--foco-border);
   border-radius: 0.625rem;
   background: #ffffff;
-  padding: 0.625rem;
+  padding: 0.5rem;
 }
 
 .context-memory-group + .context-memory-group {
-  margin-top: 1rem;
+  margin-top: 0.75rem;
 }
 
 .context-memory-item {
-  margin-bottom: 0.5rem;
+  margin-bottom: 0.375rem;
   border: 1px solid var(--foco-border);
   border-radius: 0.625rem;
   background: #ffffff;
-  padding: 0.625rem;
+  padding: 0.5rem;
 }
 
 .context-memory-item-header {
@@ -2176,7 +2189,7 @@ body,
   background: var(--foco-panel-muted);
   padding: 0.125rem 0.375rem;
   color: var(--foco-text-muted);
-  font-size: 0.68rem;
+  font-size: var(--foco-font-micro);
   font-weight: 650;
 }
 
@@ -2186,17 +2199,17 @@ body,
 }
 
 .context-memory-item p {
-  margin-top: 0.5rem;
+  margin-top: 0.375rem;
   color: var(--foco-text);
-  font-size: 0.8125rem;
-  line-height: 1.55;
+  font-size: var(--foco-font-compact);
+  line-height: 1.5;
 }
 
 .context-memory-item small {
   display: block;
-  margin-top: 0.5rem;
+  margin-top: 0.375rem;
   color: var(--foco-text-faint);
-  font-size: 0.72rem;
+  font-size: var(--foco-font-micro);
 }
 
 .context-metric {
@@ -2204,17 +2217,17 @@ body,
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--foco-border);
-  padding: 0.75rem 0;
+  padding: 0.625rem 0;
 }
 
 .context-metric span {
   color: var(--foco-text-muted);
-  font-size: 0.8125rem;
+  font-size: var(--foco-font-compact);
 }
 
 .context-metric strong {
   color: var(--foco-text);
-  font-size: 1rem;
+  font-size: 0.9rem;
 }
 
 .diff-sidebar {
@@ -2447,11 +2460,11 @@ body,
 }
 
 .message-list {
-  padding: 1rem 1.5rem;
+  padding: 0.875rem 1.25rem;
 }
 
 .message-stack {
-  gap: 0.875rem;
+  gap: 0.75rem;
 }
 
 .message-row {
@@ -2461,12 +2474,31 @@ body,
 
 .message-bubble {
   max-width: 100%;
-  gap: 0.75rem;
+  gap: 0.625rem;
   border: 1px solid var(--foco-border);
   border-radius: 0.75rem;
   background: var(--foco-panel);
-  padding: 0.875rem 1rem;
+  padding: 0.75rem 0.875rem;
   box-shadow: 0 10px 26px rgba(17, 24, 39, 0.035);
+}
+
+.message-bubble .markdown-content {
+  font-size: var(--foco-font-body);
+  line-height: var(--foco-line-body);
+}
+
+.message-bubble .markdown-content p,
+.message-bubble .markdown-content ul,
+.message-bubble .markdown-content ol,
+.message-bubble .markdown-content pre,
+.message-bubble .markdown-content table,
+.message-bubble .markdown-content blockquote {
+  margin: 0.45rem 0;
+}
+
+.message-bubble .markdown-content pre,
+.message-bubble .markdown-content code {
+  font-size: 0.78rem;
 }
 
 .message-bubble-user,
@@ -2489,8 +2521,21 @@ body,
 
 .message-bubble-user .message-avatar,
 .message-bubble-assistant .message-avatar {
+  width: 1.625rem;
+  height: 1.625rem;
+  flex-basis: 1.625rem;
   background: var(--foco-panel-muted);
   color: var(--foco-text);
+}
+
+.message-author-row {
+  min-height: 1.5rem;
+  font-size: var(--foco-font-compact);
+}
+
+.message-action-menu {
+  width: 1.5rem;
+  height: 1.5rem;
 }
 
 .reasoning-block,
@@ -2498,6 +2543,8 @@ body,
 .message-row .border-t {
   border-radius: 0.625rem;
   background: var(--foco-panel-soft);
+  padding: 0.5rem;
+  font-size: var(--foco-font-compact);
 }
 
 .message-composer-control-row {
@@ -2507,7 +2554,7 @@ body,
   gap: 0.375rem;
   border-top: 1px solid var(--foco-border);
   background: var(--foco-panel-soft);
-  padding: 0.5rem;
+  padding: 0.375rem 0.5rem;
 }
 
 .composer-control-spacer {
@@ -2518,9 +2565,9 @@ body,
 .message-composer-control-row .composer-tool-button,
 .message-composer-control-row .composer-run-button,
 .message-composer-control-row .context-usage-circle {
-  width: 2rem;
-  min-width: 2rem;
-  height: 2rem;
+  width: 1.875rem;
+  min-width: 1.875rem;
+  height: 1.875rem;
   flex: 0 0 auto;
 }
 
@@ -2531,11 +2578,11 @@ body,
 
 .message-composer-control-row .composer-select-summary,
 .message-composer-control-row .composer-branch-select {
-  font-size: 0.72rem;
+  font-size: var(--foco-font-micro);
 }
 
 .message-composer-control-row .composer-select-popover button {
-  font-size: 0.78rem;
+  font-size: var(--foco-font-compact);
 }
 
 .composer-model-select,
@@ -2566,6 +2613,34 @@ body,
   max-width: none;
   gap: 0;
   grid-template-columns: 14.5rem minmax(0, 1fr);
+  font-size: var(--foco-font-ui);
+}
+
+.settings-layout .text-lg {
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+.settings-layout .text-base {
+  font-size: 0.875rem;
+  line-height: 1.4;
+}
+
+.settings-layout .text-sm {
+  font-size: var(--foco-font-ui);
+  line-height: 1.45;
+}
+
+.settings-layout .text-xs {
+  font-size: var(--foco-font-micro);
+  line-height: 1.35;
+}
+
+.settings-layout input,
+.settings-layout select,
+.settings-layout textarea,
+.settings-layout button {
+  font-size: var(--foco-font-ui);
 }
 
 .settings-section-nav-card {
@@ -2592,7 +2667,7 @@ body,
 .settings-layout > .min-w-0 {
   min-height: 0;
   overflow-y: auto;
-  padding: 1.25rem;
+  padding: 1rem;
 }
 
 @media (max-width: 767px) {
