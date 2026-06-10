@@ -2,7 +2,35 @@ import "@testing-library/jest-dom/vitest";
 import { afterEach, vi } from "vitest";
 
 class MockResizeObserver implements ResizeObserver {
-  observe() {}
+  constructor(private readonly callback: ResizeObserverCallback) {}
+
+  observe(target: Element) {
+    const contentRect = {
+      bottom: 300,
+      height: 300,
+      left: 0,
+      right: 800,
+      toJSON: () => ({}),
+      top: 0,
+      width: 800,
+      x: 0,
+      y: 0,
+    } satisfies DOMRectReadOnly;
+
+    this.callback(
+      [
+        {
+          borderBoxSize: [],
+          contentBoxSize: [],
+          contentRect,
+          devicePixelContentBoxSize: [],
+          target,
+        } satisfies ResizeObserverEntry,
+      ],
+      this,
+    );
+  }
+
   unobserve() {}
   disconnect() {}
 }

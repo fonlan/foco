@@ -308,6 +308,51 @@ const aiStatistics = {
       workspaceName: "Default",
     },
   ],
+  summary: {
+    averageLatencyMs: 2000,
+    failedRequests: 1,
+    modelBreakdown: [
+      {
+        modelId: "gpt-test",
+        requestCount: 124,
+        totalTokens: 17360,
+      },
+      {
+        modelId: "gpt-alt",
+        requestCount: 1,
+        totalTokens: 200,
+      },
+    ],
+    providerBreakdown: [
+      {
+        averageLatencyMs: 2000,
+        failedCount: 1,
+        providerId: "openai",
+        requestCount: 125,
+        successCount: 124,
+        successRate: 0.992,
+        totalTokens: 17560,
+      },
+    ],
+    totalCacheReadTokens: 10,
+    totalCacheWriteTokens: 2,
+    totalInputTokens: 12500,
+    totalOutputTokens: 5060,
+    totalRequests: 125,
+    totalTokens: 17560,
+    trend: [
+      {
+        bucket: "2026-06-05",
+        requestCount: 60,
+        totalTokens: 8200,
+      },
+      {
+        bucket: "2026-06-06",
+        requestCount: 65,
+        totalTokens: 9360,
+      },
+    ],
+  },
   totalCount: 125,
   totalPages: 3,
 };
@@ -884,9 +929,9 @@ describe("App verification surfaces", () => {
     );
     expect(screen.getByText("Model: gpt-test")).toBeInTheDocument();
     expect(screen.getByText("Channel: openai")).toBeInTheDocument();
-    expect(screen.getByText("Total time: 2,000 ms")).toBeInTheDocument();
+    expect(screen.getByText("Total time: 2 s")).toBeInTheDocument();
     expect(screen.getByText("tokens/s: 20")).toBeInTheDocument();
-    expect(screen.getByText("First token latency: 250 ms")).toBeInTheDocument();
+    expect(screen.getByText("First token latency: 0.25 s")).toBeInTheDocument();
     await userEvent.click(screen.getByText("Memories used"));
     expect(screen.getByText("Use memory graph retrieval.")).toBeInTheDocument();
   });
@@ -1414,6 +1459,19 @@ describe("App verification surfaces", () => {
       within(tabList).getByRole("tab", { name: /Second chat/ }),
     ).toHaveAttribute("aria-selected", "true");
     expect(screen.getByText("Tool run")).toBeInTheDocument();
+
+    const messageList = document.querySelector(".message-list");
+    if (!(messageList instanceof HTMLElement)) {
+      throw new Error("Expected message list to exist");
+    }
+    messageList.scrollTop = 480;
+
+    await userEvent.click(
+      within(tabList).getByRole("button", { name: "Close chat tab Second chat" }),
+    );
+
+    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    expect(messageList.scrollTop).toBe(0);
   });
 
   it("reflects chat tab and running state in workspace chat dots", async () => {
@@ -1714,7 +1772,9 @@ describe("App verification surfaces", () => {
 
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
     expect(screen.getByText("Configured providers")).toBeInTheDocument();
-    expect(screen.getByText("OpenAI")).toBeInTheDocument();
+    const providersSection = screen.getByText("Configured providers").closest("section");
+    expect(providersSection).not.toBeNull();
+    expect(within(providersSection as HTMLElement).getByText("OpenAI")).toBeInTheDocument();
 
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
     expect(screen.getByText("Model settings")).toBeInTheDocument();
@@ -2207,9 +2267,15 @@ describe("App verification surfaces", () => {
   it("shows AI statistics and request details", async () => {
     render(<App />);
 
-    await userEvent.click((await screen.findAllByRole("button", { name: "Usage" }))[0]);
+    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getAllByText("17.6K").length).toBeGreaterThan(0),
+    );
+    expect(screen.queryByText("Workspace shell is ready")).not.toBeInTheDocument();
 
-    expect(await screen.findByText("API statistics")).toBeInTheDocument();
+    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+
+    expect(await screen.findByText("API details")).toBeInTheDocument();
     expect(screen.getByText("Request audit")).toBeInTheDocument();
     const table = screen.getByRole("table");
     expect(within(table).getByText("openai")).toBeInTheDocument();

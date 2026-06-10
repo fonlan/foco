@@ -75,6 +75,20 @@ import {
   type ReactNode,
 } from "react";
 import ReactMarkdown from "react-markdown";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -639,10 +653,47 @@ type AiRequestAuditDetail = AiRequestAuditSummary & {
   responseBody: JsonValue | null;
 };
 
+type AiStatisticsTrendPoint = {
+  bucket: string;
+  requestCount: number;
+  totalTokens: number;
+};
+
+type AiStatisticsModelBreakdown = {
+  modelId: string;
+  requestCount: number;
+  totalTokens: number;
+};
+
+type AiStatisticsProviderBreakdown = {
+  averageLatencyMs: number | null;
+  failedCount: number;
+  providerId: string;
+  requestCount: number;
+  successCount: number;
+  successRate: number | null;
+  totalTokens: number;
+};
+
+type AiStatisticsSummary = {
+  averageLatencyMs: number | null;
+  failedRequests: number;
+  modelBreakdown: AiStatisticsModelBreakdown[];
+  providerBreakdown: AiStatisticsProviderBreakdown[];
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalRequests: number;
+  totalTokens: number;
+  trend: AiStatisticsTrendPoint[];
+};
+
 type AiStatisticsResponse = {
   page: number;
   pageSize: number;
   requests: AiRequestAuditSummary[];
+  summary: AiStatisticsSummary;
   totalCount: number;
   totalPages: number;
 };
@@ -921,6 +972,29 @@ const AI_STATS_COLUMN_IDS = [
   "details",
 ] as const;
 const DEFAULT_AI_STATS_COLUMN_IDS: AiStatsColumnId[] = [...AI_STATS_COLUMN_IDS];
+const ANALYTICS_CHART_COLORS = [
+  "#0f766e",
+  "#2563eb",
+  "#7c3aed",
+  "#dc2626",
+  "#ca8a04",
+  "#16a34a",
+  "#475569",
+  "#db2777",
+];
+const chartTooltipStyle: CSSProperties = {
+  backgroundColor: "#ffffff",
+  border: "1px solid #e7e5e4",
+  borderRadius: "10px",
+  boxShadow: "0 12px 28px rgba(33, 31, 28, 0.14)",
+  color: "#1c1917",
+  fontSize: "12px",
+};
+const chartTooltipLabelStyle: CSSProperties = {
+  color: "#57534e",
+  fontWeight: 700,
+  marginBottom: "4px",
+};
 
 type Translate = (key: string, values?: Record<string, string | number>) => string;
 type AiStatsColumnId = (typeof AI_STATS_COLUMN_IDS)[number];
@@ -1075,9 +1149,6 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Branch name": "分支名",
     "Cancel branch creation": "取消创建分支",
     "Create branch": "创建分支",
-    "Workspace shell is ready": "工作区 Shell 已就绪",
-    "Pick an enabled model and start the current workspace chat.":
-      "选择一个已启用模型，开始当前工作区聊天。",
     "Remove skill": "移除技能",
     "Remove skill {name}": "移除技能 {name}",
     "Message Foco": "给 Foco 发送消息",
@@ -1121,7 +1192,22 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Terminal WebSocket failed.": "终端 WebSocket 失败。",
     "terminal exited: {status}": "终端已退出：{status}",
     "terminal error: {message}": "终端错误：{message}",
-    "API statistics": "API 统计",
+    "API details": "API 详情",
+    "API overview": "API 概览",
+    "API statistics": "API 详情",
+    "Total requests": "总请求数",
+    "Total tokens": "总 token 数",
+    "Failed requests": "失败请求数",
+    "Request trend": "请求数趋势",
+    "Token trend": "Token 数趋势",
+    "Tokens by model": "Token 按模型分布",
+    "Requests by model": "请求数按模型分布",
+    "Tokens by channel": "Token 按渠道分布",
+    "Requests by channel": "请求数按渠道分布",
+    "Channel success rate": "渠道请求成功率",
+    "Channel response time": "渠道请求响应时间",
+    "No statistics yet": "暂无统计数据",
+    "No chart data": "暂无图表数据",
     "No workspace selected": "未选择工作区",
     "Workspace chats": "工作区聊天",
     "Enabled providers": "已启用供应商",
@@ -3875,9 +3961,11 @@ export function App() {
               selectedProviderId={selectedProviderId}
               selectedSkillIds={selectedSkillIds}
               selectedThinkingLevel={selectedThinkingLevel}
+              settings={settings}
               providers={settings?.providers ?? []}
               skills={detectedSkills}
               thinkingLevels={thinkingLevels}
+              workspaces={workspaces}
             />
           {isTerminalOpen ? (
             <TerminalPanel
@@ -4962,7 +5050,7 @@ function FocoNavRail({
         <NavRailButton
           active={activeMode === "stats"}
           icon={Activity}
-          label={t("Usage")}
+          label={t("API details")}
           onClick={onOpenStats}
         />
         <NavRailButton
@@ -5071,9 +5159,11 @@ function ChatPanel({
   selectedProviderId,
   selectedSkillIds,
   selectedThinkingLevel,
+  settings,
   providers,
   skills,
   thinkingLevels,
+  workspaces,
 }: {
   availableModels: ConfiguredModelSummary[];
   branchError: string | null;
@@ -5107,9 +5197,11 @@ function ChatPanel({
   selectedProviderId: string;
   selectedSkillIds: string[];
   selectedThinkingLevel: string;
+  settings: SettingsResponse | null;
   providers: ConfiguredProviderSummary[];
   skills: ConfiguredSkillSummary[];
   thinkingLevels: ThinkingLevelSummary[];
+  workspaces: WorkspaceSummary[];
 }) {
   const { t } = useI18n();
   const messageScrollRef = useRef<HTMLDivElement>(null);
@@ -5167,9 +5259,18 @@ function ChatPanel({
   }
 
   useLayoutEffect(() => {
-    shouldLockMessageScrollRef.current = true;
+    const element = messageScrollRef.current;
+    shouldLockMessageScrollRef.current = messages.length > 0;
+
+    if (messages.length === 0) {
+      if (element) {
+        element.scrollTop = 0;
+      }
+      return;
+    }
+
     scrollMessageListToBottom();
-  }, [chatScrollKey]);
+  }, [chatScrollKey, messages.length]);
 
   useLayoutEffect(() => {
     if (!shouldLockMessageScrollRef.current) {
@@ -5208,6 +5309,11 @@ function ChatPanel({
   function handleMessageScroll() {
     const element = messageScrollRef.current;
     if (!element) {
+      return;
+    }
+
+    if (messages.length === 0) {
+      shouldLockMessageScrollRef.current = false;
       return;
     }
 
@@ -5276,7 +5382,9 @@ function ChatPanel({
         ref={messageScrollRef}
       >
         <div
-          className="message-stack mx-auto flex w-full max-w-5xl flex-col gap-4"
+          className={`message-stack mx-auto flex w-full flex-col ${
+            messages.length ? "max-w-5xl gap-4" : "max-w-6xl"
+          }`}
           ref={messageScrollContentRef}
         >
           {messages.length ? (
@@ -5388,17 +5496,7 @@ function ChatPanel({
               );
             })
           ) : (
-            <div className="empty-chat-state mx-auto flex min-h-[22rem] w-full max-w-xl flex-col items-center justify-center rounded-2xl border border-dashed border-stone-300 bg-white/60 px-6 py-10 text-center shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-              <div className="inline-flex size-11 items-center justify-center rounded-2xl bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]">
-                <Bot aria-hidden="true" className="size-5" />
-              </div>
-              <h2 className="mt-4 text-base font-semibold text-stone-950">
-                {t("Workspace shell is ready")}
-              </h2>
-              <p className="mt-2 max-w-sm text-sm leading-6 text-stone-600">
-                {t("Pick an enabled model and start the current workspace chat.")}
-              </p>
-            </div>
+            <ApiOverviewPanel settings={settings} workspaces={workspaces} />
           )}
         </div>
         <div aria-hidden="true" className="h-px" ref={messageScrollEndRef} />
@@ -6031,12 +6129,12 @@ function ChatReplyMetricsLine({ metrics }: { metrics: ChatReplyMetrics }) {
   const values = [
     `${t("Model")}: ${metrics.modelId}`,
     `${t("Channel")}: ${metrics.providerId}`,
-    `${t("Total time")}: ${formatNullableLatency(
+    `${t("Total time")}: ${formatNullableLatencySeconds(
       metrics.totalLatencyMs,
       language,
     )}`,
     `${t("tokens/s")}: ${formatTokensPerSecond(metrics, language)}`,
-    `${t("First token latency")}: ${formatNullableLatency(
+    `${t("First token latency")}: ${formatNullableLatencySeconds(
       metrics.firstTokenLatencyMs,
       language,
     )}`,
@@ -6859,6 +6957,525 @@ function createTerminalPanelSession(number: number): TerminalPanelSession {
   };
 }
 
+type ChartDatum = {
+  displayValue?: string;
+  id: string;
+  label: string;
+  value: number;
+};
+
+function ApiOverviewPanel({
+  settings,
+  workspaces,
+}: {
+  settings: SettingsResponse | null;
+  workspaces: WorkspaceSummary[];
+}) {
+  const { language, t } = useI18n();
+  const [filters, setFilters] = useState({
+    startedAfter: "",
+    startedBefore: "",
+    workspaceId: "",
+  });
+  const [stats, setStats] = useState<AiStatisticsResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const summary = stats?.summary ?? emptyAiStatisticsSummary();
+  const providerLabels = useMemo(
+    () =>
+      new Map(
+        (settings?.providers ?? []).map((provider) => [
+          provider.id,
+          provider.name,
+        ]),
+      ),
+    [settings?.providers],
+  );
+  const modelLabels = useMemo(
+    () =>
+      new Map(
+        (settings?.configuredModels ?? []).map((model) => [
+          model.id,
+          model.displayName,
+        ]),
+      ),
+    [settings?.configuredModels],
+  );
+  const selectedWorkspace =
+    workspaces.find((workspace) => workspace.id === filters.workspaceId) ?? null;
+  const requestTrendData = summary.trend.map((point) => ({
+    id: point.bucket,
+    label: formatTrendBucket(point.bucket, language),
+    value: point.requestCount,
+  }));
+  const tokenTrendData = summary.trend.map((point) => ({
+    id: point.bucket,
+    label: formatTrendBucket(point.bucket, language),
+    value: point.totalTokens,
+  }));
+  const modelTokenData = summary.modelBreakdown.map((item) => ({
+    id: item.modelId,
+    label: modelLabels.get(item.modelId) ?? item.modelId,
+    value: item.totalTokens,
+  }));
+  const modelRequestData = summary.modelBreakdown.map((item) => ({
+    id: item.modelId,
+    label: modelLabels.get(item.modelId) ?? item.modelId,
+    value: item.requestCount,
+  }));
+  const providerTokenData = summary.providerBreakdown.map((item) => ({
+    id: item.providerId,
+    label: providerLabels.get(item.providerId) ?? item.providerId,
+    value: item.totalTokens,
+  }));
+  const providerRequestData = summary.providerBreakdown.map((item) => ({
+    id: item.providerId,
+    label: providerLabels.get(item.providerId) ?? item.providerId,
+    value: item.requestCount,
+  }));
+  const providerSuccessData = summary.providerBreakdown.map((item) => ({
+    displayValue: formatPercent(item.successRate, language),
+    id: item.providerId,
+    label: providerLabels.get(item.providerId) ?? item.providerId,
+    value: item.successRate ?? 0,
+  }));
+  const providerLatencyData = summary.providerBreakdown.map((item) => ({
+    displayValue: formatNullableLatencySeconds(item.averageLatencyMs, language),
+    id: item.providerId,
+    label: providerLabels.get(item.providerId) ?? item.providerId,
+    value: item.averageLatencyMs ?? 0,
+  }));
+
+  const loadOverview = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const query = aiOverviewQuery(filters);
+      const data = await requestJson<AiStatisticsResponse>(
+        `/api/ai-statistics${query ? `?${query}` : ""}`,
+      );
+      setStats(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsLoading(false);
+    }
+  }, [filters]);
+
+  useEffect(() => {
+    void loadOverview();
+  }, [loadOverview]);
+
+  function updateOverviewFilters(update: Partial<typeof filters>) {
+    setFilters((current) => ({
+      ...current,
+      ...update,
+    }));
+  }
+
+  return (
+    <div className="api-overview-panel flex w-full flex-col gap-4">
+      <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="inline-flex size-10 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
+              <BarChart3 aria-hidden="true" className="size-5" />
+            </span>
+            <div className="min-w-0">
+              <h2 className="truncate text-lg font-semibold text-stone-950">
+                {t("API overview")}
+              </h2>
+              <p className="mt-1 truncate text-xs font-medium text-stone-500">
+                {selectedWorkspace?.name ?? t("All workspaces")}
+              </p>
+            </div>
+          </div>
+          <button
+            aria-label={t("Refresh request audit")}
+            className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+            disabled={isLoading}
+            onClick={() => void loadOverview()}
+            title={t("Refresh request audit")}
+            type="button"
+          >
+            {isLoading ? (
+              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+            ) : (
+              <RefreshCw aria-hidden="true" className="size-4" />
+            )}
+          </button>
+        </div>
+        <div className="mt-4 grid gap-3 md:grid-cols-3">
+          <FilterSelect
+            label={t("Workspace")}
+            onChange={(value) => updateOverviewFilters({ workspaceId: value })}
+            options={workspaces.map((workspace) => ({
+              label: workspace.name,
+              value: workspace.id,
+            }))}
+            placeholder={t("All workspaces")}
+            value={filters.workspaceId}
+          />
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+              {t("Started after")}
+            </span>
+            <input
+              className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+              onChange={(event) =>
+                updateOverviewFilters({ startedAfter: event.target.value })
+              }
+              type="datetime-local"
+              value={filters.startedAfter}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+              {t("Started before")}
+            </span>
+            <input
+              className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+              onChange={(event) =>
+                updateOverviewFilters({ startedBefore: event.target.value })
+              }
+              type="datetime-local"
+              value={filters.startedBefore}
+            />
+          </label>
+        </div>
+      </section>
+
+      {error ? (
+        <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {error}
+        </div>
+      ) : null}
+
+      <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <StatsCard
+          icon={Activity}
+          label={t("Total requests")}
+          value={formatNumber(summary.totalRequests, language)}
+        />
+        <StatsCard
+          icon={Bot}
+          label={t("Total tokens")}
+          value={formatCompactNumber(summary.totalTokens, language)}
+        />
+        <StatsCard
+          icon={SlidersHorizontal}
+          label={t("Average latency")}
+          value={formatNullableLatencySeconds(summary.averageLatencyMs, language)}
+        />
+        <StatsCard
+          icon={CircleAlert}
+          label={t("Failed requests")}
+          value={formatNumber(summary.failedRequests, language)}
+        />
+      </section>
+
+      {summary.totalRequests === 0 ? (
+        <section className="rounded-2xl border border-dashed border-stone-300 bg-white/65 px-4 py-8 text-center text-sm font-medium text-stone-500">
+          {isLoading ? t("Loading...") : t("No statistics yet")}
+        </section>
+      ) : (
+        <section className="grid gap-4 xl:grid-cols-2">
+          <LineChartCard
+            data={requestTrendData}
+            title={t("Request trend")}
+            valueFormatter={(value) => formatNumber(value, language)}
+          />
+          <LineChartCard
+            data={tokenTrendData}
+            title={t("Token trend")}
+            valueFormatter={(value) => formatCompactNumber(value, language)}
+          />
+          <DonutChartCard
+            data={modelTokenData}
+            title={t("Tokens by model")}
+            valueFormatter={(value) => formatCompactNumber(value, language)}
+          />
+          <DonutChartCard
+            data={modelRequestData}
+            title={t("Requests by model")}
+            valueFormatter={(value) => formatNumber(value, language)}
+          />
+          <BarChartCard
+            data={providerTokenData}
+            title={t("Tokens by channel")}
+            valueFormatter={(value) => formatCompactNumber(value, language)}
+          />
+          <DonutChartCard
+            data={providerRequestData}
+            title={t("Requests by channel")}
+            valueFormatter={(value) => formatNumber(value, language)}
+          />
+          <BarChartCard
+            data={providerSuccessData}
+            maxValue={1}
+            title={t("Channel success rate")}
+            valueFormatter={(value) => formatPercent(value, language)}
+          />
+          <BarChartCard
+            data={providerLatencyData}
+            title={t("Channel response time")}
+            valueFormatter={(value) => formatNullableLatencySeconds(value, language)}
+          />
+        </section>
+      )}
+    </div>
+  );
+}
+
+function LineChartCard({
+  data,
+  title,
+  valueFormatter,
+}: {
+  data: ChartDatum[];
+  title: string;
+  valueFormatter: (value: number) => string;
+}) {
+  const { t } = useI18n();
+  const chartData = data.slice(-12);
+
+  return (
+    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+      {chartData.length ? (
+        <div className="mt-3 h-52 w-full">
+          <ResponsiveContainer
+            height="100%"
+            initialDimension={{ height: 208, width: 720 }}
+            width="100%"
+          >
+            <LineChart
+              data={chartData}
+              margin={{ bottom: 4, left: 0, right: 12, top: 10 }}
+            >
+              <CartesianGrid stroke="#f5f5f4" vertical={false} />
+              <XAxis
+                axisLine={false}
+                dataKey="label"
+                minTickGap={18}
+                tick={{ fill: "#78716c", fontSize: 12 }}
+                tickLine={false}
+              />
+              <YAxis
+                axisLine={false}
+                tick={{ fill: "#78716c", fontSize: 12 }}
+                tickFormatter={compactChartTick}
+                tickLine={false}
+                width={46}
+              />
+              <Tooltip
+                contentStyle={chartTooltipStyle}
+                cursor={{ stroke: "#99f6e4", strokeWidth: 1 }}
+                formatter={(value) => [valueFormatter(Number(value)), title]}
+                labelStyle={chartTooltipLabelStyle}
+              />
+              <Line
+                activeDot={{ r: 6, stroke: "#0f766e", strokeWidth: 2 }}
+                dataKey="value"
+                dot={{
+                  fill: "#ffffff",
+                  r: 3,
+                  stroke: "#0f766e",
+                  strokeWidth: 2,
+                }}
+                isAnimationActive
+                name={title}
+                stroke="#0f766e"
+                strokeWidth={2.5}
+                type="monotone"
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      ) : (
+        <ChartEmptyState label={t("No chart data")} />
+      )}
+    </section>
+  );
+}
+
+function DonutChartCard({
+  data,
+  title,
+  valueFormatter,
+}: {
+  data: ChartDatum[];
+  title: string;
+  valueFormatter: (value: number) => string;
+}) {
+  const { t } = useI18n();
+  const chartData = data.filter((item) => item.value > 0).slice(0, 6);
+  const total = chartData.reduce((sum, item) => sum + item.value, 0);
+
+  return (
+    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+      {total > 0 ? (
+        <div className="mt-4 grid gap-4 sm:grid-cols-[12rem_1fr] sm:items-center">
+          <div className="relative h-48 w-full min-w-0">
+            <ResponsiveContainer
+              height="100%"
+              initialDimension={{ height: 192, width: 192 }}
+              width="100%"
+            >
+              <PieChart>
+                <Tooltip
+                  contentStyle={chartTooltipStyle}
+                  formatter={(value, _name, item) => [
+                    valueFormatter(Number(value)),
+                    chartPayloadLabel(item.payload),
+                  ]}
+                  labelStyle={chartTooltipLabelStyle}
+                />
+                <Pie
+                  animationDuration={450}
+                  data={chartData}
+                  dataKey="value"
+                  innerRadius="58%"
+                  nameKey="label"
+                  outerRadius="82%"
+                  paddingAngle={2}
+                >
+                  {chartData.map((item, index) => (
+                    <Cell fill={chartColor(index)} key={item.id} />
+                  ))}
+                </Pie>
+              </PieChart>
+            </ResponsiveContainer>
+            <div className="pointer-events-none absolute inset-0 grid place-items-center">
+              <div className="rounded-full bg-white/80 px-2 py-1 text-center font-mono text-sm font-semibold text-stone-950 shadow-sm">
+                {valueFormatter(total)}
+              </div>
+            </div>
+          </div>
+          <ChartLegend data={chartData} valueFormatter={valueFormatter} />
+        </div>
+      ) : (
+        <ChartEmptyState label={t("No chart data")} />
+      )}
+    </section>
+  );
+}
+
+function BarChartCard({
+  data,
+  maxValue,
+  title,
+  valueFormatter,
+}: {
+  data: ChartDatum[];
+  maxValue?: number;
+  title: string;
+  valueFormatter: (value: number) => string;
+}) {
+  const { t } = useI18n();
+  const chartData = data.filter((item) => item.value > 0).slice(0, 8);
+  const chartMax = Math.max(maxValue ?? 0, ...chartData.map((item) => item.value), 1);
+
+  return (
+    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+      {chartData.length ? (
+        <>
+          <div className="mt-4 h-64 w-full">
+            <ResponsiveContainer
+              height="100%"
+              initialDimension={{ height: 256, width: 720 }}
+              width="100%"
+            >
+              <BarChart
+                data={chartData}
+                layout="vertical"
+                margin={{ bottom: 4, left: 6, right: 18, top: 4 }}
+              >
+                <CartesianGrid horizontal={false} stroke="#f5f5f4" />
+                <XAxis domain={[0, chartMax]} hide type="number" />
+                <YAxis
+                  axisLine={false}
+                  dataKey="label"
+                  tick={{ fill: "#78716c", fontSize: 12 }}
+                  tickFormatter={compactChartLabel}
+                  tickLine={false}
+                  type="category"
+                  width={112}
+                />
+                <Tooltip
+                  contentStyle={chartTooltipStyle}
+                  cursor={{ fill: "#f0fdfa" }}
+                  formatter={(value, _name, item) => [
+                    chartPayloadDisplayValue(
+                      item.payload,
+                      valueFormatter,
+                      value,
+                    ),
+                    chartPayloadLabel(item.payload),
+                  ]}
+                  labelStyle={chartTooltipLabelStyle}
+                />
+                <Bar
+                  animationDuration={450}
+                  barSize={16}
+                  dataKey="value"
+                  radius={[0, 8, 8, 0]}
+                >
+                  {chartData.map((item, index) => (
+                    <Cell fill={chartColor(index)} key={item.id} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+          <ChartLegend data={chartData} valueFormatter={valueFormatter} />
+        </>
+      ) : (
+        <ChartEmptyState label={t("No chart data")} />
+      )}
+    </section>
+  );
+}
+
+function ChartLegend({
+  data,
+  valueFormatter,
+}: {
+  data: ChartDatum[];
+  valueFormatter: (value: number) => string;
+}) {
+  return (
+    <div className="grid gap-2">
+      {data.map((item, index) => (
+        <div className="flex min-w-0 items-center gap-2 text-xs" key={item.id}>
+          <span
+            aria-hidden="true"
+            className="size-2.5 shrink-0 rounded-full"
+            style={{ backgroundColor: chartColor(index) }}
+          />
+          <span className="min-w-0 flex-1 truncate font-medium text-stone-600">
+            {item.label}
+          </span>
+          <span className="shrink-0 font-mono text-stone-950">
+            {item.displayValue ?? valueFormatter(item.value)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChartEmptyState({ label }: { label: string }) {
+  return (
+    <div className="mt-4 grid h-44 place-items-center rounded-xl border border-dashed border-stone-300 bg-stone-50/70 text-sm font-medium text-stone-500">
+      {label}
+    </div>
+  );
+}
+
 function ApiStatsPanel({
   settings,
   workspaces,
@@ -6882,7 +7499,8 @@ function ApiStatsPanel({
     Set<AiStatsColumnId>
   >(() => new Set(DEFAULT_AI_STATS_COLUMN_IDS));
   const requests = stats?.requests ?? [];
-  const totalCount = stats?.totalCount ?? requests.length;
+  const summary = stats?.summary ?? emptyAiStatisticsSummary();
+  const totalCount = stats?.totalCount ?? summary.totalRequests;
   const currentPage = stats?.page ?? positiveIntegerText(filters.page, 1);
   const pageSize = stats?.pageSize ?? positiveIntegerText(filters.pageSize, 50);
   const totalPages =
@@ -6892,10 +7510,6 @@ function ApiStatsPanel({
   const pageEnd = requests.length
     ? Math.min(totalCount, pageStart + requests.length - 1)
     : 0;
-  const chatCount = workspaces.reduce(
-    (total, workspace) => total + workspace.chats.length,
-    0,
-  );
   const selectedWorkspace =
     workspaces.find((workspace) => workspace.id === filters.workspaceId) ?? null;
   const chatOptions = (selectedWorkspace ? [selectedWorkspace] : workspaces)
@@ -6929,23 +7543,8 @@ function ApiStatsPanel({
     requests.map((request) => request.finalState),
     (status) => auditStatusText(status, t),
   );
-  const totalInputTokens = requests.reduce(
-    (total, request) => total + (request.inputTokens ?? 0),
-    0,
-  );
-  const totalOutputTokens = requests.reduce(
-    (total, request) => total + (request.outputTokens ?? 0),
-    0,
-  );
-  const latencyValues = requests
-    .map((request) => request.totalLatencyMs)
-    .filter((value): value is number => value !== null);
-  const averageLatency = latencyValues.length
-    ? Math.round(
-        latencyValues.reduce((total, value) => total + value, 0) /
-          latencyValues.length,
-      )
-    : null;
+  const totalInputTokens = summary.totalInputTokens;
+  const totalOutputTokens = summary.totalOutputTokens;
   const aiStatsColumns: AiStatsColumn[] = [
     {
       cellClassName: "px-4 py-3 font-medium text-stone-900",
@@ -6985,14 +7584,16 @@ function ApiStatsPanel({
       headerClassName: "text-right",
       id: "inputTokens",
       label: t("Input tokens"),
-      render: (request) => formatNullableNumber(request.inputTokens, language),
+      render: (request) =>
+        formatNullableCompactNumber(request.inputTokens, language),
     },
     {
       cellClassName: "px-4 py-3 text-right font-mono",
       headerClassName: "text-right",
       id: "outputTokens",
       label: t("Output tokens"),
-      render: (request) => formatNullableNumber(request.outputTokens, language),
+      render: (request) =>
+        formatNullableCompactNumber(request.outputTokens, language),
     },
     {
       cellClassName: "px-4 py-3 text-right font-mono",
@@ -7000,7 +7601,7 @@ function ApiStatsPanel({
       id: "cacheRead",
       label: t("Cache read"),
       render: (request) =>
-        formatNullableNumber(request.cacheReadTokens, language),
+        formatNullableCompactNumber(request.cacheReadTokens, language),
     },
     {
       cellClassName: "px-4 py-3 text-right font-mono",
@@ -7008,7 +7609,7 @@ function ApiStatsPanel({
       id: "cacheWrite",
       label: t("Cache write"),
       render: (request) =>
-        formatNullableNumber(request.cacheWriteTokens, language),
+        formatNullableCompactNumber(request.cacheWriteTokens, language),
     },
     {
       cellClassName: "px-4 py-3 text-right font-mono",
@@ -7023,7 +7624,7 @@ function ApiStatsPanel({
       id: "latency",
       label: t("Latency"),
       render: (request) =>
-        formatNullableLatency(request.totalLatencyMs, language),
+        formatNullableLatencySeconds(request.totalLatencyMs, language),
     },
     {
       cellClassName: "px-4 py-3 text-right font-mono",
@@ -7031,7 +7632,7 @@ function ApiStatsPanel({
       id: "firstToken",
       label: t("First token"),
       render: (request) =>
-        formatNullableLatency(request.firstTokenLatencyMs, language),
+        formatNullableLatencySeconds(request.firstTokenLatencyMs, language),
     },
     {
       cellClassName: "px-4 py-3 text-right font-mono",
@@ -7170,7 +7771,7 @@ function ApiStatsPanel({
               </span>
               <div className="min-w-0">
                 <h2 className="truncate text-lg font-semibold text-stone-950">
-                  {t("API statistics")}
+                  {t("API details")}
                 </h2>
                 <p className="mt-1 truncate text-xs font-medium text-stone-500">
                   {filters.workspaceId
@@ -7199,23 +7800,23 @@ function ApiStatsPanel({
         <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
           <StatsCard
             icon={Activity}
-            label={t("Recorded requests")}
+            label={t("Total requests")}
             value={formatNumber(totalCount, language)}
           />
           <StatsCard
             icon={MessageSquare}
-            label={t("All chats")}
-            value={formatNumber(chatCount, language)}
+            label={t("Total tokens")}
+            value={formatCompactNumber(summary.totalTokens, language)}
           />
           <StatsCard
             icon={Bot}
             label={t("Input tokens")}
-            value={formatNumber(totalInputTokens, language)}
+            value={formatCompactNumber(totalInputTokens, language)}
           />
           <StatsCard
             icon={SlidersHorizontal}
             label={t("Average latency")}
-            value={formatNullableLatency(averageLatency, language)}
+            value={formatNullableLatencySeconds(summary.averageLatencyMs, language)}
           />
         </section>
 
@@ -7233,7 +7834,8 @@ function ApiStatsPanel({
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <div className="text-xs text-stone-500">
-                {t("Output tokens")}: {formatNumber(totalOutputTokens, language)}
+                {t("Output tokens")}:{" "}
+                {formatCompactNumber(totalOutputTokens, language)}
               </div>
               <details className="relative">
                 <summary className="inline-flex h-9 cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 [&::-webkit-details-marker]:hidden">
@@ -7603,11 +8205,14 @@ function AiRequestDetailDialog({
                 />
                 <AuditMeta
                   label={t("Latency")}
-                  value={formatNullableLatency(request.totalLatencyMs, language)}
+                  value={formatNullableLatencySeconds(
+                    request.totalLatencyMs,
+                    language,
+                  )}
                 />
                 <AuditMeta
                   label={t("First token")}
-                  value={formatNullableLatency(
+                  value={formatNullableLatencySeconds(
                     request.firstTokenLatencyMs,
                     language,
                   )}
@@ -7694,7 +8299,7 @@ function StatsCard({
   label,
   value,
 }: {
-  icon: typeof Settings;
+  icon: LucideIcon;
   label: string;
   value: string;
 }) {
@@ -15167,6 +15772,45 @@ function emptyAiStatsFilters(): AiStatsFilterState {
   };
 }
 
+function emptyAiStatisticsSummary(): AiStatisticsSummary {
+  return {
+    averageLatencyMs: null,
+    failedRequests: 0,
+    modelBreakdown: [],
+    providerBreakdown: [],
+    totalCacheReadTokens: 0,
+    totalCacheWriteTokens: 0,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalRequests: 0,
+    totalTokens: 0,
+    trend: [],
+  };
+}
+
+function aiOverviewQuery(filters: {
+  startedAfter: string;
+  startedBefore: string;
+  workspaceId: string;
+}) {
+  const params = new URLSearchParams();
+  if (filters.workspaceId) {
+    params.set("workspaceId", filters.workspaceId);
+  }
+  const startedAfter = datetimeLocalToRfc3339(filters.startedAfter);
+  if (startedAfter) {
+    params.set("startedAfter", startedAfter);
+  }
+  const startedBefore = datetimeLocalToRfc3339(filters.startedBefore);
+  if (startedBefore) {
+    params.set("startedBefore", startedBefore);
+  }
+  params.set("page", "1");
+  params.set("pageSize", "1");
+
+  return params.toString();
+}
+
 function aiStatsQuery(filters: AiStatsFilterState) {
   const params = new URLSearchParams();
   const entries: [keyof AiStatsFilterState, string][] = [
@@ -15188,6 +15832,60 @@ function aiStatsQuery(filters: AiStatsFilterState) {
   }
 
   return params.toString();
+}
+
+function chartColor(index: number) {
+  return ANALYTICS_CHART_COLORS[index % ANALYTICS_CHART_COLORS.length];
+}
+
+function chartPayloadLabel(payload: unknown) {
+  return isObjectRecord(payload) && typeof payload.label === "string"
+    ? payload.label
+    : "";
+}
+
+function chartPayloadDisplayValue(
+  payload: unknown,
+  valueFormatter: (value: number) => string,
+  fallbackValue?: unknown,
+) {
+  if (isObjectRecord(payload) && typeof payload.displayValue === "string") {
+    return payload.displayValue;
+  }
+
+  if (isObjectRecord(payload) && typeof payload.value === "number") {
+    return valueFormatter(payload.value);
+  }
+
+  const numberValue = Number(fallbackValue);
+  return Number.isFinite(numberValue) ? valueFormatter(numberValue) : "n/a";
+}
+
+function compactChartTick(value: unknown) {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) {
+    return String(value);
+  }
+
+  return formatCompactNumber(numberValue, "en");
+}
+
+function compactChartLabel(value: unknown) {
+  const label = String(value);
+  return label.length > 16 ? `${label.slice(0, 15)}...` : label;
+}
+
+function formatTrendBucket(bucket: string, language: AppLanguageId = "en") {
+  const date = new Date(`${bucket}T00:00:00`);
+
+  if (Number.isNaN(date.getTime())) {
+    return bucket;
+  }
+
+  return new Intl.DateTimeFormat(language, {
+    day: "2-digit",
+    month: "short",
+  }).format(date);
 }
 
 function positiveIntegerText(value: string, fallback: number) {
@@ -15357,11 +16055,24 @@ function formatNullableNumber(
   return value === null ? "n/a" : formatNumber(value, language);
 }
 
-function formatNullableLatency(
+function formatNullableCompactNumber(
   value: number | null,
   language: AppLanguageId = "en",
 ) {
-  return value === null ? "n/a" : `${formatNumber(value, language)} ms`;
+  return value === null ? "n/a" : formatCompactNumber(value, language);
+}
+
+function formatNullableLatencySeconds(
+  value: number | null,
+  language: AppLanguageId = "en",
+) {
+  if (value === null) {
+    return "n/a";
+  }
+
+  return `${new Intl.NumberFormat(language, {
+    maximumFractionDigits: 2,
+  }).format(value / 1000)} s`;
 }
 
 function formatTokensPerSecond(
@@ -15394,6 +16105,13 @@ function formatPercent(value: number | null, language: AppLanguageId = "en") {
 
 function formatNumber(value: number, language: AppLanguageId = "en") {
   return new Intl.NumberFormat(language).format(value);
+}
+
+function formatCompactNumber(value: number, _language: AppLanguageId = "en") {
+  return new Intl.NumberFormat("en", {
+    maximumFractionDigits: 1,
+    notation: "compact",
+  }).format(value);
 }
 
 function formatChatCreatedAt(value: string) {
