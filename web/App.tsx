@@ -4817,7 +4817,10 @@ function ChatTabBar({
   }
 
   return (
-    <div className="chat-tabs min-w-0 flex-1" ref={tabsContainerRef}>
+    <div
+      className="chat-tabs flex min-w-0 flex-1 flex-nowrap overflow-hidden"
+      ref={tabsContainerRef}
+    >
       {scrollState.hasOverflow ? (
         <button
           aria-label={t("Scroll chat tabs left")}

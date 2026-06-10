@@ -1896,7 +1896,17 @@ body,
   gap: 0;
 }
 
+.chat-tabs {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
+  overflow: hidden;
+}
+
 .chat-tab-list {
+  min-width: 0;
+  flex: 1 1 auto;
   height: 100%;
   gap: 0;
   padding-bottom: 0;
@@ -2603,6 +2613,16 @@ summary:focus-visible {
 
 .chat-tab-item:has([aria-selected="true"])::after {
   background: var(--foco-accent);
+}
+
+.chat-tab-scroll-button {
+  display: inline-flex;
+  width: 2rem;
+  height: 100%;
+  flex: 0 0 2rem;
+  align-items: center;
+  justify-content: center;
+  border-width: 0 1px;
 }
 
 .chat-tab-scroll-button,

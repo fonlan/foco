@@ -1518,6 +1518,7 @@ describe("App verification surfaces", () => {
     if (!tabsContainer) {
       throw new Error("Expected chat tab list to have a container");
     }
+    expect(tabsContainer).toHaveClass("flex", "flex-nowrap", "overflow-hidden");
     expect(
       screen.queryByRole("button", { name: "Scroll chat tabs left" }),
     ).not.toBeInTheDocument();
