@@ -4525,7 +4525,7 @@ function ChatTabBar({
 
             return (
               <div
-                className={`chat-tab-item group flex h-12 min-w-44 max-w-64 shrink-0 items-center rounded-lg border px-2 py-1.5 transition-colors ${
+                className={`chat-tab-item group flex h-12 min-w-36 max-w-64 shrink-0 items-center rounded-lg border px-2 py-1.5 transition-colors ${
                   isActive
                     ? "border-teal-200 bg-white text-stone-950 shadow-sm"
                     : "border-stone-200 bg-stone-50/80 text-stone-600 hover:border-stone-300 hover:bg-white"
