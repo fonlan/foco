@@ -20,6 +20,8 @@ const MCP_TOOL_PREFIX: &str = "mcp__";
 const MCP_TOOL_SEPARATOR: &str = "__";
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -457,6 +459,8 @@ async fn start_runtime(
                 rmcp::transport::which_command(command)?.configure(move |cmd| {
                     cmd.args(args);
                     cmd.current_dir(workspace_path);
+                    #[cfg(windows)]
+                    cmd.creation_flags(CREATE_NO_WINDOW);
                 }),
             )?;
 

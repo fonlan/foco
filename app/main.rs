@@ -14,6 +14,9 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use axum::{
     Json, Router,
     body::Body,
@@ -213,6 +216,8 @@ const RIPGREP_RELEASE_API_URL: &str =
 const RIPGREP_DOWNLOAD_ARCHIVE_NAME: &str = "ripgrep-download.tmp";
 // Temporary directory name used while extracting a downloaded ripgrep archive.
 const RIPGREP_EXTRACT_DIR_NAME: &str = "ripgrep-extract";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 // Process-wide counter used by unique_id to keep IDs distinct within the same millisecond.
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
@@ -11484,13 +11489,16 @@ fn ripgrep_executable_name() -> &'static str {
 }
 
 fn ripgrep_executable_works(path: &Path) -> bool {
-    Command::new(path)
+    let mut command = Command::new(path);
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    command.status().is_ok_and(|status| status.success())
 }
 
 async fn download_and_install_ripgrep(install_dir: &Path) -> Result<RipgrepStatus, ApiError> {
