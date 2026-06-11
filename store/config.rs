@@ -262,6 +262,8 @@ pub struct GlobalConfig {
     pub hooks: HookConfig,
     #[serde(default)]
     pub memory: MemorySettings,
+    #[serde(default)]
+    pub prompts: PromptSettings,
     pub providers: Vec<ProviderSettings>,
     pub models: Vec<ModelSettings>,
     pub mcp: McpConfig,
@@ -281,6 +283,7 @@ impl GlobalConfig {
             },
             hooks: HookConfig::default(),
             memory: MemorySettings::default(),
+            prompts: PromptSettings::default(),
             providers: Vec::new(),
             models: Vec::new(),
             mcp: McpConfig {
@@ -323,6 +326,7 @@ impl GlobalConfig {
         validate_web_server_settings(config_path, &self.app.web_server)?;
         validate_hook_config(config_path, "hooks", &self.hooks)?;
         validate_memory_settings(config_path, &self.memory, &self.models)?;
+        validate_prompt_settings(config_path, &self.prompts)?;
         require_non_empty_list(config_path, "workspaces", self.workspaces.len())?;
 
         let mut workspace_ids = HashSet::new();
@@ -665,6 +669,15 @@ impl Default for MemorySettings {
             extraction_model_id: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PromptSettings {
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
+    #[serde(default)]
+    pub extra_text: String,
 }
 
 pub type HookEventMap = std::collections::BTreeMap<String, Vec<HookMatcherGroup>>;
@@ -1154,6 +1167,31 @@ fn validate_memory_settings(
             return invalid_config(
                 config_path,
                 format!("memory.extraction_model_id references missing model '{model_id}'"),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_prompt_settings(
+    config_path: Option<&Path>,
+    settings: &PromptSettings,
+) -> Result<(), ConfigError> {
+    let mut prompt_files = HashSet::new();
+
+    for file in &settings.files {
+        if !file.is_absolute() {
+            return invalid_config(
+                config_path,
+                format!("prompt file path must be absolute: {}", file.display()),
+            );
+        }
+
+        if !prompt_files.insert(file) {
+            return invalid_config(
+                config_path,
+                format!("duplicate prompt file path: {}", file.display()),
             );
         }
     }

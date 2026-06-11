@@ -47,8 +47,8 @@ use foco_providers::{
 use foco_store::{
     config::{
         ApiProxySettings, DEFAULT_TERMINAL_SHELL, GlobalConfig, HookConfig, HookEventMap,
-        McpServerConfig, MemorySettings, ModelLimits, ModelSettings, ProviderSettings,
-        SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES,
+        McpServerConfig, MemorySettings, ModelLimits, ModelSettings, PromptSettings,
+        ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES,
         SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_HOOK_EVENTS,
         SUPPORTED_TERMINAL_SHELLS, SkillSettings, UNSUPPORTED_HOOK_EVENTS, WebServerSettings,
         WorkspaceConfig, load_or_create_global_config, load_workspace_hook_config,
@@ -169,6 +169,10 @@ const WORKSPACE_LOGO_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const WORKSPACE_LOGO_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
 // Prefix used to identify injected AGENTS.md instruction messages.
 const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
+// Prefix used to identify injected user-configured prompt file messages.
+const PROMPT_FILE_MESSAGE_PREFIX: &str = "Prompt file instructions loaded from";
+// Prefix used to identify injected user-configured extra prompt text.
+const EXTRA_PROMPT_MESSAGE_PREFIX: &str = "Extra user prompt instructions:";
 // Prefix used to identify injected enabled skill front matter messages.
 const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
     "Enabled skill front matter loaded from configured skills";
@@ -647,6 +651,7 @@ fn app_router(state: AppState) -> Router {
         .route("/api/settings", get(settings))
         .route("/api/settings/general", post(save_general_settings))
         .route("/api/settings/memory", post(save_memory_settings))
+        .route("/api/settings/prompts", post(save_prompt_settings))
         .route("/api/memory", get(memory_list))
         .route("/api/memory/manual", post(create_manual_memory))
         .route("/api/memory/status", post(update_memory_status))
@@ -1356,6 +1361,37 @@ fn normalize_web_server_settings(
     })
 }
 
+fn normalize_prompt_file_paths(files: Vec<String>) -> Result<Vec<PathBuf>, ApiError> {
+    let mut normalized = Vec::with_capacity(files.len());
+    let mut seen = HashSet::new();
+
+    for file in files {
+        let file = file.trim();
+        if file.is_empty() {
+            return Err(ApiError::bad_request("prompt file path must not be empty"));
+        }
+
+        let path = PathBuf::from(file);
+        if !path.is_absolute() {
+            return Err(ApiError::bad_request(format!(
+                "prompt file path must be absolute: {}",
+                path.display()
+            )));
+        }
+
+        let path = normalize_windows_verbatim_path(path);
+        if !seen.insert(path.clone()) {
+            return Err(ApiError::bad_request(format!(
+                "duplicate prompt file path: {}",
+                path.display()
+            )));
+        }
+        normalized.push(path);
+    }
+
+    Ok(normalized)
+}
+
 fn normalize_api_proxy_settings(
     current: &ApiProxySettings,
     request: Option<&ManualApiProxySettingsRequest>,
@@ -1728,6 +1764,24 @@ async fn save_memory_settings(
         extraction_mode: request.extraction_mode.trim().to_string(),
         retention_days: request.retention_days,
         extraction_model_id,
+    };
+    config
+        .validate(Some(&state.config_file))
+        .map_err(ApiError::from_config_error)?;
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
+async fn save_prompt_settings(
+    State(state): State<AppState>,
+    Json(request): Json<ManualPromptSettingsRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+
+    config.prompts = PromptSettings {
+        files: normalize_prompt_file_paths(request.files)?,
+        extra_text: request.extra_text.trim().to_string(),
     };
     config
         .validate(Some(&state.config_file))
@@ -3216,6 +3270,13 @@ struct ManualMemorySettingsRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ManualPromptSettingsRequest {
+    files: Vec<String>,
+    extra_text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ManualApiProxySettingsRequest {
     enabled: bool,
     proxy_type: String,
@@ -3481,6 +3542,7 @@ struct SettingsResponse {
     general: GeneralSettingsSummary,
     native_tools: NativeToolsSummary,
     memory: MemorySettingsSummary,
+    prompts: PromptSettingsSummary,
     workspaces: Vec<ConfiguredWorkspaceSummary>,
     terminal_shells: Vec<TerminalShellSummary>,
     provider_kinds: Vec<ProviderKindSummary>,
@@ -3549,6 +3611,13 @@ struct MemorySettingsSummary {
 struct MemoryExtractionModeSummary {
     value: &'static str,
     label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptSettingsSummary {
+    files: Vec<String>,
+    extra_text: String,
 }
 
 #[derive(Serialize)]
@@ -5500,7 +5569,12 @@ async fn prepare_prompt_context(
 
     let covered_sequences = snapshot_covered_sequences(&compression_snapshots);
     let agents_messages = if is_new_chat {
-        agents_prompt_messages(&workspace.path, &state.user_profile_dir)?
+        agents_prompt_messages(&workspace.path)?
+    } else {
+        Vec::new()
+    };
+    let configured_prompt_messages = if is_new_chat {
+        configured_prompt_messages(&config.prompts)?
     } else {
         Vec::new()
     };
@@ -5527,6 +5601,7 @@ async fn prepare_prompt_context(
         existing_messages.len()
             + compression_snapshots.len()
             + agents_messages.len()
+            + configured_prompt_messages.len()
             + environment_messages.len()
             + skill_messages.len()
             + usize::from(memory_context.profile_message.is_some())
@@ -5550,6 +5625,10 @@ async fn prepare_prompt_context(
     }
     for agents_message in agents_messages {
         neutral_messages.push(agents_message);
+        message_source_sequences.push(None);
+    }
+    for prompt_message in configured_prompt_messages {
+        neutral_messages.push(prompt_message);
         message_source_sequences.push(None);
     }
     for environment_message in environment_messages {
@@ -6321,25 +6400,41 @@ fn interleaved_tool_state_messages(
     messages
 }
 
-fn agents_prompt_messages(
-    workspace_path: &Path,
-    user_profile_dir: &Path,
-) -> Result<Vec<NeutralChatMessage>, ApiError> {
+fn agents_prompt_messages(workspace_path: &Path) -> Result<Vec<NeutralChatMessage>, ApiError> {
     let mut messages = Vec::new();
+    let path = workspace_path.join("AGENTS.md");
 
-    for path in [
-        workspace_path.join("AGENTS.md"),
-        user_profile_dir.join(".codex").join("AGENTS.md"),
-    ] {
-        if let Some(message) = agents_prompt_message(&path)? {
-            messages.push(message);
-        }
+    if let Some(message) = prompt_file_message(&path, AGENTS_MESSAGE_PREFIX, "AGENTS.md path")? {
+        messages.push(message);
     }
 
     Ok(messages)
 }
 
-fn agents_prompt_message(path: &Path) -> Result<Option<NeutralChatMessage>, ApiError> {
+fn configured_prompt_messages(
+    settings: &PromptSettings,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    let mut messages = Vec::new();
+
+    for path in &settings.files {
+        if let Some(message) = prompt_file_message(path, PROMPT_FILE_MESSAGE_PREFIX, "prompt file")?
+        {
+            messages.push(message);
+        }
+    }
+
+    if let Some(message) = extra_prompt_message(&settings.extra_text) {
+        messages.push(message);
+    }
+
+    Ok(messages)
+}
+
+fn prompt_file_message(
+    path: &Path,
+    prefix: &str,
+    field_name: &str,
+) -> Result<Option<NeutralChatMessage>, ApiError> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -6353,7 +6448,7 @@ fn agents_prompt_message(path: &Path) -> Result<Option<NeutralChatMessage>, ApiE
 
     if !metadata.is_file() {
         return Err(ApiError::bad_request(format!(
-            "AGENTS.md path is not a file: {}",
+            "{field_name} is not a file: {}",
             path.display()
         )));
     }
@@ -6368,12 +6463,20 @@ fn agents_prompt_message(path: &Path) -> Result<Option<NeutralChatMessage>, ApiE
 
     Ok(Some(neutral_text_message(
         NeutralChatRole::User,
-        format!(
-            "{AGENTS_MESSAGE_PREFIX} {}:\n\n{}",
-            path.display(),
-            content.trim()
-        ),
+        format!("{prefix} {}:\n\n{}", path.display(), content.trim()),
     )))
+}
+
+fn extra_prompt_message(content: &str) -> Option<NeutralChatMessage> {
+    let content = content.trim();
+    if content.is_empty() {
+        return None;
+    }
+
+    Some(neutral_text_message(
+        NeutralChatRole::User,
+        format!("{EXTRA_PROMPT_MESSAGE_PREFIX}\n\n{content}"),
+    ))
 }
 
 fn environment_context_message(workspace_path: &Path) -> Result<NeutralChatMessage, ApiError> {
@@ -11144,6 +11247,19 @@ async fn settings_response(
                 },
             ],
         },
+        prompts: PromptSettingsSummary {
+            files: config
+                .prompts
+                .files
+                .iter()
+                .map(|path| {
+                    normalize_windows_verbatim_path(path.clone())
+                        .display()
+                        .to_string()
+                })
+                .collect(),
+            extra_text: config.prompts.extra_text.clone(),
+        },
         workspaces: config
             .workspaces
             .iter()
@@ -14678,27 +14794,56 @@ description: Project memory.
     }
 
     #[test]
-    fn agents_prompt_messages_read_workspace_and_codex_agents_files() {
+    fn prompt_messages_read_workspace_and_configured_prompt_files() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-agents-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-profile-agents-test"));
         let codex_dir = profile_dir.join(".codex");
+        let configured_prompt_file = codex_dir.join("AGENTS.md");
 
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
         fs::create_dir_all(&codex_dir).expect("codex directory");
         fs::write(workspace_dir.join("AGENTS.md"), "Workspace instructions.\n")
             .expect("workspace AGENTS write");
-        fs::write(codex_dir.join("AGENTS.md"), "Codex instructions.\n")
-            .expect("codex AGENTS write");
+        fs::write(&configured_prompt_file, "Configured prompt instructions.\n")
+            .expect("configured prompt write");
 
-        let messages =
-            agents_prompt_messages(&workspace_dir, &profile_dir).expect("agents messages");
+        let agents_messages = agents_prompt_messages(&workspace_dir).expect("agents messages");
+        let prompt_messages = configured_prompt_messages(&PromptSettings {
+            files: vec![configured_prompt_file],
+            extra_text: "Extra prompt instructions.\n".to_string(),
+        })
+        .expect("configured prompt messages");
 
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].role, NeutralChatRole::User);
-        assert!(messages[0].content.contains(AGENTS_MESSAGE_PREFIX));
-        assert!(messages[0].content.contains("Workspace instructions."));
-        assert_eq!(messages[1].role, NeutralChatRole::User);
-        assert!(messages[1].content.contains("Codex instructions."));
+        assert_eq!(agents_messages.len(), 1);
+        assert_eq!(agents_messages[0].role, NeutralChatRole::User);
+        assert!(agents_messages[0].content.contains(AGENTS_MESSAGE_PREFIX));
+        assert!(
+            agents_messages[0]
+                .content
+                .contains("Workspace instructions.")
+        );
+        assert_eq!(prompt_messages.len(), 2);
+        assert_eq!(prompt_messages[0].role, NeutralChatRole::User);
+        assert!(
+            prompt_messages[0]
+                .content
+                .contains(PROMPT_FILE_MESSAGE_PREFIX)
+        );
+        assert!(
+            prompt_messages[0]
+                .content
+                .contains("Configured prompt instructions.")
+        );
+        assert!(
+            prompt_messages[1]
+                .content
+                .contains(EXTRA_PROMPT_MESSAGE_PREFIX)
+        );
+        assert!(
+            prompt_messages[1]
+                .content
+                .contains("Extra prompt instructions.")
+        );
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
         remove_dir_if_exists(&profile_dir);
@@ -16136,6 +16281,7 @@ description: Project memory.
 
         assert_eq!(stored_session.working_directory, expected_directory);
 
+        drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
         remove_dir_if_exists(&profile_dir);
     }
@@ -16145,6 +16291,7 @@ description: Project memory.
         let workspace_dir = env::temp_dir().join(unique_id("foco-chat-agents-workspace-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-chat-agents-profile-test"));
         let codex_dir = profile_dir.join(".codex");
+        let configured_prompt_file = codex_dir.join("AGENTS.md");
         let skill_dir = profile_dir.join(".agents").join("skills").join("gitmemo");
 
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -16155,8 +16302,11 @@ description: Project memory.
             "Workspace chat instructions.\n",
         )
         .expect("workspace AGENTS write");
-        fs::write(codex_dir.join("AGENTS.md"), "Codex chat instructions.\n")
-            .expect("codex AGENTS write");
+        fs::write(
+            &configured_prompt_file,
+            "Configured prompt chat instructions.\n",
+        )
+        .expect("configured prompt write");
         fs::write(
             skill_dir.join("SKILL.md"),
             "---
@@ -16172,6 +16322,8 @@ Search memory before repo work.
         .expect("skill file write");
 
         let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.prompts.files.push(configured_prompt_file);
+        config.prompts.extra_text = "Extra configured prompt.\n".to_string();
         config.providers.push(ProviderSettings {
             id: "provider".to_string(),
             name: "Provider".to_string(),
@@ -16221,16 +16373,37 @@ Search memory before repo work.
             .filter(|message| message.content.contains(AGENTS_MESSAGE_PREFIX))
             .collect::<Vec<_>>();
 
-        assert_eq!(injected_messages.len(), 2);
+        assert_eq!(injected_messages.len(), 1);
         assert!(
             injected_messages[0]
                 .content
                 .contains("Workspace chat instructions.")
         );
-        assert!(
-            injected_messages[1]
+        assert!(injected_messages.iter().all(|message| {
+            !message
                 .content
-                .contains("Codex chat instructions.")
+                .contains("Configured prompt chat instructions.")
+        }));
+        let prompt_messages = new_context
+            .provider_request
+            .messages
+            .iter()
+            .filter(|message| {
+                message.content.contains(PROMPT_FILE_MESSAGE_PREFIX)
+                    || message.content.contains(EXTRA_PROMPT_MESSAGE_PREFIX)
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(prompt_messages.len(), 2);
+        assert!(
+            prompt_messages[0]
+                .content
+                .contains("Configured prompt chat instructions.")
+        );
+        assert!(
+            prompt_messages[1]
+                .content
+                .contains("Extra configured prompt.")
         );
         let skill_messages = new_context
             .provider_request
@@ -16303,6 +16476,20 @@ Search memory before repo work.
                 .messages
                 .iter()
                 .all(|message| !message.content.contains(AGENTS_MESSAGE_PREFIX))
+        );
+        assert!(
+            existing_context
+                .provider_request
+                .messages
+                .iter()
+                .all(|message| !message.content.contains(PROMPT_FILE_MESSAGE_PREFIX))
+        );
+        assert!(
+            existing_context
+                .provider_request
+                .messages
+                .iter()
+                .all(|message| !message.content.contains(EXTRA_PROMPT_MESSAGE_PREFIX))
         );
         assert!(
             existing_context

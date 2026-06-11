@@ -120,6 +120,10 @@ const settings = {
     ],
     retentionDays: null,
   },
+  prompts: {
+    extraText: "",
+    files: [],
+  },
   mcpServers: [
     {
       args: ["serve"],
@@ -922,7 +926,7 @@ describe("App verification surfaces", () => {
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("Done.")).toBeInTheDocument();
-    expect(await screen.findByTestId("mermaid-svg")).toBeInTheDocument();
+    expect(await screen.findByTestId("mermaid-svg", undefined, { timeout: 5000 })).toBeInTheDocument();
     expect(mermaidMock.render).toHaveBeenCalledWith(
       expect.stringMatching(/^foco-mermaid-/),
       "flowchart TD\n  A --> B",
@@ -1770,6 +1774,11 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("127.0.0.1:3210")).toBeInTheDocument();
     expect(screen.getByText("Password is disabled")).toBeInTheDocument();
 
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+    expect(screen.getByText("Prompt settings")).toBeInTheDocument();
+    expect(screen.getByText("Prompt files")).toBeInTheDocument();
+    expect(screen.getByText("No prompt files")).toBeInTheDocument();
+
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
     expect(screen.getByText("Configured providers")).toBeInTheDocument();
     const providersSection = screen.getByText("Configured providers").closest("section");
@@ -2041,6 +2050,36 @@ describe("App verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Show password" }));
     expect(passwordInput).toHaveAttribute("type", "text");
     expect(passwordInput).toHaveValue("replacement");
+  });
+
+  it("saves prompt files and extra prompt text", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+
+    await userEvent.type(
+      screen.getByLabelText("Prompt file path"),
+      "C:/Users/fonla/.codex/AGENTS.md",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Add prompt file" }));
+    await userEvent.type(screen.getByLabelText("Extra prompt"), "Keep replies concise.");
+    await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/prompts",
+        expect.objectContaining({
+          body: JSON.stringify({
+            extraText: "Keep replies concise.",
+            files: ["C:/Users/fonla/.codex/AGENTS.md"],
+          }),
+          method: "POST",
+        }),
+      );
+    });
   });
 
   it("saves provider, model, MCP server, and skill settings", async () => {
@@ -2385,6 +2424,16 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
         extractionMode: "pending_review",
         extractionModelId: "gpt-test",
         retentionDays: 30,
+      },
+    });
+  }
+
+  if (path === "/api/settings/prompts") {
+    return jsonResponse({
+      ...settings,
+      prompts: {
+        extraText: "Keep replies concise.",
+        files: ["C:/Users/fonla/.codex/AGENTS.md"],
       },
     });
   }

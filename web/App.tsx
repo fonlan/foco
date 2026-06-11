@@ -39,6 +39,7 @@ import {
   Settings,
   SlidersHorizontal,
   SquareTerminal,
+  ScrollText,
   SunMoon,
   Terminal,
   Trash2,
@@ -277,6 +278,11 @@ type MemorySettingsSummary = {
   extractionModes: MemoryExtractionModeSummary[];
 };
 
+type PromptSettingsSummary = {
+  files: string[];
+  extraText: string;
+};
+
 type ConfiguredWorkspaceSummary = {
   id: string;
   name: string;
@@ -296,6 +302,7 @@ type SettingsResponse = {
   general: GeneralSettingsSummary;
   nativeTools: NativeToolsSummary;
   memory: MemorySettingsSummary;
+  prompts: PromptSettingsSummary;
   workspaces: ConfiguredWorkspaceSummary[];
   terminalShells: TerminalShellSummary[];
   providerKinds: ProviderKindSummary[];
@@ -402,6 +409,12 @@ type GeneralFormState = {
   listenPort: string;
   password: string;
   theme: AppThemeId;
+};
+
+type PromptSettingsFormState = {
+  files: string[];
+  extraText: string;
+  pendingFile: string;
 };
 
 type AuthStatusResponse = {
@@ -921,6 +934,7 @@ type HookNotificationSummary = {
 
 type SettingsSection =
   | "general"
+  | "prompts"
   | "hooks"
   | "memory"
   | "mcp"
@@ -946,6 +960,7 @@ const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024;
 const SAVED_PASSWORD_MASK = "********";
 const SETTINGS_SECTION_IDS: SettingsSection[] = [
   "general",
+  "prompts",
   "workspaces",
   "hooks",
   "memory",
@@ -1285,11 +1300,13 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Inline diff is unavailable for binary or non-text files.":
       "二进制或非文本文件无法展示 inline diff。",
     General: "常规",
+    Prompts: "提示词",
     Providers: "供应商",
     Models: "模型",
     Skills: "技能",
     Memory: "记忆",
     "General settings": "常规设置",
+    "Prompt settings": "提示词设置",
     "Provider settings": "供应商设置",
     "Model settings": "模型设置",
     "MCP settings": "MCP 设置",
@@ -1333,6 +1350,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No extraction failures": "暂无抽取失败",
     "Memory extraction failed": "记忆抽取失败",
     "Web service listen address": "Web 服务监听地址",
+    "Prompt files and extra instructions": "提示词文件与额外指令",
     "Provider credentials and connection checks": "供应商凭据与连接检查",
     "Workspace-scoped MCP server runtimes": "工作区级 MCP 服务运行时",
     "Skill discovery and enablement": "技能发现与启用",
@@ -1369,6 +1387,16 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Save general settings": "保存常规设置",
     Save: "保存",
     "Reload general settings": "重新加载常规设置",
+    "Prompt files": "提示词文件",
+    "Prompt file path": "提示词文件路径",
+    "Add prompt file": "添加提示词文件",
+    "Choose prompt file": "选择提示词文件",
+    "Remove prompt file": "移除提示词文件",
+    "Remove prompt file {path}": "移除提示词文件 {path}",
+    "No prompt files": "暂无提示词文件",
+    "Extra prompt": "额外提示词",
+    "Save prompt settings": "保存提示词设置",
+    "Reload prompt settings": "重新加载提示词设置",
     "Reload settings": "重新加载设置",
     Reload: "重新加载",
     "Saved bind": "已保存绑定",
@@ -8886,6 +8914,8 @@ function SettingsPanel({
   const [generalForm, setGeneralForm] = useState<GeneralFormState>(() =>
     emptyGeneralForm(),
   );
+  const [promptSettingsForm, setPromptSettingsForm] =
+    useState<PromptSettingsFormState>(() => emptyPromptSettingsForm());
   const [memorySettingsForm, setMemorySettingsForm] =
     useState<MemorySettingsFormState>(() => emptyMemorySettingsForm());
   const [memoryFilter, setMemoryFilter] = useState<MemoryFilterState>(() =>
@@ -8940,6 +8970,8 @@ function SettingsPanel({
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isSavingGeneral, setIsSavingGeneral] = useState(false);
+  const [isSavingPromptSettings, setIsSavingPromptSettings] = useState(false);
+  const [isSelectingPromptFile, setIsSelectingPromptFile] = useState(false);
   const [isSavingMemorySettings, setIsSavingMemorySettings] = useState(false);
   const [isLoadingMemories, setIsLoadingMemories] = useState(false);
   const [isSavingMemory, setIsSavingMemory] = useState(false);
@@ -9115,6 +9147,14 @@ function SettingsPanel({
     });
   }
 
+  function syncPromptSettingsForm(data: SettingsResponse) {
+    setPromptSettingsForm({
+      extraText: data.prompts.extraText,
+      files: data.prompts.files,
+      pendingFile: "",
+    });
+  }
+
   function syncMemorySettingsForm(data: SettingsResponse) {
     setMemorySettingsForm({
       enabled: data.memory.enabled,
@@ -9159,6 +9199,7 @@ function SettingsPanel({
       setDraggedModelId(null);
       setModelOrderPreview(null);
       syncGeneralForm(data);
+      syncPromptSettingsForm(data);
       syncMemorySettingsForm(data);
       setProviderForm((current) => ({
         ...current,
@@ -9599,6 +9640,88 @@ function SettingsPanel({
       }));
     } finally {
       setIsSavingTheme(false);
+    }
+  }
+
+  async function savePromptSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSavingPromptSettings(true);
+    setError(null);
+
+    try {
+      const files = promptSettingsForm.files.map((file) => file.trim());
+      const data = await requestJson<SettingsResponse>("/api/settings/prompts", {
+        body: JSON.stringify({
+          extraText: promptSettingsForm.extraText,
+          files,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncPromptSettingsForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingPromptSettings(false);
+    }
+  }
+
+  function addPromptFilePath(path: string) {
+    const nextPath = path.trim();
+    if (!nextPath) {
+      return;
+    }
+
+    setPromptSettingsForm((current) => {
+      if (current.files.includes(nextPath)) {
+        return {
+          ...current,
+          pendingFile: "",
+        };
+      }
+
+      return {
+        ...current,
+        files: [...current.files, nextPath],
+        pendingFile: "",
+      };
+    });
+  }
+
+  function removePromptFilePath(path: string) {
+    setPromptSettingsForm((current) => ({
+      ...current,
+      files: current.files.filter((file) => file !== path),
+    }));
+  }
+
+  async function selectPromptFile() {
+    setIsSelectingPromptFile(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<{ files: NativeSelectedFile[] }>(
+        "/api/native/select-files",
+        { method: "POST" },
+      );
+      setPromptSettingsForm((current) => {
+        const files = [...current.files];
+        for (const file of data.files) {
+          if (!files.includes(file.path)) {
+            files.push(file.path);
+          }
+        }
+        return {
+          ...current,
+          files,
+        };
+      });
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSelectingPromptFile(false);
     }
   }
 
@@ -10722,6 +10845,12 @@ function SettingsPanel({
             onClick={() => onActiveSectionChange("general")}
           />
           <SettingsNavButton
+            active={activeSection === "prompts"}
+            icon={ScrollText}
+            label={t("Prompts")}
+            onClick={() => onActiveSectionChange("prompts")}
+          />
+          <SettingsNavButton
             active={activeSection === "workspaces"}
             icon={Folder}
             label={t("Workspaces")}
@@ -11061,6 +11190,146 @@ function SettingsPanel({
               </div>
             </div>
           </section>
+        </section>
+        ) : null}
+
+        {activeSection === "prompts" ? (
+        <section className="grid gap-4">
+          <form
+            className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+            onSubmit={(event) => void savePromptSettings(event)}
+          >
+            <div className="flex items-center gap-2">
+              <ScrollText aria-hidden="true" className="size-5 text-teal-700" />
+              <h3 className="text-sm font-semibold text-stone-950">
+                {t("Prompt files")}
+              </h3>
+            </div>
+            <div className="mt-4 grid gap-3">
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  {t("Prompt file path")}
+                </span>
+                <div className="flex gap-2">
+                  <input
+                    autoComplete="off"
+                    className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    name="prompt-file-path"
+                    onChange={(event) =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        pendingFile: event.target.value,
+                      }))
+                    }
+                    placeholder="C:/Users/name/.codex/AGENTS.md"
+                    value={promptSettingsForm.pendingFile}
+                  />
+                  <button
+                    aria-label={t("Add prompt file")}
+                    className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                    disabled={!promptSettingsForm.pendingFile.trim()}
+                    onClick={() => addPromptFilePath(promptSettingsForm.pendingFile)}
+                    title={t("Add prompt file")}
+                    type="button"
+                  >
+                    <Plus aria-hidden="true" className="size-4" />
+                  </button>
+                  <button
+                    aria-label={t("Choose prompt file")}
+                    className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                    disabled={isSelectingPromptFile}
+                    onClick={() => void selectPromptFile()}
+                    title={t("Choose prompt file")}
+                    type="button"
+                  >
+                    {isSelectingPromptFile ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <FolderSearch aria-hidden="true" className="size-4" />
+                    )}
+                  </button>
+                </div>
+              </label>
+              <div className="rounded-xl border border-stone-200 bg-stone-50/80">
+                {promptSettingsForm.files.length ? (
+                  <div className="divide-y divide-stone-200">
+                    {promptSettingsForm.files.map((file) => (
+                      <div
+                        className="flex min-w-0 items-center justify-between gap-3 px-3 py-2"
+                        key={file}
+                      >
+                        <div className="min-w-0 break-all text-sm font-semibold text-stone-800">
+                          {file}
+                        </div>
+                        <button
+                          aria-label={t("Remove prompt file {path}", { path: file })}
+                          className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                          onClick={() => removePromptFilePath(file)}
+                          title={t("Remove prompt file")}
+                          type="button"
+                        >
+                          <Trash2 aria-hidden="true" className="size-4" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="px-3 py-6 text-center text-sm font-medium text-stone-500">
+                    {t("No prompt files")}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <label className="mt-4 block">
+              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                {t("Extra prompt")}
+              </span>
+              <textarea
+                className="min-h-36 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                onChange={(event) =>
+                  setPromptSettingsForm((current) => ({
+                    ...current,
+                    extraText: event.target.value,
+                  }))
+                }
+                placeholder={t("Extra prompt")}
+                value={promptSettingsForm.extraText}
+              />
+            </label>
+
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                aria-label={t("Save prompt settings")}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                disabled={isSavingPromptSettings}
+                title={t("Save prompt settings")}
+                type="submit"
+              >
+                {isSavingPromptSettings ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 aria-hidden="true" className="size-4" />
+                )}
+                {t("Save")}
+              </button>
+              <button
+                aria-label={t("Reload prompt settings")}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                disabled={isLoadingSettings}
+                onClick={() => void loadSettings()}
+                title={t("Reload settings")}
+                type="button"
+              >
+                {isLoadingSettings ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <RefreshCw aria-hidden="true" className="size-4" />
+                )}
+                {t("Reload")}
+              </button>
+            </div>
+          </form>
         </section>
         ) : null}
 
@@ -14245,6 +14514,10 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
     return t("Workspace settings");
   }
 
+  if (section === "prompts") {
+    return t("Prompt settings");
+  }
+
   if (section === "hooks") {
     return t("Hook settings");
   }
@@ -14275,6 +14548,10 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
 
   if (section === "workspaces") {
     return t("Workspace order and terminal shell");
+  }
+
+  if (section === "prompts") {
+    return t("Prompt files and extra instructions");
   }
 
   if (section === "hooks") {
@@ -14500,6 +14777,14 @@ function emptyGeneralForm(): GeneralFormState {
     listenPort: "3210",
     password: "",
     theme: "light",
+  };
+}
+
+function emptyPromptSettingsForm(): PromptSettingsFormState {
+  return {
+    extraText: "",
+    files: [],
+    pendingFile: "",
   };
 }
 
