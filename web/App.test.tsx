@@ -17,6 +17,9 @@ vi.mock("mermaid", () => ({
 
 import { App } from "./App";
 
+const defaultComposerPlaceholder = "Ask Foco anything about Default...";
+const sideProjectComposerPlaceholder = "Ask Foco anything about Side project...";
+
 const workspace = {
   chats: [
     {
@@ -848,6 +851,9 @@ describe("App verification surfaces", () => {
 
     expect(await screen.findAllByText("Default")).not.toHaveLength(0);
     expect(screen.getAllByText("Tool run").length).toBeGreaterThan(0);
+    expect(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+    ).toBeInTheDocument();
 
     await userEvent.click(screen.getByText("Tool run"));
 
@@ -944,6 +950,13 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("First token latency: 0.25 s")).toBeInTheDocument();
     await userEvent.click(screen.getByText("Memories used"));
     expect(screen.getByText("Use memory graph retrieval.")).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "New chat in Side project" }),
+    );
+    expect(
+      await screen.findByPlaceholderText(sideProjectComposerPlaceholder),
+    ).toBeInTheDocument();
   });
 
   it("opens a settings section from the URL and writes section changes back to the URL", async () => {
@@ -1139,7 +1152,7 @@ describe("App verification surfaces", () => {
     const user = userEvent.setup();
     render(<App />);
 
-    const composer = await screen.findByPlaceholderText("Ask Foco anything...");
+    const composer = await screen.findByPlaceholderText(defaultComposerPlaceholder);
     await user.click(composer);
     await user.keyboard("Line one{Shift>}{Enter}{/Shift}Line two");
 
@@ -1158,7 +1171,7 @@ describe("App verification surfaces", () => {
     render(<App />);
 
     await userEvent.click(await screen.findByText("Tool run"));
-    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "continue");
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
 
     const usage = await screen.findByRole("status", {
       name: "Context usage 47%",
@@ -1191,7 +1204,7 @@ describe("App verification surfaces", () => {
 
     await userEvent.click(screen.getByLabelText("Provider"));
     await userEvent.click(screen.getByRole("button", { name: "Provider: Anthropic" }));
-    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "Review it");
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "Review it");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => {
@@ -1236,7 +1249,7 @@ describe("App verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
-    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "diagram");
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "diagram");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await act(async () => {
@@ -1273,7 +1286,7 @@ describe("App verification surfaces", () => {
   it("appends stream errors after already rendered assistant text", async () => {
     render(<App />);
 
-    await userEvent.type(await screen.findByPlaceholderText("Ask Foco anything..."), "debug");
+    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "debug");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await act(async () => {
@@ -1301,7 +1314,7 @@ describe("App verification surfaces", () => {
   it("shows hook blocking notifications in the active chat", async () => {
     render(<App />);
 
-    await userEvent.type(await screen.findByPlaceholderText("Ask Foco anything..."), "danger");
+    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "danger");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await act(async () => {
@@ -1354,7 +1367,7 @@ describe("App verification surfaces", () => {
     );
     expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
 
-    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "Fresh task");
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "Fresh task");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => {
@@ -1503,7 +1516,7 @@ describe("App verification surfaces", () => {
     await screen.findByText("Please inspect README.");
     expect(statusDot()).toHaveClass("session-status-dot-open");
 
-    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "continue");
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() =>
@@ -1542,7 +1555,7 @@ describe("App verification surfaces", () => {
 
     await userEvent.click(historyButton);
     await screen.findByText("Please inspect README.");
-    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "continue");
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() =>
@@ -1677,7 +1690,7 @@ describe("App verification surfaces", () => {
       within(tabList).getByRole("button", { name: "Close chat tab Tool run" }),
     ).toBeInTheDocument();
 
-    await userEvent.type(screen.getByPlaceholderText("Ask Foco anything..."), "continue");
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     expect(
@@ -2242,7 +2255,7 @@ describe("App verification surfaces", () => {
   it("keeps task graph and git diff in separate context tabs", async () => {
     render(<App />);
 
-    await userEvent.type(await screen.findByPlaceholderText("Ask Foco anything..."), "plan");
+    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "plan");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(activeChatStreamController).not.toBeNull());
 
@@ -2292,7 +2305,7 @@ describe("App verification surfaces", () => {
   it("opens the task graph sidebar when a task graph refresh arrives", async () => {
     render(<App />);
 
-    await userEvent.type(await screen.findByPlaceholderText("Ask Foco anything..."), "plan");
+    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "plan");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(activeChatStreamController).not.toBeNull());
 

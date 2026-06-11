@@ -1172,6 +1172,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Remove skill": "移除技能",
     "Remove skill {name}": "移除技能 {name}",
     "Message Foco": "给 Foco 发送消息",
+    "Ask Foco anything about {name}...": "询问 Foco 关于 {name} 的任何问题...",
     "Copy message": "复制消息",
     "Copied message": "已复制消息",
     "Select skill {name}": "选择技能 {name}",
@@ -3965,6 +3966,7 @@ export function App() {
                 </div>
               </header>
           <ChatPanel
+              activeWorkspaceName={activeWorkspace?.name ?? null}
               availableModels={availableModels}
               branchError={branchError}
               chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
@@ -5165,6 +5167,7 @@ function NavRailButton({
 }
 
 function ChatPanel({
+  activeWorkspaceName,
   availableModels,
   branchError,
   chatScrollKey,
@@ -5203,6 +5206,7 @@ function ChatPanel({
   thinkingLevels,
   workspaces,
 }: {
+  activeWorkspaceName: string | null;
   availableModels: ConfiguredModelSummary[];
   branchError: string | null;
   chatScrollKey: string;
@@ -5254,6 +5258,10 @@ function ChatPanel({
   const selectedSkills = selectedSkillIds
     .map((skillId) => skills.find((skill) => skill.key === skillId))
     .filter((skill): skill is ConfiguredSkillSummary => Boolean(skill));
+  const workspaceName = activeWorkspaceName?.trim();
+  const composerPlaceholder = workspaceName
+    ? t("Ask Foco anything about {name}...", { name: workspaceName })
+    : t("Ask Foco anything...");
   const modelOptions = availableModels.map((model) => ({
     label: model.displayName,
     value: model.id,
@@ -5599,7 +5607,7 @@ function ChatPanel({
                 event.currentTarget.form?.requestSubmit();
               }}
               onPaste={handlePaste}
-              placeholder={t("Ask Foco anything...")}
+              placeholder={composerPlaceholder}
               ref={messageTextareaRef}
               value={draftMessage}
             />
