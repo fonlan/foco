@@ -556,6 +556,170 @@ summary:focus-visible {
   opacity: 0.68;
 }
 
+.audit-json-block {
+  overflow: hidden;
+  border: 1px solid var(--foco-json-border);
+  border-radius: 0.75rem;
+  background: var(--foco-json-surface);
+  color: var(--foco-json-text);
+}
+
+.audit-json-header {
+  display: flex;
+  min-height: 2.75rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-bottom: 1px solid var(--foco-json-border);
+  background: var(--foco-json-header);
+  padding: 0.5rem 0.75rem;
+}
+
+.audit-json-title {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.375rem;
+  color: var(--foco-text);
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+.audit-json-title svg {
+  flex: 0 0 auto;
+  color: var(--foco-text-faint);
+}
+
+.audit-json-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.audit-json-icon-button,
+.audit-json-copy-button {
+  display: inline-flex;
+  height: 2rem;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.375rem;
+  border: 1px solid var(--foco-json-border);
+  border-radius: 0.5rem;
+  background: var(--foco-json-surface);
+  padding: 0 0.5rem;
+  color: var(--foco-text-muted);
+  font-size: 0.75rem;
+  font-weight: 700;
+  box-shadow: var(--foco-shadow-subtle);
+}
+
+.audit-json-icon-button {
+  width: 2rem;
+  justify-content: center;
+  padding: 0;
+}
+
+.audit-json-icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+  box-shadow: none;
+}
+
+.audit-json-icon-button:hover:not(:disabled),
+.audit-json-copy-button:hover {
+  border-color: var(--foco-border-active);
+  background: var(--foco-accent-soft);
+  color: var(--foco-accent-strong);
+}
+
+.audit-json-code {
+  max-height: 32rem;
+  overflow: auto;
+  margin: 0;
+  background: var(--foco-json-surface);
+  padding: 0.875rem;
+  color: var(--foco-json-text);
+  font-family:
+    "Cascadia Mono", "Fira Code", Consolas, ui-monospace, monospace;
+  font-size: 0.75rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.audit-json-code code {
+  display: block;
+}
+
+.audit-json-line {
+  display: block;
+  min-height: 1.35rem;
+  padding-left: calc(var(--audit-json-depth) * 1rem);
+}
+
+.audit-json-node-toggle,
+.audit-json-node-toggle-spacer {
+  display: inline-flex;
+  width: 1.1rem;
+  height: 1.1rem;
+  align-items: center;
+  justify-content: center;
+  margin-right: 0.25rem;
+  vertical-align: -0.15rem;
+}
+
+.audit-json-node-toggle {
+  border: 0;
+  border-radius: 0.35rem;
+  background: transparent;
+  padding: 0;
+  color: var(--foco-text-faint);
+  box-shadow: none;
+}
+
+.audit-json-node-toggle:hover {
+  background: var(--foco-accent-soft);
+  color: var(--foco-accent-strong);
+}
+
+.audit-json-node-toggle-icon {
+  width: 0.8rem;
+  height: 0.8rem;
+  transition: transform 140ms ease;
+}
+
+.audit-json-node-toggle-icon-open {
+  transform: rotate(90deg);
+}
+
+.audit-json-collapsed-marker {
+  margin: 0 0.25rem;
+  color: var(--foco-text-faint);
+  font-style: italic;
+}
+
+.audit-json-token-key {
+  color: var(--foco-json-key);
+}
+
+.audit-json-token-string {
+  color: var(--foco-json-string);
+}
+
+.audit-json-token-number {
+  color: var(--foco-json-number);
+}
+
+.audit-json-token-literal {
+  color: var(--foco-json-literal);
+  font-weight: 700;
+}
+
+.audit-json-token-punctuation {
+  color: var(--foco-json-punctuation);
+}
+
 @media (max-width: 1199px) {
   .app-shell {
     grid-template-areas:
@@ -850,6 +1014,15 @@ summary:focus-visible {
     rgba(238, 243, 246, 0.62)
   );
   --foco-settings-card-surface: rgba(255, 255, 255, 0.88);
+  --foco-json-surface: #ffffff;
+  --foco-json-header: #f5f8fa;
+  --foco-json-border: #d2dde4;
+  --foco-json-text: #172033;
+  --foco-json-key: #0d5b52;
+  --foco-json-string: #8a4b05;
+  --foco-json-number: #1d4ed8;
+  --foco-json-literal: #be123c;
+  --foco-json-punctuation: #526273;
 }
 
 html[data-foco-theme="dark"] {
@@ -928,6 +1101,15 @@ html[data-foco-theme="dark"] {
     rgba(13, 18, 21, 0.84)
   );
   --foco-settings-card-surface: rgba(21, 28, 31, 0.9);
+  --foco-json-surface: #11181c;
+  --foco-json-header: #151f23;
+  --foco-json-border: #2a373c;
+  --foco-json-text: #e8eeee;
+  --foco-json-key: #94e5db;
+  --foco-json-string: #f5c06b;
+  --foco-json-number: #93c5fd;
+  --foco-json-literal: #fb7185;
+  --foco-json-punctuation: #a9b6bb;
 }
 
 body,

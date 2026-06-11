@@ -2674,6 +2674,29 @@ describe("App verification surfaces", () => {
     const dialog = await screen.findByRole("dialog", { name: "Request details" });
     expect(within(dialog).getByText("Request body")).toBeInTheDocument();
     expect(within(dialog).getByText("Response body")).toBeInTheDocument();
+    const requestBodyBlock = within(dialog)
+      .getByText("Request body")
+      .closest(".audit-json-block");
+    expect(requestBodyBlock).not.toBeNull();
+    const requestBodyViewer = requestBodyBlock as HTMLElement;
+    expect(requestBodyViewer).toHaveClass("audit-json-block");
+    expect(within(requestBodyViewer).getByText('"messages"')).toHaveClass(
+      "audit-json-token-key",
+    );
+    await userEvent.click(
+      within(requestBodyViewer).getByRole("button", {
+        name: "Collapse all Request body",
+      }),
+    );
+    expect(within(requestBodyViewer).queryByText('"messages"')).not.toBeInTheDocument();
+    await userEvent.click(
+      within(requestBodyViewer).getByRole("button", {
+        name: "Expand all Request body",
+      }),
+    );
+    expect(within(requestBodyViewer).getByText('"messages"')).toHaveClass(
+      "audit-json-token-key",
+    );
     expect(within(dialog).queryByText("Stream events")).not.toBeInTheDocument();
   });
 

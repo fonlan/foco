@@ -1334,6 +1334,12 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Copy: "复制",
     Copied: "已复制",
     "Copy {label}": "复制 {label}",
+    "Collapse all": "全部收起",
+    "Expand all": "全部展开",
+    "Collapse all {label}": "收起全部 {label}",
+    "Expand all {label}": "展开全部 {label}",
+    "Collapse JSON node": "收起 JSON 节点",
+    "Expand JSON node": "展开 JSON 节点",
     "Resize git diff panel": "调整 Git diff 面板宽度",
     "Resize todo graph and git diff panels": "调整待办事项和 Git diff 面板高度",
     "Resize terminal panel": "调整终端面板高度",
@@ -8617,25 +8623,93 @@ function AuditJsonBlock({
   value: JsonValue | null;
 }) {
   const { t } = useI18n();
+  const jsonText = auditJsonText(value);
+  const jsonValue = useMemo(
+    () => (value === null ? null : normalizedJsonValue(value)),
+    [value],
+  );
+  const collapsiblePaths = useMemo(
+    () => collectJsonContainerPaths(jsonValue, "root"),
+    [jsonValue],
+  );
+  const [collapsedPaths, setCollapsedPaths] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    setCollapsedPaths(new Set());
+  }, [jsonText]);
+
+  const collapseAll = useCallback(() => {
+    setCollapsedPaths(new Set(collapsiblePaths));
+  }, [collapsiblePaths]);
+
+  const expandAll = useCallback(() => {
+    setCollapsedPaths(new Set());
+  }, []);
+
+  const togglePath = useCallback((path: string) => {
+    setCollapsedPaths((current) => {
+      const next = new Set(current);
+      if (next.has(path)) {
+        next.delete(path);
+      } else {
+        next.add(path);
+      }
+      return next;
+    });
+  }, []);
 
   return (
-    <section className="min-w-0 rounded-xl border border-stone-200 bg-white">
-      <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-3 py-2">
-        <h3 className="text-sm font-semibold text-stone-950">{label}</h3>
-        <button
-          aria-label={t("Copy {label}", { label })}
-          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-          onClick={onCopy}
-          title={t("Copy {label}", { label })}
-          type="button"
-        >
-          <Copy aria-hidden="true" className="size-3.5" />
-          {copied ? t("Copied") : t("Copy")}
-        </button>
+    <section className="audit-json-block min-w-0">
+      <div className="audit-json-header">
+        <span className="audit-json-title">
+          <Code2 aria-hidden="true" className="size-4" />
+          <span>{label}</span>
+        </span>
+        <div className="audit-json-actions">
+          <button
+            aria-label={t("Collapse all {label}", { label })}
+            className="audit-json-icon-button"
+            disabled={collapsiblePaths.length === 0}
+            onClick={collapseAll}
+            title={t("Collapse all")}
+            type="button"
+          >
+            <ArrowUp aria-hidden="true" className="size-3.5" />
+          </button>
+          <button
+            aria-label={t("Expand all {label}", { label })}
+            className="audit-json-icon-button"
+            disabled={collapsedPaths.size === 0}
+            onClick={expandAll}
+            title={t("Expand all")}
+            type="button"
+          >
+            <ArrowDown aria-hidden="true" className="size-3.5" />
+          </button>
+          <button
+            aria-label={t("Copy {label}", { label })}
+            className="audit-json-copy-button"
+            onClick={onCopy}
+            title={t("Copy {label}", { label })}
+            type="button"
+          >
+            <Copy aria-hidden="true" className="size-3.5" />
+            {copied ? t("Copied") : t("Copy")}
+          </button>
+        </div>
       </div>
-      <pre className="max-h-[32rem] overflow-auto whitespace-pre-wrap break-words bg-white px-3 py-3 text-xs leading-5 text-stone-950">
-        {auditJsonText(value)}
-      </pre>
+      <div className="audit-json-code panel-scroll">
+        <code>
+          <JsonTreeNode
+            collapsedPaths={collapsedPaths}
+            depth={0}
+            isLast
+            onToggle={togglePath}
+            path="root"
+            value={jsonValue}
+          />
+        </code>
+      </div>
     </section>
   );
 }
@@ -17598,6 +17672,267 @@ function taskStatusClass(status: TaskStatus) {
 
 function auditJsonText(value: JsonValue | null) {
   return value === null ? "null" : formatJsonValue(value);
+}
+
+function JsonTreeNode({
+  collapsedPaths,
+  depth,
+  isLast,
+  name,
+  onToggle,
+  path,
+  value,
+}: {
+  collapsedPaths: Set<string>;
+  depth: number;
+  isLast: boolean;
+  name?: string;
+  onToggle: (path: string) => void;
+  path: string;
+  value: JsonValue | null;
+}) {
+  if (Array.isArray(value)) {
+    return (
+      <JsonContainerNode
+        collapsedPaths={collapsedPaths}
+        closeToken="]"
+        depth={depth}
+        entries={value.map((item, index) => [String(index), item] as [
+          string,
+          JsonValue,
+        ])}
+        isLast={isLast}
+        name={name}
+        onToggle={onToggle}
+        openToken="["
+        path={path}
+        valueKind="array"
+      />
+    );
+  }
+
+  if (isObjectRecord(value)) {
+    return (
+      <JsonContainerNode
+        collapsedPaths={collapsedPaths}
+        closeToken="}"
+        depth={depth}
+        entries={Object.entries(value) as [string, JsonValue][]}
+        isLast={isLast}
+        name={name}
+        onToggle={onToggle}
+        openToken="{"
+        path={path}
+        valueKind="object"
+      />
+    );
+  }
+
+  return (
+    <JsonLine depth={depth}>
+      <JsonKey name={name} />
+      <JsonPrimitive value={value} />
+      {isLast ? null : <JsonPunctuation>,</JsonPunctuation>}
+    </JsonLine>
+  );
+}
+
+function JsonContainerNode({
+  closeToken,
+  collapsedPaths,
+  depth,
+  entries,
+  isLast,
+  name,
+  onToggle,
+  openToken,
+  path,
+  valueKind,
+}: {
+  closeToken: "]" | "}";
+  collapsedPaths: Set<string>;
+  depth: number;
+  entries: [string, JsonValue][];
+  isLast: boolean;
+  name?: string;
+  onToggle: (path: string) => void;
+  openToken: "[" | "{";
+  path: string;
+  valueKind: "array" | "object";
+}) {
+  const { t } = useI18n();
+  const isCollapsible = entries.length > 0;
+  const isCollapsed = collapsedPaths.has(path);
+
+  if (!isCollapsible) {
+    return (
+      <JsonLine depth={depth}>
+        <JsonTogglePlaceholder />
+        <JsonKey name={name} />
+        <JsonPunctuation>{openToken}</JsonPunctuation>
+        <JsonPunctuation>{closeToken}</JsonPunctuation>
+        {isLast ? null : <JsonPunctuation>,</JsonPunctuation>}
+      </JsonLine>
+    );
+  }
+
+  return (
+    <>
+      <JsonLine depth={depth}>
+        <button
+          aria-label={
+            isCollapsed ? t("Expand JSON node") : t("Collapse JSON node")
+          }
+          className="audit-json-node-toggle"
+          onClick={() => onToggle(path)}
+          type="button"
+        >
+          <ChevronRight
+            aria-hidden="true"
+            className={
+              isCollapsed
+                ? "audit-json-node-toggle-icon"
+                : "audit-json-node-toggle-icon audit-json-node-toggle-icon-open"
+            }
+          />
+        </button>
+        <JsonKey name={name} />
+        <JsonPunctuation>{openToken}</JsonPunctuation>
+        {isCollapsed ? (
+          <>
+            <span className="audit-json-collapsed-marker">
+              {jsonContainerSummary(valueKind, entries.length)}
+            </span>
+            <JsonPunctuation>{closeToken}</JsonPunctuation>
+            {isLast ? null : <JsonPunctuation>,</JsonPunctuation>}
+          </>
+        ) : null}
+      </JsonLine>
+      {isCollapsed
+        ? null
+        : entries.map(([entryName, entryValue], index) => (
+            <JsonTreeNode
+              collapsedPaths={collapsedPaths}
+              depth={depth + 1}
+              isLast={index === entries.length - 1}
+              key={jsonChildPath(path, entryName)}
+              name={valueKind === "object" ? entryName : undefined}
+              onToggle={onToggle}
+              path={jsonChildPath(path, entryName)}
+              value={entryValue}
+            />
+          ))}
+      {isCollapsed ? null : (
+        <JsonLine depth={depth}>
+          <JsonTogglePlaceholder />
+          <JsonPunctuation>{closeToken}</JsonPunctuation>
+          {isLast ? null : <JsonPunctuation>,</JsonPunctuation>}
+        </JsonLine>
+      )}
+    </>
+  );
+}
+
+function JsonLine({
+  children,
+  depth,
+}: {
+  children: ReactNode;
+  depth: number;
+}) {
+  return (
+    <span
+      className="audit-json-line"
+      style={{ "--audit-json-depth": depth } as CSSProperties}
+    >
+      {children}
+    </span>
+  );
+}
+
+function JsonKey({ name }: { name?: string }) {
+  if (typeof name === "undefined") {
+    return null;
+  }
+
+  return (
+    <>
+      <span className="audit-json-token audit-json-token-key">
+        {JSON.stringify(name)}
+      </span>
+      <JsonPunctuation>: </JsonPunctuation>
+    </>
+  );
+}
+
+function JsonPrimitive({ value }: { value: JsonValue | null }) {
+  if (typeof value === "string") {
+    return (
+      <span className="audit-json-token audit-json-token-string">
+        {JSON.stringify(value)}
+      </span>
+    );
+  }
+
+  if (typeof value === "number") {
+    return (
+      <span className="audit-json-token audit-json-token-number">
+        {String(value)}
+      </span>
+    );
+  }
+
+  return (
+    <span className="audit-json-token audit-json-token-literal">
+      {value === null ? "null" : String(value)}
+    </span>
+  );
+}
+
+function JsonPunctuation({ children }: { children: ReactNode }) {
+  return (
+    <span className="audit-json-token audit-json-token-punctuation">
+      {children}
+    </span>
+  );
+}
+
+function JsonTogglePlaceholder() {
+  return <span aria-hidden="true" className="audit-json-node-toggle-spacer" />;
+}
+
+function collectJsonContainerPaths(value: JsonValue | null, path: string) {
+  const paths: string[] = [];
+
+  if (Array.isArray(value)) {
+    if (value.length > 0) {
+      paths.push(path);
+    }
+    value.forEach((item, index) => {
+      paths.push(...collectJsonContainerPaths(item, jsonChildPath(path, index)));
+    });
+    return paths;
+  }
+
+  if (isObjectRecord(value)) {
+    const entries = Object.entries(value) as [string, JsonValue][];
+    if (entries.length > 0) {
+      paths.push(path);
+    }
+    entries.forEach(([key, item]) => {
+      paths.push(...collectJsonContainerPaths(item, jsonChildPath(path, key)));
+    });
+  }
+
+  return paths;
+}
+
+function jsonChildPath(path: string, segment: string | number) {
+  return `${path}/${encodeURIComponent(String(segment))}`;
+}
+
+function jsonContainerSummary(kind: "array" | "object", count: number) {
+  return kind === "array" ? `... ${count} items ` : `... ${count} keys `;
 }
 
 function formatAuditDate(value: string, language: AppLanguageId = "en") {
