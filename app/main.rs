@@ -156,10 +156,23 @@ const MEMORY_RETRIEVAL_TIMEOUT_MS: u64 = 30_000;
 const MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 2048;
 // Maximum output tokens allowed for the memory retrieval model request.
 const MEMORY_RETRIEVAL_MAX_OUTPUT_TOKENS: u32 = 1024;
+// Maximum active or pending facts included for extraction-time duplicate checks.
+const MEMORY_EXTRACTION_EXISTING_FACT_LIMIT: u32 = 80;
 // Maximum active memory facts sent to the model-based memory retrieval request.
 const MEMORY_RETRIEVAL_LLM_FACT_LIMIT: u32 = 200;
 // System prompt for the memory extraction request that forces evidence-backed tool output only.
-const MEMORY_EXTRACTION_SYSTEM_PROMPT: &str = "Extract only durable, user-reviewable memory facts from the provided completed chat turn evidence. Use the submit_memory_extraction tool exactly once. Do not return prose. Include a fact only when it is directly supported by one or more provided evidenceIds. If there is nothing worth remembering, submit {\"facts\":[]}. Suggested scopes mean: global for user-wide stable preferences, workspace for project-specific durable facts, chat for session-specific details.";
+const MEMORY_EXTRACTION_SYSTEM_PROMPT: &str = "\
+Extract only durable, user-reviewable memory facts from the provided completed chat turn evidence. \
+Use the submit_memory_extraction tool exactly once. Do not return prose. \
+Apply a high bar: save only facts that are important for future turns and unlikely to change often. \
+Do not save transient progress, timestamps, temporary plans, routine chat summaries, obvious tool actions, or facts that are likely to be invalid soon. \
+Compare against Existing memory candidates JSON. Do not extract a fact that duplicates or near-duplicates an existing active or pending memory, even if the wording differs. \
+If the evidence materially changes an existing memory, extract only the updated fact and add an updates or extends relationCandidate pointing at the existing targetFactId or targetFact. \
+If the evidence merely repeats or adds another source for the same memory, submit {\"facts\":[]}. \
+Avoid extracting multiple facts in the same output that restate each other at different specificity levels. \
+Include a fact only when it is directly supported by one or more provided evidenceIds. \
+If there is nothing worth remembering, submit {\"facts\":[]}. \
+Suggested scopes mean: global for user-wide stable preferences, workspace for project-specific durable facts, chat for session-specific details.";
 // System prompt for model-based memory retrieval.
 const MEMORY_RETRIEVAL_SYSTEM_PROMPT: &str = "Select only Foco memory facts that are directly relevant to the user's current request. Use the select_relevant_memory tool exactly once. Do not return prose. Return factKeys in the order they should be injected. Include pinned facts only when relevant.";
 // Maximum number of attachments allowed on one chat or context-usage request.
@@ -7922,6 +7935,16 @@ async fn run_memory_extraction_job_inner(task: &MemoryExtractionTask) -> Result<
         &task.user_message_id,
         &task.assistant_message_id,
     )?;
+    let workspace_memory =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&task.workspace_path))
+            .map_err(ApiError::from_memory_error)?;
+    let global_memory = MemoryDatabase::open_or_create_global_at(&task.global_memory_database_file)
+        .map_err(ApiError::from_memory_error)?;
+    let existing_memory_candidates = memory_extraction_existing_memory_candidates(
+        &global_memory,
+        &workspace_memory,
+        &task.chat_id,
+    )?;
     let (provider_id, provider_config, max_output_tokens) =
         extraction_provider_for_model(&task.config, &task.model_id)?;
     let request = memory_extraction_provider_request(
@@ -7932,6 +7955,7 @@ async fn run_memory_extraction_job_inner(task: &MemoryExtractionTask) -> Result<
         &provider_id,
         max_output_tokens,
         &evidence_candidates,
+        &existing_memory_candidates,
     )?;
     let tool_arguments = call_memory_extraction_provider(
         &task.workspace_path,
@@ -8048,6 +8072,45 @@ fn memory_extraction_evidence_candidates(
     Ok(evidence)
 }
 
+fn memory_extraction_existing_memory_candidates(
+    global_memory: &MemoryDatabase,
+    workspace_memory: &MemoryDatabase,
+    chat_id: &str,
+) -> Result<Vec<MemoryFactRecord>, ApiError> {
+    let mut candidates = Vec::new();
+    for status in [MemoryStatus::Active, MemoryStatus::Pending] {
+        candidates.extend(
+            workspace_memory
+                .list_facts_for_scope(
+                    Some(chat_id),
+                    status,
+                    None,
+                    None,
+                    MEMORY_EXTRACTION_EXISTING_FACT_LIMIT,
+                )
+                .map_err(ApiError::from_memory_error)?,
+        );
+        candidates.extend(
+            global_memory
+                .list_facts_for_scope(
+                    None,
+                    status,
+                    None,
+                    None,
+                    MEMORY_EXTRACTION_EXISTING_FACT_LIMIT,
+                )
+                .map_err(ApiError::from_memory_error)?,
+        );
+    }
+
+    candidates.sort_by(memory_fact_prompt_order);
+    let mut seen = HashSet::new();
+    candidates.retain(|fact| seen.insert(memory_fact_key(fact)));
+    candidates.truncate(MEMORY_EXTRACTION_EXISTING_FACT_LIMIT as usize);
+
+    Ok(candidates)
+}
+
 fn extraction_provider_for_model(
     config: &GlobalConfig,
     model_id: &str,
@@ -8126,7 +8189,30 @@ fn memory_extraction_provider_request(
     provider_id: &str,
     max_output_tokens: u32,
     evidence: &[MemoryExtractionEvidenceCandidate],
+    existing_memory_candidates: &[MemoryFactRecord],
 ) -> Result<NeutralChatRequest, ApiError> {
+    let existing_memories_json = serde_json::to_string_pretty(
+        &existing_memory_candidates
+            .iter()
+            .map(|fact| {
+                json!({
+                    "factKey": memory_fact_key(fact),
+                    "scope": &fact.scope,
+                    "chatId": &fact.chat_id,
+                    "status": &fact.status,
+                    "kind": &fact.kind,
+                    "pinned": fact.pinned,
+                    "updatedAt": &fact.updated_at,
+                    "fact": &fact.fact,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize extraction memory candidates: {source}"
+        ))
+    })?;
     let evidence_json = serde_json::to_string_pretty(
         &evidence
             .iter()
@@ -8156,7 +8242,7 @@ fn memory_extraction_provider_request(
             neutral_text_message(
                 NeutralChatRole::User,
                 format!(
-                    "workspaceId: {workspace_id}\nchatId: {chat_id}\nrunId: {run_id}\nproviderId: {provider_id}\n\nEvidence JSON:\n{evidence_json}"
+                    "workspaceId: {workspace_id}\nchatId: {chat_id}\nrunId: {run_id}\nproviderId: {provider_id}\n\nExisting memory candidates JSON:\n{existing_memories_json}\n\nEvidence JSON:\n{evidence_json}"
                 ),
             ),
         ],
@@ -17066,6 +17152,137 @@ description: Project memory.
     }
 
     #[test]
+    fn memory_extraction_request_includes_existing_candidates_and_strict_prompt_rules() {
+        let evidence = vec![MemoryExtractionEvidenceCandidate {
+            evidence_id: "user_message".to_string(),
+            source_type: MemorySourceType::ChatMessage,
+            source_id: "user-1".to_string(),
+            title: "User message".to_string(),
+            content: "Remember that I prefer concise replies.".to_string(),
+            metadata: json!({"role":"user"}),
+        }];
+        let existing = vec![MemoryFactRecord {
+            id: "fact-1".to_string(),
+            scope: "workspace".to_string(),
+            chat_id: None,
+            status: "active".to_string(),
+            kind: "preference".to_string(),
+            fact: "Prefer concise replies.".to_string(),
+            confidence: Some(0.9),
+            pinned: false,
+            is_latest: true,
+            expires_at: None,
+            metadata_json: "{}".to_string(),
+            created_at: "2026-06-11T00:00:00Z".to_string(),
+            updated_at: "2026-06-11T00:00:00Z".to_string(),
+        }];
+
+        let request = memory_extraction_provider_request(
+            "model-1",
+            "workspace-1",
+            "chat-1",
+            "run-1",
+            "provider-1",
+            512,
+            &evidence,
+            &existing,
+        )
+        .expect("memory extraction request");
+
+        assert_eq!(request.messages[0].role, NeutralChatRole::System);
+        assert!(
+            request.messages[0]
+                .content
+                .contains("unlikely to change often")
+        );
+        assert!(
+            request.messages[0]
+                .content
+                .contains("duplicates or near-duplicates")
+        );
+        assert_eq!(request.messages[1].role, NeutralChatRole::User);
+        assert!(
+            request.messages[1]
+                .content
+                .contains("Existing memory candidates JSON")
+        );
+        assert!(request.messages[1].content.contains("workspace:fact-1"));
+        assert!(
+            request.messages[1]
+                .content
+                .contains("Prefer concise replies.")
+        );
+        assert!(request.messages[1].content.contains("Evidence JSON"));
+    }
+
+    #[test]
+    fn memory_extraction_existing_candidates_include_active_and_pending_memories() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-extract-candidates-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Memory candidates")
+                .expect("chat insert");
+        }
+        let mut workspace_memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        let mut global_memory =
+            MemoryDatabase::open_or_create_global_at(workspace_dir.join("global-memory.sqlite"))
+                .expect("global memory database");
+
+        insert_test_memory_fact(
+            &mut workspace_memory,
+            "workspace-active-source",
+            "workspace-active",
+            MemoryScope::Workspace,
+            None,
+            "Workspace active memory.",
+            false,
+        );
+        insert_test_memory_fact_with_status(
+            &mut workspace_memory,
+            "chat-pending-source",
+            "chat-pending",
+            MemoryScope::Chat,
+            Some("chat-1"),
+            MemoryStatus::Pending,
+            "Chat pending memory.",
+            false,
+        );
+        insert_test_memory_fact(
+            &mut global_memory,
+            "global-active-source",
+            "global-active",
+            MemoryScope::Global,
+            None,
+            "Global active memory.",
+            false,
+        );
+
+        let candidates = memory_extraction_existing_memory_candidates(
+            &global_memory,
+            &workspace_memory,
+            "chat-1",
+        )
+        .expect("existing memory candidates");
+        let facts = candidates
+            .iter()
+            .map(|fact| fact.fact.as_str())
+            .collect::<HashSet<_>>();
+
+        assert!(facts.contains("Workspace active memory."));
+        assert!(facts.contains("Chat pending memory."));
+        assert!(facts.contains("Global active memory."));
+
+        drop(global_memory);
+        drop(workspace_memory);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
     fn memory_extraction_validates_required_fact_fields() {
         let output = parse_memory_extraction_output(json!({
             "facts": [{
@@ -18893,6 +19110,28 @@ description: Project memory.
         fact: &str,
         pinned: bool,
     ) {
+        insert_test_memory_fact_with_status(
+            database,
+            source_id,
+            fact_id,
+            scope,
+            chat_id,
+            MemoryStatus::Active,
+            fact,
+            pinned,
+        );
+    }
+
+    fn insert_test_memory_fact_with_status(
+        database: &mut MemoryDatabase,
+        source_id: &str,
+        fact_id: &str,
+        scope: MemoryScope,
+        chat_id: Option<&str>,
+        status: MemoryStatus,
+        fact: &str,
+        pinned: bool,
+    ) {
         database
             .insert_source(NewMemorySource {
                 id: source_id,
@@ -18910,7 +19149,7 @@ description: Project memory.
                 id: fact_id,
                 scope,
                 chat_id,
-                status: MemoryStatus::Active,
+                status,
                 kind: MemoryKind::ProjectFact,
                 fact,
                 confidence: None,
