@@ -11410,7 +11410,7 @@ function SettingsPanel({
           />
           <SettingsNavButton
             active={activeSection === "memory"}
-            icon={Bot}
+            icon={Brain}
             label={t("Memory")}
             onClick={() => onActiveSectionChange("memory")}
           />
