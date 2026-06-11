@@ -1129,6 +1129,17 @@ impl MemoryDatabase {
         kind: Option<MemoryKind>,
         limit: u32,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.search_active_facts_for_scope_page(query, chat_id, kind, limit, 0)
+    }
+
+    pub fn search_active_facts_for_scope_page(
+        &self,
+        query: &str,
+        chat_id: Option<&str>,
+        kind: Option<MemoryKind>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("query", query)?;
         if let Some(chat_id) = chat_id {
             require_non_empty("chat_id", chat_id)?;
@@ -1165,7 +1176,7 @@ impl MemoryDatabase {
                COALESCE(f.confidence, -1.0) DESC,
                f.is_latest DESC,
                f.id ASC
-             LIMIT ?3"
+             LIMIT ?3 OFFSET ?5"
         );
         let kind_param = kind
             .map(|kind| kind.as_str().to_string())
@@ -1177,12 +1188,55 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let rows = statement
             .query_map(
-                params![query, chat_param, limit, kind_param,],
+                params![query, chat_param, limit, kind_param, offset],
                 memory_fact_from_row,
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
         collect_rows(rows, &self.database_path)
+    }
+
+    pub fn count_search_active_facts_for_scope(
+        &self,
+        query: &str,
+        chat_id: Option<&str>,
+        kind: Option<MemoryKind>,
+    ) -> Result<u32, MemoryDatabaseError> {
+        require_non_empty("query", query)?;
+        if let Some(chat_id) = chat_id {
+            require_non_empty("chat_id", chat_id)?;
+        }
+
+        let (filter_sql, chat_param) = match self.kind {
+            MemoryDatabaseKind::Global => ("f.scope = 'global'", None),
+            MemoryDatabaseKind::Workspace if chat_id.is_some() => (
+                "(f.scope = 'chat' AND f.chat_id = ?2) OR f.scope = 'workspace'",
+                chat_id,
+            ),
+            MemoryDatabaseKind::Workspace => ("f.scope = 'workspace'", None),
+        };
+        let sql = format!(
+            "SELECT COUNT(*)
+             FROM memory_fts_index
+             JOIN memory_facts f ON f.id = memory_fts_index.fact_id
+             WHERE memory_fts_index MATCH ?1
+               AND ({filter_sql})
+               AND f.status = 'active'
+               AND (?3 IS NULL OR f.kind = ?3)
+               AND f.is_latest = 1"
+        );
+        let kind_param = kind
+            .map(|kind| kind.as_str().to_string())
+            .map(rusqlite::types::Value::Text)
+            .unwrap_or(rusqlite::types::Value::Null);
+        let count = self
+            .connection
+            .query_row(&sql, params![query, chat_param, kind_param], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(count as u32)
     }
 
     pub fn find_active_facts_containing_any_for_scope(
@@ -1328,6 +1382,18 @@ impl MemoryDatabase {
         query: Option<&str>,
         limit: u32,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.list_facts_for_scope_page(chat_id, status, kind, query, limit, 0)
+    }
+
+    pub fn list_facts_for_scope_page(
+        &self,
+        chat_id: Option<&str>,
+        status: MemoryStatus,
+        kind: Option<MemoryKind>,
+        query: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
         if let Some(chat_id) = chat_id {
             require_non_empty("chat_id", chat_id)?;
         }
@@ -1361,7 +1427,7 @@ impl MemoryDatabase {
                CASE WHEN scope = 'chat' THEN 0 WHEN scope = 'workspace' THEN 1 ELSE 2 END,
                pinned DESC,
                updated_at DESC
-             LIMIT ?2"
+             LIMIT ?2 OFFSET ?6"
         );
         let mut statement = self
             .connection
@@ -1378,8 +1444,146 @@ impl MemoryDatabase {
                         "%{}%",
                         escaped_memory_like_term(&query.to_lowercase())
                     )),
+                    offset,
                 ],
                 memory_fact_from_row,
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn count_facts_for_scope(
+        &self,
+        chat_id: Option<&str>,
+        status: MemoryStatus,
+        kind: Option<MemoryKind>,
+        query: Option<&str>,
+    ) -> Result<u32, MemoryDatabaseError> {
+        if let Some(chat_id) = chat_id {
+            require_non_empty("chat_id", chat_id)?;
+        }
+        if let Some(query) = query {
+            require_non_empty("query", query)?;
+        }
+
+        let (filter_sql, chat_param) = match self.kind {
+            MemoryDatabaseKind::Global => ("scope = 'global'", None),
+            MemoryDatabaseKind::Workspace if chat_id.is_some() => (
+                "(scope = 'chat' AND chat_id = ?1) OR scope = 'workspace'",
+                chat_id,
+            ),
+            MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
+        };
+        let sql = format!(
+            "SELECT COUNT(*)
+             FROM memory_facts
+             WHERE ({filter_sql})
+               AND status = ?2
+               AND (?3 IS NULL OR kind = ?3)
+               AND (?4 IS NULL OR lower(fact) LIKE ?4 ESCAPE '\\')
+               AND is_latest = 1"
+        );
+        let count = self
+            .connection
+            .query_row(
+                &sql,
+                params![
+                    chat_param,
+                    status.as_str(),
+                    kind.map(MemoryKind::as_str),
+                    query.map(|query| format!(
+                        "%{}%",
+                        escaped_memory_like_term(&query.to_lowercase())
+                    )),
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(count as u32)
+    }
+
+    pub fn list_fact_ids_for_exact_scope(
+        &self,
+        scope: MemoryScope,
+        chat_id: Option<&str>,
+        status: MemoryStatus,
+        kind: Option<MemoryKind>,
+        query: Option<&str>,
+    ) -> Result<Vec<String>, MemoryDatabaseError> {
+        self.validate_scope(scope)?;
+        validate_scope_chat_id(scope, chat_id)?;
+        if let Some(query) = query {
+            require_non_empty("query", query)?;
+        }
+
+        if status == MemoryStatus::Active && query.is_some() {
+            return self.search_active_fact_ids_for_exact_scope(
+                scope,
+                chat_id,
+                kind,
+                query.unwrap(),
+            );
+        }
+
+        let sql = "SELECT id
+             FROM memory_facts
+             WHERE scope = ?1
+               AND ((?2 IS NULL AND chat_id IS NULL) OR chat_id = ?2)
+               AND status = ?3
+               AND (?4 IS NULL OR kind = ?4)
+               AND (?5 IS NULL OR lower(fact) LIKE ?5 ESCAPE '\\')
+               AND is_latest = 1
+             ORDER BY pinned DESC, updated_at DESC, id ASC";
+        let mut statement = self
+            .connection
+            .prepare(sql)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    scope.as_str(),
+                    chat_id,
+                    status.as_str(),
+                    kind.map(MemoryKind::as_str),
+                    query.map(|query| format!(
+                        "%{}%",
+                        escaped_memory_like_term(&query.to_lowercase())
+                    )),
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    fn search_active_fact_ids_for_exact_scope(
+        &self,
+        scope: MemoryScope,
+        chat_id: Option<&str>,
+        kind: Option<MemoryKind>,
+        query: &str,
+    ) -> Result<Vec<String>, MemoryDatabaseError> {
+        let sql = "SELECT f.id
+             FROM memory_fts_index
+             JOIN memory_facts f ON f.id = memory_fts_index.fact_id
+             WHERE memory_fts_index MATCH ?1
+               AND f.scope = ?2
+               AND ((?3 IS NULL AND f.chat_id IS NULL) OR f.chat_id = ?3)
+               AND f.status = 'active'
+               AND (?4 IS NULL OR f.kind = ?4)
+               AND f.is_latest = 1
+             ORDER BY bm25(memory_fts_index), f.pinned DESC, f.updated_at DESC, f.id ASC";
+        let mut statement = self
+            .connection
+            .prepare(sql)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(
+                params![query, scope.as_str(), chat_id, kind.map(MemoryKind::as_str)],
+                |row| row.get::<_, String>(0),
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
@@ -3041,6 +3245,101 @@ mod tests {
             .expect("query filtered pending facts");
         assert_eq!(pending_keyword.len(), 1);
         assert_eq!(pending_keyword[0].id, "pending");
+
+        let active_total = database
+            .count_facts_for_scope(None, MemoryStatus::Active, None, None)
+            .expect("count active facts");
+        assert_eq!(active_total, 2);
+
+        let second_active_page = database
+            .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 1, 1)
+            .expect("second active page");
+        assert_eq!(second_active_page.len(), 1);
+    }
+
+    #[test]
+    fn workspace_database_lists_exact_scope_fact_ids() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "Memory chat")
+                .expect("chat insert");
+        }
+        let mut database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+
+        for (id, scope, chat_id, fact) in [
+            (
+                "workspace",
+                MemoryScope::Workspace,
+                None,
+                "Workspace memory visible in chat context.",
+            ),
+            (
+                "chat",
+                MemoryScope::Chat,
+                Some("chat-1"),
+                "Chat memory clear target.",
+            ),
+        ] {
+            let source_id = format!("source-{id}");
+            database
+                .insert_source(NewMemorySource {
+                    id: &source_id,
+                    scope,
+                    chat_id,
+                    source_type: MemorySourceType::ManualNote,
+                    source_id: None,
+                    title: "Manual note",
+                    content: fact,
+                    metadata_json: "{}",
+                })
+                .expect("source insert");
+            database
+                .insert_fact(NewMemoryFact {
+                    id,
+                    scope,
+                    chat_id,
+                    status: MemoryStatus::Active,
+                    kind: MemoryKind::ProjectFact,
+                    fact,
+                    confidence: None,
+                    pinned: false,
+                    source_ids: &[source_id.as_str()],
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+
+        let chat_visible = database
+            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Active, None, None, 10)
+            .expect("chat visible facts");
+        assert_eq!(chat_visible.len(), 2);
+
+        let exact_chat_ids = database
+            .list_fact_ids_for_exact_scope(
+                MemoryScope::Chat,
+                Some("chat-1"),
+                MemoryStatus::Active,
+                None,
+                None,
+            )
+            .expect("exact chat fact ids");
+        assert_eq!(exact_chat_ids, vec!["chat".to_string()]);
+
+        let exact_workspace_ids = database
+            .list_fact_ids_for_exact_scope(
+                MemoryScope::Workspace,
+                None,
+                MemoryStatus::Active,
+                None,
+                None,
+            )
+            .expect("exact workspace fact ids");
+        assert_eq!(exact_workspace_ids, vec!["workspace".to_string()]);
     }
 
     #[test]

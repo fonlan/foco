@@ -269,6 +269,14 @@ const workspaceMemory = {
   scope: "workspace",
 };
 
+const chatMemory = {
+  ...activeMemory,
+  chatId: "chat-test",
+  fact: "Chat scoped memory",
+  id: "memory-chat-1",
+  scope: "chat",
+};
+
 const pendingMemory = {
   ...activeMemory,
   fact: "Pending extracted memory",
@@ -1928,6 +1936,20 @@ describe("App verification surfaces", () => {
     expect(await screen.findByText("Memory settings")).toBeInTheDocument();
     expect((await screen.findAllByText(activeMemory.fact)).length).toBeGreaterThan(0);
     expect(await screen.findByText(memoryExtractionJob.errorMessage)).toBeInTheDocument();
+    expect(screen.getAllByText("Preference").length).toBeGreaterThan(0);
+
+    await userEvent.click(screen.getByRole("button", { name: "Go to page 2" }));
+    await waitFor(() => {
+      const pageCall = [...fetchMock.mock.calls].find(([url]) => {
+        const value = String(url);
+        return (
+          value.startsWith("/api/memory?") &&
+          value.includes("page=2") &&
+          value.includes("pageSize=20")
+        );
+      });
+      expect(pageCall).toBeDefined();
+    });
 
     await userEvent.click(screen.getByLabelText("Enable memory"));
     await userEvent.selectOptions(screen.getByLabelText("Extraction mode"), "automatic");
@@ -2027,6 +2049,25 @@ describe("App verification surfaces", () => {
 
     await userEvent.selectOptions(screen.getByLabelText("Memory scope"), "workspace");
     expect(await screen.findByText(workspaceMemory.fact)).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Clear filtered workspace memories" }),
+    );
+
+    await waitFor(() => {
+      const clearCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/memory/clear",
+      );
+      expect(clearCall).toBeDefined();
+      expect(JSON.parse(String(clearCall?.[1]?.body))).toEqual({
+        chatId: null,
+        kind: "preference",
+        query: null,
+        scope: "workspace",
+        status: "active",
+        workspaceId: workspace.id,
+      });
+    });
+
     await userEvent.click(screen.getByRole("button", { name: "Promote one level" }));
 
     await waitFor(() => {
@@ -2079,6 +2120,47 @@ describe("App verification surfaces", () => {
       });
     });
     confirmSpy.mockRestore();
+  }, 10000);
+
+  it("keeps chat memory pagination requests tied to a chat id", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+    expect(await screen.findByText("Memory settings")).toBeInTheDocument();
+
+    const callCountBeforeChatScope = fetchMock.mock.calls.length;
+    await userEvent.selectOptions(screen.getByLabelText("Memory scope"), "chat");
+
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "Go to page 2" })).not.toBeInTheDocument();
+    });
+    const missingChatIdCall = fetchMock.mock.calls
+      .slice(callCountBeforeChatScope)
+      .find(([url]) => {
+        const value = String(url);
+        return value.startsWith("/api/memory?") && value.includes("scope=chat");
+      });
+    expect(missingChatIdCall).toBeUndefined();
+
+    await userEvent.type(screen.getByLabelText("Chat ID"), "chat-test");
+    expect(await screen.findByText(chatMemory.fact)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Go to page 2" }));
+
+    await waitFor(() => {
+      const pageCall = [...fetchMock.mock.calls].find(([url]) => {
+        const value = String(url);
+        return (
+          value.startsWith("/api/memory?") &&
+          value.includes("scope=chat") &&
+          value.includes("chatId=chat-test") &&
+          value.includes("page=2")
+        );
+      });
+      expect(pageCall).toBeDefined();
+    });
   });
 
   it("shows translated hook settings and imports Claude hooks by target scope", async () => {
@@ -2585,14 +2667,28 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   if (path === "/api/memory") {
     const status = requestUrl.searchParams.get("status");
     const scope = requestUrl.searchParams.get("scope");
+    const chatId = requestUrl.searchParams.get("chatId");
+    const page = Number(requestUrl.searchParams.get("page") ?? "1");
+    const pageSize = Number(requestUrl.searchParams.get("pageSize") ?? "20");
+    const memories =
+      status === "pending"
+        ? [pendingMemory]
+        : scope === "chat"
+          ? [chatMemory]
+        : scope === "workspace"
+          ? [workspaceMemory]
+          : [activeMemory];
+    const totalCount =
+      (scope === "global" && status !== "pending") || (scope === "chat" && chatId)
+        ? 21
+        : memories.length;
     return jsonResponse({
       extractionJobs: [memoryExtractionJob],
-      memories:
-        status === "pending"
-          ? [pendingMemory]
-          : scope === "workspace"
-            ? [workspaceMemory]
-            : [activeMemory],
+      memories,
+      page,
+      pageSize,
+      totalCount,
+      totalPages: totalCount ? Math.ceil(totalCount / pageSize) : 0,
     });
   }
 
@@ -2605,6 +2701,7 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
     path === "/api/memory/edit" ||
     path === "/api/memory/status" ||
     path === "/api/memory/forget" ||
+    path === "/api/memory/clear" ||
     path === "/api/memory/promote"
   ) {
     return jsonResponse({ memory: activeMemory });

@@ -679,6 +679,7 @@ fn app_router(state: AppState) -> Router {
         .route("/api/memory/status", post(update_memory_status))
         .route("/api/memory/edit", post(edit_memory))
         .route("/api/memory/forget", post(forget_memory))
+        .route("/api/memory/clear", post(clear_filtered_memories))
         .route("/api/memory/promote", post(promote_memory))
         .route("/api/memory/sources", get(memory_sources))
         .route("/api/hooks", get(hooks_settings))
@@ -2319,6 +2320,8 @@ struct MemoryListQuery {
     status: Option<String>,
     kind: Option<String>,
     limit: Option<u32>,
+    page: Option<u32>,
+    page_size: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2376,6 +2379,23 @@ struct ForgetMemoryRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ClearMemoriesRequest {
+    scope: String,
+    workspace_id: Option<String>,
+    chat_id: Option<String>,
+    query: Option<String>,
+    status: Option<String>,
+    kind: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearMemoriesResponse {
+    deleted_count: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PromoteMemoryRequest {
     scope: String,
     workspace_id: Option<String>,
@@ -2399,6 +2419,10 @@ struct MemorySourcesQuery {
 struct MemoryListResponse {
     memories: Vec<MemoryFactRecord>,
     extraction_jobs: Vec<MemoryExtractionJobSummary>,
+    page: u32,
+    page_size: u32,
+    total_count: u32,
+    total_pages: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -2434,7 +2458,9 @@ async fn memory_list(
     let config = config_snapshot(&state)?;
     let scope = MemoryScope::parse(query.scope.trim()).map_err(ApiError::from_memory_error)?;
     let chat_id = normalized_optional_text(query.chat_id);
-    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query.page_size.or(query.limit).unwrap_or(20).clamp(1, 200);
+    let offset = page.saturating_sub(1).saturating_mul(page_size);
     let status = query
         .status
         .as_deref()
@@ -2468,24 +2494,53 @@ async fn memory_list(
             .flatten(),
     )?;
 
-    let memories = if status == MemoryStatus::Active {
+    let total_count = if status == MemoryStatus::Active {
         if let Some(query_text) = query_text.as_deref() {
             database
-                .search_active_facts_for_scope(query_text, chat_id.as_deref(), kind, limit)
+                .count_search_active_facts_for_scope(query_text, chat_id.as_deref(), kind)
                 .map_err(ApiError::from_memory_error)?
         } else {
             database
-                .list_facts_for_scope(chat_id.as_deref(), status, kind, None, limit)
+                .count_facts_for_scope(chat_id.as_deref(), status, kind, None)
                 .map_err(ApiError::from_memory_error)?
         }
     } else {
         database
-            .list_facts_for_scope(
+            .count_facts_for_scope(chat_id.as_deref(), status, kind, query_text.as_deref())
+            .map_err(ApiError::from_memory_error)?
+    };
+    let memories = if status == MemoryStatus::Active {
+        if let Some(query_text) = query_text.as_deref() {
+            database
+                .search_active_facts_for_scope_page(
+                    query_text,
+                    chat_id.as_deref(),
+                    kind,
+                    page_size,
+                    offset,
+                )
+                .map_err(ApiError::from_memory_error)?
+        } else {
+            database
+                .list_facts_for_scope_page(
+                    chat_id.as_deref(),
+                    status,
+                    kind,
+                    None,
+                    page_size,
+                    offset,
+                )
+                .map_err(ApiError::from_memory_error)?
+        }
+    } else {
+        database
+            .list_facts_for_scope_page(
                 chat_id.as_deref(),
                 status,
                 kind,
                 query_text.as_deref(),
-                limit,
+                page_size,
+                offset,
             )
             .map_err(ApiError::from_memory_error)?
     };
@@ -2500,6 +2555,14 @@ async fn memory_list(
     Ok(Json(MemoryListResponse {
         memories,
         extraction_jobs,
+        page,
+        page_size,
+        total_count,
+        total_pages: if total_count == 0 {
+            0
+        } else {
+            total_count.div_ceil(page_size)
+        },
     }))
 }
 
@@ -2759,6 +2822,68 @@ async fn forget_memory(
     }
 
     Ok(Json(MemoryMutationResponse { memory: None }))
+}
+
+async fn clear_filtered_memories(
+    State(state): State<AppState>,
+    Json(request): Json<ClearMemoriesRequest>,
+) -> Result<Json<ClearMemoriesResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let scope = MemoryScope::parse(request.scope.trim()).map_err(ApiError::from_memory_error)?;
+
+    if scope == MemoryScope::Global {
+        return Err(ApiError::bad_request(
+            "clearing filtered memories only supports workspace or chat scope",
+        ));
+    }
+
+    let chat_id = normalized_optional_text(request.chat_id);
+    if scope == MemoryScope::Chat && chat_id.is_none() {
+        return Err(ApiError::bad_request(
+            "chat memory clearing requires chatId",
+        ));
+    }
+
+    let status = request
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(MemoryStatus::parse)
+        .transpose()
+        .map_err(ApiError::from_memory_error)?
+        .unwrap_or(MemoryStatus::Active);
+    let kind = request
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(MemoryKind::parse)
+        .transpose()
+        .map_err(ApiError::from_memory_error)?;
+    let query_text = normalized_optional_text(request.query);
+    let mut database =
+        open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
+    let exact_chat_id = (scope == MemoryScope::Chat)
+        .then_some(chat_id.as_deref())
+        .flatten();
+
+    expire_due_memories(&mut database)?;
+    let memory_ids = database
+        .list_fact_ids_for_exact_scope(scope, exact_chat_id, status, kind, query_text.as_deref())
+        .map_err(ApiError::from_memory_error)?;
+    let mut deleted_count = 0;
+    for memory_id in memory_ids {
+        if database
+            .hard_delete_fact(&memory_id)
+            .map_err(ApiError::from_memory_error)?
+        {
+            deleted_count += 1;
+        }
+    }
+    refresh_memory_profile(&mut database, scope, exact_chat_id)?;
+
+    Ok(Json(ClearMemoriesResponse { deleted_count }))
 }
 
 async fn promote_memory(

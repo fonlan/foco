@@ -351,10 +351,18 @@ type MemoryExtractionJobSummary = {
 type MemoryListResponse = {
   memories: MemoryFactRecord[];
   extractionJobs: MemoryExtractionJobSummary[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
 };
 
 type MemoryMutationResponse = {
   memory: MemoryFactRecord | null;
+};
+
+type ClearMemoriesResponse = {
+  deletedCount: number;
 };
 
 type MemorySourcesResponse = {
@@ -377,6 +385,15 @@ type MemoryFilterState = {
   workspaceId: string;
   chatId: string;
   query: string;
+  page: number;
+  pageSize: number;
+};
+
+type MemoryListMeta = {
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
 };
 
 type ManualMemoryFormState = {
@@ -1370,6 +1387,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Close memory dialog": "关闭记忆弹窗",
     "Delete memory": "删除记忆",
     "Delete memory confirmation": "确定要删除这条记忆吗？",
+    "Clear filtered workspace memories": "清空当前筛选的工作区记忆",
+    "Clear filtered chat memories": "清空当前筛选的会话记忆",
+    "Clear filtered memories confirmation": "确定要清空当前筛选范围内的记忆吗？",
+    "Memory pagination": "记忆分页",
     "Memory scope": "记忆范围",
     "Memory status": "记忆状态",
     "Search memories": "搜索记忆",
@@ -1377,6 +1398,16 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No memories": "暂无记忆",
     "All memory kinds": "全部记忆类型",
     "Pending review": "待审核",
+    Rejected: "已拒绝",
+    Expired: "已过期",
+    Superseded: "已取代",
+    "User note": "用户备注",
+    Preference: "偏好",
+    "Project fact": "项目事实",
+    "Project decision": "项目决策",
+    Procedure: "流程",
+    Constraint: "约束",
+    Episode: "片段",
     Automatic: "自动",
     "Manual": "手动",
     Disabled: "已禁用",
@@ -4151,7 +4182,7 @@ function RipgrepMissingDialog({
   onClose: () => void;
   onInstall: () => void;
 }) {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
 
   return (
     <div
@@ -4260,7 +4291,7 @@ function WorkspaceDialog({
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   path: string;
 }) {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const title = t("Add workspace");
 
   return (
@@ -8931,7 +8962,7 @@ function SettingsPanel({
   onWorkspacesChange: () => Promise<void>;
   workspaceDialogRevision: number;
 }) {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [isProviderDialogOpen, setIsProviderDialogOpen] = useState(false);
   const [isModelDialogOpen, setIsModelDialogOpen] = useState(false);
@@ -8966,6 +8997,12 @@ function SettingsPanel({
     useState<MemoryDialogMode>("create");
   const [isMemoryDialogOpen, setIsMemoryDialogOpen] = useState(false);
   const [memories, setMemories] = useState<MemoryFactRecord[]>([]);
+  const [memoryListMeta, setMemoryListMeta] = useState<MemoryListMeta>({
+    page: 1,
+    pageSize: 20,
+    totalCount: 0,
+    totalPages: 0,
+  });
   const [memoryExtractionJobs, setMemoryExtractionJobs] = useState<
     MemoryExtractionJobSummary[]
   >([]);
@@ -9091,6 +9128,25 @@ function SettingsPanel({
     null;
   const selectedMemory =
     memories.find((memory) => memory.id === selectedMemoryId) ?? null;
+  const memoryPaginationItems = auditPaginationItems(
+    memoryListMeta.page,
+    memoryListMeta.totalPages,
+  );
+  const memoryPageStart = memories.length
+    ? (memoryListMeta.page - 1) * memoryListMeta.pageSize + 1
+    : 0;
+  const memoryPageEnd = memories.length
+    ? Math.min(memoryListMeta.totalCount, memoryPageStart + memories.length - 1)
+    : 0;
+  const canClearFilteredMemories =
+    memoryFilter.scope !== "global" &&
+    (memoryFilter.scope !== "chat" || Boolean(memoryFilter.chatId.trim()));
+  const isMemoryFilterReady =
+    memoryFilter.scope !== "chat" || Boolean(memoryFilter.chatId.trim());
+  const clearFilteredMemoryLabel =
+    memoryFilter.scope === "chat"
+      ? t("Clear filtered chat memories")
+      : t("Clear filtered workspace memories");
   const selectedHookWorkspace =
     workspaces.find((workspace) => workspace.id === hookWorkspaceId) ??
     workspaces[0] ??
@@ -9288,16 +9344,31 @@ function SettingsPanel({
     setError(null);
 
     try {
+      const chatId = memoryFilter.chatId.trim();
+      if (memoryFilter.scope === "chat" && !chatId) {
+        setMemories([]);
+        setMemoryExtractionJobs([]);
+        setMemoryListMeta({
+          page: 1,
+          pageSize: memoryFilter.pageSize,
+          totalCount: 0,
+          totalPages: 0,
+        });
+        setSelectedMemoryId(null);
+        return;
+      }
+
       const params = new URLSearchParams({
-        limit: "100",
+        page: String(memoryFilter.page),
+        pageSize: String(memoryFilter.pageSize),
         scope: memoryFilter.scope,
         status: memoryFilter.status,
       });
       if (memoryFilter.workspaceId) {
         params.set("workspaceId", memoryFilter.workspaceId);
       }
-      if (memoryFilter.chatId) {
-        params.set("chatId", memoryFilter.chatId);
+      if (chatId) {
+        params.set("chatId", chatId);
       }
       if (memoryFilter.kind) {
         params.set("kind", memoryFilter.kind);
@@ -9308,8 +9379,20 @@ function SettingsPanel({
       const data = await requestJson<MemoryListResponse>(
         `/api/memory?${params.toString()}`,
       );
+      if (data.totalPages > 0 && data.page > data.totalPages) {
+        setMemoryFilter((current) =>
+          current.page === data.page ? { ...current, page: data.totalPages } : current,
+        );
+        return;
+      }
       setMemories(data.memories);
       setMemoryExtractionJobs(data.extractionJobs ?? []);
+      setMemoryListMeta({
+        page: data.page,
+        pageSize: data.pageSize,
+        totalCount: data.totalCount,
+        totalPages: data.totalPages,
+      });
       setSelectedMemoryId((current) =>
         current && data.memories.some((memory) => memory.id === current)
           ? current
@@ -9831,6 +9914,33 @@ function SettingsPanel({
     }
   }
 
+  function updateMemoryFilter(patch: Partial<MemoryFilterState>) {
+    setMemoryFilter((current) => ({
+      ...current,
+      ...patch,
+      page: 1,
+    }));
+  }
+
+  function goToMemoryPage(page: number) {
+    if (!isMemoryFilterReady) {
+      return;
+    }
+
+    setMemoryFilter((current) => ({
+      ...current,
+      page,
+    }));
+  }
+
+  function updateMemoryPageSize(value: string) {
+    setMemoryFilter((current) => ({
+      ...current,
+      page: 1,
+      pageSize: Math.min(200, positiveIntegerText(value, current.pageSize)),
+    }));
+  }
+
   function openCreateMemoryDialog() {
     setMemoryDialogMode("create");
     setMemorySourceForms([]);
@@ -10011,6 +10121,46 @@ function SettingsPanel({
         method: "POST",
       });
       await loadMemories();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingMemory(false);
+    }
+  }
+
+  async function clearFilteredMemories() {
+    if (!canClearFilteredMemories) {
+      return;
+    }
+    if (!window.confirm(t("Clear filtered memories confirmation"))) {
+      return;
+    }
+
+    setIsSavingMemory(true);
+    setError(null);
+
+    try {
+      await requestJson<ClearMemoriesResponse>("/api/memory/clear", {
+        body: JSON.stringify({
+          chatId: memoryFilter.scope === "chat" ? memoryFilter.chatId : null,
+          kind: memoryFilter.kind || null,
+          query: memoryFilter.query.trim() || null,
+          scope: memoryFilter.scope,
+          status: memoryFilter.status,
+          workspaceId:
+            memoryFilter.scope === "global" ? null : memoryFilter.workspaceId,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      const shouldReload = memoryFilter.page === 1;
+      setMemoryFilter((current) => ({
+        ...current,
+        page: 1,
+      }));
+      if (shouldReload) {
+        await loadMemories();
+      }
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -11491,11 +11641,7 @@ function SettingsPanel({
                       </h3>
                     </div>
                     <div className="mt-1 truncate text-xs text-stone-500">
-                      {manualMemoryForm.scope === "global"
-                        ? t("Global memory")
-                        : manualMemoryForm.scope === "workspace"
-                          ? t("Workspace memory")
-                          : t("Chat memory")}
+                      {memoryScopeLabel(manualMemoryForm.scope, t)}
                     </div>
                   </div>
                   <button
@@ -11595,7 +11741,7 @@ function SettingsPanel({
                     >
                       {MEMORY_KIND_OPTIONS.map((kind) => (
                         <option key={kind} value={kind}>
-                          {kind}
+                          {memoryKindLabel(kind, t)}
                         </option>
                       ))}
                     </select>
@@ -11675,13 +11821,13 @@ function SettingsPanel({
                           <span className="font-semibold text-stone-700">
                             {t("Memory status")}:{" "}
                           </span>
-                          {selectedMemory.status}
+                          {memoryStatusLabel(selectedMemory.status, t)}
                         </div>
                         <div>
                           <span className="font-semibold text-stone-700">
                             {t("Memory scope")}:{" "}
                           </span>
-                          {selectedMemory.scope}
+                          {memoryScopeLabel(selectedMemory.scope, t)}
                         </div>
                         <div>
                           <span className="font-semibold text-stone-700">
@@ -12042,23 +12188,34 @@ function SettingsPanel({
                     {t("Memory list")}
                   </h3>
                   <p className="mt-1 truncate text-xs text-stone-500">
-                    {memoryFilter.scope === "global"
-                      ? t("Global memory")
-                      : memoryFilter.scope === "workspace"
-                        ? t("Workspace memory")
-                        : t("Chat memory")}
+                    {memoryScopeLabel(memoryFilter.scope, t)}
                   </p>
                 </div>
-                <button
-                  aria-label={t("Create memory")}
-                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900"
-                  onClick={openCreateMemoryDialog}
-                  title={t("Create memory")}
-                  type="button"
-                >
-                  <Plus aria-hidden="true" className="size-4" />
-                  {t("Create memory")}
-                </button>
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  {memoryFilter.scope !== "global" ? (
+                    <button
+                      aria-label={clearFilteredMemoryLabel}
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      disabled={!canClearFilteredMemories || isSavingMemory}
+                      onClick={() => void clearFilteredMemories()}
+                      title={clearFilteredMemoryLabel}
+                      type="button"
+                    >
+                      <Trash2 aria-hidden="true" className="size-4" />
+                      {clearFilteredMemoryLabel}
+                    </button>
+                  ) : null}
+                  <button
+                    aria-label={t("Create memory")}
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900"
+                    onClick={openCreateMemoryDialog}
+                    title={t("Create memory")}
+                    type="button"
+                  >
+                    <Plus aria-hidden="true" className="size-4" />
+                    {t("Create memory")}
+                  </button>
+                </div>
               </div>
               <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(9rem,0.8fr)_minmax(9rem,0.8fr)_minmax(8rem,0.7fr)_minmax(0,1.4fr)_auto]">
                 <label className="block">
@@ -12069,14 +12226,13 @@ function SettingsPanel({
                     aria-label={t("Memory scope")}
                     className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                     onChange={(event) =>
-                      setMemoryFilter((current) => ({
-                        ...current,
+                      updateMemoryFilter({
                         scope: event.target.value as MemoryFilterState["scope"],
                         workspaceId:
                           event.target.value === "global"
                             ? ""
-                            : current.workspaceId || memoryWorkspace?.id || "",
-                      }))
+                            : memoryFilter.workspaceId || memoryWorkspace?.id || "",
+                      })
                     }
                     value={memoryFilter.scope}
                   >
@@ -12094,10 +12250,9 @@ function SettingsPanel({
                       aria-label={t("Workspace")}
                       className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                       onChange={(event) =>
-                        setMemoryFilter((current) => ({
-                          ...current,
+                        updateMemoryFilter({
                           workspaceId: event.target.value,
-                        }))
+                        })
                       }
                       value={memoryFilter.workspaceId || memoryWorkspace?.id || ""}
                     >
@@ -12113,10 +12268,9 @@ function SettingsPanel({
                   <TextField
                     label={t("Chat ID")}
                     onChange={(value) =>
-                      setMemoryFilter((current) => ({
-                        ...current,
+                      updateMemoryFilter({
                         chatId: value,
-                      }))
+                      })
                     }
                     placeholder="chat-..."
                     value={memoryFilter.chatId}
@@ -12130,17 +12284,16 @@ function SettingsPanel({
                     aria-label={t("Memory kind")}
                     className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                     onChange={(event) =>
-                      setMemoryFilter((current) => ({
-                        ...current,
+                      updateMemoryFilter({
                         kind: event.target.value,
-                      }))
+                      })
                     }
                     value={memoryFilter.kind}
                   >
                     <option value="">{t("All memory kinds")}</option>
                     {MEMORY_KIND_OPTIONS.map((kind) => (
                       <option key={kind} value={kind}>
-                        {kind}
+                        {memoryKindLabel(kind, t)}
                       </option>
                     ))}
                   </select>
@@ -12148,10 +12301,9 @@ function SettingsPanel({
                 <TextField
                   label={t("Search memories")}
                   onChange={(value) =>
-                    setMemoryFilter((current) => ({
-                      ...current,
+                    updateMemoryFilter({
                       query: value,
-                    }))
+                    })
                   }
                   placeholder={t("Search memories")}
                   value={memoryFilter.query}
@@ -12165,10 +12317,9 @@ function SettingsPanel({
                       aria-label={t("Memory status")}
                       className="h-10 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                       onChange={(event) =>
-                        setMemoryFilter((current) => ({
-                          ...current,
+                        updateMemoryFilter({
                           status: event.target.value as MemoryFilterState["status"],
-                        }))
+                        })
                       }
                       value={memoryFilter.status}
                     >
@@ -12212,8 +12363,14 @@ function SettingsPanel({
                         type="button"
                       >
                         <div className="flex flex-wrap items-center gap-2">
-                          <CapabilityPill label={memory.status} ok={memory.status === "active"} />
-                          <CapabilityPill label={memory.kind} ok={memory.pinned} />
+                          <CapabilityPill
+                            label={memoryStatusLabel(memory.status, t)}
+                            ok={memory.status === "active"}
+                          />
+                          <CapabilityPill
+                            label={memoryKindLabel(memory.kind, t)}
+                            ok={memory.pinned}
+                          />
                           {memory.scope === "chat" && memory.chatId ? (
                             <span className="text-xs font-semibold text-stone-500">
                               {memory.chatId}
@@ -12265,6 +12422,96 @@ function SettingsPanel({
                     </div>
                   ))
                 )}
+              </div>
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 pt-3 text-sm">
+                <div className="text-stone-500">
+                  {t("Showing {start}-{end} of {total}", {
+                    end: formatNumber(memoryPageEnd, language),
+                    start: formatNumber(memoryPageStart, language),
+                    total: formatNumber(memoryListMeta.totalCount, language),
+                  })}
+                </div>
+                <div className="flex flex-wrap items-center justify-end gap-3">
+                  <label className="flex items-center gap-2 text-xs font-semibold text-stone-500">
+                    <span>{t("Page size")}</span>
+                    <input
+                      className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      max={200}
+                      min={1}
+                      onChange={(event) => updateMemoryPageSize(event.target.value)}
+                      type="number"
+                      value={memoryFilter.pageSize}
+                    />
+                  </label>
+                  <nav
+                    aria-label={t("Memory pagination")}
+                    className="flex items-center gap-1"
+                  >
+                    <button
+                      aria-label={t("Previous page")}
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      disabled={
+                        !isMemoryFilterReady ||
+                        isLoadingMemories ||
+                        memoryListMeta.page <= 1
+                      }
+                      onClick={() => goToMemoryPage(memoryListMeta.page - 1)}
+                      title={t("Previous page")}
+                      type="button"
+                    >
+                      <ChevronLeft aria-hidden="true" className="size-4" />
+                    </button>
+                    {memoryPaginationItems.map((item, index) =>
+                      item === "ellipsis" ? (
+                        <span
+                          aria-hidden="true"
+                          className="inline-flex size-9 items-center justify-center text-stone-400"
+                          key={`memory-ellipsis-${index}`}
+                        >
+                          ...
+                        </span>
+                      ) : (
+                        <button
+                          aria-current={
+                            item === memoryListMeta.page ? "page" : undefined
+                          }
+                          aria-label={t("Go to page {page}", {
+                            page: formatNumber(item, language),
+                          })}
+                          className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${
+                            item === memoryListMeta.page
+                              ? "border-teal-700 bg-teal-700 text-white"
+                              : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                          }`}
+                          disabled={!isMemoryFilterReady || isLoadingMemories}
+                          key={item}
+                          onClick={() => goToMemoryPage(item)}
+                          title={t("Go to page {page}", {
+                            page: formatNumber(item, language),
+                          })}
+                          type="button"
+                        >
+                          {formatNumber(item, language)}
+                        </button>
+                      ),
+                    )}
+                    <button
+                      aria-label={t("Next page")}
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      disabled={
+                        isLoadingMemories ||
+                        !isMemoryFilterReady ||
+                        memoryListMeta.totalPages === 0 ||
+                        memoryListMeta.page >= memoryListMeta.totalPages
+                      }
+                      onClick={() => goToMemoryPage(memoryListMeta.page + 1)}
+                      title={t("Next page")}
+                      type="button"
+                    >
+                      <ChevronRight aria-hidden="true" className="size-4" />
+                    </button>
+                  </nav>
+                </div>
               </div>
               <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
                 <div className="flex items-center gap-2">
@@ -15245,7 +15492,7 @@ function MemorySourceReadonlyDetails({
     <div className="grid gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3 text-xs text-stone-600 sm:grid-cols-2">
       <div>
         <span className="font-semibold text-stone-700">{t("Memory scope")}: </span>
-        {source.scope}
+        {memoryScopeLabel(source.scope, t)}
       </div>
       <div>
         <span className="font-semibold text-stone-700">{t("Chat ID")}: </span>
@@ -15269,6 +15516,57 @@ function MemorySourceReadonlyDetails({
       </div>
     </div>
   );
+}
+
+function memoryKindLabel(kind: string, t: Translate) {
+  switch (kind) {
+    case "constraint":
+      return t("Constraint");
+    case "episode":
+      return t("Episode");
+    case "preference":
+      return t("Preference");
+    case "procedure":
+      return t("Procedure");
+    case "project_decision":
+      return t("Project decision");
+    case "project_fact":
+      return t("Project fact");
+    case "user_note":
+      return t("User note");
+    default:
+      return kind;
+  }
+}
+
+function memoryScopeLabel(scope: string, t: Translate) {
+  switch (scope) {
+    case "chat":
+      return t("Chat memory");
+    case "global":
+      return t("Global memory");
+    case "workspace":
+      return t("Workspace memory");
+    default:
+      return scope;
+  }
+}
+
+function memoryStatusLabel(status: string, t: Translate) {
+  switch (status) {
+    case "active":
+      return t("Active");
+    case "expired":
+      return t("Expired");
+    case "pending":
+      return t("Pending review");
+    case "rejected":
+      return t("Rejected");
+    case "superseded":
+      return t("Superseded");
+    default:
+      return status;
+  }
 }
 
 function CapabilityPill({ label, ok }: { label: string; ok: boolean }) {
@@ -15367,6 +15665,8 @@ function emptyMemoryFilter(): MemoryFilterState {
   return {
     chatId: "",
     kind: "",
+    page: 1,
+    pageSize: 20,
     query: "",
     scope: "global",
     status: "active",
