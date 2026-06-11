@@ -5281,18 +5281,6 @@ function FocoNavRail({
           onClick={onOpenStats}
         />
         <NavRailButton
-          active={false}
-          icon={Brain}
-          label={t("Memory")}
-          onClick={onReturnHome}
-        />
-        <NavRailButton
-          active={false}
-          icon={Wrench}
-          label={t("Skills")}
-          onClick={onOpenSettings}
-        />
-        <NavRailButton
           active={activeMode === "settings"}
           icon={Settings}
           label={t("Settings")}
