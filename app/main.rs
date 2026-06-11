@@ -4232,6 +4232,7 @@ struct PreparedChatContext {
     memories_used: Vec<ChatMemoryUsedSummary>,
     memory_target_status: MemoryStatus,
     request_body_json: String,
+    captured_llm_requests: Vec<CapturedLlmRequest>,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
     active_tool_start_index: usize,
@@ -4451,6 +4452,7 @@ struct ValidatedExtractedMemoryFact {
     metadata_json: String,
 }
 
+#[derive(Clone)]
 struct CapturedAuditEvent {
     event_at: String,
     event_type: String,
@@ -4552,6 +4554,7 @@ struct ToolExecutionWithHooks {
     hook_summary: HookRunSummary,
 }
 
+#[derive(Clone)]
 struct ChatAuditOutcome {
     first_token_at: Option<String>,
     completed_at: String,
@@ -4564,6 +4567,31 @@ struct ChatAuditOutcome {
     status_code: Option<i64>,
     final_state: &'static str,
     response_body_json: Option<String>,
+}
+
+struct CapturedLlmRequest {
+    id: String,
+    request_started_at: String,
+    request_body_json: String,
+    events: Vec<CapturedAuditEvent>,
+    outcome: ChatAuditOutcome,
+}
+
+impl CapturedLlmRequest {
+    fn from_run_context(
+        context: &PreparedChatContext,
+        request_started_at: &str,
+        outcome: ChatAuditOutcome,
+        events: &[CapturedAuditEvent],
+    ) -> Self {
+        Self {
+            id: context.llm_request_id.clone(),
+            request_started_at: request_started_at.to_string(),
+            request_body_json: context.request_body_json.clone(),
+            events: events.to_vec(),
+            outcome,
+        }
+    }
 }
 
 impl PreparedChatContext {
@@ -4699,9 +4727,28 @@ impl PreparedChatContext {
                 };
                 let mut turn_request = self.provider_request.clone();
                 turn_request.messages = packed_messages;
+                let turn_llm_request_id = unique_id("llm");
+                let turn_request_started_at = utc_timestamp();
+                let turn_started_at = Instant::now();
+                let mut turn_events = vec![CapturedAuditEvent {
+                    event_at: turn_request_started_at.clone(),
+                    event_type: "start".to_string(),
+                    normalized_event_json: json!({
+                        "type": "start",
+                        "chatId": &self.chat_id,
+                        "userMessageId": &self.user_message_id,
+                        "assistantMessageId": &self.assistant_message_id,
+                        "llmRequestId": &turn_llm_request_id,
+                        "runId": &self.llm_request_id,
+                        "turnIndex": turn_index,
+                    })
+                    .to_string(),
+                }];
+                let turn_request_body_json;
                 match serialize_provider_request(&turn_request) {
                     Ok(request_body_json) => {
                         self.request_body_json = request_body_json;
+                        turn_request_body_json = self.request_body_json.clone();
                     }
                     Err(error) => {
                         let message = error.message;
@@ -4758,12 +4805,19 @@ impl PreparedChatContext {
                         events.push(captured_event(&event));
                         let outcome = failed_chat_audit_outcome(
                             &self,
-                            started_at,
+                            turn_started_at,
                             &mut events,
                             &message,
                             status_code,
                         )
                         .await;
+                        self.captured_llm_requests.push(CapturedLlmRequest {
+                            id: turn_llm_request_id,
+                            request_started_at: turn_request_started_at,
+                            request_body_json: turn_request_body_json,
+                            events: turn_events,
+                            outcome: outcome.clone(),
+                        });
 
                         if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                             let event = ChatSseEvent::Error {
@@ -4779,6 +4833,8 @@ impl PreparedChatContext {
                 };
                 let mut turn_text = String::new();
                 let mut turn_reasoning = String::new();
+                let mut turn_first_token_at = None;
+                let mut turn_first_token_latency_ms = None;
                 let mut completed_turn = false;
 
                 loop {
@@ -4812,13 +4868,20 @@ impl PreparedChatContext {
                             };
                             events.push(captured_event(&event));
                             let outcome = failed_chat_audit_outcome(
-                            &self,
-                            started_at,
-                            &mut events,
-                            &message,
-                            status_code,
-                        )
-                        .await;
+                                &self,
+                                turn_started_at,
+                                &mut events,
+                                &message,
+                                status_code,
+                            )
+                            .await;
+                            self.captured_llm_requests.push(CapturedLlmRequest {
+                                id: turn_llm_request_id,
+                                request_started_at: turn_request_started_at,
+                                request_body_json: turn_request_body_json,
+                                events: turn_events,
+                                outcome: outcome.clone(),
+                            });
 
                             if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                 let event = ChatSseEvent::Error {
@@ -4833,12 +4896,13 @@ impl PreparedChatContext {
                         }
                     };
 
-                    events.push(captured_provider_event(&provider_event));
+                    turn_events.push(captured_provider_event(&provider_event));
 
                     match provider_event {
                         NeutralChatStreamEvent::Start => {}
                         NeutralChatStreamEvent::TextDelta { delta } => {
                             capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
                             assistant_text.push_str(&delta);
                             turn_text.push_str(&delta);
                             let event = ChatSseEvent::TextDelta {
@@ -4849,6 +4913,7 @@ impl PreparedChatContext {
                         }
                         NeutralChatStreamEvent::ReasoningDelta { delta } => {
                             capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
                             assistant_reasoning.push_str(&delta);
                             turn_reasoning.push_str(&delta);
                             let event = ChatSseEvent::ReasoningDelta {
@@ -4859,9 +4924,11 @@ impl PreparedChatContext {
                         }
                         NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
                             capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
                         }
                         NeutralChatStreamEvent::ToolCall { tool_call } => {
                             capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                            capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
                             if seen_tool_call_ids.insert(tool_call.call_id.clone()) {
                                 let event = ChatSseEvent::ToolCall {
                                     assistant_message_id: self.assistant_message_id.clone(),
@@ -4959,6 +5026,38 @@ impl PreparedChatContext {
                                 merge_usage(&mut total_usage, usage);
                                 final_usage = Some(total_usage.clone());
                             }
+                            let turn_total_latency_ms = elapsed_millis(turn_started_at);
+                            self.captured_llm_requests.push(CapturedLlmRequest {
+                                id: turn_llm_request_id.clone(),
+                                request_started_at: turn_request_started_at.clone(),
+                                request_body_json: turn_request_body_json.clone(),
+                                events: turn_events.clone(),
+                                outcome: ChatAuditOutcome {
+                                    first_token_at: turn_first_token_at.clone(),
+                                    completed_at: utc_timestamp(),
+                                    first_token_latency_ms: turn_first_token_latency_ms,
+                                    total_latency_ms: turn_total_latency_ms,
+                                    input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
+                                    output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
+                                    cache_read_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.cache_read_tokens),
+                                    cache_write_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.cache_write_tokens),
+                                    status_code: Some(200),
+                                    final_state: "succeeded",
+                                    response_body_json: Some(json!({
+                                        "turnIndex": turn_index,
+                                        "text": text.clone(),
+                                        "reasoning": reasoning.clone(),
+                                        "toolCalls": tool_calls.clone(),
+                                        "usage": usage.clone(),
+                                        "stopReason": stop_reason.clone(),
+                                        "responseId": response_id.clone(),
+                                    }).to_string()),
+                                },
+                            });
 
                             if tool_calls.is_empty() {
                                 let assistant_message_text =
@@ -5154,6 +5253,7 @@ impl PreparedChatContext {
 
                             for tool_call in &tool_calls {
                                 capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                                capture_first_token(turn_started_at, &mut turn_first_token_at, &mut turn_first_token_latency_ms);
                                 seen_tool_call_ids.insert(tool_call.call_id.clone());
                                 let event = ChatSseEvent::ToolCall {
                                     assistant_message_id: self.assistant_message_id.clone(),
@@ -5832,6 +5932,7 @@ async fn prepare_chat_context(
         memories_used: prompt_context.memories_used,
         memory_target_status: memory_target_status_for_prompt(raw_message),
         request_body_json,
+        captured_llm_requests: Vec::new(),
         compression_snapshots: prompt_context.compression_snapshots,
         message_source_sequences: prompt_context.message_source_sequences,
         active_tool_start_index: prompt_context.active_tool_start_index,
@@ -7197,47 +7298,16 @@ fn persist_chat_result(
 ) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
+    let final_state = outcome.final_state;
 
-    database
-        .insert_llm_request(NewLlmRequest {
-            id: &context.llm_request_id,
-            workspace_id: &context.workspace_id,
-            chat_id: Some(&context.chat_id),
-            provider_id: &context.provider_id,
-            model_id: &context.model_id,
-            request_started_at,
-            first_token_at: outcome.first_token_at.as_deref(),
-            completed_at: Some(&outcome.completed_at),
-            input_tokens: outcome.input_tokens,
-            output_tokens: outcome.output_tokens,
-            cache_read_tokens: outcome.cache_read_tokens,
-            cache_write_tokens: outcome.cache_write_tokens,
-            first_token_latency_ms: outcome.first_token_latency_ms,
-            total_latency_ms: Some(outcome.total_latency_ms),
-            status_code: outcome.status_code,
-            final_state: outcome.final_state,
-            request_body_json: Some(&context.request_body_json),
-            response_body_json: outcome.response_body_json.as_deref(),
-        })
-        .map_err(ApiError::from_workspace_error)?;
-
-    for (index, event) in events.iter().enumerate() {
-        let sequence = i64::try_from(index).map_err(|_| {
-            ApiError::internal("too many LLM request events to fit SQLite sequence")
-        })?;
-        let id = format!("{}-event-{sequence}", context.llm_request_id);
-
-        database
-            .insert_llm_request_event(NewLlmRequestEvent {
-                id: &id,
-                llm_request_id: &context.llm_request_id,
-                sequence,
-                event_at: &event.event_at,
-                event_type: &event.event_type,
-                raw_chunk_json: None,
-                normalized_event_json: &event.normalized_event_json,
-            })
-            .map_err(ApiError::from_workspace_error)?;
+    if context.captured_llm_requests.is_empty() {
+        let run_request =
+            CapturedLlmRequest::from_run_context(context, request_started_at, outcome, events);
+        persist_llm_request(&mut database, context, &run_request)?;
+    } else {
+        for llm_request in &context.captured_llm_requests {
+            persist_llm_request(&mut database, context, llm_request)?;
+        }
     }
 
     let assistant_message_id = if let Some(assistant_text) = assistant_text {
@@ -7295,7 +7365,57 @@ fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
-    queue_memory_extraction_job(context, outcome.final_state)?;
+    queue_memory_extraction_job(context, final_state)?;
+
+    Ok(())
+}
+
+fn persist_llm_request(
+    database: &mut WorkspaceDatabase,
+    context: &PreparedChatContext,
+    request: &CapturedLlmRequest,
+) -> Result<(), ApiError> {
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: &request.id,
+            workspace_id: &context.workspace_id,
+            chat_id: Some(&context.chat_id),
+            provider_id: &context.provider_id,
+            model_id: &context.model_id,
+            request_started_at: &request.request_started_at,
+            first_token_at: request.outcome.first_token_at.as_deref(),
+            completed_at: Some(&request.outcome.completed_at),
+            input_tokens: request.outcome.input_tokens,
+            output_tokens: request.outcome.output_tokens,
+            cache_read_tokens: request.outcome.cache_read_tokens,
+            cache_write_tokens: request.outcome.cache_write_tokens,
+            first_token_latency_ms: request.outcome.first_token_latency_ms,
+            total_latency_ms: Some(request.outcome.total_latency_ms),
+            status_code: request.outcome.status_code,
+            final_state: request.outcome.final_state,
+            request_body_json: Some(&request.request_body_json),
+            response_body_json: request.outcome.response_body_json.as_deref(),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    for (index, event) in request.events.iter().enumerate() {
+        let sequence = i64::try_from(index).map_err(|_| {
+            ApiError::internal("too many LLM request events to fit SQLite sequence")
+        })?;
+        let id = format!("{}-event-{sequence}", request.id);
+
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: &id,
+                llm_request_id: &request.id,
+                sequence,
+                event_at: &event.event_at,
+                event_type: &event.event_type,
+                raw_chunk_json: None,
+                normalized_event_json: &event.normalized_event_json,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
 
     Ok(())
 }
@@ -9992,13 +10112,13 @@ fn failed_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome 
 }
 
 fn failed_provider_audit_outcome(
-    started_at: Instant,
+    request_started_at: Instant,
     message: &str,
     status_code: Option<i64>,
 ) -> ChatAuditOutcome {
     ChatAuditOutcome {
         status_code,
-        ..failed_audit_outcome(started_at, message)
+        ..failed_audit_outcome(request_started_at, message)
     }
 }
 
@@ -12981,7 +13101,7 @@ fn normalized_ai_statistics_query(
     query: AiStatisticsQuery,
 ) -> Result<NormalizedAiStatisticsFilters, ApiError> {
     let page = query.page.unwrap_or(1);
-    let page_size = query.page_size.or(query.limit).unwrap_or(50);
+    let page_size = query.page_size.or(query.limit).unwrap_or(20);
 
     if page < 1 {
         return Err(ApiError::bad_request(
@@ -13774,36 +13894,48 @@ fn assistant_reply_metrics(
     llm_request_events: &[LlmRequestEventRecord],
 ) -> Result<Option<ChatReplyMetrics>, ApiError> {
     let request_ids = assistant_message_request_ids(message_id, llm_request_events)?;
-    let Some(request_id) = request_ids.first() else {
+    if request_ids.is_empty() {
         return Ok(None);
-    };
-
-    if request_ids.len() > 1 {
-        return Err(ApiError::internal(format!(
-            "assistant message '{message_id}' is linked to multiple LLM requests"
-        )));
     }
 
-    let request = database
-        .llm_request(request_id)
-        .map_err(ApiError::from_workspace_error)?
-        .ok_or_else(|| {
-            ApiError::internal(format!(
-                "assistant message '{message_id}' is linked to missing LLM request '{request_id}'"
-            ))
-        })?;
+    let mut requests = Vec::with_capacity(request_ids.len());
+    for request_id in request_ids {
+        let request = database
+            .llm_request(&request_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "assistant message '{message_id}' is linked to missing LLM request '{request_id}'"
+                ))
+            })?;
+        requests.push(request);
+    }
 
-    Ok(Some(chat_reply_metrics_from_request(&request)))
+    Ok(Some(chat_reply_metrics_from_requests(&requests)))
 }
 
-fn chat_reply_metrics_from_request(request: &LlmRequestRecord) -> ChatReplyMetrics {
+fn chat_reply_metrics_from_requests(requests: &[LlmRequestRecord]) -> ChatReplyMetrics {
+    let first_request = requests
+        .first()
+        .expect("assistant reply metrics require at least one LLM request");
+
     ChatReplyMetrics {
-        model_id: request.model_id.clone(),
-        provider_id: request.provider_id.clone(),
-        total_latency_ms: request.total_latency_ms,
-        first_token_latency_ms: request.first_token_latency_ms,
-        output_tokens: request.output_tokens,
+        model_id: first_request.model_id.clone(),
+        provider_id: first_request.provider_id.clone(),
+        total_latency_ms: sum_optional_i64(requests.iter().map(|request| request.total_latency_ms)),
+        first_token_latency_ms: first_request.first_token_latency_ms,
+        output_tokens: sum_optional_i64(requests.iter().map(|request| request.output_tokens)),
     }
+}
+
+fn sum_optional_i64(values: impl IntoIterator<Item = Option<i64>>) -> Option<i64> {
+    let mut total = 0_i64;
+
+    for value in values {
+        total += value?;
+    }
+
+    Some(total)
 }
 
 fn chat_message_parts(
@@ -14348,6 +14480,44 @@ mod tests {
             name: name.to_string(),
             arguments,
             thought_signatures: None,
+        }
+    }
+
+    fn captured_test_llm_request(
+        request_id: &str,
+        assistant_message_id: &str,
+        output_tokens: i64,
+        total_latency_ms: i64,
+    ) -> CapturedLlmRequest {
+        CapturedLlmRequest {
+            id: request_id.to_string(),
+            request_started_at: "2026-06-06T09:00:00Z".to_string(),
+            request_body_json: "{}".to_string(),
+            events: vec![CapturedAuditEvent {
+                event_at: "2026-06-06T09:00:00Z".to_string(),
+                event_type: "start".to_string(),
+                normalized_event_json: json!({
+                    "type": "start",
+                    "chatId": "chat-1",
+                    "userMessageId": "user-1",
+                    "assistantMessageId": assistant_message_id,
+                    "llmRequestId": request_id,
+                })
+                .to_string(),
+            }],
+            outcome: ChatAuditOutcome {
+                first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
+                completed_at: "2026-06-06T09:00:01Z".to_string(),
+                first_token_latency_ms: Some(100),
+                total_latency_ms,
+                input_tokens: Some(100),
+                output_tokens: Some(output_tokens),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                status_code: Some(200),
+                final_state: "succeeded",
+                response_body_json: Some("{}".to_string()),
+            },
         }
     }
 
@@ -15487,6 +15657,7 @@ description: Project memory.
             memories_used: Vec::new(),
             memory_target_status: MemoryStatus::Pending,
             request_body_json: "{}".to_string(),
+            captured_llm_requests: Vec::new(),
             compression_snapshots: Vec::new(),
             message_source_sequences: vec![Some(0)],
             active_tool_start_index: 1,
@@ -15564,6 +15735,129 @@ description: Project memory.
     }
 
     #[test]
+    fn persist_chat_result_writes_each_captured_llm_request() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-multi-audit-request-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            database
+                .insert_chat("chat-1", "Multi audit chat")
+                .expect("chat insert");
+        }
+        let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
+        let mcp_registry = Arc::new(McpRegistry::default());
+        let context = PreparedChatContext {
+            workspace_id: "workspace-1".to_string(),
+            workspace_path: workspace_dir.clone(),
+            memory_database_file: workspace_dir.join("global-memory.sqlite"),
+            chat_id: "chat-1".to_string(),
+            provider_id: "openai-responses".to_string(),
+            model_id: "gpt-5.4".to_string(),
+            user_message_id: "user-1".to_string(),
+            assistant_message_id: "assistant-1".to_string(),
+            llm_request_id: "run-1".to_string(),
+            assistant_sequence: 1,
+            provider_config: ProviderConnectionConfig {
+                kind: foco_providers::ProviderKind::OpenAiResponses,
+                base_url: None,
+                api_key: Some("test-key".to_string()),
+                proxy_url: None,
+            },
+            provider_request: NeutralChatRequest {
+                model_id: "gpt-5.4".to_string(),
+                messages: vec![neutral_text_message(
+                    NeutralChatRole::User,
+                    "Hello".to_string(),
+                )],
+                tools: Vec::new(),
+                thinking_level: None,
+                max_output_tokens: Some(16),
+            },
+            hook_runtime: HookRuntime::new(mcp_registry.clone()),
+            global_hooks: HookConfig::default(),
+            mcp_registry,
+            question_registry: QuestionRegistry::default(),
+            app_shutdown_rx,
+            context_budget: foco_agent::ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 16,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: 984,
+            },
+            global_config: GlobalConfig::first_run(workspace_dir.clone()),
+            memory_settings: MemorySettings {
+                enabled: false,
+                extraction_mode: "manual".to_string(),
+                retention_days: None,
+                extraction_model_id: None,
+            },
+            memories_used: Vec::new(),
+            memory_target_status: MemoryStatus::Pending,
+            request_body_json: "{}".to_string(),
+            captured_llm_requests: vec![
+                captured_test_llm_request("request-1", "assistant-1", 10, 1_000),
+                captured_test_llm_request("request-2", "assistant-1", 20, 1_500),
+            ],
+            compression_snapshots: Vec::new(),
+            message_source_sequences: vec![Some(0)],
+            active_tool_start_index: 1,
+            hook_context_messages: Vec::new(),
+            hook_notifications: Vec::new(),
+        };
+        let outcome = ChatAuditOutcome {
+            first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
+            completed_at: "2026-06-06T09:00:02Z".to_string(),
+            first_token_latency_ms: Some(100),
+            total_latency_ms: 2_500,
+            input_tokens: Some(30),
+            output_tokens: Some(30),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            status_code: Some(200),
+            final_state: "succeeded",
+            response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+        };
+
+        persist_chat_result(
+            &context,
+            "2026-06-06T09:00:00Z",
+            outcome,
+            &[],
+            Some("Done."),
+            None,
+            &[],
+        )
+        .expect("persist chat result");
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        assert!(
+            database
+                .llm_request("run-1")
+                .expect("run audit lookup")
+                .is_none()
+        );
+        assert!(
+            database
+                .llm_request("request-1")
+                .expect("first request lookup")
+                .is_some()
+        );
+        assert!(
+            database
+                .llm_request("request-2")
+                .expect("second request lookup")
+                .is_some()
+        );
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
     fn persist_failed_chat_result_keeps_tool_calls_without_assistant_message() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-failed-tool-call-test"));
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -15626,6 +15920,7 @@ description: Project memory.
             memories_used: Vec::new(),
             memory_target_status: MemoryStatus::Pending,
             request_body_json: "{}".to_string(),
+            captured_llm_requests: Vec::new(),
             compression_snapshots: Vec::new(),
             message_source_sequences: vec![Some(0)],
             active_tool_start_index: 1,
@@ -16300,6 +16595,91 @@ description: Project memory.
         assert_eq!(summary.memories_used.len(), 1);
         assert_eq!(summary.memories_used[0].id, "fact-1");
         assert_eq!(summary.memories_used[0].source, "direct");
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn chat_message_summary_aggregates_multiple_llm_request_metrics() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-message-multi-metrics-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+
+        database
+            .insert_chat("chat-1", "Multi request metrics chat")
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "Done.",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("assistant message insert");
+
+        for (index, (request_id, output_tokens, latency_ms)) in [
+            ("request-1", 12_i64, 1_000_i64),
+            ("request-2", 28_i64, 1_500_i64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            database
+                .insert_llm_request(NewLlmRequest {
+                    id: request_id,
+                    workspace_id: "workspace-1",
+                    chat_id: Some("chat-1"),
+                    provider_id: "openai-responses",
+                    model_id: "gpt-5.4",
+                    request_started_at: "2026-06-06T09:00:00Z",
+                    first_token_at: Some("2026-06-06T09:00:00Z"),
+                    completed_at: Some("2026-06-06T09:00:02Z"),
+                    input_tokens: Some(100),
+                    output_tokens: Some(output_tokens),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    first_token_latency_ms: Some(if index == 0 { 250 } else { 300 }),
+                    total_latency_ms: Some(latency_ms),
+                    status_code: Some(200),
+                    final_state: "succeeded",
+                    request_body_json: Some("{}"),
+                    response_body_json: Some("{}"),
+                })
+                .expect("llm request insert");
+            database
+                .insert_llm_request_event(NewLlmRequestEvent {
+                    id: &format!("{request_id}-event-0"),
+                    llm_request_id: request_id,
+                    sequence: 0,
+                    event_at: "2026-06-06T09:00:00Z",
+                    event_type: "start",
+                    raw_chunk_json: None,
+                    normalized_event_json: &format!(
+                        r#"{{"type":"start","chatId":"chat-1","userMessageId":"user-1","assistantMessageId":"assistant-1","llmRequestId":"{request_id}"}}"#
+                    ),
+                })
+                .expect("llm start event insert");
+        }
+
+        let message = database
+            .messages_for_chat("chat-1")
+            .expect("messages")
+            .into_iter()
+            .next()
+            .expect("assistant message");
+        let events = database
+            .llm_request_events_for_chat("chat-1")
+            .expect("llm request events");
+        let summary = chat_message_summary(&database, message, &events).expect("message summary");
+        let metrics = summary.metrics.expect("assistant metrics");
+
+        assert_eq!(metrics.total_latency_ms, Some(2500));
+        assert_eq!(metrics.first_token_latency_ms, Some(250));
+        assert_eq!(metrics.output_tokens, Some(40));
 
         drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");

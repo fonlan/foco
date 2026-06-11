@@ -288,7 +288,7 @@ const memoryExtractionJob = {
 
 const aiStatistics = {
   page: 1,
-  pageSize: 50,
+  pageSize: 20,
   requests: [
     {
       cacheRatio: 0.25,
@@ -2317,11 +2317,15 @@ describe("App verification surfaces", () => {
     expect(await screen.findByText("API details")).toBeInTheDocument();
     expect(screen.getByText("Request audit")).toBeInTheDocument();
     const table = screen.getByRole("table");
+    expect(table.parentElement).toHaveClass("panel-scroll");
+    expect(table.parentElement).toHaveClass("overflow-x-auto");
+    expect(table.parentElement).not.toHaveClass("overflow-auto");
+    expect(table.closest(".overflow-y-auto")).toHaveClass("panel-scroll");
     expect(within(table).getByText("openai")).toBeInTheDocument();
     expect(within(table).getByText("gpt-test")).toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "Request audit pagination" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Go to page 2" })).toBeInTheDocument();
-    expect(screen.getByLabelText("Page size")).toBeInTheDocument();
+    expect(screen.getByLabelText("Page size")).toHaveValue(20);
 
     await userEvent.click(screen.getByText("Columns"));
     await userEvent.click(screen.getByRole("checkbox", { name: "Provider" }));

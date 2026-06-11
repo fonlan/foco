@@ -7530,7 +7530,7 @@ function ApiStatsPanel({
   const summary = stats?.summary ?? emptyAiStatisticsSummary();
   const totalCount = stats?.totalCount ?? summary.totalRequests;
   const currentPage = stats?.page ?? positiveIntegerText(filters.page, 1);
-  const pageSize = stats?.pageSize ?? positiveIntegerText(filters.pageSize, 50);
+  const pageSize = stats?.pageSize ?? positiveIntegerText(filters.pageSize, 20);
   const totalPages =
     stats?.totalPages ?? (totalCount ? Math.ceil(totalCount / pageSize) : 0);
   const paginationItems = auditPaginationItems(currentPage, totalPages);
@@ -7789,7 +7789,7 @@ function ApiStatsPanel({
   }
 
   return (
-    <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
+    <div className="panel-scroll h-full min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
       <div className="flex w-full min-w-0 flex-col gap-5">
         <section className="rounded-2xl border border-stone-200 bg-white/80 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -7848,7 +7848,7 @@ function ApiStatsPanel({
           />
         </section>
 
-        <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+        <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
             <div>
               <h3 className="text-sm font-semibold text-stone-950">
@@ -7973,7 +7973,7 @@ function ApiStatsPanel({
               {error}
             </div>
           ) : null}
-          <div className="overflow-x-auto">
+          <div className="panel-scroll min-w-0 overflow-x-auto">
             <table className="w-full min-w-max text-left text-sm">
               <thead className="border-b border-stone-200 bg-white text-xs font-semibold text-stone-500">
                 <tr>
@@ -8174,13 +8174,13 @@ function AiRequestDetailDialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex min-h-0 items-center justify-center overflow-y-auto bg-stone-950/35 p-4 backdrop-blur-sm"
       role="presentation"
     >
       <section
         aria-labelledby="ai-request-detail-title"
         aria-modal="true"
-        className="flex max-h-[90vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        className="flex h-[min(90dvh,56rem)] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
         role="dialog"
       >
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
@@ -16048,7 +16048,7 @@ function emptyAiStatsFilters(): AiStatsFilterState {
     chatId: "",
     modelId: "",
     page: "1",
-    pageSize: "50",
+    pageSize: "20",
     providerId: "",
     startedAfter: "",
     startedBefore: "",
