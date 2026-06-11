@@ -2541,6 +2541,64 @@ describe("App verification surfaces", () => {
     expect(screen.queryByText("Binary files a/asset.bin and b/asset.bin differ")).not.toBeInTheDocument();
   });
 
+  it("deletes memories from the right panel memory tab", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<App />);
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Memory" }));
+
+    const globalItem = (await screen.findByText(activeMemory.fact)).closest("article");
+    const workspaceItem = (await screen.findByText(workspaceMemory.fact)).closest("article");
+    expect(globalItem).not.toBeNull();
+    expect(workspaceItem).not.toBeNull();
+
+    await userEvent.click(
+      within(globalItem!).getByRole("button", { name: "Delete memory" }),
+    );
+
+    await waitFor(() => {
+      expect(confirmSpy).toHaveBeenCalledWith("Delete memory confirmation");
+      const forgetCall = fetchMock.mock.calls.find(([url, init]) => {
+        if (url !== "/api/memory/forget") {
+          return false;
+        }
+
+        return JSON.parse(String(init?.body)).memoryId === activeMemory.id;
+      });
+      expect(forgetCall).toBeDefined();
+      expect(JSON.parse(String(forgetCall?.[1]?.body))).toEqual({
+        memoryId: activeMemory.id,
+        scope: "global",
+        workspaceId: null,
+      });
+    });
+
+    await userEvent.click(
+      within(workspaceItem!).getByRole("button", { name: "Delete memory" }),
+    );
+
+    await waitFor(() => {
+      const forgetCall = fetchMock.mock.calls.find(([url, init]) => {
+        if (url !== "/api/memory/forget") {
+          return false;
+        }
+
+        return JSON.parse(String(init?.body)).memoryId === workspaceMemory.id;
+      });
+      expect(forgetCall).toBeDefined();
+      expect(JSON.parse(String(forgetCall?.[1]?.body))).toEqual({
+        memoryId: workspaceMemory.id,
+        scope: "workspace",
+        workspaceId: workspace.id,
+      });
+    });
+
+    confirmSpy.mockRestore();
+  });
+
   it("opens the task graph sidebar when a task graph refresh arrives", async () => {
     render(<App />);
 

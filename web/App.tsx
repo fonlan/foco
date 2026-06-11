@@ -1908,6 +1908,9 @@ export function App() {
   const [contextMemoryError, setContextMemoryError] = useState<string | null>(
     null,
   );
+  const [deletingContextMemoryId, setDeletingContextMemoryId] = useState<
+    string | null
+  >(null);
   const [isSendingMessage, setIsSendingMessage] = useState(false);
   const [runningChatKey, setRunningChatKey] = useState<string | null>(null);
   const [failedChatKeySet, setFailedChatKeySet] = useState<Set<string>>(
@@ -2207,6 +2210,41 @@ export function App() {
       setIsLoadingContextMemories(false);
     }
   }, []);
+
+  const forgetContextMemory = useCallback(
+    async (memory: MemoryFactRecord) => {
+      if (!activeWorkspace?.id) {
+        return;
+      }
+      if (!window.confirm(t("Delete memory confirmation"))) {
+        return;
+      }
+
+      setDeletingContextMemoryId(memory.id);
+      setContextMemoryError(null);
+
+      try {
+        await requestJson<MemoryMutationResponse>("/api/memory/forget", {
+          body: JSON.stringify({
+            memoryId: memory.id,
+            scope: memory.scope,
+            workspaceId:
+              memory.scope === "global" ? null : activeWorkspace.id,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        });
+        await loadContextMemories(activeWorkspace.id);
+      } catch (requestError) {
+        setContextMemoryError(errorMessage(requestError));
+      } finally {
+        setDeletingContextMemoryId((current) =>
+          current === memory.id ? null : current,
+        );
+      }
+    },
+    [activeWorkspace?.id, loadContextMemories, t],
+  );
 
   const loadTaskGraph = useCallback(async (workspaceId: string, chatId: string) => {
     const requestedChatKey = chatRunKey(workspaceId, chatId);
@@ -4242,6 +4280,7 @@ export function App() {
             <ContextPanel
               activeTab={contextPanelTab}
               contextMemories={contextMemories}
+              deletingContextMemoryId={deletingContextMemoryId}
               contextMemoryError={contextMemoryError}
               diffError={diffError}
               diffResponse={gitDiff}
@@ -4254,6 +4293,7 @@ export function App() {
                   void loadGitDiff(activeWorkspace.id, selectedDiffPath);
                 }
               }}
+              onForgetContextMemory={(memory) => void forgetContextMemory(memory)}
               onSelectDiffFile={setSelectedDiffPath}
               onTabChange={(tab) => {
                 setContextPanelTab(tab);
@@ -8629,6 +8669,7 @@ function TaskGraphPanel({
 function ContextPanel({
   activeTab,
   contextMemories,
+  deletingContextMemoryId,
   contextMemoryError,
   diffError,
   diffResponse,
@@ -8636,6 +8677,7 @@ function ContextPanel({
   isLoadingContextMemories,
   isLoadingDiff,
   isLoadingTaskGraph,
+  onForgetContextMemory,
   onRefreshDiff,
   onSelectDiffFile,
   onTabChange,
@@ -8645,6 +8687,7 @@ function ContextPanel({
 }: {
   activeTab: ContextPanelTab;
   contextMemories: ContextMemoryState;
+  deletingContextMemoryId: string | null;
   contextMemoryError: string | null;
   diffError: string | null;
   diffResponse: GitDiffResponse | null;
@@ -8652,6 +8695,7 @@ function ContextPanel({
   isLoadingContextMemories: boolean;
   isLoadingDiff: boolean;
   isLoadingTaskGraph: boolean;
+  onForgetContextMemory: (memory: MemoryFactRecord) => void;
   onRefreshDiff: () => void;
   onSelectDiffFile: (path: string | null) => void;
   onTabChange: (tab: ContextPanelTab) => void;
@@ -8714,9 +8758,11 @@ function ContextPanel({
 
         {activeTab === "memory" ? (
           <ContextMemoryTab
+            deletingMemoryId={deletingContextMemoryId}
             error={contextMemoryError}
             isLoading={isLoadingContextMemories}
             memories={contextMemories}
+            onForgetMemory={onForgetContextMemory}
           />
         ) : null}
       </div>
@@ -8755,13 +8801,17 @@ function ContextTaskGraphTab({
 }
 
 function ContextMemoryTab({
+  deletingMemoryId,
   error,
   isLoading,
   memories,
+  onForgetMemory,
 }: {
+  deletingMemoryId: string | null;
   error: string | null;
   isLoading: boolean;
   memories: ContextMemoryState;
+  onForgetMemory: (memory: MemoryFactRecord) => void;
 }) {
   const { t } = useI18n();
 
@@ -8782,14 +8832,18 @@ function ContextMemoryTab({
       ) : (
         <>
           <ContextMemoryGroup
+            deletingMemoryId={deletingMemoryId}
             emptyLabel={t("No memories")}
             label={t("Global memory")}
             memories={memories.global}
+            onForgetMemory={onForgetMemory}
           />
           <ContextMemoryGroup
+            deletingMemoryId={deletingMemoryId}
             emptyLabel={t("No memories")}
             label={t("Workspace memory")}
             memories={memories.workspace}
+            onForgetMemory={onForgetMemory}
           />
         </>
       )}
@@ -8798,14 +8852,20 @@ function ContextMemoryTab({
 }
 
 function ContextMemoryGroup({
+  deletingMemoryId,
   emptyLabel,
   label,
   memories,
+  onForgetMemory,
 }: {
+  deletingMemoryId: string | null;
   emptyLabel: string;
   label: string;
   memories: MemoryFactRecord[];
+  onForgetMemory: (memory: MemoryFactRecord) => void;
 }) {
+  const { t } = useI18n();
+
   return (
     <div className="context-memory-group">
       <div className="context-panel-section-title">{label}</div>
@@ -8813,10 +8873,26 @@ function ContextMemoryGroup({
         memories.map((memory) => (
           <article className="context-memory-item" key={memory.id}>
             <div className="context-memory-item-header">
-              <span className="context-memory-kind">{memory.kind}</span>
-              {memory.pinned ? (
-                <span className="context-memory-pin">pinned</span>
-              ) : null}
+              <div className="context-memory-badges">
+                <span className="context-memory-kind">{memory.kind}</span>
+                {memory.pinned ? (
+                  <span className="context-memory-pin">pinned</span>
+                ) : null}
+              </div>
+              <button
+                aria-label={t("Delete memory")}
+                className="context-memory-delete-button"
+                disabled={deletingMemoryId === memory.id}
+                onClick={() => onForgetMemory(memory)}
+                title={t("Delete memory")}
+                type="button"
+              >
+                {deletingMemoryId === memory.id ? (
+                  <LoaderCircle aria-hidden="true" className="animate-spin" />
+                ) : (
+                  <Trash2 aria-hidden="true" />
+                )}
+              </button>
             </div>
             <p>{memory.fact}</p>
             <small>
