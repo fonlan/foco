@@ -1321,6 +1321,15 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Local memory graph and review queue": "本地记忆图与审核队列",
     "Memory controls": "记忆控制",
     "Enable memory": "启用记忆",
+    "General memory control": "记忆总控",
+    "Controls whether memory tools, retrieval, and extraction are available.":
+      "控制记忆工具、检索和抽取是否可用。",
+    "Memory extraction": "记忆抽取",
+    "Controls how new facts are extracted and how long they are retained.":
+      "控制新事实如何抽取，以及保留多久。",
+    "Memory retrieval": "记忆匹配",
+    "Controls how existing memory is matched into chat context.":
+      "控制已有记忆如何匹配进聊天上下文。",
     "Extraction mode": "抽取模式",
     "Memory matching": "记忆匹配",
     "Retention days": "保留天数",
@@ -11367,121 +11376,178 @@ function SettingsPanel({
                 {t("Memory controls")}
               </h3>
             </div>
-            <div className="mt-4 grid gap-3 sm:grid-cols-2">
-              <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                <span className="text-sm font-semibold text-stone-700">
-                  {t("Enable memory")}
-                </span>
-                <input
-                  checked={memorySettingsForm.enabled}
-                  className="size-4 accent-teal-700"
-                  onChange={(event) =>
-                    setMemorySettingsForm((current) => ({
-                      ...current,
-                      enabled: event.target.checked,
-                    }))
-                  }
-                  type="checkbox"
-                />
-              </label>
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                  {t("Extraction mode")}
-                </span>
-                <select
-                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) =>
-                    setMemorySettingsForm((current) => ({
-                      ...current,
-                      extractionMode: event.target.value,
-                    }))
-                  }
-                  value={memorySettingsForm.extractionMode}
-                >
-                  {(settings?.memory.extractionModes ?? []).map((mode) => (
-                    <option key={mode.value} value={mode.value}>
-                      {t(mode.label)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                  {t("Memory matching")}
-                </span>
-                <select
-                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) =>
-                    setMemorySettingsForm((current) => ({
-                      ...current,
-                      retrievalMode: event.target.value,
-                    }))
-                  }
-                  value={memorySettingsForm.retrievalMode}
-                >
-                  {(settings?.memory.retrievalModes ?? []).map((mode) => (
-                    <option key={mode.value} value={mode.value}>
-                      {t(mode.label)}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <TextField
-                inputMode="numeric"
-                label={t("Retention days")}
-                onChange={(value) =>
-                  setMemorySettingsForm((current) => ({
-                    ...current,
-                    retentionDays: value,
-                  }))
-                }
-                placeholder="90"
-                value={memorySettingsForm.retentionDays}
-              />
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                  {t("Extraction model")}
-                </span>
-                <select
-                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) =>
-                    setMemorySettingsForm((current) => ({
-                      ...current,
-                      extractionModelId: event.target.value,
-                    }))
-                  }
-                  value={memorySettingsForm.extractionModelId}
-                >
-                  <option value="">{t("Default")}</option>
-                  {(settings?.configuredModels ?? []).map((model) => (
-                    <option key={model.id} value={model.id}>
-                      {model.displayName}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                  {t("Matching model")}
-                </span>
-                <select
-                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) =>
-                    setMemorySettingsForm((current) => ({
-                      ...current,
-                      retrievalModelId: event.target.value,
-                    }))
-                  }
-                  value={memorySettingsForm.retrievalModelId}
-                >
-                  <option value="">{t("Current chat model")}</option>
-                  {(settings?.configuredModels ?? []).map((model) => (
-                    <option key={model.id} value={model.id}>
-                      {model.displayName}
-                    </option>
-                  ))}
-                </select>
-              </label>
+            <div className="mt-4 grid gap-3">
+              <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                <legend className="px-1 text-xs font-semibold text-stone-600">
+                  {t("General memory control")}
+                </legend>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <p className="text-sm font-semibold text-stone-800">
+                      {t("Enable memory")}
+                    </p>
+                    <p className="mt-1 text-xs text-stone-500">
+                      {t(
+                        "Controls whether memory tools, retrieval, and extraction are available.",
+                      )}
+                    </p>
+                  </div>
+                  <label
+                    aria-label={t("Enable memory")}
+                    className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                  >
+                    <input
+                      checked={memorySettingsForm.enabled}
+                      className="size-4 accent-teal-700"
+                      onChange={(event) =>
+                        setMemorySettingsForm((current) => ({
+                          ...current,
+                          enabled: event.target.checked,
+                        }))
+                      }
+                      type="checkbox"
+                    />
+                  </label>
+                </div>
+              </fieldset>
+
+              <div className="grid gap-3 xl:grid-cols-2">
+                <fieldset className="rounded-xl border border-stone-200 bg-white/75 px-3 py-3">
+                  <legend className="px-1 text-xs font-semibold text-stone-600">
+                    {t("Memory extraction")}
+                  </legend>
+                  <div className="mb-3 flex items-start gap-2">
+                    <SlidersHorizontal
+                      aria-hidden="true"
+                      className="mt-0.5 size-4 shrink-0 text-teal-700"
+                    />
+                    <p className="text-xs text-stone-500">
+                      {t(
+                        "Controls how new facts are extracted and how long they are retained.",
+                      )}
+                    </p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Extraction mode")}
+                      </span>
+                      <select
+                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) =>
+                          setMemorySettingsForm((current) => ({
+                            ...current,
+                            extractionMode: event.target.value,
+                          }))
+                        }
+                        value={memorySettingsForm.extractionMode}
+                      >
+                        {(settings?.memory.extractionModes ?? []).map((mode) => (
+                          <option key={mode.value} value={mode.value}>
+                            {t(mode.label)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Extraction model")}
+                      </span>
+                      <select
+                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) =>
+                          setMemorySettingsForm((current) => ({
+                            ...current,
+                            extractionModelId: event.target.value,
+                          }))
+                        }
+                        value={memorySettingsForm.extractionModelId}
+                      >
+                        <option value="">{t("Default")}</option>
+                        {(settings?.configuredModels ?? []).map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.displayName}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="sm:col-span-2">
+                      <TextField
+                        inputMode="numeric"
+                        label={t("Retention days")}
+                        onChange={(value) =>
+                          setMemorySettingsForm((current) => ({
+                            ...current,
+                            retentionDays: value,
+                          }))
+                        }
+                        placeholder="90"
+                        value={memorySettingsForm.retentionDays}
+                      />
+                    </div>
+                  </div>
+                </fieldset>
+
+                <fieldset className="rounded-xl border border-stone-200 bg-white/75 px-3 py-3">
+                  <legend className="px-1 text-xs font-semibold text-stone-600">
+                    {t("Memory retrieval")}
+                  </legend>
+                  <div className="mb-3 flex items-start gap-2">
+                    <Brain
+                      aria-hidden="true"
+                      className="mt-0.5 size-4 shrink-0 text-teal-700"
+                    />
+                    <p className="text-xs text-stone-500">
+                      {t("Controls how existing memory is matched into chat context.")}
+                    </p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Memory matching")}
+                      </span>
+                      <select
+                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) =>
+                          setMemorySettingsForm((current) => ({
+                            ...current,
+                            retrievalMode: event.target.value,
+                          }))
+                        }
+                        value={memorySettingsForm.retrievalMode}
+                      >
+                        {(settings?.memory.retrievalModes ?? []).map((mode) => (
+                          <option key={mode.value} value={mode.value}>
+                            {t(mode.label)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        {t("Matching model")}
+                      </span>
+                      <select
+                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) =>
+                          setMemorySettingsForm((current) => ({
+                            ...current,
+                            retrievalModelId: event.target.value,
+                          }))
+                        }
+                        value={memorySettingsForm.retrievalModelId}
+                      >
+                        <option value="">{t("Current chat model")}</option>
+                        {(settings?.configuredModels ?? []).map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.displayName}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                </fieldset>
+              </div>
             </div>
             <button
               aria-label={t("Save memory settings")}
