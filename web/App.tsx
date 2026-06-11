@@ -833,7 +833,7 @@ type TaskStatus =
   | "failed"
   | "cancelled";
 
-type TaskGraphTask = {
+type TodoGraphTask = {
   id: string;
   title: string;
   status: TaskStatus;
@@ -842,13 +842,13 @@ type TaskGraphTask = {
   summary: string | null;
   createdAt: string;
   updatedAt: string;
-  subtasks: TaskGraphTask[];
+  subtasks: TodoGraphTask[];
 };
 
-type TaskGraphResponse = {
+type TodoGraphResponse = {
   chatId: string;
   exists: boolean;
-  tasks: TaskGraphTask[];
+  tasks: TodoGraphTask[];
   createdAt: string | null;
   updatedAt: string | null;
 };
@@ -969,7 +969,7 @@ type ChatStreamEvent =
       workspaceId: string;
     }
   | {
-      type: "taskGraphRefresh";
+      type: "todoGraphRefresh";
       workspaceId: string;
       chatId: string;
     }
@@ -992,7 +992,7 @@ type SettingsSection =
   | "skills"
   | "workspaces";
 type ViewMode = "chat" | "settings" | "stats";
-type ContextPanelTab = "task" | "git" | "memory";
+type ContextPanelTab = "todo" | "git" | "memory";
 type BrowserRoute =
   | { viewMode: "chat"; workspaceId: string | null; chatId: string | null }
   | { viewMode: "settings"; section: SettingsSection }
@@ -1335,12 +1335,12 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Copied: "已复制",
     "Copy {label}": "复制 {label}",
     "Resize git diff panel": "调整 Git diff 面板宽度",
-    "Resize task graph and git diff panels": "调整任务图和 Git diff 面板高度",
+    "Resize todo graph and git diff panels": "调整待办事项和 Git diff 面板高度",
     "Resize terminal panel": "调整终端面板高度",
     "New terminal": "新建终端",
     "Terminal sessions": "终端列表",
     "Terminal {number}": "终端 {number}",
-    "Task graph": "任务图",
+    "ToDo graph": "待办事项",
     "Updated {time}": "更新于 {time}",
     pending: "待处理",
     Active: "活跃",
@@ -1885,7 +1885,7 @@ export function App() {
   const [isSavingBranch, setIsSavingBranch] = useState(false);
   const [isContextPanelOpen, setIsContextPanelOpen] = useState(true);
   const [contextPanelTab, setContextPanelTab] =
-    useState<ContextPanelTab>("task");
+    useState<ContextPanelTab>("todo");
   const [diffPanelWidth, setDiffPanelWidth] = useState(420);
   const [isResizingDiffPanel, setIsResizingDiffPanel] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(288);
@@ -1898,9 +1898,9 @@ export function App() {
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
-  const [taskGraph, setTaskGraph] = useState<TaskGraphResponse | null>(null);
-  const [isLoadingTaskGraph, setIsLoadingTaskGraph] = useState(false);
-  const [taskGraphError, setTaskGraphError] = useState<string | null>(null);
+  const [todoGraph, setTodoGraph] = useState<TodoGraphResponse | null>(null);
+  const [isLoadingTodoGraph, setIsLoadingTodoGraph] = useState(false);
+  const [todoGraphError, setTodoGraphError] = useState<string | null>(null);
   const [contextMemories, setContextMemories] = useState<ContextMemoryState>({
     global: [],
     workspace: [],
@@ -2248,26 +2248,26 @@ export function App() {
     [activeWorkspace?.id, loadContextMemories, t],
   );
 
-  const loadTaskGraph = useCallback(async (workspaceId: string, chatId: string) => {
+  const loadTodoGraph = useCallback(async (workspaceId: string, chatId: string) => {
     const requestedChatKey = chatRunKey(workspaceId, chatId);
-    setIsLoadingTaskGraph(true);
-    setTaskGraphError(null);
+    setIsLoadingTodoGraph(true);
+    setTodoGraphError(null);
 
     try {
-      const data = await requestJson<TaskGraphResponse>(
-        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/task-graph`,
+      const data = await requestJson<TodoGraphResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/todo-graph`,
       );
       if (activeChatKeyRef.current === requestedChatKey) {
-        setTaskGraph(data);
+        setTodoGraph(data);
       }
     } catch (requestError) {
       if (activeChatKeyRef.current === requestedChatKey) {
-        setTaskGraph(null);
-        setTaskGraphError(errorMessage(requestError));
+        setTodoGraph(null);
+        setTodoGraphError(errorMessage(requestError));
       }
     } finally {
       if (activeChatKeyRef.current === requestedChatKey) {
-        setIsLoadingTaskGraph(false);
+        setIsLoadingTodoGraph(false);
       }
     }
   }, []);
@@ -2327,16 +2327,16 @@ export function App() {
 
   useEffect(() => {
     if (!activeWorkspace?.id || !activeChatId) {
-      setTaskGraph(null);
-      setTaskGraphError(null);
-      setIsLoadingTaskGraph(false);
+      setTodoGraph(null);
+      setTodoGraphError(null);
+      setIsLoadingTodoGraph(false);
       return;
     }
 
-    setTaskGraph(null);
-    setTaskGraphError(null);
-    void loadTaskGraph(activeWorkspace.id, activeChatId);
-  }, [activeChatId, activeWorkspace?.id, loadTaskGraph]);
+    setTodoGraph(null);
+    setTodoGraphError(null);
+    void loadTodoGraph(activeWorkspace.id, activeChatId);
+  }, [activeChatId, activeWorkspace?.id, loadTodoGraph]);
 
   useEffect(() => {
     if (contextPanelTab !== "memory" || !activeWorkspace?.id) {
@@ -3593,15 +3593,15 @@ export function App() {
           return;
         }
 
-        if (streamEvent.type === "taskGraphRefresh") {
+        if (streamEvent.type === "todoGraphRefresh") {
           const activeKey = activeChatKeyRef.current;
           if (
             activeKey ===
             chatRunKey(streamEvent.workspaceId, streamEvent.chatId)
           ) {
-            setContextPanelTab("task");
+            setContextPanelTab("todo");
             setIsContextPanelOpen(true);
-            void loadTaskGraph(streamEvent.workspaceId, streamEvent.chatId);
+            void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId);
           }
           return;
         }
@@ -4289,7 +4289,7 @@ export function App() {
               files={gitDiff?.files ?? []}
               isLoadingDiff={isLoadingDiff}
               isLoadingContextMemories={isLoadingContextMemories}
-              isLoadingTaskGraph={isLoadingTaskGraph}
+              isLoadingTodoGraph={isLoadingTodoGraph}
               onRefreshDiff={() => {
                 if (activeWorkspace?.id) {
                   void loadGitDiff(activeWorkspace.id, selectedDiffPath);
@@ -4302,8 +4302,8 @@ export function App() {
                 setIsContextPanelOpen(true);
               }}
               selectedPath={selectedDiffPath}
-              taskGraph={taskGraph}
-              taskGraphError={taskGraphError}
+              todoGraph={todoGraph}
+              todoGraphError={todoGraphError}
             />
           </div>
         </aside>
@@ -8642,14 +8642,14 @@ function StatsCard({
   );
 }
 
-function TaskGraphPanel({
+function TodoGraphPanel({
   error,
   isLoading,
-  taskGraph,
+  todoGraph,
 }: {
   error: string | null;
   isLoading: boolean;
-  taskGraph: TaskGraphResponse;
+  todoGraph: TodoGraphResponse;
 }) {
   const { language, t } = useI18n();
 
@@ -8662,14 +8662,14 @@ function TaskGraphPanel({
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">
-              {t("Task graph")}
+              {t("ToDo graph")}
             </h2>
             <p className="truncate text-xs font-medium text-stone-500">
-              {taskGraph.updatedAt
+              {todoGraph.updatedAt
                 ? t("Updated {time}", {
-                    time: formatTaskGraphDate(taskGraph.updatedAt, language),
+                    time: formatTodoGraphDate(todoGraph.updatedAt, language),
                   })
-                : taskGraph.chatId}
+                : todoGraph.chatId}
             </p>
           </div>
         </div>
@@ -8687,8 +8687,8 @@ function TaskGraphPanel({
       ) : null}
       <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3">
         <div className="space-y-2">
-          {taskGraph.tasks.map((task) => (
-            <TaskGraphTaskItem key={task.id} level={0} task={task} />
+          {todoGraph.tasks.map((task) => (
+            <TodoGraphTaskItem key={task.id} level={0} task={task} />
           ))}
         </div>
       </div>
@@ -8706,14 +8706,14 @@ function ContextPanel({
   files,
   isLoadingContextMemories,
   isLoadingDiff,
-  isLoadingTaskGraph,
+  isLoadingTodoGraph,
   onForgetContextMemory,
   onRefreshDiff,
   onSelectDiffFile,
   onTabChange,
   selectedPath,
-  taskGraph,
-  taskGraphError,
+  todoGraph,
+  todoGraphError,
 }: {
   activeTab: ContextPanelTab;
   contextMemories: ContextMemoryState;
@@ -8724,18 +8724,18 @@ function ContextPanel({
   files: GitStatusFileSummary[];
   isLoadingContextMemories: boolean;
   isLoadingDiff: boolean;
-  isLoadingTaskGraph: boolean;
+  isLoadingTodoGraph: boolean;
   onForgetContextMemory: (memory: MemoryFactRecord) => void;
   onRefreshDiff: () => void;
   onSelectDiffFile: (path: string | null) => void;
   onTabChange: (tab: ContextPanelTab) => void;
   selectedPath: string | null;
-  taskGraph: TaskGraphResponse | null;
-  taskGraphError: string | null;
+  todoGraph: TodoGraphResponse | null;
+  todoGraphError: string | null;
 }) {
   const { t } = useI18n();
   const tabs: { id: ContextPanelTab; label: string; icon: LucideIcon }[] = [
-    { id: "task", label: "Task", icon: ListChecks },
+    { id: "todo", label: "ToDo", icon: ListChecks },
     { id: "git", label: "Git", icon: GitCompare },
     { id: "memory", label: "Memory", icon: Brain },
   ];
@@ -8764,11 +8764,11 @@ function ContextPanel({
       </div>
 
       <div className="min-h-0 flex-1">
-        {activeTab === "task" ? (
-          <ContextTaskGraphTab
-            error={taskGraphError}
-            isLoading={isLoadingTaskGraph}
-            taskGraph={taskGraph}
+        {activeTab === "todo" ? (
+          <ContextTodoGraphTab
+            error={todoGraphError}
+            isLoading={isLoadingTodoGraph}
+            todoGraph={todoGraph}
           />
         ) : null}
 
@@ -8800,23 +8800,23 @@ function ContextPanel({
   );
 }
 
-function ContextTaskGraphTab({
+function ContextTodoGraphTab({
   error,
   isLoading,
-  taskGraph,
+  todoGraph,
 }: {
   error: string | null;
   isLoading: boolean;
-  taskGraph: TaskGraphResponse | null;
+  todoGraph: TodoGraphResponse | null;
 }) {
   const { t } = useI18n();
 
-  if (taskGraph?.exists && taskGraph.tasks.length) {
+  if (todoGraph?.exists && todoGraph.tasks.length) {
     return (
-      <TaskGraphPanel
+      <TodoGraphPanel
         error={error}
         isLoading={isLoading}
-        taskGraph={taskGraph}
+        todoGraph={todoGraph}
       />
     );
   }
@@ -8824,8 +8824,8 @@ function ContextTaskGraphTab({
   return (
     <div className="context-empty-state">
       <ListChecks aria-hidden="true" className="size-5" />
-      <h2>{t("Task graph")}</h2>
-      <p>{t("No task graph for the active session yet.")}</p>
+      <h2>{t("ToDo graph")}</h2>
+      <p>{t("No todo graph for the active session yet.")}</p>
     </div>
   );
 }
@@ -8926,7 +8926,7 @@ function ContextMemoryGroup({
             </div>
             <p>{memory.fact}</p>
             <small>
-              {memory.scope} · {formatTaskGraphDate(memory.updatedAt)}
+              {memory.scope} · {formatTodoGraphDate(memory.updatedAt)}
             </small>
           </article>
         ))
@@ -8937,16 +8937,16 @@ function ContextMemoryGroup({
   );
 }
 
-function flattenTaskGraphTasks(tasks: TaskGraphTask[]): TaskGraphTask[] {
-  return tasks.flatMap((task) => [task, ...flattenTaskGraphTasks(task.subtasks)]);
+function flattenTodoGraphTasks(tasks: TodoGraphTask[]): TodoGraphTask[] {
+  return tasks.flatMap((task) => [task, ...flattenTodoGraphTasks(task.subtasks)]);
 }
 
-function TaskGraphTaskItem({
+function TodoGraphTaskItem({
   level,
   task,
 }: {
   level: number;
-  task: TaskGraphTask;
+  task: TodoGraphTask;
 }) {
   const { t } = useI18n();
 
@@ -9005,7 +9005,7 @@ function TaskGraphTaskItem({
       {task.subtasks.length ? (
         <div className="mt-2 space-y-2">
           {task.subtasks.map((subtask) => (
-            <TaskGraphTaskItem
+            <TodoGraphTaskItem
               key={subtask.id}
               level={level + 1}
               task={subtask}
@@ -17597,7 +17597,7 @@ function formatAuditDate(value: string, language: AppLanguageId = "en") {
   }).format(date);
 }
 
-function formatTaskGraphDate(value: string, language: AppLanguageId = "en") {
+function formatTodoGraphDate(value: string, language: AppLanguageId = "en") {
   const date = new Date(value);
 
   if (Number.isNaN(date.getTime())) {
@@ -18272,8 +18272,8 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
   }
 
   if (
-    value.type === "taskGraphRefresh" ||
-    value.type === "task_graph_refresh"
+    value.type === "todoGraphRefresh" ||
+    value.type === "todo_graph_refresh"
   ) {
     const workspaceId = stringField(value, "workspaceId", "workspace_id");
     const chatId = stringField(value, "chatId", "chat_id");
@@ -18282,7 +18282,7 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       return null;
     }
 
-    return { type: "taskGraphRefresh", workspaceId, chatId };
+    return { type: "todoGraphRefresh", workspaceId, chatId };
   }
 
   if (value.type === "error") {

@@ -14,7 +14,7 @@ use crate::memory::WORKSPACE_MEMORY_SCHEMA_SQL;
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 7;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 8;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -44,6 +44,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 7,
         sql: WORKSPACE_MEMORY_SCHEMA_SQL,
+    },
+    Migration {
+        version: 8,
+        sql: MIGRATION_008,
     },
 ];
 
@@ -1403,25 +1407,25 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
-    pub fn upsert_task_graph(
+    pub fn upsert_todo_graph(
         &mut self,
         chat_id: &str,
-        tasks: Vec<TaskGraphTask>,
-    ) -> Result<TaskGraphRecord, WorkspaceDatabaseError> {
+        tasks: Vec<TodoGraphTask>,
+    ) -> Result<TodoGraphRecord, WorkspaceDatabaseError> {
         if self.chat(chat_id)?.is_none() {
-            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+            return Err(WorkspaceDatabaseError::InvalidTodoGraph {
                 message: format!("chat was not found: {chat_id}"),
             });
         }
 
         let now = now_timestamp();
-        let tasks = normalize_new_task_graph_tasks(tasks, &now)?;
+        let tasks = normalize_new_todo_graph_tasks(tasks, &now)?;
         let graph_json = serde_json::to_string(&tasks)
-            .map_err(|source| WorkspaceDatabaseError::TaskGraphJson { source })?;
+            .map_err(|source| WorkspaceDatabaseError::TodoGraphJson { source })?;
 
         self.connection
             .execute(
-                "INSERT INTO task_graphs
+                "INSERT INTO todo_graphs
                     (chat_id, graph_json, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?3)
                  ON CONFLICT(chat_id) DO UPDATE SET
@@ -1431,20 +1435,20 @@ impl WorkspaceDatabase {
             )
             .map_err(|source| self.sqlite_error(source))?;
 
-        self.task_graph(chat_id)?
-            .ok_or_else(|| WorkspaceDatabaseError::InvalidTaskGraph {
-                message: format!("task graph was not saved for chat: {chat_id}"),
+        self.todo_graph(chat_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidTodoGraph {
+                message: format!("todo graph was not saved for chat: {chat_id}"),
             })
     }
 
-    pub fn task_graph(
+    pub fn todo_graph(
         &self,
         chat_id: &str,
-    ) -> Result<Option<TaskGraphRecord>, WorkspaceDatabaseError> {
+    ) -> Result<Option<TodoGraphRecord>, WorkspaceDatabaseError> {
         self.connection
             .query_row(
                 "SELECT chat_id, graph_json, created_at, updated_at
-                 FROM task_graphs
+                 FROM todo_graphs
                  WHERE chat_id = ?1",
                 params![chat_id],
                 |row| {
@@ -1457,7 +1461,7 @@ impl WorkspaceDatabase {
                         )
                     })?;
 
-                    Ok(TaskGraphRecord {
+                    Ok(TodoGraphRecord {
                         chat_id: row.get(0)?,
                         tasks,
                         created_at: row.get(2)?,
@@ -1470,48 +1474,48 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
-    pub fn filtered_task_graph(
+    pub fn filtered_todo_graph(
         &self,
         chat_id: &str,
-        filter: TaskGraphFilter<'_>,
-    ) -> Result<Option<TaskGraphRecord>, WorkspaceDatabaseError> {
-        let Some(mut graph) = self.task_graph(chat_id)? else {
+        filter: TodoGraphFilter<'_>,
+    ) -> Result<Option<TodoGraphRecord>, WorkspaceDatabaseError> {
+        let Some(mut graph) = self.todo_graph(chat_id)? else {
             return Ok(None);
         };
 
-        graph.tasks = filter_task_graph_tasks(graph.tasks, filter)?;
+        graph.tasks = filter_todo_graph_tasks(graph.tasks, filter)?;
 
         Ok(Some(graph))
     }
 
-    pub fn update_task_graph_task(
+    pub fn update_todo_graph_task(
         &mut self,
         chat_id: &str,
         task_id: &str,
-        patch: TaskGraphTaskPatch,
-    ) -> Result<TaskGraphRecord, WorkspaceDatabaseError> {
+        patch: TodoGraphTaskPatch,
+    ) -> Result<TodoGraphRecord, WorkspaceDatabaseError> {
         let mut record =
-            self.task_graph(chat_id)?
-                .ok_or_else(|| WorkspaceDatabaseError::MissingTaskGraph {
+            self.todo_graph(chat_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::MissingTodoGraph {
                     chat_id: chat_id.to_string(),
                 })?;
         if task_id.trim().is_empty() {
-            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+            return Err(WorkspaceDatabaseError::InvalidTodoGraph {
                 message: "task id must not be empty".to_string(),
             });
         }
         let now = now_timestamp();
         let updated_task = update_task_by_id(&mut record.tasks, task_id.trim(), &patch, &now)?
-            .ok_or_else(|| WorkspaceDatabaseError::InvalidTaskGraph {
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidTodoGraph {
                 message: format!("task was not found: {}", task_id.trim()),
             })?;
-        validate_task_graph_tasks(&record.tasks)?;
+        validate_todo_graph_tasks(&record.tasks)?;
 
         let graph_json = serde_json::to_string(&record.tasks)
-            .map_err(|source| WorkspaceDatabaseError::TaskGraphJson { source })?;
+            .map_err(|source| WorkspaceDatabaseError::TodoGraphJson { source })?;
         self.connection
             .execute(
-                "UPDATE task_graphs
+                "UPDATE todo_graphs
                  SET graph_json = ?2, updated_at = ?3
                  WHERE chat_id = ?1",
                 params![chat_id, graph_json, now],
@@ -2135,7 +2139,7 @@ pub struct HookRunRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TaskGraphTask {
+pub struct TodoGraphTask {
     pub id: String,
     pub title: String,
     pub status: String,
@@ -2144,31 +2148,31 @@ pub struct TaskGraphTask {
     pub summary: String,
     pub created_at: String,
     pub updated_at: String,
-    pub subtasks: Vec<TaskGraphTask>,
+    pub subtasks: Vec<TodoGraphTask>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TaskGraphRecord {
+pub struct TodoGraphRecord {
     pub chat_id: String,
-    pub tasks: Vec<TaskGraphTask>,
+    pub tasks: Vec<TodoGraphTask>,
     pub created_at: String,
     pub updated_at: String,
-    pub updated_task: Option<TaskGraphTask>,
+    pub updated_task: Option<TodoGraphTask>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TaskGraphTaskPatch {
+pub struct TodoGraphTaskPatch {
     pub title: Option<String>,
     pub status: Option<String>,
     pub depends_on: Option<Vec<String>>,
     pub acceptance: Option<Vec<String>>,
     pub summary: Option<String>,
-    pub subtasks: Option<Vec<TaskGraphTask>>,
+    pub subtasks: Option<Vec<TodoGraphTask>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TaskGraphFilter<'a> {
+pub struct TodoGraphFilter<'a> {
     pub status: Option<&'a str>,
     pub task_id: Option<&'a str>,
     pub include_subtasks: bool,
@@ -2288,7 +2292,7 @@ pub enum WorkspaceDatabaseError {
     InvalidCodeGraphInput {
         message: String,
     },
-    InvalidTaskGraph {
+    InvalidTodoGraph {
         message: String,
     },
     InvalidAuditJson {
@@ -2305,7 +2309,7 @@ pub enum WorkspaceDatabaseError {
     MissingDatabaseParent {
         path: PathBuf,
     },
-    MissingTaskGraph {
+    MissingTodoGraph {
         chat_id: String,
     },
     MissingTerminalSession {
@@ -2321,7 +2325,7 @@ pub enum WorkspaceDatabaseError {
         path: PathBuf,
         source: rusqlite::Error,
     },
-    TaskGraphJson {
+    TodoGraphJson {
         source: serde_json::Error,
     },
     UnsupportedSchemaVersion {
@@ -2340,8 +2344,8 @@ impl fmt::Display for WorkspaceDatabaseError {
             Self::InvalidCodeGraphInput { message } => {
                 write!(formatter, "invalid code graph index data: {message}")
             }
-            Self::InvalidTaskGraph { message } => {
-                write!(formatter, "invalid task graph: {message}")
+            Self::InvalidTodoGraph { message } => {
+                write!(formatter, "invalid todo graph: {message}")
             }
             Self::InvalidAuditJson { field, source } => {
                 write!(formatter, "invalid LLM audit JSON in {field}: {source}")
@@ -2355,8 +2359,8 @@ impl fmt::Display for WorkspaceDatabaseError {
                 "workspace database path has no parent directory: {}",
                 path.display()
             ),
-            Self::MissingTaskGraph { chat_id } => {
-                write!(formatter, "task graph was not found for chat: {chat_id}")
+            Self::MissingTodoGraph { chat_id } => {
+                write!(formatter, "todo graph was not found for chat: {chat_id}")
             }
             Self::MissingTerminalSession { id } => {
                 write!(formatter, "terminal session was not found: {id}")
@@ -2370,8 +2374,8 @@ impl fmt::Display for WorkspaceDatabaseError {
             Self::Sqlite { path, source } => {
                 write!(formatter, "{} SQLite error: {}", path.display(), source)
             }
-            Self::TaskGraphJson { source } => {
-                write!(formatter, "invalid task graph JSON: {source}")
+            Self::TodoGraphJson { source } => {
+                write!(formatter, "invalid todo graph JSON: {source}")
             }
             Self::UnsupportedSchemaVersion {
                 path,
@@ -2399,13 +2403,13 @@ impl std::error::Error for WorkspaceDatabaseError {
             Self::InvalidAuditJson { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
-            Self::TaskGraphJson { source } => Some(source),
+            Self::TodoGraphJson { source } => Some(source),
             Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
-            | Self::InvalidTaskGraph { .. }
+            | Self::InvalidTodoGraph { .. }
             | Self::MissingDatabaseParent { .. }
             | Self::MissingLlmRequest { .. }
-            | Self::MissingTaskGraph { .. }
+            | Self::MissingTodoGraph { .. }
             | Self::MissingTerminalSession { .. }
             | Self::NonUtf8Path { .. }
             | Self::UnsupportedSchemaVersion { .. }
@@ -2613,56 +2617,56 @@ fn delete_code_graph_fts_entry(
     Ok(())
 }
 
-fn normalize_new_task_graph_tasks(
-    tasks: Vec<TaskGraphTask>,
+fn normalize_new_todo_graph_tasks(
+    tasks: Vec<TodoGraphTask>,
     now: &str,
-) -> Result<Vec<TaskGraphTask>, WorkspaceDatabaseError> {
+) -> Result<Vec<TodoGraphTask>, WorkspaceDatabaseError> {
     let mut normalized = Vec::with_capacity(tasks.len());
 
     for task in tasks {
-        normalized.push(normalize_task_graph_task(task, now)?);
+        normalized.push(normalize_todo_graph_task(task, now)?);
     }
 
-    validate_task_graph_tasks(&normalized)?;
+    validate_todo_graph_tasks(&normalized)?;
 
     Ok(normalized)
 }
 
-fn normalize_task_graph_task(
-    mut task: TaskGraphTask,
+fn normalize_todo_graph_task(
+    mut task: TodoGraphTask,
     now: &str,
-) -> Result<TaskGraphTask, WorkspaceDatabaseError> {
-    task.id = required_task_graph_text("id", task.id)?;
-    task.title = required_task_graph_text("title", task.title)?;
+) -> Result<TodoGraphTask, WorkspaceDatabaseError> {
+    task.id = required_todo_graph_text("id", task.id)?;
+    task.title = required_todo_graph_text("title", task.title)?;
     task.status = normalize_task_status(task.status)?;
-    task.depends_on = normalize_task_graph_text_array("dependsOn", task.depends_on)?;
-    task.acceptance = normalize_task_graph_text_array("acceptance", task.acceptance)?;
+    task.depends_on = normalize_todo_graph_text_array("dependsOn", task.depends_on)?;
+    task.acceptance = normalize_todo_graph_text_array("acceptance", task.acceptance)?;
     task.summary = task.summary.trim().to_string();
     task.created_at = now.to_string();
     task.updated_at = now.to_string();
-    task.subtasks = normalize_new_task_graph_tasks_without_validation(task.subtasks, now)?;
+    task.subtasks = normalize_new_todo_graph_tasks_without_validation(task.subtasks, now)?;
 
     Ok(task)
 }
 
-fn normalize_new_task_graph_tasks_without_validation(
-    tasks: Vec<TaskGraphTask>,
+fn normalize_new_todo_graph_tasks_without_validation(
+    tasks: Vec<TodoGraphTask>,
     now: &str,
-) -> Result<Vec<TaskGraphTask>, WorkspaceDatabaseError> {
+) -> Result<Vec<TodoGraphTask>, WorkspaceDatabaseError> {
     let mut normalized = Vec::with_capacity(tasks.len());
 
     for task in tasks {
-        normalized.push(normalize_task_graph_task(task, now)?);
+        normalized.push(normalize_todo_graph_task(task, now)?);
     }
 
     Ok(normalized)
 }
 
-fn required_task_graph_text(field: &str, value: String) -> Result<String, WorkspaceDatabaseError> {
+fn required_todo_graph_text(field: &str, value: String) -> Result<String, WorkspaceDatabaseError> {
     let value = value.trim().to_string();
 
     if value.is_empty() {
-        return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+        return Err(WorkspaceDatabaseError::InvalidTodoGraph {
             message: format!("{field} must not be empty"),
         });
     }
@@ -2670,7 +2674,7 @@ fn required_task_graph_text(field: &str, value: String) -> Result<String, Worksp
     Ok(value)
 }
 
-fn normalize_task_graph_text_array(
+fn normalize_todo_graph_text_array(
     field: &str,
     values: Vec<String>,
 ) -> Result<Vec<String>, WorkspaceDatabaseError> {
@@ -2678,7 +2682,7 @@ fn normalize_task_graph_text_array(
     let mut seen = HashSet::new();
 
     for value in values {
-        let value = required_task_graph_text(field, value)?;
+        let value = required_todo_graph_text(field, value)?;
 
         if seen.insert(value.clone()) {
             normalized.push(value);
@@ -2691,64 +2695,64 @@ fn normalize_task_graph_text_array(
 fn normalize_task_status(status: String) -> Result<String, WorkspaceDatabaseError> {
     let status = status.trim().to_string();
 
-    if is_task_graph_status(&status) {
+    if is_todo_graph_status(&status) {
         Ok(status)
     } else {
-        Err(WorkspaceDatabaseError::InvalidTaskGraph {
-            message: format!("status must be one of: {}", TASK_GRAPH_STATUSES.join(", ")),
+        Err(WorkspaceDatabaseError::InvalidTodoGraph {
+            message: format!("status must be one of: {}", TODO_GRAPH_STATUSES.join(", ")),
         })
     }
 }
 
-fn validate_task_graph_tasks(tasks: &[TaskGraphTask]) -> Result<(), WorkspaceDatabaseError> {
+fn validate_todo_graph_tasks(tasks: &[TodoGraphTask]) -> Result<(), WorkspaceDatabaseError> {
     let mut task_ids = HashSet::new();
     let mut dependencies = HashMap::new();
 
-    collect_task_graph_ids(tasks, &mut task_ids, &mut dependencies)?;
+    collect_todo_graph_ids(tasks, &mut task_ids, &mut dependencies)?;
 
     for (task_id, depends_on) in &dependencies {
         for dependency_id in depends_on {
             if dependency_id == task_id {
-                return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                return Err(WorkspaceDatabaseError::InvalidTodoGraph {
                     message: format!("task '{task_id}' cannot depend on itself"),
                 });
             }
 
             if !task_ids.contains(dependency_id) {
-                return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+                return Err(WorkspaceDatabaseError::InvalidTodoGraph {
                     message: format!("task '{task_id}' depends on missing task '{dependency_id}'"),
                 });
             }
         }
     }
 
-    validate_task_graph_dependency_cycles(&dependencies)
+    validate_todo_graph_dependency_cycles(&dependencies)
 }
 
-fn collect_task_graph_ids(
-    tasks: &[TaskGraphTask],
+fn collect_todo_graph_ids(
+    tasks: &[TodoGraphTask],
     task_ids: &mut HashSet<String>,
     dependencies: &mut HashMap<String, Vec<String>>,
 ) -> Result<(), WorkspaceDatabaseError> {
     for task in tasks {
         if !task_ids.insert(task.id.clone()) {
-            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+            return Err(WorkspaceDatabaseError::InvalidTodoGraph {
                 message: format!("duplicate task id: {}", task.id),
             });
         }
-        if !is_task_graph_status(&task.status) {
-            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+        if !is_todo_graph_status(&task.status) {
+            return Err(WorkspaceDatabaseError::InvalidTodoGraph {
                 message: format!("task '{}' has invalid status '{}'", task.id, task.status),
             });
         }
         dependencies.insert(task.id.clone(), task.depends_on.clone());
-        collect_task_graph_ids(&task.subtasks, task_ids, dependencies)?;
+        collect_todo_graph_ids(&task.subtasks, task_ids, dependencies)?;
     }
 
     Ok(())
 }
 
-fn validate_task_graph_dependency_cycles(
+fn validate_todo_graph_dependency_cycles(
     dependencies: &HashMap<String, Vec<String>>,
 ) -> Result<(), WorkspaceDatabaseError> {
     let mut states = HashMap::new();
@@ -2767,8 +2771,8 @@ fn visit_task_dependency(
 ) -> Result<(), WorkspaceDatabaseError> {
     match states.get(task_id).copied() {
         Some(1) => {
-            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
-                message: format!("task graph dependencies contain a cycle at '{task_id}'"),
+            return Err(WorkspaceDatabaseError::InvalidTodoGraph {
+                message: format!("todo graph dependencies contain a cycle at '{task_id}'"),
             });
         }
         Some(2) => return Ok(()),
@@ -2787,11 +2791,11 @@ fn visit_task_dependency(
 }
 
 fn update_task_by_id(
-    tasks: &mut [TaskGraphTask],
+    tasks: &mut [TodoGraphTask],
     task_id: &str,
-    patch: &TaskGraphTaskPatch,
+    patch: &TodoGraphTaskPatch,
     now: &str,
-) -> Result<Option<TaskGraphTask>, WorkspaceDatabaseError> {
+) -> Result<Option<TodoGraphTask>, WorkspaceDatabaseError> {
     for task in tasks {
         if task.id == task_id {
             apply_task_patch(task, patch, now)?;
@@ -2807,8 +2811,8 @@ fn update_task_by_id(
 }
 
 fn apply_task_patch(
-    task: &mut TaskGraphTask,
-    patch: &TaskGraphTaskPatch,
+    task: &mut TodoGraphTask,
+    patch: &TodoGraphTaskPatch,
     now: &str,
 ) -> Result<(), WorkspaceDatabaseError> {
     if patch.title.is_none()
@@ -2818,28 +2822,28 @@ fn apply_task_patch(
         && patch.summary.is_none()
         && patch.subtasks.is_none()
     {
-        return Err(WorkspaceDatabaseError::InvalidTaskGraph {
+        return Err(WorkspaceDatabaseError::InvalidTodoGraph {
             message: "task patch must update at least one field".to_string(),
         });
     }
 
     if let Some(title) = &patch.title {
-        task.title = required_task_graph_text("title", title.clone())?;
+        task.title = required_todo_graph_text("title", title.clone())?;
     }
     if let Some(status) = &patch.status {
         task.status = normalize_task_status(status.clone())?;
     }
     if let Some(depends_on) = &patch.depends_on {
-        task.depends_on = normalize_task_graph_text_array("dependsOn", depends_on.clone())?;
+        task.depends_on = normalize_todo_graph_text_array("dependsOn", depends_on.clone())?;
     }
     if let Some(acceptance) = &patch.acceptance {
-        task.acceptance = normalize_task_graph_text_array("acceptance", acceptance.clone())?;
+        task.acceptance = normalize_todo_graph_text_array("acceptance", acceptance.clone())?;
     }
     if let Some(summary) = &patch.summary {
         task.summary = summary.trim().to_string();
     }
     if let Some(subtasks) = &patch.subtasks {
-        task.subtasks = normalize_new_task_graph_tasks_without_validation(subtasks.clone(), now)?;
+        task.subtasks = normalize_new_todo_graph_tasks_without_validation(subtasks.clone(), now)?;
     }
 
     task.updated_at = now.to_string();
@@ -2847,14 +2851,14 @@ fn apply_task_patch(
     Ok(())
 }
 
-fn filter_task_graph_tasks(
-    tasks: Vec<TaskGraphTask>,
-    filter: TaskGraphFilter<'_>,
-) -> Result<Vec<TaskGraphTask>, WorkspaceDatabaseError> {
+fn filter_todo_graph_tasks(
+    tasks: Vec<TodoGraphTask>,
+    filter: TodoGraphFilter<'_>,
+) -> Result<Vec<TodoGraphTask>, WorkspaceDatabaseError> {
     if let Some(status) = filter.status {
-        if !is_task_graph_status(status) {
-            return Err(WorkspaceDatabaseError::InvalidTaskGraph {
-                message: format!("status must be one of: {}", TASK_GRAPH_STATUSES.join(", ")),
+        if !is_todo_graph_status(status) {
+            return Err(WorkspaceDatabaseError::InvalidTodoGraph {
+                message: format!("status must be one of: {}", TODO_GRAPH_STATUSES.join(", ")),
             });
         }
     }
@@ -2864,15 +2868,15 @@ fn filter_task_graph_tasks(
     }
 
     let mut matches = Vec::new();
-    collect_matching_task_graph_tasks(&tasks, filter, &mut matches);
+    collect_matching_todo_graph_tasks(&tasks, filter, &mut matches);
 
     Ok(matches)
 }
 
-fn collect_matching_task_graph_tasks(
-    tasks: &[TaskGraphTask],
-    filter: TaskGraphFilter<'_>,
-    matches: &mut Vec<TaskGraphTask>,
+fn collect_matching_todo_graph_tasks(
+    tasks: &[TodoGraphTask],
+    filter: TodoGraphFilter<'_>,
+    matches: &mut Vec<TodoGraphTask>,
 ) {
     for task in tasks {
         let status_matches = filter.status.is_none_or(|status| task.status == status);
@@ -2886,22 +2890,22 @@ fn collect_matching_task_graph_tasks(
             });
         }
 
-        collect_matching_task_graph_tasks(&task.subtasks, filter, matches);
+        collect_matching_todo_graph_tasks(&task.subtasks, filter, matches);
     }
 }
 
-fn task_without_subtasks(task: &TaskGraphTask) -> TaskGraphTask {
-    TaskGraphTask {
+fn task_without_subtasks(task: &TodoGraphTask) -> TodoGraphTask {
+    TodoGraphTask {
         subtasks: Vec::new(),
         ..task.clone()
     }
 }
 
-fn is_task_graph_status(status: &str) -> bool {
-    TASK_GRAPH_STATUSES.contains(&status)
+fn is_todo_graph_status(status: &str) -> bool {
+    TODO_GRAPH_STATUSES.contains(&status)
 }
 
-const TASK_GRAPH_STATUSES: &[&str] = &[
+const TODO_GRAPH_STATUSES: &[&str] = &[
     "pending",
     "ready",
     "running",
@@ -3494,6 +3498,12 @@ CREATE INDEX hook_runs_workspace_started_idx ON hook_runs (workspace_id, started
 CREATE INDEX hook_runs_chat_idx ON hook_runs (chat_id);
 CREATE INDEX hook_runs_run_idx ON hook_runs (run_id);
 CREATE INDEX hook_runs_event_idx ON hook_runs (event);
+"#;
+
+const MIGRATION_008: &str = r#"
+DROP INDEX task_graphs_updated_at_idx;
+ALTER TABLE task_graphs RENAME TO todo_graphs;
+CREATE INDEX todo_graphs_updated_at_idx ON todo_graphs (updated_at);
 "#;
 
 #[cfg(test)]

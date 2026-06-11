@@ -6,12 +6,12 @@ use foco_store::{
         LlmRequestAuditFilters, LlmRequestRecord, NewCodeGraphEdge, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
-        NewTerminalSession, NewToolCall, NewToolResult, TaskGraphFilter, TaskGraphTask,
-        TaskGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
+        NewTerminalSession, NewToolCall, NewToolResult, TodoGraphFilter, TodoGraphTask,
+        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
         initialize_workspace_databases, workspace_database_path,
     },
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use serde_json::Value;
 
 #[test]
@@ -48,7 +48,7 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "code_graph_fts_index",
         "code_graph_file_hashes",
         "code_graph_parse_status",
-        "task_graphs",
+        "todo_graphs",
         "hook_runs",
         "memory_sources",
         "memory_facts",
@@ -127,6 +127,67 @@ fn backs_up_existing_database_before_migration() {
 }
 
 #[test]
+fn migrates_v7_task_graphs_table_to_todo_graphs() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let legacy_tasks = serde_json::to_string(&vec![todo_graph_task(
+        "plan",
+        "Plan work",
+        "ready",
+        vec![],
+        vec!["Plan is clear"],
+        "Legacy row",
+        vec![],
+    )])
+    .expect("legacy graph json");
+    let connection = Connection::open(&database_path).expect("old database");
+    connection
+        .execute_batch(
+            "CREATE TABLE chats (
+                id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+                title TEXT NOT NULL CHECK (length(title) > 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE task_graphs (
+                chat_id TEXT PRIMARY KEY NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                graph_json TEXT NOT NULL CHECK (length(graph_json) > 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX task_graphs_updated_at_idx ON task_graphs (updated_at);
+            INSERT INTO chats (id, title, created_at, updated_at)
+                VALUES ('chat-1', 'Legacy todo graph', '2026-06-10T00:00:00Z', '2026-06-10T00:00:00Z');
+            PRAGMA user_version = 7;",
+        )
+        .expect("old todo graph schema");
+    connection
+        .execute(
+            "INSERT INTO task_graphs (chat_id, graph_json, created_at, updated_at)
+             VALUES ('chat-1', ?1, '2026-06-10T00:00:00Z', '2026-06-10T00:00:00Z')",
+            params![legacy_tasks],
+        )
+        .expect("legacy todo graph row");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let connection = Connection::open(database.database_path()).expect("open migrated database");
+    assert!(table_exists(&connection, "todo_graphs"));
+    assert!(!table_exists(&connection, "task_graphs"));
+
+    let graph = database
+        .todo_graph("chat-1")
+        .expect("read migrated todo graph")
+        .expect("migrated todo graph");
+    assert_eq!(graph.tasks[0].id, "plan");
+}
+
+#[test]
 fn chat_memory_facts_cascade_when_chat_is_deleted() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
@@ -173,25 +234,25 @@ fn chat_memory_facts_cascade_when_chat_is_deleted() {
 }
 
 #[test]
-fn repository_helpers_round_trip_task_graphs() {
+fn repository_helpers_round_trip_todo_graphs() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
 
     database
-        .insert_chat("chat-1", "Task graph chat")
+        .insert_chat("chat-1", "ToDo graph chat")
         .expect("chat insert");
     let graph = database
-        .upsert_task_graph(
+        .upsert_todo_graph(
             "chat-1",
-            vec![task_graph_task(
+            vec![todo_graph_task(
                 "plan",
                 "Plan work",
                 "ready",
                 vec![],
                 vec!["Plan is clear"],
                 "Find the smallest path.",
-                vec![task_graph_task(
+                vec![todo_graph_task(
                     "probe",
                     "Probe code",
                     "pending",
@@ -202,7 +263,7 @@ fn repository_helpers_round_trip_task_graphs() {
                 )],
             )],
         )
-        .expect("task graph create");
+        .expect("todo graph create");
 
     assert_eq!(graph.chat_id, "chat-1");
     assert_eq!(graph.tasks.len(), 1);
@@ -210,13 +271,13 @@ fn repository_helpers_round_trip_task_graphs() {
     assert_eq!(graph.tasks[0].subtasks[0].depends_on, vec!["plan"]);
 
     let updated = database
-        .update_task_graph_task(
+        .update_todo_graph_task(
             "chat-1",
             "probe",
-            TaskGraphTaskPatch {
+            TodoGraphTaskPatch {
                 status: Some("completed".to_string()),
                 summary: Some("Found store, tools, app, and web entrypoints.".to_string()),
-                ..TaskGraphTaskPatch::default()
+                ..TodoGraphTaskPatch::default()
             },
         )
         .expect("task patch");
@@ -229,35 +290,35 @@ fn repository_helpers_round_trip_task_graphs() {
     );
 
     let completed = database
-        .filtered_task_graph(
+        .filtered_todo_graph(
             "chat-1",
-            TaskGraphFilter {
+            TodoGraphFilter {
                 status: Some("completed"),
                 task_id: None,
                 include_subtasks: false,
             },
         )
-        .expect("filtered task graph")
-        .expect("task graph");
+        .expect("filtered todo graph")
+        .expect("todo graph");
     assert_eq!(completed.tasks.len(), 1);
     assert_eq!(completed.tasks[0].id, "probe");
     assert!(completed.tasks[0].subtasks.is_empty());
 }
 
 #[test]
-fn repository_helpers_reject_invalid_task_graph_dependencies() {
+fn repository_helpers_reject_invalid_todo_graph_dependencies() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
 
     database
-        .insert_chat("chat-1", "Task graph chat")
+        .insert_chat("chat-1", "ToDo graph chat")
         .expect("chat insert");
 
     let missing = database
-        .upsert_task_graph(
+        .upsert_todo_graph(
             "chat-1",
-            vec![task_graph_task(
+            vec![todo_graph_task(
                 "build",
                 "Build feature",
                 "pending",
@@ -272,10 +333,10 @@ fn repository_helpers_reject_invalid_task_graph_dependencies() {
     assert!(missing.contains("depends on missing task"));
 
     let cycle = database
-        .upsert_task_graph(
+        .upsert_todo_graph(
             "chat-1",
             vec![
-                task_graph_task(
+                todo_graph_task(
                     "first",
                     "First",
                     "pending",
@@ -284,7 +345,7 @@ fn repository_helpers_reject_invalid_task_graph_dependencies() {
                     "",
                     vec![],
                 ),
-                task_graph_task(
+                todo_graph_task(
                     "second",
                     "Second",
                     "pending",
@@ -1054,16 +1115,16 @@ fn assert_json_eq(actual: &str, expected: &str) {
     assert_eq!(actual, expected);
 }
 
-fn task_graph_task(
+fn todo_graph_task(
     id: &str,
     title: &str,
     status: &str,
     depends_on: Vec<&str>,
     acceptance: Vec<&str>,
     summary: &str,
-    subtasks: Vec<TaskGraphTask>,
-) -> TaskGraphTask {
-    TaskGraphTask {
+    subtasks: Vec<TodoGraphTask>,
+) -> TodoGraphTask {
+    TodoGraphTask {
         id: id.to_string(),
         title: title.to_string(),
         status: status.to_string(),

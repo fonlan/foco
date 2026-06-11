@@ -654,7 +654,7 @@ const secondChatMessages = {
   ],
 };
 
-const taskGraph = {
+const todoGraph = {
   chatId: "chat-1",
   createdAt: "2026-06-05T10:01:00Z",
   exists: true,
@@ -2438,7 +2438,7 @@ describe("App verification surfaces", () => {
 
     await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("button", { name: "Close context panel" }));
-    expect(screen.queryByRole("tab", { name: "Task" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "ToDo" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Open context panel" }));
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
@@ -2494,7 +2494,7 @@ describe("App verification surfaces", () => {
     });
   });
 
-  it("keeps task graph and git diff in separate context tabs", async () => {
+  it("keeps todo graph and git diff in separate context tabs", async () => {
     render(<App />);
 
     await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "plan");
@@ -2504,7 +2504,7 @@ describe("App verification surfaces", () => {
     await act(async () => {
       enqueueChatStreamEvent({
         chatId: "chat-1",
-        type: "taskGraphRefresh",
+        type: "todoGraphRefresh",
         workspaceId: "workspace-1",
       });
     });
@@ -2602,7 +2602,7 @@ describe("App verification surfaces", () => {
     confirmSpy.mockRestore();
   });
 
-  it("opens the task graph sidebar when a task graph refresh arrives", async () => {
+  it("opens the todo graph sidebar when a todo graph refresh arrives", async () => {
     render(<App />);
 
     await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "plan");
@@ -2612,12 +2612,12 @@ describe("App verification surfaces", () => {
     await act(async () => {
       enqueueChatStreamEvent({
         chatId: "chat-1",
-        type: "taskGraphRefresh",
+        type: "todoGraphRefresh",
         workspaceId: "workspace-1",
       });
     });
 
-    expect(await screen.findByText("Task graph")).toBeInTheDocument();
+    expect(await screen.findByText("ToDo graph")).toBeInTheDocument();
     expect(screen.getByText("Inspect workspace changes")).toBeInTheDocument();
     expect(screen.queryByText("Git diff")).not.toBeInTheDocument();
 
@@ -2965,15 +2965,15 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
     return jsonResponse(chatMessages);
   }
 
-  if (path === "/api/workspaces/workspace-1/chats/chat-1/task-graph") {
-    return jsonResponse(taskGraph);
+  if (path === "/api/workspaces/workspace-1/chats/chat-1/todo-graph") {
+    return jsonResponse(todoGraph);
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
     return jsonResponse(secondChatMessages);
   }
 
-  if (path === "/api/workspaces/workspace-1/chats/chat-2/task-graph") {
+  if (path === "/api/workspaces/workspace-1/chats/chat-2/todo-graph") {
     return jsonResponse({
       chatId: "chat-2",
       createdAt: null,

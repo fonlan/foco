@@ -133,8 +133,8 @@ summary:focus-visible {
   height: 100%;
 }
 
-.task-graph-panel-slot {
-  flex: 0 0 var(--task-graph-panel-height, 48%);
+.todo-graph-panel-slot {
+  flex: 0 0 var(--todo-graph-panel-height, 48%);
   min-height: 8rem;
 }
 

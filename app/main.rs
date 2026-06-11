@@ -71,14 +71,14 @@ use foco_store::{
         ChatRecord, ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
         LlmRequestAuditRow, LlmRequestEventRecord, LlmRequestRecord, MessageRecord,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-        NewTerminalSession, NewToolCall, NewToolResult, TaskGraphFilter, TaskGraphRecord,
-        TaskGraphTask, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        NewTerminalSession, NewToolCall, NewToolResult, TodoGraphFilter, TodoGraphRecord,
+        TodoGraphTask, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
         initialize_workspace_databases, workspace_database_path,
     },
 };
 use foco_tools::{
-    ASK_QUESTION_TOOL, CREATE_TASK_GRAPH_TOOL, PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
-    SLEEP_TOOL, ToolExecution, UPDATE_TASK_GRAPH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions,
+    ASK_QUESTION_TOOL, CREATE_TODO_GRAPH_TOOL, PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
+    SLEEP_TOOL, ToolExecution, UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions,
     builtin_tool_timeout_ms, execute_builtin_tool_for_chat, set_ripgrep_path,
 };
 use futures_util::future::join_all;
@@ -732,8 +732,8 @@ fn app_router(state: AppState) -> Router {
             get(chat_messages),
         )
         .route(
-            "/api/workspaces/{workspace_id}/chats/{chat_id}/task-graph",
-            get(chat_task_graph),
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/todo-graph",
+            get(chat_todo_graph),
         )
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/delete",
@@ -3191,11 +3191,11 @@ async fn chat_messages(
     Ok(Json(ChatMessagesResponse { messages }))
 }
 
-async fn chat_task_graph(
+async fn chat_todo_graph(
     State(state): State<AppState>,
     AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
-    Query(query): Query<TaskGraphQuery>,
-) -> Result<Json<TaskGraphResponse>, ApiError> {
+    Query(query): Query<TodoGraphQuery>,
+) -> Result<Json<TodoGraphResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace_id = workspace_id.trim();
     let chat_id = chat_id.trim();
@@ -3216,9 +3216,9 @@ async fn chat_task_graph(
     let status = optional_trimmed_string(query.status);
     let task_id = optional_trimmed_string(query.task_id);
     let graph = database
-        .filtered_task_graph(
+        .filtered_todo_graph(
             chat_id,
-            TaskGraphFilter {
+            TodoGraphFilter {
                 status: status.as_deref(),
                 task_id: task_id.as_deref(),
                 include_subtasks: query.include_subtasks.unwrap_or(true),
@@ -3226,7 +3226,7 @@ async fn chat_task_graph(
         )
         .map_err(ApiError::from_workspace_error)?;
 
-    Ok(Json(task_graph_response(chat_id, graph)))
+    Ok(Json(todo_graph_response(chat_id, graph)))
 }
 
 async fn delete_chat(
@@ -3746,7 +3746,7 @@ struct GitDiffQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskGraphQuery {
+struct TodoGraphQuery {
     status: Option<String>,
     task_id: Option<String>,
     include_subtasks: Option<bool>,
@@ -4149,10 +4149,10 @@ struct ChatMessagesResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskGraphResponse {
+struct TodoGraphResponse {
     chat_id: String,
     exists: bool,
-    tasks: Vec<TaskGraphTask>,
+    tasks: Vec<TodoGraphTask>,
     created_at: Option<String>,
     updated_at: Option<String>,
 }
@@ -4429,7 +4429,7 @@ enum ChatSseEvent {
     GitDiffRefresh {
         workspace_id: String,
     },
-    TaskGraphRefresh {
+    TodoGraphRefresh {
         workspace_id: String,
         chat_id: String,
     },
@@ -5680,8 +5680,8 @@ impl PreparedChatContext {
                                 events.push(captured_event(&event));
                                 yield Ok(sse_event(&event));
                             }
-                            if tool_results_affect_task_graph(&next_executed_tool_calls) {
-                                let event = ChatSseEvent::TaskGraphRefresh {
+                            if tool_results_affect_todo_graph(&next_executed_tool_calls) {
+                                let event = ChatSseEvent::TodoGraphRefresh {
                                     workspace_id: self.workspace_id.clone(),
                                     chat_id: self.chat_id.clone(),
                                 };
@@ -11008,8 +11008,8 @@ fn tool_call_requires_sequential_execution(tool_call: &NeutralToolCall) -> bool 
     matches!(
         tool_call.name.as_str(),
         ASK_QUESTION_TOOL
-            | CREATE_TASK_GRAPH_TOOL
-            | UPDATE_TASK_GRAPH_TOOL
+            | CREATE_TODO_GRAPH_TOOL
+            | UPDATE_TODO_GRAPH_TOOL
             | MEMORY_WRITE_TOOL_NAME
     )
 }
@@ -11023,11 +11023,11 @@ fn tool_results_affect_git_diff(tool_results: &[ExecutedToolCall]) -> bool {
     })
 }
 
-fn tool_results_affect_task_graph(tool_results: &[ExecutedToolCall]) -> bool {
+fn tool_results_affect_todo_graph(tool_results: &[ExecutedToolCall]) -> bool {
     tool_results.iter().any(|tool_result| {
         matches!(
             tool_result.name.as_str(),
-            CREATE_TASK_GRAPH_TOOL | UPDATE_TASK_GRAPH_TOOL
+            CREATE_TODO_GRAPH_TOOL | UPDATE_TODO_GRAPH_TOOL
         )
     })
 }
@@ -11240,7 +11240,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::QuestionRequest { .. } => "question_request",
         ChatSseEvent::HookNotification { .. } => "hook_notification",
         ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
-        ChatSseEvent::TaskGraphRefresh { .. } => "task_graph_refresh",
+        ChatSseEvent::TodoGraphRefresh { .. } => "todo_graph_refresh",
         ChatSseEvent::Usage { .. } => "usage",
         ChatSseEvent::Complete { .. } => "completion",
         ChatSseEvent::Error { .. } => "error",
@@ -11356,8 +11356,8 @@ impl ApiError {
 
     fn from_workspace_error(error: foco_store::workspace::WorkspaceDatabaseError) -> Self {
         match error {
-            foco_store::workspace::WorkspaceDatabaseError::InvalidTaskGraph { .. }
-            | foco_store::workspace::WorkspaceDatabaseError::MissingTaskGraph { .. } => {
+            foco_store::workspace::WorkspaceDatabaseError::InvalidTodoGraph { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::MissingTodoGraph { .. } => {
                 Self::bad_request(error.to_string())
             }
             _ => Self::internal(error.to_string()),
@@ -13660,16 +13660,16 @@ fn workspace_response_from_config(
     }))
 }
 
-fn task_graph_response(chat_id: &str, graph: Option<TaskGraphRecord>) -> TaskGraphResponse {
+fn todo_graph_response(chat_id: &str, graph: Option<TodoGraphRecord>) -> TodoGraphResponse {
     match graph {
-        Some(graph) => TaskGraphResponse {
+        Some(graph) => TodoGraphResponse {
             chat_id: graph.chat_id,
             exists: true,
             tasks: graph.tasks,
             created_at: Some(graph.created_at),
             updated_at: Some(graph.updated_at),
         },
-        None => TaskGraphResponse {
+        None => TodoGraphResponse {
             chat_id: chat_id.to_string(),
             exists: false,
             tasks: Vec::new(),

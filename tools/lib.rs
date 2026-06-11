@@ -13,8 +13,8 @@ use std::os::windows::process::CommandExt;
 
 use foco_store::workspace::{
     CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
-    CodeGraphSymbolRelationRecord, TaskGraphFilter, TaskGraphRecord, TaskGraphTask,
-    TaskGraphTaskPatch, WorkspaceDatabase, WorkspaceDatabaseError,
+    CodeGraphSymbolRelationRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
+    TodoGraphTaskPatch, WorkspaceDatabase, WorkspaceDatabaseError,
 };
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
@@ -32,9 +32,9 @@ pub const GRAPH_FIND_CALLERS_TOOL: &str = "graph_find_callers";
 pub const GRAPH_FIND_CALLEES_TOOL: &str = "graph_find_callees";
 pub const GRAPH_FIND_REFERENCES_TOOL: &str = "graph_find_references";
 pub const GRAPH_RELATED_FILES_TOOL: &str = "graph_related_files";
-pub const CREATE_TASK_GRAPH_TOOL: &str = "create_task_graph";
-pub const UPDATE_TASK_GRAPH_TOOL: &str = "update_task_graph";
-pub const GET_TASK_GRAPH_TOOL: &str = "get_task_graph";
+pub const CREATE_TODO_GRAPH_TOOL: &str = "create_todo_graph";
+pub const UPDATE_TODO_GRAPH_TOOL: &str = "update_todo_graph";
+pub const GET_TODO_GRAPH_TOOL: &str = "get_todo_graph";
 pub const ASK_QUESTION_TOOL: &str = "ask_question";
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
@@ -49,7 +49,7 @@ const DEFAULT_SEARCH_TEXT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
-const DEFAULT_TASK_GRAPH_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_TODO_GRAPH_TIMEOUT_MS: u64 = 10_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
 #[cfg(windows)]
@@ -84,9 +84,9 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         search_text_definition(),
         write_file_definition(),
         patch_file_definition(),
-        create_task_graph_definition(),
-        update_task_graph_definition(),
-        get_task_graph_definition(),
+        create_todo_graph_definition(),
+        update_todo_graph_definition(),
+        get_todo_graph_definition(),
         ask_question_definition(),
         run_command_definition(),
         sleep_definition(),
@@ -151,8 +151,8 @@ pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64
         | GRAPH_RELATED_FILES_TOOL => DEFAULT_GRAPH_TOOL_TIMEOUT_MS,
         SEARCH_TEXT_TOOL => DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
         WRITE_FILE_TOOL | PATCH_FILE_TOOL => DEFAULT_WRITE_FILE_TIMEOUT_MS,
-        CREATE_TASK_GRAPH_TOOL | UPDATE_TASK_GRAPH_TOOL | GET_TASK_GRAPH_TOOL => {
-            DEFAULT_TASK_GRAPH_TIMEOUT_MS
+        CREATE_TODO_GRAPH_TOOL | UPDATE_TODO_GRAPH_TOOL | GET_TODO_GRAPH_TOOL => {
+            DEFAULT_TODO_GRAPH_TIMEOUT_MS
         }
         ASK_QUESTION_TOOL => {
             return Err(
@@ -184,9 +184,9 @@ fn execute_builtin_tool_inner(
         SEARCH_TEXT_TOOL => search_text(workspace_path, arguments),
         WRITE_FILE_TOOL => write_file(workspace_path, arguments),
         PATCH_FILE_TOOL => patch_file(workspace_path, arguments),
-        CREATE_TASK_GRAPH_TOOL => create_task_graph(workspace_path, chat_id, arguments),
-        UPDATE_TASK_GRAPH_TOOL => update_task_graph(workspace_path, chat_id, arguments),
-        GET_TASK_GRAPH_TOOL => get_task_graph(workspace_path, chat_id, arguments),
+        CREATE_TODO_GRAPH_TOOL => create_todo_graph(workspace_path, chat_id, arguments),
+        UPDATE_TODO_GRAPH_TOOL => update_todo_graph(workspace_path, chat_id, arguments),
+        GET_TODO_GRAPH_TOOL => get_todo_graph(workspace_path, chat_id, arguments),
         ASK_QUESTION_TOOL => Err(ToolRuntimeError::InvalidArguments(
             "ask_question must be executed through the chat UI question bridge".to_string(),
         )),
@@ -611,36 +611,36 @@ fn patch_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
     }))
 }
 
-fn create_task_graph(
+fn create_todo_graph(
     workspace_path: &Path,
     chat_id: Option<&str>,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
-    let request: CreateTaskGraphInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TASK_GRAPH_TIMEOUT_MS)?;
+    let request: CreateTodoGraphInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TODO_GRAPH_TIMEOUT_MS)?;
     let chat_id = required_chat_id(chat_id)?;
-    let mut database = open_task_graph_database(workspace_path)?;
-    let graph = database.upsert_task_graph(
+    let mut database = open_todo_graph_database(workspace_path)?;
+    let graph = database.upsert_todo_graph(
         chat_id,
         request
             .tasks
             .into_iter()
-            .map(task_graph_task_from_input)
+            .map(todo_graph_task_from_input)
             .collect(),
     )?;
 
-    Ok(task_graph_json(graph, timeout_ms))
+    Ok(todo_graph_json(graph, timeout_ms))
 }
 
-fn update_task_graph(
+fn update_todo_graph(
     workspace_path: &Path,
     chat_id: Option<&str>,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
-    let request: UpdateTaskGraphInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TASK_GRAPH_TIMEOUT_MS)?;
+    let request: UpdateTodoGraphInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TODO_GRAPH_TIMEOUT_MS)?;
     let chat_id = required_chat_id(chat_id)?;
-    let patch = TaskGraphTaskPatch {
+    let patch = TodoGraphTaskPatch {
         title: request.patch.title,
         status: request.patch.status,
         depends_on: request.patch.depends_on,
@@ -649,21 +649,21 @@ fn update_task_graph(
         subtasks: request
             .patch
             .subtasks
-            .map(|tasks| tasks.into_iter().map(task_graph_task_from_input).collect()),
+            .map(|tasks| tasks.into_iter().map(todo_graph_task_from_input).collect()),
     };
-    let mut database = open_task_graph_database(workspace_path)?;
-    let graph = database.update_task_graph_task(chat_id, &request.task_id, patch)?;
+    let mut database = open_todo_graph_database(workspace_path)?;
+    let graph = database.update_todo_graph_task(chat_id, &request.task_id, patch)?;
 
-    Ok(task_graph_json(graph, timeout_ms))
+    Ok(todo_graph_json(graph, timeout_ms))
 }
 
-fn get_task_graph(
+fn get_todo_graph(
     workspace_path: &Path,
     chat_id: Option<&str>,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
-    let request: GetTaskGraphInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TASK_GRAPH_TIMEOUT_MS)?;
+    let request: GetTodoGraphInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TODO_GRAPH_TIMEOUT_MS)?;
     let chat_id = required_chat_id(chat_id)?;
     let status = request
         .status
@@ -675,10 +675,10 @@ fn get_task_graph(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let database = open_task_graph_database(workspace_path)?;
-    let graph = database.filtered_task_graph(
+    let database = open_todo_graph_database(workspace_path)?;
+    let graph = database.filtered_todo_graph(
         chat_id,
-        TaskGraphFilter {
+        TodoGraphFilter {
             status,
             task_id,
             include_subtasks: request.include_subtasks,
@@ -686,7 +686,7 @@ fn get_task_graph(
     )?;
 
     match graph {
-        Some(graph) => Ok(task_graph_json(graph, timeout_ms)),
+        Some(graph) => Ok(todo_graph_json(graph, timeout_ms)),
         None => Ok(json!({
             "chatId": chat_id,
             "tasks": [],
@@ -769,7 +769,7 @@ fn open_code_graph_database(workspace_path: &Path) -> Result<WorkspaceDatabase, 
     WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
 }
 
-fn open_task_graph_database(workspace_path: &Path) -> Result<WorkspaceDatabase, ToolRuntimeError> {
+fn open_todo_graph_database(workspace_path: &Path) -> Result<WorkspaceDatabase, ToolRuntimeError> {
     WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
 }
 
@@ -779,7 +779,7 @@ fn required_chat_id(chat_id: Option<&str>) -> Result<&str, ToolRuntimeError> {
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             ToolRuntimeError::InvalidArguments(
-                "task graph tools require an active chat".to_string(),
+                "todo graph tools require an active chat".to_string(),
             )
         })
 }
@@ -1024,7 +1024,7 @@ fn related_file_json(file: CodeGraphRelatedFileRecord) -> Value {
     })
 }
 
-fn task_graph_json(graph: TaskGraphRecord, timeout_ms: u64) -> Value {
+fn todo_graph_json(graph: TodoGraphRecord, timeout_ms: u64) -> Value {
     json!({
         "chatId": graph.chat_id,
         "tasks": graph.tasks,
@@ -1036,10 +1036,10 @@ fn task_graph_json(graph: TaskGraphRecord, timeout_ms: u64) -> Value {
     })
 }
 
-fn task_graph_task_from_input(task: TaskGraphTaskInput) -> TaskGraphTask {
+fn todo_graph_task_from_input(task: TodoGraphTaskInput) -> TodoGraphTask {
     let _server_generated_timestamps = (task.created_at, task.updated_at);
 
-    TaskGraphTask {
+    TodoGraphTask {
         id: task.id,
         title: task.title,
         status: task.status,
@@ -1051,7 +1051,7 @@ fn task_graph_task_from_input(task: TaskGraphTaskInput) -> TaskGraphTask {
         subtasks: task
             .subtasks
             .into_iter()
-            .map(task_graph_task_from_input)
+            .map(todo_graph_task_from_input)
             .collect(),
     }
 }
@@ -2197,18 +2197,18 @@ fn patch_file_definition() -> ToolDefinition {
     }
 }
 
-fn create_task_graph_definition() -> ToolDefinition {
+fn create_todo_graph_definition() -> ToolDefinition {
     ToolDefinition {
-        name: CREATE_TASK_GRAPH_TOOL,
-        description: "Create or replace the current chat's task graph. Use this instead of plain todo lists to preserve task context, dependencies, acceptance criteria, summaries, and nested subtasks.",
+        name: CREATE_TODO_GRAPH_TOOL,
+        description: "Create or replace the current chat's todo graph. Use this instead of plain todo lists to preserve task context, dependencies, acceptance criteria, summaries, and nested subtasks.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "tasks": {
                     "type": "array",
-                    "items": task_graph_task_schema(),
-                    "description": "Top-level tasks for the current chat task graph."
+                    "items": todo_graph_task_schema(),
+                    "description": "Top-level tasks for the current chat todo graph."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
@@ -2221,10 +2221,10 @@ fn create_task_graph_definition() -> ToolDefinition {
     }
 }
 
-fn update_task_graph_definition() -> ToolDefinition {
+fn update_todo_graph_definition() -> ToolDefinition {
     ToolDefinition {
-        name: UPDATE_TASK_GRAPH_TOOL,
-        description: "Patch one task in the current chat's task graph without resending the entire graph. Pass the task id and only the fields that should change.",
+        name: UPDATE_TODO_GRAPH_TOOL,
+        description: "Patch one task in the current chat's todo graph without resending the entire graph. Pass the task id and only the fields that should change.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2262,7 +2262,7 @@ fn update_task_graph_definition() -> ToolDefinition {
                         },
                         "subtasks": {
                             "type": ["array", "null"],
-                            "items": task_graph_task_schema(),
+                            "items": todo_graph_task_schema(),
                             "description": "Complete replacement nested subtask list, or null to leave unchanged."
                         }
                     },
@@ -2279,10 +2279,10 @@ fn update_task_graph_definition() -> ToolDefinition {
     }
 }
 
-fn get_task_graph_definition() -> ToolDefinition {
+fn get_todo_graph_definition() -> ToolDefinition {
     ToolDefinition {
-        name: GET_TASK_GRAPH_TOOL,
-        description: "Read the current chat's task graph, optionally filtering tasks by id or status such as completed, pending, ready, running, blocked, failed, or cancelled.",
+        name: GET_TODO_GRAPH_TOOL,
+        description: "Read the current chat's todo graph, optionally filtering tasks by id or status such as completed, pending, ready, running, blocked, failed, or cancelled.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2424,11 +2424,11 @@ fn sleep_definition() -> ToolDefinition {
     }
 }
 
-fn task_graph_task_schema() -> Value {
-    task_graph_task_schema_with_depth(3)
+fn todo_graph_task_schema() -> Value {
+    todo_graph_task_schema_with_depth(3)
 }
 
-fn task_graph_task_schema_with_depth(depth: usize) -> Value {
+fn todo_graph_task_schema_with_depth(depth: usize) -> Value {
     let subtasks_schema = if depth == 0 {
         json!({
             "type": "array",
@@ -2443,7 +2443,7 @@ fn task_graph_task_schema_with_depth(depth: usize) -> Value {
     } else {
         json!({
             "type": "array",
-            "items": task_graph_task_schema_with_depth(depth - 1)
+            "items": todo_graph_task_schema_with_depth(depth - 1)
         })
     };
 
@@ -2566,22 +2566,22 @@ struct PatchFileInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateTaskGraphInput {
-    tasks: Vec<TaskGraphTaskInput>,
+struct CreateTodoGraphInput {
+    tasks: Vec<TodoGraphTaskInput>,
     timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct UpdateTaskGraphInput {
+struct UpdateTodoGraphInput {
     task_id: String,
-    patch: TaskGraphPatchInput,
+    patch: TodoGraphPatchInput,
     timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GetTaskGraphInput {
+struct GetTodoGraphInput {
     status: Option<String>,
     task_id: Option<String>,
     include_subtasks: bool,
@@ -2590,18 +2590,18 @@ struct GetTaskGraphInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskGraphPatchInput {
+struct TodoGraphPatchInput {
     title: Option<String>,
     status: Option<String>,
     depends_on: Option<Vec<String>>,
     acceptance: Option<Vec<String>>,
     summary: Option<String>,
-    subtasks: Option<Vec<TaskGraphTaskInput>>,
+    subtasks: Option<Vec<TodoGraphTaskInput>>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskGraphTaskInput {
+struct TodoGraphTaskInput {
     id: String,
     title: String,
     status: String,
@@ -2610,7 +2610,7 @@ struct TaskGraphTaskInput {
     summary: String,
     created_at: Option<String>,
     updated_at: Option<String>,
-    subtasks: Vec<TaskGraphTaskInput>,
+    subtasks: Vec<TodoGraphTaskInput>,
 }
 
 #[derive(Deserialize)]
@@ -3016,19 +3016,19 @@ mod tests {
     }
 
     #[test]
-    fn task_graph_tools_round_trip_current_chat() {
+    fn todo_graph_tools_round_trip_current_chat() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
         database
-            .insert_chat("chat-1", "Task graph chat")
+            .insert_chat("chat-1", "ToDo graph chat")
             .expect("chat insert");
         drop(database);
 
         let create = execute_builtin_tool_for_chat(
             workspace.path(),
             Some("chat-1"),
-            CREATE_TASK_GRAPH_TOOL,
+            CREATE_TODO_GRAPH_TOOL,
             json!({
                 "tasks": [
                     {
@@ -3067,7 +3067,7 @@ mod tests {
         let update = execute_builtin_tool_for_chat(
             workspace.path(),
             Some("chat-1"),
-            UPDATE_TASK_GRAPH_TOOL,
+            UPDATE_TODO_GRAPH_TOOL,
             json!({
                 "taskId": "probe",
                 "patch": {
@@ -3089,7 +3089,7 @@ mod tests {
         let completed = execute_builtin_tool_for_chat(
             workspace.path(),
             Some("chat-1"),
-            GET_TASK_GRAPH_TOOL,
+            GET_TODO_GRAPH_TOOL,
             json!({
                 "status": "completed",
                 "taskId": null,
