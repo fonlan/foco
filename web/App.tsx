@@ -14915,7 +14915,7 @@ function SettingsPanel({
               {orderedConfiguredModels.length ? (
                 orderedConfiguredModels.map((model) => (
                 <div
-                  className={`grid gap-3 px-4 py-3 transition md:grid-cols-[auto_minmax(0,1fr)_auto] ${
+                  className={`grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5 transition ${
                     draggedModelId === model.id
                       ? "bg-teal-50/70 opacity-80"
                       : "bg-white/0"
@@ -14927,7 +14927,7 @@ function SettingsPanel({
                   onDragStart={(event) => handleModelDragStart(event, model.id)}
                   onDrop={(event) => void handleModelDrop(event)}
                 >
-                  <div className="flex items-start pt-1">
+                  <div className="flex items-center">
                     <span
                       aria-label={t("Reorder model {name}", {
                         name: model.displayName,
@@ -14952,15 +14952,20 @@ function SettingsPanel({
                     </span>
                   </div>
                   <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="truncate text-sm font-semibold">
+                    <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+                      <span
+                        className="min-w-0 truncate text-sm font-semibold"
+                        title={model.displayName}
+                      >
                         {model.displayName}
                       </span>
                       <CapabilityPill
+                        className="shrink-0"
                         label={model.enabled ? t("enabled") : t("disabled")}
                         ok={model.enabled}
                       />
                       <CapabilityPill
+                        className="shrink-0"
                         label={
                           model.canEnable
                             ? t("limits ok")
@@ -14969,23 +14974,29 @@ function SettingsPanel({
                         ok={model.canEnable}
                       />
                     </div>
-                    <div className="mt-1 truncate text-xs font-medium text-stone-500">
-                      {model.id}
-                    </div>
-                    <div className="mt-2 flex flex-wrap gap-1.5">
+                    <div className="mt-1 flex min-w-0 items-center gap-2 overflow-hidden">
+                      <span
+                        className="min-w-0 truncate text-xs font-medium text-stone-500"
+                        title={model.id}
+                      >
+                        {model.id}
+                      </span>
                       <CapabilityPill
+                        className="shrink-0"
                         label={t("providers {count}", {
                           count: model.providerIds.length,
                         })}
                         ok={model.providerIds.length > 0}
                       />
                       <CapabilityPill
+                        className="min-w-0"
                         label={
                           model.activeProviderId
                             ? t("active {id}", { id: model.activeProviderId })
                             : t("active missing")
                         }
                         ok={model.activeProviderId !== null}
+                        title={model.activeProviderId ?? undefined}
                       />
                     </div>
                   </div>
@@ -15814,16 +15825,27 @@ function memoryStatusLabel(status: string, t: Translate) {
   }
 }
 
-function CapabilityPill({ label, ok }: { label: string; ok: boolean }) {
+function CapabilityPill({
+  className,
+  label,
+  ok,
+  title,
+}: {
+  className?: string;
+  label: string;
+  ok: boolean;
+  title?: string;
+}) {
   return (
     <span
-      className={`inline-flex min-h-6 items-center rounded-md border px-2 py-0.5 text-xs font-semibold ${
+      className={`inline-flex min-h-6 max-w-full items-center rounded-md border px-2 py-0.5 text-xs font-semibold ${
         ok
           ? "border-teal-200 bg-teal-50 text-teal-800"
           : "border-stone-200 bg-stone-50 text-stone-500"
-      }`}
+      } ${className ?? ""}`}
+      title={title}
     >
-      {label}
+      <span className="min-w-0 truncate">{label}</span>
     </span>
   );
 }
