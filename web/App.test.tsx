@@ -262,6 +262,13 @@ const activeMemory = {
   updatedAt: "2026-06-09T02:05:00Z",
 };
 
+const workspaceMemory = {
+  ...activeMemory,
+  fact: "Workspace scoped memory",
+  id: "memory-workspace-1",
+  scope: "workspace",
+};
+
 const pendingMemory = {
   ...activeMemory,
   fact: "Pending extracted memory",
@@ -272,10 +279,10 @@ const pendingMemory = {
 
 const memorySource = {
   chatId: null,
-  content: "Manual source content",
+  content: "{\"note\":\"Manual source content\",\"details\":{\"origin\":\"test\"}}",
   createdAt: "2026-06-09T02:00:00Z",
   id: "memory-source-1",
-  metadataJson: "{}",
+  metadataJson: "{\"source\":\"manual\"}",
   scope: "global",
   sourceId: null,
   sourceType: "manual_note",
@@ -287,7 +294,7 @@ const memoryExtractionJob = {
   chatId: "chat-test",
   completedAt: "2026-06-09T02:10:00Z",
   createdAt: "2026-06-09T02:09:00Z",
-  errorMessage: "malformed memory extraction JSON",
+  errorMessage: "memory extraction provider failed",
   id: "memory-job-1",
   modelId: "gpt-test",
   scope: "chat",
@@ -1920,7 +1927,6 @@ describe("App verification surfaces", () => {
 
     expect(await screen.findByText("Memory settings")).toBeInTheDocument();
     expect((await screen.findAllByText(activeMemory.fact)).length).toBeGreaterThan(0);
-    expect(await screen.findByText(memorySource.content)).toBeInTheDocument();
     expect(await screen.findByText(memoryExtractionJob.errorMessage)).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText("Enable memory"));
@@ -1961,8 +1967,10 @@ describe("App verification surfaces", () => {
       expect(createCall).toBeDefined();
       expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({
         chatId: null,
+        confidence: null,
         fact: "Remember local memory graph.",
         kind: "user_note",
+        metadata: {},
         pinned: false,
         scope: "global",
         workspaceId: null,
@@ -1980,6 +1988,13 @@ describe("App verification surfaces", () => {
     const editButtons = screen.getAllByRole("button", { name: "Edit memory" });
     await userEvent.click(editButtons[0]);
     const editDialog = await screen.findByRole("dialog", { name: "Edit memory" });
+    expect(within(editDialog).getByText("Memory details")).toBeInTheDocument();
+    expect(await within(editDialog).findAllByText("Expand JSON")).toHaveLength(2);
+    await userEvent.click(
+      within(editDialog).getByRole("button", { name: "Expand JSON Source content" }),
+    );
+    expect(within(editDialog).getAllByLabelText("Source content")).toHaveLength(1);
+    expect(within(editDialog).getAllByText(/"origin"/).length).toBeGreaterThan(0);
     const editFactInput = within(editDialog).getByLabelText("Memory fact");
     await userEvent.clear(editFactInput);
     await userEvent.type(editFactInput, "Updated memory preference.");
@@ -1991,14 +2006,46 @@ describe("App verification surfaces", () => {
       );
       expect(editCall).toBeDefined();
       expect(JSON.parse(String(editCall?.[1]?.body))).toEqual({
+        confidence: null,
         fact: "Updated memory preference.",
         kind: "preference",
+        metadata: {},
         memoryId: activeMemory.id,
         pinned: true,
         scope: "global",
+        sources: [
+          {
+            content: memorySource.content,
+            id: memorySource.id,
+            metadata: { source: "manual" },
+            title: memorySource.title,
+          },
+        ],
         workspaceId: null,
       });
     });
+
+    await userEvent.selectOptions(screen.getByLabelText("Memory scope"), "workspace");
+    expect(await screen.findByText(workspaceMemory.fact)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Promote one level" }));
+
+    await waitFor(() => {
+      const promoteCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/memory/promote",
+      );
+      expect(promoteCall).toBeDefined();
+      expect(JSON.parse(String(promoteCall?.[1]?.body))).toEqual({
+        memoryId: workspaceMemory.id,
+        scope: "workspace",
+        targetChatId: null,
+        targetScope: "global",
+        targetWorkspaceId: null,
+        workspaceId: workspace.id,
+      });
+    });
+
+    await userEvent.selectOptions(screen.getByLabelText("Memory scope"), "global");
+    expect((await screen.findAllByText(activeMemory.fact)).length).toBeGreaterThan(0);
 
     await userEvent.click(screen.getAllByRole("button", { name: "Delete memory" })[0]);
     await waitFor(() => {
@@ -2537,9 +2584,15 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
 
   if (path === "/api/memory") {
     const status = requestUrl.searchParams.get("status");
+    const scope = requestUrl.searchParams.get("scope");
     return jsonResponse({
       extractionJobs: [memoryExtractionJob],
-      memories: status === "pending" ? [pendingMemory] : [activeMemory],
+      memories:
+        status === "pending"
+          ? [pendingMemory]
+          : scope === "workspace"
+            ? [workspaceMemory]
+            : [activeMemory],
     });
   }
 

@@ -10,6 +10,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleAlert,
+  Code2,
   Copy,
   Download,
   Eye,
@@ -384,7 +385,16 @@ type ManualMemoryFormState = {
   chatId: string;
   kind: string;
   fact: string;
+  confidence: string;
+  metadataText: string;
   pinned: boolean;
+};
+
+type MemorySourceFormState = {
+  id: string;
+  title: string;
+  content: string;
+  metadataText: string;
 };
 
 type MemoryDialogMode = "create" | "edit";
@@ -1377,10 +1387,28 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Memory fact": "记忆事实",
     "Memory kind": "记忆类型",
     "Pinned memory": "置顶记忆",
+    "Confidence": "置信度",
+    "Memory metadata": "记忆元数据",
+    "Memory details": "记忆详情",
+    "Memory source details": "记忆来源详情",
+    "Source title": "来源标题",
+    "Source content": "来源内容",
+    "Source metadata": "来源元数据",
+    "Source type": "来源类型",
+    "Source ID": "来源 ID",
+    Latest: "最新",
+    "Expires at": "过期时间",
+    Created: "创建时间",
+    Updated: "更新时间",
+    Yes: "是",
+    No: "否",
+    "Expand JSON": "展开 JSON",
+    "Collapse JSON": "折叠 JSON",
     "Approve memory": "批准记忆",
     "Reject memory": "拒绝记忆",
     "Forget memory": "遗忘记忆",
     "Promote memory": "提升记忆",
+    "Promote one level": "提升一级",
     "Promote to workspace": "提升到工作区",
     "Promote to global": "提升到全局",
     "Memory sources": "记忆来源",
@@ -8928,6 +8956,12 @@ function SettingsPanel({
   );
   const [manualMemoryForm, setManualMemoryForm] =
     useState<ManualMemoryFormState>(() => emptyManualMemoryForm());
+  const [memorySourceForms, setMemorySourceForms] = useState<MemorySourceFormState[]>(
+    [],
+  );
+  const [expandedMemoryJsonIds, setExpandedMemoryJsonIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [memoryDialogMode, setMemoryDialogMode] =
     useState<MemoryDialogMode>("create");
   const [isMemoryDialogOpen, setIsMemoryDialogOpen] = useState(false);
@@ -9308,6 +9342,7 @@ function SettingsPanel({
   useEffect(() => {
     if (activeSection !== "memory" || !selectedMemory) {
       setMemorySources([]);
+      setMemorySourceForms([]);
       return;
     }
     const memoryForSources = selectedMemory;
@@ -9325,6 +9360,9 @@ function SettingsPanel({
           `/api/memory/sources?${params.toString()}`,
         );
         setMemorySources(data.sources);
+        if (isMemoryDialogOpen && memoryDialogMode === "edit") {
+          setMemorySourceForms(memorySourceRecordsToForm(data.sources));
+        }
       } catch (requestError) {
         setError(errorMessage(requestError));
       }
@@ -9333,8 +9371,10 @@ function SettingsPanel({
     void loadMemorySources();
   }, [
     activeSection,
+    isMemoryDialogOpen,
     memoryFilter.scope,
     memoryFilter.workspaceId,
+    memoryDialogMode,
     selectedMemory?.id,
   ]);
 
@@ -9793,6 +9833,8 @@ function SettingsPanel({
 
   function openCreateMemoryDialog() {
     setMemoryDialogMode("create");
+    setMemorySourceForms([]);
+    setExpandedMemoryJsonIds(new Set());
     setManualMemoryForm({
       ...emptyManualMemoryForm(),
       chatId: memoryFilter.chatId,
@@ -9803,12 +9845,19 @@ function SettingsPanel({
   }
 
   function openEditMemoryDialog(memory: MemoryFactRecord) {
+    const isCurrentSelection = selectedMemoryId === memory.id;
     setSelectedMemoryId(memory.id);
     setMemoryDialogMode("edit");
+    setMemorySourceForms(
+      isCurrentSelection ? memorySourceRecordsToForm(memorySources) : [],
+    );
+    setExpandedMemoryJsonIds(new Set());
     setManualMemoryForm({
       chatId: memory.chatId ?? "",
+      confidence: memory.confidence === null ? "" : String(memory.confidence),
       fact: memory.fact,
       kind: memory.kind,
+      metadataText: prettyJsonText(memory.metadataJson),
       pinned: memory.pinned,
       scope: memory.scope as ManualMemoryFormState["scope"],
       workspaceId: memoryFilter.workspaceId || workspaces[0]?.id || "",
@@ -9820,6 +9869,40 @@ function SettingsPanel({
     setIsMemoryDialogOpen(false);
     setMemoryDialogMode("create");
     setManualMemoryForm(emptyManualMemoryForm());
+    setMemorySourceForms([]);
+    setExpandedMemoryJsonIds(new Set());
+  }
+
+  function updateMemorySourceForm(
+    sourceId: string,
+    field: keyof Omit<MemorySourceFormState, "id">,
+    value: string,
+  ) {
+    setMemorySourceForms((current) =>
+      current.map((source) =>
+        source.id === sourceId ? { ...source, [field]: value } : source,
+      ),
+    );
+  }
+
+  function toggleMemoryJson(id: string) {
+    setExpandedMemoryJsonIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  function promoteMemoryOneLevel(memory: MemoryFactRecord) {
+    if (memory.scope === "chat") {
+      void promoteMemory(memory.id, "workspace");
+    } else if (memory.scope === "workspace") {
+      void promoteMemory(memory.id, "global");
+    }
   }
 
   async function saveMemoryDialog(event: FormEvent<HTMLFormElement>) {
@@ -9831,32 +9914,45 @@ function SettingsPanel({
     setIsSavingMemory(true);
     setError(null);
 
-    const scope = manualMemoryForm.scope;
-    const workspaceId =
-      scope === "global" ? null : manualMemoryForm.workspaceId || memoryFilter.workspaceId;
-    const payload =
-      memoryDialogMode === "create"
-        ? {
-            chatId: scope === "chat" ? manualMemoryForm.chatId : null,
-            fact: manualMemoryForm.fact,
-            kind: manualMemoryForm.kind,
-            pinned: manualMemoryForm.pinned,
-            scope,
-            workspaceId,
-          }
-        : {
-            fact: manualMemoryForm.fact,
-            kind: manualMemoryForm.kind,
-            memoryId: selectedMemory?.id,
-            pinned: manualMemoryForm.pinned,
-            scope: memoryFilter.scope,
-            workspaceId:
-              memoryFilter.scope === "global" ? null : memoryFilter.workspaceId,
-          };
-    const endpoint =
-      memoryDialogMode === "create" ? "/api/memory/manual" : "/api/memory/edit";
-
     try {
+      const scope = manualMemoryForm.scope;
+      const workspaceId =
+        scope === "global" ? null : manualMemoryForm.workspaceId || memoryFilter.workspaceId;
+      const metadata = parseJsonText(manualMemoryForm.metadataText || "{}", t("Memory metadata"));
+      const payload =
+        memoryDialogMode === "create"
+          ? {
+              chatId: scope === "chat" ? manualMemoryForm.chatId : null,
+              confidence: optionalNumber(manualMemoryForm.confidence, t("Confidence")),
+              fact: manualMemoryForm.fact,
+              kind: manualMemoryForm.kind,
+              metadata,
+              pinned: manualMemoryForm.pinned,
+              scope,
+              workspaceId,
+            }
+          : {
+              confidence: optionalNumber(manualMemoryForm.confidence, t("Confidence")),
+              fact: manualMemoryForm.fact,
+              kind: manualMemoryForm.kind,
+              memoryId: selectedMemory?.id,
+              metadata,
+              pinned: manualMemoryForm.pinned,
+              scope: memoryFilter.scope,
+              sources: memorySourceForms.map((source) => ({
+                content: source.content,
+                id: source.id,
+                metadata: parseJsonText(
+                  source.metadataText || "{}",
+                  `${t("Source metadata")} ${source.id}`,
+                ),
+                title: source.title,
+              })),
+              workspaceId:
+                memoryFilter.scope === "global" ? null : memoryFilter.workspaceId,
+            };
+      const endpoint =
+        memoryDialogMode === "create" ? "/api/memory/manual" : "/api/memory/edit";
       await requestJson<MemoryMutationResponse>(endpoint, {
         body: JSON.stringify(payload),
         headers: { "Content-Type": "application/json" },
@@ -11374,7 +11470,9 @@ function SettingsPanel({
                     ? t("Create memory")
                     : t("Edit memory")
                 }
-                className="fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                className={`fixed left-1/2 top-1/2 z-50 max-h-[88vh] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)] ${
+                  memoryDialogMode === "edit" ? "w-[min(94vw,72rem)]" : "w-[min(92vw,34rem)]"
+                }`}
                 onSubmit={(event) => void saveMemoryDialog(event)}
                 role="dialog"
               >
@@ -11410,7 +11508,14 @@ function SettingsPanel({
                     <X aria-hidden="true" className="size-4" />
                   </button>
                 </div>
-                <div className="grid gap-3">
+                <div
+                  className={
+                    memoryDialogMode === "edit"
+                      ? "grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]"
+                      : "grid gap-3"
+                  }
+                >
+                  <div className="grid min-w-0 gap-3">
                   {memoryDialogMode === "create" ? (
                     <>
                       <label className="block">
@@ -11495,6 +11600,36 @@ function SettingsPanel({
                       ))}
                     </select>
                   </label>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <TextField
+                      inputMode="numeric"
+                      label={t("Confidence")}
+                      onChange={(value) =>
+                        setManualMemoryForm((current) => ({
+                          ...current,
+                          confidence: value,
+                        }))
+                      }
+                      placeholder="0.8"
+                      value={manualMemoryForm.confidence}
+                    />
+                    <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2 sm:mt-6">
+                      <span className="text-sm font-semibold text-stone-700">
+                        {t("Pinned memory")}
+                      </span>
+                      <input
+                        checked={manualMemoryForm.pinned}
+                        className="size-4 accent-teal-700"
+                        onChange={(event) =>
+                          setManualMemoryForm((current) => ({
+                            ...current,
+                            pinned: event.target.checked,
+                          }))
+                        }
+                        type="checkbox"
+                      />
+                    </label>
+                  </div>
                   <label className="block">
                     <span className="mb-1.5 block text-xs font-semibold text-stone-600">
                       {t("Memory fact")}
@@ -11510,29 +11645,168 @@ function SettingsPanel({
                       value={manualMemoryForm.fact}
                     />
                   </label>
-                  <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                    <span className="text-sm font-semibold text-stone-700">
-                      {t("Pinned memory")}
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Memory metadata")}
                     </span>
-                    <input
-                      checked={manualMemoryForm.pinned}
-                      className="size-4 accent-teal-700"
+                    <textarea
+                      className="min-h-28 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-xs text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                       onChange={(event) =>
                         setManualMemoryForm((current) => ({
                           ...current,
-                          pinned: event.target.checked,
+                          metadataText: event.target.value,
                         }))
                       }
-                      type="checkbox"
+                      spellCheck={false}
+                      value={manualMemoryForm.metadataText}
                     />
                   </label>
+                  {memoryDialogMode === "edit" && selectedMemory ? (
+                    <div className="grid gap-2 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3 text-xs text-stone-600">
+                      <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+                        {t("Memory details")}
+                      </div>
+                      <div className="grid gap-2 sm:grid-cols-2">
+                        <div className="break-all">
+                          <span className="font-semibold text-stone-700">ID: </span>
+                          {selectedMemory.id}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-stone-700">
+                            {t("Memory status")}:{" "}
+                          </span>
+                          {selectedMemory.status}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-stone-700">
+                            {t("Memory scope")}:{" "}
+                          </span>
+                          {selectedMemory.scope}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-stone-700">
+                            {t("Chat ID")}:{" "}
+                          </span>
+                          {selectedMemory.chatId ?? "-"}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-stone-700">
+                            {t("Latest")}:{" "}
+                          </span>
+                          {selectedMemory.isLatest ? t("Yes") : t("No")}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-stone-700">
+                            {t("Expires at")}:{" "}
+                          </span>
+                          {selectedMemory.expiresAt ?? "-"}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-stone-700">
+                            {t("Created")}:{" "}
+                          </span>
+                          {selectedMemory.createdAt}
+                        </div>
+                        <div>
+                          <span className="font-semibold text-stone-700">
+                            {t("Updated")}:{" "}
+                          </span>
+                          {selectedMemory.updatedAt}
+                        </div>
+                      </div>
+                    </div>
+                  ) : null}
+                  </div>
+                  {memoryDialogMode === "edit" ? (
+                    <div className="grid min-w-0 gap-2 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <h4 className="text-xs font-semibold text-stone-600">
+                          {t("Memory source details")}
+                        </h4>
+                        <span className="font-mono text-[11px] font-semibold text-stone-400">
+                          {memorySourceForms.length}
+                        </span>
+                      </div>
+                      {memorySourceForms.length === 0 ? (
+                        <div className="rounded-lg border border-dashed border-stone-300 bg-white px-3 py-6 text-center text-sm font-medium text-stone-500">
+                          {t("No memory sources")}
+                        </div>
+                      ) : (
+                        <div className="grid max-h-[58vh] gap-3 overflow-y-auto pr-1">
+                          {memorySourceForms.map((source, index) => (
+                            <div
+                              className="grid gap-3 rounded-xl border border-stone-200 bg-white px-3 py-3"
+                              key={source.id}
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div className="min-w-0">
+                                  <div className="text-xs font-semibold text-stone-500">
+                                    {t("Memory sources")} #{index + 1}
+                                  </div>
+                                  <div className="mt-1 break-all font-mono text-[11px] text-stone-400">
+                                    {source.id}
+                                  </div>
+                                </div>
+                              </div>
+                              <TextField
+                                label={t("Source title")}
+                                onChange={(value) =>
+                                  updateMemorySourceForm(source.id, "title", value)
+                                }
+                                placeholder={t("Source title")}
+                                value={source.title}
+                              />
+                              <MemorySourceReadonlyDetails
+                                source={memorySources.find((item) => item.id === source.id)}
+                                t={t}
+                              />
+                              <div className="grid gap-1.5">
+                                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                  {t("Source content")}
+                                </span>
+                                <SourceValueEditor
+                                  id={`${source.id}:content`}
+                                  isExpanded={expandedMemoryJsonIds.has(`${source.id}:content`)}
+                                  minHeightClass="min-h-28"
+                                  onChange={(value) =>
+                                    updateMemorySourceForm(source.id, "content", value)
+                                  }
+                                  onToggle={toggleMemoryJson}
+                                  t={t}
+                                  title={t("Source content")}
+                                  value={source.content}
+                                />
+                              </div>
+                              <div className="grid gap-1.5">
+                                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                  {t("Source metadata")}
+                                </span>
+                                <SourceValueEditor
+                                  id={`${source.id}:metadata`}
+                                  isExpanded={expandedMemoryJsonIds.has(`${source.id}:metadata`)}
+                                  minHeightClass="min-h-24"
+                                  onChange={(value) =>
+                                    updateMemorySourceForm(source.id, "metadataText", value)
+                                  }
+                                  onToggle={toggleMemoryJson}
+                                  t={t}
+                                  title={t("Source metadata")}
+                                  value={source.metadataText}
+                                />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
                   <button
                     aria-label={
                       memoryDialogMode === "create"
                         ? t("Create memory")
                         : t("Save memory")
                     }
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 xl:col-span-2"
                     disabled={
                       isSavingMemory ||
                       !manualMemoryForm.fact.trim() ||
@@ -11798,6 +12072,10 @@ function SettingsPanel({
                       setMemoryFilter((current) => ({
                         ...current,
                         scope: event.target.value as MemoryFilterState["scope"],
+                        workspaceId:
+                          event.target.value === "global"
+                            ? ""
+                            : current.workspaceId || memoryWorkspace?.id || "",
                       }))
                     }
                     value={memoryFilter.scope}
@@ -11948,10 +12226,25 @@ function SettingsPanel({
                         <div className="mt-2 text-xs text-stone-500">
                           {memory.updatedAt}
                         </div>
-                      </button>
-                      <div className="flex items-start justify-end gap-2">
-                        <button
-                          aria-label={t("Edit memory")}
+	                      </button>
+	                      <div className="flex items-start justify-end gap-2">
+	                        {memory.scope !== "global" ? (
+	                          <button
+	                            aria-label={t("Promote one level")}
+	                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+	                            onClick={() => promoteMemoryOneLevel(memory)}
+	                            title={
+	                              memory.scope === "chat"
+	                                ? t("Promote to workspace")
+	                                : t("Promote to global")
+	                            }
+	                            type="button"
+	                          >
+	                            <ArrowUp aria-hidden="true" className="size-4" />
+	                          </button>
+	                        ) : null}
+	                        <button
+	                          aria-label={t("Edit memory")}
                           className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                           onClick={() => openEditMemoryDialog(memory)}
                           title={t("Edit memory")}
@@ -12014,75 +12307,25 @@ function SettingsPanel({
                   )}
                 </div>
               </div>
-              {selectedMemory ? (
+              {selectedMemory?.status === "pending" ? (
                 <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
                   <div className="flex flex-wrap gap-2">
-                    {selectedMemory.status === "pending" ? (
-                      <>
-                        <button
-                          className="inline-flex h-9 items-center gap-2 rounded-lg bg-teal-800 px-3 text-xs font-semibold text-white hover:bg-teal-900"
-                          onClick={() => void setMemoryStatus(selectedMemory.id, "active")}
-                          type="button"
-                        >
-                          <CheckCircle2 aria-hidden="true" className="size-3.5" />
-                          {t("Approve memory")}
-                        </button>
-                        <button
-                          className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-xs font-semibold text-rose-700 hover:bg-rose-50"
-                          onClick={() => void setMemoryStatus(selectedMemory.id, "rejected")}
-                          type="button"
-                        >
-                          <X aria-hidden="true" className="size-3.5" />
-                          {t("Reject memory")}
-                        </button>
-                      </>
-                    ) : null}
-                    {memoryFilter.scope === "chat" ? (
-                      <button
-                        className="inline-flex h-9 items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                        onClick={() => void promoteMemory(selectedMemory.id, "workspace")}
-                        type="button"
-                      >
-                        <ArrowUp aria-hidden="true" className="size-3.5" />
-                        {t("Promote to workspace")}
-                      </button>
-                    ) : null}
-                    {memoryFilter.scope !== "global" ? (
-                      <button
-                        className="inline-flex h-9 items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                        onClick={() => void promoteMemory(selectedMemory.id, "global")}
-                        type="button"
-                      >
-                        <ArrowUp aria-hidden="true" className="size-3.5" />
-                        {t("Promote to global")}
-                      </button>
-                    ) : null}
-                  </div>
-                  <div className="mt-4">
-                    <h4 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
-                      {t("Memory sources")}
-                    </h4>
-                    <div className="mt-2 grid gap-2">
-                      {memorySources.length === 0 ? (
-                        <div className="text-sm text-stone-500">
-                          {t("No memory sources")}
-                        </div>
-                      ) : (
-                        memorySources.map((source) => (
-                          <div
-                            className="rounded-lg border border-stone-200 bg-white px-3 py-2"
-                            key={source.id}
-                          >
-                            <div className="text-xs font-semibold text-stone-600">
-                              {source.sourceType}
-                            </div>
-                            <div className="mt-1 break-words text-sm text-stone-800">
-                              {source.content}
-                            </div>
-                          </div>
-                        ))
-                      )}
-                    </div>
+                    <button
+                      className="inline-flex h-9 items-center gap-2 rounded-lg bg-teal-800 px-3 text-xs font-semibold text-white hover:bg-teal-900"
+                      onClick={() => void setMemoryStatus(selectedMemory.id, "active")}
+                      type="button"
+                    >
+                      <CheckCircle2 aria-hidden="true" className="size-3.5" />
+                      {t("Approve memory")}
+                    </button>
+                    <button
+                      className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-xs font-semibold text-rose-700 hover:bg-rose-50"
+                      onClick={() => void setMemoryStatus(selectedMemory.id, "rejected")}
+                      type="button"
+                    >
+                      <X aria-hidden="true" className="size-3.5" />
+                      {t("Reject memory")}
+                    </button>
                   </div>
                 </div>
               ) : null}
@@ -14921,6 +15164,113 @@ function TextField({
   );
 }
 
+function SourceValueEditor({
+  id,
+  isExpanded,
+  minHeightClass,
+  onChange,
+  onToggle,
+  title,
+  value,
+  t,
+}: {
+  id: string;
+  isExpanded: boolean;
+  minHeightClass: string;
+  onChange: (value: string) => void;
+  onToggle: (id: string) => void;
+  title: string;
+  value: string;
+  t: Translate;
+}) {
+  const parsed = parseDisplayJson(value);
+
+  if (!parsed) {
+    return (
+      <textarea
+        aria-label={title}
+        className={`${minHeightClass} w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-xs text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100`}
+        onChange={(event) => onChange(event.target.value)}
+        spellCheck={false}
+        value={value}
+      />
+    );
+  }
+
+  return (
+    <div className="rounded-lg border border-stone-200 bg-stone-950 text-stone-100">
+      <button
+        aria-label={`${isExpanded ? t("Collapse JSON") : t("Expand JSON")} ${title}`}
+        className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-xs font-semibold text-stone-200"
+        onClick={() => onToggle(id)}
+        type="button"
+      >
+        <span className="inline-flex min-w-0 items-center gap-2">
+          <Code2 aria-hidden="true" className="size-3.5 shrink-0 text-teal-300" />
+          <span className="truncate">{title}</span>
+        </span>
+        <span className="shrink-0 text-stone-400">
+          {isExpanded ? t("Collapse JSON") : t("Expand JSON")}
+        </span>
+      </button>
+      {isExpanded ? (
+        <textarea
+          aria-label={title}
+          className={`${minHeightClass} w-full resize-y border-0 border-t border-stone-800 bg-stone-950 px-3 py-3 font-mono text-xs leading-relaxed text-stone-100 outline-none focus:ring-2 focus:ring-inset focus:ring-teal-500/40`}
+          onChange={(event) => onChange(event.target.value)}
+          spellCheck={false}
+          value={parsed.pretty}
+        />
+      ) : (
+        <div className="border-t border-stone-800 px-3 py-2 font-mono text-xs text-stone-400">
+          <code>{jsonSyntaxNodes(compactToolText(parsed.pretty))}</code>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MemorySourceReadonlyDetails({
+  source,
+  t,
+}: {
+  source: MemorySourceRecord | undefined;
+  t: Translate;
+}) {
+  if (!source) {
+    return null;
+  }
+
+  return (
+    <div className="grid gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3 text-xs text-stone-600 sm:grid-cols-2">
+      <div>
+        <span className="font-semibold text-stone-700">{t("Memory scope")}: </span>
+        {source.scope}
+      </div>
+      <div>
+        <span className="font-semibold text-stone-700">{t("Chat ID")}: </span>
+        {source.chatId ?? "-"}
+      </div>
+      <div>
+        <span className="font-semibold text-stone-700">{t("Source type")}: </span>
+        {source.sourceType}
+      </div>
+      <div>
+        <span className="font-semibold text-stone-700">{t("Source ID")}: </span>
+        {source.sourceId ?? "-"}
+      </div>
+      <div>
+        <span className="font-semibold text-stone-700">{t("Created")}: </span>
+        {source.createdAt}
+      </div>
+      <div>
+        <span className="font-semibold text-stone-700">{t("Updated")}: </span>
+        {source.updatedAt}
+      </div>
+    </div>
+  );
+}
+
 function CapabilityPill({ label, ok }: { label: string; ok: boolean }) {
   return (
     <span
@@ -15027,8 +15377,10 @@ function emptyMemoryFilter(): MemoryFilterState {
 function emptyManualMemoryForm(): ManualMemoryFormState {
   return {
     chatId: "",
+    confidence: "",
     fact: "",
     kind: "user_note",
+    metadataText: "{}",
     pinned: false,
     scope: "global",
     workspaceId: "",
@@ -15461,6 +15813,71 @@ function parseJsonText(value: string, label: string): JsonValue {
   return parsed;
 }
 
+function prettyJsonText(value: string) {
+  try {
+    return JSON.stringify(JSON.parse(value) as JsonValue, null, 2);
+  } catch {
+    return value || "{}";
+  }
+}
+
+function parseDisplayJson(value: string) {
+  const normalized = normalizedJsonValue(value);
+  if (normalized === value) {
+    return null;
+  }
+  return { pretty: formatJsonValue(normalized) };
+}
+
+function jsonSyntaxNodes(value: string) {
+  const tokenPattern =
+    /("(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"(?=\s*:)|"(?:\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"|true|false|null|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g;
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = tokenPattern.exec(value)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(value.slice(lastIndex, match.index));
+    }
+    const token = match[0];
+    nodes.push(
+      <span className={jsonTokenClass(token)} key={`${match.index}-${token}`}>
+        {token}
+      </span>,
+    );
+    lastIndex = match.index + token.length;
+  }
+
+  if (lastIndex < value.length) {
+    nodes.push(value.slice(lastIndex));
+  }
+
+  return nodes;
+}
+
+function jsonTokenClass(token: string) {
+  if (token.startsWith('"')) {
+    return token.endsWith('":') ? "text-sky-300" : "text-emerald-300";
+  }
+  if (token === "true" || token === "false") {
+    return "text-amber-300";
+  }
+  if (token === "null") {
+    return "text-stone-500";
+  }
+  return "text-violet-300";
+}
+
+function memorySourceRecordsToForm(sources: MemorySourceRecord[]): MemorySourceFormState[] {
+  return sources.map((source) => ({
+    content: source.content,
+    id: source.id,
+    metadataText: prettyJsonText(source.metadataJson),
+    title: source.title,
+  }));
+}
+
 function optionalText(value: string) {
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
@@ -15855,6 +16272,22 @@ function optionalPositiveInteger(value: string, label: string) {
 
   if (!Number.isSafeInteger(numberValue) || numberValue <= 0) {
     throw new Error(`${label} must be a positive whole number`);
+  }
+
+  return numberValue;
+}
+
+function optionalNumber(value: string, label: string) {
+  const trimmed = value.trim();
+
+  if (!trimmed) {
+    return null;
+  }
+
+  const numberValue = Number(trimmed);
+
+  if (!Number.isFinite(numberValue)) {
+    throw new Error(`${label} must be a number`);
   }
 
   return numberValue;

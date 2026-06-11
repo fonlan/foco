@@ -58,6 +58,7 @@ use foco_store::{
         MemoryDatabase, MemoryDatabaseError, MemoryExtractionJobStatus, MemoryFactRecord,
         MemoryKind, MemoryScope, MemorySourceRecord, MemorySourceType, MemoryStatus,
         NewMemoryExtractionJob, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
+        UpdateMemorySource,
     },
     model_metadata::{
         MODELS_DEV_API_URL, ModelMetadataCache, ModelMetadataError, ModelMetadataRecord,
@@ -147,6 +148,8 @@ const MEMORY_EXTRACTION_TOOL_NAME: &str = "submit_memory_extraction";
 const MEMORY_RETRIEVAL_TOOL_NAME: &str = "select_relevant_memory";
 // Timeout for the background model call that extracts durable memory facts.
 const MEMORY_EXTRACTION_TIMEOUT_MS: u64 = 60_000;
+// One retry is enough for malformed model tool output; repeated failures are ignored.
+const MEMORY_EXTRACTION_MAX_ATTEMPTS: usize = 2;
 // Timeout for model-based memory retrieval during prompt assembly.
 const MEMORY_RETRIEVAL_TIMEOUT_MS: u64 = 30_000;
 // Maximum output tokens allowed for the memory extraction model request.
@@ -2338,6 +2341,16 @@ struct EditMemoryRequest {
     confidence: Option<f64>,
     pinned: Option<bool>,
     metadata: Option<Value>,
+    sources: Option<Vec<EditMemorySourceRequest>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditMemorySourceRequest {
+    id: String,
+    title: Option<String>,
+    content: Option<String>,
+    metadata: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2538,18 +2551,21 @@ fn memory_extraction_job_summaries(
     status: MemoryExtractionJobStatus,
     limit: u32,
 ) -> Result<Vec<MemoryExtractionJobSummary>, ApiError> {
+    let fetch_limit = limit.saturating_mul(10).max(limit).min(200);
     let jobs = match scope {
         MemoryScope::Global => Vec::new(),
         MemoryScope::Chat => database
-            .extraction_jobs_for_scope(chat_id, Some(status), limit)
+            .extraction_jobs_for_scope(chat_id, Some(status), fetch_limit)
             .map_err(ApiError::from_memory_error)?,
         MemoryScope::Workspace => database
-            .extraction_jobs(Some(status), limit)
+            .extraction_jobs(Some(status), fetch_limit)
             .map_err(ApiError::from_memory_error)?,
     };
 
     Ok(jobs
         .into_iter()
+        .filter(|job| !memory_extraction_error_should_be_ignored(job.error_message.as_deref()))
+        .take(limit as usize)
         .map(|job| MemoryExtractionJobSummary {
             id: job.id,
             scope: job.scope,
@@ -2645,6 +2661,7 @@ async fn edit_memory(
     let memory_id = normalized_required_text("memoryId", &request.memory_id)?;
     let fact = normalized_optional_text(request.fact);
     let metadata_json = optional_memory_metadata_json(request.metadata)?;
+    let source_updates = memory_source_updates(request.sources)?;
     let kind = request
         .kind
         .as_deref()
@@ -2655,6 +2672,23 @@ async fn edit_memory(
         .map_err(ApiError::from_memory_error)?;
     let mut database =
         open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
+
+    if !source_updates.is_empty() {
+        let linked_source_ids = database
+            .sources_for_fact(&memory_id)
+            .map_err(ApiError::from_memory_error)?
+            .into_iter()
+            .map(|source| source.id)
+            .collect::<HashSet<_>>();
+        for source_update in &source_updates {
+            if !linked_source_ids.contains(&source_update.id) {
+                return Err(ApiError::bad_request(format!(
+                    "memory source '{}' is not linked to memory '{}'",
+                    source_update.id, memory_id
+                )));
+            }
+        }
+    }
 
     database
         .update_fact(UpdateMemoryFact {
@@ -2667,6 +2701,16 @@ async fn edit_memory(
             ..UpdateMemoryFact::default()
         })
         .map_err(ApiError::from_memory_error)?;
+    for source_update in &source_updates {
+        database
+            .update_source(UpdateMemorySource {
+                id: &source_update.id,
+                title: source_update.title.as_deref(),
+                content: source_update.content.as_deref(),
+                metadata_json: source_update.metadata_json.as_deref(),
+            })
+            .map_err(ApiError::from_memory_error)?;
+    }
     let memory = database
         .fact(&memory_id)
         .map_err(ApiError::from_memory_error)?;
@@ -7811,7 +7855,38 @@ async fn run_memory_extraction_job(task: MemoryExtractionTask) -> Result<(), Api
         .map_err(ApiError::from_memory_error)?;
     drop(workspace_memory_database);
 
-    let extraction_result = run_memory_extraction_job_inner(&task).await;
+    let mut attempt = 1;
+    let extraction_result = loop {
+        let result = run_memory_extraction_job_inner(&task).await;
+        let Err(error) = &result else {
+            break result;
+        };
+        if !memory_extraction_error_should_be_ignored(Some(&error.message)) {
+            break result;
+        }
+        if attempt >= MEMORY_EXTRACTION_MAX_ATTEMPTS {
+            tracing::warn!(
+                job_id = %task.job_id,
+                workspace_id = %task.workspace_id,
+                chat_id = %task.chat_id,
+                model_id = %task.model_id,
+                attempt,
+                error = %error.message,
+                "memory extraction model output stayed invalid after retry; ignoring extraction"
+            );
+            break result;
+        }
+        tracing::warn!(
+            job_id = %task.job_id,
+            workspace_id = %task.workspace_id,
+            chat_id = %task.chat_id,
+            model_id = %task.model_id,
+            attempt,
+            error = %error.message,
+            "memory extraction model output was invalid; retrying"
+        );
+        attempt += 1;
+    };
     let mut workspace_memory_database = MemoryDatabase::open_workspace_at(&workspace_memory_path)
         .map_err(ApiError::from_memory_error)?;
 
@@ -7822,9 +7897,15 @@ async fn run_memory_extraction_job(task: MemoryExtractionTask) -> Result<(), Api
                 .map_err(ApiError::from_memory_error)?;
         }
         Err(error) => {
-            workspace_memory_database
-                .fail_extraction_job(&task.job_id, &error.message, None)
-                .map_err(ApiError::from_memory_error)?;
+            if memory_extraction_error_should_be_ignored(Some(&error.message)) {
+                workspace_memory_database
+                    .complete_extraction_job(&task.job_id, r#"{"facts":[]}"#)
+                    .map_err(ApiError::from_memory_error)?;
+            } else {
+                workspace_memory_database
+                    .fail_extraction_job(&task.job_id, &error.message, None)
+                    .map_err(ApiError::from_memory_error)?;
+            }
         }
     }
 
@@ -9047,6 +9128,18 @@ fn parse_memory_extraction_output(value: Value) -> Result<MemoryExtractionOutput
     serde_json::from_value(value).map_err(|source| {
         ApiError::bad_request(format!("malformed memory extraction JSON: {source}"))
     })
+}
+
+fn memory_extraction_error_should_be_ignored(error_message: Option<&str>) -> bool {
+    let Some(message) = error_message else {
+        return false;
+    };
+    message.starts_with("malformed memory extraction JSON:")
+        || message == "memory extraction did not call submit tool"
+        || message.starts_with("memory extraction returned text instead of submit tool:")
+        || message.starts_with("memory extraction called unsupported tool ")
+        || message.starts_with("memory extraction completed with unsupported tool ")
+        || message.starts_with("extracted fact ")
 }
 
 fn parse_memory_retrieval_output(value: Value) -> Result<MemoryRetrievalOutput, ApiError> {
@@ -12084,6 +12177,30 @@ fn optional_memory_metadata_json(metadata: Option<Value>) -> Result<Option<Strin
     metadata
         .map(|value| memory_metadata_json(Some(value)))
         .transpose()
+}
+
+struct MemorySourceUpdatePayload {
+    id: String,
+    title: Option<String>,
+    content: Option<String>,
+    metadata_json: Option<String>,
+}
+
+fn memory_source_updates(
+    sources: Option<Vec<EditMemorySourceRequest>>,
+) -> Result<Vec<MemorySourceUpdatePayload>, ApiError> {
+    sources
+        .unwrap_or_default()
+        .into_iter()
+        .map(|source| {
+            Ok(MemorySourceUpdatePayload {
+                id: normalized_required_text("source.id", &source.id)?,
+                title: source.title,
+                content: source.content,
+                metadata_json: optional_memory_metadata_json(source.metadata)?,
+            })
+        })
+        .collect()
 }
 
 async fn settings_response(
@@ -16705,7 +16822,19 @@ description: Project memory.
                 model_id: Some("model-1"),
                 input_json: r#"{"safe":"ok"}"#,
                 output_json: None,
-                error_message: Some("malformed memory extraction JSON"),
+                error_message: Some("memory extraction provider failed"),
+            })
+            .expect("failed job insert");
+        memory_database
+            .insert_extraction_job(NewMemoryExtractionJob {
+                id: "job-ignored",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                status: MemoryExtractionJobStatus::Failed,
+                model_id: Some("model-1"),
+                input_json: r#"{"safe":"ok"}"#,
+                output_json: None,
+                error_message: Some("malformed memory extraction JSON: unknown field `query`"),
             })
             .expect("failed job insert");
 
@@ -16722,7 +16851,7 @@ description: Project memory.
         assert_eq!(summaries[0].id, "job-1");
         assert_eq!(
             summaries[0].error_message.as_deref(),
-            Some("malformed memory extraction JSON")
+            Some("memory extraction provider failed")
         );
 
         drop(memory_database);
