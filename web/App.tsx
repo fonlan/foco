@@ -32,6 +32,7 @@ import {
   MessageSquare,
   PanelRight,
   Pencil,
+  Play,
   PlugZap,
   Plus,
   RefreshCw,
@@ -108,7 +109,13 @@ type WorkspaceSummary = {
   logoUrl: string | null;
   pinned: boolean;
   terminalShell: string;
+  commonCommands: WorkspaceCommonCommandSummary[];
   chats: ChatSummary[];
+};
+
+type WorkspaceCommonCommandSummary = {
+  name: string;
+  command: string;
 };
 
 type WorkspacesResponse = {
@@ -283,6 +290,7 @@ type ConfiguredWorkspaceSummary = {
   logoUrl: string | null;
   pinned: boolean;
   terminalShell: string;
+  commonCommands: WorkspaceCommonCommandSummary[];
   isDefault: boolean;
 };
 
@@ -455,6 +463,7 @@ type WorkspaceFormState = {
   path: string;
   pinned: boolean;
   terminalShell: string;
+  commonCommands: WorkspaceCommonCommandSummary[];
 };
 
 type McpTransportSummary = {
@@ -1158,6 +1167,11 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Upload icon": "上传图标",
     "Workspace list": "工作区列表",
     "Terminal shell": "终端 Shell",
+    "Common commands": "常用命令",
+    "Command name": "命令名",
+    "Add command": "添加命令",
+    "Remove command": "移除命令",
+    "Remove command {name}": "移除命令 {name}",
     "Pinned workspace": "置顶工作区",
     "Save workspace": "保存工作区",
     "Default workspace": "Default 工作区",
@@ -1343,6 +1357,9 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Resize git diff panel": "调整 Git diff 面板宽度",
     "Resize todo graph and git diff panels": "调整待办事项和 Git diff 面板高度",
     "Resize terminal panel": "调整终端面板高度",
+    "Run common command": "运行常用命令",
+    "Run common command {name}": "运行常用命令 {name}",
+    "Terminal is not connected.": "终端尚未连接。",
     "New terminal": "新建终端",
     "Terminal sessions": "终端列表",
     "Terminal {number}": "终端 {number}",
@@ -1761,11 +1778,16 @@ type TerminalServerEvent =
 
 type TerminalPaneStatus = "closed" | "connected" | "connecting" | "error";
 
+type TerminalCommandRun = {
+  input: string;
+};
+
 type TerminalPanelSession = {
   clientId: string;
   cwd: string;
   error: string | null;
   number: number;
+  pendingCommand: TerminalCommandRun | null;
   serverSessionId: string | null;
   status: TerminalPaneStatus;
 };
@@ -6823,6 +6845,83 @@ function ToolCallBlock({ toolCall }: { toolCall: ChatToolCallSummary }) {
   );
 }
 
+function TerminalCommandButton({
+  commands,
+  disabled,
+  onRun,
+}: {
+  commands: WorkspaceCommonCommandSummary[];
+  disabled: boolean;
+  onRun: (command: WorkspaceCommonCommandSummary) => void;
+}) {
+  const { t } = useI18n();
+  const detailsRef = useCloseDetailsOnOutsidePointerDown();
+
+  if (!commands.length) {
+    return null;
+  }
+
+  if (commands.length === 1) {
+    const command = commands[0];
+    return (
+      <button
+        aria-label={t("Run common command {name}", { name: command.name })}
+        className="inline-flex size-6 items-center justify-center rounded-md text-stone-400 hover:bg-stone-800 hover:text-stone-100 disabled:cursor-not-allowed disabled:text-stone-600 disabled:hover:bg-transparent"
+        disabled={disabled}
+        onClick={() => onRun(command)}
+        title={t("Run common command {name}", { name: command.name })}
+        type="button"
+      >
+        <Play aria-hidden="true" className="size-3.5 fill-current" />
+      </button>
+    );
+  }
+
+  function handleSelect(
+    command: WorkspaceCommonCommandSummary,
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) {
+    event.currentTarget.closest("details")?.removeAttribute("open");
+    onRun(command);
+  }
+
+  return (
+    <details className="relative" ref={detailsRef}>
+      <summary
+        aria-disabled={disabled}
+        aria-label={t("Run common command")}
+        className={`inline-flex size-6 cursor-pointer list-none items-center justify-center rounded-md text-stone-400 outline-none marker:hidden focus-visible:ring-2 focus-visible:ring-teal-500/60 [&::-webkit-details-marker]:hidden ${
+          disabled
+            ? "pointer-events-none text-stone-600"
+            : "hover:bg-stone-800 hover:text-stone-100"
+        }`}
+        title={t("Run common command")}
+      >
+        <Play aria-hidden="true" className="size-3.5 fill-current" />
+      </summary>
+      <div className="absolute right-0 top-full z-30 mt-2 w-56 overflow-hidden rounded-lg border border-stone-800 bg-stone-950 shadow-[0_18px_40px_rgba(0,0,0,0.28)]">
+        <div className="panel-scroll max-h-56 overflow-y-auto py-1">
+          {commands.map((command, index) => (
+            <button
+              aria-label={t("Run common command {name}", { name: command.name })}
+              className="flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-xs font-semibold text-stone-200 hover:bg-stone-800"
+              key={`${command.name}-${index}`}
+              onClick={(event) => handleSelect(command, event)}
+              type="button"
+            >
+              <Play
+                aria-hidden="true"
+                className="size-3.5 shrink-0 fill-current text-teal-400"
+              />
+              <span className="min-w-0 flex-1 truncate">{command.name}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+    </details>
+  );
+}
+
 function TerminalPanel({
   onClose,
   workspace,
@@ -6841,6 +6940,7 @@ function TerminalPanel({
   const previousWorkspaceIdRef = useRef(workspace?.id ?? "");
   const workspaceId = workspace?.id ?? "";
   const workspacePath = workspace?.path ?? "";
+  const commonCommands = workspace?.commonCommands ?? [];
   const activeSession =
     sessions.find((session) => session.clientId === activeClientId) ??
     sessions[0] ??
@@ -6934,6 +7034,22 @@ function TerminalPanel({
     }
   }
 
+  function runWorkspaceCommonCommand(command: WorkspaceCommonCommandSummary) {
+    if (!activeSession || !workspace) {
+      return;
+    }
+
+    updateSession(activeSession.clientId, {
+      pendingCommand: {
+        input: terminalCommandInput(
+          workspace.terminalShell,
+          workspace.path,
+          command.command,
+        ),
+      },
+    });
+  }
+
   return (
     <section
       className="terminal-panel relative shrink-0 border-t border-stone-800 bg-[#16130f]"
@@ -6979,6 +7095,11 @@ function TerminalPanel({
                   {activeSession.error}
                 </span>
               ) : null}
+              <TerminalCommandButton
+                commands={commonCommands}
+                disabled={!activeSession || !isTerminalConnected(activeSession.status)}
+                onRun={runWorkspaceCommonCommand}
+              />
               <button
                 aria-label={t("New terminal")}
                 className="inline-flex size-6 items-center justify-center rounded-md text-stone-400 hover:bg-stone-800 hover:text-stone-100"
@@ -7280,6 +7401,25 @@ function TerminalSessionPane({
     };
   }, [clientId, markClosed, onUpdate, workspaceId]);
 
+  useEffect(() => {
+    const pendingCommand = session.pendingCommand;
+    if (!pendingCommand) {
+      return;
+    }
+
+    const socket = socketRef.current;
+    if (socket?.readyState !== WebSocket.OPEN) {
+      onUpdate(clientId, {
+        error: tRef.current("Terminal is not connected."),
+        pendingCommand: null,
+      });
+      return;
+    }
+
+    socket.send(JSON.stringify({ type: "input", data: pendingCommand.input }));
+    onUpdate(clientId, { pendingCommand: null });
+  }, [clientId, onUpdate, session.pendingCommand]);
+
   return (
     <div
       aria-hidden={!isActive}
@@ -7300,9 +7440,40 @@ function createTerminalPanelSession(number: number): TerminalPanelSession {
     cwd: "",
     error: null,
     number,
+    pendingCommand: null,
     serverSessionId: null,
     status: "closed",
   };
+}
+
+function terminalCommandInput(
+  terminalShell: string,
+  workspacePath: string,
+  command: string,
+) {
+  const commandInput =
+    command.endsWith("\n") || command.endsWith("\r") ? command : `${command}\r`;
+  return `${terminalCdCommand(terminalShell, workspacePath)}\r${commandInput}`;
+}
+
+function terminalCdCommand(terminalShell: string, workspacePath: string) {
+  if (terminalShell === "powershell") {
+    return `Set-Location -LiteralPath '${quotePowerShellSingle(workspacePath)}'`;
+  }
+
+  if (terminalShell === "cmd") {
+    return `cd /d "${workspacePath.replaceAll('"', '""')}"`;
+  }
+
+  return `cd -- '${quotePosixSingle(workspacePath)}'`;
+}
+
+function quotePowerShellSingle(value: string) {
+  return value.replaceAll("'", "''");
+}
+
+function quotePosixSingle(value: string) {
+  return value.replaceAll("'", "'\\''");
 }
 
 type ChartDatum = {
@@ -9960,6 +10131,7 @@ function SettingsPanel({
 
   function editConfiguredWorkspace(workspace: ConfiguredWorkspaceSummary) {
     setWorkspaceForm({
+      commonCommands: workspace.commonCommands.map((command) => ({ ...command })),
       id: workspace.id,
       name: workspace.name,
       path: workspace.path,
@@ -10646,6 +10818,7 @@ function SettingsPanel({
           path: workspaceForm.path,
           pinned: workspaceForm.pinned,
           terminalShell: workspaceForm.terminalShell,
+          commonCommands: workspaceForm.commonCommands,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -10666,6 +10839,35 @@ function SettingsPanel({
     } finally {
       setIsSavingWorkspace(false);
     }
+  }
+
+  function addWorkspaceCommonCommand() {
+    setWorkspaceForm((current) => ({
+      ...current,
+      commonCommands: [...current.commonCommands, { name: "", command: "" }],
+    }));
+  }
+
+  function updateWorkspaceCommonCommand(
+    index: number,
+    field: keyof WorkspaceCommonCommandSummary,
+    value: string,
+  ) {
+    setWorkspaceForm((current) => ({
+      ...current,
+      commonCommands: current.commonCommands.map((command, commandIndex) =>
+        commandIndex === index ? { ...command, [field]: value } : command,
+      ),
+    }));
+  }
+
+  function removeWorkspaceCommonCommand(index: number) {
+    setWorkspaceForm((current) => ({
+      ...current,
+      commonCommands: current.commonCommands.filter(
+        (_command, commandIndex) => commandIndex !== index,
+      ),
+    }));
   }
 
   async function saveWorkspaceOrder(workspaceIds: string[]) {
@@ -10712,6 +10914,7 @@ function SettingsPanel({
             path: workspace.path,
             pinned,
             terminalShell: workspace.terminalShell,
+            commonCommands: workspace.commonCommands,
           }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -12951,7 +13154,7 @@ function SettingsPanel({
               <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
               <form
                 aria-label={t("Workspace configuration")}
-                className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
                 onSubmit={(event) => void saveWorkspace(event)}
               >
                 <div className="mb-4 flex items-center justify-between gap-3">
@@ -13105,6 +13308,76 @@ function SettingsPanel({
                       ))}
                     </select>
                   </label>
+                  <div className="rounded-lg border border-stone-200 bg-stone-50/80 p-3">
+                    <div className="mb-3 flex items-center justify-between gap-3">
+                      <span className="text-sm font-semibold text-stone-700">
+                        {t("Common commands")}
+                      </span>
+                      <button
+                        aria-label={t("Add command")}
+                        className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                        onClick={addWorkspaceCommonCommand}
+                        title={t("Add command")}
+                        type="button"
+                      >
+                        <Plus aria-hidden="true" className="size-4" />
+                      </button>
+                    </div>
+                    {workspaceForm.commonCommands.length ? (
+                      <div className="space-y-2">
+                        <div className="grid gap-2 pr-10 text-xs font-semibold text-stone-500 sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1.4fr)]">
+                          <span>{t("Command name")}</span>
+                          <span>{t("Command")}</span>
+                        </div>
+                        {workspaceForm.commonCommands.map((command, index) => (
+                          <div
+                            className="grid items-center gap-2 sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1.4fr)_2.25rem]"
+                            key={index}
+                          >
+                            <input
+                              aria-label={t("Command name")}
+                              autoComplete="off"
+                              className="h-9 min-w-0 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                              onChange={(event) =>
+                                updateWorkspaceCommonCommand(
+                                  index,
+                                  "name",
+                                  event.target.value,
+                                )
+                              }
+                              placeholder={t("Command name")}
+                              value={command.name}
+                            />
+                            <input
+                              aria-label={t("Command")}
+                              autoComplete="off"
+                              className="h-9 min-w-0 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                              onChange={(event) =>
+                                updateWorkspaceCommonCommand(
+                                  index,
+                                  "command",
+                                  event.target.value,
+                                )
+                              }
+                              placeholder="npm run dev"
+                              value={command.command}
+                            />
+                            <button
+                              aria-label={t("Remove command {name}", {
+                                name: command.name || String(index + 1),
+                              })}
+                              className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-500 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                              onClick={() => removeWorkspaceCommonCommand(index)}
+                              title={t("Remove command")}
+                              type="button"
+                            >
+                              <Trash2 aria-hidden="true" className="size-4" />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
                   <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
                     <span className="text-sm font-semibold text-stone-700">
                       {t("Pinned workspace")}
@@ -16075,6 +16348,7 @@ function emptyManualMemoryForm(): ManualMemoryFormState {
 
 function emptyWorkspaceForm(): WorkspaceFormState {
   return {
+    commonCommands: [],
     id: "",
     name: "",
     path: "",

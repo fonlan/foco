@@ -301,6 +301,7 @@ impl GlobalConfig {
                 path: default_workspace_path,
                 pinned: false,
                 terminal_shell: default_terminal_shell(),
+                common_commands: Vec::new(),
             }],
         }
     }
@@ -349,6 +350,11 @@ impl GlobalConfig {
                 config_path,
                 "workspace.terminal_shell",
                 &workspace.terminal_shell,
+            )?;
+            validate_workspace_common_commands(
+                config_path,
+                &workspace.id,
+                &workspace.common_commands,
             )?;
 
             if !workspace_ids.insert(workspace.id.as_str()) {
@@ -888,6 +894,15 @@ pub struct WorkspaceConfig {
     pub pinned: bool,
     #[serde(default = "default_terminal_shell")]
     pub terminal_shell: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub common_commands: Vec<WorkspaceCommonCommand>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceCommonCommand {
+    pub name: String,
+    pub command: String,
 }
 
 #[derive(Debug)]
@@ -1458,6 +1473,20 @@ fn validate_terminal_shell(
     )
 }
 
+fn validate_workspace_common_commands(
+    config_path: Option<&Path>,
+    workspace_id: &str,
+    commands: &[WorkspaceCommonCommand],
+) -> Result<(), ConfigError> {
+    for (index, command) in commands.iter().enumerate() {
+        let field = format!("workspace '{workspace_id}' common_commands[{index}]");
+        require_non_empty(config_path, &format!("{field}.name"), &command.name)?;
+        require_non_empty(config_path, &format!("{field}.command"), &command.command)?;
+    }
+
+    Ok(())
+}
+
 fn require_non_empty_list(
     config_path: Option<&Path>,
     field: &str,
@@ -1551,6 +1580,7 @@ mod tests {
             loaded.config.workspaces[0].terminal_shell,
             DEFAULT_TERMINAL_SHELL
         );
+        assert!(loaded.config.workspaces[0].common_commands.is_empty());
         assert!(loaded.config.skills.directories.is_empty());
     }
 
@@ -1868,6 +1898,31 @@ mod tests {
             error
                 .to_string()
                 .contains("workspace.terminal_shell 'fish' is unsupported")
+        );
+    }
+
+    #[test]
+    fn load_rejects_workspace_common_command_without_command() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.workspaces[0]
+            .common_commands
+            .push(WorkspaceCommonCommand {
+                name: "Dev".to_string(),
+                command: " ".to_string(),
+            });
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("empty common command should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("workspace 'default' common_commands[0].command must not be empty")
         );
     }
 

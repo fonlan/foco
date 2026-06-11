@@ -41,6 +41,7 @@ const workspace = {
       updatedAt: `2026-06-04T${String(10 - index).padStart(2, "0")}:05:00Z`,
     })),
   ],
+  commonCommands: [],
   id: "workspace-1",
   logoUrl: "/api/workspaces/workspace-1/logo?v=1",
   name: "Default",
@@ -58,6 +59,7 @@ const secondaryWorkspace = {
       updatedAt: "2026-06-05T12:05:00Z",
     },
   ],
+  commonCommands: [],
   id: "workspace-2",
   logoUrl: null,
   name: "Side project",
@@ -242,6 +244,7 @@ const settings = {
       logoUrl: workspace.logoUrl,
       pinned: workspace.pinned,
       terminalShell: workspace.terminalShell,
+      commonCommands: workspace.commonCommands,
     },
   ],
 };
@@ -2509,6 +2512,67 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("runs a workspace common command in the active terminal", async () => {
+    const commandWorkspace = {
+      ...workspace,
+      commonCommands: [{ command: "npm run dev", name: "Dev" }],
+    };
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((input, init) => {
+      const path =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+
+      if (path === "/api/workspaces") {
+        return Promise.resolve(jsonResponse({
+          activeWorkspaceId: commandWorkspace.id,
+          workspaces: [commandWorkspace, secondaryWorkspace],
+        }));
+      }
+
+      if (path === "/api/settings") {
+        return Promise.resolve(jsonResponse({
+          ...settings,
+          workspaces: [
+            {
+              ...settings.workspaces[0],
+              commonCommands: commandWorkspace.commonCommands,
+            },
+          ],
+        }));
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+    const sendSpy = vi.spyOn(window.WebSocket.prototype, "send");
+
+    render(<App />);
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("button", { name: "Open terminal" }));
+    expect(await screen.findByText("connected")).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Run common command Dev" }),
+    );
+
+    await waitFor(() => {
+      const sentInput = sendSpy.mock.calls
+        .map(([data]) => JSON.parse(String(data)) as { data?: string; type: string })
+        .find(
+          (message) =>
+            message.type === "input" && message.data?.includes("npm run dev"),
+        );
+
+      expect(sentInput?.data).toBe(
+        `Set-Location -LiteralPath '${commandWorkspace.path}'\rnpm run dev\r`,
+      );
+    });
+  });
+
   it("keeps todo graph and git diff in separate context tabs", async () => {
     render(<App />);
 
@@ -2795,6 +2859,7 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
           path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
           pinned: false,
           terminalShell: "powershell",
+          commonCommands: [],
         },
       ],
     });

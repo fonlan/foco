@@ -77,6 +77,7 @@ fn initializes_every_registered_workspace() {
             path: first.path().to_path_buf(),
             pinned: false,
             terminal_shell: foco_store::config::DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
         },
         WorkspaceConfig {
             id: "second".to_string(),
@@ -84,6 +85,7 @@ fn initializes_every_registered_workspace() {
             path: second.path().to_path_buf(),
             pinned: false,
             terminal_shell: foco_store::config::DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
         },
     ];
 

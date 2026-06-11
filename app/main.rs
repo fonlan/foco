@@ -56,8 +56,9 @@ use foco_store::{
         ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES,
         SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_HOOK_EVENTS,
         SUPPORTED_TERMINAL_SHELLS, SkillSettings, UNSUPPORTED_HOOK_EVENTS, WebServerSettings,
-        WorkspaceConfig, load_or_create_global_config, load_workspace_hook_config,
-        save_global_config, save_workspace_hook_config, workspace_hook_config_path,
+        WorkspaceCommonCommand, WorkspaceConfig, load_or_create_global_config,
+        load_workspace_hook_config, save_global_config, save_workspace_hook_config,
+        workspace_hook_config_path,
     },
     memory::{
         MemoryDatabase, MemoryDatabaseError, MemoryExtractionJobStatus, MemoryFactRecord,
@@ -1335,6 +1336,7 @@ async fn add_workspace(
         path,
         pinned: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
     });
     save_config(&state, config.clone())?;
     sync_all_mcp_workspaces(&state.mcp_registry, &config)
@@ -1353,6 +1355,7 @@ async fn save_workspace_settings(
     let name = request.name.trim();
     let requested_path = validate_workspace_path(&request.path)?;
     let terminal_shell = normalize_terminal_shell(&request.terminal_shell)?;
+    let common_commands = normalize_workspace_common_commands(&request.common_commands)?;
 
     if workspace_id.is_empty() {
         return Err(ApiError::bad_request("workspace id must not be empty"));
@@ -1392,6 +1395,7 @@ async fn save_workspace_settings(
     workspace.path = path;
     workspace.pinned = request.pinned;
     workspace.terminal_shell = terminal_shell;
+    workspace.common_commands = common_commands;
     group_pinned_workspaces(&mut config.workspaces);
 
     save_config(&state, config.clone())?;
@@ -3576,6 +3580,15 @@ struct ManualWorkspaceRequest {
     path: String,
     pinned: bool,
     terminal_shell: String,
+    #[serde(default)]
+    common_commands: Vec<WorkspaceCommonCommandRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceCommonCommandRequest {
+    name: String,
+    command: String,
 }
 
 #[derive(Deserialize)]
@@ -4058,7 +4071,15 @@ struct ConfiguredWorkspaceSummary {
     logo_url: Option<String>,
     pinned: bool,
     terminal_shell: String,
+    common_commands: Vec<WorkspaceCommonCommandSummary>,
     is_default: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceCommonCommandSummary {
+    name: String,
+    command: String,
 }
 
 #[derive(Serialize)]
@@ -4288,6 +4309,7 @@ struct WorkspaceSummary {
     logo_url: Option<String>,
     pinned: bool,
     terminal_shell: String,
+    common_commands: Vec<WorkspaceCommonCommandSummary>,
     chats: Vec<ChatSummary>,
 }
 
@@ -13035,8 +13057,21 @@ fn configured_workspace_summary(
         logo_url: workspace_logo_url(workspace)?,
         pinned: workspace.pinned,
         terminal_shell: workspace.terminal_shell.clone(),
+        common_commands: workspace_common_command_summaries(&workspace.common_commands),
         is_default: workspace.id == foco_store::config::DEFAULT_WORKSPACE_ID,
     })
+}
+
+fn workspace_common_command_summaries(
+    commands: &[WorkspaceCommonCommand],
+) -> Vec<WorkspaceCommonCommandSummary> {
+    commands
+        .iter()
+        .map(|command| WorkspaceCommonCommandSummary {
+            name: command.name.clone(),
+            command: command.command.clone(),
+        })
+        .collect()
 }
 
 fn terminal_shell_summaries() -> Vec<TerminalShellSummary> {
@@ -13855,6 +13890,7 @@ fn workspace_response_from_config(
             logo_url: workspace_logo_url(workspace)?,
             pinned: workspace.pinned,
             terminal_shell: workspace.terminal_shell.clone(),
+            common_commands: workspace_common_command_summaries(&workspace.common_commands),
             chats,
         });
     }
@@ -14169,6 +14205,42 @@ fn normalize_terminal_shell(shell: &str) -> Result<String, ApiError> {
         "terminal shell '{shell}' is unsupported; expected one of {}",
         SUPPORTED_TERMINAL_SHELLS.join(", ")
     )))
+}
+
+fn normalize_workspace_common_commands(
+    commands: &[WorkspaceCommonCommandRequest],
+) -> Result<Vec<WorkspaceCommonCommand>, ApiError> {
+    let mut normalized = Vec::new();
+
+    for (index, command) in commands.iter().enumerate() {
+        let name = command.name.trim();
+        let command_text = command.command.trim();
+
+        if name.is_empty() && command_text.is_empty() {
+            continue;
+        }
+
+        if name.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "workspace common command {} name must not be empty",
+                index + 1
+            )));
+        }
+
+        if command_text.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "workspace common command {} command must not be empty",
+                index + 1
+            )));
+        }
+
+        normalized.push(WorkspaceCommonCommand {
+            name: name.to_string(),
+            command: command_text.to_string(),
+        });
+    }
+
+    Ok(normalized)
 }
 
 fn validate_model_provider_references(
@@ -16441,6 +16513,7 @@ description: Project memory.
             path: workspace_dir.clone(),
             pinned: false,
             terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
         }];
         let discovery = discover_skills(&profile_dir, &workspaces);
 
@@ -19400,6 +19473,7 @@ description: Project memory.
             path: workspace_dir.clone(),
             pinned: false,
             terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
         }];
         let discovery = discover_skills(&profile_dir, &workspaces);
 
@@ -19466,6 +19540,7 @@ description: Project memory.
             path: env::temp_dir().join(id),
             pinned: false,
             terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
         }
     }
 
