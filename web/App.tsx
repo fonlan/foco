@@ -784,6 +784,7 @@ type ChatMessageSummary = {
   parts: ChatMessagePart[];
   metrics: ChatReplyMetrics | null;
   memoriesUsed: ChatMemoryUsedSummary[];
+  extractedMemories: ChatExtractedMemorySummary[];
 };
 
 type ChatMessagesResponse = {
@@ -844,6 +845,15 @@ type ChatMemoryUsedSummary = {
   source: string;
 };
 
+type ChatExtractedMemorySummary = {
+  id: string;
+  scope: string;
+  chatId: string | null;
+  status: string;
+  kind: string;
+  fact: string;
+};
+
 type QuestionOptionSummary = {
   label: string;
   value: string;
@@ -872,6 +882,7 @@ type ChatStreamEvent =
       userMessageId: string;
       assistantMessageId: string;
       llmRequestId?: string;
+      memoriesUsed: ChatMemoryUsedSummary[];
     }
   | { type: "textDelta"; assistantMessageId?: string; delta: string }
   | { type: "reasoningDelta"; assistantMessageId?: string; delta: string }
@@ -1307,6 +1318,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "MCP settings": "MCP 设置",
     "Skill settings": "技能设置",
     "Memory settings": "记忆设置",
+    "Memories saved": "已保存记忆",
     "Local memory graph and review queue": "本地记忆图与审核队列",
     "Memory controls": "记忆控制",
     "Enable memory": "启用记忆",
@@ -1671,6 +1683,7 @@ type ShellMessage = {
   parts: ChatMessagePart[];
   metrics: ChatReplyMetrics | null;
   memoriesUsed: ChatMemoryUsedSummary[];
+  extractedMemories: ChatExtractedMemorySummary[];
 };
 
 type OpenChatTab = {
@@ -3059,6 +3072,7 @@ export function App() {
         parts: localUserParts,
         metrics: null,
         memoriesUsed: [],
+        extractedMemories: [],
       },
       {
         id: localAssistantId,
@@ -3071,6 +3085,7 @@ export function App() {
         parts: [],
         metrics: null,
         memoriesUsed: [],
+        extractedMemories: [],
       },
     ]);
     setDraftMessage("");
@@ -3135,7 +3150,11 @@ export function App() {
                   message.role === "assistant" &&
                   message.id === localAssistantId
                 ) {
-                  return { ...message, id: streamEvent.assistantMessageId };
+                  return {
+                    ...message,
+                    id: streamEvent.assistantMessageId,
+                    memoriesUsed: streamEvent.memoriesUsed,
+                  };
                 }
 
                 return message;
@@ -3153,7 +3172,11 @@ export function App() {
                   message.role === "assistant" &&
                   message.id === localAssistantId
                 ) {
-                  return { ...message, id: streamEvent.assistantMessageId };
+                  return {
+                    ...message,
+                    id: streamEvent.assistantMessageId,
+                    memoriesUsed: streamEvent.memoriesUsed,
+                  };
                 }
 
                 return message;
@@ -5442,6 +5465,9 @@ function ChatPanel({
                             )}
                           </button>
                         </div>
+                        {!isUser ? (
+                          <MemoriesUsedBlock memories={message.memoriesUsed} />
+                        ) : null}
                         {parts.length ? (
                           parts.map((part, partIndex) => (
                             <MessagePartBlock
@@ -5458,8 +5484,10 @@ function ChatPanel({
                             className="size-4 animate-spin"
                           />
                         ) : null}
-                        {!isUser && message.metrics ? (
-                          <MemoriesUsedBlock memories={message.memoriesUsed} />
+                        {!isUser ? (
+                          <ExtractedMemoriesBlock
+                            memories={message.extractedMemories}
+                          />
                         ) : null}
                         {!isUser && message.metrics ? (
                           <ChatReplyMetricsLine metrics={message.metrics} />
@@ -6122,6 +6150,47 @@ function MemoriesUsedBlock({ memories }: { memories: ChatMemoryUsedSummary[] }) 
               <span>{memory.kind}</span>
               <span>{memory.source}</span>
               {memory.pinned ? <span>{t("Pinned")}</span> : null}
+            </div>
+            <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-stone-700">
+              {memory.fact}
+            </div>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function ExtractedMemoriesBlock({
+  memories,
+}: {
+  memories: ChatExtractedMemorySummary[];
+}) {
+  const { t } = useI18n();
+  if (!memories.length) {
+    return null;
+  }
+
+  return (
+    <details className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-2 text-xs text-stone-600">
+      <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-stone-600 marker:hidden">
+        <Brain aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <span>{t("Memories saved")}</span>
+        <span className="rounded-full bg-white px-1.5 py-0.5 text-[10px] text-stone-500">
+          {memories.length}
+        </span>
+        <ChevronDown aria-hidden="true" className="ml-auto size-3.5 shrink-0" />
+      </summary>
+      <div className="mt-2 space-y-2">
+        {memories.map((memory) => (
+          <div
+            className="min-w-0 rounded-md border border-stone-100 bg-white px-2.5 py-2"
+            key={`${memory.scope}-${memory.id}`}
+          >
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-semibold uppercase tracking-normal text-stone-400">
+              <span>{memory.scope}</span>
+              <span>{memory.kind}</span>
+              <span>{memory.status}</span>
             </div>
             <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-stone-700">
               {memory.fact}
@@ -15718,6 +15787,7 @@ function completedAssistantMessage(
     content: streamEvent.text,
     metrics: streamEvent.metrics,
     memoriesUsed: streamEvent.memoriesUsed,
+    extractedMemories: message.extractedMemories,
     reasoning: nextReasoning,
     status: undefined,
     parts: parts.length
@@ -15751,6 +15821,7 @@ function assistantMessageWithAppendedError(
     parts: appendTextPart(existingParts, `${separator}${errorText}`),
     metrics: null,
     memoriesUsed: [],
+    extractedMemories: [],
     status: hasVisibleContent ? undefined : "error",
   };
 }
@@ -16819,8 +16890,17 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       "llmRequestId",
       "llm_request_id",
     );
+    const memoriesUsed = parseChatMemoriesUsed(
+      fieldValue(value, "memoriesUsed", "memories_used"),
+    );
 
-    if (!chatId || !userMessageId || !assistantMessageId || llmRequestId === null) {
+    if (
+      !chatId ||
+      !userMessageId ||
+      !assistantMessageId ||
+      llmRequestId === null ||
+      memoriesUsed === false
+    ) {
       return null;
     }
 
@@ -16830,6 +16910,7 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       userMessageId,
       assistantMessageId,
       llmRequestId,
+      memoriesUsed,
     };
   }
 
@@ -17227,6 +17308,50 @@ function parseChatMemoryUsedSummary(
   };
 }
 
+function parseChatExtractedMemories(
+  value: unknown,
+): ChatExtractedMemorySummary[] | false {
+  if (typeof value === "undefined" || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return false;
+  }
+
+  const memories = value.map(parseChatExtractedMemorySummary);
+  return memories.some((memory) => memory === null)
+    ? false
+    : (memories as ChatExtractedMemorySummary[]);
+}
+
+function parseChatExtractedMemorySummary(
+  value: unknown,
+): ChatExtractedMemorySummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const id = stringField(value, "id");
+  const scope = stringField(value, "scope");
+  const chatId = optionalNullableStringField(value, "chatId", "chat_id");
+  const status = stringField(value, "status");
+  const kind = stringField(value, "kind");
+  const fact = stringField(value, "fact");
+
+  if (!id || !scope || chatId === false || !status || !kind || !fact) {
+    return null;
+  }
+
+  return {
+    chatId: chatId ?? null,
+    fact,
+    id,
+    kind,
+    scope,
+    status,
+  };
+}
+
 function normalizeChatMessageSummary(
   message: ChatMessageSummary,
 ): ChatMessageSummary {
@@ -17238,6 +17363,12 @@ function normalizeChatMessageSummary(
   if (memoriesUsed === false) {
     throw new Error("chat message memoriesUsed are invalid");
   }
+  const extractedMemories = parseChatExtractedMemories(
+    fieldValue(message, "extractedMemories", "extracted_memories"),
+  );
+  if (extractedMemories === false) {
+    throw new Error("chat message extractedMemories are invalid");
+  }
 
   const toolCalls = Array.isArray(message.toolCalls)
     ? message.toolCalls.map(normalizedToolCallSummary)
@@ -17248,6 +17379,7 @@ function normalizeChatMessageSummary(
     .filter((part): part is ChatMessagePart => part !== null);
   const normalizedMessage = {
     ...message,
+    extractedMemories,
     metrics,
     memoriesUsed,
     toolCalls,

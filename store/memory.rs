@@ -1049,6 +1049,36 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn facts_for_source_reference(
+        &self,
+        source_type: MemorySourceType,
+        source_id: &str,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        require_non_empty("source_id", source_id)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
+                        f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                        f.updated_at
+                 FROM memory_facts f
+                 JOIN memory_fact_sources fs ON fs.fact_id = f.id
+                 JOIN memory_sources s ON s.id = fs.source_id
+                 WHERE s.source_type = ?1
+                   AND s.source_id = ?2
+                 ORDER BY f.created_at ASC, f.id ASC",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(
+                params![source_type.as_str(), source_id],
+                memory_fact_from_row,
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn source_count_for_fact(&self, fact_id: &str) -> Result<i64, MemoryDatabaseError> {
         require_non_empty("fact_id", fact_id)?;
         source_count_for_fact(&self.connection, &self.database_path, fact_id)

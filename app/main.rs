@@ -2978,6 +2978,8 @@ async fn chat_messages(
 
         messages.push(chat_message_summary(
             &database,
+            &workspace.path,
+            Some(&state.memory_database_file),
             message,
             &llm_request_events,
         )?);
@@ -4121,6 +4123,7 @@ struct ChatMessageSummary {
     parts: Vec<ChatMessagePart>,
     metrics: Option<ChatReplyMetrics>,
     memories_used: Vec<ChatMemoryUsedSummary>,
+    extracted_memories: Vec<ChatExtractedMemorySummary>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4165,6 +4168,17 @@ struct ChatMemoryUsedSummary {
     source: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatExtractedMemorySummary {
+    id: String,
+    scope: String,
+    chat_id: Option<String>,
+    status: String,
+    kind: String,
+    fact: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 enum ChatSseEvent {
@@ -4173,6 +4187,7 @@ enum ChatSseEvent {
         user_message_id: String,
         assistant_message_id: String,
         llm_request_id: String,
+        memories_used: Vec<ChatMemoryUsedSummary>,
     },
     TextDelta {
         assistant_message_id: String,
@@ -4642,6 +4657,7 @@ impl PreparedChatContext {
                 user_message_id: self.user_message_id.clone(),
                 assistant_message_id: self.assistant_message_id.clone(),
                 llm_request_id: self.llm_request_id.clone(),
+                memories_used: self.memories_used.clone(),
             };
             let mut events = vec![captured_event(&start_event)];
             let mut assistant_text = String::new();
@@ -6706,6 +6722,17 @@ fn chat_memory_used_summary(retrieved_fact: &RetrievedMemoryFact) -> ChatMemoryU
         fact: fact.fact.clone(),
         pinned: fact.pinned,
         source: retrieved_fact.source.as_str().to_string(),
+    }
+}
+
+fn chat_extracted_memory_summary(fact: MemoryFactRecord) -> ChatExtractedMemorySummary {
+    ChatExtractedMemorySummary {
+        id: fact.id,
+        scope: fact.scope,
+        chat_id: fact.chat_id,
+        status: fact.status,
+        kind: fact.kind,
+        fact: fact.fact,
     }
 }
 
@@ -14416,6 +14443,8 @@ fn non_empty_string(value: &str) -> Option<String> {
 
 fn chat_message_summary(
     database: &WorkspaceDatabase,
+    workspace_path: &Path,
+    global_memory_database_file: Option<&Path>,
     message: MessageRecord,
     llm_request_events: &[LlmRequestEventRecord],
 ) -> Result<ChatMessageSummary, ApiError> {
@@ -14432,6 +14461,30 @@ fn chat_message_summary(
     };
     let memories_used = if message.role == "assistant" {
         assistant_memories_used_from_metadata(&message.metadata_json)?
+    } else {
+        Vec::new()
+    };
+    let extracted_memories = if message.role == "assistant" {
+        let workspace_memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
+                .map_err(ApiError::from_memory_error)?;
+        let mut facts = workspace_memory_database
+            .facts_for_source_reference(MemorySourceType::AssistantMessage, &message.id)
+            .map_err(ApiError::from_memory_error)?;
+        if let Some(global_memory_database_file) = global_memory_database_file {
+            let global_memory_database =
+                MemoryDatabase::open_or_create_global_at(global_memory_database_file)
+                    .map_err(ApiError::from_memory_error)?;
+            facts.extend(
+                global_memory_database
+                    .facts_for_source_reference(MemorySourceType::AssistantMessage, &message.id)
+                    .map_err(ApiError::from_memory_error)?,
+            );
+        }
+        facts
+            .into_iter()
+            .map(chat_extracted_memory_summary)
+            .collect()
     } else {
         Vec::new()
     };
@@ -14457,6 +14510,7 @@ fn chat_message_summary(
         parts,
         metrics,
         memories_used,
+        extracted_memories,
     })
 }
 
@@ -17168,7 +17222,8 @@ description: Project memory.
         let events = database
             .llm_request_events_for_chat("chat-1")
             .expect("llm request events");
-        let summary = chat_message_summary(&database, message, &events).expect("message summary");
+        let summary = chat_message_summary(&database, &workspace_dir, None, message, &events)
+            .expect("message summary");
         let metrics = summary.metrics.expect("assistant metrics");
 
         assert_eq!(metrics.model_id, "gpt-5.4");
@@ -17180,6 +17235,78 @@ description: Project memory.
         assert_eq!(summary.memories_used[0].id, "fact-1");
         assert_eq!(summary.memories_used[0].source, "direct");
 
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn chat_message_summary_includes_assistant_extracted_memories() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-message-memory-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+
+        database
+            .insert_chat("chat-1", "Memory chat")
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "Done.",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("assistant message insert");
+        memory_database
+            .insert_source(NewMemorySource {
+                id: "source-1",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                source_type: MemorySourceType::AssistantMessage,
+                source_id: Some("assistant-1"),
+                title: "Assistant message",
+                content: "Done.",
+                metadata_json: "{}",
+            })
+            .expect("memory source insert");
+        memory_database
+            .insert_fact(NewMemoryFact {
+                id: "fact-1",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                status: MemoryStatus::Pending,
+                kind: MemoryKind::Episode,
+                fact: "Remember that README was inspected after completion.",
+                confidence: Some(0.8),
+                pinned: false,
+                source_ids: &["source-1"],
+                metadata_json: "{}",
+            })
+            .expect("memory fact insert");
+
+        let message = database
+            .messages_for_chat("chat-1")
+            .expect("messages")
+            .into_iter()
+            .next()
+            .expect("assistant message");
+        let summary = chat_message_summary(&database, &workspace_dir, None, message, &[])
+            .expect("message summary");
+
+        assert_eq!(summary.extracted_memories.len(), 1);
+        assert_eq!(summary.extracted_memories[0].id, "fact-1");
+        assert_eq!(summary.extracted_memories[0].status, "pending");
+        assert_eq!(
+            summary.extracted_memories[0].fact,
+            "Remember that README was inspected after completion."
+        );
+
+        drop(memory_database);
         drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }
@@ -17258,7 +17385,8 @@ description: Project memory.
         let events = database
             .llm_request_events_for_chat("chat-1")
             .expect("llm request events");
-        let summary = chat_message_summary(&database, message, &events).expect("message summary");
+        let summary = chat_message_summary(&database, &workspace_dir, None, message, &events)
+            .expect("message summary");
         let metrics = summary.metrics.expect("assistant metrics");
 
         assert_eq!(metrics.total_latency_ms, Some(2500));

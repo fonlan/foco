@@ -535,6 +535,7 @@ const chatMessages = {
     {
       content: "Please inspect README.",
       createdAt: "2026-06-10T08:00:00.000Z",
+      extractedMemories: [],
       id: "message-user",
       memoriesUsed: [],
       metrics: null,
@@ -546,6 +547,16 @@ const chatMessages = {
     {
       content: "Done.",
       createdAt: "2026-06-10T08:00:02.000Z",
+      extractedMemories: [
+        {
+          chatId: "chat-1",
+          fact: "Remember that README was inspected after completion.",
+          id: "extracted-fact-1",
+          kind: "episode",
+          scope: "chat",
+          status: "pending",
+        },
+      ],
       id: "message-assistant",
       memoriesUsed: [
         {
@@ -604,6 +615,7 @@ const secondChatMessages = {
     {
       content: "Second question.",
       createdAt: "2026-06-10T09:00:00.000Z",
+      extractedMemories: [],
       id: "message-user-2",
       memoriesUsed: [],
       metrics: null,
@@ -615,6 +627,7 @@ const secondChatMessages = {
     {
       content: "Second answer.",
       createdAt: "2026-06-10T09:00:02.000Z",
+      extractedMemories: [],
       id: "message-assistant-2",
       memoriesUsed: [],
       metrics: null,
@@ -948,8 +961,23 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("Total time: 2 s")).toBeInTheDocument();
     expect(screen.getByText("tokens/s: 20")).toBeInTheDocument();
     expect(screen.getByText("First token latency: 0.25 s")).toBeInTheDocument();
-    await userEvent.click(screen.getByText("Memories used"));
+    const memoriesUsedLabel = within(assistantBubble!).getByText("Memories used");
+    const finalAnswer = within(assistantBubble!).getByText("Done.");
+    expect(
+      memoriesUsedLabel.compareDocumentPosition(finalAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    await userEvent.click(memoriesUsedLabel);
     expect(screen.getByText("Use memory graph retrieval.")).toBeInTheDocument();
+    const memoriesSavedLabel = within(assistantBubble!).getByText("Memories saved");
+    expect(
+      finalAnswer.compareDocumentPosition(memoriesSavedLabel) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    await userEvent.click(memoriesSavedLabel);
+    expect(
+      screen.getByText("Remember that README was inspected after completion."),
+    ).toBeInTheDocument();
 
     await userEvent.click(
       screen.getByRole("button", { name: "New chat in Side project" }),
@@ -1269,6 +1297,24 @@ describe("App verification surfaces", () => {
       expect.stringMatching(/^foco-mermaid-/),
       "flowchart TD\n  A --> B",
     );
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
+  it("shows retrieved memories as soon as the chat stream starts", async () => {
+    render(<App />);
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "use memory",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await userEvent.click(await screen.findByText("Memories used"));
+    expect(screen.getByText("Use memory before streaming.")).toBeInTheDocument();
+    expect(screen.queryByText("Model: gpt-test")).not.toBeInTheDocument();
 
     await act(async () => {
       activeChatStreamController?.close();
@@ -2659,6 +2705,17 @@ function chatStreamResponse() {
             userMessageId: "message-user-stream",
             assistantMessageId: "message-assistant-stream",
             llmRequestId: "request-stream",
+            memoriesUsed: [
+              {
+                chatId: null,
+                fact: "Use memory before streaming.",
+                id: "stream-fact-1",
+                kind: "project_fact",
+                pinned: false,
+                scope: "workspace",
+                source: "direct",
+              },
+            ],
           })}\n\n`,
         ),
       );
