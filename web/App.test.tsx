@@ -1250,10 +1250,13 @@ describe("App verification surfaces", () => {
     expect(usageCallsAfterDraft).toHaveLength(usageCallsBeforeDraft.length);
   });
 
-  it("refreshes context usage while the assistant stream updates", async () => {
+  it("keeps cumulative context usage while the assistant stream updates", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
-
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
       "continue",
@@ -1261,6 +1264,9 @@ describe("App verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(activeChatStreamController).not.toBeNull());
 
+    expect(
+      screen.getByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",

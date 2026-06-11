@@ -3394,7 +3394,9 @@ export function App() {
     setError(null);
     contextUsageAbortRef.current?.abort();
     contextUsageRequestIdRef.current += 1;
-    setContextUsage(null);
+    if (!request.chatId) {
+      setContextUsage(null);
+    }
     setIsLoadingContextUsage(false);
     activeRunAbortRef.current = abortController;
 
