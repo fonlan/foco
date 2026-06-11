@@ -2062,9 +2062,29 @@ export function App() {
     }
 
     contextUsageAbortRef.current?.abort();
-    contextUsageRequestIdRef.current += 1;
     setContextUsage(null);
     setIsLoadingContextUsage(false);
+
+    if (
+      !activeWorkspaceId ||
+      !activeChatId ||
+      !selectedModelId ||
+      !selectedProviderId
+    ) {
+      contextUsageRequestIdRef.current += 1;
+      return;
+    }
+
+    void refreshContextUsage({
+      assistantDraft: "",
+      assistantDraftReasoning: "",
+      chatId: activeChatId,
+      modelId: selectedModelId,
+      providerId: selectedProviderId,
+      skillIds: [],
+      thinkingLevel: selectedThinkingLevel,
+      workspaceId: activeWorkspaceId,
+    });
   }, [
     activeChatId,
     activeWorkspaceId,

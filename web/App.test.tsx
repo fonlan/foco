@@ -1212,24 +1212,39 @@ describe("App verification surfaces", () => {
     ).toBe(false);
   });
 
-  it("does not precompute context usage before sending", async () => {
+  it("loads opened chat context usage without recomputing while drafting", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
 
     await userEvent.click(await screen.findByText("Tool run"));
+    const usage = await screen.findByRole("status", {
+      name: "Context usage 47%",
+    });
+    expect(usage).toHaveTextContent("47%");
+
+    const usageCallsBeforeDraft = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    );
+    expect(usageCallsBeforeDraft.length).toBeGreaterThan(0);
+    const [, init] = usageCallsBeforeDraft.at(-1)!;
+    expect(typeof init?.body).toBe("string");
+    expect(JSON.parse(init?.body as string)).toMatchObject({
+      assistantDraft: null,
+      assistantDraftReasoning: null,
+      chatId: "chat-1",
+      draftMessage: null,
+    });
+
     await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
 
-    const usage = await screen.findByRole("status", {
-      name: "Context usage 0%",
-    });
-    expect(usage).toHaveTextContent("0%");
-    expect(
-      fetchMock.mock.calls.some(
-        ([url]) =>
-          typeof url === "string" &&
-          url === "/api/workspaces/workspace-1/context-usage",
-      ),
-    ).toBe(false);
+    const usageCallsAfterDraft = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    );
+    expect(usageCallsAfterDraft).toHaveLength(usageCallsBeforeDraft.length);
   });
 
   it("refreshes context usage while the assistant stream updates", async () => {
