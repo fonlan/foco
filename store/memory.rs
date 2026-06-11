@@ -5,7 +5,7 @@ use std::{
 };
 
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
@@ -1146,6 +1146,77 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn find_active_facts_containing_any_for_scope(
+        &self,
+        terms: &[String],
+        chat_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(chat_id) = chat_id {
+            require_non_empty("chat_id", chat_id)?;
+        }
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let mut like_terms = Vec::new();
+        for term in terms {
+            require_non_empty("term", term)?;
+            like_terms.push(format!("%{}%", escaped_memory_like_term(term)));
+        }
+        let like_filter_sql = (0..like_terms.len())
+            .map(|index| format!("lower(fact) LIKE ?{} ESCAPE '\\'", index + 4))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let (filter_sql, chat_param) = match self.kind {
+            MemoryDatabaseKind::Global => ("scope = 'global'", None),
+            MemoryDatabaseKind::Workspace if chat_id.is_some() => (
+                "(scope = 'chat' AND chat_id = ?1) OR scope = 'workspace'",
+                chat_id,
+            ),
+            MemoryDatabaseKind::Workspace => ("scope = 'workspace'", None),
+        };
+        let sql = format!(
+            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                    expires_at, metadata_json, created_at, updated_at
+             FROM memory_facts
+             WHERE ({filter_sql})
+               AND status = ?3
+               AND is_latest = 1
+               AND ({like_filter_sql})
+             ORDER BY
+               CASE WHEN scope = 'chat' THEN 0 WHEN scope = 'workspace' THEN 1 ELSE 2 END,
+               pinned DESC,
+               updated_at DESC,
+               COALESCE(confidence, -1.0) DESC,
+               id ASC
+             LIMIT ?2"
+        );
+        let chat_value = chat_param
+            .map(|value| rusqlite::types::Value::Text(value.to_string()))
+            .unwrap_or(rusqlite::types::Value::Null);
+        let mut params = vec![
+            chat_value,
+            rusqlite::types::Value::Integer(i64::from(limit)),
+            rusqlite::types::Value::Text(MemoryStatus::Active.as_str().to_string()),
+        ];
+        params.extend(like_terms.into_iter().map(rusqlite::types::Value::Text));
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(params_from_iter(params), memory_fact_from_row)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn related_active_facts(
         &self,
         seed_fact_ids: &[String],
@@ -1948,6 +2019,20 @@ fn require_non_empty(field: &str, value: &str) -> Result<(), MemoryDatabaseError
     }
 
     Ok(())
+}
+
+fn escaped_memory_like_term(term: &str) -> String {
+    let mut escaped = String::new();
+    for character in term.chars() {
+        match character {
+            '\\' | '%' | '_' => {
+                escaped.push('\\');
+                escaped.push(character);
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn validate_json(field: &'static str, value: &str) -> Result<(), MemoryDatabaseError> {
