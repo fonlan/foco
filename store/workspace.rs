@@ -502,6 +502,64 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    pub fn update_llm_request_outcome(
+        &mut self,
+        id: &str,
+        outcome: UpdateLlmRequestOutcome<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        validate_llm_token_values(
+            outcome.input_tokens,
+            outcome.output_tokens,
+            outcome.cache_read_tokens,
+            outcome.cache_write_tokens,
+        )?;
+
+        let cache_ratio = calculate_cache_ratio(outcome.input_tokens, outcome.cache_read_tokens)?;
+        let response_body_json =
+            redact_optional_audit_json(outcome.response_body_json, "response_body_json")?;
+
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE llm_requests
+                 SET first_token_at = ?2,
+                     completed_at = ?3,
+                     input_tokens = ?4,
+                     output_tokens = ?5,
+                     cache_read_tokens = ?6,
+                     cache_write_tokens = ?7,
+                     cache_ratio = ?8,
+                     first_token_latency_ms = ?9,
+                     total_latency_ms = ?10,
+                     status_code = ?11,
+                     final_state = ?12,
+                     response_body_json = ?13
+                 WHERE id = ?1",
+                params![
+                    id,
+                    outcome.first_token_at,
+                    outcome.completed_at,
+                    outcome.input_tokens,
+                    outcome.output_tokens,
+                    outcome.cache_read_tokens,
+                    outcome.cache_write_tokens,
+                    cache_ratio,
+                    outcome.first_token_latency_ms,
+                    outcome.total_latency_ms,
+                    outcome.status_code,
+                    outcome.final_state,
+                    response_body_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        if updated == 0 {
+            return Err(WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() });
+        }
+
+        Ok(())
+    }
+
     pub fn llm_request(
         &self,
         id: &str,
@@ -1893,6 +1951,21 @@ pub struct NewLlmRequest<'a> {
     pub response_body_json: Option<&'a str>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateLlmRequestOutcome<'a> {
+    pub first_token_at: Option<&'a str>,
+    pub completed_at: Option<&'a str>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub first_token_latency_ms: Option<i64>,
+    pub total_latency_ms: Option<i64>,
+    pub status_code: Option<i64>,
+    pub final_state: &'a str,
+    pub response_body_json: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LlmRequestRecord {
     pub id: String,
@@ -2238,6 +2311,9 @@ pub enum WorkspaceDatabaseError {
     MissingTerminalSession {
         id: String,
     },
+    MissingLlmRequest {
+        id: String,
+    },
     NonUtf8Path {
         path: PathBuf,
     },
@@ -2285,6 +2361,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             Self::MissingTerminalSession { id } => {
                 write!(formatter, "terminal session was not found: {id}")
             }
+            Self::MissingLlmRequest { id } => {
+                write!(formatter, "LLM request audit row was not found: {id}")
+            }
             Self::NonUtf8Path { path } => {
                 write!(formatter, "path must be valid UTF-8: {}", path.display())
             }
@@ -2325,6 +2404,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::InvalidCodeGraphInput { .. }
             | Self::InvalidTaskGraph { .. }
             | Self::MissingDatabaseParent { .. }
+            | Self::MissingLlmRequest { .. }
             | Self::MissingTaskGraph { .. }
             | Self::MissingTerminalSession { .. }
             | Self::NonUtf8Path { .. }
@@ -3010,11 +3090,25 @@ fn now_timestamp() -> String {
 }
 
 fn validate_llm_request_tokens(request: &NewLlmRequest<'_>) -> Result<(), WorkspaceDatabaseError> {
+    validate_llm_token_values(
+        request.input_tokens,
+        request.output_tokens,
+        request.cache_read_tokens,
+        request.cache_write_tokens,
+    )
+}
+
+fn validate_llm_token_values(
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+) -> Result<(), WorkspaceDatabaseError> {
     for (name, value) in [
-        ("input_tokens", request.input_tokens),
-        ("output_tokens", request.output_tokens),
-        ("cache_read_tokens", request.cache_read_tokens),
-        ("cache_write_tokens", request.cache_write_tokens),
+        ("input_tokens", input_tokens),
+        ("output_tokens", output_tokens),
+        ("cache_read_tokens", cache_read_tokens),
+        ("cache_write_tokens", cache_write_tokens),
     ] {
         if let Some(value) = value
             && value < 0
@@ -3025,9 +3119,7 @@ fn validate_llm_request_tokens(request: &NewLlmRequest<'_>) -> Result<(), Worksp
         }
     }
 
-    if let (Some(input_tokens), Some(cache_read_tokens)) =
-        (request.input_tokens, request.cache_read_tokens)
-    {
+    if let (Some(input_tokens), Some(cache_read_tokens)) = (input_tokens, cache_read_tokens) {
         if input_tokens == 0 && cache_read_tokens > 0 {
             return Err(WorkspaceDatabaseError::InvalidAuditTokens {
                 message: "cache_read_tokens cannot be positive when input_tokens is zero"

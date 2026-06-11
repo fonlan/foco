@@ -68,8 +68,8 @@ use foco_store::{
         LlmRequestAuditRow, LlmRequestEventRecord, LlmRequestRecord, MessageRecord,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
         NewTerminalSession, NewToolCall, NewToolResult, TaskGraphFilter, TaskGraphRecord,
-        TaskGraphTask, ToolCallWithResultRecord, WorkspaceDatabase, initialize_workspace_databases,
-        workspace_database_path,
+        TaskGraphTask, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        initialize_workspace_databases, workspace_database_path,
     },
 };
 use foco_tools::{
@@ -2805,7 +2805,7 @@ async fn context_usage(
         &config,
         &workspace_id,
         request.into_prompt_request(),
-        false,
+        PromptAssemblyPurpose::ContextPreview,
     )
     .await?;
 
@@ -4278,6 +4278,22 @@ struct PreparedPromptContext {
     next_message_sequence: i64,
 }
 
+#[derive(Clone, Copy)]
+enum PromptAssemblyPurpose {
+    ChatRun,
+    ContextPreview,
+}
+
+impl PromptAssemblyPurpose {
+    fn allows_llm_memory_retrieval(self) -> bool {
+        matches!(self, Self::ChatRun)
+    }
+
+    fn allows_memory_mutation(self) -> bool {
+        matches!(self, Self::ChatRun)
+    }
+}
+
 struct MemoryPromptContext {
     retrieved_message: Option<NeutralChatMessage>,
     memories_used: Vec<ChatMemoryUsedSummary>,
@@ -5524,7 +5540,7 @@ async fn prepare_prompt_context(
     config: &GlobalConfig,
     workspace_id: &str,
     request: PromptContextRequest,
-    allow_memory_mutation: bool,
+    purpose: PromptAssemblyPurpose,
 ) -> Result<PreparedPromptContext, ApiError> {
     let workspace_id = workspace_id.trim();
     let model_id = request.model_id.trim();
@@ -5731,7 +5747,7 @@ async fn prepare_prompt_context(
         model,
         provider,
         &context_budget,
-        allow_memory_mutation,
+        purpose,
     )
     .await?;
     let mut neutral_messages = Vec::with_capacity(
@@ -5833,7 +5849,7 @@ async fn prepare_chat_context(
         config,
         workspace_id,
         request.into_prompt_request(),
-        true,
+        PromptAssemblyPurpose::ChatRun,
     )
     .await?;
     let raw_message = prompt_context.raw_message.as_deref().unwrap_or("");
@@ -5973,7 +5989,7 @@ async fn memory_prompt_context(
     chat_model: &ModelSettings,
     chat_provider: &ProviderSettings,
     context_budget: &foco_agent::ContextBudget,
-    allow_memory_mutation: bool,
+    purpose: PromptAssemblyPurpose,
 ) -> Result<MemoryPromptContext, ApiError> {
     let budget_tokens = if config.memory.enabled {
         context_budget
@@ -5997,7 +6013,7 @@ async fn memory_prompt_context(
         open_memory_database(state, config, MemoryScope::Workspace, Some(&workspace.id))?;
     let mut global_memory = open_memory_database(state, config, MemoryScope::Global, None)?;
 
-    if allow_memory_mutation {
+    if purpose.allows_memory_mutation() {
         expire_due_memories(&mut workspace_memory)?;
         refresh_memory_profile(&mut workspace_memory, MemoryScope::Workspace, None)?;
         if let Some(chat_id) = chat_id {
@@ -6007,33 +6023,44 @@ async fn memory_prompt_context(
         refresh_memory_profile(&mut global_memory, MemoryScope::Global, None)?;
     }
 
-    let relevant_facts = match config.memory.retrieval_mode.as_str() {
-        "fts" => relevant_memory_facts_fts(
+    let relevant_facts = if !purpose.allows_llm_memory_retrieval() {
+        relevant_memory_facts_fts(
             &mut global_memory,
             &mut workspace_memory,
             chat_id,
             query_text,
-        )?,
-        "llm" => {
-            let candidates =
-                llm_memory_retrieval_candidates(&global_memory, &workspace_memory, chat_id)?;
-            drop(workspace_memory);
-            drop(global_memory);
-            relevant_memory_facts_llm(
-                config,
-                &workspace.path,
-                &state.memory_database_file,
-                candidates,
+        )?
+    } else {
+        match config.memory.retrieval_mode.as_str() {
+            "fts" => relevant_memory_facts_fts(
+                &mut global_memory,
+                &mut workspace_memory,
+                chat_id,
                 query_text,
-                chat_model,
-                chat_provider,
-            )
-            .await?
-        }
-        other => {
-            return Err(ApiError::bad_request(format!(
-                "memory retrieval mode '{other}' is unsupported"
-            )));
+            )?,
+            "llm" => {
+                let candidates =
+                    llm_memory_retrieval_candidates(&global_memory, &workspace_memory, chat_id)?;
+                drop(workspace_memory);
+                drop(global_memory);
+                relevant_memory_facts_llm(
+                    config,
+                    &workspace.id,
+                    &workspace.path,
+                    &state.memory_database_file,
+                    candidates,
+                    query_text,
+                    chat_model,
+                    chat_provider,
+                    chat_id,
+                )
+                .await?
+            }
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "memory retrieval mode '{other}' is unsupported"
+                )));
+            }
         }
     };
     let mut remaining_tokens = budget_tokens;
@@ -6100,12 +6127,14 @@ fn relevant_memory_facts_fts(
 
 async fn relevant_memory_facts_llm(
     config: &GlobalConfig,
+    workspace_id: &str,
     workspace_path: &Path,
     global_memory_database_file: &Path,
     candidates: Vec<MemoryFactRecord>,
     query_text: Option<&str>,
     chat_model: &ModelSettings,
     chat_provider: &ProviderSettings,
+    chat_id: Option<&str>,
 ) -> Result<RelevantMemoryFacts, ApiError> {
     let query_text = query_text.map(str::trim).filter(|value| !value.is_empty());
     let Some(query_text) = query_text else {
@@ -6116,11 +6145,19 @@ async fn relevant_memory_facts_llm(
         return Ok(RelevantMemoryFacts { facts: Vec::new() });
     }
 
-    let (model_id, provider_config, max_output_tokens) =
+    let (model_id, provider_id, provider_config, max_output_tokens) =
         memory_retrieval_provider_for_model(config, chat_model, chat_provider)?;
     let request =
         memory_retrieval_provider_request(&model_id, max_output_tokens, query_text, &candidates)?;
-    let output = call_memory_retrieval_provider(&provider_config, request).await?;
+    let output = call_memory_retrieval_provider(
+        workspace_path,
+        workspace_id,
+        chat_id,
+        &provider_id,
+        &provider_config,
+        request,
+    )
+    .await?;
     let selected = parse_memory_retrieval_output(output)?;
     let mut by_key = candidates
         .into_iter()
@@ -6240,7 +6277,7 @@ fn memory_retrieval_provider_for_model(
     config: &GlobalConfig,
     chat_model: &ModelSettings,
     chat_provider: &ProviderSettings,
-) -> Result<(String, ProviderConnectionConfig, u32), ApiError> {
+) -> Result<(String, String, ProviderConnectionConfig, u32), ApiError> {
     let model = match config.memory.retrieval_model_id.as_deref() {
         Some(model_id) => config
             .models
@@ -6311,6 +6348,7 @@ fn memory_retrieval_provider_for_model(
 
     Ok((
         model.id.clone(),
+        provider.id.clone(),
         provider_connection_config(provider)?,
         max_output_tokens,
     ))
@@ -7771,7 +7809,15 @@ async fn run_memory_extraction_job_inner(task: &MemoryExtractionTask) -> Result<
         max_output_tokens,
         &evidence_candidates,
     )?;
-    let tool_arguments = call_memory_extraction_provider(&provider_config, request).await?;
+    let tool_arguments = call_memory_extraction_provider(
+        &task.workspace_path,
+        &task.workspace_id,
+        Some(&task.chat_id),
+        &provider_id,
+        &provider_config,
+        request,
+    )
+    .await?;
     let output = parse_memory_extraction_output(tool_arguments)?;
     store_extracted_memory_facts(task, &evidence_candidates, &output)?;
     serde_json::to_string(&output).map_err(|source| {
@@ -8576,64 +8622,253 @@ fn memory_retrieval_tool_definition() -> NeutralToolDefinition {
     }
 }
 
-async fn call_memory_extraction_provider(
+async fn audited_provider_tool_request(
+    workspace_path: &Path,
+    workspace_id: &str,
+    chat_id: Option<&str>,
+    provider_id: &str,
     provider_config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
+    request_kind: &str,
+    expected_tool_name: &str,
+    tool_label: &str,
+    timeout_ms: u64,
 ) -> Result<Value, ApiError> {
+    let request_id = unique_id("llm");
+    let request_started_at = utc_timestamp();
+    let started_at = Instant::now();
+    let request_body_json = serialize_provider_request(&request)?;
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: &request_id,
+            workspace_id,
+            chat_id,
+            provider_id,
+            model_id: &request.model_id,
+            request_started_at: &request_started_at,
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: Some(&request_body_json),
+            response_body_json: None,
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .insert_llm_request_event(NewLlmRequestEvent {
+            id: &format!("{request_id}-event-0"),
+            llm_request_id: &request_id,
+            sequence: 0,
+            event_at: &request_started_at,
+            event_type: "start",
+            raw_chunk_json: None,
+            normalized_event_json: &json!({
+                "type": "start",
+                "requestKind": request_kind,
+                "llmRequestId": &request_id,
+                "workspaceId": workspace_id,
+                "chatId": chat_id,
+            })
+            .to_string(),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    drop(database);
+
+    let result = run_provider_stream_for_tool(
+        provider_config,
+        request,
+        request_kind,
+        expected_tool_name,
+        tool_label,
+        timeout_ms,
+    )
+    .await;
+    let completed_at = utc_timestamp();
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+
+    match result {
+        Ok(AuditedToolStreamOutcome {
+            tool_arguments,
+            events,
+            usage,
+            first_token_at,
+            first_token_latency_ms,
+            response_body_json,
+        }) => {
+            database
+                .update_llm_request_outcome(
+                    &request_id,
+                    UpdateLlmRequestOutcome {
+                        first_token_at: first_token_at.as_deref(),
+                        completed_at: Some(&completed_at),
+                        input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
+                        output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
+                        cache_read_tokens: usage.as_ref().and_then(|usage| usage.cache_read_tokens),
+                        cache_write_tokens: usage
+                            .as_ref()
+                            .and_then(|usage| usage.cache_write_tokens),
+                        first_token_latency_ms,
+                        total_latency_ms: Some(elapsed_millis(started_at)),
+                        status_code: Some(200),
+                        final_state: "succeeded",
+                        response_body_json: Some(&response_body_json),
+                    },
+                )
+                .map_err(ApiError::from_workspace_error)?;
+            persist_audited_provider_events(&mut database, &request_id, &events, 1)?;
+            Ok(tool_arguments)
+        }
+        Err(error) => {
+            database
+                .update_llm_request_outcome(
+                    &request_id,
+                    UpdateLlmRequestOutcome {
+                        first_token_at: None,
+                        completed_at: Some(&completed_at),
+                        input_tokens: None,
+                        output_tokens: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
+                        first_token_latency_ms: None,
+                        total_latency_ms: Some(elapsed_millis(started_at)),
+                        status_code: error.status_code,
+                        final_state: "failed",
+                        response_body_json: Some(&json!({ "error": &error.message }).to_string()),
+                    },
+                )
+                .map_err(ApiError::from_workspace_error)?;
+            Err(ApiError::internal(error.message))
+        }
+    }
+}
+
+struct AuditedToolStreamOutcome {
+    tool_arguments: Value,
+    events: Vec<NeutralChatStreamEvent>,
+    usage: Option<NeutralUsage>,
+    first_token_at: Option<String>,
+    first_token_latency_ms: Option<i64>,
+    response_body_json: String,
+}
+
+struct AuditedProviderError {
+    message: String,
+    status_code: Option<i64>,
+}
+
+impl AuditedProviderError {
+    fn new(message: impl Into<String>, status_code: Option<i64>) -> Self {
+        Self {
+            message: message.into(),
+            status_code,
+        }
+    }
+}
+
+async fn run_provider_stream_for_tool(
+    provider_config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    request_kind: &str,
+    expected_tool_name: &str,
+    tool_label: &str,
+    timeout_ms: u64,
+) -> Result<AuditedToolStreamOutcome, AuditedProviderError> {
+    let started_at = Instant::now();
     let mut stream = timeout(
-        Duration::from_millis(MEMORY_EXTRACTION_TIMEOUT_MS),
+        Duration::from_millis(timeout_ms),
         stream_chat(provider_config, request),
     )
     .await
     .map_err(|_| {
-        ApiError::internal(format!(
-            "memory extraction timed out after {MEMORY_EXTRACTION_TIMEOUT_MS} ms"
-        ))
+        AuditedProviderError::new(
+            format!("{request_kind} timed out after {timeout_ms} ms"),
+            None,
+        )
     })?
-    .map_err(ApiError::from_provider_config_error)?;
+    .map_err(|source| {
+        AuditedProviderError::new(source.to_string(), provider_status_code(&source))
+    })?;
     let mut output_text = String::new();
     let mut tool_arguments = None;
+    let mut events = Vec::new();
+    let mut final_usage = None;
+    let mut first_token_at = None;
+    let mut first_token_latency_ms = None;
+    let mut completion_json = None;
 
     loop {
-        let Some(event) = timeout(
-            Duration::from_millis(MEMORY_EXTRACTION_TIMEOUT_MS),
-            stream.next_event(),
-        )
-        .await
-        .map_err(|_| {
-            ApiError::internal(format!(
-                "memory extraction timed out after {MEMORY_EXTRACTION_TIMEOUT_MS} ms"
-            ))
-        })?
+        let Some(event_result) = timeout(Duration::from_millis(timeout_ms), stream.next_event())
+            .await
+            .map_err(|_| {
+                AuditedProviderError::new(
+                    format!("{request_kind} timed out after {timeout_ms} ms"),
+                    None,
+                )
+            })?
         else {
             break;
         };
+        let event = event_result.map_err(|source| {
+            AuditedProviderError::new(
+                format!("{request_kind} stream failed: {source}"),
+                provider_status_code(&source),
+            )
+        })?;
+        events.push(event.clone());
 
-        match event.map_err(ApiError::from_provider_config_error)? {
-            NeutralChatStreamEvent::Start
-            | NeutralChatStreamEvent::ReasoningDelta { .. }
-            | NeutralChatStreamEvent::ThoughtSignatureDelta { .. }
-            | NeutralChatStreamEvent::Usage { .. } => {}
-            NeutralChatStreamEvent::TextDelta { delta } => output_text.push_str(&delta),
+        match event {
+            NeutralChatStreamEvent::Start => {}
+            NeutralChatStreamEvent::ReasoningDelta { .. }
+            | NeutralChatStreamEvent::ThoughtSignatureDelta { .. } => {
+                capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+            }
+            NeutralChatStreamEvent::Usage { usage } => {
+                final_usage = Some(usage);
+            }
+            NeutralChatStreamEvent::TextDelta { delta } => {
+                capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                output_text.push_str(&delta);
+            }
             NeutralChatStreamEvent::ToolCall { tool_call } => {
-                if tool_call.name != MEMORY_EXTRACTION_TOOL_NAME {
-                    return Err(ApiError::internal(format!(
-                        "memory extraction called unsupported tool '{}'",
-                        tool_call.name
-                    )));
+                capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                if tool_call.name != expected_tool_name {
+                    return Err(AuditedProviderError::new(
+                        format!(
+                            "{request_kind} called unsupported tool '{}'",
+                            tool_call.name
+                        ),
+                        None,
+                    ));
                 }
                 tool_arguments = Some(tool_call.arguments);
             }
             NeutralChatStreamEvent::Complete {
-                tool_calls, text, ..
+                tool_calls,
+                text,
+                usage,
+                stop_reason,
+                response_id,
+                ..
             } => {
                 if tool_arguments.is_none() {
                     for tool_call in tool_calls {
-                        if tool_call.name != MEMORY_EXTRACTION_TOOL_NAME {
-                            return Err(ApiError::internal(format!(
-                                "memory extraction completed with unsupported tool '{}'",
-                                tool_call.name
-                            )));
+                        if tool_call.name != expected_tool_name {
+                            return Err(AuditedProviderError::new(
+                                format!(
+                                    "{request_kind} completed with unsupported tool '{}'",
+                                    tool_call.name
+                                ),
+                                None,
+                            ));
                         }
                         tool_arguments = Some(tool_call.arguments);
                     }
@@ -8641,113 +8876,128 @@ async fn call_memory_extraction_provider(
                 if !text.trim().is_empty() {
                     output_text.push_str(&text);
                 }
+                if let Some(usage) = usage {
+                    final_usage = Some(usage);
+                }
+                completion_json = Some(
+                    json!({
+                        "requestKind": request_kind,
+                        "text": output_text,
+                        "usage": final_usage,
+                        "stopReason": stop_reason,
+                        "responseId": response_id,
+                    })
+                    .to_string(),
+                );
                 break;
             }
             NeutralChatStreamEvent::Error { message } => {
-                return Err(ApiError::internal(format!(
-                    "memory extraction stream error: {message}"
-                )));
+                return Err(AuditedProviderError::new(
+                    format!("{request_kind} stream error: {message}"),
+                    None,
+                ));
             }
         }
     }
 
-    tool_arguments.ok_or_else(|| {
+    let tool_arguments = tool_arguments.ok_or_else(|| {
         let text = output_text.trim();
         if text.is_empty() {
-            ApiError::internal("memory extraction did not call submit tool")
+            AuditedProviderError::new(format!("{request_kind} did not call {tool_label}"), None)
         } else {
-            ApiError::internal(format!(
-                "memory extraction returned text instead of submit tool call: {text}"
-            ))
+            AuditedProviderError::new(
+                format!("{request_kind} returned text instead of {tool_label}: {text}"),
+                None,
+            )
         }
+    })?;
+
+    Ok(AuditedToolStreamOutcome {
+        tool_arguments,
+        events,
+        usage: final_usage,
+        first_token_at,
+        first_token_latency_ms,
+        response_body_json: completion_json
+            .unwrap_or_else(|| json!({ "requestKind": request_kind }).to_string()),
     })
 }
 
-async fn call_memory_retrieval_provider(
+fn persist_audited_provider_events(
+    database: &mut WorkspaceDatabase,
+    request_id: &str,
+    events: &[NeutralChatStreamEvent],
+    sequence_offset: i64,
+) -> Result<(), ApiError> {
+    for (index, event) in events.iter().enumerate() {
+        let sequence = sequence_offset
+            .checked_add(i64::try_from(index).map_err(|_| {
+                ApiError::internal("too many LLM request events to fit SQLite sequence")
+            })?)
+            .ok_or_else(|| {
+                ApiError::internal("too many LLM request events to fit SQLite sequence")
+            })?;
+        let captured = captured_provider_event(event);
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: &format!("{request_id}-event-{sequence}"),
+                llm_request_id: request_id,
+                sequence,
+                event_at: &captured.event_at,
+                event_type: &captured.event_type,
+                raw_chunk_json: None,
+                normalized_event_json: &captured.normalized_event_json,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
+
+    Ok(())
+}
+
+async fn call_memory_extraction_provider(
+    workspace_path: &Path,
+    workspace_id: &str,
+    chat_id: Option<&str>,
+    provider_id: &str,
     provider_config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
 ) -> Result<Value, ApiError> {
-    let mut stream = timeout(
-        Duration::from_millis(MEMORY_RETRIEVAL_TIMEOUT_MS),
-        stream_chat(provider_config, request),
+    audited_provider_tool_request(
+        workspace_path,
+        workspace_id,
+        chat_id,
+        provider_id,
+        provider_config,
+        request,
+        "memory extraction",
+        MEMORY_EXTRACTION_TOOL_NAME,
+        "submit tool",
+        MEMORY_EXTRACTION_TIMEOUT_MS,
     )
     .await
-    .map_err(|_| {
-        ApiError::internal(format!(
-            "memory retrieval timed out after {MEMORY_RETRIEVAL_TIMEOUT_MS} ms"
-        ))
-    })?
-    .map_err(ApiError::from_provider_config_error)?;
-    let mut output_text = String::new();
-    let mut tool_arguments = None;
+}
 
-    loop {
-        let Some(event) = timeout(
-            Duration::from_millis(MEMORY_RETRIEVAL_TIMEOUT_MS),
-            stream.next_event(),
-        )
-        .await
-        .map_err(|_| {
-            ApiError::internal(format!(
-                "memory retrieval timed out after {MEMORY_RETRIEVAL_TIMEOUT_MS} ms"
-            ))
-        })?
-        else {
-            break;
-        };
-
-        match event.map_err(ApiError::from_provider_config_error)? {
-            NeutralChatStreamEvent::Start
-            | NeutralChatStreamEvent::ReasoningDelta { .. }
-            | NeutralChatStreamEvent::ThoughtSignatureDelta { .. }
-            | NeutralChatStreamEvent::Usage { .. } => {}
-            NeutralChatStreamEvent::TextDelta { delta } => output_text.push_str(&delta),
-            NeutralChatStreamEvent::ToolCall { tool_call } => {
-                if tool_call.name != MEMORY_RETRIEVAL_TOOL_NAME {
-                    return Err(ApiError::internal(format!(
-                        "memory retrieval called unsupported tool '{}'",
-                        tool_call.name
-                    )));
-                }
-                tool_arguments = Some(tool_call.arguments);
-            }
-            NeutralChatStreamEvent::Complete {
-                tool_calls, text, ..
-            } => {
-                if tool_arguments.is_none() {
-                    for tool_call in tool_calls {
-                        if tool_call.name != MEMORY_RETRIEVAL_TOOL_NAME {
-                            return Err(ApiError::internal(format!(
-                                "memory retrieval completed with unsupported tool '{}'",
-                                tool_call.name
-                            )));
-                        }
-                        tool_arguments = Some(tool_call.arguments);
-                    }
-                }
-                if !text.trim().is_empty() {
-                    output_text.push_str(&text);
-                }
-                break;
-            }
-            NeutralChatStreamEvent::Error { message } => {
-                return Err(ApiError::internal(format!(
-                    "memory retrieval stream error: {message}"
-                )));
-            }
-        }
-    }
-
-    tool_arguments.ok_or_else(|| {
-        let text = output_text.trim();
-        if text.is_empty() {
-            ApiError::internal("memory retrieval did not call select tool")
-        } else {
-            ApiError::internal(format!(
-                "memory retrieval returned text instead of select tool call: {text}"
-            ))
-        }
-    })
+async fn call_memory_retrieval_provider(
+    workspace_path: &Path,
+    workspace_id: &str,
+    chat_id: Option<&str>,
+    provider_id: &str,
+    provider_config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+) -> Result<Value, ApiError> {
+    audited_provider_tool_request(
+        workspace_path,
+        workspace_id,
+        chat_id,
+        provider_id,
+        provider_config,
+        request,
+        "memory retrieval",
+        MEMORY_RETRIEVAL_TOOL_NAME,
+        "select tool",
+        MEMORY_RETRIEVAL_TIMEOUT_MS,
+    )
+    .await
 }
 
 fn parse_memory_extraction_output(value: Value) -> Result<MemoryExtractionOutput, ApiError> {
@@ -17568,7 +17818,7 @@ Use the existing product UI conventions.
                 message: Some("hello".to_string()),
                 attachments: Vec::new(),
             },
-            false,
+            PromptAssemblyPurpose::ChatRun,
         )
         .await
         .expect("prompt context");
@@ -17704,7 +17954,7 @@ Use the existing product UI conventions.
                 message: Some("renderer prompt assembly".to_string()),
                 attachments: Vec::new(),
             },
-            false,
+            PromptAssemblyPurpose::ChatRun,
         )
         .await
         .expect("prompt context");
@@ -17848,7 +18098,7 @@ Use the existing product UI conventions.
                 message: Some("现在 markdown 预览支持公式吗？".to_string()),
                 attachments: Vec::new(),
             },
-            false,
+            PromptAssemblyPurpose::ChatRun,
         )
         .await
         .expect("prompt context");
@@ -17966,7 +18216,7 @@ Use the existing product UI conventions.
                 message: Some("Preview usage".to_string()),
                 attachments: Vec::new(),
             },
-            false,
+            PromptAssemblyPurpose::ContextPreview,
         )
         .await
         .expect("prompt context");
@@ -18004,6 +18254,83 @@ Use the existing product UI conventions.
 
         drop(database);
         drop(memory_database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
+    async fn context_usage_preview_does_not_call_model_memory_retrieval() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-context-usage-no-llm-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-context-usage-no-llm-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.memory.enabled = true;
+        config.memory.retrieval_mode = "llm".to_string();
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        {
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            let mut memory =
+                MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                    .expect("workspace memory database");
+            for index in 0..=MEMORY_RETRIEVAL_LLM_FACT_LIMIT {
+                insert_test_memory_fact(
+                    &mut memory,
+                    &format!("source-preview-{index}"),
+                    &format!("fact-preview-{index}"),
+                    MemoryScope::Workspace,
+                    None,
+                    &format!("Preview retrieval memory {index}."),
+                    false,
+                );
+            }
+        }
+
+        let prompt_context = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: Some("Preview retrieval memory".to_string()),
+                attachments: Vec::new(),
+            },
+            PromptAssemblyPurpose::ContextPreview,
+        )
+        .await
+        .expect("context preview should avoid model memory retrieval");
+
+        assert!(prompt_context.memory_context_tokens > 0);
+
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
         remove_dir_if_exists(&profile_dir);
     }

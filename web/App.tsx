@@ -166,17 +166,6 @@ type ModelMetadataResponse = {
   configuredModels: ConfiguredModelSummary[];
 };
 
-type ContextUsageResponse = {
-  usedMessageTokens: number;
-  availableMessageTokens: number;
-  memoryContextTokens: number;
-  memoryBudgetTokens: number;
-  usagePercent: number;
-  compressionTriggerTokens: number;
-  compressionTriggerPercent: number;
-  willCompressOnNextSend: boolean;
-};
-
 type ModelFormState = {
   displayName: string;
   enabled: boolean;
@@ -1822,8 +1811,6 @@ export function App() {
     useState<QuestionRequestSummary | null>(null);
   const [isAnsweringQuestion, setIsAnsweringQuestion] = useState(false);
   const [questionError, setQuestionError] = useState<string | null>(null);
-  const [contextUsage, setContextUsage] = useState<ContextUsageResponse | null>(null);
-  const [isLoadingContextUsage, setIsLoadingContextUsage] = useState(false);
   const [isRipgrepDialogDismissed, setIsRipgrepDialogDismissed] = useState(false);
   const [isInstallingRipgrep, setIsInstallingRipgrep] = useState(false);
   const [ripgrepInstallError, setRipgrepInstallError] = useState<string | null>(
@@ -2008,67 +1995,6 @@ export function App() {
       setIsInstallingRipgrep(false);
     }
   }, []);
-
-  useEffect(() => {
-    if (isGlobalView || !activeWorkspace || !selectedModelId) {
-      setContextUsage(null);
-      setIsLoadingContextUsage(false);
-      return;
-    }
-
-    const abortController = new AbortController();
-    const timeoutId = window.setTimeout(() => {
-      setIsLoadingContextUsage(true);
-      void requestJson<ContextUsageResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/context-usage`,
-        {
-          body: JSON.stringify({
-            attachments: draftAttachments.map(chatAttachmentPayload),
-            chatId: activeChatId,
-            draftMessage: draftMessage.trim() || null,
-            modelId: selectedModelId,
-            providerId: selectedProviderId || null,
-            skillIds: selectedSkillIds.length ? selectedSkillIds : null,
-            thinkingLevel: selectedThinkingLevel || null,
-          }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-          signal: abortController.signal,
-        },
-      )
-        .then((data) => {
-          setContextUsage(data);
-        })
-        .catch((requestError) => {
-          if (requestError instanceof DOMException && requestError.name === "AbortError") {
-            return;
-          }
-
-          setContextUsage(null);
-        })
-        .finally(() => {
-          if (!abortController.signal.aborted) {
-            setIsLoadingContextUsage(false);
-          }
-        });
-    }, 300);
-
-    return () => {
-      window.clearTimeout(timeoutId);
-      abortController.abort();
-      setIsLoadingContextUsage(false);
-    };
-  }, [
-    activeChatId,
-    activeWorkspace,
-    draftAttachments,
-    draftMessage,
-    isGlobalView,
-    selectedModelId,
-    selectedProviderId,
-    selectedSkillIds,
-    selectedThinkingLevel,
-  ]);
 
   const loadGitDiff = useCallback(async (workspaceId: string, path: string | null) => {
     setIsLoadingDiff(true);
@@ -3979,11 +3905,9 @@ export function App() {
               availableModels={availableModels}
               branchError={branchError}
               chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
-              contextUsage={contextUsage}
               draftAttachments={draftAttachments}
               draftMessage={draftMessage}
               gitBranches={gitBranches}
-              isLoadingContextUsage={isLoadingContextUsage}
               isLoadingSettings={isLoadingSettings}
               isLoadingBranches={isLoadingBranches}
               isSendingMessage={isSendingMessage}
@@ -5181,11 +5105,9 @@ function ChatPanel({
   branchError,
   chatScrollKey,
   canRetryRun,
-  contextUsage,
   draftAttachments,
   draftMessage,
   gitBranches,
-  isLoadingContextUsage,
   isLoadingBranches,
   isLoadingSettings,
   isSendingMessage,
@@ -5220,11 +5142,9 @@ function ChatPanel({
   branchError: string | null;
   chatScrollKey: string;
   canRetryRun: boolean;
-  contextUsage: ContextUsageResponse | null;
   draftAttachments: ComposerAttachment[];
   draftMessage: string;
   gitBranches: GitBranchesResponse | null;
-  isLoadingContextUsage: boolean;
   isLoadingBranches: boolean;
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
@@ -5733,10 +5653,7 @@ function ChatPanel({
                 </button>
               ) : null}
               <span aria-hidden="true" className="composer-control-spacer" />
-              <ContextUsageCircle
-                isLoading={isLoadingContextUsage}
-                usage={contextUsage}
-              />
+              <ContextUsageCircle />
               {isSendingMessage ? (
                 <button
                   aria-label={t("Cancel run")}
@@ -5774,49 +5691,21 @@ function ChatPanel({
   );
 }
 
-function ContextUsageCircle({
-  className = "",
-  isLoading,
-  usage,
-}: {
-  className?: string;
-  isLoading: boolean;
-  usage: ContextUsageResponse | null;
-}) {
+function ContextUsageCircle({ className = "" }: { className?: string }) {
   const { t } = useI18n();
-  const percent = usage?.usagePercent ?? null;
-  const percentLabel = percent === null ? 0 : Math.round(percent);
-  const boundedPercent =
-    percent === null ? 0 : Math.max(0, Math.min(100, percent));
-  const title =
-    usage === null
-      ? t("Context usage")
-      : usage.willCompressOnNextSend
-        ? `${t("Context usage {percent}%", { percent: percentLabel })}. ${t(
-            "Context compression may run on the next send",
-          )}`
-        : t("Context usage {percent}%", { percent: percentLabel });
-  const tone =
-    usage?.willCompressOnNextSend ||
-    (usage !== null && percent !== null && percent >= usage.compressionTriggerPercent)
-      ? "context-usage-circle-critical"
-      : percent !== null && percent >= 70
-        ? "context-usage-circle-warn"
-        : "context-usage-circle-normal";
+  const title = t("Context usage {percent}%", { percent: 0 });
 
   return (
     <div
       aria-label={title}
-      className={`context-usage-circle ${tone} ${
-        isLoading ? "context-usage-circle-loading" : ""
-      } ${className}`}
+      className={`context-usage-circle context-usage-circle-normal ${className}`}
       role="status"
       style={{
-        "--context-usage-percent": `${boundedPercent}%`,
+        "--context-usage-percent": "0%",
       } as CSSProperties}
       title={title}
     >
-      {percent === null ? "--" : `${percentLabel}%`}
+      0%
     </div>
   );
 }

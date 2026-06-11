@@ -1166,7 +1166,7 @@ describe("App verification surfaces", () => {
     ).toBe(false);
   });
 
-  it("shows context usage beside the send button", async () => {
+  it("does not precompute context usage before sending", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
 
@@ -1174,24 +1174,16 @@ describe("App verification surfaces", () => {
     await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
 
     const usage = await screen.findByRole("status", {
-      name: "Context usage 47%",
+      name: "Context usage 0%",
     });
-    expect(usage).toHaveTextContent("47%");
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/workspaces/workspace-1/context-usage",
-      expect.objectContaining({
-        body: JSON.stringify({
-          attachments: [],
-          chatId: "chat-1",
-          draftMessage: "continue",
-          modelId: "gpt-test",
-          providerId: "openai",
-          skillIds: null,
-          thinkingLevel: null,
-        }),
-        method: "POST",
-      }),
-    );
+    expect(usage).toHaveTextContent("0%");
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/context-usage",
+      ),
+    ).toBe(false);
   });
 
   it("adds native path attachments into the composer and sends them with the chat request", async () => {

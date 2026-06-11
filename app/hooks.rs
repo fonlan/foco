@@ -3,20 +3,22 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use foco_mcp::{McpRegistry, encode_mcp_tool_name};
 use foco_providers::{
-    NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStreamEvent,
-    ProviderConnectionConfig, stream_chat,
+    NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStream,
+    NeutralChatStreamEvent, NeutralUsage, ProviderConnectionConfig, stream_chat,
 };
 use foco_store::{
     config::{
         HOOK_HANDLER_COMMAND, HOOK_HANDLER_HTTP, HOOK_HANDLER_MCP_TOOL, HOOK_HANDLER_PROMPT,
         HookConfig, HookHandler, load_workspace_hook_config,
     },
-    workspace::{NewHookRun, WorkspaceDatabase},
+    workspace::{
+        NewHookRun, NewLlmRequest, NewLlmRequestEvent, UpdateLlmRequestOutcome, WorkspaceDatabase,
+    },
 };
 use regex::Regex;
 use serde::Serialize;
@@ -665,50 +667,90 @@ async fn run_prompt_hook(
         thinking_level: None,
         max_output_tokens: Some(1024),
     };
-    let mut stream = timeout(
-        Duration::from_millis(timeout_ms),
-        stream_chat(provider_config, hook_request),
-    )
-    .await
-    .map_err(|_| format!("prompt hook timed out after {timeout_ms} ms"))?
-    .map_err(|source| format!("prompt hook provider call failed: {source}"))?;
+    let mut audited_stream =
+        audited_prompt_hook_stream(provider_config, hook_request, request, timeout_ms).await?;
+    let mut first_token_at = None;
+    let mut first_token_latency_ms = None;
+    let mut usage = None;
     let mut output = String::new();
 
     loop {
-        let Some(event) = timeout(Duration::from_millis(timeout_ms), stream.next_event())
-            .await
-            .map_err(|_| format!("prompt hook timed out after {timeout_ms} ms"))?
+        let Some(event) = timeout(
+            Duration::from_millis(timeout_ms),
+            audited_stream.stream.next_event(),
+        )
+        .await
+        .map_err(|_| format!("prompt hook timed out after {timeout_ms} ms"))
+        .map_err(|message| {
+            let _ = audited_stream.fail(&message);
+            message
+        })?
         else {
             break;
         };
-        match event.map_err(|source| format!("prompt hook stream failed: {source}"))? {
-            NeutralChatStreamEvent::Start
-            | NeutralChatStreamEvent::ReasoningDelta { .. }
-            | NeutralChatStreamEvent::ThoughtSignatureDelta { .. }
-            | NeutralChatStreamEvent::Usage { .. } => {}
-            NeutralChatStreamEvent::TextDelta { delta } => output.push_str(&delta),
+        let event = event
+            .map_err(|source| format!("prompt hook stream failed: {source}"))
+            .map_err(|message| {
+                let _ = audited_stream.fail(&message);
+                message
+            })?;
+        audited_stream.events.push(event.clone());
+        match event {
+            NeutralChatStreamEvent::Start => {}
+            NeutralChatStreamEvent::ReasoningDelta { .. }
+            | NeutralChatStreamEvent::ThoughtSignatureDelta { .. } => {
+                capture_prompt_hook_first_token(
+                    audited_stream.started_at,
+                    &mut first_token_at,
+                    &mut first_token_latency_ms,
+                );
+            }
+            NeutralChatStreamEvent::Usage { usage: event_usage } => {
+                usage = Some(event_usage);
+            }
+            NeutralChatStreamEvent::TextDelta { delta } => {
+                capture_prompt_hook_first_token(
+                    audited_stream.started_at,
+                    &mut first_token_at,
+                    &mut first_token_latency_ms,
+                );
+                output.push_str(&delta);
+            }
             NeutralChatStreamEvent::ToolCall { tool_call } => {
-                return Err(format!(
+                let message = format!(
                     "prompt hook attempted unsupported tool call '{}'",
                     tool_call.name
-                ));
+                );
+                let _ = audited_stream.fail(&message);
+                return Err(message);
             }
             NeutralChatStreamEvent::Complete {
-                text, tool_calls, ..
+                text,
+                tool_calls,
+                usage: complete_usage,
+                ..
             } => {
                 if !tool_calls.is_empty() {
-                    return Err("prompt hook completed with unsupported tool calls".to_string());
+                    let message = "prompt hook completed with unsupported tool calls".to_string();
+                    let _ = audited_stream.fail(&message);
+                    return Err(message);
                 }
                 if output.trim().is_empty() {
                     output = text;
                 }
+                if let Some(complete_usage) = complete_usage {
+                    usage = Some(complete_usage);
+                }
                 break;
             }
             NeutralChatStreamEvent::Error { message } => {
-                return Err(format!("prompt hook stream error: {message}"));
+                let message = format!("prompt hook stream error: {message}");
+                let _ = audited_stream.fail(&message);
+                return Err(message);
             }
         }
     }
+    audited_stream.complete(first_token_at, first_token_latency_ms, usage, &output)?;
 
     Ok(HookExecution {
         exit_code: Some(0),
@@ -717,6 +759,253 @@ async fn run_prompt_hook(
         output_json: serde_json::from_str(&output).ok(),
         is_error: false,
     })
+}
+
+struct AuditedPromptHookStream {
+    stream: NeutralChatStream,
+    workspace_path: PathBuf,
+    request_id: String,
+    started_at: Instant,
+    events: Vec<NeutralChatStreamEvent>,
+}
+
+impl AuditedPromptHookStream {
+    fn complete(
+        &self,
+        first_token_at: Option<String>,
+        first_token_latency_ms: Option<i64>,
+        usage: Option<NeutralUsage>,
+        output: &str,
+    ) -> Result<(), String> {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&self.workspace_path).map_err(|source| {
+                format!("failed to open workspace database for prompt hook audit: {source}")
+            })?;
+        database
+            .update_llm_request_outcome(
+                &self.request_id,
+                UpdateLlmRequestOutcome {
+                    first_token_at: first_token_at.as_deref(),
+                    completed_at: Some(&utc_timestamp()),
+                    input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
+                    output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
+                    cache_read_tokens: usage.as_ref().and_then(|usage| usage.cache_read_tokens),
+                    cache_write_tokens: usage.as_ref().and_then(|usage| usage.cache_write_tokens),
+                    first_token_latency_ms,
+                    total_latency_ms: Some(elapsed_millis(self.started_at)),
+                    status_code: Some(200),
+                    final_state: "succeeded",
+                    response_body_json: Some(
+                        &json!({
+                            "requestKind": "prompt hook",
+                            "text": output,
+                            "usage": usage,
+                        })
+                        .to_string(),
+                    ),
+                },
+            )
+            .map_err(|source| format!("failed to update prompt hook LLM audit: {source}"))?;
+        self.persist_events(&mut database)?;
+
+        Ok(())
+    }
+
+    fn fail(&self, message: &str) -> Result<(), String> {
+        fail_prompt_hook_audit(
+            &self.workspace_path,
+            &self.request_id,
+            self.started_at,
+            None,
+            message,
+        )
+    }
+
+    fn persist_events(&self, database: &mut WorkspaceDatabase) -> Result<(), String> {
+        for (index, event) in self.events.iter().enumerate() {
+            let sequence = i64::try_from(index + 1)
+                .map_err(|_| "too many prompt hook LLM audit events".to_string())?;
+            let event_type = hook_provider_event_type(event);
+            database
+                .insert_llm_request_event(NewLlmRequestEvent {
+                    id: &format!("{}-event-{sequence}", self.request_id),
+                    llm_request_id: &self.request_id,
+                    sequence,
+                    event_at: &utc_timestamp(),
+                    event_type,
+                    raw_chunk_json: None,
+                    normalized_event_json: &serde_json::to_string(event).map_err(|source| {
+                        format!("failed to serialize prompt hook LLM audit event: {source}")
+                    })?,
+                })
+                .map_err(|source| {
+                    format!("failed to insert prompt hook LLM audit event: {source}")
+                })?;
+        }
+
+        Ok(())
+    }
+}
+
+async fn audited_prompt_hook_stream(
+    provider_config: &ProviderConnectionConfig,
+    hook_request: NeutralChatRequest,
+    request: &HookRunRequest<'_>,
+    timeout_ms: u64,
+) -> Result<AuditedPromptHookStream, String> {
+    let workspace_id = request.workspace_id;
+    let provider_id = request
+        .provider_id
+        .ok_or_else(|| "prompt hook requires an active provider".to_string())?;
+    let request_id = format!("llm-hook-{}", uuid_suffix());
+    let request_started_at = utc_timestamp();
+    let request_body_json = serde_json::to_string(&hook_request)
+        .map_err(|source| format!("failed to serialize prompt hook provider request: {source}"))?;
+    let mut database =
+        WorkspaceDatabase::open_or_create(request.workspace_path).map_err(|source| {
+            format!("failed to open workspace database for prompt hook audit: {source}")
+        })?;
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: &request_id,
+            workspace_id,
+            chat_id: request.chat_id,
+            provider_id,
+            model_id: &hook_request.model_id,
+            request_started_at: &request_started_at,
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: Some(&request_body_json),
+            response_body_json: None,
+        })
+        .map_err(|source| format!("failed to insert prompt hook LLM audit: {source}"))?;
+    database
+        .insert_llm_request_event(NewLlmRequestEvent {
+            id: &format!("{request_id}-event-0"),
+            llm_request_id: &request_id,
+            sequence: 0,
+            event_at: &request_started_at,
+            event_type: "start",
+            raw_chunk_json: None,
+            normalized_event_json: &json!({
+                "type": "start",
+                "requestKind": "prompt hook",
+                "llmRequestId": &request_id,
+                "workspaceId": workspace_id,
+                "chatId": request.chat_id,
+                "runId": request.run_id,
+                "event": request.event,
+            })
+            .to_string(),
+        })
+        .map_err(|source| format!("failed to insert prompt hook LLM audit event: {source}"))?;
+    drop(database);
+
+    let started_at = std::time::Instant::now();
+    match timeout(
+        Duration::from_millis(timeout_ms),
+        stream_chat(provider_config, hook_request),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => Ok(AuditedPromptHookStream {
+            stream,
+            workspace_path: request.workspace_path.to_path_buf(),
+            request_id,
+            started_at,
+            events: Vec::new(),
+        }),
+        Ok(Err(source)) => {
+            fail_prompt_hook_audit(
+                request.workspace_path,
+                &request_id,
+                started_at,
+                source.status_code().map(i64::from),
+                &format!("prompt hook provider call failed: {source}"),
+            )?;
+            Err(format!("prompt hook provider call failed: {source}"))
+        }
+        Err(_) => {
+            let message = format!("prompt hook timed out after {timeout_ms} ms");
+            fail_prompt_hook_audit(
+                request.workspace_path,
+                &request_id,
+                started_at,
+                None,
+                &message,
+            )?;
+            Err(message)
+        }
+    }
+}
+
+fn hook_provider_event_type(event: &NeutralChatStreamEvent) -> &'static str {
+    match event {
+        NeutralChatStreamEvent::Start => "start",
+        NeutralChatStreamEvent::TextDelta { .. } => "text_delta",
+        NeutralChatStreamEvent::ReasoningDelta { .. } => "reasoning_delta",
+        NeutralChatStreamEvent::ThoughtSignatureDelta { .. } => "thought_signature_delta",
+        NeutralChatStreamEvent::ToolCall { .. } => "tool_call",
+        NeutralChatStreamEvent::Usage { .. } => "usage",
+        NeutralChatStreamEvent::Complete { .. } => "completion",
+        NeutralChatStreamEvent::Error { .. } => "error",
+    }
+}
+
+fn capture_prompt_hook_first_token(
+    started_at: Instant,
+    first_token_at: &mut Option<String>,
+    first_token_latency_ms: &mut Option<i64>,
+) {
+    if first_token_at.is_none() {
+        *first_token_at = Some(utc_timestamp());
+        *first_token_latency_ms = Some(elapsed_millis(started_at));
+    }
+}
+
+fn elapsed_millis(started_at: Instant) -> i64 {
+    i64::try_from(started_at.elapsed().as_millis())
+        .expect("request latency should fit in i64 milliseconds")
+}
+
+fn fail_prompt_hook_audit(
+    workspace_path: &Path,
+    request_id: &str,
+    started_at: std::time::Instant,
+    status_code: Option<i64>,
+    message: &str,
+) -> Result<(), String> {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path).map_err(|source| {
+        format!("failed to open workspace database for prompt hook audit: {source}")
+    })?;
+    database
+        .update_llm_request_outcome(
+            request_id,
+            UpdateLlmRequestOutcome {
+                first_token_at: None,
+                completed_at: Some(&utc_timestamp()),
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(elapsed_millis(started_at)),
+                status_code: status_code.filter(|code| *code > 0),
+                final_state: "failed",
+                response_body_json: Some(&json!({ "error": message }).to_string()),
+            },
+        )
+        .map_err(|source| format!("failed to update prompt hook LLM audit: {source}"))?;
+
+    Ok(())
 }
 
 fn hook_input_json(source: &str, handler: &HookHandler, request: &HookRunRequest<'_>) -> Value {

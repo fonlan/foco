@@ -7,7 +7,7 @@ use foco_store::{
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
         NewTerminalSession, NewToolCall, NewToolResult, TaskGraphFilter, TaskGraphTask,
-        TaskGraphTaskPatch, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
+        TaskGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
         initialize_workspace_databases, workspace_database_path,
     },
 };
@@ -957,6 +957,38 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             response_body_json: Some(r#"{"error":"boom"}"#),
         })
         .expect("second llm request insert");
+    database
+        .update_llm_request_outcome(
+            "request-2",
+            UpdateLlmRequestOutcome {
+                first_token_at: Some("2026-06-03T11:00:00.050Z"),
+                completed_at: Some("2026-06-03T11:00:00.300Z"),
+                input_tokens: Some(10),
+                output_tokens: Some(4),
+                cache_read_tokens: Some(2),
+                cache_write_tokens: Some(1),
+                first_token_latency_ms: Some(50),
+                total_latency_ms: Some(300),
+                status_code: Some(200),
+                final_state: "succeeded",
+                response_body_json: Some(r#"{"ok":true,"apiKey":"secret"}"#),
+            },
+        )
+        .expect("update llm request outcome");
+    let updated_request = database
+        .llm_request("request-2")
+        .expect("updated request read")
+        .expect("updated request");
+    assert_eq!(updated_request.final_state, "succeeded");
+    assert_eq!(updated_request.status_code, Some(200));
+    assert_eq!(updated_request.cache_ratio, Some(0.2));
+    assert!(
+        updated_request
+            .response_body_json
+            .as_deref()
+            .expect("updated response body")
+            .contains(r#""apiKey":"[REDACTED]""#)
+    );
 
     let all_rows = database
         .llm_request_audit_rows(LlmRequestAuditFilters::default())
