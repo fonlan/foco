@@ -22,13 +22,24 @@ The backend binds to `127.0.0.1:3210` by default. The settings page General tab
 persists the web service listen address, port, browser authentication password,
 and UI language to `%USERPROFILE%\.foco\config.json`. Restart the backend after
 changing address or port; language changes apply immediately in the current
-browser UI. Set `FOCO_HOST` or `FOCO_PORT` for a one-off startup override.
+browser UI. Set `FOCO_HOST` or `FOCO_PORT` for a one-off startup override, or
+set `FOCO_CONFIG_DIR` to use a different config root where `config.json`,
+`memory.sqlite`, `models.dev.json`, `logs`, and the default `workspace` live.
+
+For dev/release side-by-side runs, the npm dev scripts also accept command-line
+overrides:
+
+```powershell
+npm run backend -- 33210 "$env:USERPROFILE\.foco-dev"
+npm run frontend -- 33210 "$env:USERPROFILE\.foco-dev" 5174
+```
 
 On first startup, Foco creates `%USERPROFILE%\.foco`, writes
 `%USERPROFILE%\.foco\config.json`, registers a `Default` workspace at
 `%USERPROFILE%\.foco\workspace`, initializes the workspace database at
 `%USERPROFILE%\.foco\workspace\.foco\foco.sqlite`, and writes daily logs to
-`%USERPROFILE%\.foco\logs\foco-YYYY-MM-DD.log`.
+`%USERPROFILE%\.foco\logs\foco-YYYY-MM-DD.log`. When `FOCO_CONFIG_DIR` is set,
+Foco creates and uses that directory directly instead of `%USERPROFILE%\.foco`.
 
 The browser UI starts as a three-column product shell. The left sidebar reads
 registered workspaces from `GET /api/workspaces` and adds workspaces with

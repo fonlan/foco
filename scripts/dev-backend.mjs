@@ -4,6 +4,8 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
+import { cleanDevEnv, formatDevEnvOverrides, parseBackendDevArgs } from "./dev-args.mjs";
+
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -22,12 +24,29 @@ const watchEntries = [
 const watchedExtensions = new Set([".lock", ".rs", ".toml"]);
 const pollIntervalMs = 800;
 const cargoCommand = process.platform === "win32" ? "cargo.exe" : "cargo";
+const nodeCommand = process.execPath;
+const tscScript = path.join(repoRoot, "node_modules", "typescript", "lib", "tsc.js");
+const viteScript = path.join(repoRoot, "node_modules", "vite", "bin", "vite.js");
+const webRoot = path.join(repoRoot, "web");
 
 let backendProcess = null;
 let currentSignature = "";
 let isRestarting = false;
 let isStopping = false;
+let devOptions;
 
+try {
+  devOptions = parseBackendDevArgs(process.argv.slice(2), process.env);
+} catch (error) {
+  console.error(`[backend] ${errorMessage(error)}`);
+  console.error(
+    "[backend] usage: npm run backend -- <port> <config-dir>",
+  );
+  process.exit(1);
+}
+const devEnv = cleanDevEnv(process.env, devOptions.env);
+
+await buildFrontend();
 currentSignature = await sourceSignature();
 startBackend();
 
@@ -58,16 +77,52 @@ process.on("SIGTERM", () => {
 });
 
 function startBackend() {
-  console.log("[backend] starting cargo run -p foco-app");
+  console.log(
+    `[backend] starting cargo run -p foco-app${formatDevEnvOverrides(devOptions.env)}`,
+  );
   backendProcess = spawn(cargoCommand, ["run", "-p", "foco-app"], {
     cwd: repoRoot,
     detached: process.platform !== "win32",
+    env: devEnv,
     stdio: "inherit",
   });
   backendProcess.once("exit", (code, signal) => {
     if (!isRestarting && !isStopping) {
       console.log(`[backend] exited with ${signal ?? code ?? "unknown status"}`);
     }
+  });
+}
+
+async function buildFrontend() {
+  console.log("[backend] building web assets");
+  await runCommand(nodeCommand, [tscScript, "-b"], webRoot);
+  await runCommand(nodeCommand, [viteScript, "build"], webRoot);
+}
+
+async function runCommand(command, args, cwd) {
+  await new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: devEnv,
+      stdio: "inherit",
+    });
+
+    child.once("error", reject);
+    child.once("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+
+      reject(
+        new Error(
+          `${command} ${args.join(" ")} exited with ${signal ?? code ?? "unknown status"}`,
+        ),
+      );
+    });
+  }).catch((error) => {
+    console.error(`[backend] ${errorMessage(error)}`);
+    process.exit(1);
   });
 }
 

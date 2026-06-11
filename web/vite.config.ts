@@ -122,13 +122,13 @@ function loadBackendEndpoint() {
 }
 
 function readSavedBackendEndpoint() {
-  const userProfile = process.env.USERPROFILE ?? process.env.HOME;
+  const configDir = process.env.FOCO_CONFIG_DIR ?? defaultConfigDir();
 
-  if (!userProfile) {
+  if (!configDir) {
     return {};
   }
 
-  const configPath = resolve(userProfile, ".foco", "config.json");
+  const configPath = resolve(configDir, "config.json");
 
   if (!existsSync(configPath)) {
     return {};
@@ -141,6 +141,11 @@ function readSavedBackendEndpoint() {
     host: typeof webServer?.listen_host === "string" ? webServer.listen_host : undefined,
     port: typeof webServer?.listen_port === "number" ? String(webServer.listen_port) : undefined,
   };
+}
+
+function defaultConfigDir() {
+  const userProfile = process.env.USERPROFILE ?? process.env.HOME;
+  return userProfile ? resolve(userProfile, ".foco") : undefined;
 }
 
 function formatHostForUrl(host: string) {

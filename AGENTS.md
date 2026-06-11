@@ -1,0 +1,162 @@
+# Foco 智能体说明
+
+## 项目结构
+
+- 本仓库同时是 Cargo workspace 和 npm workspace。
+- Rust crate 位于仓库根目录下，并且刻意不使用 `src/` 目录。
+- 保持当前显式 Cargo 路径：`app/main.rs`、`agent/lib.rs`、`providers/lib.rs`、`tools/lib.rs`、`graph/lib.rs`、`mcp/lib.rs` 和 `store/lib.rs`。
+- 前端位于 `web/`，并且刻意不使用 `src/` 目录。
+- 保持前端入口文件为 `web/main.tsx`、`web/App.tsx` 和 `web/styles.css`。
+
+## 开发命令
+
+- 使用 `npm install` 安装前端依赖。
+- 使用 `npm run backend` 运行后端；该命令会先构建一次 `web/dist`，再通过 `scripts/dev-backend.mjs` 启动 Rust HTTP 服务并在 Rust/Cargo 后端文件变化时自动重启；开发时可用 `npm run backend -- 33210 "%USERPROFILE%\.foco-dev"` 覆盖本次启动端口和配置根目录。
+- 使用 `npm run frontend` 运行前端开发服务器；该命令使用 Vite HMR，并会在 Rust/Cargo 后端文件变化时触发浏览器 full reload；开发时可用 `npm run frontend -- 33210 "%USERPROFILE%\.foco-dev" 5174` 指定后端端口、配置根目录和 Vite 前端端口。
+- Windows 下可运行仓库根目录的 `start-dev.bat`，一次性在两个新命令窗口中启动 `npm run backend -- 33210 "%USERPROFILE%\.foco-dev"` 和 `npm run frontend -- 33210 "%USERPROFILE%\.foco-dev" 5174`。
+- 使用 `cargo check --workspace` 运行 Rust 检查。
+- 使用 `npm run test -w web` 运行前端 Vitest/jsdom 测试。
+- 使用 `npm run typecheck` 运行前端类型检查。
+- 使用 `npm test` 运行根验证命令；该命令依次执行 `cargo test --workspace`、`npm run test -w web` 和 `npm run typecheck -w web`。
+- 使用 `npm run build:release` 运行发布构建；该命令先构建 `web/dist`，再只构建 `foco-app` release 可执行文件。
+- 使用 `npm run test:release-smoke:windows` 在 Windows 原生环境运行 release startup smoke；该脚本会构建 release、启动 `target\release\foco.exe`、检查 `/api/health` 和根 HTML UI，并验证隔离 `%USERPROFILE%` 下创建 config、logs、Default workspace 和 workspace SQLite。
+- 仓库根目录的 `foco.svg` 是应用图标的唯一源文件；Vite 会把它发布为浏览器 favicon `/foco.svg`，浏览器 UI 左上角 logo 直接引用 `/foco.svg`，Windows 编译时 `app/build.rs` 会从它生成 `.ico` 并嵌入 `foco.exe` 作为应用程序图标。
+- 后端默认绑定到 `127.0.0.1:3210`；设置页 General tab 可把 web 服务监听地址、port、浏览器访问密码和界面语言持久化到默认 `%USERPROFILE%\.foco\config.json` 或 `FOCO_CONFIG_DIR\config.json`，监听地址/port 修改后需重启后端生效，语言修改会在当前浏览器 UI 实时生效；如需单次启动覆盖监听地址/port，设置 `FOCO_HOST` 或 `FOCO_PORT`。
+- 大模型 API 代理保存在各 `ProviderSettings.api_proxy`，并在添加/编辑 provider 弹窗配置，支持 `http` 和 `socks` 两种类型；provider 连接测试、聊天流和 prompt hook 的 provider 调用都必须通过当前 active provider 的代理配置访问 endpoint，代理 URL 缺失、类型不支持、scheme 与类型不匹配或 URL 内包含凭据时必须明确报错。
+- 浏览器访问密码保存为 `app.web_server.password_hash`，设置响应只暴露 `passwordEnabled`，不得把密码或 hash 返回前端；未设置密码时不启用认证，设置密码后除 `/api/health` 和 `/api/auth/*` 外的 API 必须通过登录 cookie 认证。
+- 后端通过 `rust-embed` 从 `web/dist` 提供浏览器 UI；release 构建会把构建好的 web assets 嵌入 Rust 可执行文件，开发/debug 仍要求先存在 `web/dist`，缺失时必须明确报错。只有在已经构建前端后，才直接使用 `cargo run -p foco-app`。开发时优先用 `npm run backend` 获得自动重启。
+- Windows release 启动入口是托盘常驻模式：双击 `foco.exe` 不主动打开浏览器窗口，托盘菜单标签必须按全局配置 `app.language` 显示；Quit 必须触发同一套 graceful shutdown；如果监听地址是 `0.0.0.0`，Open Foco/打开 Foco 仍必须用 `127.0.0.1` 作为浏览器打开 host。
+- 首次启动会创建默认 `%USERPROFILE%\.foco`、`config.json`、`workspace` 和 `logs`；设置 `FOCO_CONFIG_DIR` 时直接把该目录作为配置根目录，不再额外拼接 `.foco`；日志按日写入 `logs\foco-YYYY-MM-DD.log`。
+- 每个已注册 workspace 启动时会创建 `<workspace>\.foco\foco.sqlite` 并执行 SQLite 迁移；schema 升级前会在 `<workspace>\.foco\backups` 创建数据库备份。
+- workspace SQLite schema v5 新增历史 `task_graphs` 表，schema v8 会迁移为 `todo_graphs`，按 chat 保存当前 ToDo 图 JSON；删除 chat 时 todo graph 随外键级联删除。
+- workspace SQLite schema v6 新增 `hook_runs` 表，保存 hook 审计记录：事件、来源、handler 类型、脱敏 input/output JSON、退出码/状态、stdout/stderr 预览、workspace/chat/run/tool call id 和起止时间。
+- Foco memory graph 使用三种 scope：global、workspace 和 chat；workspace/chat memory 保存在对应 `<workspace>\.foco\foco.sqlite`，global memory 保存在默认 `%USERPROFILE%\.foco\memory.sqlite` 或 `FOCO_CONFIG_DIR\memory.sqlite`，不得写入 `config.json`。
+- memory graph 使用 `memory_sources` 保存原始证据，`memory_facts` 保存原子事实，`memory_edges` 只支持 `updates`、`extends` 和 `derives`；非 `user_note` fact 必须至少关联一个 source，自动抽取不得保存无证据事实。
+- memory 默认关闭，`memory.extraction_mode` 默认 `manual`，`memory.retrieval_mode` 默认 `fts`；只有启用 memory 并选择 `pending_review` 时聊天完成后才排队抽取，抽取失败不阻断主聊天响应；抽取模型返回 malformed tool JSON、未调用抽取 tool 或调用错误 tool 时只重试一次，仍失败则忽略本次抽取并只写日志，不进入 Memory UI，配置/provider 等用户可处理失败才进入 Memory UI/日志。明确以 “remember this”“remember:” 或 “please remember” 开头的用户请求可直接写入 active fact，其它抽取或 agent 写入默认 pending。
+- prompt/context usage 共用同一套 memory 注入路径：profile context 紧跟 system prompt，query-specific retrieved memories 随后注入并计入 memory token budget；context usage preview 必须只读，不得创建 chat、消息、抽取任务或 memory 数据。
+- prompt memory retrieval 只检索 active/latest facts，默认排除 superseded、expired 和 rejected；设置页 Memory tab 可选择 SQLite FTS 或大模型匹配。FTS 是默认当前方式，排名结合文本相关性、scope、pinned、recency、confidence、is_latest；大模型匹配会把当前 global/workspace/chat active/latest 记忆和用户请求发给 `memory.retrieval_model_id` 指定模型，未指定时继承当前会话模型，并要求模型返回相关 fact key。两种方式都会在小深度内扩展 graph 相关事实；active 记忆超过模型匹配硬上限时必须明确报错，不得静默截断。
+- 删除 chat 会级联删除未提升的 chat memory；forget memory 使用 hard delete，并必须从 search、prompt 注入和 profile 生成中消失。profile 会在审批、编辑、提升、抽取落库、agent memory write 和 retention 过期处理后同步刷新。
+- agent memory 工具只在 memory 启用时暴露：`memory_search` 支持 `global`、`workspace`、`chat` 和 `auto` scope；`memory_write` 会创建 `ManualNote` source 并按当前用户 prompt 的 remember 规则决定 pending/active。当前不提供 `memory_update` agent tool，edit/promote/forget 仍由设置页和 HTTP API 用户操作负责。
+- 浏览器 UI 的 workspace 侧边栏通过 `GET /api/workspaces` 读取全局配置和各 workspace 数据库里的 chat 历史。
+- 设置页 Workspaces tab 展示所有已注册 workspace（包含 Default），workspace 在全局配置 `workspaces` 数组中的顺序就是侧边栏显示顺序；`POST /api/workspaces/order` 必须收到完整、唯一且全部已存在的 workspace id 顺序，置顶 workspace 通过 `WorkspaceConfig.pinned` 标记并显示在普通 workspace 前。
+- 浏览器 UI 的 workspace 侧边栏中，workspace 名称行点击负责展开/收起该 workspace 的 chat list；右侧 `+` 按钮只负责在该 workspace 新建 chat，若该 workspace 已收起则必须同时自动展开，hover/active 高亮应覆盖整行菜单区域。workspace 行和会话行必须有明确视觉层级区分；同一时间只能展开一个 workspace，点击历史会话或切换会话标签时必须自动收起其他 workspace 并展开该会话所属 workspace，但之后用户仍可手动收起或展开任意 workspace；新建聊天占位行必须保持与普通会话一致的行高和可点击宽度。
+- 浏览器 UI 的 workspace chat list 会在标题下方显示 chat 创建时间，当前正在等待模型返回的 chat 会把左侧气泡图标替换为旋转加载图标直到流结束。
+- 浏览器 UI 的中间聊天面板使用打开会话标签页；点击左侧会话列表会打开或切换对应标签，标签标题显示会话名、下方显示所属 workspace 名，关闭标签只关闭当前浏览器 UI 标签而不删除 chat 历史，正在 streaming 的标签右侧显示旋转加载图标而不是关闭按钮。
+- 手机宽度浏览器 UI 不常驻 workspace 侧边栏；聊天页顶部通过文件夹按钮打开 workspace 抽屉，选择或新建会话后自动收起抽屉，Git diff/任务图面板在底部覆盖显示以避免挤压聊天主区。
+- 浏览器 UI 只展示一个添加工作区入口；路径输入框右侧的选择按钮通过 `POST /api/native/select-directory` 打开本机目录选择器并回填路径。
+- `POST /api/workspaces/add` 负责添加工作区：路径不存在时创建目录后注册，路径已存在且是目录时直接注册；该接口会写回 `%USERPROFILE%\.foco\config.json` 并初始化 workspace-local SQLite，路径已存在但不是目录时必须明确报错。
+- `POST /api/workspaces/manual` 负责保存单个 workspace 的名称、路径、置顶状态和终端 shell；路径必须是绝对目录路径，保存和响应时不得把 Windows `\\?\` verbatim 前缀暴露给配置或 UI；终端 shell 只支持 `powershell`、`cmd`、`bash` 和 `zsh`，未知值必须明确报错。
+- 设置页通过 `POST /api/model-metadata/refresh` 从 `https://models.dev/api.json` 手动刷新模型元数据。
+- 刷新后的模型元数据缓存到 `%USERPROFILE%\.foco\models.dev.json`，缓存内容包含每个模型的来源 URL、刷新时间、上下文窗口、最大输出 token、价格、模态、工具支持和缓存支持。
+- `POST /api/models/manual` 负责保存模型启用状态和手动补充的 limits；启用模型时必须同时具备 context window 和 max output tokens，否则应明确报错。
+- 设置页模型列表支持拖拽调整优先级，模型在全局配置 `models` 数组中的顺序就是优先级；`POST /api/models/order` 必须收到完整、唯一且全部已存在的模型 id 顺序，聊天发送框的可运行模型下拉按该顺序展示，并在用户未手动选择时默认使用最高优先级模型。
+- 设置页通过 `POST /api/providers/manual` 保存 OpenAI Chat 与 OpenAI Responses provider 配置，并通过 `POST /api/providers/test` 使用 `genai` 检测 provider 连接。
+- `POST /api/models/manual` 同时负责保存模型关联的 provider 列表、active provider 和 thinking level；能力警告只展示，不应静默改写用户选择。
+- `POST /api/providers/delete` 删除 provider 时必须同步从所有模型的 provider 列表移除该 provider，并在 active provider 被删除时改用该模型剩余的第一个 provider 或置空。
+- `POST /api/models/delete` 删除已配置模型；模型不存在或 id 为空时必须明确报错。
+- 设置页通过 `POST /api/mcp/servers/manual` 保存 MCP server 配置，并通过 `POST /api/mcp/servers/delete` 删除配置；MCP server 必须显式设置 `transport` 为 `stdio` 或 `streamable-http`。
+- `stdio` MCP server 必须提供 `command`，可提供逐项 `args`，启动时以当前 workspace 路径为 cwd；`streamable-http` MCP server 必须提供 HTTP(S) `url`，并且不得设置 `command` 或 `args`。
+- MCP 运行时由 `foco-mcp` 的 `McpRegistry` 管理，同一全局配置会按 workspace 创建独立 server runtime；新增 workspace、保存/删除 MCP 配置和聊天运行前都会同步当前配置。
+- MCP 工具注入 agent tool registry 时命名为 `mcp__{serverId}__{toolName}`，执行时还原为 MCP server 原始工具名；MCP 工具结果走与内置工具相同的 SSE、`tool_calls` 和 `tool_results` 持久化管线。
+- 设置页会展示 MCP server 的 connected/error/disabled/stopped 状态、工具数和启动错误；配置缺失或传输字段冲突必须明确报错。
+- 设置页不提供手动填写 skill 目录；`POST /api/skills/manual` 只保存按 scoped skill key 计算的启用/禁用状态，`POST /api/skills/refresh` 从内置目录重新发现 skill。
+- skill 内置目录分两类：全局 skill 目录为 Windows 下的 `%USERPROFILE%\.agents\skills` 或 Linux/macOS 下的 `~/.agents/skills`；workspace 级 skill 目录为每个已注册 workspace 下的 `.agents\skills` 和 `.claude\skills`。
+- 不存在的 skill 目录必须静默忽略，不展示设置错误；存在但不可读、不是目录或包含无效 `SKILL.md` 时必须展示明确错误。
+- skill 发现只扫描内置目录本身的 `SKILL.md` 和该目录下一层子目录的 `SKILL.md`；skill 文件必须以 YAML frontmatter 开头，并提供非空 `name` 和 `description`。
+- 全局配置使用 `skills.detected` 缓存 discovery 结果，并使用 `skills.disabled` 保存 scoped skill key；全局 skill key 为 `global:{skill_id}`，workspace skill key 为 `workspace:{workspace_id}:{skill_id}`。发现的 skill 默认启用，只有用户手动关闭时才记录到 `skills.disabled`，`skills.enabled` 仅作为旧配置兼容的派生快照，`skills.directories` 只作为旧配置兼容字段保留。
+- agent system prompt 不直接注入全部已启用 skill 的名称、描述或 `SKILL.md` 正文；新建 chat 的初始 provider-neutral messages 会包含一个额外 `user` 消息，列出所有已发现且未手动禁用 skill 的 `SKILL.md` 路径和 YAML front matter，不包含正文。
+- 设置页 skill 列表必须标明 skill 是全局 skill 还是属于某个 workspace，并且启用/禁用必须按 scoped skill key 分别生效。
+- 对话输入框通过 `/` 命令选择的本轮 skill 会发送 scoped skill key，并作为用户消息前缀持久化，格式为 `[$skill-name](绝对/SKILL.md/路径) 原用户消息`；消息发送后本轮已选 skill 胶囊必须从输入框清空，输入框保持可聚焦且可继续编辑下一条消息；后端必须按当前 skill discovery 结果校验 scoped key、启用状态和文件声明，不存在、不启用或声明不一致时明确报错。
+- 如果启用的 skill 文件缺失、格式无效或 id 与文件声明不一致，聊天请求必须明确报错；大模型需要使用某个 skill 时，应按 front matter 列表里的路径再读取该 `SKILL.md` 全文了解用法。
+- 设置页会展示无效 skill 文件和非缺失目录扫描错误；普通 settings 加载只展示当前错误，只有保存或刷新 discovery 才会更新持久化的 `skills.detected`。
+- Hook 配置采用 Claude Code 兼容的嵌套形状：`hooks.{Event}[] = { matcher?, hooks: [handler...] }`，并支持顶层 `disableAllHooks`；Foco 额外允许 matcher group 和 handler 设置 `enabled`，缺省为启用。
+- 全局 hook 保存在 `%USERPROFILE%\.foco\config.json` 的 `hooks` 字段；workspace 级 hook 保存在对应 workspace 的 `<workspace>\.foco\hooks.json`，不得写入 workspace SQLite 配置表，也不得自动读取 `.claude/settings.json` 或 `.claude/settings.local.json`。
+- 设置页 Hooks tab 负责配置全局 hook 和 workspace hook：支持选择 Global/Workspace scope、workspace picker、显示解析后的 `.foco\hooks.json` 路径、添加/编辑/删除/启用/禁用/重排 matcher group 与 handler、展示 effective hook、导入 Claude hook、测试 hook 和查看 hook run 审计详情。
+- Claude hook 文件只作为手动导入来源；`POST /api/hooks/import-claude` 只在用户触发时读取导入来源，导入兼容的 `hooks` 与 `disableAllHooks`：目标为 `global` 时读取 `%USERPROFILE%\.claude\settings.json` 和 `%USERPROFILE%\.claude\settings.local.json` 并保存到 Foco 全局 hook，目标为 `workspace` 时读取所选 workspace 下的 `.claude\settings.json` 和 `.claude\settings.local.json` 并保存到该 workspace 的 `.foco\hooks.json`。
+- 当前支持的 hook event 名称为 `SessionStart`、`SessionEnd`、`UserPromptSubmit`、`PreToolUse`、`PermissionRequest`、`PermissionDenied`、`PostToolUse`、`PostToolUseFailure`、`PostToolBatch`、`Stop`、`StopFailure`、`PreCompact`、`PostCompact`、`Elicitation` 和 `ElicitationResult`；不支持的 Claude Code 事件必须作为配置错误明确报错，不得静默忽略。
+- 暂不支持 runtime/config hook 和 subagent/task hook；`Setup`、`UserPromptExpansion`、`MessageDisplay`、`Notification`、`SubagentStart`、`SubagentStop`、`TaskCreated`、`TaskCompleted`、`TeammateIdle`、`InstructionsLoaded`、`ConfigChange`、`CwdChanged`、`FileChanged`、`WorktreeCreate` 和 `WorktreeRemove` 必须明确拒绝。
+- Hook matcher 规则：空值或 `*` 匹配全部；只含字母数字、`_`、`-` 和 `|` 的 matcher 按 `A|B` 精确候选匹配；其它 matcher 按正则表达式匹配。工具 hook 的 match value 使用 Foco 内置工具名或 MCP 工具名 `mcp__{serverId}__{toolName}`。
+- Hook handler 支持 `command`、`http`、`mcp_tool` 和 `prompt`。`command` hook 从 stdin 接收 JSON；有 `args` 时直接执行命令与 args，无 `args` 时按 shell form 执行，并支持 `shell`、`timeout`、`statusMessage`、`async` 和保留的 `asyncRewake` 字段。`http` hook 以 `Content-Type: application/json` POST 同一份输入。`mcp_tool` hook 通过已连接的 `McpRegistry` 调用。`prompt` hook 通过现有 provider-neutral provider path 做单轮 JSON evaluator 调用，不实现 Claude Code `agent` hook。
+- Hook 输入必须包含适用的 `workspaceId`、`chatId`、`runId`、`sessionId`、`cwd`、`modelId`、`providerId`、`permissionMode` 和 `hookEventName`，以及事件 payload；hook input/output 在写日志或数据库前必须脱敏 authorization header、API key、cookie 和 password 字段。
+- Hook 输出支持顶层 `{ "decision": "block", "reason": "..." }`，支持 `additionalContext` 临时注入下一次模型请求，并通过 `systemMessage`/hook notification 在 UI 中显示而不写入聊天历史。`PreToolUse` 支持 `hookSpecificOutput.permissionDecision` 的 `allow`、`deny` 和 `ask`；`PermissionRequest` 支持 `hookSpecificOutput.decision.behavior` 的 `allow`、`deny` 和 `ask` 以及 `updatedInput`；`PermissionDenied` 支持 `hookSpecificOutput.retry` 作为可重试提示；`Elicitation`/`ElicitationResult` 支持 `hookSpecificOutput.action` 与 `content` 映射到 Foco 的 question bridge。
+- 聊天运行会在用户消息落库前触发 `UserPromptSubmit`，在 chat/run 建立后触发 `SessionStart`，在工具执行前后触发 `PreToolUse`、`PermissionRequest`、`PermissionDenied`、`PostToolUse`/`PostToolUseFailure` 与 `PostToolBatch`，在最终完成前触发 `Stop`，在 provider/API/agent-loop 失败时触发 `StopFailure`，在 context compression 前后触发 `PreCompact`/`PostCompact`，在 `ask_question` 弹窗前后触发 `Elicitation`/`ElicitationResult`，成功或取消时触发 `SessionEnd`。阻断和 hook 失败通过 `hookNotification` SSE 通知 UI，不应混入 tool result JSON，除非该 hook 直接阻断了工具调用。
+- hook run 审计日志由全局 `hooks.auditEnabled` 控制，可在 Hooks 设置页通过 “Record hook run logs” 开关启用或关闭；启用后日志写入当前 workspace SQLite 的 `hook_runs` 表，并可在 Hooks 页查看最近运行和详情。
+- Hook 相关 API 包括 `GET /api/hooks`、`POST /api/hooks/global`、`POST /api/hooks/workspace`、`POST /api/hooks/import-claude`、`POST /api/hooks/test`、`GET /api/workspaces/{workspace_id}/hooks/runs` 和 `GET /api/workspaces/{workspace_id}/hooks/runs/{hook_run_id}`。
+- workspace 数据库使用 `llm_requests` 保存 LLM 请求审计，并使用 `llm_request_events` 保存流式 chunk 与归一化事件；写入审计记录时必须提供 request time、workspace、provider、model、状态/最终状态、延迟字段和归一化 token 字段。
+- LLM 审计请求/响应 JSON 和流式事件 JSON 在落库前必须脱敏 authorization header 与 API key 字段；cache ratio 由归一化 input tokens 与 cache read tokens 计算，不由调用方手写。
+- 浏览器统计页通过 `GET /api/ai-statistics` 展示 LLM 请求审计表，并支持按 workspace、chat、provider、model、status 和 time range 过滤；该接口使用 `page` 和 `pageSize` 分页，返回 `totalCount`、`totalPages` 和当前页请求，跨 workspace 查询会合并各 workspace 数据库后按请求时间全局分页；前端请求审计表横向占满统计视图，支持用户自定义显示列，分页器显示具体页码并在同一行提供每页数量输入。
+- 浏览器统计页的详情弹窗通过 `GET /api/workspaces/{workspace_id}/ai-statistics/{request_id}` 读取单条审计请求的完整脱敏 request/response JSON；request 和 response 详情必须提供复制按钮，并以白底黑字、默认自动换行显示；详情弹窗不展示流事件。
+- 最小聊天流通过 `POST /api/workspaces/{workspace_id}/chat/stream` 返回 SSE；请求必须指定已启用且有 active provider 的模型，可选指定 chat 与 thinking level；请求可带 `attachments[]`，每项必须包含 `id`、`name`、`contentType` 和 `sizeBytes`，图片附件额外带 raw `contentBase64`（不得是 data URL），非图片附件额外带原始绝对 `path`；最多 6 个、单个最大 10MiB、总计最大 24MiB。非图片附件不得转成 base64 传给 provider，而是在 provider 可见的用户消息里追加 Files mentioned 路径块，由模型按需调用工具读取。
+- 新建 chat 时，后端会把 workspace 根目录的 `AGENTS.md` 作为额外 `user` 消息注入 provider-neutral messages；不默认加载 `%USERPROFILE%\.codex\AGENTS.md` / `~/.codex/AGENTS.md`。设置页 Prompts tab 允许用户添加提示词文件（例如 `%USERPROFILE%\.codex\AGENTS.md`）并填写额外提示词文本，已配置的提示词文件内容和额外提示词文本会在新建 chat 时作为额外 `user` 消息注入；system prompt 不重复包含这些内容；缺失文件忽略，存在但不是文件或不可读时必须明确报错；这些注入消息不写入聊天历史。
+- 新建 chat 时，后端还会注入一条额外 `user` 消息作为环境上下文，包含当前 workspace 目录、自动检测到的 shell 类型与可执行名、当前日期、本地时间戳、时区和是否处于 WSL；这条消息不写入聊天历史，后续同一 chat 请求不重复注入。
+- 聊天流由 `providers` crate 的 provider-neutral request/event 模型包住 `genai`；OpenAI Chat 和 OpenAI Responses 共用该路径。
+- 聊天流支持文本、reasoning、usage、completion、error、tool call 和 tool result 事件。
+- 浏览器聊天气泡统一实时 Markdown 渲染；assistant 气泡必须按 SSE 实际到达顺序显示 reasoning、文本和工具调用块，不能在完成后把 reasoning 或工具调用重排到固定顶部/尾部；reasoning 流式展示期间保持展开，assistant 回复完成后自动折叠为单行预览并允许用户点击展开；reasoning 仍保存到 assistant message 的 `metadata_json.reasoning` 以支持 provider reasoning replay。
+- 用户消息附件保存到 user message metadata，历史回读的 `parts` 必须包含附件 part；图片附件 part 提供 `previewDataUrl` 缩略图，非图片附件保存并展示原始 `path` 且以文件名胶囊显示。
+- 浏览器聊天气泡中的 fenced code block 如果标记为 `mermaid`，必须在气泡原位置按需加载 Mermaid 并渲染为图；流式输出期间如果 Mermaid fence 尚未闭合，必须先按普通代码块显示，等闭合 fence 到达后再渲染；渲染失败时在该气泡内显示明确错误和原始图定义。
+- assistant 气泡完成后必须在底部小字显示该次回复的模型、provider 渠道、总耗时、输出 token/s 和首 token 延迟；这些指标来自同一条 `llm_requests` 审计记录，历史回读不得从消息文本或 UI 状态推断。
+- 浏览器工具调用折叠摘要必须直接显示关键输入细节，例如 `read_file` 的文件路径和 `run_command` 的完整命令；展开后继续显示完整 Input/Output JSON。
+- 浏览器聊天消息列表在用户未主动向上滚动时会随消息追加、流式更新和内容尺寸变化锁定到底部；用户滚离底部后停止自动滚动，切换 chat 时重新默认锁定底部。
+- 内置工具运行时位于 `tools/lib.rs`，当前提供 `read_file`、`list_files`、`graph_find_symbols`、`graph_find_callers`、`graph_find_callees`、`graph_find_references`、`graph_related_files`、`search_text`、`write_file`、`patch_file`、`create_todo_graph`、`update_todo_graph`、`get_todo_graph`、`ask_question`、`run_command` 和 `sleep`。
+- todo graph 工具绑定当前 chat：`create_todo_graph` 创建或替换当前 chat 的 ToDo 图，task 必须包含 `id`、`title`、`status`、`dependsOn`、`acceptance`、`summary`、`createdAt`、`updatedAt` 和 `subtasks`，其中时间戳由后端生成并覆盖输入值。
+- todo graph 状态只允许 `pending`、`ready`、`running`、`blocked`、`completed`、`failed` 和 `cancelled`；task id 必须全图唯一，`dependsOn` 必须指向已存在 task，不能自依赖或形成环。
+- `update_todo_graph` 只接受某个 task 的 patch，不接受整图替换；patch 至少修改一个字段，替换 subtasks 时会重新生成这些 subtask 的时间戳。
+- `get_todo_graph` 支持按 `status`、`taskId` 和 `includeSubtasks` 过滤当前 chat 的 ToDo 图；不存在 todo graph 时返回 `exists=false` 和空 tasks。
+- 内置工具的 strict JSON schema 必须兼容 OpenAI Responses：`properties` 中每个字段都必须出现在 `required`，可选参数使用 `null` 表达。
+- 内置工具 schema 必须包含 `timeoutMs`；传 `null` 时使用工具默认值，执行命令类工具必须在超时后终止进程并明确报错。`ask_question` 是唯一例外：它不接受 `timeoutMs`，必须通过聊天 UI 弹窗等待用户回答或等待 run 取消。
+- 文件工具只接受 workspace-relative 路径，必须 canonicalize 后仍位于当前 workspace 内；绝对路径、父目录逃逸和 Windows prefix/root 组件都应明确报错。
+- `read_file` 支持可选的 1-based 闭区间 `startLine`/`endLine` 行过滤；两者必须同时为整数或同时为 `null`，越界时明确报错。
+- `list_files` 支持可选 `include` 和 `exclude` glob 数组，规则匹配返回的 workspace-relative path；无效或空 glob 必须明确报错。
+- `search_text` 通过 `rg --json` 执行，并返回 workspace-relative path、line、text 和 truncated 状态。
+- `write_file` 支持完整文件写入，也支持用 1-based 闭区间 `startLine`/`endLine` 替换已有文件指定行；已有文件按原编码写回，支持 UTF-8、UTF-8 BOM、UTF-16 LE BOM 和 UTF-16 BE BOM，不支持的编码必须明确报错；新建文件默认写 UTF-8；目标父目录必须已存在，文件可新建或覆盖，不创建缺失目录。
+- `patch_file` 支持对已有文本文件应用单文件 unified diff；hunk context 和删除行必须精确匹配当前文件，成功后按原文件编码写回，不支持的编码必须明确报错。
+- `run_command` 接受 `command` 和 `args` 数组并直接执行进程，不通过 shell 拼接命令；非零退出作为工具结果返回，不作为工具执行错误吞掉；大模型需要 git 状态或 diff 时应通过 `run_command` 自主调用 `git status`、`git diff` 等命令。
+- `sleep` 接受 `durationMs` 暂停指定毫秒数；`durationMs` 必须大于 0 且不超过工具 `timeoutMs`。
+- 后端 Git API 使用 `gix` 直接读取和操作 Git 仓库，不依赖外部 `git` 可执行文件。
+- 后端 `GET /api/workspaces/{workspace_id}/git/status` 和 `GET /api/workspaces/{workspace_id}/git/diff` 都会先验证 workspace 是 git repository；不是 git 仓库时必须返回明确错误。
+- 后端 `GET /api/workspaces/{workspace_id}/git/branches` 返回本地分支列表和当前分支；不是 git 仓库时返回 `isGitRepository=false` 和空列表。切换/新建分支分别通过 `POST /git/branches/switch` 与 `POST /git/branches/create`，新建成功后切到新分支；切换分支要求当前 worktree 没有未提交改动，否则必须明确报错。
+- code graph 工具直接读取 workspace SQLite 里的已索引数据；查 caller/callee/reference 时优先用 `graph_find_symbols` 返回的 `symbolId`，同名 symbol 模糊时必须明确报错而不是静默选第一个。
+- 工具调用在 provider completion 后执行一次，结果通过 SSE 挂在同一条 assistant message 内，并写入 workspace 数据库的 `tool_calls` / `tool_results`。
+- `ask_question` 工具调用会发送 `questionRequest` SSE 事件，payload 包含 `questions[]`；浏览器 UI 必须弹出问题对话框并要求用户回答全部问题，用户通过 `POST /api/chat/questions/{question_id}/answer` 返回 `answers[]` 后，后端才继续同一轮 agent loop。
+- TODO step 10 已实现首个 agent loop：聊天流会组装 system rules、workspace context、聊天历史和工具 schema，按模型 limits 打包上下文，并在工具结果返回后继续同一轮模型运行。
+- 同一模型 turn 内多个工具调用会并行执行；`write_file` 和 `patch_file` 这类写入工具如果在同一 turn 指向同一 workspace-relative path，必须在执行前失败并给出明确冲突错误。
+- 浏览器右侧 git diff 面板从 `GET /api/workspaces/{workspace_id}/git/diff` 加载当前 workspace diff，并支持按文件路径过滤 diff。
+- 浏览器通过 `GET /api/workspaces/{workspace_id}/chats/{chat_id}/todo-graph` 读取当前 chat 的 todo graph；当前会话存在 todo graph 时，右侧面板 ToDo tab 显示 ToDo graph，Git tab 保持 Git diff。
+- 聊天流在 `write_file`、`patch_file` 或 `run_command` 工具完成后会发送 `gitDiffRefresh` SSE 事件，前端收到后刷新右侧 diff 面板。
+- 聊天流在 `create_todo_graph` 或 `update_todo_graph` 工具完成后会发送 `todoGraphRefresh` SSE 事件，前端收到当前 chat 的 ToDo 图刷新事件后必须自动打开右侧 ToDo/Git diff 侧边栏并刷新 todo graph；同一模型 turn 中只要包含 todo graph 写工具，该批工具会按顺序执行以避免同一 chat 的 ToDo 图被并发覆盖。
+- 浏览器聊天 UI 支持取消当前 active run，并在失败或取消后重试上一轮 run；应用级 shutdown 也必须通知 active agent run，已开始的 run 需要以 `cancelled` 审计状态落库。
+- 聊天 API 会先持久化用户消息，provider 完成后持久化 assistant 消息，并为真实请求写入 `llm_requests` 与 `llm_request_events`。
+- 聊天上下文在接近模型上下文上限前会把较早的可选历史消息压缩为结构化 snapshot；snapshot 写入 workspace 数据库的 `context_compression_snapshots`，并在后续 prompt assembly 中作为 system context 注入。
+- context compression 只覆盖带有数据库 sequence 的旧消息；已有 compression snapshot、最新用户消息和 active tool state 必须保留，不参与压缩。
+- 浏览器发送框通过 `POST /api/workspaces/{workspace_id}/context-usage` 显示当前模型上下文使用率圆圈；该接口必须复用聊天 prompt assembly 和同一套 token budget，按 `used_message_tokens / available_message_tokens` 计算百分比，且不得创建 chat 或写入消息；该接口接受与聊天流相同的 `attachments[]` 以预估附件上下文开销。
+- 浏览器发送框直接从设置里的 enabled model 选择模型，并提供 thinking level 选择；设置页保存 provider/model 后必须同步刷新聊天发送框可用模型，不要求用户手动刷新页面。
+- 浏览器发送框使用回车发送消息、Ctrl+回车换行；模型和 thinking level 控件位于输入框下方，控件区最左侧加号按钮通过本机文件选择器选择附件；非图片附件在输入框内显示为文件名胶囊并发送原始路径，图片附件显示缩略图，粘贴到输入框的图片也必须作为图片附件加入本轮发送。
+- 历史 chat 通过 `GET /api/workspaces/{workspace_id}/chats/{chat_id}/messages` 回读，并通过 `POST /api/workspaces/{workspace_id}/chats/{chat_id}/delete` 删除；浏览器 UI 删除 chat 前必须弹窗确认；删除 chat 时消息、run events、tool calls/results 和 context compression snapshots 随 SQLite 外键级联删除，`llm_requests.chat_id` 置空以保留审计。
+- 浏览器左上 Foco 标题右侧放全局级入口；设置和统计作为全界面视图渲染，不显示 workspace 侧边栏、会话 header、右侧 Git diff 或下方终端。
+- 下方终端面板默认不显示；浏览器顶部导航的终端按钮按 workspace id 控制显示状态，切换同一 workspace 内的 chat 不应改变终端显示状态。
+- 终端面板显示时通过 `POST /api/workspaces/{workspace_id}/terminal/session` 创建 workspace-scoped session，再用 `GET /api/workspaces/{workspace_id}/terminal/{session_id}/ws` WebSocket 连接 Windows PTY。
+- 终端后端位于 `app/terminal.rs`，使用 `portable-pty` 按当前 workspace 的 `terminal_shell` 启动 `powershell.exe`、`cmd.exe`、`bash` 或 `zsh`；配置的 shell 启动失败必须明确报错，不得静默切换到另一个 shell。WebSocket JSON 协议只包含 `input`、`resize`、`started`、`output`、`cwd`、`exit` 和 `error`。
+- 终端 cwd 目前通过 PowerShell prompt 写出的 OSC 7 事件回传并持久化到 workspace 数据库的 `terminal_sessions.working_directory`；如果报告的 cwd 不存在或不是绝对路径，应明确报错。
+- 终端 WebSocket 断开、用户关闭终端面板或 app Ctrl+C shutdown 时必须清理 PTY 子进程，并把 session 标记 closed；下一次创建 session 会从最近一次 terminal cwd 恢复。
+- `foco-graph` 在后端启动时会对每个已注册 workspace 运行一次初始 code graph 索引，并启动带 debounce 的 filesystem watcher；索引或 watcher 启动失败应作为显式启动错误处理。
+- code graph 扫描使用 `.gitignore` 等 ignore 规则，并固定跳过 `.foco`、`.git`、`.codegraph`、`.mem`、`node_modules`、`target` 和 `dist` 等内部或生成目录。
+- code graph 当前通过 Tree-sitter 解析 Rust、TypeScript、TSX、JavaScript、Python、Go、C、C++、C#、Java、JSON 和 TOML；Markdown 进入文件/FTS 索引但不抽取 AST 符号。
+- workspace SQLite schema v4 新增真正的 FTS5 虚拟表 `code_graph_fts_index`，并继续用 `code_graph_fts_data` 保存 files、symbols 和 documentation text 的普通数据行。
+- code graph 增量索引以 `code_graph_file_hashes.content_hash` 为准；文件变化时替换该文件的 symbols/imports/references/edges/FTS 行，文件删除或被 ignore 后必须清理 stale graph rows。
+- agent system prompt 不注入 code graph 已索引文件数、symbol/reference/edge 数量或语言列表这类动态上下文；定位符号、调用关系、引用或相关文件时通过 graph 工具按需查询，再按需使用 `search_text`。
+- 全局配置使用严格 JSON schema；无效字段、缺失字段或无效 workspace 路径都应作为显式启动错误处理。
+
+## 实现规则
+
+- 按照 `TODO.md` 从上到下实现。
+- `TODO.md` 是本地执行计划文件，不纳入 Git 仓库。
+- 完成某个 TODO 项时，必须在同一次改动中把对应 checkbox 从 `[ ]` 改为 `[x]`。
+- 如果完成较早里程碑需要较晚 TODO 项，先把该项移动到更前面，而不是静默越序实现。
+- 保持改动外科式精简，并匹配当前项目布局。
+- 优先修 root cause，不做兜底式行为。
+- 不要引入 `Ensure*` 风格的兜底 helper；缺少必需数据时应给出明确错误。
+- `lucide-react` 是唯一允许使用的前端图标来源。
+
+## 文档规则
+
+- 如果实现了新功能，并且该功能新增或改变了项目结构、命令、约定、运行时行为、验证步骤或面向智能体的工作流，必须在同一次改动中更新 `AGENTS.md`。

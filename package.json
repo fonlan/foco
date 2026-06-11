@@ -5,8 +5,8 @@
     "web"
   ],
   "scripts": {
-    "backend": "npm run build -w web && node scripts/dev-backend.mjs",
-    "frontend": "npm run dev -w web",
+    "backend": "node scripts/dev-backend.mjs",
+    "frontend": "node scripts/dev-frontend.mjs",
     "test": "cargo test --workspace && npm run test -w web && npm run typecheck -w web",
     "test:release-smoke:windows": "node scripts/smoke-release-windows.mjs",
     "typecheck": "npm run typecheck -w web",

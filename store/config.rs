@@ -29,6 +29,7 @@ pub const SUPPORTED_APP_THEMES: &[&str] = &["light", "dark"];
 pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
 pub const SUPPORTED_API_PROXY_TYPES: &[&str] = &[HTTP_PROXY_KIND, SOCKS_PROXY_KIND];
+pub const FOCO_CONFIG_DIR_ENV: &str = "FOCO_CONFIG_DIR";
 pub const WORKSPACE_HOOK_CONFIG_FILE: &str = "hooks.json";
 pub const SUPPORTED_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
@@ -88,13 +89,31 @@ impl FocoPaths {
             return Err(ConfigError::EmptyUserProfile);
         }
 
-        Ok(Self::from_user_profile(profile))
+        let user_profile_dir = PathBuf::from(profile);
+        let root_dir = match env::var_os(FOCO_CONFIG_DIR_ENV) {
+            Some(config_dir) if config_dir.is_empty() => return Err(ConfigError::EmptyConfigDir),
+            Some(config_dir) => PathBuf::from(config_dir),
+            None => user_profile_dir.join(".foco"),
+        };
+
+        Ok(Self::from_root_dir(user_profile_dir, root_dir))
     }
 
     pub fn from_user_profile(profile: impl Into<PathBuf>) -> Self {
         let user_profile_dir = profile.into();
         let root_dir = user_profile_dir.join(".foco");
 
+        Self::from_root_dir(user_profile_dir, root_dir)
+    }
+
+    pub fn from_config_dir(
+        user_profile: impl Into<PathBuf>,
+        config_dir: impl Into<PathBuf>,
+    ) -> Self {
+        Self::from_root_dir(user_profile.into(), config_dir.into())
+    }
+
+    fn from_root_dir(user_profile_dir: PathBuf, root_dir: PathBuf) -> Self {
         Self {
             user_profile_dir,
             config_file: root_dir.join("config.json"),
@@ -907,6 +926,7 @@ pub struct WorkspaceCommonCommand {
 
 #[derive(Debug)]
 pub enum ConfigError {
+    EmptyConfigDir,
     EmptyUserProfile,
     Io {
         path: PathBuf,
@@ -926,6 +946,7 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::EmptyConfigDir => write!(formatter, "{FOCO_CONFIG_DIR_ENV} is empty"),
             Self::EmptyUserProfile => write!(formatter, "{} is empty", user_profile_env_name()),
             Self::Io { path, source } => {
                 write!(formatter, "{}: {}", path.display(), source)
@@ -961,7 +982,10 @@ impl std::error::Error for ConfigError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
-            Self::EmptyUserProfile | Self::MissingUserProfile | Self::Validation { .. } => None,
+            Self::EmptyConfigDir
+            | Self::EmptyUserProfile
+            | Self::MissingUserProfile
+            | Self::Validation { .. } => None,
         }
     }
 }
@@ -1582,6 +1606,30 @@ mod tests {
         );
         assert!(loaded.config.workspaces[0].common_commands.is_empty());
         assert!(loaded.config.skills.directories.is_empty());
+    }
+
+    #[test]
+    fn config_dir_paths_do_not_add_nested_foco_directory() {
+        let profile = PathBuf::from("/tmp/foco-profile");
+        let config_dir = PathBuf::from("/tmp/foco-dev");
+
+        let paths = FocoPaths::from_config_dir(profile.clone(), config_dir.clone());
+
+        assert_eq!(paths.user_profile_dir, profile);
+        assert_eq!(paths.root_dir, config_dir);
+        assert_eq!(
+            paths.config_file,
+            PathBuf::from("/tmp/foco-dev/config.json")
+        );
+        assert_eq!(
+            paths.workspace_dir,
+            PathBuf::from("/tmp/foco-dev/workspace")
+        );
+        assert_eq!(
+            paths.memory_database_file,
+            PathBuf::from("/tmp/foco-dev/memory.sqlite")
+        );
+        assert_eq!(paths.logs_dir, PathBuf::from("/tmp/foco-dev/logs"));
     }
 
     #[test]
