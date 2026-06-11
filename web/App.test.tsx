@@ -862,6 +862,7 @@ describe("App verification surfaces", () => {
     activeChatStreamController = null;
     terminalSessionCounter = 0;
     window.history.replaceState(null, "", "/");
+    window.localStorage.clear();
     document.documentElement.removeAttribute("data-foco-theme");
     mermaidMock.initialize.mockClear();
     mermaidMock.render.mockClear();
@@ -2657,6 +2658,34 @@ describe("App verification surfaces", () => {
     expect(within(dialog).getByText("Request body")).toBeInTheDocument();
     expect(within(dialog).getByText("Response body")).toBeInTheDocument();
     expect(within(dialog).queryByText("Stream events")).not.toBeInTheDocument();
+  });
+
+  it("loads saved API request audit column settings", async () => {
+    const { unmount } = render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    const table = await screen.findByRole("table");
+    expect(within(table).getByText("openai")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByText("Columns"));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Provider" }));
+    expect(within(table).queryByText("openai")).not.toBeInTheDocument();
+    await waitFor(() => {
+      const savedColumns = JSON.parse(
+        window.localStorage.getItem("foco.aiStats.visibleColumns") ?? "[]",
+      );
+      expect(savedColumns).not.toContain("provider");
+    });
+
+    unmount();
+    window.history.replaceState(null, "", "/");
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    const reloadedTable = await screen.findByRole("table");
+    expect(within(reloadedTable).queryByText("openai")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByText("Columns"));
+    expect(screen.getByRole("checkbox", { name: "Provider" })).not.toBeChecked();
   });
 });
 

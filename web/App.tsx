@@ -1044,6 +1044,7 @@ const AI_STATS_COLUMN_IDS = [
   "status",
   "details",
 ] as const;
+const AI_STATS_VISIBLE_COLUMNS_STORAGE_KEY = "foco.aiStats.visibleColumns";
 const DEFAULT_AI_STATS_COLUMN_IDS: AiStatsColumnId[] = [...AI_STATS_COLUMN_IDS];
 const ANALYTICS_CHART_COLORS = [
   "#0f766e",
@@ -7793,7 +7794,7 @@ function ApiStatsPanel({
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [visibleColumnIds, setVisibleColumnIds] = useState<
     Set<AiStatsColumnId>
-  >(() => new Set(DEFAULT_AI_STATS_COLUMN_IDS));
+  >(readAiStatsVisibleColumnIds);
   const requests = stats?.requests ?? [];
   const summary = stats?.summary ?? emptyAiStatisticsSummary();
   const totalCount = stats?.totalCount ?? summary.totalRequests;
@@ -8022,6 +8023,10 @@ function ApiStatsPanel({
   useEffect(() => {
     void loadStats();
   }, [loadStats]);
+
+  useEffect(() => {
+    writeAiStatsVisibleColumnIds(visibleColumnIds);
+  }, [visibleColumnIds]);
 
   async function openRequestDetail(request: AiRequestAuditSummary) {
     setSelectedRequestId(request.id);
@@ -17250,6 +17255,38 @@ function emptyAiStatsFilters(): AiStatsFilterState {
     status: "",
     workspaceId: "",
   };
+}
+
+function readAiStatsVisibleColumnIds(): Set<AiStatsColumnId> {
+  const savedValue = window.localStorage.getItem(AI_STATS_VISIBLE_COLUMNS_STORAGE_KEY);
+  if (!savedValue) {
+    return new Set(DEFAULT_AI_STATS_COLUMN_IDS);
+  }
+
+  const savedIds = JSON.parse(savedValue);
+  if (!Array.isArray(savedIds)) {
+    return new Set(DEFAULT_AI_STATS_COLUMN_IDS);
+  }
+
+  const visibleIds = savedIds.filter(isAiStatsColumnId);
+  return new Set(visibleIds.length ? visibleIds : DEFAULT_AI_STATS_COLUMN_IDS);
+}
+
+function writeAiStatsVisibleColumnIds(visibleColumnIds: Set<AiStatsColumnId>) {
+  const savedIds = AI_STATS_COLUMN_IDS.filter((columnId) =>
+    visibleColumnIds.has(columnId),
+  );
+  window.localStorage.setItem(
+    AI_STATS_VISIBLE_COLUMNS_STORAGE_KEY,
+    JSON.stringify(savedIds),
+  );
+}
+
+function isAiStatsColumnId(value: unknown): value is AiStatsColumnId {
+  return (
+    typeof value === "string" &&
+    (AI_STATS_COLUMN_IDS as readonly string[]).includes(value)
+  );
 }
 
 function emptyAiStatisticsSummary(): AiStatisticsSummary {
