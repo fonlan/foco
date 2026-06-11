@@ -860,6 +860,17 @@ type ChatUsage = {
   cacheWriteTokens: number | null;
 };
 
+type ContextUsageResponse = {
+  usedMessageTokens: number;
+  availableMessageTokens: number;
+  memoryContextTokens: number;
+  memoryBudgetTokens: number;
+  usagePercent: number;
+  compressionTriggerTokens: number;
+  compressionTriggerPercent: number;
+  willCompressOnNextSend: boolean;
+};
+
 type ChatReplyMetrics = {
   modelId: string;
   providerId: string;
@@ -1796,6 +1807,17 @@ type RetryRunRequest = {
   skillIds: string[];
 };
 
+type ContextUsageRefreshRequest = {
+  workspaceId: string;
+  chatId: string | null;
+  modelId: string;
+  providerId: string;
+  thinkingLevel: string;
+  skillIds: string[];
+  assistantDraft: string;
+  assistantDraftReasoning: string;
+};
+
 type ContextMemoryState = {
   global: MemoryFactRecord[];
   workspace: MemoryFactRecord[];
@@ -1893,6 +1915,9 @@ export function App() {
   );
   const [retryRunRequest, setRetryRunRequest] =
     useState<RetryRunRequest | null>(null);
+  const [contextUsage, setContextUsage] =
+    useState<ContextUsageResponse | null>(null);
+  const [isLoadingContextUsage, setIsLoadingContextUsage] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSavingTheme, setIsSavingTheme] = useState(false);
@@ -1910,6 +1935,9 @@ export function App() {
   );
   const [error, setError] = useState<string | null>(null);
   const activeRunAbortRef = useRef<AbortController | null>(null);
+  const contextUsageAbortRef = useRef<AbortController | null>(null);
+  const contextUsageIdentityRef = useRef("");
+  const contextUsageRequestIdRef = useRef(0);
   const activeChatKeyRef = useRef<string | null>(null);
   const applyBrowserRouteRef = useRef<(route: BrowserRoute) => void>(() => {});
   const hasAppliedInitialBrowserRouteRef = useRef(false);
@@ -2009,6 +2037,44 @@ export function App() {
     activeChatKeyRef.current =
       activeChatId === null ? null : chatRunKey(activeWorkspaceId, activeChatId);
   }, [activeChatId, activeWorkspaceId]);
+
+  useEffect(() => {
+    const identity = [
+      activeWorkspaceId,
+      activeChatId ?? "",
+      selectedModelId,
+      selectedProviderId,
+      selectedThinkingLevel,
+    ].join("\u0000");
+
+    if (contextUsageIdentityRef.current === identity) {
+      return;
+    }
+
+    contextUsageIdentityRef.current = identity;
+    if (isSendingMessage) {
+      return;
+    }
+
+    contextUsageAbortRef.current?.abort();
+    contextUsageRequestIdRef.current += 1;
+    setContextUsage(null);
+    setIsLoadingContextUsage(false);
+  }, [
+    activeChatId,
+    activeWorkspaceId,
+    isSendingMessage,
+    selectedModelId,
+    selectedProviderId,
+    selectedThinkingLevel,
+  ]);
+
+  useEffect(
+    () => () => {
+      contextUsageAbortRef.current?.abort();
+    },
+    [],
+  );
 
   const loadAuthStatus = useCallback(async () => {
     setIsCheckingAuth(true);
@@ -3113,6 +3179,58 @@ export function App() {
     setIsAnsweringQuestion(false);
   }
 
+  async function refreshContextUsage(request: ContextUsageRefreshRequest) {
+    if (!request.chatId) {
+      return;
+    }
+
+    const requestId = contextUsageRequestIdRef.current + 1;
+    contextUsageRequestIdRef.current = requestId;
+    contextUsageAbortRef.current?.abort();
+    const abortController = new AbortController();
+    contextUsageAbortRef.current = abortController;
+    setIsLoadingContextUsage(true);
+
+    try {
+      const data = await requestJson<ContextUsageResponse>(
+        `/api/workspaces/${encodeURIComponent(request.workspaceId)}/context-usage`,
+        {
+          body: JSON.stringify({
+            chatId: request.chatId,
+            modelId: request.modelId,
+            providerId: request.providerId,
+            thinkingLevel: request.thinkingLevel || null,
+            skillIds: request.skillIds.length ? request.skillIds : null,
+            draftMessage: null,
+            assistantDraft: request.assistantDraft || null,
+            assistantDraftReasoning: request.assistantDraftReasoning || null,
+            attachments: [],
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+          signal: abortController.signal,
+        },
+      );
+
+      if (contextUsageRequestIdRef.current === requestId) {
+        setContextUsage(data);
+      }
+    } catch (requestError) {
+      const wasCancelled =
+        requestError instanceof DOMException && requestError.name === "AbortError";
+      if (!wasCancelled && contextUsageRequestIdRef.current === requestId) {
+        setError(errorMessage(requestError));
+      }
+    } finally {
+      if (contextUsageAbortRef.current === abortController) {
+        contextUsageAbortRef.current = null;
+      }
+      if (contextUsageRequestIdRef.current === requestId) {
+        setIsLoadingContextUsage(false);
+      }
+    }
+  }
+
   async function runChatMessage(request: RetryRunRequest) {
     const runKey =
       globalThis.crypto?.randomUUID?.() ??
@@ -3135,7 +3253,21 @@ export function App() {
       ? chatRunKey(request.workspaceId, requestChatId)
       : pendingChatRunKey(request.workspaceId, runKey);
     let currentRunningChatKey = runMessagesKey;
+    let assistantDraft = "";
+    let assistantDraftReasoning = "";
     const abortController = new AbortController();
+    const refreshRunContextUsage = () => {
+      void refreshContextUsage({
+        assistantDraft,
+        assistantDraftReasoning,
+        chatId: requestChatId,
+        modelId: request.modelId,
+        providerId: request.providerId,
+        skillIds: request.skillIds,
+        thinkingLevel: request.thinkingLevel,
+        workspaceId: request.workspaceId,
+      });
+    };
 
     activeChatKeyRef.current = runMessagesKey;
     setChatRunFailed(runMessagesKey, false);
@@ -3172,6 +3304,10 @@ export function App() {
     setRunningChatKey(currentRunningChatKey);
     setRetryRunRequest(null);
     setError(null);
+    contextUsageAbortRef.current?.abort();
+    contextUsageRequestIdRef.current += 1;
+    setContextUsage(null);
+    setIsLoadingContextUsage(false);
     activeRunAbortRef.current = abortController;
 
     const isCurrentAssistantMessage = (
@@ -3281,6 +3417,8 @@ export function App() {
         }
 
         if (streamEvent.type === "textDelta") {
+          assistantDraft += streamEvent.delta;
+          refreshRunContextUsage();
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -3296,6 +3434,8 @@ export function App() {
         }
 
         if (streamEvent.type === "reasoningDelta") {
+          assistantDraftReasoning += streamEvent.delta;
+          refreshRunContextUsage();
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -3313,7 +3453,15 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "usage") {
+          refreshRunContextUsage();
+          return;
+        }
+
         if (streamEvent.type === "complete") {
+          assistantDraft = "";
+          assistantDraftReasoning = "";
+          refreshRunContextUsage();
           setChatRunFailed(runMessagesKey, false);
           setRetryRunRequest(null);
           setPendingQuestion(null);
@@ -3330,6 +3478,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolCall") {
+          refreshRunContextUsage();
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -3348,6 +3497,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolResult") {
+          refreshRunContextUsage();
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -4010,8 +4160,10 @@ export function App() {
               draftAttachments={draftAttachments}
               draftMessage={draftMessage}
               gitBranches={gitBranches}
+              contextUsage={contextUsage}
               isLoadingSettings={isLoadingSettings}
               isLoadingBranches={isLoadingBranches}
+              isLoadingContextUsage={isLoadingContextUsage}
               isSendingMessage={isSendingMessage}
               isSelectingAttachments={isSelectingAttachments}
               messages={messages}
@@ -5207,10 +5359,12 @@ function ChatPanel({
   branchError,
   chatScrollKey,
   canRetryRun,
+  contextUsage,
   draftAttachments,
   draftMessage,
   gitBranches,
   isLoadingBranches,
+  isLoadingContextUsage,
   isLoadingSettings,
   isSendingMessage,
   isSelectingAttachments,
@@ -5244,10 +5398,12 @@ function ChatPanel({
   branchError: string | null;
   chatScrollKey: string;
   canRetryRun: boolean;
+  contextUsage: ContextUsageResponse | null;
   draftAttachments: ComposerAttachment[];
   draftMessage: string;
   gitBranches: GitBranchesResponse | null;
   isLoadingBranches: boolean;
+  isLoadingContextUsage: boolean;
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
   isSelectingAttachments: boolean;
@@ -5760,7 +5916,10 @@ function ChatPanel({
                 </button>
               ) : null}
               <span aria-hidden="true" className="composer-control-spacer" />
-              <ContextUsageCircle />
+              <ContextUsageCircle
+                isLoading={isLoadingContextUsage}
+                usage={contextUsage}
+              />
               {isSendingMessage ? (
                 <button
                   aria-label={t("Cancel run")}
@@ -5798,21 +5957,38 @@ function ChatPanel({
   );
 }
 
-function ContextUsageCircle({ className = "" }: { className?: string }) {
+function ContextUsageCircle({
+  className = "",
+  isLoading,
+  usage,
+}: {
+  className?: string;
+  isLoading: boolean;
+  usage: ContextUsageResponse | null;
+}) {
   const { t } = useI18n();
-  const title = t("Context usage {percent}%", { percent: 0 });
+  const percent = usage?.usagePercent ?? 0;
+  const clampedPercent = Math.min(Math.max(percent, 0), 100);
+  const toneClass = usage?.willCompressOnNextSend
+    ? "context-usage-circle-critical"
+    : usage && percent >= usage.compressionTriggerPercent
+      ? "context-usage-circle-warn"
+      : "context-usage-circle-normal";
+  const title = t("Context usage {percent}%", { percent });
 
   return (
     <div
       aria-label={title}
-      className={`context-usage-circle context-usage-circle-normal ${className}`}
+      className={`context-usage-circle ${toneClass} ${
+        isLoading ? "context-usage-circle-loading" : ""
+      } ${className}`}
       role="status"
       style={{
-        "--context-usage-percent": "0%",
+        "--context-usage-percent": `${clampedPercent}%`,
       } as CSSProperties}
       title={title}
     >
-      0%
+      {percent}%
     </div>
   );
 }

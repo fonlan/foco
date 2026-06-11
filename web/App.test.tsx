@@ -1229,6 +1229,48 @@ describe("App verification surfaces", () => {
     ).toBe(false);
   });
 
+  it("refreshes context usage while the assistant stream updates", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Partial answer.",
+        type: "textDelta",
+      });
+    });
+
+    expect(
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
+    const usageCalls = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    );
+    expect(usageCalls.length).toBeGreaterThan(0);
+    const [, init] = usageCalls.at(-1)!;
+    expect(typeof init?.body).toBe("string");
+    expect(JSON.parse(init?.body as string)).toMatchObject({
+      assistantDraft: "Partial answer.",
+      assistantDraftReasoning: null,
+      chatId: "chat-1",
+      draftMessage: null,
+    });
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
   it("adds native path attachments into the composer and sends them with the chat request", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);

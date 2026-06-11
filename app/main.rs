@@ -3633,6 +3633,8 @@ struct ContextUsageRequest {
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
     draft_message: Option<String>,
+    assistant_draft: Option<String>,
+    assistant_draft_reasoning: Option<String>,
     #[serde(default)]
     attachments: Vec<ChatAttachmentInput>,
 }
@@ -3679,6 +3681,8 @@ struct PromptContextRequest {
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
     message: Option<String>,
+    assistant_draft: Option<String>,
+    assistant_draft_reasoning: Option<String>,
     attachments: Vec<ChatAttachmentInput>,
 }
 
@@ -3691,6 +3695,8 @@ impl ChatStreamRequest {
             thinking_level: self.thinking_level,
             skill_ids: self.skill_ids,
             message: Some(self.message),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
             attachments: self.attachments,
         }
     }
@@ -3705,6 +3711,8 @@ impl ContextUsageRequest {
             thinking_level: self.thinking_level,
             skill_ids: self.skill_ids,
             message: optional_trimmed_string(self.draft_message),
+            assistant_draft: self.assistant_draft,
+            assistant_draft_reasoning: self.assistant_draft_reasoning,
             attachments: self.attachments,
         }
     }
@@ -5762,6 +5770,12 @@ async fn prepare_prompt_context(
     let thinking_level = optional_trimmed_string(request.thinking_level);
     let requested_skill_ids = request.skill_ids;
     let raw_message = optional_trimmed_string(request.message);
+    let assistant_draft = request
+        .assistant_draft
+        .filter(|value| !value.trim().is_empty());
+    let assistant_draft_reasoning = request
+        .assistant_draft_reasoning
+        .filter(|value| !value.trim().is_empty());
     let attachments = normalized_chat_attachments(request.attachments)?;
 
     if workspace_id.is_empty() {
@@ -5972,6 +5986,7 @@ async fn prepare_prompt_context(
             + environment_messages.len()
             + skill_messages.len()
             + usize::from(memory_context.retrieved_message.is_some())
+            + usize::from(assistant_draft.is_some() || assistant_draft_reasoning.is_some())
             + 2,
     );
     let mut message_source_sequences = Vec::with_capacity(neutral_messages.capacity());
@@ -6013,6 +6028,13 @@ async fn prepare_prompt_context(
             neutral_messages.push(neutral_message);
             message_source_sequences.push(Some(sequence));
         }
+    }
+    if assistant_draft.is_some() || assistant_draft_reasoning.is_some() {
+        neutral_messages.push(neutral_assistant_message(
+            assistant_draft.unwrap_or_default(),
+            assistant_draft_reasoning,
+        ));
+        message_source_sequences.push(None);
     }
     if message.is_some() || !attachments.is_empty() {
         neutral_messages.push(neutral_user_message(
@@ -9555,6 +9577,18 @@ fn neutral_text_message(role: NeutralChatRole, content: String) -> NeutralChatMe
     }
 }
 
+fn neutral_assistant_message(content: String, reasoning: Option<String>) -> NeutralChatMessage {
+    NeutralChatMessage {
+        role: NeutralChatRole::Assistant,
+        content,
+        attachments: Vec::new(),
+        reasoning,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        tool_name: None,
+    }
+}
+
 fn neutral_user_message(
     content: String,
     attachments: Vec<NeutralChatAttachment>,
@@ -9793,6 +9827,10 @@ fn pack_neutral_messages(
 
 fn neutral_message_estimated_tokens(message: &NeutralChatMessage) -> u64 {
     let mut tokens = estimate_text_tokens(&message.content);
+
+    if let Some(reasoning) = &message.reasoning {
+        tokens += estimate_text_tokens(reasoning);
+    }
 
     for attachment in &message.attachments {
         tokens += neutral_attachment_estimated_tokens(attachment);
@@ -18431,6 +18469,8 @@ Use the existing product UI conventions.
                 thinking_level: None,
                 skill_ids: None,
                 message: Some("hello".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
                 attachments: Vec::new(),
             },
             PromptAssemblyPurpose::ChatRun,
@@ -18567,6 +18607,8 @@ Use the existing product UI conventions.
                 thinking_level: None,
                 skill_ids: None,
                 message: Some("renderer prompt assembly".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
                 attachments: Vec::new(),
             },
             PromptAssemblyPurpose::ChatRun,
@@ -18711,6 +18753,8 @@ Use the existing product UI conventions.
                 thinking_level: None,
                 skill_ids: None,
                 message: Some("现在 markdown 预览支持公式吗？".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
                 attachments: Vec::new(),
             },
             PromptAssemblyPurpose::ChatRun,
@@ -18829,6 +18873,8 @@ Use the existing product UI conventions.
                 thinking_level: None,
                 skill_ids: None,
                 message: Some("Preview usage".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
                 attachments: Vec::new(),
             },
             PromptAssemblyPurpose::ContextPreview,
@@ -18852,6 +18898,30 @@ Use the existing product UI conventions.
             context_compression_trigger_tokens(usage.available_message_tokens)
         );
         assert_eq!(usage.compression_trigger_percent, 80);
+        let prompt_context_with_assistant = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: Some("Preview usage".to_string()),
+                assistant_draft: Some("Streaming assistant reply adds context.".to_string()),
+                assistant_draft_reasoning: Some(
+                    "Streaming reasoning also adds context.".to_string(),
+                ),
+                attachments: Vec::new(),
+            },
+            PromptAssemblyPurpose::ContextPreview,
+        )
+        .await
+        .expect("prompt context with assistant draft");
+        let usage_with_assistant =
+            context_usage_response(&prompt_context_with_assistant).expect("context usage");
+        assert!(usage_with_assistant.used_message_tokens > usage.used_message_tokens);
 
         let database =
             WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
@@ -18937,6 +19007,8 @@ Use the existing product UI conventions.
                 thinking_level: None,
                 skill_ids: None,
                 message: Some("Preview retrieval memory".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
                 attachments: Vec::new(),
             },
             PromptAssemblyPurpose::ContextPreview,
