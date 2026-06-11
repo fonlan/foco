@@ -2301,6 +2301,7 @@ struct MemoryListQuery {
     chat_id: Option<String>,
     query: Option<String>,
     status: Option<String>,
+    kind: Option<String>,
     limit: Option<u32>,
 }
 
@@ -2417,6 +2418,14 @@ async fn memory_list(
         .transpose()
         .map_err(ApiError::from_memory_error)?
         .unwrap_or(MemoryStatus::Active);
+    let kind = query
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(MemoryKind::parse)
+        .transpose()
+        .map_err(ApiError::from_memory_error)?;
     let mut database = open_memory_database(&state, &config, scope, query.workspace_id.as_deref())?;
     let query_text = normalized_optional_text(query.query);
 
@@ -2433,18 +2442,25 @@ async fn memory_list(
             .flatten(),
     )?;
 
-    let memories = if let Some(query_text) = query_text {
-        if status != MemoryStatus::Active {
-            return Err(ApiError::bad_request(
-                "memory search currently supports active memories only",
-            ));
+    let memories = if status == MemoryStatus::Active {
+        if let Some(query_text) = query_text.as_deref() {
+            database
+                .search_active_facts_for_scope(query_text, chat_id.as_deref(), kind, limit)
+                .map_err(ApiError::from_memory_error)?
+        } else {
+            database
+                .list_facts_for_scope(chat_id.as_deref(), status, kind, None, limit)
+                .map_err(ApiError::from_memory_error)?
         }
-        database
-            .search_active_facts_for_scope(&query_text, chat_id.as_deref(), limit)
-            .map_err(ApiError::from_memory_error)?
     } else {
         database
-            .list_facts_for_scope(chat_id.as_deref(), status, limit)
+            .list_facts_for_scope(
+                chat_id.as_deref(),
+                status,
+                kind,
+                query_text.as_deref(),
+                limit,
+            )
             .map_err(ApiError::from_memory_error)?
     };
     let extraction_jobs = memory_extraction_job_summaries(
@@ -6107,10 +6123,10 @@ fn relevant_memory_facts_fts(
     };
 
     let workspace_facts = workspace_memory
-        .search_active_facts_for_scope(&search.fts_query, chat_id, MEMORY_CONTEXT_FACT_LIMIT)
+        .search_active_facts_for_scope(&search.fts_query, chat_id, None, MEMORY_CONTEXT_FACT_LIMIT)
         .map_err(ApiError::from_memory_error)?;
     let global_facts = global_memory
-        .search_active_facts_for_scope(&search.fts_query, None, MEMORY_CONTEXT_FACT_LIMIT)
+        .search_active_facts_for_scope(&search.fts_query, None, None, MEMORY_CONTEXT_FACT_LIMIT)
         .map_err(ApiError::from_memory_error)?;
     let workspace_containing_facts = workspace_memory
         .find_active_facts_containing_any_for_scope(
@@ -8370,7 +8386,7 @@ fn collect_memory_search_matches(
         None
     };
     let direct_facts = database
-        .search_active_facts_for_scope(query, chat_filter, limit)
+        .search_active_facts_for_scope(query, chat_filter, None, limit)
         .map_err(ApiError::from_memory_error)?;
     let direct_facts = direct_facts
         .into_iter()
@@ -16766,7 +16782,7 @@ description: Project memory.
         let database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
             .expect("workspace memory database");
         let facts = database
-            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Pending, 10)
+            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Pending, None, None, 10)
             .expect("pending facts");
 
         assert_eq!(facts.len(), 1);
@@ -16807,7 +16823,7 @@ description: Project memory.
         let database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
             .expect("workspace memory database");
         let facts = database
-            .list_facts_for_scope(None, MemoryStatus::Active, 10)
+            .list_facts_for_scope(None, MemoryStatus::Active, None, None, 10)
             .expect("active facts");
 
         assert_eq!(facts.len(), 1);
@@ -17017,7 +17033,7 @@ description: Project memory.
             MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
                 .expect("workspace memory database");
         let facts = memory_database
-            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Pending, 10)
+            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Pending, None, None, 10)
             .expect("pending facts");
 
         assert_eq!(facts.len(), 1);
@@ -17099,10 +17115,10 @@ description: Project memory.
             MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
                 .expect("workspace memory database");
         let active_facts = memory_database
-            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Active, 10)
+            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Active, None, None, 10)
             .expect("active facts");
         let pending_facts = memory_database
-            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Pending, 10)
+            .list_facts_for_scope(Some("chat-1"), MemoryStatus::Pending, None, None, 10)
             .expect("pending facts");
 
         assert_eq!(active_facts.len(), 1);

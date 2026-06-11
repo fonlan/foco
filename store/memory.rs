@@ -1126,6 +1126,7 @@ impl MemoryDatabase {
         &self,
         query: &str,
         chat_id: Option<&str>,
+        kind: Option<MemoryKind>,
         limit: u32,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("query", query)?;
@@ -1154,6 +1155,7 @@ impl MemoryDatabase {
              WHERE memory_fts_index MATCH ?1
                AND ({filter_sql})
                AND f.status = 'active'
+               AND (?4 IS NULL OR f.kind = ?4)
                AND f.is_latest = 1
              ORDER BY
                CASE WHEN f.scope = 'chat' THEN 0 WHEN f.scope = 'workspace' THEN 1 ELSE 2 END,
@@ -1165,12 +1167,19 @@ impl MemoryDatabase {
                f.id ASC
              LIMIT ?3"
         );
+        let kind_param = kind
+            .map(|kind| kind.as_str().to_string())
+            .map(rusqlite::types::Value::Text)
+            .unwrap_or(rusqlite::types::Value::Null);
         let mut statement = self
             .connection
             .prepare(&sql)
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let rows = statement
-            .query_map(params![query, chat_param, limit], memory_fact_from_row)
+            .query_map(
+                params![query, chat_param, limit, kind_param,],
+                memory_fact_from_row,
+            )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
         collect_rows(rows, &self.database_path)
@@ -1308,17 +1317,22 @@ impl MemoryDatabase {
         chat_id: Option<&str>,
         limit: u32,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
-        self.list_facts_for_scope(chat_id, MemoryStatus::Active, limit)
+        self.list_facts_for_scope(chat_id, MemoryStatus::Active, None, None, limit)
     }
 
     pub fn list_facts_for_scope(
         &self,
         chat_id: Option<&str>,
         status: MemoryStatus,
+        kind: Option<MemoryKind>,
+        query: Option<&str>,
         limit: u32,
     ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
         if let Some(chat_id) = chat_id {
             require_non_empty("chat_id", chat_id)?;
+        }
+        if let Some(query) = query {
+            require_non_empty("query", query)?;
         }
         if limit == 0 {
             return Err(MemoryDatabaseError::InvalidMemoryInput {
@@ -1340,6 +1354,8 @@ impl MemoryDatabase {
              FROM memory_facts
              WHERE ({filter_sql})
                AND status = ?3
+               AND (?4 IS NULL OR kind = ?4)
+               AND (?5 IS NULL OR lower(fact) LIKE ?5 ESCAPE '\\')
                AND is_latest = 1
              ORDER BY
                CASE WHEN scope = 'chat' THEN 0 WHEN scope = 'workspace' THEN 1 ELSE 2 END,
@@ -1353,7 +1369,16 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let rows = statement
             .query_map(
-                params![chat_param, limit, status.as_str()],
+                params![
+                    chat_param,
+                    limit,
+                    status.as_str(),
+                    kind.map(MemoryKind::as_str),
+                    query.map(|query| format!(
+                        "%{}%",
+                        escaped_memory_like_term(&query.to_lowercase())
+                    )),
+                ],
                 memory_fact_from_row,
             )
             .map_err(|source| sqlite_error(&self.database_path, source))?;
@@ -2945,6 +2970,80 @@ mod tests {
     }
 
     #[test]
+    fn global_database_filters_list_by_kind_and_query() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+
+        for (id, kind, status, fact) in [
+            (
+                "preference",
+                MemoryKind::Preference,
+                MemoryStatus::Active,
+                "Prefer compact memory lists.",
+            ),
+            (
+                "decision",
+                MemoryKind::ProjectDecision,
+                MemoryStatus::Active,
+                "Memory list uses a dialog for edits.",
+            ),
+            (
+                "pending",
+                MemoryKind::Preference,
+                MemoryStatus::Pending,
+                "Pending memory also supports keyword filtering.",
+            ),
+        ] {
+            let source_id = format!("source-{id}");
+            database
+                .insert_source(NewMemorySource {
+                    id: &source_id,
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    source_type: MemorySourceType::ManualNote,
+                    source_id: None,
+                    title: "Manual note",
+                    content: fact,
+                    metadata_json: "{}",
+                })
+                .expect("source insert");
+            database
+                .insert_fact(NewMemoryFact {
+                    id,
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    status,
+                    kind,
+                    fact,
+                    confidence: None,
+                    pinned: false,
+                    source_ids: &[source_id.as_str()],
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+
+        let active_preferences = database
+            .list_facts_for_scope(
+                None,
+                MemoryStatus::Active,
+                Some(MemoryKind::Preference),
+                None,
+                10,
+            )
+            .expect("kind filtered active facts");
+        assert_eq!(active_preferences.len(), 1);
+        assert_eq!(active_preferences[0].id, "preference");
+
+        let pending_keyword = database
+            .list_facts_for_scope(None, MemoryStatus::Pending, None, Some("keyword"), 10)
+            .expect("query filtered pending facts");
+        assert_eq!(pending_keyword.len(), 1);
+        assert_eq!(pending_keyword[0].id, "pending");
+    }
+
+    #[test]
     fn non_user_note_facts_require_source_evidence() {
         let profile = tempfile::tempdir().expect("profile");
         let mut database =
@@ -3192,7 +3291,7 @@ mod tests {
         );
 
         let chat_results = memory
-            .search_active_facts_for_scope("workspace", Some("chat-1"), 10)
+            .search_active_facts_for_scope("workspace", Some("chat-1"), None, 10)
             .expect("chat scoped search");
         assert_eq!(chat_results[0].id, "fact-1");
 

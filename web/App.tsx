@@ -372,16 +372,22 @@ type MemorySettingsFormState = {
 type MemoryFilterState = {
   status: "active" | "pending";
   scope: "global" | "workspace" | "chat";
+  kind: string;
   workspaceId: string;
   chatId: string;
   query: string;
 };
 
 type ManualMemoryFormState = {
+  scope: "global" | "workspace" | "chat";
+  workspaceId: string;
+  chatId: string;
   kind: string;
   fact: string;
   pinned: boolean;
 };
+
+type MemoryDialogMode = "create" | "edit";
 
 type ProviderFormState = {
   apiKey: string;
@@ -974,6 +980,15 @@ const SETTINGS_SECTION_IDS: SettingsSection[] = [
   "mcp",
   "skills",
 ];
+const MEMORY_KIND_OPTIONS = [
+  "user_note",
+  "preference",
+  "project_fact",
+  "project_decision",
+  "procedure",
+  "constraint",
+  "episode",
+];
 const AI_STATS_COLUMN_IDS = [
   "requestTime",
   "workspace",
@@ -1342,10 +1357,15 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Save memory settings": "保存记忆设置",
     "Memory list": "记忆列表",
     "Create memory": "创建记忆",
+    "Close memory dialog": "关闭记忆弹窗",
+    "Delete memory": "删除记忆",
+    "Delete memory confirmation": "确定要删除这条记忆吗？",
     "Memory scope": "记忆范围",
+    "Memory status": "记忆状态",
     "Search memories": "搜索记忆",
     "Refresh memories": "刷新记忆",
     "No memories": "暂无记忆",
+    "All memory kinds": "全部记忆类型",
     "Pending review": "待审核",
     Automatic: "自动",
     "Manual": "手动",
@@ -8908,8 +8928,9 @@ function SettingsPanel({
   );
   const [manualMemoryForm, setManualMemoryForm] =
     useState<ManualMemoryFormState>(() => emptyManualMemoryForm());
-  const [editMemoryForm, setEditMemoryForm] =
-    useState<ManualMemoryFormState>(() => emptyManualMemoryForm());
+  const [memoryDialogMode, setMemoryDialogMode] =
+    useState<MemoryDialogMode>("create");
+  const [isMemoryDialogOpen, setIsMemoryDialogOpen] = useState(false);
   const [memories, setMemories] = useState<MemoryFactRecord[]>([]);
   const [memoryExtractionJobs, setMemoryExtractionJobs] = useState<
     MemoryExtractionJobSummary[]
@@ -9028,6 +9049,10 @@ function SettingsPanel({
   const workspaces = settings?.workspaces ?? [];
   const memoryWorkspace =
     workspaces.find((workspace) => workspace.id === memoryFilter.workspaceId) ??
+    workspaces[0] ??
+    null;
+  const memoryDialogWorkspace =
+    workspaces.find((workspace) => workspace.id === manualMemoryForm.workspaceId) ??
     workspaces[0] ??
     null;
   const selectedMemory =
@@ -9240,7 +9265,10 @@ function SettingsPanel({
       if (memoryFilter.chatId) {
         params.set("chatId", memoryFilter.chatId);
       }
-      if (memoryFilter.status === "active" && memoryFilter.query.trim()) {
+      if (memoryFilter.kind) {
+        params.set("kind", memoryFilter.kind);
+      }
+      if (memoryFilter.query.trim()) {
         params.set("query", memoryFilter.query.trim());
       }
       const data = await requestJson<MemoryListResponse>(
@@ -9278,15 +9306,16 @@ function SettingsPanel({
   }, [activeSection, loadMemories]);
 
   useEffect(() => {
-    if (activeSection !== "memory" || !selectedMemoryId) {
+    if (activeSection !== "memory" || !selectedMemory) {
       setMemorySources([]);
       return;
     }
+    const memoryForSources = selectedMemory;
 
     async function loadMemorySources() {
       try {
         const params = new URLSearchParams({
-          memoryId: selectedMemoryId ?? "",
+          memoryId: memoryForSources.id,
           scope: memoryFilter.scope,
         });
         if (memoryFilter.workspaceId) {
@@ -9306,21 +9335,8 @@ function SettingsPanel({
     activeSection,
     memoryFilter.scope,
     memoryFilter.workspaceId,
-    selectedMemoryId,
+    selectedMemory?.id,
   ]);
-
-  useEffect(() => {
-    if (!selectedMemory) {
-      setEditMemoryForm(emptyManualMemoryForm());
-      return;
-    }
-
-    setEditMemoryForm({
-      fact: selectedMemory.fact,
-      kind: selectedMemory.kind,
-      pinned: selectedMemory.pinned,
-    });
-  }, [selectedMemory?.fact, selectedMemory?.id, selectedMemory?.kind, selectedMemory?.pinned]);
 
   useEffect(() => {
     if (workspaceDialogRevision > 0) {
@@ -9775,57 +9791,78 @@ function SettingsPanel({
     }
   }
 
-  async function createMemory(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setIsSavingMemory(true);
-    setError(null);
-
-    try {
-      await requestJson<MemoryMutationResponse>("/api/memory/manual", {
-        body: JSON.stringify({
-          chatId: memoryFilter.scope === "chat" ? memoryFilter.chatId : null,
-          fact: manualMemoryForm.fact,
-          kind: manualMemoryForm.kind,
-          pinned: manualMemoryForm.pinned,
-          scope: memoryFilter.scope,
-          workspaceId:
-            memoryFilter.scope === "global" ? null : memoryFilter.workspaceId,
-        }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      });
-      setManualMemoryForm(emptyManualMemoryForm());
-      await loadMemories();
-    } catch (requestError) {
-      setError(errorMessage(requestError));
-    } finally {
-      setIsSavingMemory(false);
-    }
+  function openCreateMemoryDialog() {
+    setMemoryDialogMode("create");
+    setManualMemoryForm({
+      ...emptyManualMemoryForm(),
+      chatId: memoryFilter.chatId,
+      scope: memoryFilter.scope,
+      workspaceId: memoryFilter.workspaceId || workspaces[0]?.id || "",
+    });
+    setIsMemoryDialogOpen(true);
   }
 
-  async function saveEditedMemory(event: FormEvent<HTMLFormElement>) {
+  function openEditMemoryDialog(memory: MemoryFactRecord) {
+    setSelectedMemoryId(memory.id);
+    setMemoryDialogMode("edit");
+    setManualMemoryForm({
+      chatId: memory.chatId ?? "",
+      fact: memory.fact,
+      kind: memory.kind,
+      pinned: memory.pinned,
+      scope: memory.scope as ManualMemoryFormState["scope"],
+      workspaceId: memoryFilter.workspaceId || workspaces[0]?.id || "",
+    });
+    setIsMemoryDialogOpen(true);
+  }
+
+  function closeMemoryDialog() {
+    setIsMemoryDialogOpen(false);
+    setMemoryDialogMode("create");
+    setManualMemoryForm(emptyManualMemoryForm());
+  }
+
+  async function saveMemoryDialog(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedMemory) {
+    if (memoryDialogMode === "edit" && !selectedMemory) {
       return;
     }
 
     setIsSavingMemory(true);
     setError(null);
 
+    const scope = manualMemoryForm.scope;
+    const workspaceId =
+      scope === "global" ? null : manualMemoryForm.workspaceId || memoryFilter.workspaceId;
+    const payload =
+      memoryDialogMode === "create"
+        ? {
+            chatId: scope === "chat" ? manualMemoryForm.chatId : null,
+            fact: manualMemoryForm.fact,
+            kind: manualMemoryForm.kind,
+            pinned: manualMemoryForm.pinned,
+            scope,
+            workspaceId,
+          }
+        : {
+            fact: manualMemoryForm.fact,
+            kind: manualMemoryForm.kind,
+            memoryId: selectedMemory?.id,
+            pinned: manualMemoryForm.pinned,
+            scope: memoryFilter.scope,
+            workspaceId:
+              memoryFilter.scope === "global" ? null : memoryFilter.workspaceId,
+          };
+    const endpoint =
+      memoryDialogMode === "create" ? "/api/memory/manual" : "/api/memory/edit";
+
     try {
-      await requestJson<MemoryMutationResponse>("/api/memory/edit", {
-        body: JSON.stringify({
-          fact: editMemoryForm.fact,
-          kind: editMemoryForm.kind,
-          memoryId: selectedMemory.id,
-          pinned: editMemoryForm.pinned,
-          scope: memoryFilter.scope,
-          workspaceId:
-            memoryFilter.scope === "global" ? null : memoryFilter.workspaceId,
-        }),
+      await requestJson<MemoryMutationResponse>(endpoint, {
+        body: JSON.stringify(payload),
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
+      closeMemoryDialog();
       await loadMemories();
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -9859,6 +9896,10 @@ function SettingsPanel({
   }
 
   async function forgetMemory(memoryId: string) {
+    if (!window.confirm(t("Delete memory confirmation"))) {
+      return;
+    }
+
     setIsSavingMemory(true);
     setError(null);
 
@@ -11324,6 +11365,203 @@ function SettingsPanel({
 
         {activeSection === "memory" ? (
         <section className="grid gap-4">
+          {isMemoryDialogOpen ? (
+            <>
+              <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+              <form
+                aria-label={
+                  memoryDialogMode === "create"
+                    ? t("Create memory")
+                    : t("Edit memory")
+                }
+                className="fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                onSubmit={(event) => void saveMemoryDialog(event)}
+                role="dialog"
+              >
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      {memoryDialogMode === "create" ? (
+                        <Plus aria-hidden="true" className="size-5 text-teal-700" />
+                      ) : (
+                        <Pencil aria-hidden="true" className="size-5 text-teal-700" />
+                      )}
+                      <h3 className="text-sm font-semibold text-stone-950">
+                        {memoryDialogMode === "create"
+                          ? t("Create memory")
+                          : t("Edit memory")}
+                      </h3>
+                    </div>
+                    <div className="mt-1 truncate text-xs text-stone-500">
+                      {manualMemoryForm.scope === "global"
+                        ? t("Global memory")
+                        : manualMemoryForm.scope === "workspace"
+                          ? t("Workspace memory")
+                          : t("Chat memory")}
+                    </div>
+                  </div>
+                  <button
+                    aria-label={t("Close memory dialog")}
+                    className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                    onClick={closeMemoryDialog}
+                    title={t("Close")}
+                    type="button"
+                  >
+                    <X aria-hidden="true" className="size-4" />
+                  </button>
+                </div>
+                <div className="grid gap-3">
+                  {memoryDialogMode === "create" ? (
+                    <>
+                      <label className="block">
+                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          {t("Memory scope")}
+                        </span>
+                        <select
+                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          onChange={(event) =>
+                            setManualMemoryForm((current) => ({
+                              ...current,
+                              scope: event.target.value as ManualMemoryFormState["scope"],
+                            }))
+                          }
+                          value={manualMemoryForm.scope}
+                        >
+                          <option value="global">{t("Global memory")}</option>
+                          <option value="workspace">{t("Workspace memory")}</option>
+                          <option value="chat">{t("Chat memory")}</option>
+                        </select>
+                      </label>
+                      {manualMemoryForm.scope !== "global" ? (
+                        <label className="block">
+                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                            {t("Workspace")}
+                          </span>
+                          <select
+                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            onChange={(event) =>
+                              setManualMemoryForm((current) => ({
+                                ...current,
+                                workspaceId: event.target.value,
+                              }))
+                            }
+                            value={
+                              manualMemoryForm.workspaceId ||
+                              memoryDialogWorkspace?.id ||
+                              ""
+                            }
+                          >
+                            {workspaces.map((workspace) => (
+                              <option key={workspace.id} value={workspace.id}>
+                                {workspace.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      ) : null}
+                      {manualMemoryForm.scope === "chat" ? (
+                        <TextField
+                          label={t("Chat ID")}
+                          onChange={(value) =>
+                            setManualMemoryForm((current) => ({
+                              ...current,
+                              chatId: value,
+                            }))
+                          }
+                          placeholder="chat-..."
+                          value={manualMemoryForm.chatId}
+                        />
+                      ) : null}
+                    </>
+                  ) : null}
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Memory kind")}
+                    </span>
+                    <select
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setManualMemoryForm((current) => ({
+                          ...current,
+                          kind: event.target.value,
+                        }))
+                      }
+                      value={manualMemoryForm.kind}
+                    >
+                      {MEMORY_KIND_OPTIONS.map((kind) => (
+                        <option key={kind} value={kind}>
+                          {kind}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Memory fact")}
+                    </span>
+                    <textarea
+                      className="min-h-32 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setManualMemoryForm((current) => ({
+                          ...current,
+                          fact: event.target.value,
+                        }))
+                      }
+                      value={manualMemoryForm.fact}
+                    />
+                  </label>
+                  <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+                    <span className="text-sm font-semibold text-stone-700">
+                      {t("Pinned memory")}
+                    </span>
+                    <input
+                      checked={manualMemoryForm.pinned}
+                      className="size-4 accent-teal-700"
+                      onChange={(event) =>
+                        setManualMemoryForm((current) => ({
+                          ...current,
+                          pinned: event.target.checked,
+                        }))
+                      }
+                      type="checkbox"
+                    />
+                  </label>
+                  <button
+                    aria-label={
+                      memoryDialogMode === "create"
+                        ? t("Create memory")
+                        : t("Save memory")
+                    }
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    disabled={
+                      isSavingMemory ||
+                      !manualMemoryForm.fact.trim() ||
+                      (manualMemoryForm.scope === "chat" &&
+                        !manualMemoryForm.chatId.trim())
+                    }
+                    title={
+                      memoryDialogMode === "create"
+                        ? t("Create memory")
+                        : t("Save memory")
+                    }
+                    type="submit"
+                  >
+                    {isSavingMemory ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : memoryDialogMode === "create" ? (
+                      <Plus aria-hidden="true" className="size-4" />
+                    ) : (
+                      <CheckCircle2 aria-hidden="true" className="size-4" />
+                    )}
+                    {memoryDialogMode === "create"
+                      ? t("Create memory")
+                      : t("Save memory")}
+                  </button>
+                </div>
+              </form>
+            </>
+          ) : null}
+
           <form
             className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
             onSubmit={(event) => void saveMemorySettings(event)}
@@ -11421,7 +11659,7 @@ function SettingsPanel({
                         }
                         value={memorySettingsForm.extractionModelId}
                       >
-                        <option value="">{t("Default")}</option>
+                        <option value="">{t("Current chat model")}</option>
                         {(settings?.configuredModels ?? []).map((model) => (
                           <option key={model.id} value={model.id}>
                             {model.displayName}
@@ -11523,17 +11761,38 @@ function SettingsPanel({
             </button>
           </form>
 
-          <section className="grid gap-4 lg:grid-cols-[minmax(16rem,22rem)_minmax(0,1fr)]">
-            <div className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-              <h3 className="text-sm font-semibold text-stone-950">
-                {t("Create memory")}
-              </h3>
-              <form className="mt-4 grid gap-3" onSubmit={(event) => void createMemory(event)}>
+          <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold text-stone-950">
+                    {t("Memory list")}
+                  </h3>
+                  <p className="mt-1 truncate text-xs text-stone-500">
+                    {memoryFilter.scope === "global"
+                      ? t("Global memory")
+                      : memoryFilter.scope === "workspace"
+                        ? t("Workspace memory")
+                        : t("Chat memory")}
+                  </p>
+                </div>
+                <button
+                  aria-label={t("Create memory")}
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900"
+                  onClick={openCreateMemoryDialog}
+                  title={t("Create memory")}
+                  type="button"
+                >
+                  <Plus aria-hidden="true" className="size-4" />
+                  {t("Create memory")}
+                </button>
+              </div>
+              <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(9rem,0.8fr)_minmax(9rem,0.8fr)_minmax(8rem,0.7fr)_minmax(0,1.4fr)_auto]">
                 <label className="block">
                   <span className="mb-1.5 block text-xs font-semibold text-stone-600">
                     {t("Memory scope")}
                   </span>
                   <select
+                    aria-label={t("Memory scope")}
                     className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                     onChange={(event) =>
                       setMemoryFilter((current) => ({
@@ -11554,6 +11813,7 @@ function SettingsPanel({
                       {t("Workspace")}
                     </span>
                     <select
+                      aria-label={t("Workspace")}
                       className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                       onChange={(event) =>
                         setMemoryFilter((current) => ({
@@ -11589,114 +11849,58 @@ function SettingsPanel({
                     {t("Memory kind")}
                   </span>
                   <select
+                    aria-label={t("Memory kind")}
                     className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                     onChange={(event) =>
-                      setManualMemoryForm((current) => ({
+                      setMemoryFilter((current) => ({
                         ...current,
                         kind: event.target.value,
                       }))
                     }
-                    value={manualMemoryForm.kind}
+                    value={memoryFilter.kind}
                   >
-                    {[
-                      "user_note",
-                      "preference",
-                      "project_fact",
-                      "project_decision",
-                      "procedure",
-                      "constraint",
-                      "episode",
-                    ].map((kind) => (
+                    <option value="">{t("All memory kinds")}</option>
+                    {MEMORY_KIND_OPTIONS.map((kind) => (
                       <option key={kind} value={kind}>
                         {kind}
                       </option>
                     ))}
                   </select>
                 </label>
-                <label className="block">
-                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                    {t("Memory fact")}
-                  </span>
-                  <textarea
-                    className="min-h-28 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                    onChange={(event) =>
-                      setManualMemoryForm((current) => ({
-                        ...current,
-                        fact: event.target.value,
-                      }))
-                    }
-                    value={manualMemoryForm.fact}
-                  />
-                </label>
-                <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                  <span className="text-sm font-semibold text-stone-700">
-                    {t("Pinned memory")}
-                  </span>
-                  <input
-                    checked={manualMemoryForm.pinned}
-                    className="size-4 accent-teal-700"
-                    onChange={(event) =>
-                      setManualMemoryForm((current) => ({
-                        ...current,
-                        pinned: event.target.checked,
-                      }))
-                    }
-                    type="checkbox"
-                  />
-                </label>
-                <button
-                  aria-label={t("Create memory")}
-                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300"
-                  disabled={
-                    isSavingMemory ||
-                    !manualMemoryForm.fact.trim() ||
-                    (memoryFilter.scope === "chat" && !memoryFilter.chatId.trim())
+                <TextField
+                  label={t("Search memories")}
+                  onChange={(value) =>
+                    setMemoryFilter((current) => ({
+                      ...current,
+                      query: value,
+                    }))
                   }
-                  title={t("Create memory")}
-                  type="submit"
-                >
-                  {isSavingMemory ? (
-                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  ) : (
-                    <Plus aria-hidden="true" className="size-4" />
-                  )}
-                  {t("Create memory")}
-                </button>
-              </form>
-            </div>
-
-            <div className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-              <div className="flex flex-wrap items-end justify-between gap-3">
-                <div className="min-w-0">
-                  <h3 className="text-sm font-semibold text-stone-950">
-                    {t("Memory list")}
-                  </h3>
-                  <p className="mt-1 truncate text-xs text-stone-500">
-                    {memoryFilter.scope === "global"
-                      ? t("Global memory")
-                      : memoryFilter.scope === "workspace"
-                        ? t("Workspace memory")
-                        : t("Chat memory")}
-                  </p>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <select
-                    aria-label="Memory status"
-                    className="h-9 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                    onChange={(event) =>
-                      setMemoryFilter((current) => ({
-                        ...current,
-                        status: event.target.value as MemoryFilterState["status"],
-                      }))
-                    }
-                    value={memoryFilter.status}
-                  >
-                    <option value="active">{t("Active")}</option>
-                    <option value="pending">{t("Pending review")}</option>
-                  </select>
+                  placeholder={t("Search memories")}
+                  value={memoryFilter.query}
+                />
+                <div className="flex items-end gap-2">
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Memory status")}
+                    </span>
+                    <select
+                      aria-label={t("Memory status")}
+                      className="h-10 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setMemoryFilter((current) => ({
+                          ...current,
+                          status: event.target.value as MemoryFilterState["status"],
+                        }))
+                      }
+                      value={memoryFilter.status}
+                    >
+                      <option value="active">{t("Active")}</option>
+                      <option value="pending">{t("Pending review")}</option>
+                    </select>
+                  </label>
                   <button
                     aria-label={t("Refresh memories")}
-                    className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                    className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                     onClick={() => void loadMemories()}
                     title={t("Refresh memories")}
                     type="button"
@@ -11709,19 +11913,6 @@ function SettingsPanel({
                   </button>
                 </div>
               </div>
-              <div className="mt-3">
-                <TextField
-                  label={t("Search memories")}
-                  onChange={(value) =>
-                    setMemoryFilter((current) => ({
-                      ...current,
-                      query: value,
-                    }))
-                  }
-                  placeholder={t("Search memories")}
-                  value={memoryFilter.query}
-                />
-              </div>
               <div className="mt-4 grid gap-3">
                 {memories.length === 0 ? (
                   <div className="rounded-xl border border-dashed border-stone-300 bg-stone-50 px-3 py-6 text-center text-sm font-medium text-stone-500">
@@ -11729,27 +11920,56 @@ function SettingsPanel({
                   </div>
                 ) : (
                   memories.map((memory) => (
-                    <button
-                      className={`w-full rounded-xl border px-3 py-3 text-left ${
+                    <div
+                      className={`grid gap-3 rounded-xl border px-3 py-3 sm:grid-cols-[minmax(0,1fr)_auto] ${
                         selectedMemoryId === memory.id
                           ? "border-teal-200 bg-teal-50/80"
                           : "border-stone-200 bg-white hover:border-teal-100 hover:bg-stone-50"
                       }`}
                       key={memory.id}
-                      onClick={() => setSelectedMemoryId(memory.id)}
-                      type="button"
                     >
-                      <div className="flex flex-wrap items-center gap-2">
-                        <CapabilityPill label={memory.status} ok={memory.status === "active"} />
-                        <CapabilityPill label={memory.kind} ok={memory.pinned} />
+                      <button
+                        className="min-w-0 text-left"
+                        onClick={() => setSelectedMemoryId(memory.id)}
+                        type="button"
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          <CapabilityPill label={memory.status} ok={memory.status === "active"} />
+                          <CapabilityPill label={memory.kind} ok={memory.pinned} />
+                          {memory.scope === "chat" && memory.chatId ? (
+                            <span className="text-xs font-semibold text-stone-500">
+                              {memory.chatId}
+                            </span>
+                          ) : null}
+                        </div>
+                        <div className="mt-2 break-words text-sm font-semibold text-stone-900">
+                          {memory.fact}
+                        </div>
+                        <div className="mt-2 text-xs text-stone-500">
+                          {memory.updatedAt}
+                        </div>
+                      </button>
+                      <div className="flex items-start justify-end gap-2">
+                        <button
+                          aria-label={t("Edit memory")}
+                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                          onClick={() => openEditMemoryDialog(memory)}
+                          title={t("Edit memory")}
+                          type="button"
+                        >
+                          <Pencil aria-hidden="true" className="size-4" />
+                        </button>
+                        <button
+                          aria-label={t("Delete memory")}
+                          className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                          onClick={() => void forgetMemory(memory.id)}
+                          title={t("Delete memory")}
+                          type="button"
+                        >
+                          <Trash2 aria-hidden="true" className="size-4" />
+                        </button>
                       </div>
-                      <div className="mt-2 break-words text-sm font-semibold text-stone-900">
-                        {memory.fact}
-                      </div>
-                      <div className="mt-2 text-xs text-stone-500">
-                        {memory.updatedAt}
-                      </div>
-                    </button>
+                    </div>
                   ))
                 )}
               </div>
@@ -11837,101 +12057,7 @@ function SettingsPanel({
                         {t("Promote to global")}
                       </button>
                     ) : null}
-                    <button
-                      className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-xs font-semibold text-rose-700 hover:bg-rose-50"
-                      onClick={() => void forgetMemory(selectedMemory.id)}
-                      type="button"
-                    >
-                      <Trash2 aria-hidden="true" className="size-3.5" />
-                      {t("Forget memory")}
-                    </button>
                   </div>
-                  <form
-                    className="mt-4 grid gap-3 rounded-lg border border-stone-200 bg-white px-3 py-3"
-                    onSubmit={(event) => void saveEditedMemory(event)}
-                  >
-                    <div className="flex items-center gap-2">
-                      <Pencil aria-hidden="true" className="size-4 text-teal-700" />
-                      <h4 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
-                        {t("Edit memory")}
-                      </h4>
-                    </div>
-                    <label className="block">
-                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                        {t("Memory kind")}
-                      </span>
-                      <select
-                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                        onChange={(event) =>
-                          setEditMemoryForm((current) => ({
-                            ...current,
-                            kind: event.target.value,
-                          }))
-                        }
-                        value={editMemoryForm.kind}
-                      >
-                        {[
-                          "user_note",
-                          "preference",
-                          "project_fact",
-                          "project_decision",
-                          "procedure",
-                          "constraint",
-                          "episode",
-                        ].map((kind) => (
-                          <option key={kind} value={kind}>
-                            {kind}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="block">
-                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                        {t("Memory fact")}
-                      </span>
-                      <textarea
-                        className="min-h-24 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                        onChange={(event) =>
-                          setEditMemoryForm((current) => ({
-                            ...current,
-                            fact: event.target.value,
-                          }))
-                        }
-                        value={editMemoryForm.fact}
-                      />
-                    </label>
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <label className="flex min-h-9 items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2 text-sm font-semibold text-stone-700">
-                        <input
-                          checked={editMemoryForm.pinned}
-                          className="size-4 accent-teal-700"
-                          onChange={(event) =>
-                            setEditMemoryForm((current) => ({
-                              ...current,
-                              pinned: event.target.checked,
-                            }))
-                          }
-                          type="checkbox"
-                        />
-                        {t("Pinned memory")}
-                      </label>
-                      <button
-                        className="inline-flex h-9 items-center gap-2 rounded-lg bg-stone-950 px-3 text-xs font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
-                        disabled={isSavingMemory || !editMemoryForm.fact.trim()}
-                        type="submit"
-                      >
-                        {isSavingMemory ? (
-                          <LoaderCircle
-                            aria-hidden="true"
-                            className="size-3.5 animate-spin"
-                          />
-                        ) : (
-                          <CheckCircle2 aria-hidden="true" className="size-3.5" />
-                        )}
-                        {t("Save memory")}
-                      </button>
-                    </div>
-                  </form>
                   <div className="mt-4">
                     <h4 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
                       {t("Memory sources")}
@@ -11960,7 +12086,6 @@ function SettingsPanel({
                   </div>
                 </div>
               ) : null}
-            </div>
           </section>
         </section>
         ) : null}
@@ -14891,6 +15016,7 @@ function emptyMemorySettingsForm(): MemorySettingsFormState {
 function emptyMemoryFilter(): MemoryFilterState {
   return {
     chatId: "",
+    kind: "",
     query: "",
     scope: "global",
     status: "active",
@@ -14900,9 +15026,12 @@ function emptyMemoryFilter(): MemoryFilterState {
 
 function emptyManualMemoryForm(): ManualMemoryFormState {
   return {
+    chatId: "",
     fact: "",
     kind: "user_note",
     pinned: false,
+    scope: "global",
+    workspaceId: "",
   };
 }
 

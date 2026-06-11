@@ -1911,6 +1911,7 @@ describe("App verification surfaces", () => {
 
   it("saves memory settings and manages manual memories", async () => {
     const fetchMock = vi.mocked(fetch);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<App />);
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
@@ -1945,11 +1946,13 @@ describe("App verification surfaces", () => {
       });
     });
 
+    await userEvent.click(screen.getByRole("button", { name: "Create memory" }));
+    const createDialog = await screen.findByRole("dialog", { name: "Create memory" });
     await userEvent.type(
-      screen.getAllByLabelText("Memory fact")[0],
+      within(createDialog).getByLabelText("Memory fact"),
       "Remember local memory graph.",
     );
-    await userEvent.click(screen.getByRole("button", { name: "Create memory" }));
+    await userEvent.click(within(createDialog).getByRole("button", { name: "Create memory" }));
 
     await waitFor(() => {
       const createCall = fetchMock.mock.calls.find(
@@ -1966,10 +1969,21 @@ describe("App verification surfaces", () => {
       });
     });
 
-    const editFactInput = screen.getAllByLabelText("Memory fact")[1];
+    await userEvent.selectOptions(screen.getByLabelText("Memory kind"), "preference");
+    await waitFor(() => {
+      const filteredListCall = [...fetchMock.mock.calls].find(([url]) =>
+        String(url).startsWith("/api/memory?") && String(url).includes("kind=preference"),
+      );
+      expect(filteredListCall).toBeDefined();
+    });
+
+    const editButtons = screen.getAllByRole("button", { name: "Edit memory" });
+    await userEvent.click(editButtons[0]);
+    const editDialog = await screen.findByRole("dialog", { name: "Edit memory" });
+    const editFactInput = within(editDialog).getByLabelText("Memory fact");
     await userEvent.clear(editFactInput);
     await userEvent.type(editFactInput, "Updated memory preference.");
-    await userEvent.click(screen.getByRole("button", { name: "Save memory" }));
+    await userEvent.click(within(editDialog).getByRole("button", { name: "Save memory" }));
 
     await waitFor(() => {
       const editCall = fetchMock.mock.calls.find(
@@ -1986,6 +2000,21 @@ describe("App verification surfaces", () => {
       });
     });
 
+    await userEvent.click(screen.getAllByRole("button", { name: "Delete memory" })[0]);
+    await waitFor(() => {
+      expect(confirmSpy).toHaveBeenCalledWith("Delete memory confirmation");
+      const forgetCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/memory/forget",
+      );
+      expect(forgetCall).toBeDefined();
+      expect(JSON.parse(String(forgetCall?.[1]?.body))).toEqual({
+        memoryId: activeMemory.id,
+        scope: "global",
+        workspaceId: null,
+      });
+    });
+
+    await userEvent.selectOptions(screen.getByLabelText("Memory kind"), "");
     await userEvent.selectOptions(screen.getByLabelText("Memory status"), "pending");
     expect((await screen.findAllByText(pendingMemory.fact)).length).toBeGreaterThan(0);
     await userEvent.click(screen.getByRole("button", { name: "Approve memory" }));
@@ -2002,6 +2031,7 @@ describe("App verification surfaces", () => {
         workspaceId: null,
       });
     });
+    confirmSpy.mockRestore();
   });
 
   it("shows translated hook settings and imports Claude hooks by target scope", async () => {
