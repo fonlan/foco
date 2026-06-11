@@ -1242,6 +1242,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Thinking: "思考",
     "Collapse thinking": "收起思考",
     "Expand thinking": "展开思考",
+    "Thinking duration {duration}": "思考时长 {duration}",
     "Model default": "模型默认",
     "Retry last run": "重试上次运行",
     "Cancel run": "取消运行",
@@ -5740,6 +5741,7 @@ function ChatPanel({
                               isUser={isUser}
                               key={`${message.id}-part-${partIndex}`}
                               part={part}
+                              reasoningDurationMs={message.metrics?.totalLatencyMs ?? null}
                             />
                           ))
                         ) : message.status === "streaming" ? (
@@ -6229,15 +6231,22 @@ function useCloseDetailsOnOutsidePointerDown() {
 }
 
 function ReasoningBlock({
+  durationMs,
   isStreaming,
   reasoning,
 }: {
+  durationMs: number | null;
   isStreaming: boolean;
   reasoning: string;
 }) {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
   const [isExpanded, setIsExpanded] = useState(isStreaming);
   const preview = compactInlineText(reasoning);
+  const durationLabel =
+    durationMs === null ? null : formatNullableLatencySeconds(durationMs, language);
+  const durationTitle = durationLabel
+    ? t("Thinking duration {duration}", { duration: durationLabel })
+    : null;
 
   useEffect(() => {
     setIsExpanded(isStreaming);
@@ -6269,6 +6278,14 @@ function ReasoningBlock({
             {preview}
           </span>
         )}
+        {durationLabel && durationTitle ? (
+          <span
+            className="ml-auto shrink-0 tabular-nums text-[11px] font-semibold text-stone-500"
+            title={durationTitle}
+          >
+            {durationLabel}
+          </span>
+        ) : null}
       </button>
       {isExpanded ? (
         <div className="mt-1.5">
@@ -6284,14 +6301,22 @@ function MessagePartBlock({
   isStreaming,
   isUser,
   part,
+  reasoningDurationMs,
 }: {
   isError: boolean;
   isStreaming: boolean;
   isUser: boolean;
   part: ChatMessagePart;
+  reasoningDurationMs: number | null;
 }) {
   if (part.type === "reasoning") {
-    return <ReasoningBlock isStreaming={isStreaming} reasoning={part.text} />;
+    return (
+      <ReasoningBlock
+        durationMs={reasoningDurationMs}
+        isStreaming={isStreaming}
+        reasoning={part.text}
+      />
+    );
   }
 
   if (part.type === "toolCall") {

@@ -950,12 +950,14 @@ describe("App verification surfaces", () => {
       name: "Expand thinking",
     });
     expect(reasoningToggle).toHaveAttribute("aria-expanded", "false");
+    expect(within(reasoningToggle).getByText("2 s")).toBeInTheDocument();
     expect(screen.getByText("Need file context. Then answer.")).toBeInTheDocument();
     expect(screen.queryByText("Then answer.")).not.toBeInTheDocument();
 
     await userEvent.click(reasoningToggle);
 
     expect(reasoningToggle).toHaveAttribute("aria-expanded", "true");
+    expect(within(reasoningToggle).getByText("2 s")).toBeInTheDocument();
     expect(screen.getByText("Need file context.")).toBeInTheDocument();
     expect(screen.getByText("Then answer.")).toBeInTheDocument();
     expect(screen.getByText("read_file")).toBeInTheDocument();
