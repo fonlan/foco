@@ -32,9 +32,11 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{Duration as ChronoDuration, Local, SecondsFormat, Utc};
 use foco_agent::{
-    ContextPackItem, PendingToolCall, SystemPromptInput, ToolPromptInfo, build_system_prompt,
-    calculate_context_budget, context_compression_trigger_tokens, detect_same_file_write_conflicts,
-    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
+    ContextPackItem, PendingToolCall, SystemPromptInput, ToolExecutionMode, ToolExecutionPlan,
+    ToolPromptInfo, ToolResource, ToolResourceAccess, ToolResourceLock, build_system_prompt,
+    calculate_context_budget, context_compression_trigger_tokens, estimate_json_tokens,
+    estimate_text_tokens, pack_context, plan_context_compression, plan_tool_execution,
+    tool_resource_locks, tool_resource_locks_conflict,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{
@@ -87,7 +89,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 use crate::git_backend::{
@@ -281,6 +283,7 @@ struct AppState {
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
     question_registry: QuestionRegistry,
+    tool_resource_locks: ToolResourceLockRegistry,
     _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
     #[cfg(all(windows, not(debug_assertions)))]
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
@@ -306,6 +309,161 @@ struct PendingQuestion {
 struct QuestionRegistration {
     answer_rx: oneshot::Receiver<QuestionAnswer>,
     _cleanup: QuestionCleanup,
+}
+
+#[derive(Clone, Default)]
+struct ToolResourceLockRegistry {
+    inner: Arc<ToolResourceLockRegistryInner>,
+}
+
+struct ToolResourceLockRegistryInner {
+    active: Mutex<Vec<ActiveToolResourceLock>>,
+    next_lease_id: AtomicU64,
+    released: Notify,
+}
+
+#[derive(Clone)]
+struct ActiveToolResourceLock {
+    lease_id: u64,
+    lock: ToolResourceLock,
+}
+
+struct ToolResourceLease {
+    registry: ToolResourceLockRegistry,
+    lease_id: u64,
+}
+
+impl Default for ToolResourceLockRegistryInner {
+    fn default() -> Self {
+        Self {
+            active: Mutex::new(Vec::new()),
+            next_lease_id: AtomicU64::new(1),
+            released: Notify::new(),
+        }
+    }
+}
+
+impl ToolResourceLockRegistry {
+    async fn acquire(&self, locks: Vec<ToolResourceLock>) -> ToolResourceLease {
+        let locks = normalize_tool_resource_locks(locks);
+        let lease_id = self.inner.next_lease_id.fetch_add(1, Ordering::Relaxed);
+
+        loop {
+            let notified = {
+                let mut active = self
+                    .inner
+                    .active
+                    .lock()
+                    .expect("tool resource lock registry mutex poisoned");
+                if !tool_locks_conflict_with_active(&locks, &active) {
+                    active.extend(
+                        locks
+                            .iter()
+                            .cloned()
+                            .map(|lock| ActiveToolResourceLock { lease_id, lock }),
+                    );
+                    return ToolResourceLease {
+                        registry: self.clone(),
+                        lease_id,
+                    };
+                }
+
+                self.inner.released.notified()
+            };
+
+            notified.await;
+        }
+    }
+}
+
+impl Drop for ToolResourceLease {
+    fn drop(&mut self) {
+        let released = {
+            let mut active = self
+                .registry
+                .inner
+                .active
+                .lock()
+                .expect("tool resource lock registry mutex poisoned");
+            let before = active.len();
+            active.retain(|lock| lock.lease_id != self.lease_id);
+            active.len() != before
+        };
+
+        if released {
+            self.registry.inner.released.notify_waiters();
+        }
+    }
+}
+
+fn normalize_tool_resource_locks(locks: Vec<ToolResourceLock>) -> Vec<ToolResourceLock> {
+    let mut normalized: Vec<ToolResourceLock> = Vec::new();
+    for lock in locks {
+        if let Some(existing) = normalized
+            .iter_mut()
+            .find(|existing| existing.resource == lock.resource)
+        {
+            existing.access = strongest_tool_resource_access(existing.access, lock.access);
+        } else {
+            normalized.push(lock);
+        }
+    }
+
+    normalized.sort_by(|first, second| {
+        tool_resource_sort_key(&first.resource)
+            .cmp(&tool_resource_sort_key(&second.resource))
+            .then(
+                tool_resource_access_rank(first.access)
+                    .cmp(&tool_resource_access_rank(second.access)),
+            )
+    });
+    normalized
+}
+
+fn strongest_tool_resource_access(
+    first: ToolResourceAccess,
+    second: ToolResourceAccess,
+) -> ToolResourceAccess {
+    if matches!(first, ToolResourceAccess::Exclusive)
+        || matches!(second, ToolResourceAccess::Exclusive)
+    {
+        ToolResourceAccess::Exclusive
+    } else if matches!(first, ToolResourceAccess::Write)
+        || matches!(second, ToolResourceAccess::Write)
+    {
+        ToolResourceAccess::Write
+    } else {
+        ToolResourceAccess::Read
+    }
+}
+
+fn tool_locks_conflict_with_active(
+    pending: &[ToolResourceLock],
+    active: &[ActiveToolResourceLock],
+) -> bool {
+    pending.iter().any(|pending_lock| {
+        active
+            .iter()
+            .any(|active_lock| tool_resource_locks_conflict(pending_lock, &active_lock.lock))
+    })
+}
+
+fn tool_resource_sort_key(resource: &ToolResource) -> String {
+    match resource {
+        ToolResource::WorkspaceFiles => "workspace-files".to_string(),
+        ToolResource::File(path) => format!("file:{path}"),
+        ToolResource::TodoGraph => "todo-graph".to_string(),
+        ToolResource::Memory(scope) => format!("memory:{scope}"),
+        ToolResource::ExternalTool(tool_name) => format!("external:{tool_name}"),
+    }
+}
+
+fn tool_resource_access_rank(access: ToolResourceAccess) -> u8 {
+    match access {
+        ToolResourceAccess::Read => 0,
+        ToolResourceAccess::Write => 1,
+        ToolResourceAccess::Exclusive => 2,
+    }
 }
 
 struct QuestionCleanup {
@@ -632,6 +790,7 @@ async fn run_server_until_shutdown(
         mcp_registry: mcp_registry.clone(),
         hook_runtime,
         question_registry: QuestionRegistry::default(),
+        tool_resource_locks: ToolResourceLockRegistry::default(),
         _code_graph_watchers: Arc::new(code_graph_watchers),
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
@@ -4468,6 +4627,7 @@ struct PreparedChatContext {
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
     question_registry: QuestionRegistry,
+    tool_resource_locks: ToolResourceLockRegistry,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
     global_config: GlobalConfig,
@@ -5464,7 +5624,9 @@ impl PreparedChatContext {
                             }
 
                             let pending_tool_calls = pending_tool_calls(&tool_calls);
-                            if let Err(error) = detect_same_file_write_conflicts(&pending_tool_calls) {
+                            let execution_plan = match plan_tool_execution(&pending_tool_calls) {
+                                Ok(plan) => plan,
+                                Err(error) => {
                                 let message = error.to_string();
                                 let event = ChatSseEvent::Error {
                                     message: message.clone(),
@@ -5489,7 +5651,8 @@ impl PreparedChatContext {
                                 }
 
                                 return;
-                            }
+                                }
+                            };
                             if let Err(message) = repeated_tool_call_detector.check(&tool_calls) {
                                 let event = ChatSseEvent::Error {
                                     message: message.clone(),
@@ -5554,6 +5717,8 @@ impl PreparedChatContext {
                                     &self.model_id,
                                     &self.provider_id,
                                     tool_calls.clone(),
+                                    execution_plan,
+                                    self.tool_resource_locks.clone(),
                                 );
                                 tokio::pin!(tool_results);
                                 let mut question_events_open = true;
@@ -6205,6 +6370,7 @@ async fn prepare_chat_context(
         hook_runtime: state.hook_runtime.clone(),
         global_hooks: config.hooks.clone(),
         question_registry: state.question_registry.clone(),
+        tool_resource_locks: state.tool_resource_locks.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget: prompt_context.context_budget,
         global_config: config.clone(),
@@ -9912,81 +10078,108 @@ async fn execute_tool_calls_parallel(
     model_id: &str,
     provider_id: &str,
     tool_calls: Vec<NeutralToolCall>,
+    execution_plan: ToolExecutionPlan,
+    tool_resource_lock_registry: ToolResourceLockRegistry,
 ) -> Result<Vec<ToolHookOutcome>, ApiError> {
-    if tool_calls
-        .iter()
-        .any(tool_call_requires_sequential_execution)
-    {
-        let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
-        for tool_call in tool_calls {
-            executed_tool_calls.push(
-                execute_tool_call(
-                    mcp_registry.clone(),
-                    hook_runtime.clone(),
-                    global_hooks.clone(),
-                    provider_config.clone(),
-                    question_registry.clone(),
-                    question_event_tx.clone(),
-                    memory_tool_context.clone(),
-                    workspace_id,
-                    workspace_path,
-                    chat_id,
-                    run_id,
-                    model_id,
-                    provider_id,
-                    tool_call,
-                )
-                .await,
-            );
+    let mut executed_by_index = (0..tool_calls.len())
+        .map(|_| None)
+        .collect::<Vec<Option<ToolHookOutcome>>>();
+
+    for group in execution_plan.groups {
+        match group.mode {
+            ToolExecutionMode::Sequential => {
+                for tool_index in group.call_indices {
+                    let tool_call = tool_calls.get(tool_index).cloned().ok_or_else(|| {
+                        ApiError::internal("tool execution plan referenced an unknown tool call")
+                    })?;
+                    let outcome = execute_tool_call(
+                        mcp_registry.clone(),
+                        hook_runtime.clone(),
+                        global_hooks.clone(),
+                        provider_config.clone(),
+                        question_registry.clone(),
+                        question_event_tx.clone(),
+                        memory_tool_context.clone(),
+                        tool_resource_lock_registry.clone(),
+                        workspace_id,
+                        workspace_path,
+                        chat_id,
+                        run_id,
+                        model_id,
+                        provider_id,
+                        tool_call,
+                    )
+                    .await;
+                    executed_by_index[tool_index] = Some(outcome);
+                }
+            }
+            ToolExecutionMode::Parallel => {
+                let tasks = group.call_indices.into_iter().map(|tool_index| {
+                    let workspace_path = workspace_path.to_path_buf();
+                    let workspace_id = workspace_id.to_string();
+                    let chat_id = chat_id.to_string();
+                    let run_id = run_id.to_string();
+                    let model_id = model_id.to_string();
+                    let provider_id = provider_id.to_string();
+                    let mcp_registry = mcp_registry.clone();
+                    let hook_runtime = hook_runtime.clone();
+                    let global_hooks = global_hooks.clone();
+                    let provider_config = provider_config.clone();
+                    let question_registry = question_registry.clone();
+                    let question_event_tx = question_event_tx.clone();
+                    let memory_tool_context = memory_tool_context.clone();
+                    let tool_resource_lock_registry = tool_resource_lock_registry.clone();
+                    let tool_call = tool_calls.get(tool_index).cloned();
+
+                    tokio::spawn(async move {
+                        let tool_call = tool_call.ok_or_else(|| {
+                            ApiError::internal(
+                                "tool execution plan referenced an unknown tool call",
+                            )
+                        })?;
+                        Ok::<_, ApiError>((
+                            tool_index,
+                            execute_tool_call(
+                                mcp_registry,
+                                hook_runtime,
+                                global_hooks,
+                                provider_config,
+                                question_registry,
+                                question_event_tx,
+                                memory_tool_context,
+                                tool_resource_lock_registry,
+                                &workspace_id,
+                                &workspace_path,
+                                &chat_id,
+                                &run_id,
+                                &model_id,
+                                &provider_id,
+                                tool_call,
+                            )
+                            .await,
+                        ))
+                    })
+                });
+                let results = join_all(tasks).await;
+
+                for result in results {
+                    let (tool_index, outcome) = result.map_err(|source| {
+                        ApiError::internal(format!("tool execution worker failed: {source}"))
+                    })??;
+                    executed_by_index[tool_index] = Some(outcome);
+                }
+            }
         }
-        return Ok(executed_tool_calls);
     }
 
-    let tasks = tool_calls.into_iter().map(|tool_call| {
-        let workspace_path = workspace_path.to_path_buf();
-        let workspace_id = workspace_id.to_string();
-        let chat_id = chat_id.to_string();
-        let run_id = run_id.to_string();
-        let model_id = model_id.to_string();
-        let provider_id = provider_id.to_string();
-        let mcp_registry = mcp_registry.clone();
-        let hook_runtime = hook_runtime.clone();
-        let global_hooks = global_hooks.clone();
-        let provider_config = provider_config.clone();
-        let question_registry = question_registry.clone();
-        let question_event_tx = question_event_tx.clone();
-        let memory_tool_context = memory_tool_context.clone();
-
-        tokio::spawn(async move {
-            execute_tool_call(
-                mcp_registry,
-                hook_runtime,
-                global_hooks,
-                provider_config,
-                question_registry,
-                question_event_tx,
-                memory_tool_context,
-                &workspace_id,
-                &workspace_path,
-                &chat_id,
-                &run_id,
-                &model_id,
-                &provider_id,
-                tool_call,
-            )
-            .await
+    executed_by_index
+        .into_iter()
+        .map(|outcome| {
+            outcome.ok_or_else(|| {
+                ApiError::internal("tool execution plan did not execute every tool call")
+            })
         })
-    });
-    let results = join_all(tasks).await;
-    let mut executed_tool_calls = Vec::with_capacity(results.len());
-
-    for result in results {
-        executed_tool_calls.push(result.map_err(|source| {
-            ApiError::internal(format!("tool execution worker failed: {source}"))
-        })?);
-    }
-
-    Ok(executed_tool_calls)
+        .collect()
 }
 
 async fn execute_tool_call(
@@ -9997,6 +10190,7 @@ async fn execute_tool_call(
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     mut memory_tool_context: MemoryToolContext,
+    tool_resource_lock_registry: ToolResourceLockRegistry,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -10015,6 +10209,7 @@ async fn execute_tool_call(
         question_registry,
         question_event_tx,
         memory_tool_context,
+        tool_resource_lock_registry,
         workspace_id,
         workspace_path,
         chat_id,
@@ -10079,6 +10274,7 @@ async fn execute_tool(
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     memory_tool_context: MemoryToolContext,
+    tool_resource_lock_registry: ToolResourceLockRegistry,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -10271,6 +10467,25 @@ async fn execute_tool(
             }
         }
     }
+
+    let resource_lock_request = PendingToolCall {
+        id: tool_call_id.to_string(),
+        name: tool_name.to_string(),
+        arguments: arguments.clone(),
+    };
+    let resource_locks = match tool_resource_locks(&resource_lock_request) {
+        Ok(locks) => locks,
+        Err(error) => {
+            return ToolExecutionWithHooks {
+                execution: ToolExecution {
+                    output: json!({ "error": error.to_string() }),
+                    is_error: true,
+                },
+                hook_summary,
+            };
+        }
+    };
+    let _resource_lease = tool_resource_lock_registry.acquire(resource_locks).await;
 
     if tool_name == ASK_QUESTION_TOOL {
         let ask_question = execute_ask_question(
@@ -11002,16 +11217,6 @@ fn merge_hook_summaries(target: &mut HookRunSummary, source: HookRunSummary) {
     target.additional_context.extend(source.additional_context);
     target.system_messages.extend(source.system_messages);
     target.errors.extend(source.errors);
-}
-
-fn tool_call_requires_sequential_execution(tool_call: &NeutralToolCall) -> bool {
-    matches!(
-        tool_call.name.as_str(),
-        ASK_QUESTION_TOOL
-            | CREATE_TODO_GRAPH_TOOL
-            | UPDATE_TODO_GRAPH_TOOL
-            | MEMORY_WRITE_TOOL_NAME
-    )
 }
 
 fn tool_results_affect_git_diff(tool_results: &[ExecutedToolCall]) -> bool {
@@ -15499,6 +15704,92 @@ mod tests {
         }
     }
 
+    fn test_file_resource_lock(path: &str, access: ToolResourceAccess) -> ToolResourceLock {
+        ToolResourceLock {
+            resource: ToolResource::File(path.to_string()),
+            access,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_resource_registry_blocks_same_file_read_write() {
+        let registry = ToolResourceLockRegistry::default();
+        let read_lease = registry
+            .acquire(vec![test_file_resource_lock(
+                "src/main.rs",
+                ToolResourceAccess::Read,
+            )])
+            .await;
+        let waiting_registry = registry.clone();
+        let waiter = tokio::spawn(async move {
+            let _write_lease = waiting_registry
+                .acquire(vec![test_file_resource_lock(
+                    "src/main.rs",
+                    ToolResourceAccess::Write,
+                )])
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(read_lease);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("same-file write lock should be released")
+            .expect("same-file write waiter should not panic");
+    }
+
+    #[tokio::test]
+    async fn tool_resource_registry_allows_different_file_writes() {
+        let registry = ToolResourceLockRegistry::default();
+        let _first_lease = registry
+            .acquire(vec![test_file_resource_lock(
+                "src/a.rs",
+                ToolResourceAccess::Write,
+            )])
+            .await;
+
+        let _second_lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.acquire(vec![test_file_resource_lock(
+                "src/b.rs",
+                ToolResourceAccess::Write,
+            )]),
+        )
+        .await
+        .expect("different file writes should not block each other");
+    }
+
+    #[tokio::test]
+    async fn tool_resource_registry_workspace_exclusive_blocks_file_access() {
+        let registry = ToolResourceLockRegistry::default();
+        let workspace_lease = registry
+            .acquire(vec![ToolResourceLock {
+                resource: ToolResource::WorkspaceFiles,
+                access: ToolResourceAccess::Exclusive,
+            }])
+            .await;
+        let waiting_registry = registry.clone();
+        let waiter = tokio::spawn(async move {
+            let _read_lease = waiting_registry
+                .acquire(vec![test_file_resource_lock(
+                    "src/main.rs",
+                    ToolResourceAccess::Read,
+                )])
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(workspace_lease);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("workspace exclusive lock should be released")
+            .expect("file read waiter should not panic");
+    }
+
     fn captured_test_llm_request(
         request_id: &str,
         assistant_message_id: &str,
@@ -16654,6 +16945,7 @@ description: Project memory.
             global_hooks: HookConfig::default(),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
+            tool_resource_locks: ToolResourceLockRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
                 context_window: 1_000,
@@ -16796,6 +17088,7 @@ description: Project memory.
             global_hooks: HookConfig::default(),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
+            tool_resource_locks: ToolResourceLockRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
                 context_window: 1_000,
@@ -16921,6 +17214,7 @@ description: Project memory.
             global_hooks: HookConfig::default(),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
+            tool_resource_locks: ToolResourceLockRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
                 context_window: 1_000,
@@ -19387,6 +19681,7 @@ description: Project memory.
             hook_runtime: HookRuntime::new(mcp_registry.clone()),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
+            tool_resource_locks: ToolResourceLockRegistry::default(),
             _code_graph_watchers: Arc::new(Vec::new()),
         }
     }

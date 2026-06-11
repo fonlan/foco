@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt};
+use std::fmt;
 
 use serde_json::Value;
 
@@ -8,6 +8,22 @@ const CONTEXT_COMPRESSION_TRIGGER_NUMERATOR: u64 = 4;
 const CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR: u64 = 5;
 pub const WRITE_FILE_TOOL_NAME: &str = "write_file";
 pub const PATCH_FILE_TOOL_NAME: &str = "patch_file";
+const READ_FILE_TOOL_NAME: &str = "read_file";
+const LIST_FILES_TOOL_NAME: &str = "list_files";
+const SEARCH_TEXT_TOOL_NAME: &str = "search_text";
+const RUN_COMMAND_TOOL_NAME: &str = "run_command";
+const GRAPH_FIND_SYMBOLS_TOOL_NAME: &str = "graph_find_symbols";
+const GRAPH_FIND_CALLERS_TOOL_NAME: &str = "graph_find_callers";
+const GRAPH_FIND_CALLEES_TOOL_NAME: &str = "graph_find_callees";
+const GRAPH_FIND_REFERENCES_TOOL_NAME: &str = "graph_find_references";
+const GRAPH_RELATED_FILES_TOOL_NAME: &str = "graph_related_files";
+const CREATE_TODO_GRAPH_TOOL_NAME: &str = "create_todo_graph";
+const UPDATE_TODO_GRAPH_TOOL_NAME: &str = "update_todo_graph";
+const GET_TODO_GRAPH_TOOL_NAME: &str = "get_todo_graph";
+const ASK_QUESTION_TOOL_NAME: &str = "ask_question";
+const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
+const MEMORY_WRITE_TOOL_NAME: &str = "memory_write";
+const MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolPromptInfo {
@@ -61,6 +77,45 @@ pub struct PendingToolCall {
     pub arguments: Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolExecutionPlan {
+    pub groups: Vec<ToolExecutionGroup>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolExecutionGroup {
+    pub mode: ToolExecutionMode,
+    pub call_indices: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolExecutionMode {
+    Parallel,
+    Sequential,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolResourceAccess {
+    Read,
+    Write,
+    Exclusive,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ToolResource {
+    WorkspaceFiles,
+    File(String),
+    TodoGraph,
+    Memory(String),
+    ExternalTool(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolResourceLock {
+    pub resource: ToolResource,
+    pub access: ToolResourceAccess,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ContextBudgetError {
     OutputExceedsWindow {
@@ -83,13 +138,25 @@ pub enum ContextPackError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ToolConflictError {
-    MissingWritePath {
+    MissingPath {
+        tool_name: String,
+        call_id: String,
+    },
+    MissingScope {
+        tool_name: String,
         call_id: String,
     },
     SameFileWrite {
         path: String,
         first_call_id: String,
         second_call_id: String,
+    },
+    ResourceConflict {
+        resource: ToolResource,
+        first_call_id: String,
+        first_access: ToolResourceAccess,
+        second_call_id: String,
+        second_access: ToolResourceAccess,
     },
 }
 
@@ -347,36 +414,229 @@ pub fn plan_context_compression(
     })
 }
 
-pub fn detect_same_file_write_conflicts(
+pub fn plan_tool_execution(
     tool_calls: &[PendingToolCall],
-) -> Result<(), ToolConflictError> {
-    let mut writes_by_path = HashMap::new();
-
+) -> Result<ToolExecutionPlan, ToolConflictError> {
+    let mut analyzed_calls = Vec::with_capacity(tool_calls.len());
     for tool_call in tool_calls {
-        if !matches!(
-            tool_call.name.as_str(),
-            WRITE_FILE_TOOL_NAME | PATCH_FILE_TOOL_NAME
-        ) {
-            continue;
+        analyzed_calls.push(AnalyzedToolCall {
+            requires_sequential_execution: tool_call_requires_sequential_execution(&tool_call.name),
+            locks: tool_resource_locks(tool_call)?,
+        });
+    }
+
+    for first_index in 0..tool_calls.len() {
+        for second_index in (first_index + 1)..tool_calls.len() {
+            if analyzed_calls[first_index].requires_sequential_execution
+                || analyzed_calls[second_index].requires_sequential_execution
+            {
+                continue;
+            }
+            reject_conflicting_parallel_tool_calls(
+                &tool_calls[first_index],
+                &analyzed_calls[first_index],
+                &tool_calls[second_index],
+                &analyzed_calls[second_index],
+            )?;
         }
+    }
 
-        let Some(path) = tool_call.arguments.get("path").and_then(Value::as_str) else {
-            return Err(ToolConflictError::MissingWritePath {
-                call_id: tool_call.id.clone(),
+    let mut groups = Vec::new();
+    let mut pending_parallel_indices = Vec::new();
+    for (index, analyzed_call) in analyzed_calls.iter().enumerate() {
+        if analyzed_call.requires_sequential_execution {
+            push_parallel_group(&mut groups, &mut pending_parallel_indices);
+            groups.push(ToolExecutionGroup {
+                mode: ToolExecutionMode::Sequential,
+                call_indices: vec![index],
             });
-        };
-        let normalized_path = normalize_workspace_path(path);
+        } else {
+            pending_parallel_indices.push(index);
+        }
+    }
+    push_parallel_group(&mut groups, &mut pending_parallel_indices);
 
-        if let Some(first_call_id) = writes_by_path.insert(normalized_path.clone(), &tool_call.id) {
-            return Err(ToolConflictError::SameFileWrite {
-                path: normalized_path,
-                first_call_id: first_call_id.clone(),
-                second_call_id: tool_call.id.clone(),
+    Ok(ToolExecutionPlan { groups })
+}
+
+pub fn tool_resource_locks(
+    tool_call: &PendingToolCall,
+) -> Result<Vec<ToolResourceLock>, ToolConflictError> {
+    match tool_call.name.as_str() {
+        READ_FILE_TOOL_NAME => Ok(vec![ToolResourceLock {
+            resource: ToolResource::File(required_path(tool_call)?),
+            access: ToolResourceAccess::Read,
+        }]),
+        WRITE_FILE_TOOL_NAME | PATCH_FILE_TOOL_NAME => Ok(vec![ToolResourceLock {
+            resource: ToolResource::File(required_path(tool_call)?),
+            access: ToolResourceAccess::Write,
+        }]),
+        LIST_FILES_TOOL_NAME
+        | SEARCH_TEXT_TOOL_NAME
+        | GRAPH_FIND_SYMBOLS_TOOL_NAME
+        | GRAPH_FIND_CALLERS_TOOL_NAME
+        | GRAPH_FIND_CALLEES_TOOL_NAME
+        | GRAPH_FIND_REFERENCES_TOOL_NAME
+        | GRAPH_RELATED_FILES_TOOL_NAME => Ok(vec![ToolResourceLock {
+            resource: ToolResource::WorkspaceFiles,
+            access: ToolResourceAccess::Read,
+        }]),
+        RUN_COMMAND_TOOL_NAME => Ok(vec![ToolResourceLock {
+            resource: ToolResource::WorkspaceFiles,
+            access: ToolResourceAccess::Exclusive,
+        }]),
+        CREATE_TODO_GRAPH_TOOL_NAME | UPDATE_TODO_GRAPH_TOOL_NAME => Ok(vec![ToolResourceLock {
+            resource: ToolResource::TodoGraph,
+            access: ToolResourceAccess::Write,
+        }]),
+        GET_TODO_GRAPH_TOOL_NAME => Ok(vec![ToolResourceLock {
+            resource: ToolResource::TodoGraph,
+            access: ToolResourceAccess::Read,
+        }]),
+        MEMORY_SEARCH_TOOL_NAME => Ok(vec![ToolResourceLock {
+            resource: ToolResource::Memory(memory_scope_key(tool_call)?),
+            access: ToolResourceAccess::Read,
+        }]),
+        MEMORY_WRITE_TOOL_NAME => Ok(vec![ToolResourceLock {
+            resource: ToolResource::Memory(memory_scope_key(tool_call)?),
+            access: ToolResourceAccess::Write,
+        }]),
+        ASK_QUESTION_TOOL_NAME | "sleep" => Ok(Vec::new()),
+        name if name.starts_with(MCP_TOOL_NAME_PREFIX) => Ok(vec![
+            ToolResourceLock {
+                resource: ToolResource::WorkspaceFiles,
+                access: ToolResourceAccess::Exclusive,
+            },
+            ToolResourceLock {
+                resource: ToolResource::ExternalTool(name.to_string()),
+                access: ToolResourceAccess::Exclusive,
+            },
+        ]),
+        _ => Ok(Vec::new()),
+    }
+}
+
+pub fn tool_resource_locks_conflict(first: &ToolResourceLock, second: &ToolResourceLock) -> bool {
+    resources_overlap(&first.resource, &second.resource)
+        && accesses_conflict(first.access, second.access)
+}
+
+#[derive(Clone, Debug)]
+struct AnalyzedToolCall {
+    requires_sequential_execution: bool,
+    locks: Vec<ToolResourceLock>,
+}
+
+fn push_parallel_group(groups: &mut Vec<ToolExecutionGroup>, indices: &mut Vec<usize>) {
+    if indices.is_empty() {
+        return;
+    }
+
+    groups.push(ToolExecutionGroup {
+        mode: ToolExecutionMode::Parallel,
+        call_indices: std::mem::take(indices),
+    });
+}
+
+fn reject_conflicting_parallel_tool_calls(
+    first_call: &PendingToolCall,
+    first_analysis: &AnalyzedToolCall,
+    second_call: &PendingToolCall,
+    second_analysis: &AnalyzedToolCall,
+) -> Result<(), ToolConflictError> {
+    for first_lock in &first_analysis.locks {
+        for second_lock in &second_analysis.locks {
+            if !tool_resource_locks_conflict(first_lock, second_lock) {
+                continue;
+            }
+
+            if first_lock.access == ToolResourceAccess::Write
+                && second_lock.access == ToolResourceAccess::Write
+            {
+                if let ToolResource::File(path) = &first_lock.resource {
+                    return Err(ToolConflictError::SameFileWrite {
+                        path: path.clone(),
+                        first_call_id: first_call.id.clone(),
+                        second_call_id: second_call.id.clone(),
+                    });
+                }
+            }
+
+            return Err(ToolConflictError::ResourceConflict {
+                resource: first_lock.resource.clone(),
+                first_call_id: first_call.id.clone(),
+                first_access: first_lock.access,
+                second_call_id: second_call.id.clone(),
+                second_access: second_lock.access,
             });
         }
     }
 
     Ok(())
+}
+
+fn tool_call_requires_sequential_execution(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        ASK_QUESTION_TOOL_NAME
+            | RUN_COMMAND_TOOL_NAME
+            | CREATE_TODO_GRAPH_TOOL_NAME
+            | UPDATE_TODO_GRAPH_TOOL_NAME
+            | MEMORY_WRITE_TOOL_NAME
+    ) || tool_name.starts_with(MCP_TOOL_NAME_PREFIX)
+}
+
+fn required_path(tool_call: &PendingToolCall) -> Result<String, ToolConflictError> {
+    tool_call
+        .arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .map(normalize_workspace_path)
+        .ok_or_else(|| ToolConflictError::MissingPath {
+            tool_name: tool_call.name.clone(),
+            call_id: tool_call.id.clone(),
+        })
+}
+
+fn memory_scope_key(tool_call: &PendingToolCall) -> Result<String, ToolConflictError> {
+    let scope = tool_call
+        .arguments
+        .get("scope")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolConflictError::MissingScope {
+            tool_name: tool_call.name.clone(),
+            call_id: tool_call.id.clone(),
+        })?
+        .trim();
+
+    Ok(match scope {
+        "auto" => "all",
+        "global" | "workspace" | "chat" => scope,
+        other => other,
+    }
+    .to_string())
+}
+
+fn resources_overlap(first: &ToolResource, second: &ToolResource) -> bool {
+    match (first, second) {
+        (ToolResource::WorkspaceFiles, ToolResource::WorkspaceFiles) => true,
+        (ToolResource::WorkspaceFiles, ToolResource::File(_))
+        | (ToolResource::File(_), ToolResource::WorkspaceFiles) => true,
+        (ToolResource::File(first), ToolResource::File(second)) => first == second,
+        (ToolResource::TodoGraph, ToolResource::TodoGraph) => true,
+        (ToolResource::Memory(first), ToolResource::Memory(second)) => {
+            first == second || first == "all" || second == "all"
+        }
+        (ToolResource::ExternalTool(first), ToolResource::ExternalTool(second)) => first == second,
+        _ => false,
+    }
+}
+
+fn accesses_conflict(first: ToolResourceAccess, second: ToolResourceAccess) -> bool {
+    !matches!(
+        (first, second),
+        (ToolResourceAccess::Read, ToolResourceAccess::Read)
+    )
 }
 
 fn normalize_workspace_path(path: &str) -> String {
@@ -436,9 +696,13 @@ impl std::error::Error for ContextPackError {}
 impl fmt::Display for ToolConflictError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingWritePath { call_id } => write!(
+            Self::MissingPath { tool_name, call_id } => write!(
                 formatter,
-                "file-writing tool call '{call_id}' is missing a string path for conflict detection"
+                "tool call '{call_id}' for '{tool_name}' is missing a string path for conflict detection"
+            ),
+            Self::MissingScope { tool_name, call_id } => write!(
+                formatter,
+                "tool call '{call_id}' for '{tool_name}' is missing a string scope for conflict detection"
             ),
             Self::SameFileWrite {
                 path,
@@ -448,11 +712,43 @@ impl fmt::Display for ToolConflictError {
                 formatter,
                 "same-file write conflict for '{path}' between tool calls '{first_call_id}' and '{second_call_id}'"
             ),
+            Self::ResourceConflict {
+                resource,
+                first_call_id,
+                first_access,
+                second_call_id,
+                second_access,
+            } => write!(
+                formatter,
+                "tool resource conflict for {resource} between tool call '{first_call_id}' ({first_access}) and '{second_call_id}' ({second_access})"
+            ),
         }
     }
 }
 
 impl std::error::Error for ToolConflictError {}
+
+impl fmt::Display for ToolResource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkspaceFiles => write!(formatter, "workspace files"),
+            Self::File(path) => write!(formatter, "file '{path}'"),
+            Self::TodoGraph => write!(formatter, "current chat todo graph"),
+            Self::Memory(scope) => write!(formatter, "memory scope '{scope}'"),
+            Self::ExternalTool(tool_name) => write!(formatter, "external tool '{tool_name}'"),
+        }
+    }
+}
+
+impl fmt::Display for ToolResourceAccess {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read => write!(formatter, "read"),
+            Self::Write => write!(formatter, "write"),
+            Self::Exclusive => write!(formatter, "exclusive"),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -596,18 +892,13 @@ mod tests {
                 arguments: json!({ "path": "src/main.rs" }),
             },
             PendingToolCall {
-                id: "call-b".to_string(),
-                name: "read_file".to_string(),
-                arguments: json!({ "path": "src/main.rs" }),
-            },
-            PendingToolCall {
                 id: "call-c".to_string(),
                 name: PATCH_FILE_TOOL_NAME.to_string(),
                 arguments: json!({ "path": ".\\src\\main.rs" }),
             },
         ];
 
-        let error = detect_same_file_write_conflicts(&calls).expect_err("conflict");
+        let error = plan_tool_execution(&calls).expect_err("conflict");
 
         assert_eq!(
             error,
@@ -615,6 +906,135 @@ mod tests {
                 path: "src/main.rs".to_string(),
                 first_call_id: "call-a".to_string(),
                 second_call_id: "call-c".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_same_turn_file_read_write_conflicts() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-a".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: PATCH_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+        ];
+
+        let error = plan_tool_execution(&calls).expect_err("conflict");
+
+        assert_eq!(
+            error,
+            ToolConflictError::ResourceConflict {
+                resource: ToolResource::File("src/main.rs".to_string()),
+                first_call_id: "call-a".to_string(),
+                first_access: ToolResourceAccess::Read,
+                second_call_id: "call-b".to_string(),
+                second_access: ToolResourceAccess::Write,
+            }
+        );
+    }
+
+    #[test]
+    fn plans_independent_file_writes_in_one_parallel_group() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-a".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/a.rs" }),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: PATCH_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/b.rs" }),
+            },
+        ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![ToolExecutionGroup {
+                    mode: ToolExecutionMode::Parallel,
+                    call_indices: vec![0, 1],
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn plans_run_command_as_ordered_workspace_barrier() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-a".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/a.rs" }),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: RUN_COMMAND_TOOL_NAME.to_string(),
+                arguments: json!({ "command": "npm", "args": ["test"], "cwd": null }),
+            },
+            PendingToolCall {
+                id: "call-c".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/b.rs" }),
+            },
+        ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![0],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Sequential,
+                        call_indices: vec![1],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![2],
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_workspace_read_with_parallel_file_write() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-a".to_string(),
+                name: SEARCH_TEXT_TOOL_NAME.to_string(),
+                arguments: json!({ "query": "needle", "path": "." }),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: WRITE_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+        ];
+
+        let error = plan_tool_execution(&calls).expect_err("conflict");
+
+        assert_eq!(
+            error,
+            ToolConflictError::ResourceConflict {
+                resource: ToolResource::WorkspaceFiles,
+                first_call_id: "call-a".to_string(),
+                first_access: ToolResourceAccess::Read,
+                second_call_id: "call-b".to_string(),
+                second_access: ToolResourceAccess::Write,
             }
         );
     }
