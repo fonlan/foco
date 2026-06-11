@@ -654,10 +654,14 @@ pub struct MemorySettings {
     pub enabled: bool,
     #[serde(default = "default_memory_extraction_mode")]
     pub extraction_mode: String,
+    #[serde(default = "default_memory_retrieval_mode")]
+    pub retrieval_mode: String,
     #[serde(default)]
     pub retention_days: Option<u32>,
     #[serde(default)]
     pub extraction_model_id: Option<String>,
+    #[serde(default)]
+    pub retrieval_model_id: Option<String>,
 }
 
 impl Default for MemorySettings {
@@ -665,8 +669,10 @@ impl Default for MemorySettings {
         Self {
             enabled: false,
             extraction_mode: default_memory_extraction_mode(),
+            retrieval_mode: default_memory_retrieval_mode(),
             retention_days: None,
             extraction_model_id: None,
+            retrieval_model_id: None,
         }
     }
 }
@@ -753,6 +759,10 @@ fn is_true(value: &bool) -> bool {
 
 fn default_memory_extraction_mode() -> String {
     "manual".to_string()
+}
+
+fn default_memory_retrieval_mode() -> String {
+    "fts".to_string()
 }
 
 impl Default for WebServerSettings {
@@ -1156,6 +1166,16 @@ fn validate_memory_settings(
         }
     }
 
+    match settings.retrieval_mode.as_str() {
+        "fts" | "llm" => {}
+        other => {
+            return invalid_config(
+                config_path,
+                format!("memory.retrieval_mode has unsupported value '{other}'"),
+            );
+        }
+    }
+
     if settings.retention_days == Some(0) {
         return invalid_config(config_path, "memory.retention_days must be greater than 0");
     }
@@ -1167,6 +1187,17 @@ fn validate_memory_settings(
             return invalid_config(
                 config_path,
                 format!("memory.extraction_model_id references missing model '{model_id}'"),
+            );
+        }
+    }
+
+    if let Some(model_id) = &settings.retrieval_model_id {
+        require_non_empty(config_path, "memory.retrieval_model_id", model_id)?;
+
+        if !models.iter().any(|model| model.id == *model_id) {
+            return invalid_config(
+                config_path,
+                format!("memory.retrieval_model_id references missing model '{model_id}'"),
             );
         }
     }
@@ -1983,6 +2014,37 @@ mod tests {
 
         save_global_config(&loaded.paths.config_file, &loaded.config)
             .expect("automatic memory extraction mode should save");
+    }
+
+    #[test]
+    fn model_memory_retrieval_mode_can_be_saved() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.memory.enabled = true;
+        loaded.config.memory.retrieval_mode = "llm".to_string();
+
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("model memory retrieval mode should save");
+    }
+
+    #[test]
+    fn memory_retrieval_model_must_exist() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.memory.retrieval_model_id = Some("missing-model".to_string());
+
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("missing retrieval model should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("memory.retrieval_model_id references missing model")
+        );
     }
 
     #[test]

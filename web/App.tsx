@@ -273,9 +273,12 @@ type MemoryExtractionModeSummary = {
 type MemorySettingsSummary = {
   enabled: boolean;
   extractionMode: string;
+  retrievalMode: string;
   retentionDays: number | null;
   extractionModelId: string | null;
+  retrievalModelId: string | null;
   extractionModes: MemoryExtractionModeSummary[];
+  retrievalModes: MemoryExtractionModeSummary[];
 };
 
 type PromptSettingsSummary = {
@@ -371,8 +374,10 @@ type MemorySourcesResponse = {
 type MemorySettingsFormState = {
   enabled: boolean;
   extractionMode: string;
+  retrievalMode: string;
   retentionDays: string;
   extractionModelId: string;
+  retrievalModelId: string;
 };
 
 type MemoryFilterState = {
@@ -1316,8 +1321,13 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Memory controls": "记忆控制",
     "Enable memory": "启用记忆",
     "Extraction mode": "抽取模式",
+    "Memory matching": "记忆匹配",
     "Retention days": "保留天数",
     "Extraction model": "抽取模型",
+    "Matching model": "匹配模型",
+    "SQLite FTS": "SQLite FTS",
+    "Model matching": "大模型匹配",
+    "Current chat model": "当前会话模型",
     "Save memory settings": "保存记忆设置",
     "Memory list": "记忆列表",
     "Create memory": "创建记忆",
@@ -9159,7 +9169,9 @@ function SettingsPanel({
     setMemorySettingsForm({
       enabled: data.memory.enabled,
       extractionMode: data.memory.extractionMode,
+      retrievalMode: data.memory.retrievalMode,
       extractionModelId: data.memory.extractionModelId ?? "",
+      retrievalModelId: data.memory.retrievalModelId ?? "",
       retentionDays:
         data.memory.retentionDays === null ? "" : String(data.memory.retentionDays),
     });
@@ -9767,7 +9779,9 @@ function SettingsPanel({
         body: JSON.stringify({
           enabled: memorySettingsForm.enabled,
           extractionMode: memorySettingsForm.extractionMode,
+          retrievalMode: memorySettingsForm.retrievalMode,
           extractionModelId: memorySettingsForm.extractionModelId.trim() || null,
+          retrievalModelId: memorySettingsForm.retrievalModelId.trim() || null,
           retentionDays: optionalPositiveInteger(
             memorySettingsForm.retentionDays,
             t("Retention days"),
@@ -11383,6 +11397,27 @@ function SettingsPanel({
                   ))}
                 </select>
               </label>
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  {t("Memory matching")}
+                </span>
+                <select
+                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) =>
+                    setMemorySettingsForm((current) => ({
+                      ...current,
+                      retrievalMode: event.target.value,
+                    }))
+                  }
+                  value={memorySettingsForm.retrievalMode}
+                >
+                  {(settings?.memory.retrievalModes ?? []).map((mode) => (
+                    <option key={mode.value} value={mode.value}>
+                      {t(mode.label)}
+                    </option>
+                  ))}
+                </select>
+              </label>
               <TextField
                 inputMode="numeric"
                 label={t("Retention days")}
@@ -11410,6 +11445,28 @@ function SettingsPanel({
                   value={memorySettingsForm.extractionModelId}
                 >
                   <option value="">{t("Default")}</option>
+                  {(settings?.configuredModels ?? []).map((model) => (
+                    <option key={model.id} value={model.id}>
+                      {model.displayName}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  {t("Matching model")}
+                </span>
+                <select
+                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) =>
+                    setMemorySettingsForm((current) => ({
+                      ...current,
+                      retrievalModelId: event.target.value,
+                    }))
+                  }
+                  value={memorySettingsForm.retrievalModelId}
+                >
+                  <option value="">{t("Current chat model")}</option>
                   {(settings?.configuredModels ?? []).map((model) => (
                     <option key={model.id} value={model.id}>
                       {model.displayName}
@@ -14792,7 +14849,9 @@ function emptyMemorySettingsForm(): MemorySettingsFormState {
   return {
     enabled: false,
     extractionMode: "manual",
+    retrievalMode: "fts",
     extractionModelId: "",
+    retrievalModelId: "",
     retentionDays: "",
   };
 }

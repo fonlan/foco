@@ -111,12 +111,18 @@ const settings = {
   memory: {
     enabled: false,
     extractionMode: "manual",
+    retrievalMode: "fts",
     extractionModelId: null,
+    retrievalModelId: null,
     extractionModes: [
       { label: "Manual", value: "manual" },
       { label: "Pending review", value: "pending_review" },
       { label: "Automatic", value: "automatic" },
       { label: "Disabled", value: "disabled" },
+    ],
+    retrievalModes: [
+      { label: "SQLite FTS", value: "fts" },
+      { label: "Model matching", value: "llm" },
     ],
     retentionDays: null,
   },
@@ -1867,8 +1873,10 @@ describe("App verification surfaces", () => {
 
     await userEvent.click(screen.getByLabelText("Enable memory"));
     await userEvent.selectOptions(screen.getByLabelText("Extraction mode"), "automatic");
+    await userEvent.selectOptions(screen.getByLabelText("Memory matching"), "llm");
     await userEvent.type(screen.getByLabelText("Retention days"), "30");
     await userEvent.selectOptions(screen.getByLabelText("Extraction model"), "gpt-test");
+    await userEvent.selectOptions(screen.getByLabelText("Matching model"), "gpt-test");
     await userEvent.click(screen.getByRole("button", { name: "Save memory settings" }));
 
     await waitFor(() => {
@@ -1879,7 +1887,9 @@ describe("App verification surfaces", () => {
       expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
         enabled: true,
         extractionMode: "automatic",
+        retrievalMode: "llm",
         extractionModelId: "gpt-test",
+        retrievalModelId: "gpt-test",
         retentionDays: 30,
       });
     });
@@ -2426,7 +2436,9 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
         ...settings.memory,
         enabled: true,
         extractionMode: "pending_review",
+        retrievalMode: "llm",
         extractionModelId: "gpt-test",
+        retrievalModelId: "gpt-test",
         retentionDays: 30,
       },
     });

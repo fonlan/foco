@@ -149,12 +149,22 @@ const MAX_MEMORY_TOOL_TIMEOUT_MS: u64 = 120_000;
 const MAX_MEMORY_TOOL_SEARCH_LIMIT: u32 = 50;
 // Tool name the model must call to return extracted memory facts.
 const MEMORY_EXTRACTION_TOOL_NAME: &str = "submit_memory_extraction";
+// Tool name the model must call to return relevant memories for prompt retrieval.
+const MEMORY_RETRIEVAL_TOOL_NAME: &str = "select_relevant_memory";
 // Timeout for the background model call that extracts durable memory facts.
 const MEMORY_EXTRACTION_TIMEOUT_MS: u64 = 60_000;
+// Timeout for model-based memory retrieval during prompt assembly.
+const MEMORY_RETRIEVAL_TIMEOUT_MS: u64 = 30_000;
 // Maximum output tokens allowed for the memory extraction model request.
 const MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 2048;
+// Maximum output tokens allowed for the memory retrieval model request.
+const MEMORY_RETRIEVAL_MAX_OUTPUT_TOKENS: u32 = 1024;
+// Maximum active memory facts sent to the model-based memory retrieval request.
+const MEMORY_RETRIEVAL_LLM_FACT_LIMIT: u32 = 200;
 // System prompt for the memory extraction request that forces evidence-backed tool output only.
 const MEMORY_EXTRACTION_SYSTEM_PROMPT: &str = "Extract only durable, user-reviewable memory facts from the provided completed chat turn evidence. Use the submit_memory_extraction tool exactly once. Do not return prose. Include a fact only when it is directly supported by one or more provided evidenceIds. If there is nothing worth remembering, submit {\"facts\":[]}. Suggested scopes mean: global for user-wide stable preferences, workspace for project-specific durable facts, chat for session-specific details.";
+// System prompt for model-based memory retrieval.
+const MEMORY_RETRIEVAL_SYSTEM_PROMPT: &str = "Select only Foco memory facts that are directly relevant to the user's current request. Use the select_relevant_memory tool exactly once. Do not return prose. Return factKeys in the order they should be injected. Include pinned facts only when relevant.";
 // Maximum number of attachments allowed on one chat or context-usage request.
 const MAX_CHAT_ATTACHMENTS: usize = 6;
 // Maximum size allowed for a single chat attachment.
@@ -1760,12 +1770,20 @@ async fn save_memory_settings(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let retrieval_model_id = request
+        .retrieval_model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
 
     config.memory = MemorySettings {
         enabled: request.enabled,
         extraction_mode: request.extraction_mode.trim().to_string(),
+        retrieval_mode: request.retrieval_mode.trim().to_string(),
         retention_days: request.retention_days,
         extraction_model_id,
+        retrieval_model_id,
     };
     config
         .validate(Some(&state.config_file))
@@ -3266,8 +3284,10 @@ struct ManualGeneralSettingsRequest {
 struct ManualMemorySettingsRequest {
     enabled: bool,
     extraction_mode: String,
+    retrieval_mode: String,
     retention_days: Option<u32>,
     extraction_model_id: Option<String>,
+    retrieval_model_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3603,9 +3623,12 @@ struct GeneralSettingsSummary {
 struct MemorySettingsSummary {
     enabled: bool,
     extraction_mode: String,
+    retrieval_mode: String,
     retention_days: Option<u32>,
     extraction_model_id: Option<String>,
+    retrieval_model_id: Option<String>,
     extraction_modes: Vec<MemoryExtractionModeSummary>,
+    retrieval_modes: Vec<MemoryExtractionModeSummary>,
 }
 
 #[derive(Serialize)]
@@ -4281,6 +4304,12 @@ struct RelevantMemoryFacts {
 struct MemoryPromptSearch {
     fts_query: String,
     contains_terms: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MemoryRetrievalOutput {
+    fact_keys: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -5632,6 +5661,7 @@ async fn prepare_prompt_context(
         None => Vec::new(),
     };
     let user_sequence = next_message_sequence(&existing_messages);
+    drop(database);
 
     let builtin_tool_definitions = builtin_tool_definitions();
     let memory_tool_definitions = if config.memory.enabled {
@@ -5705,9 +5735,12 @@ async fn prepare_prompt_context(
         workspace,
         chat_id.as_deref(),
         raw_message.as_deref(),
+        model,
+        provider,
         &context_budget,
         allow_memory_mutation,
-    )?;
+    )
+    .await?;
     let mut neutral_messages = Vec::with_capacity(
         existing_messages.len()
             + compression_snapshots.len()
@@ -5750,13 +5783,15 @@ async fn prepare_prompt_context(
         neutral_messages.push(skill_message);
         message_source_sequences.push(None);
     }
+    let replay_database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
     for existing_message in existing_messages {
         if covered_sequences.contains(&existing_message.sequence) {
             continue;
         }
 
         let sequence = existing_message.sequence;
-        for neutral_message in neutral_messages_from_record(&database, existing_message)? {
+        for neutral_message in neutral_messages_from_record(&replay_database, existing_message)? {
             neutral_messages.push(neutral_message);
             message_source_sequences.push(Some(sequence));
         }
@@ -5941,12 +5976,14 @@ async fn prepare_chat_context(
     })
 }
 
-fn memory_prompt_context(
+async fn memory_prompt_context(
     state: &AppState,
     config: &GlobalConfig,
     workspace: &WorkspaceConfig,
     chat_id: Option<&str>,
     query_text: Option<&str>,
+    chat_model: &ModelSettings,
+    chat_provider: &ProviderSettings,
     context_budget: &foco_agent::ContextBudget,
     allow_memory_mutation: bool,
 ) -> Result<MemoryPromptContext, ApiError> {
@@ -5983,12 +6020,35 @@ fn memory_prompt_context(
         refresh_memory_profile(&mut global_memory, MemoryScope::Global, None)?;
     }
 
-    let relevant_facts = relevant_memory_facts(
-        &mut global_memory,
-        &mut workspace_memory,
-        chat_id,
-        query_text,
-    )?;
+    let relevant_facts = match config.memory.retrieval_mode.as_str() {
+        "fts" => relevant_memory_facts_fts(
+            &mut global_memory,
+            &mut workspace_memory,
+            chat_id,
+            query_text,
+        )?,
+        "llm" => {
+            let candidates =
+                llm_memory_retrieval_candidates(&global_memory, &workspace_memory, chat_id)?;
+            drop(workspace_memory);
+            drop(global_memory);
+            relevant_memory_facts_llm(
+                config,
+                &workspace.path,
+                &state.memory_database_file,
+                candidates,
+                query_text,
+                chat_model,
+                chat_provider,
+            )
+            .await?
+        }
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "memory retrieval mode '{other}' is unsupported"
+            )));
+        }
+    };
     let mut remaining_tokens = budget_tokens;
     let summary_message =
         relevant_memory_summary_context_message(&relevant_facts.facts, &mut remaining_tokens);
@@ -6013,7 +6073,7 @@ fn memory_prompt_context(
     })
 }
 
-fn relevant_memory_facts(
+fn relevant_memory_facts_fts(
     global_memory: &mut MemoryDatabase,
     workspace_memory: &mut MemoryDatabase,
     chat_id: Option<&str>,
@@ -6043,7 +6103,7 @@ fn relevant_memory_facts(
             MEMORY_CONTEXT_FACT_LIMIT,
         )
         .map_err(ApiError::from_memory_error)?;
-    let mut facts = ranked_memory_facts(
+    let facts = ranked_memory_facts(
         merged_relevant_memory_search_matches(
             workspace_facts,
             workspace_containing_facts,
@@ -6055,6 +6115,92 @@ fn relevant_memory_facts(
             &search.contains_terms,
         ),
     );
+    finish_relevant_memory_facts(facts, global_memory, workspace_memory)
+}
+
+async fn relevant_memory_facts_llm(
+    config: &GlobalConfig,
+    workspace_path: &Path,
+    global_memory_database_file: &Path,
+    candidates: Vec<MemoryFactRecord>,
+    query_text: Option<&str>,
+    chat_model: &ModelSettings,
+    chat_provider: &ProviderSettings,
+) -> Result<RelevantMemoryFacts, ApiError> {
+    let query_text = query_text.map(str::trim).filter(|value| !value.is_empty());
+    let Some(query_text) = query_text else {
+        return Ok(RelevantMemoryFacts { facts: Vec::new() });
+    };
+
+    if candidates.is_empty() {
+        return Ok(RelevantMemoryFacts { facts: Vec::new() });
+    }
+
+    let (model_id, provider_config, max_output_tokens) =
+        memory_retrieval_provider_for_model(config, chat_model, chat_provider)?;
+    let request =
+        memory_retrieval_provider_request(&model_id, max_output_tokens, query_text, &candidates)?;
+    let output = call_memory_retrieval_provider(&provider_config, request).await?;
+    let selected = parse_memory_retrieval_output(output)?;
+    let mut by_key = candidates
+        .into_iter()
+        .map(|fact| (memory_fact_key(&fact), fact))
+        .collect::<HashMap<_, _>>();
+    let mut facts = Vec::new();
+    let mut seen = HashSet::new();
+
+    for fact_key in selected.fact_keys {
+        let fact_key = fact_key.trim();
+        if fact_key.is_empty() || !seen.insert(fact_key.to_string()) {
+            continue;
+        }
+        let fact = by_key.remove(fact_key).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "memory retrieval model returned unknown fact key '{fact_key}'"
+            ))
+        })?;
+        facts.push(RetrievedMemoryFact {
+            fact,
+            source: RetrievedMemorySource::Direct,
+            rank: facts.len(),
+        });
+    }
+
+    let mut workspace_memory =
+        MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
+            .map_err(ApiError::from_memory_error)?;
+    let mut global_memory = MemoryDatabase::open_or_create_global_at(global_memory_database_file)
+        .map_err(ApiError::from_memory_error)?;
+
+    finish_relevant_memory_facts(facts, &mut global_memory, &mut workspace_memory)
+}
+
+fn llm_memory_retrieval_candidates(
+    global_memory: &MemoryDatabase,
+    workspace_memory: &MemoryDatabase,
+    chat_id: Option<&str>,
+) -> Result<Vec<MemoryFactRecord>, ApiError> {
+    let workspace_facts = workspace_memory
+        .list_active_facts_for_scope(chat_id, MEMORY_RETRIEVAL_LLM_FACT_LIMIT.saturating_add(1))
+        .map_err(ApiError::from_memory_error)?;
+    let global_facts = global_memory
+        .list_active_facts_for_scope(None, MEMORY_RETRIEVAL_LLM_FACT_LIMIT.saturating_add(1))
+        .map_err(ApiError::from_memory_error)?;
+    let total = workspace_facts.len().saturating_add(global_facts.len());
+    if total > MEMORY_RETRIEVAL_LLM_FACT_LIMIT as usize {
+        return Err(ApiError::bad_request(format!(
+            "model-based memory retrieval supports at most {MEMORY_RETRIEVAL_LLM_FACT_LIMIT} active memories, found {total}; use SQLite FTS or reduce active memories"
+        )));
+    }
+
+    Ok(workspace_facts.into_iter().chain(global_facts).collect())
+}
+
+fn finish_relevant_memory_facts(
+    mut facts: Vec<RetrievedMemoryFact>,
+    global_memory: &mut MemoryDatabase,
+    workspace_memory: &mut MemoryDatabase,
+) -> Result<RelevantMemoryFacts, ApiError> {
     let workspace_seed_ids = facts
         .iter()
         .filter(|fact| fact.fact.scope != "global")
@@ -6104,6 +6250,136 @@ fn relevant_memory_facts(
     facts.retain(|fact| seen_fact_keys.insert((fact.fact.scope.clone(), fact.fact.id.clone())));
 
     Ok(RelevantMemoryFacts { facts })
+}
+
+fn memory_fact_key(fact: &MemoryFactRecord) -> String {
+    format!("{}:{}", fact.scope, fact.id)
+}
+
+fn memory_retrieval_provider_for_model(
+    config: &GlobalConfig,
+    chat_model: &ModelSettings,
+    chat_provider: &ProviderSettings,
+) -> Result<(String, ProviderConnectionConfig, u32), ApiError> {
+    let model = match config.memory.retrieval_model_id.as_deref() {
+        Some(model_id) => config
+            .models
+            .iter()
+            .find(|model| model.id == model_id)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("memory retrieval model was not found: {model_id}"))
+            })?,
+        None => chat_model,
+    };
+
+    if !model.enabled {
+        return Err(ApiError::bad_request(format!(
+            "memory retrieval model '{}' is disabled",
+            model.id
+        )));
+    }
+    let limits = model.limits.as_ref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "memory retrieval model '{}' is missing limits",
+            model.id
+        ))
+    })?;
+
+    let provider = match config.memory.retrieval_model_id.as_deref() {
+        None if model.id == chat_model.id => chat_provider,
+        _ => {
+            let provider_id = model.active_provider_id.as_deref().ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "memory retrieval model '{}' has no active provider selected",
+                    model.id
+                ))
+            })?;
+            if !model.provider_ids.iter().any(|id| id == provider_id) {
+                return Err(ApiError::bad_request(format!(
+                    "active provider '{}' is not associated with memory retrieval model '{}'",
+                    provider_id, model.id
+                )));
+            }
+            config
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "memory retrieval provider '{}' was not found",
+                        provider_id
+                    ))
+                })?
+        }
+    };
+
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "memory retrieval provider '{}' is disabled",
+            provider.id
+        )));
+    }
+
+    let max_output_tokens = u32::try_from(limits.max_output_tokens)
+        .map_err(|_| {
+            ApiError::bad_request(format!(
+                "memory retrieval model '{}' max output tokens exceed u32: {}",
+                model.id, limits.max_output_tokens
+            ))
+        })?
+        .min(MEMORY_RETRIEVAL_MAX_OUTPUT_TOKENS);
+
+    Ok((
+        model.id.clone(),
+        provider_connection_config(provider)?,
+        max_output_tokens,
+    ))
+}
+
+fn memory_retrieval_provider_request(
+    model_id: &str,
+    max_output_tokens: u32,
+    query_text: &str,
+    candidates: &[MemoryFactRecord],
+) -> Result<NeutralChatRequest, ApiError> {
+    let memories_json = serde_json::to_string_pretty(
+        &candidates
+            .iter()
+            .map(|fact| {
+                json!({
+                    "factKey": memory_fact_key(fact),
+                    "scope": &fact.scope,
+                    "chatId": &fact.chat_id,
+                    "kind": &fact.kind,
+                    "pinned": fact.pinned,
+                    "updatedAt": &fact.updated_at,
+                    "fact": &fact.fact,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize memory retrieval candidates: {source}"
+        ))
+    })?;
+
+    Ok(NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages: vec![
+            neutral_text_message(
+                NeutralChatRole::System,
+                MEMORY_RETRIEVAL_SYSTEM_PROMPT.to_string(),
+            ),
+            neutral_text_message(
+                NeutralChatRole::User,
+                format!("User request:\n{query_text}\n\nMemory candidates JSON:\n{memories_json}"),
+            ),
+        ],
+        tools: vec![memory_retrieval_tool_definition()],
+        thinking_level: None,
+        max_output_tokens: Some(max_output_tokens),
+    })
 }
 
 fn relevant_memory_summary_context_message(
@@ -8359,6 +8635,29 @@ fn memory_extraction_tool_definition() -> NeutralToolDefinition {
     }
 }
 
+fn memory_retrieval_tool_definition() -> NeutralToolDefinition {
+    NeutralToolDefinition {
+        name: MEMORY_RETRIEVAL_TOOL_NAME.to_string(),
+        description: "Submit selected relevant Foco memory fact keys for the current user request."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "factKeys": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Relevant memory fact keys from the candidate list, ordered by injection priority. Use an empty array when no memory is relevant."
+                }
+            },
+            "required": ["factKeys"]
+        }),
+        strict: true,
+    }
+}
+
 async fn call_memory_extraction_provider(
     provider_config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
@@ -8446,9 +8745,102 @@ async fn call_memory_extraction_provider(
     })
 }
 
+async fn call_memory_retrieval_provider(
+    provider_config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+) -> Result<Value, ApiError> {
+    let mut stream = timeout(
+        Duration::from_millis(MEMORY_RETRIEVAL_TIMEOUT_MS),
+        stream_chat(provider_config, request),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::internal(format!(
+            "memory retrieval timed out after {MEMORY_RETRIEVAL_TIMEOUT_MS} ms"
+        ))
+    })?
+    .map_err(ApiError::from_provider_config_error)?;
+    let mut output_text = String::new();
+    let mut tool_arguments = None;
+
+    loop {
+        let Some(event) = timeout(
+            Duration::from_millis(MEMORY_RETRIEVAL_TIMEOUT_MS),
+            stream.next_event(),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::internal(format!(
+                "memory retrieval timed out after {MEMORY_RETRIEVAL_TIMEOUT_MS} ms"
+            ))
+        })?
+        else {
+            break;
+        };
+
+        match event.map_err(ApiError::from_provider_config_error)? {
+            NeutralChatStreamEvent::Start
+            | NeutralChatStreamEvent::ReasoningDelta { .. }
+            | NeutralChatStreamEvent::ThoughtSignatureDelta { .. }
+            | NeutralChatStreamEvent::Usage { .. } => {}
+            NeutralChatStreamEvent::TextDelta { delta } => output_text.push_str(&delta),
+            NeutralChatStreamEvent::ToolCall { tool_call } => {
+                if tool_call.name != MEMORY_RETRIEVAL_TOOL_NAME {
+                    return Err(ApiError::internal(format!(
+                        "memory retrieval called unsupported tool '{}'",
+                        tool_call.name
+                    )));
+                }
+                tool_arguments = Some(tool_call.arguments);
+            }
+            NeutralChatStreamEvent::Complete {
+                tool_calls, text, ..
+            } => {
+                if tool_arguments.is_none() {
+                    for tool_call in tool_calls {
+                        if tool_call.name != MEMORY_RETRIEVAL_TOOL_NAME {
+                            return Err(ApiError::internal(format!(
+                                "memory retrieval completed with unsupported tool '{}'",
+                                tool_call.name
+                            )));
+                        }
+                        tool_arguments = Some(tool_call.arguments);
+                    }
+                }
+                if !text.trim().is_empty() {
+                    output_text.push_str(&text);
+                }
+                break;
+            }
+            NeutralChatStreamEvent::Error { message } => {
+                return Err(ApiError::internal(format!(
+                    "memory retrieval stream error: {message}"
+                )));
+            }
+        }
+    }
+
+    tool_arguments.ok_or_else(|| {
+        let text = output_text.trim();
+        if text.is_empty() {
+            ApiError::internal("memory retrieval did not call select tool")
+        } else {
+            ApiError::internal(format!(
+                "memory retrieval returned text instead of select tool call: {text}"
+            ))
+        }
+    })
+}
+
 fn parse_memory_extraction_output(value: Value) -> Result<MemoryExtractionOutput, ApiError> {
     serde_json::from_value(value).map_err(|source| {
         ApiError::bad_request(format!("malformed memory extraction JSON: {source}"))
+    })
+}
+
+fn parse_memory_retrieval_output(value: Value) -> Result<MemoryRetrievalOutput, ApiError> {
+    serde_json::from_value(value).map_err(|source| {
+        ApiError::bad_request(format!("malformed memory retrieval JSON: {source}"))
     })
 }
 
@@ -11527,8 +11919,10 @@ async fn settings_response(
         memory: MemorySettingsSummary {
             enabled: config.memory.enabled,
             extraction_mode: config.memory.extraction_mode.clone(),
+            retrieval_mode: config.memory.retrieval_mode.clone(),
             retention_days: config.memory.retention_days,
             extraction_model_id: config.memory.extraction_model_id.clone(),
+            retrieval_model_id: config.memory.retrieval_model_id.clone(),
             extraction_modes: vec![
                 MemoryExtractionModeSummary {
                     value: "manual",
@@ -11545,6 +11939,16 @@ async fn settings_response(
                 MemoryExtractionModeSummary {
                     value: "disabled",
                     label: "Disabled",
+                },
+            ],
+            retrieval_modes: vec![
+                MemoryExtractionModeSummary {
+                    value: "fts",
+                    label: "SQLite FTS",
+                },
+                MemoryExtractionModeSummary {
+                    value: "llm",
+                    label: "Model matching",
                 },
             ],
         },
@@ -15651,8 +16055,10 @@ description: Project memory.
             memory_settings: MemorySettings {
                 enabled: true,
                 extraction_mode: "pending_review".to_string(),
+                retrieval_mode: "fts".to_string(),
                 retention_days: None,
                 extraction_model_id: Some("extract-model".to_string()),
+                retrieval_model_id: None,
             },
             memories_used: Vec::new(),
             memory_target_status: MemoryStatus::Pending,
@@ -15791,8 +16197,10 @@ description: Project memory.
             memory_settings: MemorySettings {
                 enabled: false,
                 extraction_mode: "manual".to_string(),
+                retrieval_mode: "fts".to_string(),
                 retention_days: None,
                 extraction_model_id: None,
+                retrieval_model_id: None,
             },
             memories_used: Vec::new(),
             memory_target_status: MemoryStatus::Pending,
@@ -15914,8 +16322,10 @@ description: Project memory.
             memory_settings: MemorySettings {
                 enabled: false,
                 extraction_mode: "manual".to_string(),
+                retrieval_mode: "fts".to_string(),
                 retention_days: None,
                 extraction_model_id: None,
+                retrieval_model_id: None,
             },
             memories_used: Vec::new(),
             memory_target_status: MemoryStatus::Pending,
@@ -16486,20 +16896,26 @@ description: Project memory.
         let pending_review_settings = MemorySettings {
             enabled: true,
             extraction_mode: "pending_review".to_string(),
+            retrieval_mode: "fts".to_string(),
             retention_days: None,
             extraction_model_id: None,
+            retrieval_model_id: None,
         };
         let automatic_settings = MemorySettings {
             enabled: true,
             extraction_mode: "automatic".to_string(),
+            retrieval_mode: "fts".to_string(),
             retention_days: None,
             extraction_model_id: None,
+            retrieval_model_id: None,
         };
         let manual_settings = MemorySettings {
             enabled: true,
             extraction_mode: "manual".to_string(),
+            retrieval_mode: "fts".to_string(),
             retention_days: None,
             extraction_model_id: None,
+            retrieval_model_id: None,
         };
 
         assert!(should_queue_memory_extraction(&pending_review_settings));
@@ -17556,6 +17972,44 @@ Use the existing product UI conventions.
         remove_dir_if_exists(&profile_dir);
     }
 
+    #[test]
+    fn model_memory_retrieval_rejects_too_many_active_memories() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-llm-limit-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let workspace_database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let mut workspace_memory =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        let global_memory =
+            MemoryDatabase::open_or_create_global_at(workspace_dir.join("global-memory.sqlite"))
+                .expect("global memory database");
+
+        for index in 0..=MEMORY_RETRIEVAL_LLM_FACT_LIMIT {
+            insert_test_memory_fact(
+                &mut workspace_memory,
+                &format!("source-llm-limit-{index}"),
+                &format!("fact-llm-limit-{index}"),
+                MemoryScope::Workspace,
+                None,
+                &format!("LLM retrieval limit memory {index}."),
+                false,
+            );
+        }
+
+        let error = llm_memory_retrieval_candidates(&global_memory, &workspace_memory, None)
+            .expect_err("too many active memories should fail");
+
+        assert!(error.message.contains("at most"));
+        assert!(error.message.contains("use SQLite FTS"));
+
+        drop(workspace_memory);
+        drop(global_memory);
+        drop(workspace_database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
     #[tokio::test]
     async fn context_usage_preview_does_not_persist_chat_messages() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-context-usage-workspace-test"));
@@ -17888,7 +18342,9 @@ description: Project memory.
             memory_settings: MemorySettings {
                 enabled: true,
                 extraction_mode: "pending_review".to_string(),
+                retrieval_mode: "fts".to_string(),
                 extraction_model_id: None,
+                retrieval_model_id: None,
                 retention_days: None,
             },
         }
