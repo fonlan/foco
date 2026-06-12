@@ -1344,6 +1344,24 @@ body,
   background: #ef4444;
 }
 
+.chat-diff-stats {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.25rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.chat-diff-add {
+  color: #15803d;
+}
+
+.chat-diff-delete {
+  color: #be123c;
+}
+
 .context-list-dot-green,
 .terminal-status-dot-running {
   background: var(--foco-success);

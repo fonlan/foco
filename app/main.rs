@@ -4659,6 +4659,15 @@ struct GitDiffResponse {
     files: Vec<GitStatusFileSummary>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct GitDiffFileLineStats {
+    additions: usize,
+    deletions: usize,
+    fingerprint: String,
+}
+
+type GitDiffStatsByFile = BTreeMap<String, GitDiffFileLineStats>;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GitBranchesResponse {
@@ -4842,6 +4851,7 @@ struct PreparedChatContext {
     active_tool_start_index: usize,
     hook_context_messages: Vec<String>,
     hook_notifications: Vec<HookNotification>,
+    initial_git_diff_stats: Option<GitDiffStatsByFile>,
 }
 
 struct PreparedPromptContext {
@@ -5800,6 +5810,12 @@ impl PreparedChatContext {
                                     );
                                     continue 'agent_turns;
                                 }
+                                let assistant_message_text = append_git_diff_summary(
+                                    &assistant_message_text,
+                                    &self.initial_git_diff_stats,
+                                    &self.workspace_path,
+                                    &self.global_config.app.language,
+                                );
                                 let total_latency_ms = elapsed_millis(started_at);
                                 let metrics = ChatReplyMetrics {
                                     model_id: self.model_id.clone(),
@@ -6705,6 +6721,7 @@ async fn prepare_chat_context(
     )?);
     provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
     let request_body_json = serialize_provider_request(&provider_request)?;
+    let initial_git_diff_stats = git_diff_stats_for_workspace(&prompt_context.workspace_path);
 
     Ok(PreparedChatContext {
         workspace_id: prompt_context.workspace_id,
@@ -6738,6 +6755,7 @@ async fn prepare_chat_context(
         active_tool_start_index: prompt_context.active_tool_start_index,
         hook_context_messages,
         hook_notifications,
+        initial_git_diff_stats,
     })
 }
 
@@ -15866,6 +15884,169 @@ fn assistant_message_text(assistant_text: &str, tool_calls: &[ExecutedToolCall])
     }
 }
 
+fn git_diff_stats_for_workspace(workspace_path: &Path) -> Option<GitDiffStatsByFile> {
+    let diff = git_diff_response(workspace_path, None).ok()?;
+    Some(git_diff_stats(&diff))
+}
+
+fn git_diff_stats(diff: &GitDiffResponse) -> GitDiffStatsByFile {
+    let mut stats = BTreeMap::new();
+    collect_git_diff_file_stats(&diff.staged_diff, &mut stats);
+    collect_git_diff_file_stats(&diff.diff, &mut stats);
+    stats
+}
+
+fn collect_git_diff_file_stats(diff_text: &str, stats: &mut GitDiffStatsByFile) {
+    let mut current_path: Option<String> = None;
+
+    for line in diff_text.lines() {
+        if line.starts_with("diff --git ") {
+            current_path = path_from_diff_header(line);
+            continue;
+        }
+
+        let Some(path) = current_path.as_ref() else {
+            continue;
+        };
+
+        if line.starts_with("+++ ") {
+            if let Some(marker_path) = path_from_diff_marker(line) {
+                current_path = Some(marker_path);
+            }
+            continue;
+        }
+
+        if line.starts_with("@@") || line.starts_with('\\') {
+            let entry = stats.entry(path.clone()).or_default();
+            entry.fingerprint.push_str(line);
+            entry.fingerprint.push('\n');
+            continue;
+        }
+
+        if line.starts_with("--- ") {
+            continue;
+        }
+
+        if line.starts_with("Binary files ") {
+            let entry = stats.entry(path.clone()).or_default();
+            entry.fingerprint.push_str(line);
+            entry.fingerprint.push('\n');
+            continue;
+        }
+
+        if line.starts_with('+') {
+            let entry = stats.entry(path.clone()).or_default();
+            entry.additions += 1;
+            entry.fingerprint.push_str(line);
+            entry.fingerprint.push('\n');
+            continue;
+        }
+
+        if line.starts_with('-') {
+            let entry = stats.entry(path.clone()).or_default();
+            entry.deletions += 1;
+            entry.fingerprint.push_str(line);
+            entry.fingerprint.push('\n');
+        }
+    }
+}
+
+fn append_git_diff_summary(
+    assistant_text: &str,
+    initial_stats: &Option<GitDiffStatsByFile>,
+    workspace_path: &Path,
+    language: &str,
+) -> String {
+    let Some(initial_stats) = initial_stats else {
+        return assistant_text.to_string();
+    };
+    let Some(final_stats) = git_diff_stats_for_workspace(workspace_path) else {
+        return assistant_text.to_string();
+    };
+    let changed_files = git_diff_changed_files(initial_stats, &final_stats);
+    if changed_files.is_empty() {
+        return assistant_text.to_string();
+    }
+
+    let mut text = assistant_text.trim_end().to_string();
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    if language == "zh-CN" {
+        text.push_str("### 本轮代码改动\n\n");
+        for file in changed_files {
+            text.push_str("- ");
+            text.push_str(&markdown_inline_code(&file.0));
+            text.push_str(": +");
+            text.push_str(&file.1.additions.to_string());
+            text.push_str(" / -");
+            text.push_str(&file.1.deletions.to_string());
+            text.push('\n');
+        }
+    } else {
+        text.push_str("### Code changes in this turn\n\n");
+        for file in changed_files {
+            text.push_str("- ");
+            text.push_str(&markdown_inline_code(&file.0));
+            text.push_str(": +");
+            text.push_str(&file.1.additions.to_string());
+            text.push_str(" / -");
+            text.push_str(&file.1.deletions.to_string());
+            text.push('\n');
+        }
+    }
+    text
+}
+
+fn git_diff_changed_files(
+    initial_stats: &GitDiffStatsByFile,
+    final_stats: &GitDiffStatsByFile,
+) -> Vec<(String, GitDiffFileLineStats)> {
+    let mut changed_files = BTreeMap::new();
+
+    for (path, final_file_stats) in final_stats {
+        if initial_stats.get(path) != Some(final_file_stats) {
+            changed_files.insert(path.clone(), final_file_stats.clone());
+        }
+    }
+
+    for path in initial_stats.keys() {
+        if !final_stats.contains_key(path) {
+            changed_files.insert(path.clone(), GitDiffFileLineStats::default());
+        }
+    }
+
+    changed_files.into_iter().collect()
+}
+
+fn path_from_diff_header(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("diff --git a/")?;
+    let marker_index = rest.find(" b/")?;
+    Some(rest[..marker_index].to_string())
+}
+
+fn path_from_diff_marker(line: &str) -> Option<String> {
+    let marker = line.get(4..)?;
+    if marker == "/dev/null" {
+        return None;
+    }
+
+    marker
+        .strip_prefix("a/")
+        .or_else(|| marker.strip_prefix("b/"))
+        .or(Some(marker))
+        .map(str::to_string)
+}
+
+fn markdown_inline_code(value: &str) -> String {
+    let value = markdown_safe_single_line(value);
+    if value.contains('`') {
+        format!("`` {value} ``")
+    } else {
+        format!("`{value}`")
+    }
+}
+
 fn assistant_reasoning_from_metadata(metadata_json: &str) -> Result<Option<String>, ApiError> {
     let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
     let Some(reasoning) = metadata.get("reasoning") else {
@@ -18340,6 +18521,7 @@ description:
             active_tool_start_index: 1,
             hook_context_messages: Vec::new(),
             hook_notifications: Vec::new(),
+            initial_git_diff_stats: None,
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -18489,6 +18671,7 @@ description:
             active_tool_start_index: 1,
             hook_context_messages: Vec::new(),
             hook_notifications: Vec::new(),
+            initial_git_diff_stats: None,
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -18615,6 +18798,7 @@ description:
             active_tool_start_index: 1,
             hook_context_messages: Vec::new(),
             hook_notifications: Vec::new(),
+            initial_git_diff_stats: None,
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -18670,6 +18854,63 @@ description:
 
         drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn git_diff_changed_files_lists_only_files_changed_since_turn_start() {
+        let initial = GitDiffResponse {
+            path: None,
+            status: String::new(),
+            staged_diff: String::new(),
+            diff: [
+                "diff --git a/README.md b/README.md",
+                "--- a/README.md",
+                "+++ b/README.md",
+                "@@ -1 +1 @@",
+                "-old",
+                "+new",
+                "",
+            ]
+            .join("\n"),
+            files: Vec::new(),
+        };
+        let final_diff = GitDiffResponse {
+            path: None,
+            status: String::new(),
+            staged_diff: String::new(),
+            diff: [
+                "diff --git a/README.md b/README.md",
+                "--- a/README.md",
+                "+++ b/README.md",
+                "@@ -1 +1 @@",
+                "-old",
+                "+new",
+                "diff --git a/app/main.rs b/app/main.rs",
+                "--- a/app/main.rs",
+                "+++ b/app/main.rs",
+                "@@ -0,0 +1,2 @@",
+                "+line one",
+                "+line two",
+                "",
+            ]
+            .join("\n"),
+            files: Vec::new(),
+        };
+
+        let changed_files =
+            git_diff_changed_files(&git_diff_stats(&initial), &git_diff_stats(&final_diff));
+
+        assert_eq!(changed_files.len(), 1);
+        assert_eq!(changed_files[0].0, "app/main.rs");
+        assert_eq!(changed_files[0].1.additions, 2);
+        assert_eq!(changed_files[0].1.deletions, 0);
+
+        let cleared_files = git_diff_changed_files(&git_diff_stats(&initial), &BTreeMap::new());
+
+        assert_eq!(cleared_files.len(), 1);
+        assert_eq!(cleared_files[0].0, "README.md");
+        assert_eq!(cleared_files[0].1.additions, 0);
+        assert_eq!(cleared_files[0].1.deletions, 0);
     }
 
     #[test]

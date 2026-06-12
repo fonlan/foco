@@ -549,6 +549,48 @@ const gitDiff = {
   status: " M README.md\n?? new-note.txt\n M asset.bin\n",
 };
 
+const emptyGitDiff = {
+  diff: "",
+  files: [],
+  path: null,
+  stagedDiff: "",
+  status: "",
+};
+
+const generatedGitDiff = {
+  diff: [
+    "diff --git a/web/App.tsx b/web/App.tsx",
+    "--- a/web/App.tsx",
+    "+++ b/web/App.tsx",
+    "@@ -1 +1,2 @@",
+    "-old component",
+    "+new component",
+    "+extra line",
+    "diff --git a/app/main.rs b/app/main.rs",
+    "--- a/app/main.rs",
+    "+++ b/app/main.rs",
+    "@@ -4 +4 @@",
+    "-old handler",
+    "+new handler",
+    "",
+  ].join("\n"),
+  files: [
+    {
+      indexStatus: " ",
+      path: "web/App.tsx",
+      worktreeStatus: "M",
+    },
+    {
+      indexStatus: " ",
+      path: "app/main.rs",
+      worktreeStatus: "M",
+    },
+  ],
+  path: null,
+  stagedDiff: "",
+  status: " M web/App.tsx\n M app/main.rs\n",
+};
+
 const chatMessages = {
   messages: [
     {
@@ -820,6 +862,7 @@ let activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | nu
   null;
 let terminalSessionCounter = 0;
 let chatStreamCounter = 0;
+let workspaceGitDiffResponse = gitDiff;
 
 function savedGeneralSettings(init?: RequestInit) {
   const body =
@@ -867,6 +910,7 @@ describe("App verification surfaces", () => {
     activeChatStreamController = null;
     terminalSessionCounter = 0;
     chatStreamCounter = 0;
+    workspaceGitDiffResponse = gitDiff;
     window.history.replaceState(null, "", "/");
     window.localStorage.clear();
     document.documentElement.removeAttribute("data-foco-theme");
@@ -2075,6 +2119,56 @@ describe("App verification surfaces", () => {
     );
 
     expect(statusDot()).toHaveClass("session-status-dot-idle");
+  });
+
+  it("shows live code line changes beside the active workspace chat time", async () => {
+    workspaceGitDiffResponse = emptyGitDiff;
+    render(<App />);
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyTitle = await within(workspaceList).findByText("Tool run");
+    const historyButton = historyTitle.closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+
+    await userEvent.click(historyButton);
+    await screen.findByText("Please inspect README.");
+    expect(
+      within(historyButton).queryByLabelText("Code changes +3 -2"),
+    ).not.toBeInTheDocument();
+
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    workspaceGitDiffResponse = generatedGitDiff;
+    await act(async () => {
+      enqueueChatStreamEvent({
+        type: "gitDiffRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
+
+    expect(
+      await within(historyButton).findByLabelText("Code changes +3 -2"),
+    ).toBeInTheDocument();
+    expect(within(historyButton).getByText("+3")).toHaveClass("chat-diff-add");
+    expect(within(historyButton).getByText("-2")).toHaveClass(
+      "chat-diff-delete",
+    );
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+
+    await waitFor(() =>
+      expect(
+        within(historyButton).getByLabelText("Code changes +3 -2"),
+      ).toBeInTheDocument(),
+    );
   });
 
   it("shows chat tab scroll controls only when tabs overflow and supports wheel scrolling", async () => {
@@ -3403,23 +3497,25 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   if (path === "/api/workspaces/workspace-1/git/diff") {
     const selectedPath = requestUrl.searchParams.get("path");
     if (!selectedPath) {
-      return jsonResponse(gitDiff);
+      return jsonResponse(workspaceGitDiffResponse);
     }
 
-    const file = gitDiff.files.find((summary) => summary.path === selectedPath);
+    const file = workspaceGitDiffResponse.files.find(
+      (summary) => summary.path === selectedPath,
+    );
     const escapedPath = selectedPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const sectionMatch = gitDiff.diff.match(
+    const sectionMatch = workspaceGitDiffResponse.diff.match(
       new RegExp(`diff --git a/${escapedPath} b/${escapedPath}[\\s\\S]*?(?=diff --git a/|$)`),
     );
 
     return jsonResponse({
-      ...gitDiff,
+      ...workspaceGitDiffResponse,
       diff: sectionMatch?.[0] ?? "",
-      files: gitDiff.files,
+      files: workspaceGitDiffResponse.files,
       path: selectedPath,
       status: file
         ? `${file.indexStatus}${file.worktreeStatus} ${file.path}\n`
-        : gitDiff.status,
+        : workspaceGitDiffResponse.status,
     });
   }
 
