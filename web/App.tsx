@@ -512,6 +512,7 @@ type ConfiguredSkillSummary = {
   workspaceId: string | null;
   workspaceName: string | null;
   enabled: boolean;
+  canEnable: boolean;
   warnings: string[];
 };
 
@@ -5573,6 +5574,7 @@ function ChatPanel({
       : skills.filter((skill) => {
           const query = skillQuery.toLowerCase();
           return (
+            skill.canEnable &&
             !selectedSkillSet.has(skill.key) &&
             (skill.name.toLowerCase().includes(query) ||
               skill.id.toLowerCase().includes(query) ||
@@ -15253,7 +15255,7 @@ function SettingsPanel({
                             })}
                             checked={enabled}
                             className="peer sr-only"
-                            disabled={isSavingSkills}
+                            disabled={isSavingSkills || !skill.canEnable}
                             onChange={(event) =>
                               toggleSkill(skill.key, event.target.checked)
                             }

@@ -2214,7 +2214,7 @@ async fn save_skills(
 
     config.skills.directories.clear();
     config.skills.detected = discovery.skills;
-    config.skills.disabled = disabled;
+    config.skills.disabled = merge_disabled_skill_keys(disabled, &discovery.required_disabled);
     refresh_derived_enabled_skills(&mut config);
 
     save_config(&state, config.clone())?;
@@ -2227,6 +2227,8 @@ async fn refresh_skills(State(state): State<AppState>) -> Result<Json<SettingsRe
     let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
 
     config.skills.detected = discovery.skills;
+    config.skills.disabled =
+        merge_disabled_skill_keys(config.skills.disabled.clone(), &discovery.required_disabled);
     refresh_derived_enabled_skills(&mut config);
 
     save_config(&state, config.clone())?;
@@ -4255,6 +4257,7 @@ struct ConfiguredSkillSummary {
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     enabled: bool,
+    can_enable: bool,
     warnings: Vec<String>,
 }
 
@@ -13834,6 +13837,11 @@ fn skills_settings_summary(
         .map(String::as_str)
         .collect::<HashSet<_>>();
     let discovery = discover_skills(user_profile_dir, &config.workspaces);
+    let required_disabled_skill_ids = discovery
+        .required_disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
 
     SkillsSettingsSummary {
         directories: skill_search_roots(user_profile_dir, &config.workspaces)
@@ -13844,14 +13852,23 @@ fn skills_settings_summary(
             .skills
             .iter()
             .map(|skill| {
-                configured_skill_summary(skill, !skill_is_disabled(skill, &disabled_skill_ids))
+                let can_enable = !skill_is_required_disabled(skill, &required_disabled_skill_ids);
+                configured_skill_summary(
+                    skill,
+                    can_enable && !skill_is_disabled(skill, &disabled_skill_ids),
+                    can_enable,
+                )
             })
             .collect(),
         errors: discovery.errors,
     }
 }
 
-fn configured_skill_summary(skill: &SkillSettings, enabled: bool) -> ConfiguredSkillSummary {
+fn configured_skill_summary(
+    skill: &SkillSettings,
+    enabled: bool,
+    can_enable: bool,
+) -> ConfiguredSkillSummary {
     ConfiguredSkillSummary {
         key: skill.key.clone(),
         id: skill.id.clone(),
@@ -13862,15 +13879,21 @@ fn configured_skill_summary(skill: &SkillSettings, enabled: bool) -> ConfiguredS
         workspace_id: skill.workspace_id.clone(),
         workspace_name: skill.workspace_name.clone(),
         enabled,
-        warnings: skill_warnings(skill, enabled),
+        can_enable,
+        warnings: skill_warnings(skill, enabled, can_enable),
     }
 }
 
-fn skill_warnings(skill: &SkillSettings, enabled: bool) -> Vec<String> {
+fn skill_warnings(skill: &SkillSettings, enabled: bool, can_enable: bool) -> Vec<String> {
     let mut warnings = Vec::new();
 
     if !enabled {
         warnings.push("Skill is disabled.".to_string());
+    }
+
+    if !can_enable {
+        warnings
+            .push("Skill frontmatter is invalid and must be fixed before enabling.".to_string());
     }
 
     if let Err(message) = parse_skill_file(&skill.path) {
@@ -13902,12 +13925,11 @@ fn message_with_selected_skills(
         .map(String::as_str)
         .collect::<HashSet<_>>();
     let discovery = discover_skills(user_profile_dir, &config.workspaces);
-    if let Some(error) = discovery.errors.first() {
-        return Err(ApiError::bad_request(format!(
-            "skill discovery failed for {}: {}",
-            error.path, error.message
-        )));
-    }
+    let required_disabled_ids = discovery
+        .required_disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
 
     let available_skills = discovery
         .skills
@@ -13924,7 +13946,9 @@ fn message_with_selected_skills(
             Some(skill) => skill,
             None => unique_skill_by_legacy_id(&available_skills, &skill_key)?,
         };
-        if skill_is_disabled(skill, &disabled_ids) {
+        if skill_is_disabled(skill, &disabled_ids)
+            || skill_is_required_disabled(skill, &required_disabled_ids)
+        {
             return Err(ApiError::bad_request(format!(
                 "selected skill '{}' is disabled",
                 skill.key
@@ -13948,6 +13972,7 @@ fn message_with_selected_skills(
 struct SkillDiscovery {
     skills: Vec<SkillSettings>,
     errors: Vec<SkillDiscoveryErrorSummary>,
+    required_disabled: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -14044,6 +14069,25 @@ fn normalize_manual_disabled_skill_ids(
     Ok(Vec::new())
 }
 
+fn merge_disabled_skill_keys(
+    existing_disabled: Vec<String>,
+    required_disabled: &[String],
+) -> Vec<String> {
+    let mut disabled = Vec::new();
+    let mut seen = HashSet::new();
+
+    for key in existing_disabled
+        .into_iter()
+        .chain(required_disabled.iter().cloned())
+    {
+        if seen.insert(key.clone()) {
+            disabled.push(key);
+        }
+    }
+
+    disabled
+}
+
 fn refresh_derived_enabled_skills(config: &mut GlobalConfig) {
     let disabled_ids = config
         .skills
@@ -14064,6 +14108,8 @@ fn refresh_derived_enabled_skills(config: &mut GlobalConfig) {
 fn discover_skills(user_profile_dir: &Path, workspaces: &[WorkspaceConfig]) -> SkillDiscovery {
     let mut skills = Vec::new();
     let mut errors = Vec::new();
+    let mut invalid_skills = Vec::new();
+    let mut required_disabled = Vec::new();
     let mut seen_keys = HashSet::new();
 
     for root in skill_search_roots(user_profile_dir, workspaces) {
@@ -14094,23 +14140,29 @@ fn discover_skills(user_profile_dir: &Path, workspaces: &[WorkspaceConfig]) -> S
                         continue;
                     }
 
-                    skills.push(SkillSettings {
-                        key,
-                        id: parsed.id,
-                        name: parsed.name,
-                        description: parsed.description,
-                        path,
-                        scope: root.scope.to_string(),
-                        workspace_id: root.workspace_id.clone(),
-                        workspace_name: root.workspace_name.clone(),
+                    skills.push(skill_settings_from_parsed(&root, path, parsed));
+                }
+                Err(message) => {
+                    if let Some(skill) = disabled_skill_settings_from_invalid_file(&root, &path) {
+                        invalid_skills.push(skill);
+                    }
+                    errors.push(SkillDiscoveryErrorSummary {
+                        path: path.display().to_string(),
+                        message,
                     });
                 }
-                Err(message) => errors.push(SkillDiscoveryErrorSummary {
-                    path: path.display().to_string(),
-                    message,
-                }),
             }
         }
+    }
+
+    let mut seen_invalid_keys = HashSet::new();
+    for skill in invalid_skills {
+        if seen_keys.contains(skill.key.as_str()) || !seen_invalid_keys.insert(skill.key.clone()) {
+            continue;
+        }
+
+        required_disabled.push(skill.key.clone());
+        skills.push(skill);
     }
 
     skills.sort_by(|left, right| {
@@ -14121,7 +14173,52 @@ fn discover_skills(user_profile_dir: &Path, workspaces: &[WorkspaceConfig]) -> S
             .then_with(|| left.path.cmp(&right.path))
     });
 
-    SkillDiscovery { skills, errors }
+    required_disabled.sort();
+    required_disabled.dedup();
+
+    SkillDiscovery {
+        skills,
+        errors,
+        required_disabled,
+    }
+}
+
+fn skill_settings_from_parsed(
+    root: &SkillSearchRoot,
+    path: PathBuf,
+    parsed: ParsedSkillFile,
+) -> SkillSettings {
+    let key = skill_key(root, &parsed.id);
+
+    SkillSettings {
+        key,
+        id: parsed.id,
+        name: parsed.name,
+        description: parsed.description,
+        path,
+        scope: root.scope.to_string(),
+        workspace_id: root.workspace_id.clone(),
+        workspace_name: root.workspace_name.clone(),
+    }
+}
+
+fn disabled_skill_settings_from_invalid_file(
+    root: &SkillSearchRoot,
+    path: &Path,
+) -> Option<SkillSettings> {
+    let id = parse_skill_file_id(path).ok()?;
+    let key = skill_key(root, &id);
+
+    Some(SkillSettings {
+        key,
+        id: id.clone(),
+        name: id,
+        description: "Invalid skill frontmatter.".to_string(),
+        path: path.to_path_buf(),
+        scope: root.scope.to_string(),
+        workspace_id: root.workspace_id.clone(),
+        workspace_name: root.workspace_name.clone(),
+    })
 }
 
 fn skill_search_roots(
@@ -14181,6 +14278,13 @@ fn skill_scope_label(root: &SkillSearchRoot) -> String {
 
 fn skill_is_disabled(skill: &SkillSettings, disabled_ids: &HashSet<&str>) -> bool {
     disabled_ids.contains(skill.key.as_str()) || disabled_ids.contains(skill.id.as_str())
+}
+
+fn skill_is_required_disabled(
+    skill: &SkillSettings,
+    required_disabled_ids: &HashSet<&str>,
+) -> bool {
+    required_disabled_ids.contains(skill.key.as_str())
 }
 
 fn skill_applies_to_workspace(skill: &SkillSettings, workspace_id: &str) -> bool {
@@ -14278,6 +14382,13 @@ fn parse_skill_file(path: &Path) -> Result<ParsedSkillFile, String> {
     parse_skill_markdown(path, &content)
 }
 
+fn parse_skill_file_id(path: &Path) -> Result<String, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|source| format!("failed to read skill file {}: {}", path.display(), source))?;
+
+    parse_skill_markdown_id(path, &content)
+}
+
 fn parse_skill_markdown(path: &Path, content: &str) -> Result<ParsedSkillFile, String> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut lines = content.lines();
@@ -14325,6 +14436,35 @@ fn parse_skill_markdown(path: &Path, content: &str) -> Result<ParsedSkillFile, S
         description,
         frontmatter: frontmatter.join("\n"),
     })
+}
+
+fn parse_skill_markdown_id(path: &Path, content: &str) -> Result<String, String> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let mut lines = content.lines();
+
+    if lines.next().map(str::trim) != Some("---") {
+        return Err(format!(
+            "skill file {} must start with YAML frontmatter delimiter '---'",
+            path.display()
+        ));
+    }
+
+    let mut frontmatter = Vec::new();
+    for line in lines.by_ref() {
+        if line.trim() == "---" {
+            let id = skill_frontmatter_field(path, &frontmatter, "name")?;
+            validate_skill_id(&id)
+                .map_err(|error| format!("skill file {}: {}", path.display(), error))?;
+            return Ok(id);
+        }
+
+        frontmatter.push(line);
+    }
+
+    Err(format!(
+        "skill file {} is missing closing YAML frontmatter delimiter '---'",
+        path.display()
+    ))
 }
 
 fn skill_frontmatter_field(
@@ -14415,16 +14555,17 @@ fn enabled_skill_frontmatter_messages(
         .map(String::as_str)
         .collect::<HashSet<_>>();
     let discovery = discover_skills(user_profile_dir, &config.workspaces);
-    if let Some(error) = discovery.errors.first() {
-        return Err(ApiError::bad_request(format!(
-            "skill discovery failed for {}: {}",
-            error.path, error.message
-        )));
-    }
+    let required_disabled_ids = discovery
+        .required_disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
 
     let mut entries = Vec::new();
     for skill in discovery.skills.iter().filter(|skill| {
-        skill_applies_to_workspace(skill, workspace_id) && !skill_is_disabled(skill, &disabled_ids)
+        skill_applies_to_workspace(skill, workspace_id)
+            && !skill_is_disabled(skill, &disabled_ids)
+            && !skill_is_required_disabled(skill, &required_disabled_ids)
     }) {
         let parsed = parse_skill_file(&skill.path).map_err(ApiError::bad_request)?;
 
@@ -16909,6 +17050,129 @@ description: Project memory.
                 .expect("enabled skill frontmatter messages");
 
         assert!(messages.is_empty());
+
+        fs::remove_dir_all(profile_dir).expect("remove skill test profile");
+    }
+
+    #[test]
+    fn invalid_frontmatter_skill_is_detected_as_disabled_only() {
+        let profile_dir = env::temp_dir().join(unique_id("foco-invalid-skill-profile-test"));
+        let workspace_dir = env::temp_dir().join(unique_id("foco-invalid-skill-workspace-test"));
+        let skill_dir = profile_dir.join(".agents").join("skills").join("broken");
+        let skill_file = skill_dir.join("SKILL.md");
+
+        fs::create_dir_all(&skill_dir).expect("skill test directory");
+        fs::write(
+            &skill_file,
+            "---
+name: broken
+description:
+---
+
+# Broken
+",
+        )
+        .expect("skill file write");
+
+        let config = GlobalConfig::first_run(workspace_dir);
+        let discovery = discover_skills(&profile_dir, &config.workspaces);
+
+        assert_eq!(discovery.skills.len(), 1);
+        assert_eq!(discovery.skills[0].key, "global:broken");
+        assert_eq!(discovery.required_disabled, vec!["global:broken"]);
+        assert_eq!(discovery.errors.len(), 1);
+        assert!(discovery.errors[0].message.contains("description"));
+
+        let summary = skills_settings_summary(&config, &profile_dir);
+        assert_eq!(summary.detected.len(), 1);
+        assert!(!summary.detected[0].enabled);
+        assert!(!summary.detected[0].can_enable);
+        assert!(
+            summary.detected[0]
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("frontmatter is invalid"))
+        );
+
+        fs::remove_dir_all(profile_dir).expect("remove skill test profile");
+    }
+
+    #[test]
+    fn invalid_skill_does_not_block_enabled_skill_frontmatter_injection() {
+        let profile_dir = env::temp_dir().join(unique_id("foco-mixed-skill-profile-test"));
+        let workspace_dir = env::temp_dir().join(unique_id("foco-mixed-skill-workspace-test"));
+        let good_skill_dir = profile_dir.join(".agents").join("skills").join("gitmemo");
+        let bad_skill_dir = profile_dir.join(".agents").join("skills").join("broken");
+
+        fs::create_dir_all(&good_skill_dir).expect("good skill directory");
+        fs::create_dir_all(&bad_skill_dir).expect("bad skill directory");
+        fs::write(
+            good_skill_dir.join("SKILL.md"),
+            "---
+name: gitmemo
+description: Project memory.
+---
+
+# GitMemo
+",
+        )
+        .expect("good skill file write");
+        fs::write(
+            bad_skill_dir.join("SKILL.md"),
+            "---
+name: broken
+description:
+---
+
+# Broken
+",
+        )
+        .expect("bad skill file write");
+
+        let config = GlobalConfig::first_run(workspace_dir);
+        let messages =
+            enabled_skill_frontmatter_messages(&profile_dir, &config, DEFAULT_WORKSPACE_ID)
+                .expect("enabled skill frontmatter messages");
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("name: gitmemo"));
+        assert!(!messages[0].content.contains("name: broken"));
+
+        fs::remove_dir_all(profile_dir).expect("remove skill test profile");
+    }
+
+    #[test]
+    fn selected_invalid_skill_reports_disabled_before_frontmatter_error() {
+        let profile_dir = env::temp_dir().join(unique_id("foco-selected-invalid-skill-profile"));
+        let workspace_dir =
+            env::temp_dir().join(unique_id("foco-selected-invalid-skill-workspace"));
+        let skill_dir = profile_dir.join(".agents").join("skills").join("broken");
+
+        fs::create_dir_all(&skill_dir).expect("skill test directory");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---
+name: broken
+description:
+---
+
+# Broken
+",
+        )
+        .expect("skill file write");
+
+        let config = GlobalConfig::first_run(workspace_dir);
+        let error = message_with_selected_skills(
+            &profile_dir,
+            &config,
+            DEFAULT_WORKSPACE_ID,
+            Some(vec!["global:broken".to_string()]),
+            "Hello",
+        )
+        .expect_err("invalid selected skill should fail as disabled");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message, "selected skill 'global:broken' is disabled");
 
         fs::remove_dir_all(profile_dir).expect("remove skill test profile");
     }
@@ -20359,6 +20623,26 @@ Use the existing product UI conventions.
         .expect("disabled skill ids");
 
         assert_eq!(disabled, vec!["workspace:default:gitmemo"]);
+    }
+
+    #[test]
+    fn required_disabled_skill_keys_survive_manual_enable_request() {
+        let discovered = vec![
+            test_skill_settings("global:gitmemo", "gitmemo"),
+            test_skill_settings("global:broken", "broken"),
+        ];
+        let user_disabled = normalize_manual_disabled_skill_ids(
+            Some(Vec::new()),
+            Some(vec![
+                "global:gitmemo".to_string(),
+                "global:broken".to_string(),
+            ]),
+            &discovered,
+        )
+        .expect("manual skill ids");
+        let disabled = merge_disabled_skill_keys(user_disabled, &["global:broken".to_string()]);
+
+        assert_eq!(disabled, vec!["global:broken"]);
     }
 
     #[test]

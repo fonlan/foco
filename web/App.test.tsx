@@ -216,6 +216,7 @@ const settings = {
   skills: {
     detected: [
       {
+        canEnable: true,
         description: "Project memory.",
         enabled: true,
         key: "global:gitmemo",
