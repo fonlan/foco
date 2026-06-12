@@ -939,7 +939,7 @@ fn detect_language_by_extension(file_path: &Path) -> Option<LanguageKind> {
 
     match extension.as_str() {
         "rs" => Some(LanguageKind::Rust),
-        "ts" | "mts" | "cts" => Some(LanguageKind::TypeScript),
+        "ts" | "mts" | "cts" | "ets" => Some(LanguageKind::TypeScript),
         "tsx" => Some(LanguageKind::Tsx),
         "js" | "mjs" | "cjs" | "jsx" => Some(LanguageKind::JavaScript),
         "py" | "pyw" => Some(LanguageKind::Python),
@@ -1256,6 +1256,43 @@ fn caller() {
         assert_eq!(
             query_count(&connection, "SELECT COUNT(*) FROM code_graph_symbols"),
             0
+        );
+    }
+
+    #[test]
+    fn indexes_ets_files_as_typescript() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(
+            workspace.path().join("Widget.ets"),
+            r#"
+export function buildTitle(value: string): string {
+    return value.trim();
+}
+"#,
+        )
+        .expect("ets source");
+
+        let report = index_workspace(workspace.path()).expect("index ets");
+
+        assert_eq!(report.indexed_files, 1);
+        assert_eq!(report.skipped_files, 0);
+        assert_eq!(report.parse_errors, 0);
+
+        let database_path = workspace.path().join(".foco").join("foco.sqlite");
+        let connection = Connection::open(database_path).expect("open graph database");
+        assert_eq!(
+            query_count(
+                &connection,
+                "SELECT COUNT(*) FROM code_graph_files WHERE path = 'Widget.ets'"
+            ),
+            1
+        );
+        assert_eq!(
+            query_count(
+                &connection,
+                "SELECT COUNT(*) FROM code_graph_symbols WHERE name = 'buildTitle'"
+            ),
+            1
         );
     }
 
