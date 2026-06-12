@@ -9138,6 +9138,11 @@ function AiRequestDetailDialog({
   return (
     <div
       className="fixed inset-0 z-50 flex min-h-0 items-center justify-center overflow-y-auto bg-stone-950/35 p-4 backdrop-blur-sm"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
       role="presentation"
     >
       <section

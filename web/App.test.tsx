@@ -3090,6 +3090,14 @@ describe("App verification surfaces", () => {
       "audit-json-token-key",
     );
     expect(within(dialog).queryByText("Stream events")).not.toBeInTheDocument();
+    fireEvent.click(dialog);
+    expect(
+      screen.getByRole("dialog", { name: "Request details" }),
+    ).toBeInTheDocument();
+    fireEvent.click(dialog.parentElement as HTMLElement);
+    expect(
+      screen.queryByRole("dialog", { name: "Request details" }),
+    ).not.toBeInTheDocument();
   });
 
   it("loads saved API request audit column settings", async () => {
