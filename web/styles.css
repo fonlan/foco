@@ -1504,6 +1504,10 @@ body,
   box-shadow: none;
 }
 
+.message-bubble-pending {
+  color: var(--foco-text-muted);
+}
+
 .message-avatar {
   width: 1.75rem;
   height: 1.75rem;
@@ -1539,6 +1543,20 @@ body,
   color: var(--foco-text-muted);
   font-size: 0.72rem;
   font-weight: 500;
+  white-space: nowrap;
+}
+
+.message-pending-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--foco-border);
+  border-radius: 999px;
+  background: var(--foco-panel);
+  color: var(--foco-text-muted);
+  font-size: 0.68rem;
+  font-weight: 650;
+  line-height: 1;
+  padding: 0.18rem 0.45rem;
   white-space: nowrap;
 }
 

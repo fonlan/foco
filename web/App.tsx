@@ -976,6 +976,13 @@ type ChatStreamEvent =
       notification: HookNotificationSummary;
     }
   | {
+      type: "guidanceApplied";
+      id: string;
+      content: string;
+      parts: ChatMessagePart[];
+      interruptedAssistantMetrics: ChatReplyMetrics | null;
+    }
+  | {
       type: "gitDiffRefresh";
       workspaceId: string;
     }
@@ -1263,6 +1270,14 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Retry last run": "重试上次运行",
     "Cancel run": "取消运行",
     "Send message": "发送消息",
+    "Send guidance": "发送引导",
+    "Send guidance. Ctrl+click queues.": "发送引导。Ctrl+点击进入队列。",
+    "Send guidance. Ctrl+click queues. {count} queued.":
+      "发送引导。Ctrl+点击进入队列。已排队 {count} 条。",
+    "No active run is available for guidance.":
+      "当前没有可引导的运行。",
+    "Guidance pending": "引导待生效",
+    Queued: "队列中",
     Send: "发送",
     "Context usage": "上下文使用量",
     "Context usage {percent}%": "上下文使用量 {percent}%",
@@ -1801,6 +1816,7 @@ type ShellMessage = {
   createdAt: string;
   reasoning: string | null;
   status?: "error" | "streaming";
+  pendingMode?: "guidance" | "queued";
   toolCalls: ChatToolCallSummary[];
   parts: ChatMessagePart[];
   metrics: ChatReplyMetrics | null;
@@ -1837,6 +1853,14 @@ type RetryRunRequest = {
   providerId: string;
   thinkingLevel: string;
   skillIds: string[];
+  pendingUserMessageId?: string;
+};
+
+type ActiveRunInfo = {
+  workspaceId: string;
+  chatId: string | null;
+  runId: string | null;
+  chatKey: string;
 };
 
 type ContextUsageRefreshRequest = {
@@ -1951,6 +1975,10 @@ export function App() {
   );
   const [retryRunRequest, setRetryRunRequest] =
     useState<RetryRunRequest | null>(null);
+  const [queuedRunRequests, setQueuedRunRequests] = useState<RetryRunRequest[]>(
+    [],
+  );
+  const [activeRunInfo, setActiveRunInfo] = useState<ActiveRunInfo | null>(null);
   const [contextUsage, setContextUsage] =
     useState<ContextUsageResponse | null>(null);
   const [isLoadingContextUsage, setIsLoadingContextUsage] = useState(false);
@@ -1975,6 +2003,8 @@ export function App() {
   const contextUsageIdentityRef = useRef("");
   const contextUsageRequestIdRef = useRef(0);
   const activeChatKeyRef = useRef<string | null>(null);
+  const queuedRunRequestsRef = useRef<RetryRunRequest[]>([]);
+  const pendingGuidanceMessageIdsRef = useRef<Map<string, string>>(new Map());
   const applyBrowserRouteRef = useRef<(route: BrowserRoute) => void>(() => {});
   const hasAppliedInitialBrowserRouteRef = useRef(false);
   const hasManuallySelectedModelRef = useRef(false);
@@ -2678,6 +2708,38 @@ export function App() {
     });
   }
 
+  function appendPendingUserMessage(
+    chatKey: string,
+    messageId: string,
+    content: string,
+    attachments: ChatAttachmentPayload[],
+    pendingMode: "guidance" | "queued",
+  ) {
+    const createdAt = new Date().toISOString();
+    setMessagesForChatKey(chatKey, (current) => [
+      ...current,
+      {
+        id: messageId,
+        role: "user",
+        content,
+        createdAt,
+        reasoning: null,
+        pendingMode,
+        toolCalls: [],
+        parts: userMessageParts(content, attachments),
+        metrics: null,
+        memoriesUsed: [],
+        extractedMemories: [],
+      },
+    ]);
+  }
+
+  function removeMessageForChatKey(chatKey: string, messageId: string) {
+    setMessagesForChatKey(chatKey, (current) =>
+      current.filter((message) => message.id !== messageId),
+    );
+  }
+
   function setChatRunFailed(chatKey: string | null, failed: boolean) {
     if (!chatKey || chatKey.includes(":pending:")) {
       return;
@@ -3112,35 +3174,30 @@ export function App() {
     );
   }
 
-  async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
+  function currentDraftRunRequest(): RetryRunRequest | null {
     const content = draftMessage.trim();
     const attachments = draftAttachments.map(chatAttachmentPayload);
-    if ((!content && !attachments.length) || isSendingMessage) {
-      return;
+    if (!content && !attachments.length) {
+      return null;
     }
 
     if (!activeWorkspace) {
       setError(t("Select a workspace before sending."));
-      return;
+      return null;
     }
 
     if (!selectedModelId) {
       setError(t("Select an enabled model before sending."));
-      return;
+      return null;
     }
 
     if (!selectedProviderId) {
       setError(t("Select a provider before sending."));
-      return;
+      return null;
     }
 
     const skillIds = [...selectedSkillIds];
-    setSelectedSkillIds([]);
-    setDraftAttachments([]);
-
-    await runChatMessage({
+    return {
       attachments,
       chatId: activeChatId,
       content,
@@ -3149,7 +3206,74 @@ export function App() {
       skillIds,
       thinkingLevel: selectedThinkingLevel,
       workspaceId: activeWorkspace.id,
-    });
+    };
+  }
+
+  async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const request = currentDraftRunRequest();
+    if (!request) {
+      return;
+    }
+
+    if (isSendingMessage) {
+      await guideActiveRun(request);
+      return;
+    }
+
+    setSelectedSkillIds([]);
+    setDraftAttachments([]);
+    setDraftMessage("");
+
+    await runChatMessage(request);
+  }
+
+  async function handleGuideActiveRun() {
+    const request = currentDraftRunRequest();
+    if (!request) {
+      return;
+    }
+
+    await guideActiveRun(request);
+  }
+
+  function handleQueueActiveRun() {
+    const request = currentDraftRunRequest();
+    if (!request) {
+      return;
+    }
+    const runInfo = activeRunInfo;
+    if (!runInfo?.chatKey) {
+      setError(t("No active run is available for guidance."));
+      return;
+    }
+
+    setSelectedSkillIds([]);
+    setDraftAttachments([]);
+    setDraftMessage("");
+    setError(null);
+
+    const pendingUserMessageId = localUiId("pending-queued-user");
+    appendPendingUserMessage(
+      runInfo.chatKey,
+      pendingUserMessageId,
+      messageWithSelectedSkills(detectedSkills, request.skillIds, request.content),
+      request.attachments,
+      "queued",
+    );
+
+    const queuedRequest = {
+      ...request,
+      chatId: runInfo.chatId ?? request.chatId,
+      pendingUserMessageId,
+      workspaceId: runInfo.workspaceId ?? request.workspaceId,
+    };
+    queuedRunRequestsRef.current = [
+      ...queuedRunRequestsRef.current,
+      queuedRequest,
+    ];
+    setQueuedRunRequests([...queuedRunRequestsRef.current]);
   }
 
   async function handleRetryRun() {
@@ -3329,11 +3453,172 @@ export function App() {
     }
   }
 
+  function appendGuidanceMessage(
+    chatKey: string,
+    guidance: {
+      id: string;
+      content: string;
+      parts: ChatMessagePart[];
+      interruptedAssistantMetrics: ChatReplyMetrics | null;
+    },
+    assistantId: string,
+    previousAssistantId: string,
+  ) {
+    const pendingGuidanceMessageId =
+      pendingGuidanceMessageIdsRef.current.get(guidance.id) ?? null;
+    pendingGuidanceMessageIdsRef.current.delete(guidance.id);
+    setMessagesForChatKey(chatKey, (current) => {
+      if (current.some((message) => message.id === assistantId)) {
+        return current;
+      }
+
+      const matchingPendingGuidanceMessageId =
+        pendingGuidanceMessageId ??
+        current.find(
+          (message) =>
+            message.pendingMode === "guidance" &&
+            message.content === guidance.content,
+        )?.id ??
+        null;
+      let reusedGuidanceMessage = false;
+      const nextMessages = current
+        .filter(
+          (message) =>
+            message.id !== previousAssistantId ||
+            !isEmptyStreamingAssistantMessage(message),
+        )
+        .map((message) => {
+          if (
+            message.id === matchingPendingGuidanceMessageId ||
+            message.id === guidance.id
+          ) {
+            reusedGuidanceMessage = true;
+            return {
+              ...message,
+              id: guidance.id,
+              content: guidance.content,
+              pendingMode: undefined,
+              parts: guidance.parts.length
+                ? [{ type: "text" as const, text: guidance.content }, ...guidance.parts]
+                : [{ type: "text" as const, text: guidance.content }],
+            };
+          }
+
+          if (message.id === previousAssistantId) {
+            return {
+              ...message,
+              status: undefined,
+              metrics: guidance.interruptedAssistantMetrics ?? message.metrics,
+            };
+          }
+
+          return message;
+        });
+      const createdAt = new Date().toISOString();
+
+      return [
+        ...nextMessages,
+        ...(reusedGuidanceMessage
+          ? []
+          : [
+              {
+                id: guidance.id,
+                role: "user" as const,
+                content: guidance.content,
+                createdAt,
+                reasoning: null,
+                status: undefined,
+                toolCalls: [],
+                parts: guidance.parts.length
+                  ? [{ type: "text" as const, text: guidance.content }, ...guidance.parts]
+                  : [{ type: "text" as const, text: guidance.content }],
+                metrics: null,
+                memoriesUsed: [],
+                extractedMemories: [],
+              },
+            ]),
+        {
+          id: assistantId,
+          role: "assistant",
+          content: "",
+          createdAt,
+          reasoning: null,
+          status: "streaming",
+          toolCalls: [],
+          parts: [],
+          metrics: null,
+          memoriesUsed: [],
+          extractedMemories: [],
+        },
+      ];
+    });
+  }
+
+  async function guideActiveRun(request: RetryRunRequest) {
+    const runInfo = activeRunInfo;
+    if (
+      !isSendingMessage ||
+      !runInfo ||
+      !runInfo.chatId ||
+      !runInfo.runId ||
+      runInfo.chatKey !== activeChatKeyRef.current
+    ) {
+      setError(t("No active run is available for guidance."));
+      return;
+    }
+
+    const pendingUserMessageId = localUiId("pending-guidance-user");
+    const visibleUserContent = messageWithSelectedSkills(
+      detectedSkills,
+      request.skillIds,
+      request.content,
+    );
+    appendPendingUserMessage(
+      runInfo.chatKey,
+      pendingUserMessageId,
+      visibleUserContent,
+      request.attachments,
+      "guidance",
+    );
+    setSelectedSkillIds([]);
+    setDraftAttachments([]);
+    setDraftMessage("");
+    setError(null);
+
+    try {
+      const guidance = await requestJson<{
+        id: string;
+        content: string;
+        parts: ChatMessagePart[];
+      }>(
+        `/api/workspaces/${encodeURIComponent(runInfo.workspaceId)}/chat/guidance`,
+        {
+          body: JSON.stringify({
+            attachments: request.attachments,
+            chatId: runInfo.chatId,
+            message: visibleUserContent,
+            runId: runInfo.runId,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      pendingGuidanceMessageIdsRef.current.set(
+        guidance.id,
+        pendingUserMessageId,
+      );
+    } catch (requestError) {
+      removeMessageForChatKey(runInfo.chatKey, pendingUserMessageId);
+      setError(errorMessage(requestError));
+    }
+  }
+
   async function runChatMessage(request: RetryRunRequest) {
     const runKey =
       globalThis.crypto?.randomUUID?.() ??
       `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const localUserId = `local-user-${runKey}`;
+    const pendingUserMessageId = request.pendingUserMessageId ?? null;
+    const localUserId = pendingUserMessageId ?? `local-user-${runKey}`;
     const localAssistantId = `local-assistant-${runKey}`;
     const localCreatedAt = new Date().toISOString();
     const visibleUserContent = messageWithSelectedSkills(
@@ -3346,6 +3631,7 @@ export function App() {
       request.attachments,
     );
     let assistantMessageId = localAssistantId;
+    let currentAssistantMessageId = localAssistantId;
     let requestChatId = request.chatId;
     let runMessagesKey = requestChatId
       ? chatRunKey(request.workspaceId, requestChatId)
@@ -3354,6 +3640,9 @@ export function App() {
     let assistantDraft = "";
     let assistantDraftReasoning = "";
     let latestResponseUsage: ChatUsage | null = null;
+    let runSucceeded = false;
+    let streamHadError = false;
+    let hasGuidanceTurns = false;
     const abortController = new AbortController();
     const refreshRunContextUsage = () => {
       void refreshContextUsage({
@@ -3371,21 +3660,8 @@ export function App() {
 
     activeChatKeyRef.current = runMessagesKey;
     setChatRunFailed(runMessagesKey, false);
-    setMessagesForChatKey(runMessagesKey, (current) => [
-      ...current,
-      {
-        id: localUserId,
-        role: "user",
-        content: visibleUserContent,
-        createdAt: localCreatedAt,
-        reasoning: null,
-        toolCalls: [],
-        parts: localUserParts,
-        metrics: null,
-        memoriesUsed: [],
-        extractedMemories: [],
-      },
-      {
+    setMessagesForChatKey(runMessagesKey, (current) => {
+      const assistantMessage: ShellMessage = {
         id: localAssistantId,
         role: "assistant",
         content: "",
@@ -3397,11 +3673,55 @@ export function App() {
         metrics: null,
         memoriesUsed: [],
         extractedMemories: [],
-      },
-    ]);
+      };
+
+      if (pendingUserMessageId) {
+        const pendingIndex = current.findIndex(
+          (message) => message.id === pendingUserMessageId,
+        );
+
+        if (pendingIndex >= 0) {
+          const next = current.map((message) =>
+            message.id === pendingUserMessageId
+              ? {
+                  ...message,
+                  content: visibleUserContent,
+                  pendingMode: undefined,
+                  parts: localUserParts,
+                }
+              : message,
+          );
+          next.splice(pendingIndex + 1, 0, assistantMessage);
+          return next;
+        }
+      }
+
+      return [
+        ...current,
+        {
+          id: localUserId,
+          role: "user",
+          content: visibleUserContent,
+          createdAt: localCreatedAt,
+          reasoning: null,
+          toolCalls: [],
+          parts: localUserParts,
+          metrics: null,
+          memoriesUsed: [],
+          extractedMemories: [],
+        },
+        assistantMessage,
+      ];
+    });
     setDraftMessage("");
     setIsSendingMessage(true);
     setRunningChatKey(currentRunningChatKey);
+    setActiveRunInfo({
+      chatId: requestChatId,
+      chatKey: currentRunningChatKey,
+      runId: null,
+      workspaceId: request.workspaceId,
+    });
     setRetryRunRequest(null);
     setError(null);
     contextUsageAbortRef.current?.abort();
@@ -3417,9 +3737,12 @@ export function App() {
       eventAssistantMessageId?: string,
     ) =>
       message.role === "assistant" &&
-      (message.id === assistantMessageId ||
-        message.id === localAssistantId ||
-        message.id === eventAssistantMessageId);
+      (message.id === currentAssistantMessageId ||
+        (currentAssistantMessageId === assistantMessageId &&
+          eventAssistantMessageId !== undefined &&
+          message.id === eventAssistantMessageId) ||
+        (currentAssistantMessageId === localAssistantId &&
+          message.id === localAssistantId));
 
     try {
       const response = await fetch(
@@ -3449,11 +3772,18 @@ export function App() {
       await readChatStream(response, (streamEvent) => {
         if (streamEvent.type === "start") {
           assistantMessageId = streamEvent.assistantMessageId;
+          currentAssistantMessageId = streamEvent.assistantMessageId;
           requestChatId = streamEvent.chatId;
           currentRunningChatKey = chatRunKey(
             request.workspaceId,
             streamEvent.chatId,
           );
+          setActiveRunInfo({
+            chatId: streamEvent.chatId,
+            chatKey: currentRunningChatKey,
+            runId: streamEvent.llmRequestId ?? null,
+            workspaceId: request.workspaceId,
+          });
           setChatRunFailed(currentRunningChatKey, false);
           openChatTab(request.workspaceId, streamEvent.chatId);
           if (runMessagesKey !== currentRunningChatKey) {
@@ -3566,6 +3896,20 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "guidanceApplied") {
+          const previousAssistantId = currentAssistantMessageId;
+          const guidanceAssistantId = `${streamEvent.id}-assistant`;
+          currentAssistantMessageId = guidanceAssistantId;
+          hasGuidanceTurns = true;
+          appendGuidanceMessage(
+            runMessagesKey,
+            streamEvent,
+            guidanceAssistantId,
+            previousAssistantId,
+          );
+          return;
+        }
+
         if (streamEvent.type === "complete") {
           assistantDraft = "";
           assistantDraftReasoning = "";
@@ -3578,7 +3922,9 @@ export function App() {
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? completedAssistantMessage(message, streamEvent)
+                ? hasGuidanceTurns
+                  ? completedGuidanceAssistantMessage(message, streamEvent)
+                  : completedAssistantMessage(message, streamEvent)
                 : message,
             ),
           );
@@ -3675,6 +4021,7 @@ export function App() {
         }
 
         if (streamEvent.type === "error") {
+          streamHadError = true;
           setChatRunFailed(runMessagesKey, true);
           setRunningChatKey((current) =>
             current === currentRunningChatKey ? null : current,
@@ -3694,6 +4041,7 @@ export function App() {
       });
 
       await refreshWorkspaces();
+      runSucceeded = !streamHadError;
     } catch (requestError) {
       const wasCancelled =
         requestError instanceof DOMException && requestError.name === "AbortError";
@@ -3723,7 +4071,23 @@ export function App() {
       setRunningChatKey((current) =>
         current === currentRunningChatKey ? null : current,
       );
+      setActiveRunInfo((current) =>
+        current?.chatKey === currentRunningChatKey ? null : current,
+      );
       setIsSendingMessage(false);
+    }
+
+    if (runSucceeded) {
+      const [queuedRequest, ...remainingQueuedRequests] =
+        queuedRunRequestsRef.current;
+      if (queuedRequest) {
+        queuedRunRequestsRef.current = remainingQueuedRequests;
+        setQueuedRunRequests(remainingQueuedRequests);
+        await runChatMessage({
+          ...queuedRequest,
+          chatId: requestChatId,
+        });
+      }
     }
   }
 
@@ -4265,6 +4629,11 @@ export function App() {
               availableModels={availableModels}
               branchError={branchError}
               chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
+              canGuideActiveRun={
+                isSendingMessage &&
+                activeRunInfo?.chatKey === activeChatKeyRef.current &&
+                activeRunInfo.runId !== null
+              }
               draftAttachments={draftAttachments}
               draftMessage={draftMessage}
               gitBranches={gitBranches}
@@ -4282,6 +4651,8 @@ export function App() {
               onDraftMessageChange={setDraftMessage}
               onSelectAttachments={() => void handleSelectDraftAttachments()}
               onCancelRun={handleCancelRun}
+              onGuideActiveRun={() => void handleGuideActiveRun()}
+              onQueueActiveRun={handleQueueActiveRun}
               onModelChange={handleChatModelChange}
               onProviderChange={setSelectedProviderId}
               onRemoveAttachment={handleRemoveDraftAttachment}
@@ -4291,6 +4662,7 @@ export function App() {
               onThinkingLevelChange={setSelectedThinkingLevel}
               onToggleSkill={toggleSelectedSkill}
               canRetryRun={retryRunRequest !== null && !isSendingMessage}
+              queuedRunCount={queuedRunRequests.length}
               selectedGitBranch={selectedGitBranch}
               selectedModelId={selectedModelId}
               selectedProviderId={selectedProviderId}
@@ -5456,11 +5828,13 @@ function ChatPanel({
   availableModels,
   branchError,
   chatScrollKey,
+  canGuideActiveRun,
   canRetryRun,
   contextUsage,
   draftAttachments,
   draftMessage,
   gitBranches,
+  queuedRunCount,
   isLoadingBranches,
   isLoadingContextUsage,
   isLoadingSettings,
@@ -5471,8 +5845,10 @@ function ChatPanel({
   onBranchChange,
   onCancelRun,
   onDraftMessageChange,
+  onGuideActiveRun,
   onModelChange,
   onProviderChange,
+  onQueueActiveRun,
   onRemoveAttachment,
   onRemoveSkill,
   onRetryRun,
@@ -5495,11 +5871,13 @@ function ChatPanel({
   availableModels: ConfiguredModelSummary[];
   branchError: string | null;
   chatScrollKey: string;
+  canGuideActiveRun: boolean;
   canRetryRun: boolean;
   contextUsage: ContextUsageResponse | null;
   draftAttachments: ComposerAttachment[];
   draftMessage: string;
   gitBranches: GitBranchesResponse | null;
+  queuedRunCount: number;
   isLoadingBranches: boolean;
   isLoadingContextUsage: boolean;
   isLoadingSettings: boolean;
@@ -5510,8 +5888,10 @@ function ChatPanel({
   onBranchChange: (value: string) => void;
   onCancelRun: () => void;
   onDraftMessageChange: (value: string) => void;
+  onGuideActiveRun: () => void;
   onModelChange: (value: string) => void;
   onProviderChange: (value: string) => void;
+  onQueueActiveRun: () => void;
   onRemoveAttachment: (attachmentId: string) => void;
   onRemoveSkill: (skillId: string) => void;
   onRetryRun: () => void;
@@ -5582,6 +5962,18 @@ function ChatPanel({
               skill.description.toLowerCase().includes(query))
           );
         });
+  const hasComposerDraft = Boolean(draftMessage.trim() || draftAttachments.length);
+  const runningButtonSendsMessage = isSendingMessage && hasComposerDraft;
+  const runningButtonLabel = runningButtonSendsMessage
+    ? t("Send guidance")
+    : t("Cancel run");
+  const runningButtonTitle = runningButtonSendsMessage
+    ? queuedRunCount > 0
+      ? t("Send guidance. Ctrl+click queues. {count} queued.", {
+          count: queuedRunCount,
+        })
+      : t("Send guidance. Ctrl+click queues.")
+    : t("Cancel run");
 
   function scrollMessageListToBottom() {
     messageScrollEndRef.current?.scrollIntoView({
@@ -5668,6 +6060,23 @@ function ChatPanel({
     window.requestAnimationFrame(() => messageTextareaRef.current?.focus());
   }
 
+  function handleRunningRunButtonClick(
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) {
+    const hasDraft = Boolean(draftMessage.trim() || draftAttachments.length);
+    if (!hasDraft) {
+      onCancelRun();
+      return;
+    }
+
+    if (event.ctrlKey) {
+      onQueueActiveRun();
+      return;
+    }
+
+    onGuideActiveRun();
+  }
+
   function handlePaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
     const itemFiles = Array.from(event.clipboardData.items)
       .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
@@ -5732,6 +6141,13 @@ function ChatPanel({
                 copiedMessageId === message.id
                   ? t("Copied message")
                   : t("Copy message");
+              const pendingLabel =
+                message.pendingMode === "guidance"
+                  ? t("Guidance pending")
+                  : message.pendingMode === "queued"
+                    ? t("Queued")
+                    : null;
+              const isPendingUserMessage = isUser && pendingLabel !== null;
 
               return (
                 <div
@@ -5744,14 +6160,18 @@ function ChatPanel({
                         isUser
                           ? "message-bubble-user flex-row rounded-tr-md"
                           : "message-bubble-assistant flex-row rounded-tl-md"
-                      }`}
+                      } ${isPendingUserMessage ? "message-bubble-pending" : ""}`}
                       style={{
-                        backgroundColor: isUser
-                          ? "var(--foco-user-surface)"
-                          : "var(--foco-panel)",
-                        borderColor: isUser
-                          ? "var(--foco-user-border)"
-                          : "var(--foco-border)",
+                        backgroundColor: isPendingUserMessage
+                          ? "var(--foco-panel-soft)"
+                          : isUser
+                            ? "var(--foco-user-surface)"
+                            : "var(--foco-panel)",
+                        borderColor: isPendingUserMessage
+                          ? "var(--foco-border)"
+                          : isUser
+                            ? "var(--foco-user-border)"
+                            : "var(--foco-border)",
                       }}
                     >
                       <div
@@ -5771,6 +6191,11 @@ function ChatPanel({
                         <div className="message-author-row">
                           <span className="message-author-meta">
                             <span>{authorLabel}</span>
+                            {pendingLabel ? (
+                              <span className="message-pending-badge">
+                                {pendingLabel}
+                              </span>
+                            ) : null}
                             <time
                               className="message-created-at"
                               dateTime={message.createdAt}
@@ -5892,10 +6317,6 @@ function ChatPanel({
                 }
 
                 event.preventDefault();
-                if (isSendingMessage) {
-                  return;
-                }
-
                 event.currentTarget.form?.requestSubmit();
               }}
               onPaste={handlePaste}
@@ -5950,7 +6371,7 @@ function ChatPanel({
               <button
                 aria-label={t("Add attachment")}
                 className="composer-tool-button"
-                disabled={isSendingMessage || isSelectingAttachments}
+                disabled={isSelectingAttachments}
                 onClick={onSelectAttachments}
                 title={t("Add attachment")}
                 type="button"
@@ -5964,7 +6385,7 @@ function ChatPanel({
               <ComposerSelectMenu
                 ariaLabel={t("Model")}
                 className="composer-model-select max-w-full"
-                disabled={isLoadingSettings || isSendingMessage || !modelOptions.length}
+                disabled={isLoadingSettings || !modelOptions.length}
                 emptyLabel={t("No enabled models")}
                 icon={Bot}
                 onChange={onModelChange}
@@ -5976,7 +6397,6 @@ function ChatPanel({
                 className="composer-provider-select max-w-full"
                 disabled={
                   isLoadingSettings ||
-                  isSendingMessage ||
                   !selectedModelId ||
                   !providerOptions.length
                 }
@@ -5989,7 +6409,7 @@ function ChatPanel({
               <ComposerSelectMenu
                 ariaLabel={t("Thinking")}
                 className="composer-thinking-select max-w-full"
-                disabled={isSendingMessage}
+                disabled={isLoadingSettings}
                 emptyLabel={t("Model default")}
                 icon={SlidersHorizontal}
                 onChange={onThinkingLevelChange}
@@ -6022,13 +6442,25 @@ function ChatPanel({
               />
               {isSendingMessage ? (
                 <button
-                  aria-label={t("Cancel run")}
-                  className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
-                  onClick={onCancelRun}
-                  title={t("Cancel run")}
+                  aria-label={runningButtonLabel}
+                  className={
+                    runningButtonSendsMessage
+                      ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                      : "composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                  }
+                  disabled={
+                    runningButtonSendsMessage &&
+                    (!canGuideActiveRun || !selectedModelId)
+                  }
+                  onClick={handleRunningRunButtonClick}
+                  title={runningButtonTitle}
                   type="button"
                 >
-                  <X aria-hidden="true" className="size-4" />
+                  {runningButtonSendsMessage ? (
+                    <Send aria-hidden="true" className="size-4" />
+                  ) : (
+                    <X aria-hidden="true" className="size-4" />
+                  )}
                 </button>
               ) : (
                 <button
@@ -17356,6 +17788,20 @@ function completedAssistantMessage(
   };
 }
 
+function completedGuidanceAssistantMessage(
+  message: ShellMessage,
+  streamEvent: Extract<ChatStreamEvent, { type: "complete" }>,
+): ShellMessage {
+  return {
+    ...message,
+    metrics: streamEvent.metrics,
+    memoriesUsed: streamEvent.memoriesUsed,
+    extractedMemories: message.extractedMemories,
+    status: undefined,
+    parts: message.parts.length ? message.parts : fallbackMessageParts(message),
+  };
+}
+
 function assistantMessageWithAppendedError(
   message: ShellMessage,
   errorText: string,
@@ -17379,6 +17825,17 @@ function assistantMessageWithAppendedError(
     extractedMemories: [],
     status: hasVisibleContent ? undefined : "error",
   };
+}
+
+function isEmptyStreamingAssistantMessage(message: ShellMessage) {
+  return (
+    message.role === "assistant" &&
+    message.status === "streaming" &&
+    !message.content &&
+    !message.reasoning &&
+    message.parts.length === 0 &&
+    message.toolCalls.length === 0
+  );
 }
 
 function missingFinalSuffix(current: string, next: string) {
@@ -18475,6 +18932,13 @@ function pendingChatRunKey(workspaceId: string, runKey: string) {
   return `${workspaceId}:pending:${runKey}`;
 }
 
+function localUiId(prefix: string) {
+  const suffix =
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return `${prefix}-${suffix}`;
+}
+
 function priceText(value: number | null) {
   return value === null ? "n/a" : `$${value}`;
 }
@@ -18944,6 +19408,44 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     }
 
     return { type: "hookNotification", assistantMessageId, notification };
+  }
+
+  if (
+    value.type === "guidanceApplied" ||
+    value.type === "guidance_applied"
+  ) {
+    const id = stringField(value, "id");
+    const content = stringField(value, "content");
+    const partsValue = fieldValue(value, "parts");
+    const interruptedAssistantMetrics = parseOptionalChatReplyMetrics(
+      fieldValue(
+        value,
+        "interruptedAssistantMetrics",
+        "interrupted_assistant_metrics",
+      ),
+    );
+
+    if (
+      !id ||
+      content === null ||
+      !Array.isArray(partsValue) ||
+      interruptedAssistantMetrics === false
+    ) {
+      return null;
+    }
+
+    const parts = partsValue.map(normalizeChatMessagePart);
+    if (parts.some((part) => part === null)) {
+      return null;
+    }
+
+    return {
+      type: "guidanceApplied",
+      id,
+      content,
+      parts: parts as ChatMessagePart[],
+      interruptedAssistantMetrics,
+    };
   }
 
   if (value.type === "gitDiffRefresh" || value.type === "git_diff_refresh") {

@@ -289,6 +289,7 @@ struct AppState {
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
     question_registry: QuestionRegistry,
+    active_chat_runs: ActiveChatRunRegistry,
     tool_resource_locks: ToolResourceLockRegistry,
     _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
     #[cfg(all(windows, not(debug_assertions)))]
@@ -310,6 +311,125 @@ struct QuestionRegistry {
 struct PendingQuestion {
     request: QuestionRequest,
     answer_tx: oneshot::Sender<QuestionAnswer>,
+}
+
+#[derive(Clone, Default)]
+struct ActiveChatRunRegistry {
+    runs: Arc<Mutex<HashMap<String, ActiveChatRun>>>,
+}
+
+#[derive(Clone)]
+struct ActiveChatRun {
+    workspace_id: String,
+    chat_id: String,
+    guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
+}
+
+#[derive(Clone, Debug)]
+struct GuidanceMessage {
+    id: String,
+    content: String,
+    attachments: Vec<NeutralChatAttachment>,
+}
+
+impl ActiveChatRunRegistry {
+    fn register(
+        &self,
+        run_id: String,
+        workspace_id: String,
+        chat_id: String,
+        guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
+    ) -> Result<ActiveChatRunRegistration, ApiError> {
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
+
+        if runs
+            .insert(
+                run_id.clone(),
+                ActiveChatRun {
+                    workspace_id,
+                    chat_id,
+                    guidance_tx,
+                },
+            )
+            .is_some()
+        {
+            return Err(ApiError::internal(format!(
+                "duplicate active chat run id: {run_id}"
+            )));
+        }
+
+        Ok(ActiveChatRunRegistration {
+            registry: self.clone(),
+            run_id,
+        })
+    }
+
+    fn unregister(&self, run_id: &str) {
+        if let Ok(mut runs) = self.runs.lock() {
+            runs.remove(run_id);
+        }
+    }
+
+    fn push_guidance(
+        &self,
+        workspace_id: &str,
+        request: ChatGuidanceRequest,
+    ) -> Result<GuidanceMessage, ApiError> {
+        let workspace_id = normalized_required_text("workspaceId", workspace_id)?;
+        let chat_id = normalized_required_text("chatId", &request.chat_id)?;
+        let run_id = normalized_required_text("runId", &request.run_id)?;
+        let content = normalized_chat_message(&request.message)?;
+        let attachments = normalized_chat_attachments(request.attachments)?;
+        let guidance = GuidanceMessage {
+            id: unique_id("msg-guidance"),
+            content,
+            attachments,
+        };
+        let active_run = {
+            let runs = self
+                .runs
+                .lock()
+                .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
+            runs.get(&run_id).cloned().ok_or_else(|| {
+                ApiError::bad_request(format!("active chat run was not found: {run_id}"))
+            })?
+        };
+
+        if active_run.workspace_id != workspace_id {
+            return Err(ApiError::bad_request(format!(
+                "active chat run {run_id} belongs to workspace {}, not {workspace_id}",
+                active_run.workspace_id
+            )));
+        }
+        if active_run.chat_id != chat_id {
+            return Err(ApiError::bad_request(format!(
+                "active chat run {run_id} belongs to chat {}, not {chat_id}",
+                active_run.chat_id
+            )));
+        }
+
+        active_run.guidance_tx.send(guidance.clone()).map_err(|_| {
+            ApiError::bad_request(format!(
+                "active chat run is no longer accepting guidance: {run_id}"
+            ))
+        })?;
+
+        Ok(guidance)
+    }
+}
+
+struct ActiveChatRunRegistration {
+    registry: ActiveChatRunRegistry,
+    run_id: String,
+}
+
+impl Drop for ActiveChatRunRegistration {
+    fn drop(&mut self) {
+        self.registry.unregister(&self.run_id);
+    }
 }
 
 struct QuestionRegistration {
@@ -796,6 +916,7 @@ async fn run_server_until_shutdown(
         mcp_registry: mcp_registry.clone(),
         hook_runtime,
         question_registry: QuestionRegistry::default(),
+        active_chat_runs: ActiveChatRunRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         _code_graph_watchers: Arc::new(code_graph_watchers),
         #[cfg(all(windows, not(debug_assertions)))]
@@ -879,6 +1000,10 @@ fn app_router(state: AppState) -> Router {
             "/api/workspaces/{workspace_id}/chat/stream",
             post(stream_chat_response)
                 .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chat/guidance",
+            post(add_chat_guidance).layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/workspaces/{workspace_id}/context-usage",
@@ -3167,6 +3292,22 @@ async fn stream_chat_response(
     ))
 }
 
+async fn add_chat_guidance(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<ChatGuidanceRequest>,
+) -> Result<Json<ChatGuidanceResponse>, ApiError> {
+    let guidance = state
+        .active_chat_runs
+        .push_guidance(&workspace_id, request)?;
+
+    Ok(Json(ChatGuidanceResponse {
+        id: guidance.id,
+        content: guidance.content,
+        parts: user_guidance_message_parts(&guidance.attachments),
+    }))
+}
+
 async fn context_usage(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
@@ -3810,6 +3951,24 @@ struct ChatStreamRequest {
     message: String,
     #[serde(default)]
     attachments: Vec<ChatAttachmentInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatGuidanceRequest {
+    chat_id: String,
+    run_id: String,
+    message: String,
+    #[serde(default)]
+    attachments: Vec<ChatAttachmentInput>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatGuidanceResponse {
+    id: String,
+    content: String,
+    parts: Vec<ChatMessagePart>,
 }
 
 #[derive(Deserialize)]
@@ -4620,6 +4779,12 @@ enum ChatSseEvent {
         assistant_message_id: String,
         notification: HookNotification,
     },
+    GuidanceApplied {
+        id: String,
+        content: String,
+        parts: Vec<ChatMessagePart>,
+        interrupted_assistant_metrics: Option<ChatReplyMetrics>,
+    },
     GitDiffRefresh {
         workspace_id: String,
     },
@@ -4662,6 +4827,7 @@ struct PreparedChatContext {
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
     question_registry: QuestionRegistry,
+    active_chat_runs: ActiveChatRunRegistry,
     tool_resource_locks: ToolResourceLockRegistry,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
@@ -5068,6 +5234,22 @@ impl CapturedLlmRequest {
 impl PreparedChatContext {
     fn into_sse_stream(mut self) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
         async_stream::stream! {
+            let (guidance_tx, mut guidance_rx) = mpsc::unbounded_channel();
+            let _active_run_registration = match self.active_chat_runs.register(
+                self.llm_request_id.clone(),
+                self.workspace_id.clone(),
+                self.chat_id.clone(),
+                guidance_tx,
+            ) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    let event = ChatSseEvent::Error {
+                        message: error.message,
+                    };
+                    yield Ok(sse_event(&event));
+                    return;
+                }
+            };
             let request_started_at = utc_timestamp();
             let started_at = Instant::now();
             let start_event = ChatSseEvent::Start {
@@ -5124,6 +5306,16 @@ impl PreparedChatContext {
                     .await;
                     yield Ok(sse_event(&event));
                     return;
+                }
+
+                for event in append_guidance_events(
+                    &mut self.provider_request.messages,
+                    &mut self.message_source_sequences,
+                    &mut events,
+                    drain_guidance_messages(&mut guidance_rx),
+                    None,
+                ) {
+                    yield Ok(sse_event(&event));
                 }
 
                 let turn_active_tool_start_index = match ensure_context_compression(&mut self).await {
@@ -5530,6 +5722,13 @@ impl PreparedChatContext {
                                     }).to_string()),
                                 },
                             });
+                            let turn_metrics = turn_reply_metrics(
+                                &self.model_id,
+                                &self.provider_id,
+                                turn_total_latency_ms,
+                                turn_first_token_latency_ms,
+                                usage.as_ref(),
+                            );
                             if let Some(usage) = usage {
                                 let event = ChatSseEvent::Usage { usage };
                                 events.push(captured_event(&event));
@@ -5537,6 +5736,31 @@ impl PreparedChatContext {
                             }
 
                             if tool_calls.is_empty() {
+                                let guidance_messages =
+                                    next_guidance_messages_at_boundary(&mut guidance_rx).await;
+                                if !guidance_messages.is_empty() {
+                                    let turn_assistant_text =
+                                        assistant_message_text(&turn_text, &[]);
+                                    if !turn_assistant_text.trim().is_empty()
+                                        || !turn_reasoning.trim().is_empty()
+                                    {
+                                        self.provider_request.messages.push(neutral_assistant_message(
+                                            turn_assistant_text,
+                                            non_empty_string(&turn_reasoning),
+                                        ));
+                                        self.message_source_sequences.push(None);
+                                    }
+                                    for event in append_guidance_events(
+                                        &mut self.provider_request.messages,
+                                        &mut self.message_source_sequences,
+                                        &mut events,
+                                        guidance_messages,
+                                        Some(turn_metrics.clone()),
+                                    ) {
+                                        yield Ok(sse_event(&event));
+                                    }
+                                    continue 'agent_turns;
+                                }
                                 let assistant_message_text =
                                     assistant_message_text(&assistant_text, &executed_tool_calls);
                                 let stop_text = assistant_message_text.clone();
@@ -5915,6 +6139,15 @@ impl PreparedChatContext {
                                 non_empty_string(&turn_reasoning),
                             );
                             executed_tool_calls.extend(next_executed_tool_calls);
+                            for event in append_guidance_events(
+                                &mut self.provider_request.messages,
+                                &mut self.message_source_sequences,
+                                &mut events,
+                                next_guidance_messages_at_boundary(&mut guidance_rx).await,
+                                Some(turn_metrics.clone()),
+                            ) {
+                                yield Ok(sse_event(&event));
+                            }
 
                             break;
                         }
@@ -6490,6 +6723,7 @@ async fn prepare_chat_context(
         hook_runtime: state.hook_runtime.clone(),
         global_hooks: config.hooks.clone(),
         question_registry: state.question_registry.clone(),
+        active_chat_runs: state.active_chat_runs.clone(),
         tool_resource_locks: state.tool_resource_locks.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget: prompt_context.context_budget,
@@ -11608,6 +11842,98 @@ fn append_hook_context_messages(
     }
 }
 
+fn append_guidance_message(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    guidance: &GuidanceMessage,
+) {
+    messages.push(neutral_user_message(
+        format!(
+            "User guidance for the current in-progress run:\n\n{}",
+            guidance.content
+        ),
+        guidance.attachments.clone(),
+    ));
+    message_source_sequences.push(None);
+}
+
+fn drain_guidance_messages(
+    guidance_rx: &mut mpsc::UnboundedReceiver<GuidanceMessage>,
+) -> Vec<GuidanceMessage> {
+    let mut messages = Vec::new();
+
+    while let Ok(message) = guidance_rx.try_recv() {
+        messages.push(message);
+    }
+
+    messages
+}
+
+async fn next_guidance_messages_at_boundary(
+    guidance_rx: &mut mpsc::UnboundedReceiver<GuidanceMessage>,
+) -> Vec<GuidanceMessage> {
+    let mut messages = drain_guidance_messages(guidance_rx);
+
+    if messages.is_empty() {
+        if let Ok(Some(message)) = timeout(Duration::from_millis(150), guidance_rx.recv()).await {
+            messages.push(message);
+        }
+    }
+
+    messages.extend(drain_guidance_messages(guidance_rx));
+    messages
+}
+
+fn append_guidance_events(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    events: &mut Vec<CapturedAuditEvent>,
+    guidance_messages: Vec<GuidanceMessage>,
+    interrupted_assistant_metrics: Option<ChatReplyMetrics>,
+) -> Vec<ChatSseEvent> {
+    let mut interrupted_assistant_metrics = interrupted_assistant_metrics;
+    guidance_messages
+        .into_iter()
+        .map(|guidance| {
+            append_guidance_message(messages, message_source_sequences, &guidance);
+            let event = ChatSseEvent::GuidanceApplied {
+                id: guidance.id,
+                content: guidance.content,
+                parts: user_guidance_message_parts(&guidance.attachments),
+                interrupted_assistant_metrics: interrupted_assistant_metrics.take(),
+            };
+            events.push(captured_event(&event));
+            event
+        })
+        .collect()
+}
+
+fn turn_reply_metrics(
+    model_id: &str,
+    provider_id: &str,
+    total_latency_ms: i64,
+    first_token_latency_ms: Option<i64>,
+    usage: Option<&NeutralUsage>,
+) -> ChatReplyMetrics {
+    ChatReplyMetrics {
+        model_id: model_id.to_string(),
+        provider_id: provider_id.to_string(),
+        total_latency_ms: Some(total_latency_ms),
+        first_token_latency_ms,
+        output_tokens: usage.and_then(|usage| usage.output_tokens),
+    }
+}
+
+fn user_guidance_message_parts(attachments: &[NeutralChatAttachment]) -> Vec<ChatMessagePart> {
+    attachments
+        .iter()
+        .cloned()
+        .map(|attachment| ChatMessagePart::Attachment {
+            attachment: chat_attachment_part(attachment),
+        })
+        .collect()
+}
+
 fn hook_notification_events(
     assistant_message_id: &str,
     event: &str,
@@ -11855,6 +12181,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::ToolResult { .. } => "tool_result",
         ChatSseEvent::QuestionRequest { .. } => "question_request",
         ChatSseEvent::HookNotification { .. } => "hook_notification",
+        ChatSseEvent::GuidanceApplied { .. } => "guidance_applied",
         ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
         ChatSseEvent::TodoGraphRefresh { .. } => "todo_graph_refresh",
         ChatSseEvent::Usage { .. } => "usage",
@@ -13293,6 +13620,16 @@ fn normalized_required_text(field: &str, value: &str) -> Result<String, ApiError
     }
 
     Ok(value.to_string())
+}
+
+fn normalized_chat_message(message: &str) -> Result<String, ApiError> {
+    let message = message.trim().to_string();
+
+    if message.is_empty() {
+        return Err(ApiError::bad_request("message must not be empty"));
+    }
+
+    Ok(message)
 }
 
 fn memory_metadata_json(metadata: Option<Value>) -> Result<String, ApiError> {
@@ -17738,6 +18075,55 @@ description:
     }
 
     #[test]
+    fn active_chat_run_registry_accepts_matching_guidance() {
+        let registry = ActiveChatRunRegistry::default();
+        let (guidance_tx, mut guidance_rx) = mpsc::unbounded_channel();
+        let _registration = registry
+            .register(
+                "run-1".to_string(),
+                "workspace-1".to_string(),
+                "chat-1".to_string(),
+                guidance_tx,
+            )
+            .expect("register active run");
+
+        let guidance = registry
+            .push_guidance(
+                "workspace-1",
+                ChatGuidanceRequest {
+                    chat_id: "chat-1".to_string(),
+                    run_id: "run-1".to_string(),
+                    message: "Prefer the simpler implementation.".to_string(),
+                    attachments: Vec::new(),
+                },
+            )
+            .expect("push guidance");
+
+        assert_eq!(guidance.content, "Prefer the simpler implementation.");
+        let received = guidance_rx.try_recv().expect("guidance delivered");
+        assert_eq!(received.id, guidance.id);
+        assert_eq!(received.content, guidance.content);
+    }
+
+    #[test]
+    fn active_chat_run_registry_rejects_stale_guidance_run() {
+        let registry = ActiveChatRunRegistry::default();
+        let error = registry
+            .push_guidance(
+                "workspace-1",
+                ChatGuidanceRequest {
+                    chat_id: "chat-1".to_string(),
+                    run_id: "missing-run".to_string(),
+                    message: "Use this now.".to_string(),
+                    attachments: Vec::new(),
+                },
+            )
+            .expect_err("missing run should fail");
+
+        assert!(error.message.contains("active chat run was not found"));
+    }
+
+    #[test]
     fn user_attachments_round_trip_into_neutral_history_and_message_parts() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-user-attachment-test"));
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -17925,6 +18311,7 @@ description:
             global_hooks: HookConfig::default(),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
+            active_chat_runs: ActiveChatRunRegistry::default(),
             tool_resource_locks: ToolResourceLockRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
@@ -18070,6 +18457,7 @@ description:
             global_hooks: HookConfig::default(),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
+            active_chat_runs: ActiveChatRunRegistry::default(),
             tool_resource_locks: ToolResourceLockRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
@@ -18198,6 +18586,7 @@ description:
             global_hooks: HookConfig::default(),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
+            active_chat_runs: ActiveChatRunRegistry::default(),
             tool_resource_locks: ToolResourceLockRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
@@ -20955,6 +21344,7 @@ description: Project memory.
             hook_runtime: HookRuntime::new(mcp_registry.clone()),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
+            active_chat_runs: ActiveChatRunRegistry::default(),
             tool_resource_locks: ToolResourceLockRegistry::default(),
             _code_graph_watchers: Arc::new(Vec::new()),
         }

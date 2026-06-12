@@ -819,6 +819,7 @@ const importedHooks = {
 let activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null =
   null;
 let terminalSessionCounter = 0;
+let chatStreamCounter = 0;
 
 function savedGeneralSettings(init?: RequestInit) {
   const body =
@@ -865,6 +866,7 @@ describe("App verification surfaces", () => {
   beforeEach(() => {
     activeChatStreamController = null;
     terminalSessionCounter = 0;
+    chatStreamCounter = 0;
     window.history.replaceState(null, "", "/");
     window.localStorage.clear();
     document.documentElement.removeAttribute("data-foco-theme");
@@ -1329,6 +1331,210 @@ describe("App verification surfaces", () => {
         outputTokens: 1000,
       },
     });
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
+  it("sends guidance to the active run without ending the current stream", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "start work",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "prefer the simpler path",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Send guidance" }),
+    );
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-1/chat/guidance",
+        ),
+      ).toBe(true);
+    });
+    const guidanceCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/guidance",
+    );
+    expect(JSON.parse(String(guidanceCall?.[1]?.body))).toMatchObject({
+      chatId: "chat-1",
+      message: "prefer the simpler path",
+      runId: "request-stream",
+    });
+    const pendingGuidanceMessage = screen.getByText("prefer the simpler path");
+    const pendingGuidanceRow = pendingGuidanceMessage.closest(".message-row");
+    expect(pendingGuidanceRow).not.toBeNull();
+    expect(
+      within(pendingGuidanceRow as HTMLElement).getByText("Guidance pending"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Initial answer.",
+        type: "textDelta",
+      });
+    });
+    const initialAnswer = await screen.findByText("Initial answer.");
+    expect(initialAnswer).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        content: "prefer the simpler path",
+        id: "guidance-1",
+        interruptedAssistantMetrics: {
+          firstTokenLatencyMs: 250,
+          modelId: "gpt-test",
+          outputTokens: 10,
+          providerId: "openai",
+          totalLatencyMs: 2000,
+        },
+        parts: [],
+        type: "guidanceApplied",
+      });
+    });
+    const guidanceMessage = screen.getByText("prefer the simpler path");
+    expect(guidanceMessage).toBeInTheDocument();
+    const guidanceRow = guidanceMessage.closest(".message-row");
+    expect(guidanceRow).not.toBeNull();
+    expect(
+      within(guidanceRow as HTMLElement).queryByText("Guidance pending"),
+    ).not.toBeInTheDocument();
+    const interruptedAssistantRow = initialAnswer.closest(".message-row");
+    expect(interruptedAssistantRow).not.toBeNull();
+    expect(
+      within(interruptedAssistantRow as HTMLElement).getByText("Model: gpt-test"),
+    ).toBeInTheDocument();
+    expect(
+      within(interruptedAssistantRow as HTMLElement).getByText("Channel: openai"),
+    ).toBeInTheDocument();
+    expect(
+      within(interruptedAssistantRow as HTMLElement).getByText("Total time: 2 s"),
+    ).toBeInTheDocument();
+    expect(
+      within(interruptedAssistantRow as HTMLElement).getByText("tokens/s: 5"),
+    ).toBeInTheDocument();
+    expect(
+      within(interruptedAssistantRow as HTMLElement).getByText(
+        "First token latency: 0.25 s",
+      ),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Adjusted answer.",
+        type: "textDelta",
+      });
+    });
+    const guidedAnswer = await screen.findByText("Adjusted answer.");
+    expect(
+      guidanceMessage.compareDocumentPosition(guidedAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
+  it("queues a message during an active run and sends it after the stream ends", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "first task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "next task",
+    );
+    await userEvent.click(screen.getByLabelText("Provider"));
+    await userEvent.click(screen.getByRole("button", { name: "Provider: Anthropic" }));
+    await userEvent.click(screen.getByLabelText("Thinking"));
+    await userEvent.click(screen.getByRole("button", { name: "Thinking: High" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
+      ctrlKey: true,
+    });
+    const pendingQueuedMessage = screen.getByText("next task");
+    const pendingQueuedRow = pendingQueuedMessage.closest(".message-row");
+    expect(pendingQueuedRow).not.toBeNull();
+    expect(
+      within(pendingQueuedRow as HTMLElement).getByText("Queued"),
+    ).toBeInTheDocument();
+    const streamCallsBeforeComplete = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    expect(streamCallsBeforeComplete).toHaveLength(1);
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 10,
+        },
+        reasoning: null,
+        stopReason: null,
+        text: "Done.",
+        type: "complete",
+        usage: null,
+      });
+      activeChatStreamController?.close();
+    });
+
+    await waitFor(() => {
+      const streamCalls = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/chat/stream",
+      );
+      expect(streamCalls).toHaveLength(2);
+    });
+    const secondStreamCall = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    )[1];
+    expect(JSON.parse(String(secondStreamCall[1]?.body))).toMatchObject({
+      chatId: "chat-1",
+      message: "next task",
+      providerId: "anthropic",
+      thinkingLevel: "high",
+    });
+    const effectiveQueuedMessage = screen.getByText("next task");
+    const effectiveQueuedRow = effectiveQueuedMessage.closest(".message-row");
+    expect(effectiveQueuedRow).not.toBeNull();
+    expect(
+      within(effectiveQueuedRow as HTMLElement).queryByText("Queued"),
+    ).not.toBeInTheDocument();
 
     await act(async () => {
       activeChatStreamController?.close();
@@ -3203,6 +3409,18 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
     return chatStreamResponse();
   }
 
+  if (path === "/api/workspaces/workspace-1/chat/guidance") {
+    const body =
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as { message?: string })
+        : {};
+    return jsonResponse({
+      content: body.message ?? "",
+      id: "guidance-1",
+      parts: [],
+    });
+  }
+
   if (path === "/api/workspaces/workspace-2/chat/stream") {
     return chatStreamResponse("side-chat-stream");
   }
@@ -3212,6 +3430,17 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
 
 function chatStreamResponse(chatId = "chat-1") {
   const encoder = new TextEncoder();
+  chatStreamCounter += 1;
+  const userMessageId =
+    chatStreamCounter === 1
+      ? "message-user-stream"
+      : `message-user-stream-${chatStreamCounter}`;
+  const assistantMessageId =
+    chatStreamCounter === 1
+      ? "message-assistant-stream"
+      : `message-assistant-stream-${chatStreamCounter}`;
+  const llmRequestId =
+    chatStreamCounter === 1 ? "request-stream" : `request-stream-${chatStreamCounter}`;
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       activeChatStreamController = controller;
@@ -3220,9 +3449,9 @@ function chatStreamResponse(chatId = "chat-1") {
           `data: ${JSON.stringify({
             type: "start",
             chatId,
-            userMessageId: "message-user-stream",
-            assistantMessageId: "message-assistant-stream",
-            llmRequestId: "request-stream",
+            userMessageId,
+            assistantMessageId,
+            llmRequestId,
             memoriesUsed: [
               {
                 chatId: null,
