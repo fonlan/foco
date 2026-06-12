@@ -3166,6 +3166,7 @@ async fn context_usage(
     Json(request): Json<ContextUsageRequest>,
 ) -> Result<Json<ContextUsageResponse>, ApiError> {
     let config = config_snapshot(&state)?;
+    let latest_response_usage = request.latest_response_usage.clone();
     let prompt_context = prepare_prompt_context(
         &state,
         &config,
@@ -3175,7 +3176,10 @@ async fn context_usage(
     )
     .await?;
 
-    Ok(Json(context_usage_response(&prompt_context)?))
+    Ok(Json(context_usage_response(
+        &prompt_context,
+        latest_response_usage.as_ref(),
+    )?))
 }
 
 async fn answer_question(
@@ -3812,6 +3816,7 @@ struct ContextUsageRequest {
     draft_message: Option<String>,
     assistant_draft: Option<String>,
     assistant_draft_reasoning: Option<String>,
+    latest_response_usage: Option<NeutralUsage>,
     #[serde(default)]
     attachments: Vec<ChatAttachmentInput>,
 }
@@ -5505,6 +5510,11 @@ impl PreparedChatContext {
                                     }).to_string()),
                                 },
                             });
+                            if let Some(usage) = usage {
+                                let event = ChatSseEvent::Usage { usage };
+                                events.push(captured_event(&event));
+                                yield Ok(sse_event(&event));
+                            }
 
                             if tool_calls.is_empty() {
                                 let assistant_message_text =
@@ -9918,6 +9928,7 @@ fn pack_items_from_message_groups(groups: &[ContextMessageGroup]) -> Vec<Context
 
 fn context_usage_response(
     context: &PreparedPromptContext,
+    latest_response_usage: Option<&NeutralUsage>,
 ) -> Result<ContextUsageResponse, ApiError> {
     let message_groups = context_message_groups(
         &context.provider_request.messages,
@@ -9925,10 +9936,14 @@ fn context_usage_response(
         context.active_tool_start_index,
     )?;
     let pack_items = pack_items_from_message_groups(&message_groups);
-    let used_message_tokens = pack_items
+    let estimated_message_tokens = pack_items
         .iter()
         .map(|item| item.estimated_tokens)
         .sum::<u64>();
+    let used_message_tokens = match latest_response_usage {
+        Some(usage) => context_used_message_tokens_from_response_usage(context, usage)?,
+        None => estimated_message_tokens,
+    };
     let available_message_tokens = context.context_budget.available_message_tokens;
     let compression_trigger_tokens = context_compression_trigger_tokens(available_message_tokens);
     let usage_percent = percentage_ceil(used_message_tokens, available_message_tokens);
@@ -9952,6 +9967,40 @@ fn context_usage_response(
         compression_trigger_percent,
         will_compress_on_next_send,
     })
+}
+
+fn context_used_message_tokens_from_response_usage(
+    context: &PreparedPromptContext,
+    usage: &NeutralUsage,
+) -> Result<u64, ApiError> {
+    let input_tokens = usage
+        .input_tokens
+        .ok_or_else(|| ApiError::bad_request("latestResponseUsage.inputTokens is required"))?;
+    let input_tokens =
+        non_negative_context_usage_token(input_tokens, "latestResponseUsage.inputTokens")?;
+    let output_tokens = usage
+        .output_tokens
+        .ok_or_else(|| ApiError::bad_request("latestResponseUsage.outputTokens is required"))?;
+    let output_tokens =
+        non_negative_context_usage_token(output_tokens, "latestResponseUsage.outputTokens")?;
+    let request_overhead_tokens = context
+        .context_budget
+        .system_prompt_tokens
+        .saturating_add(context.context_budget.tool_schema_tokens);
+
+    Ok(input_tokens
+        .saturating_sub(request_overhead_tokens)
+        .saturating_add(output_tokens))
+}
+
+fn non_negative_context_usage_token(value: i64, field_name: &str) -> Result<u64, ApiError> {
+    if value < 0 {
+        return Err(ApiError::bad_request(format!(
+            "{field_name} must be greater than or equal to 0"
+        )));
+    }
+
+    Ok(value as u64)
 }
 
 fn percentage_ceil(value: u64, total: u64) -> u64 {
@@ -19511,7 +19560,7 @@ Use the existing product UI conventions.
         )
         .await
         .expect("prompt context");
-        let usage = context_usage_response(&prompt_context).expect("context usage");
+        let usage = context_usage_response(&prompt_context, None).expect("context usage");
 
         assert!(usage.used_message_tokens > 0);
         assert!(usage.memory_context_tokens > 0);
@@ -19550,8 +19599,27 @@ Use the existing product UI conventions.
         .await
         .expect("prompt context with assistant draft");
         let usage_with_assistant =
-            context_usage_response(&prompt_context_with_assistant).expect("context usage");
+            context_usage_response(&prompt_context_with_assistant, None).expect("context usage");
         assert!(usage_with_assistant.used_message_tokens > usage.used_message_tokens);
+
+        let response_input_tokens = prompt_context_with_assistant
+            .context_budget
+            .system_prompt_tokens
+            + prompt_context_with_assistant
+                .context_budget
+                .tool_schema_tokens
+            + 1_500;
+        let usage_from_response = context_usage_response(
+            &prompt_context_with_assistant,
+            Some(&NeutralUsage {
+                input_tokens: Some(response_input_tokens as i64),
+                output_tokens: Some(250),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+            }),
+        )
+        .expect("context usage from response usage");
+        assert_eq!(usage_from_response.used_message_tokens, 1_750);
 
         let database =
             WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");

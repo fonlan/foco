@@ -1846,6 +1846,7 @@ type ContextUsageRefreshRequest = {
   skillIds: string[];
   assistantDraft: string;
   assistantDraftReasoning: string;
+  latestResponseUsage: ChatUsage | null;
 };
 
 type ContextMemoryState = {
@@ -2107,6 +2108,7 @@ export function App() {
       assistantDraft: "",
       assistantDraftReasoning: "",
       chatId: activeChatId,
+      latestResponseUsage: null,
       modelId: selectedModelId,
       providerId: selectedProviderId,
       skillIds: [],
@@ -3297,6 +3299,7 @@ export function App() {
             draftMessage: null,
             assistantDraft: request.assistantDraft || null,
             assistantDraftReasoning: request.assistantDraftReasoning || null,
+            latestResponseUsage: request.latestResponseUsage,
             attachments: [],
           }),
           headers: { "Content-Type": "application/json" },
@@ -3348,12 +3351,14 @@ export function App() {
     let currentRunningChatKey = runMessagesKey;
     let assistantDraft = "";
     let assistantDraftReasoning = "";
+    let latestResponseUsage: ChatUsage | null = null;
     const abortController = new AbortController();
     const refreshRunContextUsage = () => {
       void refreshContextUsage({
         assistantDraft,
         assistantDraftReasoning,
         chatId: requestChatId,
+        latestResponseUsage,
         modelId: request.modelId,
         providerId: request.providerId,
         skillIds: request.skillIds,
@@ -3549,6 +3554,12 @@ export function App() {
         }
 
         if (streamEvent.type === "usage") {
+          latestResponseUsage =
+            streamEvent.usage &&
+            streamEvent.usage.inputTokens !== null &&
+            streamEvent.usage.outputTokens !== null
+              ? streamEvent.usage
+              : null;
           refreshRunContextUsage();
           return;
         }

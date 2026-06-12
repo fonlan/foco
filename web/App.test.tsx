@@ -1250,7 +1250,7 @@ describe("App verification surfaces", () => {
     expect(usageCallsAfterDraft).toHaveLength(usageCallsBeforeDraft.length);
   });
 
-  it("keeps cumulative context usage while the assistant stream updates", async () => {
+  it("updates context usage from latest response usage during a stream", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
     await userEvent.click(await screen.findByText("Tool run"));
@@ -1291,6 +1291,42 @@ describe("App verification surfaces", () => {
       assistantDraftReasoning: null,
       chatId: "chat-1",
       draftMessage: null,
+      latestResponseUsage: null,
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        type: "usage",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 70000,
+          outputTokens: 1000,
+        },
+      });
+    });
+
+    expect(
+      await screen.findByRole("status", { name: "Context usage 64%" }),
+    ).toHaveTextContent("64%");
+    const usageCallsAfterUsage = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    );
+    const [, usageInit] = usageCallsAfterUsage.at(-1)!;
+    expect(typeof usageInit?.body).toBe("string");
+    expect(JSON.parse(usageInit?.body as string)).toMatchObject({
+      assistantDraft: "Partial answer.",
+      assistantDraftReasoning: null,
+      chatId: "chat-1",
+      draftMessage: null,
+      latestResponseUsage: {
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 70000,
+        outputTokens: 1000,
+      },
     });
 
     await act(async () => {
@@ -3089,6 +3125,21 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
 
   if (path === "/api/workspaces/workspace-1/context-usage") {
+    const body =
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as {
+            latestResponseUsage?: { inputTokens?: number | null };
+          })
+        : {};
+
+    if (body.latestResponseUsage?.inputTokens === 70000) {
+      return jsonResponse({
+        ...contextUsage,
+        usagePercent: 64,
+        usedMessageTokens: 71000,
+      });
+    }
+
     return jsonResponse(contextUsage);
   }
 
