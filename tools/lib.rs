@@ -37,7 +37,9 @@ pub const UPDATE_TODO_GRAPH_TOOL: &str = "update_todo_graph";
 pub const GET_TODO_GRAPH_TOOL: &str = "get_todo_graph";
 pub const ASK_QUESTION_TOOL: &str = "ask_question";
 
-const MAX_READ_BYTES: u64 = 512 * 1024;
+const MAX_FULL_READ_BYTES: u64 = 1024 * 1024;
+const MAX_RANGED_READ_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_RANGED_READ_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_LIST_ENTRIES: usize = 200;
 const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
@@ -199,6 +201,7 @@ fn execute_builtin_tool_inner(
 fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: ReadFileInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
+    let requested_line_range = parse_optional_line_range(request.start_line, request.end_line)?;
     let path = resolve_workspace_file(workspace_path, &request.path)?;
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
@@ -209,11 +212,17 @@ fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunti
         return Err(ToolRuntimeError::NotFile(path));
     }
 
-    if metadata.len() > MAX_READ_BYTES {
+    let max_source_bytes = if requested_line_range.is_some() {
+        MAX_RANGED_READ_SOURCE_BYTES
+    } else {
+        MAX_FULL_READ_BYTES
+    };
+
+    if metadata.len() > max_source_bytes {
         return Err(ToolRuntimeError::FileTooLarge {
             path,
             bytes: metadata.len(),
-            max_bytes: MAX_READ_BYTES,
+            max_bytes: max_source_bytes,
         });
     }
 
@@ -222,16 +231,23 @@ fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunti
         source,
     })?;
     let (content, _) = decode_text_file(&path, &bytes)?;
-    let line_range = resolve_optional_line_range(
-        request.start_line,
-        request.end_line,
-        count_text_lines(&content),
-    )?;
+    let line_range = if let Some(range) = requested_line_range {
+        validate_line_range(range, count_text_lines(&content))?;
+        Some(range)
+    } else {
+        None
+    };
     let content = if let Some(range) = &line_range {
         read_line_range(&content, range)
     } else {
         content
     };
+    if line_range.is_some() && content.len() > MAX_RANGED_READ_OUTPUT_BYTES {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "read_file line range output is too large ({} bytes; max {MAX_RANGED_READ_OUTPUT_BYTES}); use a smaller line range",
+            content.len()
+        )));
+    }
 
     Ok(json!({
         "path": request.path,
@@ -1167,23 +1183,19 @@ struct LineSpan {
     line_ending: Option<&'static str>,
 }
 
-fn resolve_optional_line_range(
+fn parse_optional_line_range(
     start_line: Option<usize>,
     end_line: Option<usize>,
-    line_count: usize,
 ) -> Result<Option<LineRange>, ToolRuntimeError> {
-    let range = match (start_line, end_line) {
-        (None, None) => return Ok(None),
-        (Some(start), Some(end)) => LineRange::new(start, end)?,
+    match (start_line, end_line) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) => LineRange::new(start, end).map(Some),
         _ => {
-            return Err(ToolRuntimeError::InvalidArguments(
+            Err(ToolRuntimeError::InvalidArguments(
                 "startLine and endLine must both be null for full-file reads or both be integers for line-range reads".to_string(),
-            ));
+            ))
         }
-    };
-
-    validate_line_range(range, line_count)?;
-    Ok(Some(range))
+    }
 }
 
 fn validate_line_range(range: LineRange, line_count: usize) -> Result<(), ToolRuntimeError> {
@@ -2806,6 +2818,77 @@ mod tests {
         assert_eq!(result.output["content"], "two\nthree\n");
         assert_eq!(result.output["startLine"], 2);
         assert_eq!(result.output["endLine"], 3);
+    }
+
+    #[test]
+    fn rejects_full_file_read_larger_than_limit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let content = "x".repeat(MAX_FULL_READ_BYTES as usize + 1);
+        fs::write(workspace.path().join("large.txt"), content).expect("write large file");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "large.txt", "startLine": null, "endLine": null }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("too large to read")
+        );
+    }
+
+    #[test]
+    fn reads_line_range_from_file_larger_than_full_read_limit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut content = String::from("needle\n");
+        while content.len() <= MAX_FULL_READ_BYTES as usize {
+            content.push_str("padding line\n");
+        }
+        fs::write(workspace.path().join("large.txt"), content).expect("write large file");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "large.txt", "startLine": 1, "endLine": 1 }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["content"], "needle\n");
+        assert_eq!(result.output["startLine"], 1);
+        assert_eq!(result.output["endLine"], 1);
+    }
+
+    #[test]
+    fn rejects_line_range_output_larger_than_limit() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let first_line = "x".repeat(MAX_RANGED_READ_OUTPUT_BYTES);
+        fs::write(
+            workspace.path().join("large-line.txt"),
+            format!("{first_line}\nsmall\n"),
+        )
+        .expect("write large line file");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "large-line.txt", "startLine": 1, "endLine": 1 }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("line range output is too large")
+        );
     }
 
     #[test]
