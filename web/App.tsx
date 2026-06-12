@@ -782,6 +782,7 @@ type ChatToolCallSummary = {
 
 type ChatMessagePart =
   | { type: "text"; text: string }
+  | { type: "error"; text: string }
   | { type: "reasoning"; text: string }
   | { type: "attachment"; attachment: ChatAttachmentPartSummary }
   | { type: "toolCall"; toolCall: ChatToolCallSummary };
@@ -6393,8 +6394,20 @@ function MessagePartBlock({
     return <AttachmentPartBlock attachment={part.attachment} isUser={isUser} />;
   }
 
+  if (part.type === "error") {
+    return <ErrorMessagePart text={part.text} />;
+  }
+
   return (
     <MarkdownContent content={part.text} isError={isError} isUser={isUser} />
+  );
+}
+
+function ErrorMessagePart({ text }: { text: string }) {
+  return (
+    <div className="whitespace-pre-wrap break-words rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm leading-6 text-rose-700">
+      {text}
+    </div>
   );
 }
 
@@ -17358,7 +17371,7 @@ function assistantMessageWithAppendedError(
     content: message.content
       ? `${message.content}${separator}${errorText}`
       : errorText,
-    parts: appendTextPart(existingParts, `${separator}${errorText}`),
+    parts: appendErrorPart(existingParts, errorText),
     metrics: null,
     memoriesUsed: [],
     extractedMemories: [],
@@ -17386,6 +17399,25 @@ function appendTextPart(parts: ChatMessagePart[], text: string): ChatMessagePart
   const lastPart = parts[parts.length - 1];
   if (lastPart?.type !== "text") {
     return [...parts, { type: "text", text }];
+  }
+
+  return [
+    ...parts.slice(0, -1),
+    {
+      ...lastPart,
+      text: lastPart.text + text,
+    },
+  ];
+}
+
+function appendErrorPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
+  if (!text) {
+    return parts;
+  }
+
+  const lastPart = parts[parts.length - 1];
+  if (lastPart?.type !== "error") {
+    return [...parts, { type: "error", text }];
   }
 
   return [
@@ -17493,7 +17525,11 @@ function messageCopyText(
 
   return parts
     .map((part) => {
-      if (part.type === "text" || part.type === "reasoning") {
+      if (
+        part.type === "text" ||
+        part.type === "reasoning" ||
+        part.type === "error"
+      ) {
         return part.text;
       }
       if (part.type === "attachment") {
@@ -19233,6 +19269,11 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
   if (part.type === "text") {
     const text = fieldValue(part, "text");
     return typeof text === "string" ? { type: "text", text } : null;
+  }
+
+  if (part.type === "error") {
+    const text = fieldValue(part, "text");
+    return typeof text === "string" ? { type: "error", text } : null;
   }
 
   if (part.type === "reasoning") {

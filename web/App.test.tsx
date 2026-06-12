@@ -1454,14 +1454,17 @@ describe("App verification surfaces", () => {
         type: "textDelta",
       });
       enqueueChatStreamEvent({
-        message: "agent run exceeded 128 tool continuation rounds",
+        message:
+          "skill discovery failed for C:\\Users\\fonla\\Documents\\Repos\\Rutar\\.agents\\skills\\vercel-react-native-skills\\SKILL.md: skill file C:\\Users\\fonla\\Documents\\Repos\\Rutar\\.agents\\skills\\vercel-react-native-skills\\SKILL.md frontmatter field 'description' must not be empty",
         type: "error",
       });
     });
 
     expect(await screen.findByText("Partial answer.")).toBeInTheDocument();
     expect(
-      screen.getAllByText("agent run exceeded 128 tool continuation rounds").length,
+      screen.getAllByText(
+        /Rutar\\.agents\\skills\\vercel-react-native-skills\\SKILL\.md/,
+      ).length,
     ).toBeGreaterThan(0);
 
     await act(async () => {
