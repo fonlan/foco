@@ -13202,6 +13202,7 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     })
 }
 
+#[cfg(not(windows))]
 fn windows_path_to_wsl_path(path: String) -> Result<String, ApiError> {
     let output = Command::new("wslpath")
         .args(["-u", &path])
