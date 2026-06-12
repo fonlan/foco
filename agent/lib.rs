@@ -191,9 +191,10 @@ pub fn build_system_prompt(input: SystemPromptInput) -> String {
          - Prefer code graph tools before text search when locating symbols, callers, callees, references, or related files.\n\
          - Use graph_find_symbols first, then use returned symbolId values for graph_find_callers, graph_find_callees, and graph_find_references when names may be ambiguous.\n\
          - Use search_text for literal text, config keys, error messages, or when code graph results are insufficient.\n\
-         - Use read_file before editing a file. Before calling patch_file, read the target file range and confirm every context/removal line in the diff matches the current file.\n\
+         - Use read_file before editing a file. For small single-location edits, prefer write_file with startLine/endLine to replace the exact 1-based inclusive line range in an existing file.\n\
          - Use list_files to inspect directory shape when needed.\n\
-         - Use patch_file for precise edits to existing files. Use write_file for complete-file writes or explicit line-range replacements. Do not create missing parent directories unless the task requires it and the available tool supports it.\n\
+         - Use write_file for complete-file writes or explicit line-range replacements. Do not create missing parent directories unless the task requires it and the available tool supports it.\n\
+         - Use patch_file only for multi-hunk or multi-location edits when the unified diff was produced or checked from current file content. Before calling patch_file, read the target file range and confirm every context/removal line in the diff exactly matches the current file. If patch_file fails, read_file the suggested or target range again before retrying; do not retry by only adjusting hunk counts or headers from the failed diff.\n\
          - Use run_command for local commands, including git status and git diff. There is no dedicated git_diff tool.\n\
          - run_command executes a command plus args directly. Put the executable in command and each argument in args. Do not concatenate shell commands into one string. If shell features are truly required, call the detected shell explicitly.\n\
          - Treat non-zero command exits as evidence to inspect, not as something to ignore.\n\
