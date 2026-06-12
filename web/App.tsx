@@ -9609,7 +9609,7 @@ function ContextPanel({
         })}
       </div>
 
-      <div className="min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 flex-col">
         {activeTab === "todo" ? (
           <ContextTodoGraphTab
             error={todoGraphError}
@@ -9619,7 +9619,7 @@ function ContextPanel({
         ) : null}
 
         {activeTab === "git" ? (
-          <div className="min-h-0 flex-1">
+          <div className="flex min-h-0 flex-1 flex-col">
             <GitDiffPanel
               diffError={diffError}
               diffResponse={diffResponse}
@@ -10027,7 +10027,7 @@ function InlineGitDiff({
               </InlineGitDiffNotice>
             ) : (
               <div
-                className="overflow-x-auto rounded-lg border border-stone-200 bg-white py-2 font-mono text-[11px] leading-5 shadow-sm"
+                className="panel-scroll max-h-[min(30rem,52dvh)] overflow-auto rounded-lg border border-stone-200 bg-white py-2 font-mono text-[11px] leading-5 shadow-sm"
                 key={`${section.kind}-${file.path}`}
               >
                 {file.lines.map((line, index) => (

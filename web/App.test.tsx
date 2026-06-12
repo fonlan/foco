@@ -3068,7 +3068,19 @@ describe("App verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("button", { name: /README\.md M/ }));
 
-    expect(await screen.findByText(/hello world/)).toBeInTheDocument();
+    const inlineDiffLine = await screen.findByText(/hello world/);
+    expect(inlineDiffLine).toBeInTheDocument();
+    const inlineDiffScrollRegion = inlineDiffLine.closest(
+      ".panel-scroll",
+    ) as HTMLElement | null;
+    expect(inlineDiffScrollRegion).not.toBeNull();
+    expect(inlineDiffScrollRegion).toHaveClass("overflow-auto");
+    expect(inlineDiffScrollRegion?.className).toContain(
+      "max-h-[min(30rem,52dvh)]",
+    );
+    expect(inlineDiffLine.closest(".overflow-y-auto")).toHaveClass(
+      "panel-scroll",
+    );
     expect(screen.queryByText("Inspect workspace changes")).not.toBeInTheDocument();
 
     await act(async () => {
