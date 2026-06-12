@@ -1000,6 +1000,11 @@ type ChatStreamEvent =
       workspaceId: string;
       chatId: string;
     }
+  | {
+      type: "memoryExtractionComplete";
+      assistantMessageId: string;
+      extractedMemories: ChatExtractedMemorySummary[];
+    }
   | { type: "error"; message: string };
 
 type HookNotificationSummary = {
@@ -4059,6 +4064,20 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "memoryExtractionComplete") {
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? assistantMessageWithExtractedMemories(
+                    message,
+                    streamEvent.extractedMemories,
+                  )
+                : message,
+            ),
+          );
+          return;
+        }
+
         if (streamEvent.type === "error") {
           streamHadError = true;
           setChatRunFailed(chatKey, true);
@@ -4535,6 +4554,20 @@ export function App() {
             setIsContextPanelOpen(true);
             void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId);
           }
+          return;
+        }
+
+        if (streamEvent.type === "memoryExtractionComplete") {
+          setMessagesForChatKey(runMessagesKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? assistantMessageWithExtractedMemories(
+                    message,
+                    streamEvent.extractedMemories,
+                  )
+                : message,
+            ),
+          );
           return;
         }
 
@@ -18370,6 +18403,23 @@ function completedGuidanceAssistantMessage(
   };
 }
 
+function assistantMessageWithExtractedMemories(
+  message: ShellMessage,
+  extractedMemories: ChatExtractedMemorySummary[],
+): ShellMessage {
+  const memoriesById = new Map(
+    message.extractedMemories.map((memory) => [memory.id, memory]),
+  );
+  for (const memory of extractedMemories) {
+    memoriesById.set(memory.id, memory);
+  }
+
+  return {
+    ...message,
+    extractedMemories: Array.from(memoriesById.values()),
+  };
+}
+
 function assistantMessageWithAppendedError(
   message: ShellMessage,
   errorText: string,
@@ -20046,6 +20096,30 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     }
 
     return { type: "todoGraphRefresh", workspaceId, chatId };
+  }
+
+  if (
+    value.type === "memoryExtractionComplete" ||
+    value.type === "memory_extraction_complete"
+  ) {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const extractedMemories = parseChatExtractedMemories(
+      fieldValue(value, "extractedMemories", "extracted_memories"),
+    );
+
+    if (!assistantMessageId || extractedMemories === false) {
+      return null;
+    }
+
+    return {
+      type: "memoryExtractionComplete",
+      assistantMessageId,
+      extractedMemories,
+    };
   }
 
   if (value.type === "error") {

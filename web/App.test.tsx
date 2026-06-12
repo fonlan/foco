@@ -1849,6 +1849,63 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("shows saved memories from the current chat stream", async () => {
+    render(<App />);
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "remember this",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        text: "Saved.",
+        type: "complete",
+        metrics: {
+          firstTokenLatencyMs: 100,
+          modelId: "gpt-test",
+          outputTokens: 2,
+          providerId: "openai",
+          totalLatencyMs: 500,
+        },
+        reasoning: null,
+        stopReason: null,
+        usage: null,
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        extractedMemories: [
+          {
+            chatId: "chat-1",
+            fact: "Prefer seeing saved memories immediately.",
+            id: "stream-saved-memory-1",
+            kind: "preference",
+            scope: "chat",
+            status: "pending",
+          },
+        ],
+        type: "memoryExtractionComplete",
+      });
+    });
+
+    const assistantBubble = (await screen.findByText("Saved.")).closest(
+      ".message-bubble",
+    );
+    expect(assistantBubble).not.toBeNull();
+    const memoriesSavedLabel = within(assistantBubble as HTMLElement).getByText(
+      "Memories saved",
+    );
+    await userEvent.click(memoriesSavedLabel);
+    expect(
+      screen.getByText("Prefer seeing saved memories immediately."),
+    ).toBeInTheDocument();
+  });
+
   it("appends stream errors after already rendered assistant text", async () => {
     render(<App />);
 

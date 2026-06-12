@@ -636,6 +636,14 @@ impl ActiveChatRunRegistration {
     }
 }
 
+impl MemoryExtractionHandle {
+    async fn wait(self) -> Result<Vec<ChatExtractedMemorySummary>, ApiError> {
+        self.task.await.map_err(|source| {
+            ApiError::internal(format!("memory extraction worker failed: {source}"))
+        })?
+    }
+}
+
 impl Drop for ActiveChatRunRegistration {
     fn drop(&mut self) {
         if !self.completed {
@@ -5105,6 +5113,10 @@ enum ChatSseEvent {
         workspace_id: String,
         chat_id: String,
     },
+    MemoryExtractionComplete {
+        assistant_message_id: String,
+        extracted_memories: Vec<ChatExtractedMemorySummary>,
+    },
     Usage {
         usage: NeutralUsage,
     },
@@ -5349,6 +5361,10 @@ struct MemoryExtractionTask {
     model_id: String,
     target_status: MemoryStatus,
     config: GlobalConfig,
+}
+
+struct MemoryExtractionHandle {
+    task: tokio::task::JoinHandle<Result<Vec<ChatExtractedMemorySummary>, ApiError>>,
 }
 
 #[derive(Clone, Debug)]
@@ -6351,8 +6367,26 @@ impl PreparedChatContext {
                                 };
 
                                 match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), non_empty_string(&assistant_reasoning).as_deref(), &executed_tool_calls) {
-                                    Ok(()) => {
+                                    Ok(memory_extraction) => {
                                         yield complete_event;
+                                        if let Some(memory_extraction) = memory_extraction {
+                                            match memory_extraction.wait().await {
+                                                Ok(extracted_memories) => {
+                                                    if !extracted_memories.is_empty() {
+                                                        yield ChatSseEvent::MemoryExtractionComplete {
+                                                            assistant_message_id: self.assistant_message_id.clone(),
+                                                            extracted_memories,
+                                                        };
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    tracing::warn!(
+                                                        error = %error.message,
+                                                        "memory extraction job worker failed"
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                     Err(error) => {
                                         let event = ChatSseEvent::Error {
@@ -6648,6 +6682,16 @@ impl PreparedChatContext {
                                 let event = ChatSseEvent::TodoGraphRefresh {
                                     workspace_id: self.workspace_id.clone(),
                                     chat_id: self.chat_id.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
+                            let extracted_memories =
+                                tool_written_memory_summaries(&next_executed_tool_calls);
+                            if !extracted_memories.is_empty() {
+                                let event = ChatSseEvent::MemoryExtractionComplete {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    extracted_memories,
                                 };
                                 events.push(captured_event(&event));
                                 yield event;
@@ -9087,7 +9131,7 @@ fn persist_chat_result(
     assistant_text: Option<&str>,
     assistant_reasoning: Option<&str>,
     tool_calls: &[ExecutedToolCall],
-) -> Result<(), ApiError> {
+) -> Result<Option<MemoryExtractionHandle>, ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let final_state = outcome.final_state;
@@ -9160,9 +9204,9 @@ fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
-    queue_memory_extraction_job(context, final_state)?;
+    let memory_extraction = queue_memory_extraction_job(context, final_state)?;
 
-    Ok(())
+    Ok(memory_extraction)
 }
 
 fn persist_llm_request(
@@ -9218,9 +9262,9 @@ fn persist_llm_request(
 fn queue_memory_extraction_job(
     context: &PreparedChatContext,
     final_state: &str,
-) -> Result<(), ApiError> {
+) -> Result<Option<MemoryExtractionHandle>, ApiError> {
     if final_state != "succeeded" || !should_queue_memory_extraction(&context.memory_settings) {
-        return Ok(());
+        return Ok(None);
     }
 
     let target_status = memory_extraction_target_status(
@@ -9263,31 +9307,25 @@ fn queue_memory_extraction_job(
         })
         .map_err(ApiError::from_memory_error)?;
 
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        let task = MemoryExtractionTask {
-            job_id: job_id.clone(),
-            workspace_id: context.workspace_id.clone(),
-            workspace_path: context.workspace_path.clone(),
-            global_memory_database_file: context.memory_database_file.clone(),
-            chat_id: context.chat_id.clone(),
-            run_id: context.llm_request_id.clone(),
-            user_message_id: context.user_message_id.clone(),
-            assistant_message_id: context.assistant_message_id.clone(),
-            model_id: model_id.to_string(),
-            target_status,
-            config: context.global_config.clone(),
-        };
-        handle.spawn(async move {
-            if let Err(error) = run_memory_extraction_job(task).await {
-                tracing::warn!(
-                    error = %error.message,
-                    "memory extraction job worker failed"
-                );
-            }
-        });
-    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return Ok(None);
+    };
+    let task = MemoryExtractionTask {
+        job_id: job_id.clone(),
+        workspace_id: context.workspace_id.clone(),
+        workspace_path: context.workspace_path.clone(),
+        global_memory_database_file: context.memory_database_file.clone(),
+        chat_id: context.chat_id.clone(),
+        run_id: context.llm_request_id.clone(),
+        user_message_id: context.user_message_id.clone(),
+        assistant_message_id: context.assistant_message_id.clone(),
+        model_id: model_id.to_string(),
+        target_status,
+        config: context.global_config.clone(),
+    };
+    let task = handle.spawn(run_memory_extraction_job(task));
 
-    Ok(())
+    Ok(Some(MemoryExtractionHandle { task }))
 }
 
 fn should_queue_memory_extraction(settings: &MemorySettings) -> bool {
@@ -9322,7 +9360,9 @@ fn memory_target_status_for_prompt(message: &str) -> MemoryStatus {
     }
 }
 
-async fn run_memory_extraction_job(task: MemoryExtractionTask) -> Result<(), ApiError> {
+async fn run_memory_extraction_job(
+    task: MemoryExtractionTask,
+) -> Result<Vec<ChatExtractedMemorySummary>, ApiError> {
     let workspace_memory_path = workspace_database_path(&task.workspace_path);
     let mut workspace_memory_database = MemoryDatabase::open_workspace_at(&workspace_memory_path)
         .map_err(ApiError::from_memory_error)?;
@@ -9366,29 +9406,34 @@ async fn run_memory_extraction_job(task: MemoryExtractionTask) -> Result<(), Api
     let mut workspace_memory_database = MemoryDatabase::open_workspace_at(&workspace_memory_path)
         .map_err(ApiError::from_memory_error)?;
 
-    match extraction_result {
-        Ok(output_json) => {
+    let extracted_memories = match extraction_result {
+        Ok((output_json, extracted_memories)) => {
             workspace_memory_database
                 .complete_extraction_job(&task.job_id, &output_json)
                 .map_err(ApiError::from_memory_error)?;
+            extracted_memories
         }
         Err(error) => {
             if memory_extraction_error_should_be_ignored(Some(&error.message)) {
                 workspace_memory_database
                     .complete_extraction_job(&task.job_id, r#"{"facts":[]}"#)
                     .map_err(ApiError::from_memory_error)?;
+                Vec::new()
             } else {
                 workspace_memory_database
                     .fail_extraction_job(&task.job_id, &error.message, None)
                     .map_err(ApiError::from_memory_error)?;
+                Vec::new()
             }
         }
-    }
+    };
 
-    Ok(())
+    Ok(extracted_memories)
 }
 
-async fn run_memory_extraction_job_inner(task: &MemoryExtractionTask) -> Result<String, ApiError> {
+async fn run_memory_extraction_job_inner(
+    task: &MemoryExtractionTask,
+) -> Result<(String, Vec<ChatExtractedMemorySummary>), ApiError> {
     let workspace_database = WorkspaceDatabase::open_or_create(&task.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let evidence_candidates = memory_extraction_evidence_candidates(
@@ -9430,12 +9475,14 @@ async fn run_memory_extraction_job_inner(task: &MemoryExtractionTask) -> Result<
     )
     .await?;
     let output = parse_memory_extraction_output(tool_arguments)?;
-    store_extracted_memory_facts(task, &evidence_candidates, &output)?;
-    serde_json::to_string(&output).map_err(|source| {
+    let extracted_memories = store_extracted_memory_facts(task, &evidence_candidates, &output)?;
+    let output_json = serde_json::to_string(&output).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize memory extraction output: {source}"
         ))
-    })
+    })?;
+
+    Ok((output_json, extracted_memories))
 }
 
 fn memory_extraction_evidence_candidates(
@@ -10703,20 +10750,21 @@ fn store_extracted_memory_facts(
     task: &MemoryExtractionTask,
     evidence_candidates: &[MemoryExtractionEvidenceCandidate],
     output: &MemoryExtractionOutput,
-) -> Result<(), ApiError> {
+) -> Result<Vec<ChatExtractedMemorySummary>, ApiError> {
     let evidence_by_id = evidence_candidates
         .iter()
         .map(|item| (item.evidence_id.as_str(), item))
         .collect::<HashMap<_, _>>();
     let validated_facts = validate_extracted_memory_facts(output, &evidence_by_id)?;
     if validated_facts.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut global_memory_database: Option<MemoryDatabase> = None;
     let mut workspace_memory_database =
         MemoryDatabase::open_workspace_at(workspace_database_path(&task.workspace_path))
             .map_err(ApiError::from_memory_error)?;
+    let mut summaries = Vec::new();
 
     for fact in validated_facts {
         let source_ids = fact
@@ -10786,6 +10834,11 @@ fn store_extracted_memory_facts(
             })
             .map_err(ApiError::from_memory_error)?;
         apply_memory_expiration_to_fact(database, &fact_id, &task.config.memory)?;
+        let stored_fact = database
+            .fact(&fact_id)
+            .map_err(ApiError::from_memory_error)?
+            .ok_or_else(|| ApiError::internal(format!("memory fact was not found: {fact_id}")))?;
+        summaries.push(chat_extracted_memory_summary(stored_fact));
         refresh_memory_profile(
             database,
             fact.scope,
@@ -10793,7 +10846,7 @@ fn store_extracted_memory_facts(
         )?;
     }
 
-    Ok(())
+    Ok(summaries)
 }
 
 fn validate_extracted_memory_facts(
@@ -12606,6 +12659,28 @@ fn tool_results_affect_todo_graph(tool_results: &[ExecutedToolCall]) -> bool {
     })
 }
 
+fn tool_written_memory_summaries(
+    tool_results: &[ExecutedToolCall],
+) -> Vec<ChatExtractedMemorySummary> {
+    tool_results
+        .iter()
+        .filter(|tool_result| !tool_result.is_error && tool_result.name == MEMORY_WRITE_TOOL_NAME)
+        .filter_map(|tool_result| memory_write_tool_summary(&tool_result.output))
+        .collect()
+}
+
+fn memory_write_tool_summary(output: &Value) -> Option<ChatExtractedMemorySummary> {
+    let memory = output.get("memory")?;
+    Some(ChatExtractedMemorySummary {
+        id: string_json_field(memory, "id", "id")?.to_string(),
+        scope: string_json_field(memory, "scope", "scope")?.to_string(),
+        chat_id: nullable_string_json_field(memory, "chatId", "chat_id").map(str::to_string),
+        status: string_json_field(memory, "status", "status")?.to_string(),
+        kind: string_json_field(memory, "kind", "kind")?.to_string(),
+        fact: string_json_field(memory, "fact", "fact")?.to_string(),
+    })
+}
+
 fn merge_usage(total: &mut NeutralUsage, next: &NeutralUsage) {
     add_usage_tokens(&mut total.input_tokens, next.input_tokens);
     add_usage_tokens(&mut total.output_tokens, next.output_tokens);
@@ -12846,6 +12921,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::GuidanceApplied { .. } => "guidance_applied",
         ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
         ChatSseEvent::TodoGraphRefresh { .. } => "todo_graph_refresh",
+        ChatSseEvent::MemoryExtractionComplete { .. } => "memory_extraction_complete",
         ChatSseEvent::Usage { .. } => "usage",
         ChatSseEvent::Complete { .. } => "completion",
         ChatSseEvent::Error { .. } => "error",
@@ -17369,6 +17445,21 @@ fn string_json_field<'a>(value: &'a Value, primary: &str, alternate: &str) -> Op
         .and_then(Value::as_str)
 }
 
+fn nullable_string_json_field<'a>(
+    value: &'a Value,
+    primary: &str,
+    alternate: &str,
+) -> Option<&'a str> {
+    value
+        .get(primary)
+        .or_else(|| value.get(alternate))
+        .and_then(|value| match value {
+            Value::Null => None,
+            Value::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+}
+
 fn fallback_chat_message_parts(
     content: &str,
     reasoning: Option<&str>,
@@ -19873,6 +19964,20 @@ description:
         assert_eq!(output["summary"]["status"], "pending");
         assert_eq!(output["summary"]["scope"], "chat");
         assert_eq!(output["summary"]["sourceCount"], 1);
+        let tool_calls = vec![ExecutedToolCall {
+            id: "tool-call-1".to_string(),
+            name: MEMORY_WRITE_TOOL_NAME.to_string(),
+            input: json!({}),
+            output: output.clone(),
+            is_error: false,
+            started_at: "2026-06-06T09:00:00Z".to_string(),
+            completed_at: "2026-06-06T09:00:01Z".to_string(),
+        }];
+        let summaries = tool_written_memory_summaries(&tool_calls);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].fact, "Prefer compact implementation notes.");
+        assert_eq!(summaries[0].status, "pending");
 
         let database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
             .expect("workspace memory database");
@@ -20253,7 +20358,8 @@ description:
         }))
         .expect("valid extraction JSON");
 
-        store_extracted_memory_facts(&task, &evidence, &output).expect("store extracted facts");
+        let summaries =
+            store_extracted_memory_facts(&task, &evidence, &output).expect("store extracted facts");
 
         let memory_database =
             MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
@@ -20265,6 +20371,10 @@ description:
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].fact, "Prefer concise replies.");
         assert_eq!(facts[0].status, "pending");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, facts[0].id);
+        assert_eq!(summaries[0].fact, "Prefer concise replies.");
+        assert_eq!(summaries[0].status, "pending");
         let sources = memory_database
             .sources_for_fact(&facts[0].id)
             .expect("fact sources");
@@ -20335,7 +20445,8 @@ description:
         }))
         .expect("valid extraction JSON");
 
-        store_extracted_memory_facts(&task, &evidence, &output).expect("store extracted facts");
+        let summaries =
+            store_extracted_memory_facts(&task, &evidence, &output).expect("store extracted facts");
 
         let memory_database =
             MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
@@ -20349,6 +20460,9 @@ description:
 
         assert_eq!(active_facts.len(), 1);
         assert_eq!(active_facts[0].fact, "Prefer concise replies.");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, active_facts[0].id);
+        assert_eq!(summaries[0].status, "active");
         assert!(pending_facts.is_empty());
 
         drop(memory_database);
