@@ -1519,6 +1519,45 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("keeps the active non-default workspace expanded after sending a new chat", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    const defaultToggle = await screen.findByRole("button", { name: "Default" });
+    const sideToggle = screen.getByRole("button", { name: "Side project" });
+    await userEvent.click(
+      screen.getByRole("button", { name: "New chat in Side project" }),
+    );
+
+    expect(defaultToggle).toHaveAttribute("aria-expanded", "false");
+    expect(sideToggle).toHaveAttribute("aria-expanded", "true");
+
+    await userEvent.type(
+      screen.getByPlaceholderText(sideProjectComposerPlaceholder),
+      "Side task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-2/chat/stream",
+        ),
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+
+    await waitFor(() => {
+      expect(defaultToggle).toHaveAttribute("aria-expanded", "false");
+      expect(sideToggle).toHaveAttribute("aria-expanded", "true");
+    });
+  });
+
   it("opens the selected chat workspace and collapses the previous workspace", async () => {
     render(<App />);
 
@@ -3109,10 +3148,14 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
     return chatStreamResponse();
   }
 
+  if (path === "/api/workspaces/workspace-2/chat/stream") {
+    return chatStreamResponse("side-chat-stream");
+  }
+
   return jsonResponse({ error: `Unhandled test route: ${url}` }, { status: 404 });
 }
 
-function chatStreamResponse() {
+function chatStreamResponse(chatId = "chat-1") {
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -3121,7 +3164,7 @@ function chatStreamResponse() {
         encoder.encode(
           `data: ${JSON.stringify({
             type: "start",
-            chatId: "chat-1",
+            chatId,
             userMessageId: "message-user-stream",
             assistantMessageId: "message-assistant-stream",
             llmRequestId: "request-stream",

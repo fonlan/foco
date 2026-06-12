@@ -2155,7 +2155,12 @@ export function App() {
           ? current
           : data.activeWorkspaceId,
       );
-      setExpandedWorkspaceId(data.activeWorkspaceId);
+      setExpandedWorkspaceId((current) =>
+        current !== null &&
+        data.workspaces.some((workspace) => workspace.id === current)
+          ? current
+          : data.activeWorkspaceId,
+      );
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
