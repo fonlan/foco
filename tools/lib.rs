@@ -2204,7 +2204,7 @@ fn write_file_definition() -> ToolDefinition {
 fn patch_file_definition() -> ToolDefinition {
     ToolDefinition {
         name: PATCH_FILE_TOOL,
-        description: "Apply a single-file unified diff to an existing text file inside the active workspace.",
+        description: "Apply a single-file unified diff to an existing text file inside the active workspace. Before calling this tool, use read_file to confirm the target lines and ensure every context/removal line in the diff exactly matches the current file.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2215,7 +2215,7 @@ fn patch_file_definition() -> ToolDefinition {
                 },
                 "diff": {
                     "type": "string",
-                    "description": "Unified diff text containing one or more @@ hunks for this file. Context and removed lines must exactly match the current file."
+                    "description": "Unified diff text containing one or more @@ hunks for this file. Context and removed lines must exactly match the current file lines previously confirmed with read_file."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],

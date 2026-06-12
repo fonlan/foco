@@ -191,7 +191,7 @@ pub fn build_system_prompt(input: SystemPromptInput) -> String {
          - Prefer code graph tools before text search when locating symbols, callers, callees, references, or related files.\n\
          - Use graph_find_symbols first, then use returned symbolId values for graph_find_callers, graph_find_callees, and graph_find_references when names may be ambiguous.\n\
          - Use search_text for literal text, config keys, error messages, or when code graph results are insufficient.\n\
-         - Use read_file before editing a file.\n\
+         - Use read_file before editing a file. Before calling patch_file, read the target file range and confirm every context/removal line in the diff matches the current file.\n\
          - Use list_files to inspect directory shape when needed.\n\
          - Use patch_file for precise edits to existing files. Use write_file for complete-file writes or explicit line-range replacements. Do not create missing parent directories unless the task requires it and the available tool supports it.\n\
          - Use run_command for local commands, including git status and git diff. There is no dedicated git_diff tool.\n\
