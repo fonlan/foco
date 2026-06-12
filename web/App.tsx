@@ -6233,6 +6233,7 @@ function ChatPanel({
                             <MessagePartBlock
                               isError={message.status === "error"}
                               isStreaming={message.status === "streaming"}
+                              isStreamingTail={partIndex === parts.length - 1}
                               isUser={isUser}
                               key={`${message.id}-part-${partIndex}`}
                               part={part}
@@ -6801,12 +6802,14 @@ function ReasoningBlock({
 function MessagePartBlock({
   isError,
   isStreaming,
+  isStreamingTail,
   isUser,
   part,
   reasoningDurationMs,
 }: {
   isError: boolean;
   isStreaming: boolean;
+  isStreamingTail: boolean;
   isUser: boolean;
   part: ChatMessagePart;
   reasoningDurationMs: number | null;
@@ -6815,7 +6818,7 @@ function MessagePartBlock({
     return (
       <ReasoningBlock
         durationMs={reasoningDurationMs}
-        isStreaming={isStreaming}
+        isStreaming={isStreaming && isStreamingTail}
         reasoning={part.text}
       />
     );

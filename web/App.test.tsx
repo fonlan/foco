@@ -1374,6 +1374,50 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("collapses streaming thinking once answer text starts", async () => {
+    render(<App />);
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Need file context.",
+        type: "reasoningDelta",
+      });
+    });
+    const thinkingToggle = await screen.findByRole("button", {
+      name: "Collapse thinking",
+    });
+    expect(thinkingToggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Need file context.")).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Final answer.",
+        type: "textDelta",
+      });
+    });
+
+    await waitFor(() => {
+      expect(thinkingToggle).toHaveAttribute("aria-expanded", "false");
+    });
+    expect(
+      screen.getByText("Need file context.", { selector: "span" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Final answer.")).toBeInTheDocument();
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
   it("sends guidance to the active run without ending the current stream", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
