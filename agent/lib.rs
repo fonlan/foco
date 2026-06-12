@@ -419,9 +419,16 @@ pub fn plan_tool_execution(
 ) -> Result<ToolExecutionPlan, ToolConflictError> {
     let mut analyzed_calls = Vec::with_capacity(tool_calls.len());
     for tool_call in tool_calls {
+        let locks = match tool_resource_locks(tool_call) {
+            Ok(locks) => locks,
+            Err(ToolConflictError::MissingPath { .. } | ToolConflictError::MissingScope { .. }) => {
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
         analyzed_calls.push(AnalyzedToolCall {
             requires_sequential_execution: tool_call_requires_sequential_execution(&tool_call.name),
-            locks: tool_resource_locks(tool_call)?,
+            locks,
         });
     }
 
@@ -698,11 +705,11 @@ impl fmt::Display for ToolConflictError {
         match self {
             Self::MissingPath { tool_name, call_id } => write!(
                 formatter,
-                "tool call '{call_id}' for '{tool_name}' is missing a string path for conflict detection"
+                "tool call '{call_id}' for '{tool_name}' must include a string 'path' argument"
             ),
             Self::MissingScope { tool_name, call_id } => write!(
                 formatter,
-                "tool call '{call_id}' for '{tool_name}' is missing a string scope for conflict detection"
+                "tool call '{call_id}' for '{tool_name}' must include a string 'scope' argument"
             ),
             Self::SameFileWrite {
                 path,
@@ -906,6 +913,34 @@ mod tests {
                 path: "src/main.rs".to_string(),
                 first_call_id: "call-a".to_string(),
                 second_call_id: "call-c".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn plans_calls_with_missing_schema_arguments_so_tools_can_return_errors() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-a".to_string(),
+                name: READ_FILE_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: SEARCH_TEXT_TOOL_NAME.to_string(),
+                arguments: json!({ "query": "needle", "path": "." }),
+            },
+        ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![ToolExecutionGroup {
+                    mode: ToolExecutionMode::Parallel,
+                    call_indices: vec![0, 1],
+                }]
             }
         );
     }
