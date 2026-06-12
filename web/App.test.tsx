@@ -20,21 +20,38 @@ import { App } from "./App";
 const defaultComposerPlaceholder = "Ask Foco anything about Default...";
 const sideProjectComposerPlaceholder = "Ask Foco anything about Side project...";
 
+function chatSummary(
+  id: string,
+  title: string,
+  createdAt: string,
+  updatedAt: string,
+  codeChangeStats = { additions: 0, deletions: 0 },
+) {
+  return {
+    codeChangeStats,
+    createdAt,
+    id,
+    title,
+    updatedAt,
+  };
+}
+
 const workspace = {
   chats: [
-    {
-      createdAt: "2026-06-05T10:00:00Z",
-      id: "chat-1",
-      title: "Tool run",
-      updatedAt: "2026-06-05T10:05:00Z",
-    },
-    {
-      createdAt: "2026-06-05T11:00:00Z",
-      id: "chat-2",
-      title: "Second chat",
-      updatedAt: "2026-06-05T11:05:00Z",
-    },
+    chatSummary(
+      "chat-1",
+      "Tool run",
+      "2026-06-05T10:00:00Z",
+      "2026-06-05T10:05:00Z",
+    ),
+    chatSummary(
+      "chat-2",
+      "Second chat",
+      "2026-06-05T11:00:00Z",
+      "2026-06-05T11:05:00Z",
+    ),
     ...Array.from({ length: 10 }, (_, index) => ({
+      codeChangeStats: { additions: 0, deletions: 0 },
       createdAt: `2026-06-04T${String(10 - index).padStart(2, "0")}:00:00Z`,
       id: `older-chat-${index + 1}`,
       title: `Older chat ${index + 1}`,
@@ -52,12 +69,12 @@ const workspace = {
 
 const secondaryWorkspace = {
   chats: [
-    {
-      createdAt: "2026-06-05T12:00:00Z",
-      id: "side-chat-1",
-      title: "Side note",
-      updatedAt: "2026-06-05T12:05:00Z",
-    },
+    chatSummary(
+      "side-chat-1",
+      "Side note",
+      "2026-06-05T12:00:00Z",
+      "2026-06-05T12:05:00Z",
+    ),
   ],
   commonCommands: [],
   id: "workspace-2",
@@ -867,6 +884,7 @@ let chatStreamControllers = new Map<
 let terminalSessionCounter = 0;
 let chatStreamCounter = 0;
 let workspaceGitDiffResponse = gitDiff;
+let workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
 
 function savedGeneralSettings(init?: RequestInit) {
   const body =
@@ -916,6 +934,7 @@ describe("App verification surfaces", () => {
     terminalSessionCounter = 0;
     chatStreamCounter = 0;
     workspaceGitDiffResponse = gitDiff;
+    workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
     window.history.replaceState(null, "", "/");
     window.localStorage.clear();
     document.documentElement.removeAttribute("data-foco-theme");
@@ -2178,8 +2197,7 @@ describe("App verification surfaces", () => {
     expect(statusDot()).toHaveClass("session-status-dot-idle");
   });
 
-  it("shows live code line changes beside the active workspace chat time", async () => {
-    workspaceGitDiffResponse = emptyGitDiff;
+  it("shows persisted code line changes beside each workspace chat time", async () => {
     render(<App />);
 
     const workspaceList = await screen.findByRole("navigation", {
@@ -2191,40 +2209,61 @@ describe("App verification surfaces", () => {
       throw new Error("Expected Tool run history item button");
     }
 
-    await userEvent.click(historyButton);
-    await screen.findByText("Please inspect README.");
     expect(
       within(historyButton).queryByLabelText("Code changes +3 -2"),
     ).not.toBeInTheDocument();
 
+    workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            ...workspace.chats[0],
+            codeChangeStats: { additions: 3, deletions: 2 },
+          },
+          ...workspace.chats.slice(1),
+        ],
+      },
+      secondaryWorkspace,
+    ];
+    await userEvent.click(historyButton);
+    await screen.findByText("Please inspect README.");
     await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(activeChatStreamController).not.toBeNull());
-
-    workspaceGitDiffResponse = generatedGitDiff;
     await act(async () => {
       enqueueChatStreamEvent({
-        type: "gitDiffRefresh",
-        workspaceId: "workspace-1",
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 10,
+        },
+        reasoning: null,
+        stopReason: null,
+        text: "Done.",
+        type: "complete",
+        usage: null,
       });
-    });
-
-    expect(
-      await within(historyButton).findByLabelText("Code changes +3 -2"),
-    ).toBeInTheDocument();
-    expect(within(historyButton).getByText("+3")).toHaveClass("chat-diff-add");
-    expect(within(historyButton).getByText("-2")).toHaveClass(
-      "chat-diff-delete",
-    );
-
-    await act(async () => {
       activeChatStreamController?.close();
     });
 
-    await waitFor(() =>
-      expect(
-        within(historyButton).getByLabelText("Code changes +3 -2"),
-      ).toBeInTheDocument(),
+    const updatedHistoryTitle = await within(workspaceList).findByText("Tool run");
+    const updatedHistoryButton = updatedHistoryTitle.closest("button");
+    if (!updatedHistoryButton) {
+      throw new Error("Expected updated Tool run history item button");
+    }
+
+    expect(
+      await within(updatedHistoryButton).findByLabelText("Code changes +3 -2"),
+    ).toBeInTheDocument();
+    expect(within(updatedHistoryButton).getByText("+3")).toHaveClass("chat-diff-add");
+    expect(within(updatedHistoryButton).getByText("-2")).toHaveClass(
+      "chat-diff-delete",
     );
   });
 
@@ -3356,7 +3395,7 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   if (path === "/api/workspaces") {
     return jsonResponse({
       activeWorkspaceId: workspace.id,
-      workspaces: [workspace, secondaryWorkspace],
+      workspaces: workspaceResponseWorkspaces,
     });
   }
 

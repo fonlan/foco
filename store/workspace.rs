@@ -228,6 +228,49 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn chat_code_change_stats(
+        &self,
+    ) -> Result<HashMap<String, CodeChangeStats>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT chat_id, metadata_json
+                 FROM messages
+                 WHERE role = 'assistant'",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        let mut stats_by_chat = HashMap::new();
+
+        for row in rows {
+            let (chat_id, metadata_json) = row.map_err(|source| self.sqlite_error(source))?;
+            let metadata = serde_json::from_str::<Value>(&metadata_json).map_err(|source| {
+                WorkspaceDatabaseError::InvalidAuditJson {
+                    field: "message metadata_json",
+                    source,
+                }
+            })?;
+            let Some(stats_value) = metadata.get("codeChangeStats") else {
+                continue;
+            };
+            let stats = CodeChangeStats::from_metadata(stats_value)?;
+            if stats.additions == 0 && stats.deletions == 0 {
+                continue;
+            }
+            let entry = stats_by_chat
+                .entry(chat_id)
+                .or_insert_with(CodeChangeStats::default);
+            entry.additions += stats.additions;
+            entry.deletions += stats.deletions;
+        }
+
+        Ok(stats_by_chat)
+    }
+
     pub fn insert_message(
         &mut self,
         message: NewMessage<'_>,
@@ -1910,6 +1953,44 @@ pub struct ChatRecord {
     pub archived_at: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeChangeStats {
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+impl CodeChangeStats {
+    fn from_metadata(value: &Value) -> Result<Self, WorkspaceDatabaseError> {
+        let Some(additions) = value.get("additions").and_then(Value::as_u64) else {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "message metadata.codeChangeStats.additions must be an unsigned integer"
+                    .to_string(),
+            });
+        };
+        let Some(deletions) = value.get("deletions").and_then(Value::as_u64) else {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "message metadata.codeChangeStats.deletions must be an unsigned integer"
+                    .to_string(),
+            });
+        };
+
+        let additions =
+            usize::try_from(additions).map_err(|_| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "message metadata.codeChangeStats.additions is too large".to_string(),
+            })?;
+        let deletions =
+            usize::try_from(deletions).map_err(|_| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "message metadata.codeChangeStats.deletions is too large".to_string(),
+            })?;
+
+        Ok(Self {
+            additions,
+            deletions,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewMessage<'a> {
     pub id: &'a str,
@@ -2377,6 +2458,9 @@ pub enum WorkspaceDatabaseError {
     InvalidCodeGraphInput {
         message: String,
     },
+    InvalidMessageMetadata {
+        message: String,
+    },
     InvalidTodoGraph {
         message: String,
     },
@@ -2428,6 +2512,9 @@ impl fmt::Display for WorkspaceDatabaseError {
         match self {
             Self::InvalidCodeGraphInput { message } => {
                 write!(formatter, "invalid code graph index data: {message}")
+            }
+            Self::InvalidMessageMetadata { message } => {
+                write!(formatter, "invalid message metadata: {message}")
             }
             Self::InvalidTodoGraph { message } => {
                 write!(formatter, "invalid todo graph: {message}")
@@ -2491,6 +2578,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             Self::TodoGraphJson { source } => Some(source),
             Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
+            | Self::InvalidMessageMetadata { .. }
             | Self::InvalidTodoGraph { .. }
             | Self::MissingDatabaseParent { .. }
             | Self::MissingLlmRequest { .. }

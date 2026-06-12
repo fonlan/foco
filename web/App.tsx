@@ -100,6 +100,7 @@ type ChatSummary = {
   title: string;
   createdAt: string;
   updatedAt: string;
+  codeChangeStats: GitDiffLineStats;
 };
 
 type WorkspaceSummary = {
@@ -1782,14 +1783,6 @@ type GitDiffLineStats = {
   deletions: number;
 };
 
-type GitDiffFileStats = GitDiffLineStats & {
-  path: string;
-};
-
-type GitDiffStats = GitDiffLineStats & {
-  files: GitDiffFileStats[];
-};
-
 type GitBranchesResponse = {
   isGitRepository: boolean;
   currentBranch: string | null;
@@ -1969,9 +1962,6 @@ export function App() {
   >(() => new Set());
   const [gitDiff, setGitDiff] = useState<GitDiffResponse | null>(null);
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
-  const [workspaceDiffStatsById, setWorkspaceDiffStatsById] = useState<
-    Record<string, GitDiffStats>
-  >({});
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [todoGraph, setTodoGraph] = useState<TodoGraphResponse | null>(null);
@@ -2296,48 +2286,14 @@ export function App() {
         `/api/workspaces/${encodeURIComponent(workspaceId)}/git/diff${query}`,
       );
       setGitDiff(data);
-      if (!path) {
-        setWorkspaceDiffStatsById((current) => ({
-          ...current,
-          [workspaceId]: gitDiffStats(data),
-        }));
-      }
       setSelectedDiffPath(path && data.files.some((file) => file.path === path) ? path : null);
       return data;
     } catch (requestError) {
       setGitDiff(null);
       setDiffError(errorMessage(requestError));
-      if (!path) {
-        setWorkspaceDiffStatsById((current) => {
-          const next = { ...current };
-          delete next[workspaceId];
-          return next;
-        });
-      }
       return null;
     } finally {
       setIsLoadingDiff(false);
-    }
-  }, []);
-
-  const refreshWorkspaceDiffStats = useCallback(async (workspaceId: string) => {
-    try {
-      const data = await requestJson<GitDiffResponse>(
-        `/api/workspaces/${encodeURIComponent(workspaceId)}/git/diff`,
-      );
-      const stats = gitDiffStats(data);
-      setWorkspaceDiffStatsById((current) => ({
-        ...current,
-        [workspaceId]: stats,
-      }));
-      return stats;
-    } catch {
-      setWorkspaceDiffStatsById((current) => {
-        const next = { ...current };
-        delete next[workspaceId];
-        return next;
-      });
-      return null;
     }
   }, []);
 
@@ -2475,15 +2431,6 @@ export function App() {
       return;
     }
 
-    if (
-      activeChatId ||
-      [...runningChatKeys].some((chatKey) =>
-        chatKey.startsWith(`${activeWorkspace.id}:`),
-      )
-    ) {
-      void refreshWorkspaceDiffStats(activeWorkspace.id);
-    }
-
     if (!isContextPanelOpen || contextPanelTab !== "git") {
       return;
     }
@@ -2495,8 +2442,6 @@ export function App() {
     contextPanelTab,
     isContextPanelOpen,
     loadGitDiff,
-    refreshWorkspaceDiffStats,
-    runningChatKeys,
     selectedDiffPath,
   ]);
 
@@ -4246,7 +4191,6 @@ export function App() {
         }
 
         if (streamEvent.type === "gitDiffRefresh") {
-          void refreshWorkspaceDiffStats(streamEvent.workspaceId);
           if (isContextPanelOpen && contextPanelTab === "git") {
             void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
           }
@@ -4285,7 +4229,6 @@ export function App() {
       });
 
       await refreshWorkspaces();
-      await refreshWorkspaceDiffStats(request.workspaceId);
       runSucceeded = !streamHadError;
     } catch (requestError) {
       const wasCancelled =
@@ -4694,10 +4637,7 @@ export function App() {
                                 const isChatActive =
                                   activeWorkspace?.id === workspace.id &&
                                   activeChatId === chat.id;
-                                const chatDiffStats =
-                                  isChatActive || isChatRunning
-                                    ? workspaceDiffStatsById[workspace.id]
-                                    : null;
+                                const chatDiffStats = chat.codeChangeStats;
 
                                 return (
                                   <div
@@ -19290,39 +19230,7 @@ function parseGitDiffSections(diff: GitDiffResponse | null): GitDiffSection[] {
     .filter((section) => section.files.length > 0);
 }
 
-function gitDiffStats(diff: GitDiffResponse): GitDiffStats {
-  const filesByPath = new Map<string, GitDiffFileStats>();
-
-  for (const section of parseGitDiffSections(diff)) {
-    for (const file of section.files) {
-      const fileStats = filesByPath.get(file.path) ?? {
-        additions: 0,
-        deletions: 0,
-        path: file.path,
-      };
-      for (const line of file.lines) {
-        if (line.kind === "add") {
-          fileStats.additions += 1;
-        } else if (line.kind === "remove") {
-          fileStats.deletions += 1;
-        }
-      }
-      filesByPath.set(file.path, fileStats);
-    }
-  }
-
-  const files = Array.from(filesByPath.values()).filter(
-    (file) => file.additions > 0 || file.deletions > 0,
-  );
-
-  return {
-    additions: files.reduce((total, file) => total + file.additions, 0),
-    deletions: files.reduce((total, file) => total + file.deletions, 0),
-    files,
-  };
-}
-
-function hasGitDiffStats(stats: GitDiffStats) {
+function hasGitDiffStats(stats: GitDiffLineStats) {
   return stats.additions > 0 || stats.deletions > 0;
 }
 

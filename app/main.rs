@@ -71,10 +71,10 @@ use foco_store::{
         parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache,
     },
     workspace::{
-        ChatRecord, ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
-        LlmRequestAuditRow, LlmRequestEventRecord, LlmRequestRecord, MessageRecord,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-        NewPromptContextInjection, NewTerminalSession, NewToolCall, NewToolResult,
+        ChatRecord, CodeChangeStats, ContextCompressionSnapshotRecord, HookRunRecord,
+        LlmRequestAuditFilters, LlmRequestAuditRow, LlmRequestEventRecord, LlmRequestRecord,
+        MessageRecord, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
+        NewMessage, NewPromptContextInjection, NewTerminalSession, NewToolCall, NewToolResult,
         PromptContextInjectionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
         ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
         initialize_workspace_databases, workspace_database_path,
@@ -4492,6 +4492,7 @@ struct ChatSummary {
     title: String,
     created_at: String,
     updated_at: String,
+    code_change_stats: CodeChangeStats,
 }
 
 #[derive(Serialize)]
@@ -4852,6 +4853,7 @@ struct PreparedChatContext {
     hook_context_messages: Vec<String>,
     hook_notifications: Vec<HookNotification>,
     initial_git_diff_stats: Option<GitDiffStatsByFile>,
+    code_change_stats: CodeChangeStats,
 }
 
 struct PreparedPromptContext {
@@ -5810,12 +5812,14 @@ impl PreparedChatContext {
                                     );
                                     continue 'agent_turns;
                                 }
-                                let assistant_message_text = append_git_diff_summary(
+                                let git_diff_summary_result = git_diff_summary(
                                     &assistant_message_text,
                                     &self.initial_git_diff_stats,
                                     &self.workspace_path,
                                     &self.global_config.app.language,
                                 );
+                                let assistant_message_text = git_diff_summary_result.text;
+                                self.code_change_stats = git_diff_summary_result.stats;
                                 let total_latency_ms = elapsed_millis(started_at);
                                 let metrics = ChatReplyMetrics {
                                     model_id: self.model_id.clone(),
@@ -6756,6 +6760,7 @@ async fn prepare_chat_context(
         hook_context_messages,
         hook_notifications,
         initial_git_diff_stats,
+        code_change_stats: CodeChangeStats::default(),
     })
 }
 
@@ -8583,8 +8588,11 @@ fn persist_chat_result(
     }
 
     let assistant_message_id = if let Some(assistant_text) = assistant_text {
-        let metadata_json =
-            assistant_message_metadata_json(assistant_reasoning, &context.memories_used)?;
+        let metadata_json = assistant_message_metadata_json(
+            assistant_reasoning,
+            &context.memories_used,
+            &context.code_change_stats,
+        )?;
         database
             .insert_message(NewMessage {
                 id: &context.assistant_message_id,
@@ -15022,11 +15030,20 @@ fn workspace_response_from_config(
     for workspace in &config.workspaces {
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
+        let code_change_stats_by_chat = database
+            .chat_code_change_stats()
+            .map_err(ApiError::from_workspace_error)?;
         let chats = database
             .chats()
             .map_err(ApiError::from_workspace_error)?
             .into_iter()
-            .map(chat_summary)
+            .map(|chat| {
+                let code_change_stats = code_change_stats_by_chat
+                    .get(&chat.id)
+                    .cloned()
+                    .unwrap_or_default();
+                chat_summary(chat, code_change_stats)
+            })
             .collect();
 
         workspaces.push(WorkspaceSummary {
@@ -15827,12 +15844,13 @@ fn utc_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn chat_summary(chat: ChatRecord) -> ChatSummary {
+fn chat_summary(chat: ChatRecord, code_change_stats: CodeChangeStats) -> ChatSummary {
     ChatSummary {
         id: chat.id,
         title: chat.title,
         created_at: chat.created_at,
         updated_at: chat.updated_at,
+        code_change_stats,
     }
 }
 
@@ -15960,22 +15978,37 @@ fn collect_git_diff_file_stats(diff_text: &str, stats: &mut GitDiffStatsByFile) 
     }
 }
 
-fn append_git_diff_summary(
+struct GitDiffSummary {
+    text: String,
+    stats: CodeChangeStats,
+}
+
+fn git_diff_summary(
     assistant_text: &str,
     initial_stats: &Option<GitDiffStatsByFile>,
     workspace_path: &Path,
     language: &str,
-) -> String {
+) -> GitDiffSummary {
     let Some(initial_stats) = initial_stats else {
-        return assistant_text.to_string();
+        return GitDiffSummary {
+            text: assistant_text.to_string(),
+            stats: CodeChangeStats::default(),
+        };
     };
     let Some(final_stats) = git_diff_stats_for_workspace(workspace_path) else {
-        return assistant_text.to_string();
+        return GitDiffSummary {
+            text: assistant_text.to_string(),
+            stats: CodeChangeStats::default(),
+        };
     };
     let changed_files = git_diff_changed_files(initial_stats, &final_stats);
     if changed_files.is_empty() {
-        return assistant_text.to_string();
+        return GitDiffSummary {
+            text: assistant_text.to_string(),
+            stats: CodeChangeStats::default(),
+        };
     }
+    let stats = code_change_stats_from_changed_files(&changed_files);
 
     let mut text = assistant_text.trim_end().to_string();
     if !text.is_empty() {
@@ -16004,7 +16037,17 @@ fn append_git_diff_summary(
             text.push('\n');
         }
     }
-    text
+
+    GitDiffSummary { text, stats }
+}
+
+fn code_change_stats_from_changed_files(
+    changed_files: &[(String, GitDiffFileLineStats)],
+) -> CodeChangeStats {
+    CodeChangeStats {
+        additions: changed_files.iter().map(|(_, stats)| stats.additions).sum(),
+        deletions: changed_files.iter().map(|(_, stats)| stats.deletions).sum(),
+    }
 }
 
 fn git_diff_changed_files(
@@ -16095,8 +16138,13 @@ fn assistant_memories_used_from_metadata(
 fn assistant_message_metadata_json(
     reasoning: Option<&str>,
     memories_used: &[ChatMemoryUsedSummary],
+    code_change_stats: &CodeChangeStats,
 ) -> Result<String, ApiError> {
-    if reasoning.is_none() && memories_used.is_empty() {
+    if reasoning.is_none()
+        && memories_used.is_empty()
+        && code_change_stats.additions == 0
+        && code_change_stats.deletions == 0
+    {
         return Ok("{}".to_string());
     }
 
@@ -16109,6 +16157,9 @@ fn assistant_message_metadata_json(
     }
     if !memories_used.is_empty() {
         metadata.insert("memoriesUsed".to_string(), json!(memories_used));
+    }
+    if code_change_stats.additions > 0 || code_change_stats.deletions > 0 {
+        metadata.insert("codeChangeStats".to_string(), json!(code_change_stats));
     }
 
     serde_json::to_string(&Value::Object(metadata)).map_err(|source| {
@@ -18531,6 +18582,7 @@ description:
             hook_context_messages: Vec::new(),
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
+            code_change_stats: CodeChangeStats::default(),
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -18681,6 +18733,7 @@ description:
             hook_context_messages: Vec::new(),
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
+            code_change_stats: CodeChangeStats::default(),
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -18808,6 +18861,7 @@ description:
             hook_context_messages: Vec::new(),
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
+            code_change_stats: CodeChangeStats::default(),
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -18920,6 +18974,49 @@ description:
         assert_eq!(cleared_files[0].0, "README.md");
         assert_eq!(cleared_files[0].1.additions, 0);
         assert_eq!(cleared_files[0].1.deletions, 0);
+    }
+
+    #[test]
+    fn chat_code_change_stats_sum_assistant_metadata() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-chat-code-stats-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+
+        database
+            .insert_chat("chat-1", "Code stats chat")
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "Done.",
+                sequence: 0,
+                metadata_json: Some(r#"{"codeChangeStats":{"additions":3,"deletions":2}}"#),
+            })
+            .expect("assistant message insert");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-2",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "Done again.",
+                sequence: 1,
+                metadata_json: Some(r#"{"codeChangeStats":{"additions":4,"deletions":0}}"#),
+            })
+            .expect("assistant message insert");
+
+        let stats = database
+            .chat_code_change_stats()
+            .expect("chat code change stats");
+        let chat_stats = stats.get("chat-1").expect("chat stats");
+
+        assert_eq!(chat_stats.additions, 7);
+        assert_eq!(chat_stats.deletions, 2);
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }
 
     #[test]
