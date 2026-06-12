@@ -832,8 +832,16 @@ type ChatMessageSummary = {
   extractedMemories: ChatExtractedMemorySummary[];
 };
 
+type ActiveChatRunSummary = {
+  runId: string;
+  workspaceId: string;
+  chatId: string;
+  lastSequence: number | null;
+};
+
 type ChatMessagesResponse = {
   messages: ChatMessageSummary[];
+  activeRun?: ActiveChatRunSummary | null;
 };
 
 type TaskStatus =
@@ -1872,6 +1880,7 @@ type ActiveRunInfo = {
   chatId: string | null;
   runId: string | null;
   chatKey: string;
+  lastSequence?: number | null;
 };
 
 type ContextUsageRefreshRequest = {
@@ -2929,6 +2938,7 @@ export function App() {
       );
       const chatKey = chatRunKey(workspaceId, chatId);
       const nextMessages = data.messages.map(normalizeChatMessageSummary);
+      const activeRun = normalizeActiveChatRunSummary(data.activeRun);
       setActiveWorkspaceId(workspaceId);
       setActiveChatId(chatId);
       setExpandedWorkspaceId(workspaceId);
@@ -2938,6 +2948,12 @@ export function App() {
       setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
       setViewMode("chat");
       setIsMobileWorkspaceOpen(false);
+      if (activeRun) {
+        void subscribeActiveChatRun(activeRun);
+      } else {
+        setChatRunning(chatKey, false);
+        setActiveRunInfoForChatKey(chatKey, null);
+      }
       if (options.updateUrl !== false) {
         updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
       }
@@ -3553,10 +3569,23 @@ export function App() {
     };
   }, []);
 
-  function handleCancelRun() {
+  async function handleCancelRun() {
     const currentChatKey = activeChatKeyRef.current;
     if (!currentChatKey) {
       return;
+    }
+
+    const runInfo = activeRunInfoByChatKey[currentChatKey] ?? null;
+    if (runInfo?.runId) {
+      try {
+        await requestJson<{ ok: boolean; runId: string }>(
+          `/api/workspaces/${encodeURIComponent(runInfo.workspaceId)}/chat/runs/${encodeURIComponent(runInfo.runId)}/cancel`,
+          { method: "POST" },
+        );
+      } catch (requestError) {
+        setError(errorMessage(requestError));
+        return;
+      }
     }
 
     activeRunAbortByChatKeyRef.current.get(currentChatKey)?.abort();
@@ -3775,6 +3804,298 @@ export function App() {
     } catch (requestError) {
       removeMessageForChatKey(runInfo.chatKey, pendingUserMessageId);
       setError(errorMessage(requestError));
+    }
+  }
+
+  async function subscribeActiveChatRun(activeRun: ActiveChatRunSummary) {
+    const chatKey = chatRunKey(activeRun.workspaceId, activeRun.chatId);
+    if (activeRunAbortByChatKeyRef.current.has(chatKey)) {
+      return;
+    }
+
+    const abortController = new AbortController();
+    let assistantMessageId = `active-assistant-${activeRun.runId}`;
+    let currentAssistantMessageId = assistantMessageId;
+    let hasGuidanceTurns = false;
+    let streamHadError = false;
+
+    const ensureStreamingAssistantMessage = (
+      nextAssistantMessageId: string,
+      memoriesUsed: ChatMemoryUsedSummary[] = [],
+    ) => {
+      setMessagesForChatKey(chatKey, (current) => {
+        if (current.some((message) => message.id === nextAssistantMessageId)) {
+          return current.map((message) =>
+            message.id === nextAssistantMessageId && message.role === "assistant"
+              ? {
+                  ...message,
+                  memoriesUsed: message.memoriesUsed.length
+                    ? message.memoriesUsed
+                    : memoriesUsed,
+                  status: "streaming",
+                }
+              : message,
+          );
+        }
+
+        return [
+          ...current,
+          streamingAssistantMessage(nextAssistantMessageId, memoriesUsed),
+        ];
+      });
+    };
+
+    const isCurrentAssistantMessage = (
+      message: ShellMessage,
+      eventAssistantMessageId?: string,
+    ) =>
+      message.role === "assistant" &&
+      (message.id === currentAssistantMessageId ||
+        (eventAssistantMessageId !== undefined &&
+          message.id === eventAssistantMessageId) ||
+        message.id === assistantMessageId);
+
+    setChatRunning(chatKey, true);
+    setChatRunFailed(chatKey, false);
+    setActiveRunInfoForChatKey(chatKey, {
+      chatId: activeRun.chatId,
+      chatKey,
+      lastSequence: activeRun.lastSequence,
+      runId: activeRun.runId,
+      workspaceId: activeRun.workspaceId,
+    });
+    activeRunAbortByChatKeyRef.current.set(chatKey, abortController);
+
+    try {
+      const response = await fetch(
+        `/api/workspaces/${encodeURIComponent(activeRun.workspaceId)}/chat/runs/${encodeURIComponent(activeRun.runId)}/stream?afterSequence=-1`,
+        {
+          cache: "no-store",
+          credentials: "same-origin",
+          signal: abortController.signal,
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error(await responseErrorMessage(response));
+      }
+
+      await readChatStream(response, (streamEvent) => {
+        if (streamEvent.type === "start") {
+          assistantMessageId = streamEvent.assistantMessageId;
+          currentAssistantMessageId = streamEvent.assistantMessageId;
+          ensureStreamingAssistantMessage(
+            streamEvent.assistantMessageId,
+            streamEvent.memoriesUsed,
+          );
+          setChatRunFailed(chatKey, false);
+          setChatRunning(chatKey, true);
+          setActiveRunInfoForChatKey(chatKey, {
+            chatId: streamEvent.chatId,
+            chatKey,
+            lastSequence: activeRun.lastSequence,
+            runId: streamEvent.llmRequestId ?? activeRun.runId,
+            workspaceId: activeRun.workspaceId,
+          });
+          return;
+        }
+
+        if (streamEvent.type === "textDelta") {
+          ensureStreamingAssistantMessage(
+            streamEvent.assistantMessageId ?? currentAssistantMessageId,
+          );
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? {
+                    ...message,
+                    content: message.content + streamEvent.delta,
+                    parts: appendTextPart(message.parts, streamEvent.delta),
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "reasoningDelta") {
+          ensureStreamingAssistantMessage(
+            streamEvent.assistantMessageId ?? currentAssistantMessageId,
+          );
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? {
+                    ...message,
+                    reasoning: `${message.reasoning ?? ""}${streamEvent.delta}`,
+                    parts: appendReasoningPart(message.parts, streamEvent.delta),
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "usage") {
+          return;
+        }
+
+        if (streamEvent.type === "guidanceApplied") {
+          const previousAssistantId = currentAssistantMessageId;
+          const guidanceAssistantId = `${streamEvent.id}-assistant`;
+          currentAssistantMessageId = guidanceAssistantId;
+          hasGuidanceTurns = true;
+          appendGuidanceMessage(
+            chatKey,
+            streamEvent,
+            guidanceAssistantId,
+            previousAssistantId,
+          );
+          return;
+        }
+
+        if (streamEvent.type === "complete") {
+          setChatRunFailed(chatKey, false);
+          setRetryRunRequest(null);
+          setPendingQuestion(null);
+          setQuestionError(null);
+          setIsAnsweringQuestion(false);
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? hasGuidanceTurns
+                  ? completedGuidanceAssistantMessage(message, streamEvent)
+                  : completedAssistantMessage(message, streamEvent)
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "toolCall") {
+          ensureStreamingAssistantMessage(streamEvent.assistantMessageId);
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? {
+                    ...message,
+                    parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
+                    toolCalls: upsertToolCall(
+                      message.toolCalls,
+                      streamEvent.toolCall,
+                    ),
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "toolResult") {
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? {
+                    ...message,
+                    parts: applyToolResultToParts(
+                      message.parts,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                    ),
+                    toolCalls: applyToolResult(
+                      message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                    ),
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "questionRequest") {
+          setQuestionError(null);
+          setPendingQuestion(streamEvent.request);
+          return;
+        }
+
+        if (streamEvent.type === "hookNotification") {
+          if (streamEvent.notification.level === "error") {
+            setError(streamEvent.notification.message);
+          }
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? {
+                    ...message,
+                    parts: appendTextPart(
+                      message.parts,
+                      `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
+                    ),
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "gitDiffRefresh") {
+          if (isContextPanelOpen && contextPanelTab === "git") {
+            void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
+          }
+          return;
+        }
+
+        if (streamEvent.type === "todoGraphRefresh") {
+          const activeKey = activeChatKeyRef.current;
+          if (activeKey === chatRunKey(streamEvent.workspaceId, streamEvent.chatId)) {
+            setContextPanelTab("todo");
+            setIsContextPanelOpen(true);
+            void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId);
+          }
+          return;
+        }
+
+        if (streamEvent.type === "error") {
+          streamHadError = true;
+          setChatRunFailed(chatKey, true);
+          setChatRunning(chatKey, false);
+          setError(streamEvent.message);
+          setPendingQuestion(null);
+          setQuestionError(null);
+          setIsAnsweringQuestion(false);
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message)
+                ? assistantMessageWithAppendedError(message, streamEvent.message)
+                : message,
+            ),
+          );
+        }
+      });
+
+      await refreshWorkspaces();
+    } catch (requestError) {
+      const wasCancelled =
+        requestError instanceof DOMException && requestError.name === "AbortError";
+      if (!wasCancelled) {
+        setChatRunFailed(chatKey, true);
+        setError(errorMessage(requestError));
+      }
+    } finally {
+      if (activeRunAbortByChatKeyRef.current.get(chatKey) === abortController) {
+        activeRunAbortByChatKeyRef.current.delete(chatKey);
+      }
+      setChatRunning(chatKey, false);
+      setActiveRunInfoForChatKey(chatKey, null);
+      if (!streamHadError) {
+        setPendingQuestion(null);
+        setQuestionError(null);
+        setIsAnsweringQuestion(false);
+      }
     }
   }
 
@@ -4877,7 +5198,7 @@ export function App() {
               onBranchChange={(branch) => void handleGitBranchChange(branch)}
               onDraftMessageChange={setDraftMessage}
               onSelectAttachments={() => void handleSelectDraftAttachments()}
-              onCancelRun={handleCancelRun}
+              onCancelRun={() => void handleCancelRun()}
               onGuideActiveRun={() => void handleGuideActiveRun()}
               onQueueActiveRun={handleQueueActiveRun}
               onModelChange={handleChatModelChange}
@@ -5011,7 +5332,7 @@ export function App() {
         <QuestionDialog
           error={questionError}
           isSaving={isAnsweringQuestion}
-          onCancelRun={handleCancelRun}
+          onCancelRun={() => void handleCancelRun()}
           onSubmit={handleQuestionSubmit}
           question={pendingQuestion}
         />
@@ -19977,6 +20298,50 @@ function parseChatExtractedMemorySummary(
     kind,
     scope,
     status,
+  };
+}
+
+function streamingAssistantMessage(
+  id: string,
+  memoriesUsed: ChatMemoryUsedSummary[] = [],
+): ShellMessage {
+  return {
+    id,
+    role: "assistant",
+    content: "",
+    createdAt: new Date().toISOString(),
+    reasoning: null,
+    status: "streaming",
+    toolCalls: [],
+    parts: [],
+    metrics: null,
+    memoriesUsed,
+    extractedMemories: [],
+  };
+}
+
+function normalizeActiveChatRunSummary(
+  value: unknown,
+): ActiveChatRunSummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const runId = stringField(value, "runId", "run_id");
+  const workspaceId = stringField(value, "workspaceId", "workspace_id");
+  const chatId = stringField(value, "chatId", "chat_id");
+  const lastSequenceValue = fieldValue(value, "lastSequence", "last_sequence");
+
+  if (!runId || !workspaceId || !chatId) {
+    return null;
+  }
+
+  return {
+    runId,
+    workspaceId,
+    chatId,
+    lastSequence:
+      typeof lastSequenceValue === "number" ? lastSequenceValue : null,
   };
 }
 

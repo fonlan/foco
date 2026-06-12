@@ -3,7 +3,10 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -74,6 +77,25 @@ pub struct ToolExecution {
     pub is_error: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct ToolCancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ToolCancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         read_file_definition(),
@@ -115,7 +137,29 @@ pub fn execute_builtin_tool_for_chat(
     tool_name: &str,
     arguments: Value,
 ) -> ToolExecution {
-    match execute_builtin_tool_inner(workspace_path, chat_id, tool_name, arguments) {
+    execute_builtin_tool_for_chat_with_cancellation(
+        workspace_path,
+        chat_id,
+        tool_name,
+        arguments,
+        None,
+    )
+}
+
+pub fn execute_builtin_tool_for_chat_with_cancellation(
+    workspace_path: &Path,
+    chat_id: Option<&str>,
+    tool_name: &str,
+    arguments: Value,
+    cancellation_token: Option<ToolCancellationToken>,
+) -> ToolExecution {
+    match execute_builtin_tool_inner(
+        workspace_path,
+        chat_id,
+        tool_name,
+        arguments,
+        cancellation_token.as_ref(),
+    ) {
         Ok(output) => ToolExecution {
             output,
             is_error: false,
@@ -129,6 +173,13 @@ pub fn execute_builtin_tool_for_chat(
 
 fn tool_error_output(error: &ToolRuntimeError) -> Value {
     match error {
+        ToolRuntimeError::Cancelled => json!({ "error": error.to_string(), "cancelled": true }),
+        ToolRuntimeError::CommandCancelled { command, pid } => json!({
+            "error": error.to_string(),
+            "command": command,
+            "pid": pid,
+            "cancelled": true
+        }),
         ToolRuntimeError::CommandTimedOut {
             command,
             pid,
@@ -175,6 +226,7 @@ fn execute_builtin_tool_inner(
     chat_id: Option<&str>,
     tool_name: &str,
     arguments: Value,
+    cancellation_token: Option<&ToolCancellationToken>,
 ) -> Result<Value, ToolRuntimeError> {
     match tool_name {
         READ_FILE_TOOL => read_file(workspace_path, arguments),
@@ -184,7 +236,7 @@ fn execute_builtin_tool_inner(
         GRAPH_FIND_CALLEES_TOOL => graph_find_callees(workspace_path, arguments),
         GRAPH_FIND_REFERENCES_TOOL => graph_find_references(workspace_path, arguments),
         GRAPH_RELATED_FILES_TOOL => graph_related_files(workspace_path, arguments),
-        SEARCH_TEXT_TOOL => search_text(workspace_path, arguments),
+        SEARCH_TEXT_TOOL => search_text(workspace_path, arguments, cancellation_token),
         WRITE_FILE_TOOL => write_file(workspace_path, arguments),
         PATCH_FILE_TOOL => patch_file(workspace_path, arguments),
         CREATE_TODO_GRAPH_TOOL => create_todo_graph(workspace_path, chat_id, arguments),
@@ -193,8 +245,8 @@ fn execute_builtin_tool_inner(
         ASK_QUESTION_TOOL => Err(ToolRuntimeError::InvalidArguments(
             "ask_question must be executed through the chat UI question bridge".to_string(),
         )),
-        RUN_COMMAND_TOOL => run_command(workspace_path, arguments),
-        SLEEP_TOOL => sleep_tool(arguments),
+        RUN_COMMAND_TOOL => run_command(workspace_path, arguments, cancellation_token),
+        SLEEP_TOOL => sleep_tool(arguments, cancellation_token),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
     }
 }
@@ -433,7 +485,11 @@ fn graph_related_files(workspace_path: &Path, arguments: Value) -> Result<Value,
     }))
 }
 
-fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+fn search_text(
+    workspace_path: &Path,
+    arguments: Value,
+    cancellation_token: Option<&ToolCancellationToken>,
+) -> Result<Value, ToolRuntimeError> {
     let request: SearchTextInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_SEARCH_TEXT_TIMEOUT_MS)?;
     let input_path = request.path;
@@ -460,6 +516,7 @@ fn search_text(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         &rg_args,
         workspace_path,
         Duration::from_millis(timeout_ms),
+        cancellation_token,
     )?;
 
     if !output.status.success() {
@@ -719,7 +776,11 @@ fn get_todo_graph(
     }
 }
 
-fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+fn run_command(
+    workspace_path: &Path,
+    arguments: Value,
+    cancellation_token: Option<&ToolCancellationToken>,
+) -> Result<Value, ToolRuntimeError> {
     let request: RunCommandInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_RUN_COMMAND_TIMEOUT_MS)?;
     let command = request.command.trim();
@@ -748,7 +809,13 @@ fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
         return Err(ToolRuntimeError::NotDirectory(cwd));
     }
 
-    let output = run_command_with_timeout(command, &args, &cwd, Duration::from_millis(timeout_ms))?;
+    let output = run_command_with_timeout(
+        command,
+        &args,
+        &cwd,
+        Duration::from_millis(timeout_ms),
+        cancellation_token,
+    )?;
     let (stdout, stdout_truncated) = limited_output_text(&output.stdout);
     let (stderr, stderr_truncated) = limited_output_text(&output.stderr);
 
@@ -767,7 +834,10 @@ fn run_command(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRun
     }))
 }
 
-fn sleep_tool(arguments: Value) -> Result<Value, ToolRuntimeError> {
+fn sleep_tool(
+    arguments: Value,
+    cancellation_token: Option<&ToolCancellationToken>,
+) -> Result<Value, ToolRuntimeError> {
     let request: SleepInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_SLEEP_TIMEOUT_MS)?;
 
@@ -777,7 +847,27 @@ fn sleep_tool(arguments: Value) -> Result<Value, ToolRuntimeError> {
         )));
     }
 
-    thread::sleep(Duration::from_millis(request.duration_ms));
+    let started = Instant::now();
+    let duration = Duration::from_millis(request.duration_ms);
+    loop {
+        if cancellation_token
+            .map(ToolCancellationToken::is_cancelled)
+            .unwrap_or(false)
+        {
+            return Err(ToolRuntimeError::Cancelled);
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= duration {
+            break;
+        }
+
+        thread::sleep(
+            duration
+                .saturating_sub(elapsed)
+                .min(Duration::from_millis(COMMAND_WAIT_POLL_MS)),
+        );
+    }
 
     Ok(json!({
         "durationMs": request.duration_ms,
@@ -1948,6 +2038,7 @@ fn run_command_with_timeout(
     args: &[String],
     cwd: &Path,
     timeout: Duration,
+    cancellation_token: Option<&ToolCancellationToken>,
 ) -> Result<CommandRunOutput, ToolRuntimeError> {
     let command_label = command_label(command, args);
     let mut command_process = Command::new(command);
@@ -1977,6 +2068,21 @@ fn run_command_with_timeout(
     let started = Instant::now();
 
     loop {
+        if cancellation_token
+            .map(ToolCancellationToken::is_cancelled)
+            .unwrap_or(false)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            drop(stdout_handle);
+            drop(stderr_handle);
+
+            return Err(ToolRuntimeError::CommandCancelled {
+                command: command_label,
+                pid,
+            });
+        }
+
         if let Some(status) = child
             .try_wait()
             .map_err(|source| ToolRuntimeError::Command {
@@ -2818,9 +2924,14 @@ struct SleepInput {
 
 #[derive(Debug)]
 enum ToolRuntimeError {
+    Cancelled,
     Command {
         command: String,
         source: io::Error,
+    },
+    CommandCancelled {
+        command: String,
+        pid: u32,
     },
     CommandTimedOut {
         command: String,
@@ -2858,8 +2969,12 @@ enum ToolRuntimeError {
 impl fmt::Display for ToolRuntimeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => write!(formatter, "tool execution cancelled"),
             Self::Command { command, source } => {
                 write!(formatter, "failed to run {command}: {source}")
+            }
+            Self::CommandCancelled { command, pid } => {
+                write!(formatter, "{command} (pid {pid}) was cancelled")
             }
             Self::CommandTimedOut {
                 command,
@@ -2913,7 +3028,9 @@ impl std::error::Error for ToolRuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::WorkspaceDatabase(source) => Some(source),
-            Self::Command { .. }
+            Self::Cancelled
+            | Self::Command { .. }
+            | Self::CommandCancelled { .. }
             | Self::CommandTimedOut { .. }
             | Self::CommandFailed { .. }
             | Self::FileTooLarge { .. }
@@ -3655,6 +3772,24 @@ mod tests {
 
         assert!(!result.is_error);
         assert_eq!(result.output["durationMs"], 1);
+    }
+
+    #[test]
+    fn sleep_tool_stops_when_cancelled() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let cancellation_token = ToolCancellationToken::new();
+        cancellation_token.cancel();
+
+        let result = execute_builtin_tool_for_chat_with_cancellation(
+            workspace.path(),
+            None,
+            SLEEP_TOOL,
+            json!({ "durationMs": 60_000, "timeoutMs": null }),
+            Some(cancellation_token),
+        );
+
+        assert!(result.is_error);
+        assert_eq!(result.output["cancelled"], true);
     }
 
     #[test]

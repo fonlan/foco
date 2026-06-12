@@ -2383,6 +2383,59 @@ describe("App verification surfaces", () => {
     });
   });
 
+
+  it("reattaches to an active run when loading chat messages", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({
+          ...chatMessages,
+          activeRun: {
+            chatId: "chat-1",
+            lastSequence: 0,
+            runId: "request-stream",
+            workspaceId: "workspace-1",
+          },
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    render(<App />);
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url ===
+              "/api/workspaces/workspace-1/chat/runs/request-stream/stream?afterSequence=-1",
+        ),
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Still running.",
+        type: "textDelta",
+      });
+    });
+
+    expect(await screen.findByText("Still running.")).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Chat is running" })).toBeInTheDocument();
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
   it("adds a workspace with a selectable slash-style path", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
@@ -3664,7 +3717,7 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-    return jsonResponse(chatMessages);
+    return jsonResponse({ ...chatMessages, activeRun: null });
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/todo-graph") {
@@ -3672,7 +3725,7 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
-    return jsonResponse(secondChatMessages);
+    return jsonResponse({ ...secondChatMessages, activeRun: null });
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-2/todo-graph") {
@@ -3704,6 +3757,15 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
         ? (JSON.parse(init.body) as { chatId?: string | null })
         : {};
     return chatStreamResponse(body.chatId ?? "chat-1");
+  }
+
+
+  if (path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream") {
+    return chatStreamResponse("chat-1");
+  }
+
+  if (path === "/api/workspaces/workspace-1/chat/runs/request-stream/cancel") {
+    return jsonResponse({ ok: true, runId: "request-stream" });
   }
 
   if (path === "/api/workspaces/workspace-1/chat/guidance") {

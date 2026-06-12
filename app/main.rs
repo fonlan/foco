@@ -74,18 +74,19 @@ use foco_store::{
         ChatRecord, CodeChangeStats, ContextCompressionSnapshotRecord, HookRunRecord,
         LlmRequestAuditFilters, LlmRequestAuditRow, LlmRequestEventRecord, LlmRequestRecord,
         MessageRecord, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
-        NewMessage, NewPromptContextInjection, NewTerminalSession, NewToolCall, NewToolResult,
-        PromptContextInjectionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
-        ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        NewMessage, NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall,
+        NewToolResult, PromptContextInjectionRecord, TodoGraphFilter, TodoGraphRecord,
+        TodoGraphTask, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
         initialize_workspace_databases, workspace_database_path,
     },
 };
 use foco_tools::{
     ASK_QUESTION_TOOL, CREATE_TODO_GRAPH_TOOL, PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
-    SLEEP_TOOL, ToolExecution, UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions,
-    builtin_tool_timeout_ms, execute_builtin_tool_for_chat, set_ripgrep_path,
+    SLEEP_TOOL, ToolCancellationToken, ToolExecution, UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL,
+    builtin_tool_definitions, builtin_tool_timeout_ms,
+    execute_builtin_tool_for_chat_with_cancellation, set_ripgrep_path,
 };
-use futures_util::future::join_all;
+use futures_util::{StreamExt, future::join_all};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -325,6 +326,46 @@ struct ActiveChatRun {
     workspace_id: String,
     chat_id: String,
     guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
+    cancellation: ChatRunCancellation,
+    events: Arc<Mutex<Vec<ChatRunEventFrame>>>,
+    event_tx: broadcast::Sender<ChatRunEventFrame>,
+    completed_rx: watch::Receiver<bool>,
+}
+
+#[derive(Clone, Debug)]
+struct ChatRunEventFrame {
+    sequence: i64,
+    event_type: String,
+    payload_json: String,
+}
+
+#[derive(Clone)]
+struct ChatRunCancellation {
+    tx: watch::Sender<bool>,
+    tool_token: ToolCancellationToken,
+}
+
+impl ChatRunCancellation {
+    fn new() -> Self {
+        let (tx, _rx) = watch::channel(false);
+        Self {
+            tx,
+            tool_token: ToolCancellationToken::new(),
+        }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<bool> {
+        self.tx.subscribe()
+    }
+
+    fn tool_token(&self) -> ToolCancellationToken {
+        self.tool_token.clone()
+    }
+
+    fn cancel(&self) {
+        self.tool_token.cancel();
+        let _ = self.tx.send(true);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -347,25 +388,38 @@ impl ActiveChatRunRegistry {
             .lock()
             .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
 
-        if runs
-            .insert(
-                run_id.clone(),
-                ActiveChatRun {
-                    workspace_id,
-                    chat_id,
-                    guidance_tx,
-                },
-            )
-            .is_some()
-        {
+        if runs.contains_key(&run_id) {
             return Err(ApiError::internal(format!(
                 "duplicate active chat run id: {run_id}"
             )));
         }
 
+        let cancellation = ChatRunCancellation::new();
+        let (event_tx, _event_rx) = broadcast::channel(512);
+        let (completed_tx, completed_rx) = watch::channel(false);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        runs.insert(
+            run_id.clone(),
+            ActiveChatRun {
+                workspace_id,
+                chat_id,
+                guidance_tx,
+                cancellation: cancellation.clone(),
+                events: events.clone(),
+                event_tx: event_tx.clone(),
+                completed_rx,
+            },
+        );
+
         Ok(ActiveChatRunRegistration {
             registry: self.clone(),
             run_id,
+            cancellation,
+            events,
+            event_tx,
+            completed_tx,
+            next_sequence: 0,
+            completed: false,
         })
     }
 
@@ -373,6 +427,102 @@ impl ActiveChatRunRegistry {
         if let Ok(mut runs) = self.runs.lock() {
             runs.remove(run_id);
         }
+    }
+
+    fn active_run_for_chat(
+        &self,
+        workspace_id: &str,
+        chat_id: &str,
+    ) -> Result<Option<ActiveChatRunSummary>, ApiError> {
+        let runs = self
+            .runs
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
+        let mut matches = runs.iter().filter(|(_, run)| {
+            run.workspace_id == workspace_id
+                && run.chat_id == chat_id
+                && !*run.completed_rx.borrow()
+        });
+        let Some((run_id, run)) = matches.next() else {
+            return Ok(None);
+        };
+
+        let last_sequence = run
+            .events
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run event cache lock is poisoned"))?
+            .last()
+            .map(|event| event.sequence);
+
+        Ok(Some(ActiveChatRunSummary {
+            run_id: run_id.clone(),
+            workspace_id: run.workspace_id.clone(),
+            chat_id: run.chat_id.clone(),
+            last_sequence,
+        }))
+    }
+
+    fn subscribe(
+        &self,
+        workspace_id: &str,
+        run_id: &str,
+        after_sequence: Option<i64>,
+    ) -> Result<ActiveChatRunSubscription, ApiError> {
+        let active_run = {
+            let runs = self
+                .runs
+                .lock()
+                .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
+            runs.get(run_id).cloned().ok_or_else(|| {
+                ApiError::bad_request(format!("active chat run was not found: {run_id}"))
+            })?
+        };
+
+        if active_run.workspace_id != workspace_id {
+            return Err(ApiError::bad_request(format!(
+                "active chat run {run_id} belongs to workspace {}, not {workspace_id}",
+                active_run.workspace_id
+            )));
+        }
+
+        let after_sequence = after_sequence.unwrap_or(-1);
+        let replay = active_run
+            .events
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run event cache lock is poisoned"))?
+            .iter()
+            .filter(|event| event.sequence > after_sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        Ok(ActiveChatRunSubscription {
+            replay,
+            event_rx: active_run.event_tx.subscribe(),
+            completed_rx: active_run.completed_rx.clone(),
+            after_sequence,
+        })
+    }
+
+    fn cancel(&self, workspace_id: &str, run_id: &str) -> Result<(), ApiError> {
+        let active_run = {
+            let runs = self
+                .runs
+                .lock()
+                .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
+            runs.get(run_id).cloned().ok_or_else(|| {
+                ApiError::bad_request(format!("active chat run was not found: {run_id}"))
+            })?
+        };
+
+        if active_run.workspace_id != workspace_id {
+            return Err(ApiError::bad_request(format!(
+                "active chat run {run_id} belongs to workspace {}, not {workspace_id}",
+                active_run.workspace_id
+            )));
+        }
+
+        active_run.cancellation.cancel();
+        Ok(())
     }
 
     fn push_guidance(
@@ -426,12 +576,89 @@ impl ActiveChatRunRegistry {
 struct ActiveChatRunRegistration {
     registry: ActiveChatRunRegistry,
     run_id: String,
+    cancellation: ChatRunCancellation,
+    events: Arc<Mutex<Vec<ChatRunEventFrame>>>,
+    event_tx: broadcast::Sender<ChatRunEventFrame>,
+    completed_tx: watch::Sender<bool>,
+    next_sequence: i64,
+    completed: bool,
+}
+
+impl ActiveChatRunRegistration {
+    fn cancellation(&self) -> &ChatRunCancellation {
+        &self.cancellation
+    }
+
+    fn record_event(
+        &mut self,
+        workspace_path: &Path,
+        chat_id: &str,
+        event: &ChatSseEvent,
+    ) -> Result<(), ApiError> {
+        let captured = captured_event(event);
+        let payload_json = captured.normalized_event_json;
+        let event_frame = ChatRunEventFrame {
+            sequence: self.next_sequence,
+            event_type: captured.event_type,
+            payload_json,
+        };
+        self.next_sequence += 1;
+
+        {
+            let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+                .map_err(ApiError::from_workspace_error)?;
+            let id = format!("{}-event-{}", self.run_id, event_frame.sequence);
+            database
+                .insert_run_event(NewRunEvent {
+                    id: &id,
+                    chat_id,
+                    run_id: &self.run_id,
+                    sequence: event_frame.sequence,
+                    event_type: &event_frame.event_type,
+                    payload_json: &event_frame.payload_json,
+                })
+                .map_err(ApiError::from_workspace_error)?;
+        }
+
+        self.events
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run event cache lock is poisoned"))?
+            .push(event_frame.clone());
+        let _ = self.event_tx.send(event_frame);
+
+        Ok(())
+    }
+
+    fn finish(&mut self) {
+        self.completed = true;
+        let _ = self.completed_tx.send(true);
+        self.registry.unregister(&self.run_id);
+    }
 }
 
 impl Drop for ActiveChatRunRegistration {
     fn drop(&mut self) {
-        self.registry.unregister(&self.run_id);
+        if !self.completed {
+            let _ = self.completed_tx.send(true);
+            self.registry.unregister(&self.run_id);
+        }
     }
+}
+
+struct ActiveChatRunSubscription {
+    replay: Vec<ChatRunEventFrame>,
+    event_rx: broadcast::Receiver<ChatRunEventFrame>,
+    completed_rx: watch::Receiver<bool>,
+    after_sequence: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveChatRunSummary {
+    run_id: String,
+    workspace_id: String,
+    chat_id: String,
+    last_sequence: Option<i64>,
 }
 
 struct QuestionRegistration {
@@ -1002,6 +1229,14 @@ fn app_router(state: AppState) -> Router {
             "/api/workspaces/{workspace_id}/chat/stream",
             post(stream_chat_response)
                 .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chat/runs/{run_id}/stream",
+            get(subscribe_chat_run),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chat/runs/{run_id}/cancel",
+            post(cancel_chat_run),
         )
         .route(
             "/api/workspaces/{workspace_id}/chat/guidance",
@@ -3286,12 +3521,57 @@ async fn stream_chat_response(
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
     let config = config_snapshot(&state)?;
     let chat_context = prepare_chat_context(&state, &config, &workspace_id, request).await?;
+    let run_id = chat_context.llm_request_id.clone();
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    let active_run_registration = state.active_chat_runs.register(
+        run_id.clone(),
+        chat_context.workspace_id.clone(),
+        chat_context.chat_id.clone(),
+        guidance_tx,
+    )?;
+    let subscription = state
+        .active_chat_runs
+        .subscribe(&workspace_id, &run_id, Some(-1))?;
 
-    Ok(Sse::new(chat_context.into_sse_stream()).keep_alive(
+    tokio::spawn(run_chat_context_in_background(
+        chat_context,
+        active_run_registration,
+        guidance_rx,
+    ));
+
+    Ok(chat_run_sse(subscription))
+}
+
+async fn subscribe_chat_run(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, run_id)): AxumPath<(String, String)>,
+    Query(query): Query<ChatRunStreamQuery>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let subscription =
+        state
+            .active_chat_runs
+            .subscribe(&workspace_id, &run_id, query.after_sequence)?;
+
+    Ok(chat_run_sse(subscription))
+}
+
+async fn cancel_chat_run(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, run_id)): AxumPath<(String, String)>,
+) -> Result<Json<CancelChatRunResponse>, ApiError> {
+    state.active_chat_runs.cancel(&workspace_id, &run_id)?;
+
+    Ok(Json(CancelChatRunResponse { ok: true, run_id }))
+}
+
+fn chat_run_sse(
+    subscription: ActiveChatRunSubscription,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    Sse::new(chat_run_subscription_stream(subscription)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(10))
             .text("keep-alive"),
-    ))
+    )
 }
 
 async fn add_chat_guidance(
@@ -3505,7 +3785,14 @@ async fn chat_messages(
         )?);
     }
 
-    Ok(Json(ChatMessagesResponse { messages }))
+    let active_run = state
+        .active_chat_runs
+        .active_run_for_chat(workspace_id, chat_id)?;
+
+    Ok(Json(ChatMessagesResponse {
+        messages,
+        active_run,
+    }))
 }
 
 async fn chat_todo_graph(
@@ -3953,6 +4240,19 @@ struct ChatStreamRequest {
     message: String,
     #[serde(default)]
     attachments: Vec<ChatAttachmentInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatRunStreamQuery {
+    after_sequence: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelChatRunResponse {
+    ok: bool,
+    run_id: String,
 }
 
 #[derive(Deserialize)]
@@ -4501,6 +4801,7 @@ struct ChatSummary {
 #[serde(rename_all = "camelCase")]
 struct ChatMessagesResponse {
     messages: Vec<ChatMessageSummary>,
+    active_run: Option<ActiveChatRunSummary>,
 }
 
 #[derive(Serialize)]
@@ -4822,6 +5123,7 @@ enum ChatSseEvent {
     },
 }
 
+#[derive(Clone)]
 struct PreparedChatContext {
     workspace_id: String,
     workspace_path: PathBuf,
@@ -4839,7 +5141,6 @@ struct PreparedChatContext {
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
     question_registry: QuestionRegistry,
-    active_chat_runs: ActiveChatRunRegistry,
     tool_resource_locks: ToolResourceLockRegistry,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
@@ -5205,6 +5506,41 @@ struct ToolExecutionWithHooks {
     hook_summary: HookRunSummary,
 }
 
+struct AbortOnDropJoinHandle<T> {
+    handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> AbortOnDropJoinHandle<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self { handle }
+    }
+
+    fn new_each(
+        handles: impl IntoIterator<Item = tokio::task::JoinHandle<T>>,
+    ) -> Vec<AbortOnDropJoinHandle<T>> {
+        handles.into_iter().map(Self::new).collect()
+    }
+}
+
+impl<T> std::future::Future for AbortOnDropJoinHandle<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.handle).poll(context)
+    }
+}
+
+impl<T> Drop for AbortOnDropJoinHandle<T> {
+    fn drop(&mut self) {
+        if !self.handle.is_finished() {
+            self.handle.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ChatAuditOutcome {
     first_token_at: Option<String>,
@@ -5220,6 +5556,7 @@ struct ChatAuditOutcome {
     response_body_json: Option<String>,
 }
 
+#[derive(Clone)]
 struct CapturedLlmRequest {
     id: String,
     request_started_at: String,
@@ -5245,25 +5582,98 @@ impl CapturedLlmRequest {
     }
 }
 
-impl PreparedChatContext {
-    fn into_sse_stream(mut self) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
-        async_stream::stream! {
-            let (guidance_tx, mut guidance_rx) = mpsc::unbounded_channel();
-            let _active_run_registration = match self.active_chat_runs.register(
-                self.llm_request_id.clone(),
-                self.workspace_id.clone(),
-                self.chat_id.clone(),
-                guidance_tx,
-            ) {
-                Ok(registration) => registration,
-                Err(error) => {
-                    let event = ChatSseEvent::Error {
-                        message: error.message,
-                    };
-                    yield Ok(sse_event(&event));
-                    return;
-                }
+async fn run_chat_context_in_background(
+    chat_context: PreparedChatContext,
+    mut active_run_registration: ActiveChatRunRegistration,
+    guidance_rx: mpsc::UnboundedReceiver<GuidanceMessage>,
+) {
+    let workspace_path = chat_context.workspace_path.clone();
+    let chat_id = chat_context.chat_id.clone();
+    let cancellation = active_run_registration.cancellation().clone();
+    let stream = chat_context.into_sse_stream(cancellation.clone(), guidance_rx);
+    tokio::pin!(stream);
+
+    while let Some(event) = stream.next().await {
+        if let Err(error) = active_run_registration.record_event(&workspace_path, &chat_id, &event)
+        {
+            tracing::warn!(
+                error = %error.message,
+                run_id = %active_run_registration.run_id,
+                "failed to record chat run event"
+            );
+            cancellation.cancel();
+            let error_event = ChatSseEvent::Error {
+                message: error.message,
             };
+            let _ = active_run_registration.record_event(&workspace_path, &chat_id, &error_event);
+            break;
+        }
+    }
+
+    active_run_registration.finish();
+}
+
+fn chat_run_subscription_stream(
+    mut subscription: ActiveChatRunSubscription,
+) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        let mut last_sequence = subscription.after_sequence;
+        for event in subscription.replay {
+            if event.sequence > last_sequence {
+                last_sequence = event.sequence;
+            }
+            yield Ok(sse_event_payload(&event.payload_json));
+        }
+
+        if *subscription.completed_rx.borrow() {
+            return;
+        }
+
+        loop {
+            tokio::select! {
+                changed = subscription.completed_rx.changed() => {
+                    if changed.is_err() || *subscription.completed_rx.borrow() {
+                        while let Ok(event) = subscription.event_rx.try_recv() {
+                            if event.sequence > last_sequence {
+                                last_sequence = event.sequence;
+                                yield Ok(sse_event_payload(&event.payload_json));
+                            }
+                        }
+                        return;
+                    }
+                }
+                event = subscription.event_rx.recv() => {
+                    match event {
+                        Ok(event) => {
+                            if event.sequence > last_sequence {
+                                last_sequence = event.sequence;
+                                yield Ok(sse_event_payload(&event.payload_json));
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let event = ChatSseEvent::Error {
+                                message: "chat run event subscriber lagged behind; refresh to replay the run".to_string(),
+                            };
+                            yield Ok(sse_event(&event));
+                            return;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl PreparedChatContext {
+    fn into_sse_stream(
+        mut self,
+        cancellation: ChatRunCancellation,
+        mut guidance_rx: mpsc::UnboundedReceiver<GuidanceMessage>,
+    ) -> impl futures_util::Stream<Item = ChatSseEvent> {
+        async_stream::stream! {
+            let mut run_cancellation_rx = cancellation.subscribe();
+            let tool_cancellation_token = cancellation.tool_token();
             let request_started_at = utc_timestamp();
             let started_at = Instant::now();
             let start_event = ChatSseEvent::Start {
@@ -5286,7 +5696,7 @@ impl PreparedChatContext {
             let mut final_usage = None;
             let mut app_shutdown_rx = self.app_shutdown_rx.clone();
 
-            yield Ok(sse_event(&start_event));
+            yield start_event;
             for event in self
                 .hook_notifications
                 .iter()
@@ -5298,7 +5708,7 @@ impl PreparedChatContext {
                 })
             {
                 events.push(captured_event(&event));
-                yield Ok(sse_event(&event));
+                yield event;
             }
             self.hook_notifications.clear();
             append_hook_context_messages(
@@ -5309,16 +5719,23 @@ impl PreparedChatContext {
             self.hook_context_messages.clear();
 
             'agent_turns: for turn_index in 0..=MAX_AGENT_TOOL_ROUNDS {
-                if *app_shutdown_rx.borrow() {
-                    let event = finish_cancelled_chat_run(
+                if chat_run_was_cancelled(&app_shutdown_rx, &run_cancellation_rx) {
+                    let message = chat_run_cancel_message(&app_shutdown_rx);
+                    let event = match finish_cancelled_chat_run_with_message(
                         &self,
                         &request_started_at,
                         started_at,
                         &mut events,
                         &executed_tool_calls,
+                        message,
                     )
-                    .await;
-                    yield Ok(sse_event(&event));
+                    .await {
+                        Ok(event) => event,
+                        Err(error) => ChatSseEvent::Error {
+                            message: error.message,
+                        },
+                    };
+                    yield event;
                     return;
                 }
 
@@ -5329,7 +5746,7 @@ impl PreparedChatContext {
                     drain_guidance_messages(&mut guidance_rx),
                     None,
                 ) {
-                    yield Ok(sse_event(&event));
+                    yield event;
                 }
 
                 let turn_active_tool_start_index = match ensure_context_compression(&mut self).await {
@@ -5353,9 +5770,9 @@ impl PreparedChatContext {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
-                            yield Ok(sse_event(&event));
+                            yield event;
                         } else {
-                            yield Ok(sse_event(&event));
+                            yield event;
                         }
 
                         return;
@@ -5367,7 +5784,7 @@ impl PreparedChatContext {
                         notification,
                     };
                     events.push(captured_event(&event));
-                    yield Ok(sse_event(&event));
+                    yield event;
                 }
                 let packed_messages = match pack_neutral_messages(
                     self.provider_request.messages.clone(),
@@ -5395,9 +5812,9 @@ impl PreparedChatContext {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
-                            yield Ok(sse_event(&event));
+                            yield event;
                         } else {
-                            yield Ok(sse_event(&event));
+                            yield event;
                         }
 
                         return;
@@ -5447,9 +5864,9 @@ impl PreparedChatContext {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
-                            yield Ok(sse_event(&event));
+                            yield event;
                         } else {
-                            yield Ok(sse_event(&event));
+                            yield event;
                         }
 
                         return;
@@ -5458,15 +5875,42 @@ impl PreparedChatContext {
                 let mut provider_stream = match tokio::select! {
                     changed = app_shutdown_rx.changed() => {
                         if changed.is_err() || *app_shutdown_rx.borrow() {
-                            let event = finish_cancelled_chat_run(
+                            cancellation.cancel();
+                            let event = match finish_cancelled_chat_run(
                                 &self,
                                 &request_started_at,
                                 started_at,
                                 &mut events,
                                 &executed_tool_calls,
                             )
-                            .await;
-                            yield Ok(sse_event(&event));
+                            .await {
+                                Ok(event) => event,
+                                Err(error) => ChatSseEvent::Error {
+                                    message: error.message,
+                                },
+                            };
+                            yield event;
+                            return;
+                        }
+                        continue;
+                    }
+                    changed = run_cancellation_rx.changed() => {
+                        if changed.is_err() || *run_cancellation_rx.borrow() {
+                            let event = match finish_cancelled_chat_run_with_message(
+                                &self,
+                                &request_started_at,
+                                started_at,
+                                &mut events,
+                                &executed_tool_calls,
+                                "chat run cancelled",
+                            )
+                            .await {
+                                Ok(event) => event,
+                                Err(error) => ChatSseEvent::Error {
+                                    message: error.message,
+                                },
+                            };
+                            yield event;
                             return;
                         }
                         continue;
@@ -5501,9 +5945,9 @@ impl PreparedChatContext {
                             let event = ChatSseEvent::Error {
                                 message: persist_error.message,
                             };
-                            yield Ok(sse_event(&event));
+                            yield event;
                         } else {
-                            yield Ok(sse_event(&event));
+                            yield event;
                         }
 
                         return;
@@ -5519,15 +5963,42 @@ impl PreparedChatContext {
                     let Some(event_result) = (tokio::select! {
                         changed = app_shutdown_rx.changed() => {
                             if changed.is_err() || *app_shutdown_rx.borrow() {
-                                let event = finish_cancelled_chat_run(
+                                cancellation.cancel();
+                                let event = match finish_cancelled_chat_run(
                                     &self,
                                     &request_started_at,
                                     started_at,
                                     &mut events,
                                     &executed_tool_calls,
                                 )
-                                .await;
-                                yield Ok(sse_event(&event));
+                                .await {
+                                    Ok(event) => event,
+                                    Err(error) => ChatSseEvent::Error {
+                                        message: error.message,
+                                    },
+                                };
+                                yield event;
+                                return;
+                            }
+                            continue;
+                        }
+                        changed = run_cancellation_rx.changed() => {
+                            if changed.is_err() || *run_cancellation_rx.borrow() {
+                                let event = match finish_cancelled_chat_run_with_message(
+                                    &self,
+                                    &request_started_at,
+                                    started_at,
+                                    &mut events,
+                                    &executed_tool_calls,
+                                    "chat run cancelled",
+                                )
+                                .await {
+                                    Ok(event) => event,
+                                    Err(error) => ChatSseEvent::Error {
+                                        message: error.message,
+                                    },
+                                };
+                                yield event;
                                 return;
                             }
                             continue;
@@ -5565,9 +6036,9 @@ impl PreparedChatContext {
                                 let event = ChatSseEvent::Error {
                                     message: persist_error.message,
                                 };
-                                yield Ok(sse_event(&event));
+                                yield event;
                             } else {
-                                yield Ok(sse_event(&event));
+                                yield event;
                             }
 
                             return;
@@ -5587,7 +6058,7 @@ impl PreparedChatContext {
                                 assistant_message_id: self.assistant_message_id.clone(),
                                 delta,
                             };
-                            yield Ok(sse_event(&event));
+                            yield event;
                         }
                         NeutralChatStreamEvent::ReasoningDelta { delta } => {
                             capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
@@ -5598,7 +6069,7 @@ impl PreparedChatContext {
                                 assistant_message_id: self.assistant_message_id.clone(),
                                 delta,
                             };
-                            yield Ok(sse_event(&event));
+                            yield event;
                         }
                         NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
                             capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
@@ -5612,13 +6083,14 @@ impl PreparedChatContext {
                                     assistant_message_id: self.assistant_message_id.clone(),
                                     tool_call: pending_tool_call_summary(&tool_call),
                                 };
-                                events.push(captured_event(&event));
-                                yield Ok(sse_event(&event));
+                                let captured = captured_event(&event);
+                                events.push(captured.clone());
+                                yield event;
                             }
                         }
                         NeutralChatStreamEvent::Usage { usage } => {
                             let event = ChatSseEvent::Usage { usage };
-                            yield Ok(sse_event(&event));
+                            yield event;
                         }
                         NeutralChatStreamEvent::Complete {
                             text,
@@ -5649,9 +6121,9 @@ impl PreparedChatContext {
                                     let event = ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 } else {
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 }
 
                                 return;
@@ -5676,9 +6148,9 @@ impl PreparedChatContext {
                                     let event = ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 } else {
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 }
 
                                 return;
@@ -5746,7 +6218,7 @@ impl PreparedChatContext {
                             if let Some(usage) = usage {
                                 let event = ChatSseEvent::Usage { usage };
                                 events.push(captured_event(&event));
-                                yield Ok(sse_event(&event));
+                                yield event;
                             }
 
                             if tool_calls.is_empty() {
@@ -5771,7 +6243,7 @@ impl PreparedChatContext {
                                         guidance_messages,
                                         Some(turn_metrics.clone()),
                                     ) {
-                                        yield Ok(sse_event(&event));
+                                        yield event;
                                     }
                                     continue 'agent_turns;
                                 }
@@ -5801,7 +6273,7 @@ impl PreparedChatContext {
                                 }).await;
                                 for event in hook_notification_events(&self.assistant_message_id, "Stop", &stop_summary) {
                                     events.push(captured_event(&event));
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 }
                                 if let Some(reason) = stop_summary.first_block_reason() {
                                     append_hook_context_messages(
@@ -5852,9 +6324,10 @@ impl PreparedChatContext {
                                 ).await;
                                 for event in hook_notification_events(&self.assistant_message_id, "SessionEnd", &session_end_summary) {
                                     events.push(captured_event(&event));
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 }
-                                events.push(captured_event(&complete_event));
+                                let captured_complete = captured_event(&complete_event);
+                                events.push(captured_complete.clone());
                                 let completed_at = utc_timestamp();
                                 let outcome = ChatAuditOutcome {
                                     first_token_at,
@@ -5879,13 +6352,13 @@ impl PreparedChatContext {
 
                                 match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), non_empty_string(&assistant_reasoning).as_deref(), &executed_tool_calls) {
                                     Ok(()) => {
-                                        yield Ok(sse_event(&complete_event));
+                                        yield complete_event;
                                     }
                                     Err(error) => {
                                         let event = ChatSseEvent::Error {
                                             message: error.message,
                                         };
-                                        yield Ok(sse_event(&event));
+                                        yield event;
                                     }
                                 }
 
@@ -5913,9 +6386,9 @@ impl PreparedChatContext {
                                     let event = ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 } else {
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 }
 
                                 return;
@@ -5943,9 +6416,9 @@ impl PreparedChatContext {
                                     let event = ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 } else {
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 }
 
                                 return;
@@ -5969,9 +6442,9 @@ impl PreparedChatContext {
                                     let event = ChatSseEvent::Error {
                                         message: persist_error.message,
                                     };
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 } else {
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 }
 
                                 return;
@@ -5986,7 +6459,7 @@ impl PreparedChatContext {
                                     tool_call: pending_tool_call_summary(tool_call),
                                 };
                                 events.push(captured_event(&event));
-                                yield Ok(sse_event(&event));
+                                yield event;
                             }
 
                             let next_tool_results = match {
@@ -6017,6 +6490,7 @@ impl PreparedChatContext {
                                     tool_calls.clone(),
                                     execution_plan,
                                     self.tool_resource_locks.clone(),
+                                    tool_cancellation_token.clone(),
                                 );
                                 tokio::pin!(tool_results);
                                 let mut question_events_open = true;
@@ -6025,15 +6499,42 @@ impl PreparedChatContext {
                                     let next = tokio::select! {
                                         changed = app_shutdown_rx.changed() => {
                                             if changed.is_err() || *app_shutdown_rx.borrow() {
-                                                let event = finish_cancelled_chat_run(
+                                                cancellation.cancel();
+                                                let event = match finish_cancelled_chat_run(
                                                     &self,
                                                     &request_started_at,
                                                     started_at,
                                                     &mut events,
                                                     &executed_tool_calls,
                                                 )
-                                                .await;
-                                                yield Ok(sse_event(&event));
+                                                .await {
+                                                    Ok(event) => event,
+                                                    Err(error) => ChatSseEvent::Error {
+                                                        message: error.message,
+                                                    },
+                                                };
+                                                yield event;
+                                                return;
+                                            }
+                                            None
+                                        }
+                                        changed = run_cancellation_rx.changed() => {
+                                            if changed.is_err() || *run_cancellation_rx.borrow() {
+                                                let event = match finish_cancelled_chat_run_with_message(
+                                                    &self,
+                                                    &request_started_at,
+                                                    started_at,
+                                                    &mut events,
+                                                    &executed_tool_calls,
+                                                    "chat run cancelled",
+                                                )
+                                                .await {
+                                                    Ok(event) => event,
+                                                    Err(error) => ChatSseEvent::Error {
+                                                        message: error.message,
+                                                    },
+                                                };
+                                                yield event;
                                                 return;
                                             }
                                             None
@@ -6056,7 +6557,7 @@ impl PreparedChatContext {
                                             request: question_request,
                                         };
                                         events.push(captured_event(&event));
-                                        yield Ok(sse_event(&event));
+                                        yield event;
                                     }
                                 }
                             } {
@@ -6080,9 +6581,9 @@ impl PreparedChatContext {
                                         let event = ChatSseEvent::Error {
                                             message: persist_error.message,
                                         };
-                                        yield Ok(sse_event(&event));
+                                        yield event;
                                     } else {
-                                        yield Ok(sse_event(&event));
+                                        yield event;
                                     }
 
                                     return;
@@ -6093,7 +6594,7 @@ impl PreparedChatContext {
                             for outcome in next_tool_results {
                                 for event in hook_notification_events(&self.assistant_message_id, "ToolHook", &outcome.hook_summary) {
                                     events.push(captured_event(&event));
-                                    yield Ok(sse_event(&event));
+                                    yield event;
                                 }
                                 merge_hook_summaries(&mut batch_hook_summary, outcome.hook_summary);
                                 next_executed_tool_calls.push(outcome.tool_call);
@@ -6118,7 +6619,7 @@ impl PreparedChatContext {
                             }).await;
                             for event in hook_notification_events(&self.assistant_message_id, "PostToolBatch", &batch_summary) {
                                 events.push(captured_event(&event));
-                                yield Ok(sse_event(&event));
+                                yield event;
                             }
                             merge_hook_summaries(&mut batch_hook_summary, batch_summary);
                             append_hook_context_messages(
@@ -6134,14 +6635,14 @@ impl PreparedChatContext {
                                     is_error: executed_tool_call.is_error,
                                 };
                                 events.push(captured_event(&result_event));
-                                yield Ok(sse_event(&result_event));
+                                yield result_event;
                             }
                             if tool_results_affect_git_diff(&next_executed_tool_calls) {
                                 let event = ChatSseEvent::GitDiffRefresh {
                                     workspace_id: self.workspace_id.clone(),
                                 };
                                 events.push(captured_event(&event));
-                                yield Ok(sse_event(&event));
+                                yield event;
                             }
                             if tool_results_affect_todo_graph(&next_executed_tool_calls) {
                                 let event = ChatSseEvent::TodoGraphRefresh {
@@ -6149,7 +6650,7 @@ impl PreparedChatContext {
                                     chat_id: self.chat_id.clone(),
                                 };
                                 events.push(captured_event(&event));
-                                yield Ok(sse_event(&event));
+                                yield event;
                             }
 
                             append_tool_state_messages(
@@ -6168,7 +6669,7 @@ impl PreparedChatContext {
                                 next_guidance_messages_at_boundary(&mut guidance_rx).await,
                                 Some(turn_metrics.clone()),
                             ) {
-                                yield Ok(sse_event(&event));
+                                yield event;
                             }
 
                             break;
@@ -6191,9 +6692,9 @@ impl PreparedChatContext {
                                 let event = ChatSseEvent::Error {
                                     message: persist_error.message,
                                 };
-                                yield Ok(sse_event(&event));
+                                yield event;
                             } else {
-                                yield Ok(sse_event(&event));
+                                yield event;
                             }
 
                             return;
@@ -6223,9 +6724,9 @@ impl PreparedChatContext {
                     let event = ChatSseEvent::Error {
                         message: persist_error.message,
                     };
-                    yield Ok(sse_event(&event));
+                    yield event;
                 } else {
-                    yield Ok(sse_event(&event));
+                    yield event;
                 }
 
                 return;
@@ -6759,7 +7260,6 @@ async fn prepare_chat_context(
         hook_runtime: state.hook_runtime.clone(),
         global_hooks: config.hooks.clone(),
         question_registry: state.question_registry.clone(),
-        active_chat_runs: state.active_chat_runs.clone(),
         tool_resource_locks: state.tool_resource_locks.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget: prompt_context.context_budget,
@@ -10787,6 +11287,7 @@ async fn execute_tool_calls_parallel(
     tool_calls: Vec<NeutralToolCall>,
     execution_plan: ToolExecutionPlan,
     tool_resource_lock_registry: ToolResourceLockRegistry,
+    cancellation_token: ToolCancellationToken,
 ) -> Result<Vec<ToolHookOutcome>, ApiError> {
     let mut executed_by_index = (0..tool_calls.len())
         .map(|_| None)
@@ -10808,6 +11309,7 @@ async fn execute_tool_calls_parallel(
                         question_event_tx.clone(),
                         memory_tool_context.clone(),
                         tool_resource_lock_registry.clone(),
+                        cancellation_token.clone(),
                         workspace_id,
                         workspace_path,
                         chat_id,
@@ -10836,6 +11338,7 @@ async fn execute_tool_calls_parallel(
                     let question_event_tx = question_event_tx.clone();
                     let memory_tool_context = memory_tool_context.clone();
                     let tool_resource_lock_registry = tool_resource_lock_registry.clone();
+                    let cancellation_token = cancellation_token.clone();
                     let tool_call = tool_calls.get(tool_index).cloned();
 
                     tokio::spawn(async move {
@@ -10855,6 +11358,7 @@ async fn execute_tool_calls_parallel(
                                 question_event_tx,
                                 memory_tool_context,
                                 tool_resource_lock_registry,
+                                cancellation_token,
                                 &workspace_id,
                                 &workspace_path,
                                 &chat_id,
@@ -10867,7 +11371,7 @@ async fn execute_tool_calls_parallel(
                         ))
                     })
                 });
-                let results = join_all(tasks).await;
+                let results = join_all(AbortOnDropJoinHandle::new_each(tasks)).await;
 
                 for result in results {
                     let (tool_index, outcome) = result.map_err(|source| {
@@ -10898,6 +11402,7 @@ async fn execute_tool_call(
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     mut memory_tool_context: MemoryToolContext,
     tool_resource_lock_registry: ToolResourceLockRegistry,
+    cancellation_token: ToolCancellationToken,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -10917,6 +11422,7 @@ async fn execute_tool_call(
         question_event_tx,
         memory_tool_context,
         tool_resource_lock_registry,
+        cancellation_token.clone(),
         workspace_id,
         workspace_path,
         chat_id,
@@ -10982,6 +11488,7 @@ async fn execute_tool(
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     memory_tool_context: MemoryToolContext,
     tool_resource_lock_registry: ToolResourceLockRegistry,
+    cancellation_token: ToolCancellationToken,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -10992,6 +11499,10 @@ async fn execute_tool(
     tool_name: &str,
     mut arguments: Value,
 ) -> ToolExecutionWithHooks {
+    if cancellation_token.is_cancelled() {
+        return cancelled_tool_execution();
+    }
+
     let pre_summary = hook_runtime
         .run_hooks(HookRunRequest {
             global_config: global_hooks,
@@ -11193,6 +11704,9 @@ async fn execute_tool(
         }
     };
     let _resource_lease = tool_resource_lock_registry.acquire(resource_locks).await;
+    if cancellation_token.is_cancelled() {
+        return cancelled_tool_execution_with_hooks(hook_summary);
+    }
 
     if tool_name == ASK_QUESTION_TOOL {
         let ask_question = execute_ask_question(
@@ -11209,6 +11723,7 @@ async fn execute_tool(
             provider_id,
             tool_call_id,
             arguments,
+            cancellation_token.clone(),
         )
         .await;
         merge_hook_summaries(&mut hook_summary, ask_question.hook_summary);
@@ -11233,7 +11748,11 @@ async fn execute_tool(
         };
         let tool_name = tool_name.to_string();
         let worker_tool_name = tool_name.clone();
+        let worker_cancellation_token = cancellation_token.clone();
         let worker = tokio::task::spawn_blocking(move || {
+            if worker_cancellation_token.is_cancelled() {
+                return Err("tool execution cancelled".to_string());
+            }
             execute_memory_tool(&memory_tool_context, &worker_tool_name, arguments)
         });
         let execution = timeout(Duration::from_millis(timeout_ms), worker)
@@ -11260,10 +11779,15 @@ async fn execute_tool(
     }
 
     let execution = if is_mcp_tool_name(tool_name) {
-        match mcp_registry
-            .execute_tool(workspace_id, tool_name, arguments)
-            .await
-        {
+        let tool_future = mcp_registry.execute_tool(workspace_id, tool_name, arguments);
+        match tokio::select! {
+            _ = cancellation_token_cancelled(cancellation_token.clone()) => {
+                Err("tool execution cancelled".to_string())
+            }
+            execution = tool_future => {
+                execution.map_err(|error| error.to_string())
+            }
+        } {
             Ok(execution) => ToolExecution {
                 output: execution.output,
                 is_error: execution.is_error,
@@ -11291,29 +11815,22 @@ async fn execute_tool(
             let workspace_path = workspace_path.to_path_buf();
             let chat_id = chat_id.to_string();
             let tool_name = tool_name.clone();
+            let cancellation_token = cancellation_token.clone();
             move || {
-                execute_builtin_tool_for_chat(
+                execute_builtin_tool_for_chat_with_cancellation(
                     &workspace_path,
                     Some(&chat_id),
                     &tool_name,
                     arguments,
+                    Some(cancellation_token),
                 )
             }
         });
-        let execution: Result<ToolExecution, String> = if matches!(
-            tool_name.as_str(),
-            RUN_COMMAND_TOOL | SEARCH_TEXT_TOOL | SLEEP_TOOL
-        ) {
-            worker
-                .await
-                .map_err(|source| format!("tool execution worker failed: {source}"))
-        } else {
-            timeout(Duration::from_millis(timeout_ms), worker)
-                .await
-                .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
-                .and_then(|result| {
-                    result.map_err(|source| format!("tool execution worker failed: {source}"))
-                })
+        let execution: Result<ToolExecution, String> = tokio::select! {
+            _ = cancellation_token_cancelled(cancellation_token.clone()) => {
+                Err("tool execution cancelled".to_string())
+            }
+            execution = wait_for_builtin_tool_worker(worker, &tool_name, timeout_ms) => execution,
         };
 
         match execution {
@@ -11331,6 +11848,48 @@ async fn execute_tool(
     }
 }
 
+fn cancelled_tool_execution() -> ToolExecutionWithHooks {
+    cancelled_tool_execution_with_hooks(HookRunSummary::default())
+}
+
+fn cancelled_tool_execution_with_hooks(hook_summary: HookRunSummary) -> ToolExecutionWithHooks {
+    ToolExecutionWithHooks {
+        execution: ToolExecution {
+            output: json!({
+                "error": "tool execution cancelled",
+                "cancelled": true,
+            }),
+            is_error: true,
+        },
+        hook_summary,
+    }
+}
+
+async fn cancellation_token_cancelled(cancellation_token: ToolCancellationToken) {
+    while !cancellation_token.is_cancelled() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_builtin_tool_worker(
+    worker: tokio::task::JoinHandle<ToolExecution>,
+    tool_name: &str,
+    timeout_ms: u64,
+) -> Result<ToolExecution, String> {
+    if matches!(tool_name, RUN_COMMAND_TOOL | SEARCH_TEXT_TOOL | SLEEP_TOOL) {
+        worker
+            .await
+            .map_err(|source| format!("tool execution worker failed: {source}"))
+    } else {
+        timeout(Duration::from_millis(timeout_ms), worker)
+            .await
+            .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
+            .and_then(|result| {
+                result.map_err(|source| format!("tool execution worker failed: {source}"))
+            })
+    }
+}
+
 async fn execute_ask_question(
     hook_runtime: HookRuntime,
     global_hooks: &HookConfig,
@@ -11345,6 +11904,7 @@ async fn execute_ask_question(
     provider_id: &str,
     tool_call_id: &str,
     arguments: Value,
+    cancellation_token: ToolCancellationToken,
 ) -> ToolExecutionWithHooks {
     let mut hook_summary = HookRunSummary::default();
     let input = match serde_json::from_value::<AskQuestionInput>(arguments) {
@@ -11478,17 +12038,27 @@ async fn execute_ask_question(
         };
     }
 
-    let execution = match registration.answer_rx.await {
-        Ok(answer) => {
+    let execution = match tokio::select! {
+        _ = cancellation_token_cancelled(cancellation_token.clone()) => None,
+        answer = registration.answer_rx => Some(answer),
+    } {
+        Some(Ok(answer)) => {
             let output = question_answer_output(&request, answer);
             ToolExecution {
                 output,
                 is_error: false,
             }
         }
-        Err(_) => ToolExecution {
+        Some(Err(_)) => ToolExecution {
             output: json!({
                 "error": format!("question '{}' was cancelled before the user answered", request.id)
+            }),
+            is_error: true,
+        },
+        None => ToolExecution {
+            output: json!({
+                "error": format!("question '{}' was cancelled because the chat run was cancelled", request.id),
+                "cancelled": true,
             }),
             is_error: true,
         },
@@ -12140,18 +12710,52 @@ fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutco
     }
 }
 
+fn chat_run_was_cancelled(
+    app_shutdown_rx: &watch::Receiver<bool>,
+    run_cancellation_rx: &watch::Receiver<bool>,
+) -> bool {
+    *app_shutdown_rx.borrow() || *run_cancellation_rx.borrow()
+}
+
+fn chat_run_cancel_message(app_shutdown_rx: &watch::Receiver<bool>) -> &'static str {
+    if *app_shutdown_rx.borrow() {
+        SHUTDOWN_MESSAGE
+    } else {
+        "chat run cancelled"
+    }
+}
+
 async fn finish_cancelled_chat_run(
     context: &PreparedChatContext,
     request_started_at: &str,
     started_at: Instant,
     events: &mut Vec<CapturedAuditEvent>,
     executed_tool_calls: &[ExecutedToolCall],
-) -> ChatSseEvent {
+) -> Result<ChatSseEvent, ApiError> {
+    finish_cancelled_chat_run_with_message(
+        context,
+        request_started_at,
+        started_at,
+        events,
+        executed_tool_calls,
+        SHUTDOWN_MESSAGE,
+    )
+    .await
+}
+
+async fn finish_cancelled_chat_run_with_message(
+    context: &PreparedChatContext,
+    request_started_at: &str,
+    started_at: Instant,
+    events: &mut Vec<CapturedAuditEvent>,
+    executed_tool_calls: &[ExecutedToolCall],
+    message: &str,
+) -> Result<ChatSseEvent, ApiError> {
     let session_end_summary = session_end_hook(
         context,
         "cancelled",
         json!({
-            "reason": SHUTDOWN_MESSAGE,
+            "reason": message,
         }),
     )
     .await;
@@ -12163,12 +12767,12 @@ async fn finish_cancelled_chat_run(
         events.push(captured_event(&event));
     }
     let event = ChatSseEvent::Error {
-        message: SHUTDOWN_MESSAGE.to_string(),
+        message: message.to_string(),
     };
     events.push(captured_event(&event));
-    let outcome = cancelled_audit_outcome(started_at, SHUTDOWN_MESSAGE);
+    let outcome = cancelled_audit_outcome(started_at, message);
 
-    if let Err(error) = persist_chat_result(
+    persist_chat_result(
         context,
         request_started_at,
         outcome,
@@ -12176,13 +12780,9 @@ async fn finish_cancelled_chat_run(
         None,
         None,
         executed_tool_calls,
-    ) {
-        return ChatSseEvent::Error {
-            message: error.message,
-        };
-    }
+    )?;
 
-    event
+    Ok(event)
 }
 
 async fn session_end_hook(
@@ -12262,6 +12862,10 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
 fn sse_event(event: &ChatSseEvent) -> Event {
     let data = serde_json::to_string(event).expect("chat SSE events are always serializable");
 
+    sse_event_payload(&data)
+}
+
+fn sse_event_payload(data: &str) -> Event {
     Event::default().data(data)
 }
 
@@ -13555,7 +14159,10 @@ fn workspace_logo_kind(bytes: &[u8]) -> Result<WorkspaceLogoKind, ApiError> {
     }
     if let Ok(s) = std::str::from_utf8(&bytes[..bytes.len().min(256)]) {
         let trimmed = s.trim_start();
-        if trimmed.starts_with("<?xml") || trimmed.starts_with("<svg") || trimmed.starts_with("<!DOCTYPE") {
+        if trimmed.starts_with("<?xml")
+            || trimmed.starts_with("<svg")
+            || trimmed.starts_with("<!DOCTYPE")
+        {
             return Ok(WorkspaceLogoKind {
                 extension: "svg",
                 content_type: "image/svg+xml",
@@ -18588,7 +19195,6 @@ description:
             global_hooks: HookConfig::default(),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
-            active_chat_runs: ActiveChatRunRegistry::default(),
             tool_resource_locks: ToolResourceLockRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
@@ -18736,7 +19342,6 @@ description:
             global_hooks: HookConfig::default(),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
-            active_chat_runs: ActiveChatRunRegistry::default(),
             tool_resource_locks: ToolResourceLockRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
@@ -18867,7 +19472,6 @@ description:
             global_hooks: HookConfig::default(),
             mcp_registry,
             question_registry: QuestionRegistry::default(),
-            active_chat_runs: ActiveChatRunRegistry::default(),
             tool_resource_locks: ToolResourceLockRegistry::default(),
             app_shutdown_rx,
             context_budget: foco_agent::ContextBudget {
@@ -18951,6 +19555,61 @@ description:
         assert_eq!(request.final_state, "failed");
         assert!(messages.is_empty());
 
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn active_chat_run_subscription_replays_cached_events_after_sequence() {
+        let registry = ActiveChatRunRegistry::default();
+        let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+        let workspace_dir = env::temp_dir().join(unique_id("foco-active-run-replay-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            database
+                .insert_chat("chat-1", "Active run")
+                .expect("chat insert");
+        }
+        let mut registration = registry
+            .register(
+                "run-1".to_string(),
+                "workspace-1".to_string(),
+                "chat-1".to_string(),
+                guidance_tx,
+            )
+            .expect("register active run");
+        let first_event = ChatSseEvent::TextDelta {
+            assistant_message_id: "assistant-1".to_string(),
+            delta: "hello".to_string(),
+        };
+        let second_event = ChatSseEvent::TextDelta {
+            assistant_message_id: "assistant-1".to_string(),
+            delta: " world".to_string(),
+        };
+        registration
+            .record_event(&workspace_dir, "chat-1", &first_event)
+            .expect("record first event");
+        registration
+            .record_event(&workspace_dir, "chat-1", &second_event)
+            .expect("record second event");
+
+        let subscription = registry
+            .subscribe("workspace-1", "run-1", Some(0))
+            .expect("subscribe active run");
+        assert_eq!(subscription.replay.len(), 1);
+        assert_eq!(subscription.replay[0].sequence, 1);
+        assert!(subscription.replay[0].payload_json.contains(" world"));
+
+        registration.finish();
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let run_events = database
+            .run_events_for_run("run-1")
+            .expect("run events for run");
+        assert_eq!(run_events.len(), 2);
+        assert!(registry.subscribe("workspace-1", "run-1", Some(0)).is_err());
         drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }
