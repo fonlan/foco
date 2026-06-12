@@ -666,6 +666,8 @@ async fn run_prompt_hook(
         tools: Vec::new(),
         thinking_level: None,
         max_output_tokens: Some(1024),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
     };
     let mut audited_stream =
         audited_prompt_hook_stream(provider_config, hook_request, request, timeout_ms).await?;

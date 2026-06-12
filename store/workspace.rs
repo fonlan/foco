@@ -14,7 +14,7 @@ use crate::memory::WORKSPACE_MEMORY_SCHEMA_SQL;
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 8;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 9;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -48,6 +48,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 8,
         sql: MIGRATION_008,
+    },
+    Migration {
+        version: 9,
+        sql: MIGRATION_009,
     },
 ];
 
@@ -870,6 +874,66 @@ impl WorkspaceDatabase {
                     summary_token_count: row.get(8)?,
                     created_at: row.get(9)?,
                     metadata_json: row.get(10)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn insert_prompt_context_injection(
+        &mut self,
+        injection: NewPromptContextInjection<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let created_at = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO prompt_context_injections
+                    (id, chat_id, kind, sequence, messages_json, memory_keys_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    injection.id,
+                    injection.chat_id,
+                    injection.kind,
+                    injection.sequence,
+                    injection.messages_json,
+                    injection.memory_keys_json,
+                    created_at
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn prompt_context_injections_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<PromptContextInjectionRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, chat_id, kind, sequence, messages_json, memory_keys_json, created_at
+                 FROM prompt_context_injections
+                 WHERE chat_id = ?1
+                 ORDER BY
+                    CASE kind WHEN 'stable' THEN 0 ELSE 1 END,
+                    sequence ASC,
+                    created_at ASC,
+                    id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(PromptContextInjectionRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    sequence: row.get(3)?,
+                    messages_json: row.get(4)?,
+                    memory_keys_json: row.get(5)?,
+                    created_at: row.get(6)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -2076,6 +2140,27 @@ pub struct ContextCompressionSnapshotRecord {
     pub summary_token_count: i64,
     pub created_at: String,
     pub metadata_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewPromptContextInjection<'a> {
+    pub id: &'a str,
+    pub chat_id: &'a str,
+    pub kind: &'a str,
+    pub sequence: Option<i64>,
+    pub messages_json: &'a str,
+    pub memory_keys_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptContextInjectionRecord {
+    pub id: String,
+    pub chat_id: String,
+    pub kind: String,
+    pub sequence: Option<i64>,
+    pub messages_json: String,
+    pub memory_keys_json: String,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3504,6 +3589,28 @@ const MIGRATION_008: &str = r#"
 DROP INDEX task_graphs_updated_at_idx;
 ALTER TABLE task_graphs RENAME TO todo_graphs;
 CREATE INDEX todo_graphs_updated_at_idx ON todo_graphs (updated_at);
+"#;
+
+const MIGRATION_009: &str = r#"
+CREATE TABLE prompt_context_injections (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('stable', 'turn_memory')),
+    sequence INTEGER CHECK (sequence IS NULL OR sequence >= 0),
+    messages_json TEXT NOT NULL CHECK (length(messages_json) > 0),
+    memory_keys_json TEXT NOT NULL CHECK (length(memory_keys_json) > 0),
+    created_at TEXT NOT NULL,
+    CHECK ((kind = 'stable' AND sequence IS NULL) OR (kind = 'turn_memory' AND sequence IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX prompt_context_injections_stable_chat_idx
+    ON prompt_context_injections (chat_id)
+    WHERE kind = 'stable';
+CREATE UNIQUE INDEX prompt_context_injections_turn_chat_sequence_idx
+    ON prompt_context_injections (chat_id, sequence)
+    WHERE kind = 'turn_memory';
+CREATE INDEX prompt_context_injections_chat_kind_sequence_idx
+    ON prompt_context_injections (chat_id, kind, sequence);
 "#;
 
 #[cfg(test)]

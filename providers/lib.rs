@@ -5,8 +5,9 @@ use genai::{
     Client, WebConfig,
     adapter::AdapterKind,
     chat::{
-        ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart, MessageContent,
-        ReasoningEffort, StreamEnd, Tool, ToolCall as GenaiToolCall, ToolResponse, Usage,
+        CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart,
+        MessageContent, ReasoningEffort, StreamEnd, Tool, ToolCall as GenaiToolCall, ToolResponse,
+        Usage,
     },
     resolver::{AuthData, Endpoint, ProviderConfig},
 };
@@ -166,6 +167,10 @@ pub struct NeutralChatRequest {
     pub tools: Vec<NeutralToolDefinition>,
     pub thinking_level: Option<String>,
     pub max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_retention: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -606,6 +611,22 @@ fn genai_chat_options(request: &NeutralChatRequest) -> Result<ChatOptions, Provi
         options = options.with_reasoning_effort(effort);
     }
 
+    if let Some(prompt_cache_key) = request.prompt_cache_key.as_deref() {
+        options = options.with_prompt_cache_key(prompt_cache_key);
+    }
+
+    if let Some(prompt_cache_retention) = request.prompt_cache_retention.as_deref() {
+        let cache_control = match prompt_cache_retention {
+            "24h" => CacheControl::Ephemeral24h,
+            other => {
+                return Err(ProviderConfigError::InvalidRequest(format!(
+                    "unsupported prompt cache retention '{other}'"
+                )));
+            }
+        };
+        options = options.with_cache_control(cache_control);
+    }
+
     Ok(options)
 }
 
@@ -987,6 +1008,8 @@ mod tests {
             tools: Vec::new(),
             thinking_level: None,
             max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -1018,6 +1041,8 @@ mod tests {
             tools: Vec::new(),
             thinking_level: None,
             max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -1054,6 +1079,8 @@ mod tests {
             tools: Vec::new(),
             thinking_level: None,
             max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -1063,5 +1090,47 @@ mod tests {
 
         assert_eq!(parts.len(), 1);
         assert!(parts[0].is_text());
+    }
+
+    #[test]
+    fn maps_prompt_cache_options_to_genai_chat_options() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-5.5".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: Some("foco:workspace:chat".to_string()),
+            prompt_cache_retention: Some("24h".to_string()),
+        };
+
+        let options = genai_chat_options(&request).expect("chat options");
+
+        assert_eq!(
+            options.prompt_cache_key.as_deref(),
+            Some("foco:workspace:chat")
+        );
+        assert_eq!(options.cache_control, Some(CacheControl::Ephemeral24h));
+    }
+
+    #[test]
+    fn rejects_unsupported_prompt_cache_retention() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-5.5".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: Some("foco:workspace:chat".to_string()),
+            prompt_cache_retention: Some("1h".to_string()),
+        };
+
+        let error = genai_chat_options(&request).expect_err("unsupported retention should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported prompt cache retention")
+        );
     }
 }

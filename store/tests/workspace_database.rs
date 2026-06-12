@@ -5,10 +5,11 @@ use foco_store::{
     workspace::{
         LlmRequestAuditFilters, LlmRequestRecord, NewCodeGraphEdge, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
-        NewTerminalSession, NewToolCall, NewToolResult, TodoGraphFilter, TodoGraphTask,
-        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
-        initialize_workspace_databases, workspace_database_path,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+        NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
+        TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome,
+        WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, initialize_workspace_databases,
+        workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -58,6 +59,7 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "memory_fts_index",
         "memory_profiles",
         "memory_extraction_jobs",
+        "prompt_context_injections",
     ] {
         assert!(
             table_exists(&connection, table),
@@ -1108,6 +1110,47 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             .expect("filtered audit count"),
         1
     );
+}
+
+#[test]
+fn stores_prompt_context_injections_for_chat_replay() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .insert_chat("chat-1", "Prompt cache chat")
+        .expect("chat insert");
+
+    database
+        .insert_prompt_context_injection(NewPromptContextInjection {
+            id: "stable-1",
+            chat_id: "chat-1",
+            kind: "stable",
+            sequence: None,
+            messages_json: r#"[{"role":"system","content":"Stable memory"}]"#,
+            memory_keys_json: r#"["workspace:fact-1"]"#,
+        })
+        .expect("stable injection");
+    database
+        .insert_prompt_context_injection(NewPromptContextInjection {
+            id: "turn-1",
+            chat_id: "chat-1",
+            kind: "turn_memory",
+            sequence: Some(0),
+            messages_json: r#"[{"role":"user","content":"Turn memory"}]"#,
+            memory_keys_json: r#"["chat:fact-2"]"#,
+        })
+        .expect("turn injection");
+
+    let injections = database
+        .prompt_context_injections_for_chat("chat-1")
+        .expect("injections");
+
+    assert_eq!(injections.len(), 2);
+    assert_eq!(injections[0].kind, "stable");
+    assert_eq!(injections[0].sequence, None);
+    assert_eq!(injections[1].kind, "turn_memory");
+    assert_eq!(injections[1].sequence, Some(0));
+    assert_eq!(injections[1].memory_keys_json, r#"["chat:fact-2"]"#);
 }
 
 fn assert_json_eq(actual: &str, expected: &str) {

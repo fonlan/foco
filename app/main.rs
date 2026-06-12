@@ -74,8 +74,9 @@ use foco_store::{
         ChatRecord, ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
         LlmRequestAuditRow, LlmRequestEventRecord, LlmRequestRecord, MessageRecord,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-        NewTerminalSession, NewToolCall, NewToolResult, TodoGraphFilter, TodoGraphRecord,
-        TodoGraphTask, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        NewPromptContextInjection, NewTerminalSession, NewToolCall, NewToolResult,
+        PromptContextInjectionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
+        ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
         initialize_workspace_databases, workspace_database_path,
     },
 };
@@ -138,6 +139,10 @@ const MEMORY_CONTEXT_EDGE_EXPANSION_LIMIT: u32 = 12;
 const MEMORY_PROFILE_REFRESH_FACT_LIMIT: u32 = 32;
 // Prefix used to identify injected query-specific retrieved memory messages.
 const MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX: &str = "Foco retrieved memory context:";
+// Confidence at or above this value makes a first-turn memory part of the stable chat prefix.
+const STABLE_MEMORY_CONFIDENCE_THRESHOLD: f64 = 0.85;
+// OpenAI prompt cache retention requested for main chat runs.
+const PROMPT_CACHE_RETENTION_24H: &str = "24h";
 // Agent tool name exposed for searching memory facts.
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 // Agent tool name exposed for writing manual memory notes.
@@ -4689,6 +4694,14 @@ struct PreparedPromptContext {
     message: Option<String>,
     attachments: Vec<NeutralChatAttachment>,
     next_message_sequence: i64,
+    pending_context_injections: Vec<PendingPromptContextInjection>,
+}
+
+struct PendingPromptContextInjection {
+    kind: &'static str,
+    sequence: Option<i64>,
+    messages: Vec<NeutralChatMessage>,
+    memory_keys: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -4708,15 +4721,19 @@ impl PromptAssemblyPurpose {
 }
 
 struct MemoryPromptContext {
-    retrieved_message: Option<NeutralChatMessage>,
+    stable_message: Option<NeutralChatMessage>,
+    turn_message: Option<NeutralChatMessage>,
     memories_used: Vec<ChatMemoryUsedSummary>,
     context_tokens: u64,
     budget_tokens: u64,
+    stable_memory_keys: Vec<String>,
+    turn_memory_keys: Vec<String>,
 }
 
 struct RetrievedMemoryContext {
     message: Option<NeutralChatMessage>,
     memories_used: Vec<ChatMemoryUsedSummary>,
+    memory_keys: Vec<String>,
 }
 
 struct RelevantMemoryFacts {
@@ -6099,6 +6116,12 @@ async fn prepare_prompt_context(
             .map_err(ApiError::from_workspace_error)?,
         None => Vec::new(),
     };
+    let prompt_context_injections = match chat_id.as_deref() {
+        Some(chat_id) => database
+            .prompt_context_injections_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?,
+        None => Vec::new(),
+    };
     let user_sequence = next_message_sequence(&existing_messages);
     drop(database);
 
@@ -6168,6 +6191,21 @@ async fn prepare_prompt_context(
     } else {
         Vec::new()
     };
+    let active_stored_memory_keys = active_prompt_context_memory_keys(
+        state,
+        config,
+        workspace,
+        config.memory.enabled,
+        &prompt_context_injections,
+    )?;
+    let existing_stable_context_messages = stored_stable_prompt_context_messages(
+        &prompt_context_injections,
+        &active_stored_memory_keys,
+    )?;
+    let existing_turn_memory_messages = stored_turn_memory_messages_by_sequence(
+        &prompt_context_injections,
+        &active_stored_memory_keys,
+    )?;
     let memory_context = memory_prompt_context(
         state,
         config,
@@ -6178,44 +6216,63 @@ async fn prepare_prompt_context(
         provider,
         &context_budget,
         purpose,
+        &active_stored_memory_keys,
+        is_new_chat,
     )
     .await?;
+    let mut stable_context_messages = if is_new_chat {
+        let mut messages = Vec::new();
+        if let Some(message) = memory_context.stable_message.clone() {
+            messages.push(message);
+        }
+        messages.extend(agents_messages);
+        messages.extend(configured_prompt_messages);
+        messages.extend(environment_messages);
+        messages.extend(skill_messages);
+        messages
+    } else {
+        existing_stable_context_messages
+    };
+    let current_turn_memory_messages = memory_context
+        .turn_message
+        .clone()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut pending_context_injections = Vec::new();
+    if is_new_chat && !stable_context_messages.is_empty() {
+        pending_context_injections.push(PendingPromptContextInjection {
+            kind: "stable",
+            sequence: None,
+            messages: stable_context_messages.clone(),
+            memory_keys: memory_context.stable_memory_keys.clone(),
+        });
+    }
+    if !current_turn_memory_messages.is_empty() {
+        pending_context_injections.push(PendingPromptContextInjection {
+            kind: "turn_memory",
+            sequence: Some(user_sequence),
+            messages: current_turn_memory_messages.clone(),
+            memory_keys: memory_context.turn_memory_keys.clone(),
+        });
+    }
     let mut neutral_messages = Vec::with_capacity(
         existing_messages.len()
             + compression_snapshots.len()
-            + agents_messages.len()
-            + configured_prompt_messages.len()
-            + environment_messages.len()
-            + skill_messages.len()
-            + usize::from(memory_context.retrieved_message.is_some())
+            + stable_context_messages.len()
+            + existing_turn_memory_messages.len()
+            + current_turn_memory_messages.len()
             + usize::from(assistant_draft.is_some() || assistant_draft_reasoning.is_some())
             + 2,
     );
     let mut message_source_sequences = Vec::with_capacity(neutral_messages.capacity());
     neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
     message_source_sequences.push(None);
-    if let Some(retrieved_message) = memory_context.retrieved_message {
-        neutral_messages.push(retrieved_message);
+    for stable_context_message in stable_context_messages.drain(..) {
+        neutral_messages.push(stable_context_message);
         message_source_sequences.push(None);
     }
     for snapshot in &compression_snapshots {
         neutral_messages.push(compression_snapshot_message(snapshot));
-        message_source_sequences.push(None);
-    }
-    for agents_message in agents_messages {
-        neutral_messages.push(agents_message);
-        message_source_sequences.push(None);
-    }
-    for prompt_message in configured_prompt_messages {
-        neutral_messages.push(prompt_message);
-        message_source_sequences.push(None);
-    }
-    for environment_message in environment_messages {
-        neutral_messages.push(environment_message);
-        message_source_sequences.push(None);
-    }
-    for skill_message in skill_messages {
-        neutral_messages.push(skill_message);
         message_source_sequences.push(None);
     }
     let replay_database = WorkspaceDatabase::open_or_create(&workspace.path)
@@ -6229,6 +6286,12 @@ async fn prepare_prompt_context(
         for neutral_message in neutral_messages_from_record(&replay_database, existing_message)? {
             neutral_messages.push(neutral_message);
             message_source_sequences.push(Some(sequence));
+        }
+        if let Some(turn_memory_messages) = existing_turn_memory_messages.get(&sequence) {
+            for turn_memory_message in turn_memory_messages {
+                neutral_messages.push(turn_memory_message.clone());
+                message_source_sequences.push(Some(sequence));
+            }
         }
     }
     if assistant_draft.is_some() || assistant_draft_reasoning.is_some() {
@@ -6245,6 +6308,10 @@ async fn prepare_prompt_context(
         ));
         message_source_sequences.push(Some(user_sequence));
     }
+    for turn_memory_message in current_turn_memory_messages {
+        neutral_messages.push(turn_memory_message);
+        message_source_sequences.push(Some(user_sequence));
+    }
     let active_tool_start_index = neutral_messages.len();
 
     let provider_request = NeutralChatRequest {
@@ -6253,6 +6320,8 @@ async fn prepare_prompt_context(
         tools: neutral_tools,
         thinking_level: thinking_level.or_else(|| model.thinking_level.clone()),
         max_output_tokens: Some(max_output_tokens),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
     };
     Ok(PreparedPromptContext {
         workspace_id: workspace.id.clone(),
@@ -6273,6 +6342,7 @@ async fn prepare_prompt_context(
         message,
         attachments,
         next_message_sequence: user_sequence,
+        pending_context_injections,
     })
 }
 
@@ -6383,7 +6453,22 @@ async fn prepare_chat_context(
         })
         .map_err(ApiError::from_workspace_error)?;
 
-    let request_body_json = serialize_provider_request(&prompt_context.provider_request)?;
+    persist_pending_prompt_context_injections(
+        &mut database,
+        &chat_id,
+        &prompt_context.pending_context_injections,
+    )?;
+
+    let mut provider_request = prompt_context.provider_request;
+    provider_request.prompt_cache_key = Some(prompt_cache_key(
+        &prompt_context.workspace_id,
+        &chat_id,
+        &prompt_context.provider_id,
+        &prompt_context.model_id,
+        &provider_request,
+    )?);
+    provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
+    let request_body_json = serialize_provider_request(&provider_request)?;
 
     Ok(PreparedChatContext {
         workspace_id: prompt_context.workspace_id,
@@ -6397,7 +6482,7 @@ async fn prepare_chat_context(
         llm_request_id,
         assistant_sequence,
         provider_config: prompt_context.provider_config,
-        provider_request: prompt_context.provider_request,
+        provider_request,
         mcp_registry: state.mcp_registry.clone(),
         hook_runtime: state.hook_runtime.clone(),
         global_hooks: config.hooks.clone(),
@@ -6429,6 +6514,8 @@ async fn memory_prompt_context(
     chat_provider: &ProviderSettings,
     context_budget: &foco_agent::ContextBudget,
     purpose: PromptAssemblyPurpose,
+    excluded_memory_keys: &HashSet<String>,
+    split_stable_memory: bool,
 ) -> Result<MemoryPromptContext, ApiError> {
     let budget_tokens = if config.memory.enabled {
         context_budget
@@ -6441,10 +6528,13 @@ async fn memory_prompt_context(
 
     if !config.memory.enabled || budget_tokens == 0 {
         return Ok(MemoryPromptContext {
-            retrieved_message: None,
+            stable_message: None,
+            turn_message: None,
             memories_used: Vec::new(),
             context_tokens: 0,
             budget_tokens,
+            stable_memory_keys: Vec::new(),
+            turn_memory_keys: Vec::new(),
         });
     }
 
@@ -6462,7 +6552,7 @@ async fn memory_prompt_context(
         refresh_memory_profile(&mut global_memory, MemoryScope::Global, None)?;
     }
 
-    let relevant_facts = if !purpose.allows_llm_memory_retrieval() {
+    let mut relevant_facts = if !purpose.allows_llm_memory_retrieval() {
         relevant_memory_facts_fts(
             &mut global_memory,
             &mut workspace_memory,
@@ -6502,21 +6592,62 @@ async fn memory_prompt_context(
             }
         }
     };
+    relevant_facts
+        .facts
+        .retain(|fact| !excluded_memory_keys.contains(&memory_fact_key(&fact.fact)));
     let mut remaining_tokens = budget_tokens;
-    let retrieved_context =
-        retrieved_memory_context_message(&relevant_facts.facts, &mut remaining_tokens);
-    let context_tokens = retrieved_context
+    let (stable_facts, turn_facts) = if split_stable_memory {
+        split_stable_retrieved_memory_facts(relevant_facts.facts)
+    } else {
+        (Vec::new(), relevant_facts.facts)
+    };
+    let stable_context = retrieved_memory_context_message(
+        &stable_facts,
+        &mut remaining_tokens,
+        NeutralChatRole::System,
+    );
+    let turn_context =
+        retrieved_memory_context_message(&turn_facts, &mut remaining_tokens, NeutralChatRole::User);
+    let context_tokens = stable_context
         .message
         .as_ref()
         .map(neutral_message_estimated_tokens)
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .saturating_add(
+            turn_context
+                .message
+                .as_ref()
+                .map(neutral_message_estimated_tokens)
+                .unwrap_or(0),
+        );
+    let mut memories_used = stable_context.memories_used;
+    memories_used.extend(turn_context.memories_used);
 
     Ok(MemoryPromptContext {
-        retrieved_message: retrieved_context.message,
-        memories_used: retrieved_context.memories_used,
+        stable_message: stable_context.message,
+        turn_message: turn_context.message,
+        memories_used,
         context_tokens,
         budget_tokens,
+        stable_memory_keys: stable_context.memory_keys,
+        turn_memory_keys: turn_context.memory_keys,
     })
+}
+
+fn split_stable_retrieved_memory_facts(
+    facts: Vec<RetrievedMemoryFact>,
+) -> (Vec<RetrievedMemoryFact>, Vec<RetrievedMemoryFact>) {
+    facts
+        .into_iter()
+        .partition(|fact| is_stable_prompt_memory(&fact.fact))
+}
+
+fn is_stable_prompt_memory(fact: &MemoryFactRecord) -> bool {
+    fact.pinned
+        || matches!(fact.scope.as_str(), "global" | "workspace")
+        || fact
+            .confidence
+            .is_some_and(|confidence| confidence >= STABLE_MEMORY_CONFIDENCE_THRESHOLD)
 }
 
 fn relevant_memory_facts_fts(
@@ -6836,17 +6967,21 @@ fn memory_retrieval_provider_request(
         tools: vec![memory_retrieval_tool_definition()],
         thinking_level: None,
         max_output_tokens: Some(max_output_tokens),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
     })
 }
 
 fn retrieved_memory_context_message(
     facts: &[RetrievedMemoryFact],
     remaining_tokens: &mut u64,
+    role: NeutralChatRole,
 ) -> RetrievedMemoryContext {
     if facts.is_empty() {
         return RetrievedMemoryContext {
             message: None,
             memories_used: Vec::new(),
+            memory_keys: Vec::new(),
         };
     }
 
@@ -6855,11 +6990,13 @@ fn retrieved_memory_context_message(
         return RetrievedMemoryContext {
             message: None,
             memories_used: Vec::new(),
+            memory_keys: Vec::new(),
         };
     }
     *remaining_tokens = remaining_tokens.saturating_sub(prefix_tokens);
     let mut content = String::from(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX);
     let mut memories_used = Vec::new();
+    let mut memory_keys = Vec::new();
     for retrieved_fact in facts {
         let fact = &retrieved_fact.fact;
         let entry = format!(
@@ -6879,6 +7016,7 @@ fn retrieved_memory_context_message(
         }
         content.push_str(&entry);
         memories_used.push(chat_memory_used_summary(&retrieved_fact));
+        memory_keys.push(memory_fact_key(fact));
         *remaining_tokens = remaining_tokens.saturating_sub(entry_tokens);
     }
 
@@ -6886,13 +7024,210 @@ fn retrieved_memory_context_message(
         return RetrievedMemoryContext {
             message: None,
             memories_used: Vec::new(),
+            memory_keys: Vec::new(),
         };
     }
 
     RetrievedMemoryContext {
-        message: Some(neutral_text_message(NeutralChatRole::System, content)),
+        message: Some(neutral_text_message(role, content)),
         memories_used,
+        memory_keys,
     }
+}
+
+fn stored_stable_prompt_context_messages(
+    records: &[PromptContextInjectionRecord],
+    active_memory_keys: &HashSet<String>,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    records
+        .iter()
+        .find(|record| record.kind == "stable")
+        .map(|record| stored_prompt_context_messages(record, active_memory_keys))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn stored_turn_memory_messages_by_sequence(
+    records: &[PromptContextInjectionRecord],
+    active_memory_keys: &HashSet<String>,
+) -> Result<BTreeMap<i64, Vec<NeutralChatMessage>>, ApiError> {
+    let mut by_sequence = BTreeMap::new();
+
+    for record in records.iter().filter(|record| record.kind == "turn_memory") {
+        let sequence = record.sequence.ok_or_else(|| {
+            ApiError::internal(format!(
+                "stored prompt context injection '{}' is missing sequence",
+                record.id
+            ))
+        })?;
+        let messages = stored_prompt_context_messages(record, active_memory_keys)?;
+        if !messages.is_empty() {
+            by_sequence.insert(sequence, messages);
+        }
+    }
+
+    Ok(by_sequence)
+}
+
+fn stored_prompt_context_messages(
+    record: &PromptContextInjectionRecord,
+    active_memory_keys: &HashSet<String>,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    let messages = serde_json::from_str::<Vec<NeutralChatMessage>>(&record.messages_json).map_err(
+        |source| {
+            ApiError::internal(format!(
+                "failed to parse stored prompt context injection '{}': {source}",
+                record.id
+            ))
+        },
+    )?;
+    let memory_keys = stored_prompt_context_record_memory_keys(record)?;
+
+    if memory_keys.is_empty()
+        || memory_keys
+            .iter()
+            .all(|key| active_memory_keys.contains(key))
+    {
+        return Ok(messages);
+    }
+
+    Ok(messages
+        .into_iter()
+        .filter(|message| {
+            !message
+                .content
+                .contains(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX)
+        })
+        .collect())
+}
+
+fn active_prompt_context_memory_keys(
+    state: &AppState,
+    config: &GlobalConfig,
+    workspace: &WorkspaceConfig,
+    memory_enabled: bool,
+    records: &[PromptContextInjectionRecord],
+) -> Result<HashSet<String>, ApiError> {
+    let stored_keys = stored_prompt_context_memory_keys(records)?;
+    if !memory_enabled || stored_keys.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let workspace_memory =
+        open_memory_database(state, config, MemoryScope::Workspace, Some(&workspace.id))?;
+    let global_memory = open_memory_database(state, config, MemoryScope::Global, None)?;
+    let mut active_keys = HashSet::new();
+
+    for key in stored_keys {
+        let Some((scope, fact_id)) = key.split_once(':') else {
+            continue;
+        };
+        let fact = match scope {
+            "global" => global_memory
+                .fact(fact_id)
+                .map_err(ApiError::from_memory_error)?,
+            "workspace" | "chat" => workspace_memory
+                .fact(fact_id)
+                .map_err(ApiError::from_memory_error)?,
+            _ => None,
+        };
+        if fact
+            .as_ref()
+            .is_some_and(|fact| fact.status == "active" && fact.is_latest)
+        {
+            active_keys.insert(key);
+        }
+    }
+
+    Ok(active_keys)
+}
+
+fn stored_prompt_context_memory_keys(
+    records: &[PromptContextInjectionRecord],
+) -> Result<HashSet<String>, ApiError> {
+    let mut keys = HashSet::new();
+
+    for record in records {
+        let record_keys = stored_prompt_context_record_memory_keys(record)?;
+        keys.extend(record_keys.into_iter().filter(|key| !key.trim().is_empty()));
+    }
+
+    Ok(keys)
+}
+
+fn stored_prompt_context_record_memory_keys(
+    record: &PromptContextInjectionRecord,
+) -> Result<Vec<String>, ApiError> {
+    serde_json::from_str(&record.memory_keys_json).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to parse stored prompt context injection '{}' memory keys: {source}",
+            record.id
+        ))
+    })
+}
+
+fn persist_pending_prompt_context_injections(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    pending: &[PendingPromptContextInjection],
+) -> Result<(), ApiError> {
+    for injection in pending {
+        if injection.messages.is_empty() {
+            continue;
+        }
+
+        let messages_json = serde_json::to_string(&injection.messages).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to serialize prompt context injection: {source}"
+            ))
+        })?;
+        let memory_keys_json = serde_json::to_string(&injection.memory_keys).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to serialize prompt context injection memory keys: {source}"
+            ))
+        })?;
+
+        database
+            .insert_prompt_context_injection(NewPromptContextInjection {
+                id: &unique_id("ctx-inj"),
+                chat_id,
+                kind: injection.kind,
+                sequence: injection.sequence,
+                messages_json: &messages_json,
+                memory_keys_json: &memory_keys_json,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
+
+    Ok(())
+}
+
+fn prompt_cache_key(
+    workspace_id: &str,
+    chat_id: &str,
+    provider_id: &str,
+    model_id: &str,
+    request: &NeutralChatRequest,
+) -> Result<String, ApiError> {
+    let mut hasher = Sha256::new();
+    hasher.update(workspace_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(chat_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(provider_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(model_id.as_bytes());
+    hasher.update(b"\0");
+    let tools_json = serde_json::to_string(&request.tools).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize tool definitions for cache key: {source}"
+        ))
+    })?;
+    hasher.update(tools_json.as_bytes());
+    hasher.update(b"\0");
+    let digest = hasher.finalize();
+
+    Ok(format!("foco:{}", hex_encode(&digest[..16])))
 }
 
 fn memory_fts_query(text: &str) -> Option<String> {
@@ -8599,6 +8934,8 @@ fn memory_extraction_provider_request(
         tools: vec![memory_extraction_tool_definition()],
         thinking_level: None,
         max_output_tokens: Some(max_output_tokens),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
     })
 }
 
@@ -17317,6 +17654,8 @@ description: Project memory.
                 tools: Vec::new(),
                 thinking_level: None,
                 max_output_tokens: Some(16),
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
             },
             hook_runtime: HookRuntime::new(mcp_registry.clone()),
             global_hooks: HookConfig::default(),
@@ -17460,6 +17799,8 @@ description: Project memory.
                 tools: Vec::new(),
                 thinking_level: None,
                 max_output_tokens: Some(16),
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
             },
             hook_runtime: HookRuntime::new(mcp_registry.clone()),
             global_hooks: HookConfig::default(),
@@ -17586,6 +17927,8 @@ description: Project memory.
                 tools: Vec::new(),
                 thinking_level: None,
                 max_output_tokens: Some(16),
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
             },
             hook_runtime: HookRuntime::new(mcp_registry.clone()),
             global_hooks: HookConfig::default(),
@@ -18782,7 +19125,7 @@ description: Project memory.
     }
 
     #[tokio::test]
-    async fn prepare_chat_context_injects_initial_context_only_for_new_chat() {
+    async fn prepare_chat_context_freezes_initial_context_for_chat_replay() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-chat-agents-workspace-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-chat-agents-profile-test"));
         let codex_dir = profile_dir.join(".codex");
@@ -18946,6 +19289,21 @@ Search memory before repo work.
                 .expect("stored messages");
             assert_eq!(stored_messages.len(), 1);
             assert_eq!(stored_messages[0].content, "Hello");
+            let context_injections = database
+                .prompt_context_injections_for_chat(&new_context.chat_id)
+                .expect("context injections");
+            assert_eq!(context_injections.len(), 1);
+            assert_eq!(context_injections[0].kind, "stable");
+            assert!(
+                context_injections[0]
+                    .messages_json
+                    .contains(AGENTS_MESSAGE_PREFIX)
+            );
+            assert!(
+                context_injections[0]
+                    .messages_json
+                    .contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX)
+            );
         }
 
         let existing_context = prepare_chat_context(
@@ -18965,40 +19323,67 @@ Search memory before repo work.
         .await
         .expect("existing chat context");
 
-        assert!(
-            existing_context
-                .provider_request
-                .messages
-                .iter()
-                .all(|message| !message.content.contains(AGENTS_MESSAGE_PREFIX))
+        let existing_agents_messages = existing_context
+            .provider_request
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(AGENTS_MESSAGE_PREFIX))
+            .collect::<Vec<_>>();
+        assert_eq!(existing_agents_messages.len(), 1);
+        assert_eq!(
+            existing_agents_messages[0].content,
+            injected_messages[0].content
         );
-        assert!(
-            existing_context
-                .provider_request
-                .messages
-                .iter()
-                .all(|message| !message.content.contains(PROMPT_FILE_MESSAGE_PREFIX))
+        let existing_prompt_messages = existing_context
+            .provider_request
+            .messages
+            .iter()
+            .filter(|message| {
+                message.content.contains(PROMPT_FILE_MESSAGE_PREFIX)
+                    || message.content.contains(EXTRA_PROMPT_MESSAGE_PREFIX)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(existing_prompt_messages.len(), 2);
+        assert_eq!(
+            existing_prompt_messages[0].content,
+            prompt_messages[0].content
         );
-        assert!(
-            existing_context
-                .provider_request
-                .messages
-                .iter()
-                .all(|message| !message.content.contains(EXTRA_PROMPT_MESSAGE_PREFIX))
+        assert_eq!(
+            existing_prompt_messages[1].content,
+            prompt_messages[1].content
         );
-        assert!(
-            existing_context
-                .provider_request
-                .messages
-                .iter()
-                .all(|message| !message.content.contains(ENABLED_SKILLS_MESSAGE_PREFIX))
+        let existing_skill_messages = existing_context
+            .provider_request
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(ENABLED_SKILLS_MESSAGE_PREFIX))
+            .collect::<Vec<_>>();
+        assert_eq!(existing_skill_messages.len(), 1);
+        assert_eq!(
+            existing_skill_messages[0].content,
+            skill_messages[0].content
         );
-        assert!(
+        let existing_environment_messages = existing_context
+            .provider_request
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX))
+            .collect::<Vec<_>>();
+        assert_eq!(existing_environment_messages.len(), 1);
+        assert_eq!(
+            existing_environment_messages[0].content,
+            environment_messages[0].content
+        );
+        assert_eq!(
+            new_context.provider_request.prompt_cache_key,
+            existing_context.provider_request.prompt_cache_key
+        );
+        assert_eq!(
             existing_context
                 .provider_request
-                .messages
-                .iter()
-                .all(|message| !message.content.contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX))
+                .prompt_cache_retention
+                .as_deref(),
+            Some(PROMPT_CACHE_RETENTION_24H)
         );
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -19171,7 +19556,7 @@ Use the existing product UI conventions.
     }
 
     #[tokio::test]
-    async fn prepare_prompt_context_injects_memory_context_after_system_prompt() {
+    async fn prepare_prompt_context_appends_memory_context_after_current_user() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-memory-prompt-workspace-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-memory-prompt-profile-test"));
 
@@ -19297,37 +19682,53 @@ Use the existing product UI conventions.
         let messages = &context.provider_request.messages;
 
         assert!(messages[0].content.contains("You are Foco"));
+        let current_user_index = messages
+            .iter()
+            .position(|message| message.content == "renderer prompt assembly")
+            .expect("current user message");
+        assert_eq!(
+            messages[current_user_index].content,
+            "renderer prompt assembly"
+        );
+        let memory_message = messages
+            .get(current_user_index + 1)
+            .expect("memory message after current user");
+        assert_eq!(memory_message.role, NeutralChatRole::User);
         assert!(
-            messages[1]
+            memory_message
                 .content
                 .contains(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX)
         );
         assert!(
-            messages[1]
+            memory_message
                 .content
                 .contains("Use the renderer pipeline for preview bugs.")
         );
         assert!(
-            messages[1]
+            memory_message
                 .content
                 .contains("Workspace renderer work should share prompt assembly.")
         );
         assert!(
-            messages[1]
+            memory_message
                 .content
                 .contains("Graph-linked memory is pulled through adjacent edges.")
         );
-        assert!(messages[1].content.contains("source: direct"));
-        assert!(messages[1].content.contains("source: related"));
+        assert!(memory_message.content.contains("source: direct"));
+        assert!(memory_message.content.contains("source: related"));
         assert!(
-            messages[1]
+            memory_message
                 .content
                 .contains("Global renderer memory should be available.")
         );
         assert!(
-            !messages[1]
+            !memory_message
                 .content
                 .contains("Billing invoices use monthly finance tags.")
+        );
+        assert_eq!(
+            context.message_source_sequences[current_user_index],
+            context.message_source_sequences[current_user_index + 1]
         );
         assert!(
             context
@@ -19350,6 +19751,197 @@ Use the existing product UI conventions.
                 .available_message_tokens
                 .saturating_mul(MEMORY_CONTEXT_BUDGET_PERCENT)
                 / 100
+        );
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
+    async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-cache-layout-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-memory-cache-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.memory.enabled = true;
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        {
+            let mut memory =
+                MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                    .expect("workspace memory database");
+            insert_test_memory_fact(
+                &mut memory,
+                "source-workspace-renderer",
+                "fact-workspace-renderer",
+                MemoryScope::Workspace,
+                None,
+                "Workspace renderer memory should stay in the stable prefix.",
+                false,
+            );
+        }
+
+        let first_context = prepare_chat_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            ChatStreamRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: "renderer first turn".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("first chat context");
+        let stable_memory_index = first_context
+            .provider_request
+            .messages
+            .iter()
+            .position(|message| {
+                message.role == NeutralChatRole::System
+                    && message
+                        .content
+                        .contains("Workspace renderer memory should stay in the stable prefix.")
+            })
+            .expect("stable memory message");
+        assert!(
+            stable_memory_index
+                < first_context
+                    .provider_request
+                    .messages
+                    .iter()
+                    .position(|message| message.content == "renderer first turn")
+                    .expect("first user index")
+        );
+        assert_eq!(
+            first_context
+                .provider_request
+                .prompt_cache_retention
+                .as_deref(),
+            Some(PROMPT_CACHE_RETENTION_24H)
+        );
+        let first_cache_key = first_context
+            .provider_request
+            .prompt_cache_key
+            .clone()
+            .expect("first cache key");
+        {
+            let database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            let injections = database
+                .prompt_context_injections_for_chat(&first_context.chat_id)
+                .expect("context injections");
+            assert_eq!(injections.len(), 1);
+            assert_eq!(injections[0].kind, "stable");
+            assert!(
+                injections[0]
+                    .memory_keys_json
+                    .contains("workspace:fact-workspace-renderer")
+            );
+        }
+        {
+            let mut memory =
+                MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                    .expect("workspace memory database");
+            insert_test_memory_fact(
+                &mut memory,
+                "source-chat-renderer",
+                "fact-chat-renderer",
+                MemoryScope::Chat,
+                Some(&first_context.chat_id),
+                "Chat renderer delta memory should be appended after the second user.",
+                false,
+            );
+        }
+
+        let second_context = prepare_chat_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            ChatStreamRequest {
+                chat_id: Some(first_context.chat_id.clone()),
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: "renderer second turn".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("second chat context");
+        let second_text = second_context
+            .provider_request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            second_text
+                .matches("Workspace renderer memory should stay in the stable prefix.")
+                .count(),
+            1
+        );
+        let latest_user_index = second_context
+            .provider_request
+            .messages
+            .iter()
+            .rposition(|message| message.content == "renderer second turn")
+            .expect("second user index");
+        let turn_memory = second_context
+            .provider_request
+            .messages
+            .get(latest_user_index + 1)
+            .expect("second turn memory");
+        assert_eq!(turn_memory.role, NeutralChatRole::User);
+        assert!(
+            turn_memory
+                .content
+                .contains("Chat renderer delta memory should be appended after the second user.")
+        );
+        assert!(
+            !turn_memory
+                .content
+                .contains("Workspace renderer memory should stay in the stable prefix.")
+        );
+        assert_eq!(
+            second_context.message_source_sequences[latest_user_index],
+            second_context.message_source_sequences[latest_user_index + 1]
+        );
+        assert_eq!(
+            second_context.provider_request.prompt_cache_key.as_deref(),
+            Some(first_cache_key.as_str())
         );
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
