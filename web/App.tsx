@@ -1022,6 +1022,8 @@ const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
 const WORKSPACE_CHAT_HISTORY_PAGE_SIZE = 5;
 const WORKSPACE_SIDEBAR_MIN_WIDTH = 232;
 const WORKSPACE_SIDEBAR_MAX_WIDTH = 420;
+const CONTEXT_PANEL_MIN_WIDTH = 280;
+const CONTEXT_PANEL_MAX_WIDTH = 720;
 const MAX_CHAT_ATTACHMENTS = 6;
 const MAX_CHAT_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024;
@@ -1645,10 +1647,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Delete hook": "删除钩子",
     "Enable hook group": "启用钩子组",
     "Failed to render.": "渲染失败。",
-    "AI API proxy": "大模型 API 代理",
+    "AI API proxy": "代理服务器",
     "Proxy enabled": "代理已启用",
     "Proxy disabled": "代理已禁用",
-    "Enable AI API proxy": "启用大模型 API 代理",
+    "Enable AI API proxy": "启用代理服务器",
     "Proxy type": "代理类型",
     "Proxy server": "代理服务器",
     "Provider configuration": "供应商配置",
@@ -1952,9 +1954,9 @@ export function App() {
   );
   const [contextPanelTab, setContextPanelTab] =
     useState<ContextPanelTab>("todo");
-  const [diffPanelWidth, setDiffPanelWidth] = useState(420);
+  const [diffPanelWidth, setDiffPanelWidth] = useState(CONTEXT_PANEL_MIN_WIDTH);
   const [isResizingDiffPanel, setIsResizingDiffPanel] = useState(false);
-  const [sidebarWidth, setSidebarWidth] = useState(288);
+  const [sidebarWidth, setSidebarWidth] = useState(WORKSPACE_SIDEBAR_MIN_WIDTH);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [isMobileWorkspaceOpen, setIsMobileWorkspaceOpen] = useState(false);
   const [terminalOpenWorkspaceIds, setTerminalOpenWorkspaceIds] = useState<
@@ -2538,7 +2540,12 @@ export function App() {
 
     function handlePointerMove(event: PointerEvent) {
       const nextWidth = window.innerWidth - event.clientX;
-      setDiffPanelWidth(Math.min(Math.max(nextWidth, 280), 720));
+      setDiffPanelWidth(
+        Math.min(
+          Math.max(nextWidth, CONTEXT_PANEL_MIN_WIDTH),
+          CONTEXT_PANEL_MAX_WIDTH,
+        ),
+      );
     }
 
     function handlePointerUp() {
@@ -4921,14 +4928,14 @@ export function App() {
                 if (event.key === "ArrowLeft") {
                   event.preventDefault();
                   setDiffPanelWidth((current) =>
-                    Math.min(current + 24, 720),
+                    Math.min(current + 24, CONTEXT_PANEL_MAX_WIDTH),
                   );
                 }
 
                 if (event.key === "ArrowRight") {
                   event.preventDefault();
                   setDiffPanelWidth((current) =>
-                    Math.max(current - 24, 280),
+                    Math.max(current - 24, CONTEXT_PANEL_MIN_WIDTH),
                   );
                 }
               }}
@@ -14133,7 +14140,7 @@ function SettingsPanel({
               {orderedWorkspaces.length ? (
                 orderedWorkspaces.map((workspace) => (
                   <div
-                    className={`grid gap-3 px-4 py-3 transition md:grid-cols-[auto_minmax(0,1fr)_auto] ${
+                    className={`grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5 transition ${
                       draggedWorkspaceId === workspace.id
                         ? "bg-teal-50/70 opacity-80"
                         : "bg-white/0"
@@ -14144,7 +14151,7 @@ function SettingsPanel({
                     }
                     onDrop={(event) => void handleWorkspaceDrop(event)}
                   >
-                    <div className="flex items-start pt-1">
+                    <div className="flex items-center">
                       <span
                         aria-label={t("Reorder workspace {name}", {
                           name: workspace.name,
@@ -14173,26 +14180,34 @@ function SettingsPanel({
                         )}
                       </span>
                     </div>
-                    <div className="min-w-0 select-text">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="truncate text-sm font-semibold">
-                          {workspace.name}
-                        </span>
-                        {workspace.isDefault ? (
-                          <CapabilityPill label={t("Default workspace")} ok />
-                        ) : null}
-                        {workspace.pinned ? (
-                          <CapabilityPill label={t("pinned")} ok />
-                        ) : null}
-                      </div>
-                      <div className="mt-1 truncate text-xs font-medium text-stone-500">
-                        {workspace.id} / {terminalShellLabel(terminalShells, workspace.terminalShell)}
-                      </div>
-                      <div className="mt-1 break-all text-xs text-stone-500">
-                        {workspace.path}
+                    <div className="flex min-w-0 items-center gap-3 select-text">
+                      <WorkspaceIcon
+                        className="size-9 shrink-0 rounded-lg border border-stone-200 object-cover shadow-sm"
+                        fallbackClassName="size-9 shrink-0 rounded-lg border border-stone-200 bg-stone-50 p-2 text-stone-500 shadow-sm"
+                        logoUrl={workspace.logoUrl}
+                      />
+                      <div className="min-w-0">
+                        <div className="flex min-w-0 items-center gap-2">
+                          <span className="min-w-0 truncate text-sm font-semibold">
+                            {workspace.name}
+                          </span>
+                          {workspace.isDefault ? (
+                            <CapabilityPill label={t("Default workspace")} ok />
+                          ) : null}
+                          {workspace.pinned ? (
+                            <CapabilityPill label={t("pinned")} ok />
+                          ) : null}
+                        </div>
+                        <div className="mt-1 truncate text-xs text-stone-500">
+                          <span className="font-medium">
+                            {terminalShellLabel(terminalShells, workspace.terminalShell)}
+                          </span>
+                          <span className="text-stone-300"> / </span>
+                          <span>{workspace.path}</span>
+                        </div>
                       </div>
                     </div>
-                    <div className="flex flex-wrap gap-2 md:justify-end">
+                    <div className="flex gap-2 justify-end">
                       <button
                         aria-label={t(
                           workspace.pinned
