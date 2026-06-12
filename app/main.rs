@@ -11986,7 +11986,192 @@ fn ripgrep_tool_summary(status: &RipgrepStatus) -> RipgrepToolSummary {
 }
 
 fn native_select_directory() -> Result<Option<String>, ApiError> {
-    if !(cfg!(windows) || is_wsl_environment()) {
+    #[cfg(windows)]
+    {
+        return native_select_directory_windows();
+    }
+
+    #[cfg(not(windows))]
+    {
+        if !is_wsl_environment() {
+            return Err(ApiError::bad_request(
+                "native directory picker is only available on Windows",
+            ));
+        }
+
+        let Some(selected_path) = native_select_directory_with_powershell()? else {
+            return Ok(None);
+        };
+
+        let output = Command::new("wslpath")
+            .args(["-u", &selected_path])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|source| {
+                ApiError::internal(format!("failed to convert selected Windows path: {source}"))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(ApiError::internal(format!(
+                "failed to convert selected Windows path{}",
+                if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {stderr}")
+                }
+            )));
+        }
+
+        Ok(Some(
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        ))
+    }
+}
+
+#[cfg(windows)]
+struct NativePickerComApartment;
+
+#[cfg(windows)]
+impl Drop for NativePickerComApartment {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::System::Com::CoUninitialize();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn native_picker_com_apartment() -> Result<NativePickerComApartment, ApiError> {
+    use windows::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+    };
+
+    unsafe {
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        if initialized.is_err() {
+            return Err(ApiError::internal(format!(
+                "failed to initialize native picker COM: {}",
+                initialized.message()
+            )));
+        }
+
+        Ok(NativePickerComApartment)
+    }
+}
+
+#[cfg(windows)]
+fn native_picker_was_cancelled(error: &windows::core::Error) -> bool {
+    use windows::{Win32::Foundation::ERROR_CANCELLED, core::HRESULT};
+
+    error.code() == HRESULT::from_win32(ERROR_CANCELLED.0)
+}
+
+#[cfg(windows)]
+fn native_shell_item_path(
+    item: &windows::Win32::UI::Shell::IShellItem,
+) -> Result<String, ApiError> {
+    use windows::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{IShellItem, SIGDN_FILESYSPATH},
+    };
+
+    let item: &IShellItem = item;
+    unsafe {
+        let path_ptr = item.GetDisplayName(SIGDN_FILESYSPATH).map_err(|source| {
+            ApiError::internal(format!("failed to read native picker path: {source}"))
+        })?;
+        if path_ptr.0.is_null() {
+            return Err(ApiError::internal(
+                "native picker returned an empty path pointer",
+            ));
+        }
+
+        let mut length = 0usize;
+        while *path_ptr.0.add(length) != 0 {
+            length += 1;
+        }
+        let path = String::from_utf16_lossy(std::slice::from_raw_parts(path_ptr.0, length));
+        CoTaskMemFree(Some(path_ptr.0.cast()));
+
+        Ok(path)
+    }
+}
+
+#[cfg(windows)]
+fn native_select_directory_windows() -> Result<Option<String>, ApiError> {
+    use windows::{
+        Win32::{
+            System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
+            UI::Shell::{
+                FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FileOpenDialog,
+                IFileOpenDialog,
+            },
+        },
+        core::{HSTRING, IUnknown},
+    };
+
+    let _com_apartment = native_picker_com_apartment()?;
+
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None::<&IUnknown>, CLSCTX_INPROC_SERVER).map_err(
+                |source| {
+                    ApiError::internal(format!(
+                        "failed to create native directory picker: {source}"
+                    ))
+                },
+            )?;
+        let options = dialog.GetOptions().map_err(|source| {
+            ApiError::internal(format!(
+                "failed to read native directory picker options: {source}"
+            ))
+        })?;
+        dialog
+            .SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to configure native directory picker: {source}"
+                ))
+            })?;
+        dialog
+            .SetTitle(&HSTRING::from("Choose workspace path"))
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to set native directory picker title: {source}"
+                ))
+            })?;
+        dialog
+            .SetOkButtonLabel(&HSTRING::from("Select"))
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to set native directory picker button label: {source}"
+                ))
+            })?;
+
+        if let Err(source) = dialog.Show(None) {
+            if native_picker_was_cancelled(&source) {
+                return Ok(None);
+            }
+
+            return Err(ApiError::internal(format!(
+                "native directory picker failed: {source}"
+            )));
+        }
+
+        let item = dialog.GetResult().map_err(|source| {
+            ApiError::internal(format!(
+                "failed to read native directory picker result: {source}"
+            ))
+        })?;
+
+        Ok(Some(native_shell_item_path(&item)?))
+    }
+}
+
+#[cfg(not(windows))]
+fn native_select_directory_with_powershell() -> Result<Option<String>, ApiError> {
+    if !is_wsl_environment() {
         return Err(ApiError::bad_request(
             "native directory picker is only available on Windows",
         ));
@@ -12093,15 +12278,16 @@ if ($selectedPath) {
   Write-Output $selectedPath
 }
 "#;
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args(["-NoLogo", "-NoProfile", "-STA", "-Command", script])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| {
-            ApiError::internal(format!(
-                "failed to launch native directory picker: {source}"
-            ))
-        })?;
+        .stdin(Stdio::null());
+
+    let output = command.output().map_err(|source| {
+        ApiError::internal(format!(
+            "failed to launch native directory picker: {source}"
+        ))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -12121,37 +12307,113 @@ if ($selectedPath) {
         return Ok(None);
     }
 
-    if is_wsl_environment() && !cfg!(windows) {
-        let output = Command::new("wslpath")
-            .args(["-u", &selected_path])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|source| {
-                ApiError::internal(format!("failed to convert selected Windows path: {source}"))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(ApiError::internal(format!(
-                "failed to convert selected Windows path{}",
-                if stderr.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {stderr}")
-                }
-            )));
-        }
-
-        return Ok(Some(
-            String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        ));
-    }
-
     Ok(Some(selected_path))
 }
 
 fn native_select_files() -> Result<Vec<NativeSelectedFile>, ApiError> {
-    if !(cfg!(windows) || is_wsl_environment()) {
+    #[cfg(windows)]
+    {
+        return native_select_files_windows();
+    }
+
+    #[cfg(not(windows))]
+    {
+        if !is_wsl_environment() {
+            return Err(ApiError::bad_request(
+                "native file picker is only available on Windows",
+            ));
+        }
+
+        let selected_paths = native_select_files_with_powershell()?
+            .into_iter()
+            .map(windows_path_to_wsl_path)
+            .collect::<Result<Vec<_>, _>>()?;
+
+        native_selected_files_from_paths(selected_paths)
+    }
+}
+
+#[cfg(windows)]
+fn native_select_files_windows() -> Result<Vec<NativeSelectedFile>, ApiError> {
+    use windows::{
+        Win32::{
+            System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
+            UI::Shell::{
+                FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST,
+                FileOpenDialog, IFileOpenDialog,
+            },
+        },
+        core::{HSTRING, IUnknown},
+    };
+
+    let _com_apartment = native_picker_com_apartment()?;
+
+    unsafe {
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None::<&IUnknown>, CLSCTX_INPROC_SERVER).map_err(
+                |source| {
+                    ApiError::internal(format!("failed to create native file picker: {source}"))
+                },
+            )?;
+        let options = dialog.GetOptions().map_err(|source| {
+            ApiError::internal(format!(
+                "failed to read native file picker options: {source}"
+            ))
+        })?;
+        dialog
+            .SetOptions(
+                options
+                    | FOS_ALLOWMULTISELECT
+                    | FOS_FILEMUSTEXIST
+                    | FOS_FORCEFILESYSTEM
+                    | FOS_PATHMUSTEXIST,
+            )
+            .map_err(|source| {
+                ApiError::internal(format!("failed to configure native file picker: {source}"))
+            })?;
+        dialog
+            .SetTitle(&HSTRING::from("Choose attachments"))
+            .map_err(|source| {
+                ApiError::internal(format!("failed to set native file picker title: {source}"))
+            })?;
+
+        if let Err(source) = dialog.Show(None) {
+            if native_picker_was_cancelled(&source) {
+                return Ok(Vec::new());
+            }
+
+            return Err(ApiError::internal(format!(
+                "native file picker failed: {source}"
+            )));
+        }
+
+        let items = dialog.GetResults().map_err(|source| {
+            ApiError::internal(format!(
+                "failed to read native file picker results: {source}"
+            ))
+        })?;
+        let count = items.GetCount().map_err(|source| {
+            ApiError::internal(format!(
+                "failed to count native file picker results: {source}"
+            ))
+        })?;
+        let mut paths = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let item = items.GetItemAt(index).map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to read native file picker result {index}: {source}"
+                ))
+            })?;
+            paths.push(native_shell_item_path(&item)?);
+        }
+
+        native_selected_files_from_paths(paths)
+    }
+}
+
+#[cfg(not(windows))]
+fn native_select_files_with_powershell() -> Result<Vec<String>, ApiError> {
+    if !is_wsl_environment() {
         return Err(ApiError::bad_request(
             "native file picker is only available on Windows",
         ));
@@ -12173,13 +12435,14 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
   Write-Output "[]"
 }
 "#;
-    let output = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    command
         .args(["-NoLogo", "-NoProfile", "-STA", "-Command", script])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|source| {
-            ApiError::internal(format!("failed to launch native file picker: {source}"))
-        })?;
+        .stdin(Stdio::null());
+
+    let output = command.output().map_err(|source| {
+        ApiError::internal(format!("failed to launch native file picker: {source}"))
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -12198,19 +12461,11 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
         return Ok(Vec::new());
     }
 
-    let mut selected_paths = serde_json::from_str::<Vec<String>>(&stdout).map_err(|source| {
+    serde_json::from_str::<Vec<String>>(&stdout).map_err(|source| {
         ApiError::internal(format!(
             "native file picker returned invalid JSON: {source}"
         ))
-    })?;
-    if is_wsl_environment() && !cfg!(windows) {
-        selected_paths = selected_paths
-            .into_iter()
-            .map(windows_path_to_wsl_path)
-            .collect::<Result<Vec<_>, _>>()?;
-    }
-
-    native_selected_files_from_paths(selected_paths)
+    })
 }
 
 fn windows_path_to_wsl_path(path: String) -> Result<String, ApiError> {
