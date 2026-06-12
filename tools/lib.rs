@@ -232,8 +232,10 @@ fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunti
     })?;
     let (content, _) = decode_text_file(&path, &bytes)?;
     let line_range = if let Some(range) = requested_line_range {
-        validate_line_range(range, count_text_lines(&content))?;
-        Some(range)
+        Some(normalize_read_line_range(
+            range,
+            count_text_lines(&content),
+        )?)
     } else {
         None
     };
@@ -1209,6 +1211,23 @@ fn validate_line_range(range: LineRange, line_count: usize) -> Result<(), ToolRu
     Ok(())
 }
 
+fn normalize_read_line_range(
+    range: LineRange,
+    line_count: usize,
+) -> Result<LineRange, ToolRuntimeError> {
+    if range.start > line_count {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "line range {}-{} is outside the file; file has {line_count} lines",
+            range.start, range.end
+        )));
+    }
+
+    Ok(LineRange {
+        end: range.end.min(line_count),
+        ..range
+    })
+}
+
 fn count_text_lines(content: &str) -> usize {
     line_spans(content).len()
 }
@@ -1907,7 +1926,7 @@ fn read_file_definition() -> ToolDefinition {
                 },
                 "endLine": {
                     "type": ["integer", "null"],
-                    "description": "Optional 1-based last line to read, inclusive. Must be null when startLine is null."
+                    "description": "Optional 1-based last line to read, inclusive. Values beyond the file length read through the final line. Must be null when startLine is null."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
@@ -2892,14 +2911,31 @@ mod tests {
     }
 
     #[test]
-    fn rejects_read_line_range_outside_file() {
+    fn reads_line_range_to_end_when_end_line_exceeds_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "one\ntwo\nthree\n").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "note.txt", "startLine": 2, "endLine": 160 }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["content"], "two\nthree\n");
+        assert_eq!(result.output["startLine"], 2);
+        assert_eq!(result.output["endLine"], 3);
+    }
+
+    #[test]
+    fn rejects_read_line_range_start_outside_file() {
         let workspace = tempfile::tempdir().expect("workspace");
         fs::write(workspace.path().join("note.txt"), "one\n").expect("write note");
 
         let result = execute_builtin_tool(
             workspace.path(),
             READ_FILE_TOOL,
-            json!({ "path": "note.txt", "startLine": 1, "endLine": 2 }),
+            json!({ "path": "note.txt", "startLine": 2, "endLine": 2 }),
         );
 
         assert!(result.is_error);

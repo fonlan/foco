@@ -67,7 +67,7 @@ winresource = { version = "0.1.31", default-features = false }
 
 [profile.release]
 codegen-units = 1
-lto = "thin"
+lto = true
 opt-level = "z"
 panic = "abort"
-strip = "symbols"
+strip = true
