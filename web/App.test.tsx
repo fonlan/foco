@@ -1011,6 +1011,43 @@ describe("App verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("localizes completed tool status and uses success color", async () => {
+    const zhSettings = {
+      ...settings,
+      general: {
+        ...settings.general,
+        language: "zh-CN",
+      },
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/settings") {
+        return jsonResponse(zhSettings);
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    render(<App />);
+
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    const assistantBubble = screen
+      .getByText("Done.")
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    const completedPill = within(assistantBubble).getByText("已完成");
+    expect(completedPill).toHaveClass("bg-emerald-50", "text-emerald-700");
+    expect(within(assistantBubble).queryByText("completed")).not.toBeInTheDocument();
+  });
+
   it("opens a settings section from the URL and writes section changes back to the URL", async () => {
     window.history.replaceState(null, "", "/settings/models");
     render(<App />);

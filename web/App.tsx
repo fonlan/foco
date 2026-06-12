@@ -7278,6 +7278,8 @@ function ToolCallBlock({ toolCall }: { toolCall: ChatToolCallSummary }) {
           className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${
             toolCall.isError
               ? "bg-rose-50 text-rose-700"
+              : toolCall.status === "completed"
+                ? "bg-emerald-50 text-emerald-700"
               : "bg-stone-100 text-stone-600"
           }`}
         >
@@ -18015,6 +18017,10 @@ function normalizedToolCallSummary(
 function toolStatusText(toolCall: ChatToolCallSummary, t: Translate) {
   if (toolCall.isError) {
     return t("error");
+  }
+
+  if (toolCall.status === "completed") {
+    return t("completed");
   }
 
   return toolCall.status;
