@@ -860,6 +860,10 @@ const importedHooks = {
 
 let activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null =
   null;
+let chatStreamControllers = new Map<
+  string,
+  ReadableStreamDefaultController<Uint8Array>
+>();
 let terminalSessionCounter = 0;
 let chatStreamCounter = 0;
 let workspaceGitDiffResponse = gitDiff;
@@ -908,6 +912,7 @@ function savedGeneralSettings(init?: RequestInit) {
 describe("App verification surfaces", () => {
   beforeEach(() => {
     activeChatStreamController = null;
+    chatStreamControllers = new Map();
     terminalSessionCounter = 0;
     chatStreamCounter = 0;
     workspaceGitDiffResponse = gitDiff;
@@ -1663,6 +1668,58 @@ describe("App verification surfaces", () => {
 
     await act(async () => {
       activeChatStreamController?.close();
+    });
+  });
+
+  it("starts another chat stream while a different chat is still running", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "first task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(chatStreamControllers.has("request-stream")).toBe(true),
+    );
+
+    await userEvent.click(await screen.findByText("Second chat"));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "second task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const streamCalls = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/chat/stream",
+      );
+      expect(streamCalls).toHaveLength(2);
+    });
+    const guidanceCalls = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/guidance",
+    );
+    expect(guidanceCalls).toHaveLength(0);
+    const secondStreamCall = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    )[1];
+    expect(JSON.parse(String(secondStreamCall[1]?.body))).toMatchObject({
+      chatId: "chat-2",
+      message: "second task",
+    });
+
+    await act(async () => {
+      chatStreamControllers.get("request-stream")?.close();
+      chatStreamControllers.get("request-stream-2")?.close();
     });
   });
 
@@ -3603,7 +3660,11 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
 
   if (path === "/api/workspaces/workspace-1/chat/stream") {
-    return chatStreamResponse();
+    const body =
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as { chatId?: string | null })
+        : {};
+    return chatStreamResponse(body.chatId ?? "chat-1");
   }
 
   if (path === "/api/workspaces/workspace-1/chat/guidance") {
@@ -3641,6 +3702,7 @@ function chatStreamResponse(chatId = "chat-1") {
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       activeChatStreamController = controller;
+      chatStreamControllers.set(llmRequestId, controller);
       controller.enqueue(
         encoder.encode(
           `data: ${JSON.stringify({

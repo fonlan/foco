@@ -1989,17 +1989,20 @@ export function App() {
   const [deletingContextMemoryId, setDeletingContextMemoryId] = useState<
     string | null
   >(null);
-  const [isSendingMessage, setIsSendingMessage] = useState(false);
-  const [runningChatKey, setRunningChatKey] = useState<string | null>(null);
+  const [runningChatKeys, setRunningChatKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [failedChatKeySet, setFailedChatKeySet] = useState<Set<string>>(
     () => new Set(),
   );
   const [retryRunRequest, setRetryRunRequest] =
     useState<RetryRunRequest | null>(null);
-  const [queuedRunRequests, setQueuedRunRequests] = useState<RetryRunRequest[]>(
-    [],
-  );
-  const [activeRunInfo, setActiveRunInfo] = useState<ActiveRunInfo | null>(null);
+  const [queuedRunRequestsByChatKey, setQueuedRunRequestsByChatKey] = useState<
+    Record<string, RetryRunRequest[]>
+  >({});
+  const [activeRunInfoByChatKey, setActiveRunInfoByChatKey] = useState<
+    Record<string, ActiveRunInfo>
+  >({});
   const [contextUsage, setContextUsage] =
     useState<ContextUsageResponse | null>(null);
   const [isLoadingContextUsage, setIsLoadingContextUsage] = useState(false);
@@ -2019,12 +2022,16 @@ export function App() {
     null,
   );
   const [error, setError] = useState<string | null>(null);
-  const activeRunAbortRef = useRef<AbortController | null>(null);
+  const activeRunAbortByChatKeyRef = useRef<Map<string, AbortController>>(
+    new Map(),
+  );
   const contextUsageAbortRef = useRef<AbortController | null>(null);
   const contextUsageIdentityRef = useRef("");
   const contextUsageRequestIdRef = useRef(0);
   const activeChatKeyRef = useRef<string | null>(null);
-  const queuedRunRequestsRef = useRef<RetryRunRequest[]>([]);
+  const queuedRunRequestsByChatKeyRef = useRef<
+    Record<string, RetryRunRequest[]>
+  >({});
   const pendingGuidanceMessageIdsRef = useRef<Map<string, string>>(new Map());
   const applyBrowserRouteRef = useRef<(route: BrowserRoute) => void>(() => {});
   const hasAppliedInitialBrowserRouteRef = useRef(false);
@@ -2037,6 +2044,18 @@ export function App() {
       workspaces[0],
     [activeWorkspaceId, workspaces],
   );
+  const activeChatKey =
+    activeChatId === null
+      ? activeChatKeyRef.current
+      : chatRunKey(activeWorkspaceId, activeChatId);
+  const activeRunInfo = activeChatKey
+    ? activeRunInfoByChatKey[activeChatKey] ?? null
+    : null;
+  const isSendingMessage =
+    activeChatKey !== null && runningChatKeys.has(activeChatKey);
+  const queuedRunRequests = activeChatKey
+    ? queuedRunRequestsByChatKey[activeChatKey] ?? []
+    : [];
   const chatTabs = useMemo(
     () => openChatTabs.map((tab) => hydrateChatTab(tab, workspaces)),
     [openChatTabs, workspaces],
@@ -2458,7 +2477,9 @@ export function App() {
 
     if (
       activeChatId ||
-      runningChatKey?.startsWith(`${activeWorkspace.id}:`)
+      [...runningChatKeys].some((chatKey) =>
+        chatKey.startsWith(`${activeWorkspace.id}:`),
+      )
     ) {
       void refreshWorkspaceDiffStats(activeWorkspace.id);
     }
@@ -2475,7 +2496,7 @@ export function App() {
     isContextPanelOpen,
     loadGitDiff,
     refreshWorkspaceDiffStats,
-    runningChatKey,
+    runningChatKeys,
     selectedDiffPath,
   ]);
 
@@ -2530,6 +2551,39 @@ export function App() {
       );
       return next.size === current.size ? current : next;
     });
+
+    setRunningChatKeys((current) => {
+      const next = new Set(
+        [...current].filter((chatKey) => {
+          if (chatKey.includes(":pending:")) {
+            return true;
+          }
+
+          const parsed = parseChatRunKey(chatKey);
+          return parsed ? workspaceHasChat(workspaces, parsed) : false;
+        }),
+      );
+      return next.size === current.size ? current : next;
+    });
+
+    setActiveRunInfoByChatKey((current) => {
+      const next = Object.fromEntries(
+        Object.entries(current).filter(([chatKey]) => {
+          if (chatKey.includes(":pending:")) {
+            return true;
+          }
+
+          const parsed = parseChatRunKey(chatKey);
+          return parsed ? workspaceHasChat(workspaces, parsed) : false;
+        }),
+      );
+
+      return Object.keys(next).length === Object.keys(current).length
+        ? current
+        : next;
+    });
+
+    updateQueuedRunRequestsByWorkspaceList(workspaces);
   }, [workspaces]);
 
   useEffect(() => {
@@ -2827,6 +2881,89 @@ export function App() {
     });
   }
 
+  function setChatRunning(chatKey: string, running: boolean) {
+    setRunningChatKeys((current) => {
+      if (current.has(chatKey) === running) {
+        return current;
+      }
+
+      const next = new Set(current);
+      if (running) {
+        next.add(chatKey);
+      } else {
+        next.delete(chatKey);
+      }
+      return next;
+    });
+  }
+
+  function setActiveRunInfoForChatKey(
+    chatKey: string,
+    runInfo: ActiveRunInfo | null,
+  ) {
+    setActiveRunInfoByChatKey((current) => {
+      if (!runInfo) {
+        if (!(chatKey in current)) {
+          return current;
+        }
+
+        const { [chatKey]: _removed, ...next } = current;
+        return next;
+      }
+
+      return { ...current, [chatKey]: runInfo };
+    });
+  }
+
+  function updateQueuedRunRequestsForChatKey(
+    chatKey: string,
+    updater: (current: RetryRunRequest[]) => RetryRunRequest[],
+  ) {
+    const nextRequests = updater(
+      queuedRunRequestsByChatKeyRef.current[chatKey] ?? [],
+    );
+    const next = { ...queuedRunRequestsByChatKeyRef.current };
+
+    if (nextRequests.length) {
+      next[chatKey] = nextRequests;
+    } else {
+      delete next[chatKey];
+    }
+
+    queuedRunRequestsByChatKeyRef.current = next;
+    setQueuedRunRequestsByChatKey(next);
+  }
+
+  function updateQueuedRunRequestsByWorkspaceList(
+    nextWorkspaces: WorkspaceSummary[],
+  ) {
+    const next: Record<string, RetryRunRequest[]> = {};
+
+    for (const [chatKey, requests] of Object.entries(
+      queuedRunRequestsByChatKeyRef.current,
+    )) {
+      if (chatKey.includes(":pending:")) {
+        next[chatKey] = requests;
+        continue;
+      }
+
+      const parsed = parseChatRunKey(chatKey);
+      if (parsed && workspaceHasChat(nextWorkspaces, parsed)) {
+        next[chatKey] = requests;
+      }
+    }
+
+    if (
+      Object.keys(next).length ===
+      Object.keys(queuedRunRequestsByChatKeyRef.current).length
+    ) {
+      return;
+    }
+
+    queuedRunRequestsByChatKeyRef.current = next;
+    setQueuedRunRequestsByChatKey(next);
+  }
+
   async function loadChatMessages(
     workspaceId: string,
     chatId: string,
@@ -2916,7 +3053,7 @@ export function App() {
 
   function closeChatTab(workspaceId: string, chatId: string) {
     const chatKey = chatRunKey(workspaceId, chatId);
-    if (runningChatKey === chatKey) {
+    if (runningChatKeys.has(chatKey)) {
       return;
     }
 
@@ -2957,7 +3094,7 @@ export function App() {
   }
 
   function requestDeleteWorkspaceChat(workspace: WorkspaceSummary, chat: ChatSummary) {
-    if (runningChatKey === chatRunKey(workspace.id, chat.id)) {
+    if (runningChatKeys.has(chatRunKey(workspace.id, chat.id))) {
       setError(t("Cancel the current run before deleting this chat."));
       return;
     }
@@ -2981,7 +3118,7 @@ export function App() {
   }
 
   async function deleteWorkspaceChat(workspaceId: string, chatId: string) {
-    if (runningChatKey === chatRunKey(workspaceId, chatId)) {
+    if (runningChatKeys.has(chatRunKey(workspaceId, chatId))) {
       setError(t("Cancel the current run before deleting this chat."));
       return;
     }
@@ -3310,8 +3447,13 @@ export function App() {
     if (!request) {
       return;
     }
+    const currentChatKey = activeChatKeyRef.current;
     const runInfo = activeRunInfo;
-    if (!runInfo?.chatKey) {
+    if (
+      !currentChatKey ||
+      !runInfo?.chatKey ||
+      runInfo.chatKey !== currentChatKey
+    ) {
       setError(t("No active run is available for guidance."));
       return;
     }
@@ -3336,11 +3478,10 @@ export function App() {
       pendingUserMessageId,
       workspaceId: runInfo.workspaceId ?? request.workspaceId,
     };
-    queuedRunRequestsRef.current = [
-      ...queuedRunRequestsRef.current,
+    updateQueuedRunRequestsForChatKey(runInfo.chatKey, (current) => [
+      ...current,
       queuedRequest,
-    ];
-    setQueuedRunRequests([...queuedRunRequestsRef.current]);
+    ]);
   }
 
   async function handleRetryRun() {
@@ -3461,7 +3602,12 @@ export function App() {
   }, []);
 
   function handleCancelRun() {
-    activeRunAbortRef.current?.abort();
+    const currentChatKey = activeChatKeyRef.current;
+    if (!currentChatKey) {
+      return;
+    }
+
+    activeRunAbortByChatKeyRef.current.get(currentChatKey)?.abort();
     setPendingQuestion(null);
     setQuestionError(null);
     setIsAnsweringQuestion(false);
@@ -3781,9 +3927,8 @@ export function App() {
       ];
     });
     setDraftMessage("");
-    setIsSendingMessage(true);
-    setRunningChatKey(currentRunningChatKey);
-    setActiveRunInfo({
+    setChatRunning(currentRunningChatKey, true);
+    setActiveRunInfoForChatKey(currentRunningChatKey, {
       chatId: requestChatId,
       chatKey: currentRunningChatKey,
       runId: null,
@@ -3797,7 +3942,10 @@ export function App() {
       setContextUsage(null);
     }
     setIsLoadingContextUsage(false);
-    activeRunAbortRef.current = abortController;
+    activeRunAbortByChatKeyRef.current.set(
+      currentRunningChatKey,
+      abortController,
+    );
 
     const isCurrentAssistantMessage = (
       message: ShellMessage,
@@ -3845,15 +3993,37 @@ export function App() {
             request.workspaceId,
             streamEvent.chatId,
           );
-          setActiveRunInfo({
-            chatId: streamEvent.chatId,
-            chatKey: currentRunningChatKey,
-            runId: streamEvent.llmRequestId ?? null,
-            workspaceId: request.workspaceId,
-          });
           setChatRunFailed(currentRunningChatKey, false);
           openChatTab(request.workspaceId, streamEvent.chatId);
           if (runMessagesKey !== currentRunningChatKey) {
+            setChatRunning(runMessagesKey, false);
+            setActiveRunInfoForChatKey(runMessagesKey, null);
+            if (
+              activeRunAbortByChatKeyRef.current.get(runMessagesKey) ===
+              abortController
+            ) {
+              activeRunAbortByChatKeyRef.current.delete(runMessagesKey);
+              activeRunAbortByChatKeyRef.current.set(
+                currentRunningChatKey,
+                abortController,
+              );
+            }
+            const pendingQueuedRequests =
+              queuedRunRequestsByChatKeyRef.current[runMessagesKey] ?? [];
+            if (pendingQueuedRequests.length) {
+              updateQueuedRunRequestsForChatKey(
+                currentRunningChatKey,
+                (current) => [
+                  ...current,
+                  ...pendingQueuedRequests.map((queuedRequest) => ({
+                    ...queuedRequest,
+                    chatId: streamEvent.chatId,
+                    workspaceId: request.workspaceId,
+                  })),
+                ],
+              );
+              updateQueuedRunRequestsForChatKey(runMessagesKey, () => []);
+            }
             moveMessagesForChatKey(runMessagesKey, currentRunningChatKey, (current) =>
               current.map((message) => {
                 if (message.id === localUserId) {
@@ -3897,6 +4067,13 @@ export function App() {
               }),
             );
           }
+          setChatRunning(currentRunningChatKey, true);
+          setActiveRunInfoForChatKey(currentRunningChatKey, {
+            chatId: streamEvent.chatId,
+            chatKey: currentRunningChatKey,
+            runId: streamEvent.llmRequestId ?? null,
+            workspaceId: request.workspaceId,
+          });
           if (
             activeChatKeyRef.current === currentRunningChatKey ||
             activeChatKeyRef.current === null ||
@@ -3910,7 +4087,6 @@ export function App() {
               workspaceId: request.workspaceId,
             });
           }
-          setRunningChatKey(currentRunningChatKey);
           void refreshWorkspaces();
           return;
         }
@@ -4093,9 +4269,7 @@ export function App() {
         if (streamEvent.type === "error") {
           streamHadError = true;
           setChatRunFailed(runMessagesKey, true);
-          setRunningChatKey((current) =>
-            current === currentRunningChatKey ? null : current,
-          );
+          setChatRunning(currentRunningChatKey, false);
           setError(streamEvent.message);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -4136,24 +4310,23 @@ export function App() {
         ),
       );
     } finally {
-      if (activeRunAbortRef.current === abortController) {
-        activeRunAbortRef.current = null;
+      if (
+        activeRunAbortByChatKeyRef.current.get(currentRunningChatKey) ===
+        abortController
+      ) {
+        activeRunAbortByChatKeyRef.current.delete(currentRunningChatKey);
       }
-      setRunningChatKey((current) =>
-        current === currentRunningChatKey ? null : current,
-      );
-      setActiveRunInfo((current) =>
-        current?.chatKey === currentRunningChatKey ? null : current,
-      );
-      setIsSendingMessage(false);
+      setChatRunning(currentRunningChatKey, false);
+      setActiveRunInfoForChatKey(currentRunningChatKey, null);
     }
 
     if (runSucceeded) {
-      const [queuedRequest, ...remainingQueuedRequests] =
-        queuedRunRequestsRef.current;
+      const [queuedRequest] =
+        queuedRunRequestsByChatKeyRef.current[currentRunningChatKey] ?? [];
       if (queuedRequest) {
-        queuedRunRequestsRef.current = remainingQueuedRequests;
-        setQueuedRunRequests(remainingQueuedRequests);
+        updateQueuedRunRequestsForChatKey(currentRunningChatKey, (current) =>
+          current.slice(1),
+        );
         await runChatMessage({
           ...queuedRequest,
           chatId: requestChatId,
@@ -4506,7 +4679,7 @@ export function App() {
                               {visibleChats.map((chat) => {
                                 const chatKey = chatRunKey(workspace.id, chat.id);
                                 const isChatRunning =
-                                  runningChatKey === chatKey;
+                                  runningChatKeys.has(chatKey);
                                 const isChatOpen = openChatKeySet.has(chatKey);
                                 const isChatFailed =
                                   isChatOpen && failedChatKeySet.has(chatKey);
@@ -4682,7 +4855,7 @@ export function App() {
                     activeWorkspaceId={activeWorkspaceId}
                     onCloseTab={closeChatTab}
                     onSelectTab={selectWorkspaceChat}
-                    runningChatKey={runningChatKey}
+                    runningChatKeys={runningChatKeys}
                     tabs={chatTabs}
                   />
                   <div className="chat-header-actions">
@@ -4738,8 +4911,7 @@ export function App() {
               branchError={branchError}
               chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
               canGuideActiveRun={
-                isSendingMessage &&
-                activeRunInfo?.chatKey === activeChatKeyRef.current &&
+                activeRunInfo?.chatKey === activeChatKey &&
                 activeRunInfo.runId !== null
               }
               draftAttachments={draftAttachments}
@@ -5589,14 +5761,14 @@ function ChatTabBar({
   activeWorkspaceId,
   onCloseTab,
   onSelectTab,
-  runningChatKey,
+  runningChatKeys,
   tabs,
 }: {
   activeChatId: string | null;
   activeWorkspaceId: string;
   onCloseTab: (workspaceId: string, chatId: string) => void;
   onSelectTab: (workspaceId: string, chatId: string) => void;
-  runningChatKey: string | null;
+  runningChatKeys: Set<string>;
   tabs: ChatTabSummary[];
 }) {
   const { t } = useI18n();
@@ -5742,7 +5914,9 @@ function ChatTabBar({
           tabs.map((tab) => {
             const isActive =
               activeWorkspaceId === tab.workspaceId && activeChatId === tab.chatId;
-            const isRunning = runningChatKey === chatRunKey(tab.workspaceId, tab.chatId);
+            const isRunning = runningChatKeys.has(
+              chatRunKey(tab.workspaceId, tab.chatId),
+            );
             const title = tab.title || t("Chat");
 
             return (
