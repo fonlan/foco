@@ -1954,7 +1954,9 @@ export function App() {
   const [isBranchDialogOpen, setIsBranchDialogOpen] = useState(false);
   const [newBranchName, setNewBranchName] = useState("");
   const [isSavingBranch, setIsSavingBranch] = useState(false);
-  const [isContextPanelOpen, setIsContextPanelOpen] = useState(true);
+  const [isContextPanelOpen, setIsContextPanelOpen] = useState(
+    () => typeof window !== "undefined" && window.innerWidth >= 768,
+  );
   const [contextPanelTab, setContextPanelTab] =
     useState<ContextPanelTab>("todo");
   const [diffPanelWidth, setDiffPanelWidth] = useState(420);
