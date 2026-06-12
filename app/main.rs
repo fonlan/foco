@@ -199,7 +199,7 @@ const MAX_WORKSPACE_LOGO_BYTES: u64 = 2 * 1024 * 1024;
 // HTTP request body limit for workspace logo upload and save endpoints.
 const WORKSPACE_LOGO_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 // File extensions accepted for persisted workspace logo images.
-const WORKSPACE_LOGO_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "webp", "gif"];
+const WORKSPACE_LOGO_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "gif", "svg"];
 // Prefix used to identify injected AGENTS.md instruction messages.
 const AGENTS_MESSAGE_PREFIX: &str = "AGENTS.md instructions loaded from";
 // Prefix used to identify injected user-configured prompt file messages.
@@ -13509,12 +13509,20 @@ fn workspace_logo_kind(bytes: &[u8]) -> Result<WorkspaceLogoKind, ApiError> {
             content_type: "image/webp",
         });
     }
+    if let Ok(s) = std::str::from_utf8(&bytes[..bytes.len().min(256)]) {
+        let trimmed = s.trim_start();
+        if trimmed.starts_with("<?xml") || trimmed.starts_with("<svg") || trimmed.starts_with("<!DOCTYPE") {
+            return Ok(WorkspaceLogoKind {
+                extension: "svg",
+                content_type: "image/svg+xml",
+            });
+        }
+    }
 
     Err(ApiError::bad_request(
-        "workspace logo must be a PNG, JPEG, WebP, or GIF image",
+        "workspace logo must be a PNG, JPEG, WebP, GIF, or SVG image",
     ))
 }
-
 fn workspace_logo_extension_matches(extension: &str, kind: WorkspaceLogoKind) -> bool {
     match kind.extension {
         "jpg" => extension == "jpg" || extension == "jpeg",

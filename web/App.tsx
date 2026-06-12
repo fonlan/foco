@@ -13850,7 +13850,7 @@ function SettingsPanel({
                     </div>
                     <input
                       aria-label={t("Workspace icon file")}
-                      accept="image/png,image/jpeg,image/webp,image/gif"
+                      accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"
                       className="sr-only"
                       onChange={handleWorkspaceLogoFileChange}
                       ref={workspaceLogoInputRef}
