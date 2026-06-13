@@ -47,8 +47,8 @@ use foco_providers::{
     DEFAULT_OPENAI_BASE_URL, NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest,
     NeutralChatRole, NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
     OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig,
-    normalized_base_url, normalized_proxy_url, parse_provider_kind,
-    serialize_provider_request_body, stream_chat, test_provider_connection,
+    normalized_base_url, normalized_proxy_url, parse_provider_kind, stream_chat,
+    test_provider_connection,
 };
 use foco_store::{
     config::{
@@ -5980,7 +5980,7 @@ impl PreparedChatContext {
                     .to_string(),
                 }];
                 let turn_request_body_json;
-                match serialize_provider_request(&self.provider_config, &turn_request) {
+                match serialize_provider_request(&turn_request) {
                     Ok(request_body_json) => {
                         self.request_body_json = request_body_json;
                         turn_request_body_json = self.request_body_json.clone();
@@ -7418,8 +7418,7 @@ async fn prepare_chat_context(
         &prompt_context.message_source_sequences,
     )?);
     provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
-    let request_body_json =
-        serialize_provider_request(&prompt_context.provider_config, &provider_request)?;
+    let request_body_json = serialize_provider_request(&provider_request)?;
     let initial_git_diff_stats = git_diff_stats_for_workspace(&prompt_context.workspace_path);
 
     Ok(PreparedChatContext {
@@ -9300,12 +9299,12 @@ fn next_context_snapshot_sequence(
     Ok(next)
 }
 
-fn serialize_provider_request(
-    provider_config: &ProviderConnectionConfig,
-    request: &NeutralChatRequest,
-) -> Result<String, ApiError> {
-    serialize_provider_request_body(provider_config.kind, request)
-        .map_err(ApiError::from_provider_config_error)
+fn serialize_provider_request(request: &NeutralChatRequest) -> Result<String, ApiError> {
+    serde_json::to_string(request).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize provider-neutral chat request: {source}"
+        ))
+    })
 }
 
 fn neutral_role_label(role: &NeutralChatRole) -> &'static str {
@@ -10555,7 +10554,7 @@ async fn audited_provider_tool_request(
     let request_id = unique_id("llm");
     let request_started_at = utc_timestamp();
     let started_at = Instant::now();
-    let request_body_json = serialize_provider_request(provider_config, &request)?;
+    let request_body_json = serialize_provider_request(&request)?;
     let mut database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     database
@@ -21850,17 +21849,6 @@ Use the existing product UI conventions.
             context.provider_request.messages[0].content,
             "Custom Foco system prompt."
         );
-        let request_body: Value = serde_json::from_str(
-            &serialize_provider_request(&context.provider_config, &context.provider_request)
-                .unwrap(),
-        )
-        .expect("provider request body");
-        let request_messages = request_body["messages"]
-            .as_array()
-            .expect("provider messages");
-        assert_eq!(request_messages[0]["role"], "system");
-        assert_eq!(request_messages[0]["content"], "Custom Foco system prompt.");
-        assert_eq!(request_messages[1]["role"], "developer");
         assert!(
             !context.provider_request.messages[0]
                 .content
@@ -22577,11 +22565,9 @@ Use the existing product UI conventions.
         )
         .await
         .expect("prompt context");
-        let request_json: Value = serde_json::from_str(
-            &serialize_provider_request(&context.provider_config, &context.provider_request)
-                .unwrap(),
-        )
-        .expect("request json");
+        let request_json: Value =
+            serde_json::from_str(&serialize_provider_request(&context.provider_request).unwrap())
+                .expect("request json");
         let request_text = request_json.to_string();
 
         assert!(request_text.contains("Foco retrieved memory context"));

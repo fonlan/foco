@@ -13,7 +13,6 @@ use genai::{
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
 
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
 pub const OPENAI_RESPONSES_KIND: &str = "openai-responses";
@@ -319,7 +318,7 @@ pub async fn stream_chat(
     let chat_request = genai_chat_request(&request)?;
     let error_context =
         config.provider_error_context("opening provider stream", &request.model_id)?;
-    let options = genai_chat_options(config.kind, &request)?;
+    let options = genai_chat_options(&request)?;
     let model = genai::ModelIden::new(config.kind.adapter_kind(), request.model_id.clone());
     let response = client
         .exec_chat_stream(model, chat_request, Some(&options))
@@ -331,18 +330,6 @@ pub async fn stream_chat(
     Ok(NeutralChatStream {
         stream: response.stream,
         error_context: error_context.with_phase("reading provider stream"),
-    })
-}
-
-pub fn serialize_provider_request_body(
-    provider_kind: ProviderKind,
-    request: &NeutralChatRequest,
-) -> Result<String, ProviderConfigError> {
-    let payload = provider_request_payload(provider_kind, request)?;
-    serde_json::to_string(&payload).map_err(|source| {
-        ProviderConfigError::InvalidRequest(format!(
-            "failed to serialize provider request body: {source}"
-        ))
     })
 }
 
@@ -438,7 +425,17 @@ pub fn normalized_base_url(value: &str) -> Result<String, ProviderConfigError> {
 }
 
 fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, ProviderConfigError> {
-    validate_chat_request(request)?;
+    if request.model_id.trim().is_empty() {
+        return Err(ProviderConfigError::InvalidRequest(
+            "model id must not be empty".to_string(),
+        ));
+    }
+
+    if request.messages.is_empty() {
+        return Err(ProviderConfigError::InvalidRequest(
+            "chat request must contain at least one message".to_string(),
+        ));
+    }
 
     let mut system_prompt = None;
     let mut messages = Vec::with_capacity(request.messages.len());
@@ -463,22 +460,6 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
     Ok(chat_request)
 }
 
-fn validate_chat_request(request: &NeutralChatRequest) -> Result<(), ProviderConfigError> {
-    if request.model_id.trim().is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "model id must not be empty".to_string(),
-        ));
-    }
-
-    if request.messages.is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "chat request must contain at least one message".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
 fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderConfigError> {
     match message.role {
         NeutralChatRole::System | NeutralChatRole::Developer => {
@@ -487,7 +468,17 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
             Ok(ChatMessage::system(message.content.clone()))
         }
         NeutralChatRole::User => {
-            validate_user_message(message)?;
+            if message.content.trim().is_empty() && message.attachments.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "user message content must not be empty unless it contains attachments"
+                        .to_string(),
+                ));
+            }
+            if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "user messages cannot contain tool state".to_string(),
+                ));
+            }
 
             if message.attachments.is_empty() {
                 return Ok(ChatMessage::user(message.content.clone()));
@@ -525,8 +516,19 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
             Ok(ChatMessage::user(MessageContent::from_parts(parts)))
         }
         NeutralChatRole::Assistant => {
-            validate_assistant_message(message)?;
+            if !message.attachments.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "assistant messages cannot contain attachments".to_string(),
+                ));
+            }
             if message.tool_calls.is_empty() {
+                if message.content.trim().is_empty() {
+                    return Err(ProviderConfigError::InvalidRequest(
+                        "assistant message content must not be empty unless it contains tool calls"
+                            .to_string(),
+                    ));
+                }
+
                 let mut chat_message = ChatMessage::assistant(message.content.clone());
                 if let Some(reasoning) = message
                     .reasoning
@@ -579,8 +581,26 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
             Ok(ChatMessage::assistant(MessageContent::from_parts(parts)))
         }
         NeutralChatRole::Tool => {
-            validate_tool_message(message)?;
-            let tool_call_id = message.tool_call_id.as_deref().unwrap_or_default();
+            if !message.attachments.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "tool messages cannot contain attachments".to_string(),
+                ));
+            }
+            if !message.tool_calls.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "tool messages cannot contain tool calls".to_string(),
+                ));
+            }
+            if message.content.trim().is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "tool response content must not be empty".to_string(),
+                ));
+            }
+            let tool_call_id = message.tool_call_id.as_deref().ok_or_else(|| {
+                ProviderConfigError::InvalidRequest(
+                    "tool response message is missing tool_call_id".to_string(),
+                )
+            })?;
             let mut response = ToolResponse::new(tool_call_id, message.content.clone());
             if let Some(tool_name) = message.tool_name.as_deref() {
                 response = response.with_fn_name(tool_name);
@@ -611,65 +631,7 @@ fn validate_instruction_message(message: &NeutralChatMessage) -> Result<(), Prov
     Ok(())
 }
 
-fn validate_user_message(message: &NeutralChatMessage) -> Result<(), ProviderConfigError> {
-    if message.content.trim().is_empty() && message.attachments.is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "user message content must not be empty unless it contains attachments".to_string(),
-        ));
-    }
-    if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "user messages cannot contain tool state".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_assistant_message(message: &NeutralChatMessage) -> Result<(), ProviderConfigError> {
-    if !message.attachments.is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "assistant messages cannot contain attachments".to_string(),
-        ));
-    }
-    if message.tool_calls.is_empty() && message.content.trim().is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "assistant message content must not be empty unless it contains tool calls".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_tool_message(message: &NeutralChatMessage) -> Result<(), ProviderConfigError> {
-    if !message.attachments.is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "tool messages cannot contain attachments".to_string(),
-        ));
-    }
-    if !message.tool_calls.is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "tool messages cannot contain tool calls".to_string(),
-        ));
-    }
-    if message.content.trim().is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "tool response content must not be empty".to_string(),
-        ));
-    }
-    if message.tool_call_id.is_none() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "tool response message is missing tool_call_id".to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn genai_chat_options(
-    provider_kind: ProviderKind,
-    request: &NeutralChatRequest,
-) -> Result<ChatOptions, ProviderConfigError> {
+fn genai_chat_options(request: &NeutralChatRequest) -> Result<ChatOptions, ProviderConfigError> {
     let mut options = ChatOptions::default()
         .with_capture_usage(true)
         .with_capture_content(true)
@@ -705,479 +667,7 @@ fn genai_chat_options(
         options = options.with_cache_control(cache_control);
     }
 
-    if let Some(role_payload) = provider_role_payload(provider_kind, request)? {
-        options = options.with_extra_body(role_payload);
-    }
-
     Ok(options)
-}
-
-fn provider_role_payload(
-    provider_kind: ProviderKind,
-    request: &NeutralChatRequest,
-) -> Result<Option<Value>, ProviderConfigError> {
-    if request.messages.is_empty() {
-        return Ok(None);
-    }
-
-    match provider_kind {
-        ProviderKind::OpenAiChat => Ok(Some(json!({
-            "messages": openai_chat_messages(request)?
-        }))),
-        ProviderKind::OpenAiResponses => {
-            let (instructions, input) = openai_responses_input(request)?;
-            let mut payload = Map::new();
-            if let Some(instructions) = instructions {
-                payload.insert("instructions".to_string(), Value::String(instructions));
-            }
-            payload.insert("input".to_string(), Value::Array(input));
-            Ok(Some(Value::Object(payload)))
-        }
-    }
-}
-
-fn provider_request_payload(
-    provider_kind: ProviderKind,
-    request: &NeutralChatRequest,
-) -> Result<Value, ProviderConfigError> {
-    validate_chat_request(request)?;
-
-    match provider_kind {
-        ProviderKind::OpenAiChat => openai_chat_payload(request),
-        ProviderKind::OpenAiResponses => openai_responses_payload(request),
-    }
-}
-
-fn openai_chat_payload(request: &NeutralChatRequest) -> Result<Value, ProviderConfigError> {
-    let mut payload = Map::new();
-    payload.insert("model".to_string(), Value::String(request.model_id.clone()));
-    payload.insert(
-        "messages".to_string(),
-        Value::Array(openai_chat_messages(request)?),
-    );
-    payload.insert("stream".to_string(), Value::Bool(true));
-    payload.insert("stream_options".to_string(), json!({"include_usage": true}));
-
-    if let Some(reasoning_effort) = explicit_reasoning_effort(request)? {
-        if let Some(keyword) = reasoning_effort.as_keyword() {
-            payload.insert(
-                "reasoning_effort".to_string(),
-                Value::String(keyword.to_string()),
-            );
-        }
-    }
-    if let Some(max_output_tokens) = request.max_output_tokens {
-        let key = openai_chat_max_tokens_key(&request.model_id);
-        payload.insert(key.to_string(), json!(max_output_tokens));
-    }
-    if !request.tools.is_empty() {
-        payload.insert(
-            "tools".to_string(),
-            Value::Array(openai_chat_tools(&request.tools)),
-        );
-    }
-    insert_prompt_cache_fields(&mut payload, request)?;
-
-    Ok(Value::Object(payload))
-}
-
-fn openai_responses_payload(request: &NeutralChatRequest) -> Result<Value, ProviderConfigError> {
-    let (instructions, input) = openai_responses_input(request)?;
-    let mut payload = Map::new();
-    payload.insert("store".to_string(), Value::Bool(false));
-    payload.insert("model".to_string(), Value::String(request.model_id.clone()));
-    payload.insert("input".to_string(), Value::Array(input));
-    payload.insert("stream".to_string(), Value::Bool(true));
-    if let Some(instructions) = instructions {
-        payload.insert("instructions".to_string(), Value::String(instructions));
-    }
-
-    let effort_keyword = explicit_reasoning_effort(request)?
-        .as_ref()
-        .and_then(ReasoningEffort::as_keyword)
-        .map(str::to_string);
-    let mut reasoning = Map::new();
-    if let Some(effort_keyword) = effort_keyword {
-        reasoning.insert("effort".to_string(), Value::String(effort_keyword));
-    }
-    reasoning.insert("summary".to_string(), Value::String("detailed".to_string()));
-    payload.insert("reasoning".to_string(), Value::Object(reasoning));
-    payload.insert(
-        "include".to_string(),
-        json!(["reasoning.encrypted_content"]),
-    );
-
-    if let Some(max_output_tokens) = request.max_output_tokens {
-        payload.insert("max_output_tokens".to_string(), json!(max_output_tokens));
-    }
-    if !request.tools.is_empty() {
-        payload.insert(
-            "tools".to_string(),
-            Value::Array(openai_responses_tools(&request.tools)),
-        );
-    }
-    insert_prompt_cache_fields(&mut payload, request)?;
-
-    Ok(Value::Object(payload))
-}
-
-fn explicit_reasoning_effort(
-    request: &NeutralChatRequest,
-) -> Result<Option<ReasoningEffort>, ProviderConfigError> {
-    request
-        .thinking_level
-        .as_deref()
-        .map(|thinking_level| {
-            thinking_level.parse::<ReasoningEffort>().map_err(|_| {
-                ProviderConfigError::InvalidRequest(format!(
-                    "unsupported thinking level '{thinking_level}'"
-                ))
-            })
-        })
-        .transpose()
-}
-
-fn openai_chat_max_tokens_key(model_id: &str) -> &'static str {
-    if model_id.starts_with("gpt-5")
-        || model_id.starts_with("o1")
-        || model_id.starts_with("o3")
-        || model_id.starts_with("o4")
-    {
-        "max_completion_tokens"
-    } else {
-        "max_tokens"
-    }
-}
-
-fn insert_prompt_cache_fields(
-    payload: &mut Map<String, Value>,
-    request: &NeutralChatRequest,
-) -> Result<(), ProviderConfigError> {
-    if let Some(prompt_cache_key) = request.prompt_cache_key.as_deref() {
-        payload.insert(
-            "prompt_cache_key".to_string(),
-            Value::String(prompt_cache_key.to_string()),
-        );
-    }
-    if let Some(prompt_cache_retention) = request.prompt_cache_retention.as_deref() {
-        match prompt_cache_retention {
-            "24h" => {
-                payload.insert(
-                    "prompt_cache_retention".to_string(),
-                    Value::String(prompt_cache_retention.to_string()),
-                );
-            }
-            other => {
-                return Err(ProviderConfigError::InvalidRequest(format!(
-                    "unsupported prompt cache retention '{other}'"
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn openai_chat_tools(tools: &[NeutralToolDefinition]) -> Vec<Value> {
-    tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": strict_tool_schema(tool),
-                    "strict": tool.strict,
-                }
-            })
-        })
-        .collect()
-}
-
-fn openai_responses_tools(tools: &[NeutralToolDefinition]) -> Vec<Value> {
-    tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": strict_tool_schema(tool),
-                "strict": tool.strict,
-            })
-        })
-        .collect()
-}
-
-fn strict_tool_schema(tool: &NeutralToolDefinition) -> Value {
-    let mut schema = tool.input_schema.clone();
-    if tool.strict {
-        apply_strict_object_schema(&mut schema);
-    }
-    schema
-}
-
-fn apply_strict_object_schema(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            if map.get("type").and_then(Value::as_str) == Some("object") {
-                map.insert("additionalProperties".to_string(), Value::Bool(false));
-            }
-            for child in map.values_mut() {
-                apply_strict_object_schema(child);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                apply_strict_object_schema(item);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
-}
-
-fn openai_chat_messages(request: &NeutralChatRequest) -> Result<Vec<Value>, ProviderConfigError> {
-    let mut messages = Vec::with_capacity(request.messages.len());
-    for message in &request.messages {
-        match message.role {
-            NeutralChatRole::System => {
-                validate_instruction_message(message)?;
-                messages.push(json!({"role": "system", "content": message.content}));
-            }
-            NeutralChatRole::Developer => {
-                validate_instruction_message(message)?;
-                messages.push(json!({"role": "developer", "content": message.content}));
-            }
-            NeutralChatRole::User => messages.push(openai_chat_user_message(message)?),
-            NeutralChatRole::Assistant => messages.push(openai_chat_assistant_message(message)?),
-            NeutralChatRole::Tool => messages.extend(openai_chat_tool_messages(message)?),
-        }
-    }
-
-    Ok(messages)
-}
-
-fn openai_chat_user_message(message: &NeutralChatMessage) -> Result<Value, ProviderConfigError> {
-    validate_user_message(message)?;
-
-    let binary_attachments = message
-        .attachments
-        .iter()
-        .filter(|attachment| attachment.content_base64.is_some())
-        .collect::<Vec<_>>();
-    if binary_attachments.is_empty() {
-        return Ok(json!({"role": "user", "content": message.content}));
-    }
-
-    let mut content = Vec::new();
-    if !message.content.trim().is_empty() {
-        content.push(json!({"type": "text", "text": message.content}));
-    }
-    for attachment in binary_attachments {
-        if !attachment.content_type.starts_with("image/") {
-            return Err(ProviderConfigError::InvalidRequest(format!(
-                "binary attachment '{}' has unsupported content type '{}'",
-                attachment.name, attachment.content_type
-            )));
-        }
-        content.push(json!({
-            "type": "image_url",
-            "image_url": {
-                "url": attachment_data_url(attachment)
-            }
-        }));
-    }
-
-    if content.is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "user message content must not be empty unless it contains binary attachments"
-                .to_string(),
-        ));
-    }
-
-    Ok(json!({"role": "user", "content": content}))
-}
-
-fn openai_chat_assistant_message(
-    message: &NeutralChatMessage,
-) -> Result<Value, ProviderConfigError> {
-    validate_assistant_message(message)?;
-
-    let mut assistant = json!({
-        "role": "assistant",
-        "content": message.content
-    });
-    if let Some(reasoning) = message
-        .reasoning
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        assistant["reasoning_content"] = Value::String(reasoning.to_string());
-    }
-    if !message.tool_calls.is_empty() {
-        assistant["tool_calls"] = Value::Array(
-            message
-                .tool_calls
-                .iter()
-                .map(openai_chat_tool_call)
-                .collect::<Vec<_>>(),
-        );
-    }
-
-    Ok(assistant)
-}
-
-fn openai_chat_tool_call(tool_call: &NeutralToolCall) -> Value {
-    json!({
-        "type": "function",
-        "id": tool_call.call_id,
-        "function": {
-            "name": tool_call.name,
-            "arguments": tool_call.arguments.to_string()
-        }
-    })
-}
-
-fn openai_chat_tool_messages(
-    message: &NeutralChatMessage,
-) -> Result<Vec<Value>, ProviderConfigError> {
-    validate_tool_message(message)?;
-    Ok(vec![json!({
-        "role": "tool",
-        "content": message.content,
-        "tool_call_id": message.tool_call_id.as_deref().unwrap_or_default()
-    })])
-}
-
-fn openai_responses_input(
-    request: &NeutralChatRequest,
-) -> Result<(Option<String>, Vec<Value>), ProviderConfigError> {
-    let mut instructions = None;
-    let mut input = Vec::with_capacity(request.messages.len());
-
-    for (index, message) in request.messages.iter().enumerate() {
-        match message.role {
-            NeutralChatRole::System if index == 0 => {
-                validate_instruction_message(message)?;
-                instructions = Some(message.content.clone());
-            }
-            NeutralChatRole::System => {
-                validate_instruction_message(message)?;
-                input.push(json!({"role": "system", "content": message.content}));
-            }
-            NeutralChatRole::Developer => {
-                validate_instruction_message(message)?;
-                input.push(json!({"role": "developer", "content": message.content}));
-            }
-            NeutralChatRole::User => input.push(openai_responses_user_message(message)?),
-            NeutralChatRole::Assistant => openai_responses_assistant_items(message, &mut input)?,
-            NeutralChatRole::Tool => input.extend(openai_responses_tool_items(message)?),
-        }
-    }
-
-    Ok((instructions, input))
-}
-
-fn openai_responses_user_message(
-    message: &NeutralChatMessage,
-) -> Result<Value, ProviderConfigError> {
-    validate_user_message(message)?;
-
-    let binary_attachments = message
-        .attachments
-        .iter()
-        .filter(|attachment| attachment.content_base64.is_some())
-        .collect::<Vec<_>>();
-    if binary_attachments.is_empty() {
-        return Ok(json!({"role": "user", "content": message.content}));
-    }
-
-    let mut content = Vec::new();
-    if !message.content.trim().is_empty() {
-        content.push(json!({"type": "input_text", "text": message.content}));
-    }
-    for attachment in binary_attachments {
-        if !attachment.content_type.starts_with("image/") {
-            return Err(ProviderConfigError::InvalidRequest(format!(
-                "binary attachment '{}' has unsupported content type '{}'",
-                attachment.name, attachment.content_type
-            )));
-        }
-        content.push(json!({
-            "type": "input_image",
-            "detail": "auto",
-            "image_url": attachment_data_url(attachment)
-        }));
-    }
-
-    if content.is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "user message content must not be empty unless it contains binary attachments"
-                .to_string(),
-        ));
-    }
-
-    Ok(json!({"role": "user", "content": content}))
-}
-
-fn openai_responses_assistant_items(
-    message: &NeutralChatMessage,
-    input: &mut Vec<Value>,
-) -> Result<(), ProviderConfigError> {
-    validate_assistant_message(message)?;
-
-    for tool_call in &message.tool_calls {
-        if let Some(thought_signatures) = tool_call.thought_signatures.as_ref() {
-            for thought_signature in thought_signatures {
-                input.push(json!({
-                    "type": "reasoning",
-                    "encrypted_content": thought_signature,
-                    "summary": []
-                }));
-            }
-        }
-    }
-
-    if !message.content.trim().is_empty() {
-        input.push(json!({
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": message.content
-            }]
-        }));
-    }
-    for tool_call in &message.tool_calls {
-        input.push(json!({
-            "type": "function_call",
-            "call_id": tool_call.call_id,
-            "name": tool_call.name,
-            "arguments": tool_call.arguments.to_string()
-        }));
-    }
-
-    Ok(())
-}
-
-fn openai_responses_tool_items(
-    message: &NeutralChatMessage,
-) -> Result<Vec<Value>, ProviderConfigError> {
-    validate_tool_message(message)?;
-    Ok(vec![json!({
-        "type": "function_call_output",
-        "call_id": message.tool_call_id.as_deref().unwrap_or_default(),
-        "output": message.content
-    })])
-}
-
-fn attachment_data_url(attachment: &NeutralChatAttachment) -> String {
-    format!(
-        "data:{};base64,{}",
-        attachment.content_type,
-        attachment.content_base64.as_deref().unwrap_or_default()
-    )
 }
 
 fn normalize_stream_event(
@@ -1639,79 +1129,6 @@ mod tests {
     }
 
     #[test]
-    fn openai_chat_payload_preserves_system_and_developer_roles() {
-        let request = NeutralChatRequest {
-            model_id: "gpt-4o-mini".to_string(),
-            messages: vec![
-                neutral_text_message(NeutralChatRole::System, "Configured system prompt."),
-                neutral_text_message(NeutralChatRole::Developer, "Developer workflow."),
-                neutral_text_message(NeutralChatRole::User, "Do the task."),
-            ],
-            tools: Vec::new(),
-            thinking_level: None,
-            max_output_tokens: None,
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        };
-
-        let payload = provider_role_payload(ProviderKind::OpenAiChat, &request)
-            .expect("provider role payload")
-            .expect("chat payload");
-        let messages = payload
-            .get("messages")
-            .and_then(Value::as_array)
-            .expect("messages array");
-
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], "Configured system prompt.");
-        assert_eq!(messages[1]["role"], "developer");
-        assert_eq!(messages[1]["content"], "Developer workflow.");
-        assert_eq!(messages[2]["role"], "user");
-
-        let request_body = serialize_provider_request_body(ProviderKind::OpenAiChat, &request)
-            .expect("request body");
-        let payload: Value = serde_json::from_str(&request_body).expect("request payload json");
-        assert_eq!(payload["messages"][0]["role"], "system");
-        assert_eq!(payload["messages"][1]["role"], "developer");
-    }
-
-    #[test]
-    fn openai_responses_payload_preserves_system_instructions_and_developer_input() {
-        let request = NeutralChatRequest {
-            model_id: "gpt-5-mini".to_string(),
-            messages: vec![
-                neutral_text_message(NeutralChatRole::System, "Configured system prompt."),
-                neutral_text_message(NeutralChatRole::Developer, "Developer workflow."),
-                neutral_text_message(NeutralChatRole::User, "Do the task."),
-            ],
-            tools: Vec::new(),
-            thinking_level: None,
-            max_output_tokens: None,
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        };
-
-        let payload = provider_role_payload(ProviderKind::OpenAiResponses, &request)
-            .expect("provider role payload")
-            .expect("responses payload");
-        let input = payload
-            .get("input")
-            .and_then(Value::as_array)
-            .expect("input array");
-
-        assert_eq!(payload["instructions"], "Configured system prompt.");
-        assert_eq!(input[0]["role"], "developer");
-        assert_eq!(input[0]["content"], "Developer workflow.");
-        assert_eq!(input[1]["role"], "user");
-
-        let request_body = serialize_provider_request_body(ProviderKind::OpenAiResponses, &request)
-            .expect("request body");
-        let payload: Value = serde_json::from_str(&request_body).expect("request payload json");
-        assert_eq!(payload["instructions"], "Configured system prompt.");
-        assert_eq!(payload["input"][0]["role"], "developer");
-    }
-
-    #[test]
     fn converts_tool_state_messages_for_genai_continuation() {
         let request = NeutralChatRequest {
             model_id: "gpt-4o-mini".to_string(),
@@ -1848,8 +1265,7 @@ mod tests {
             prompt_cache_retention: Some("24h".to_string()),
         };
 
-        let options =
-            genai_chat_options(ProviderKind::OpenAiResponses, &request).expect("chat options");
+        let options = genai_chat_options(&request).expect("chat options");
 
         assert_eq!(
             options.prompt_cache_key.as_deref(),
@@ -1870,8 +1286,7 @@ mod tests {
             prompt_cache_retention: Some("1h".to_string()),
         };
 
-        let error = genai_chat_options(ProviderKind::OpenAiResponses, &request)
-            .expect_err("unsupported retention should fail");
+        let error = genai_chat_options(&request).expect_err("unsupported retention should fail");
 
         assert!(
             error
