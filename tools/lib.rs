@@ -297,6 +297,8 @@ fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunti
     } else {
         content
     };
+    let content_start_line = line_range.as_ref().map(|range| range.start).unwrap_or(1);
+    let content = numbered_content(&content, content_start_line);
     if line_range.is_some() && content.len() > MAX_RANGED_READ_OUTPUT_BYTES {
         return Err(ToolRuntimeError::InvalidArguments(format!(
             "read_file line range output is too large ({} bytes; max {MAX_RANGED_READ_OUTPUT_BYTES}); use a smaller line range",
@@ -1331,6 +1333,17 @@ fn read_line_range(content: &str, range: &LineRange) -> String {
     content[start..end].to_string()
 }
 
+fn numbered_content(content: &str, start_line: usize) -> String {
+    let mut numbered = String::new();
+    for (index, span) in line_spans(content).into_iter().enumerate() {
+        numbered.push_str(&(start_line + index).to_string());
+        numbered.push('\t');
+        numbered.push_str(&content[span.start_byte..span.end_byte]);
+    }
+
+    numbered
+}
+
 fn replace_line_range(
     existing_content: &str,
     range: LineRange,
@@ -2173,7 +2186,7 @@ fn limited_output_text(output: &[u8]) -> (String, bool) {
 fn read_file_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_FILE_TOOL,
-        description: "Read a text file inside the active workspace, optionally restricted to a 1-based inclusive line range.",
+        description: "Read a text file inside the active workspace, optionally restricted to a 1-based inclusive line range. The returned content is prefixed with real 1-based file line numbers for patch targeting; line-number prefixes are not file content and must not be copied into write_file content or patch_file context/removal lines.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2477,7 +2490,7 @@ fn patch_file_definition() -> ToolDefinition {
                 },
                 "diff": {
                     "type": "string",
-                    "description": "Unified diff text containing one or more valid @@ -old,count +new,count @@ hunks for this file. Header line counts, context lines, and removed lines must exactly match the current file lines previously confirmed with read_file."
+                    "description": "Unified diff text containing one or more valid @@ -old,count +new,count @@ hunks for this file. Header line counts, context lines, and removed lines must exactly match the current file lines previously confirmed with read_file, excluding read_file line-number prefixes."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
@@ -3095,7 +3108,22 @@ mod tests {
         );
 
         assert!(!result.is_error);
-        assert_eq!(result.output["content"], "hello");
+        assert_eq!(result.output["content"], "1\thello");
+    }
+
+    #[test]
+    fn reads_workspace_file_with_line_numbers_without_trailing_newline() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "one\ntwo\nthree").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "note.txt", "startLine": null, "endLine": null }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["content"], "1\tone\n2\ttwo\n3\tthree");
     }
 
     #[test]
@@ -3110,7 +3138,7 @@ mod tests {
         );
 
         assert!(!result.is_error);
-        assert_eq!(result.output["content"], "two\nthree\n");
+        assert_eq!(result.output["content"], "2\ttwo\n3\tthree\n");
         assert_eq!(result.output["startLine"], 2);
         assert_eq!(result.output["endLine"], 3);
     }
@@ -3154,7 +3182,7 @@ mod tests {
         );
 
         assert!(!result.is_error);
-        assert_eq!(result.output["content"], "needle\n");
+        assert_eq!(result.output["content"], "1\tneedle\n");
         assert_eq!(result.output["startLine"], 1);
         assert_eq!(result.output["endLine"], 1);
     }
@@ -3198,7 +3226,7 @@ mod tests {
         );
 
         assert!(!result.is_error);
-        assert_eq!(result.output["content"], "two\nthree\n");
+        assert_eq!(result.output["content"], "2\ttwo\n3\tthree\n");
         assert_eq!(result.output["startLine"], 2);
         assert_eq!(result.output["endLine"], 3);
     }
