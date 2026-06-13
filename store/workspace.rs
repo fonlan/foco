@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use chrono::{SecondsFormat, Utc};
@@ -15,6 +16,7 @@ use crate::memory::WORKSPACE_MEMORY_SCHEMA_SQL;
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_SCHEMA_VERSION: u32 = 9;
+const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -3102,6 +3104,12 @@ fn open_connection(database_path: &Path) -> Result<Connection, WorkspaceDatabase
             source,
         })?;
 
+    connection
+        .busy_timeout(WORKSPACE_DATABASE_BUSY_TIMEOUT)
+        .map_err(|source| WorkspaceDatabaseError::Sqlite {
+            path: database_path.to_path_buf(),
+            source,
+        })?;
     connection
         .pragma_update(None, "foreign_keys", "ON")
         .map_err(|source| WorkspaceDatabaseError::Sqlite {

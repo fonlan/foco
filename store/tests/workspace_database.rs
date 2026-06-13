@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, thread, time::Duration};
 
 use foco_store::{
     config::WorkspaceConfig,
@@ -66,6 +66,52 @@ fn creates_workspace_foco_database_and_runs_migrations() {
             "{table} table should exist"
         );
     }
+}
+
+#[test]
+fn workspace_connections_wait_for_concurrent_writer_lock() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let workspace_path = workspace.path().to_path_buf();
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_path).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Lock test")
+        .expect("chat insert");
+
+    let locker = Connection::open(database.database_path()).expect("open locking connection");
+    locker
+        .execute_batch(
+            "PRAGMA journal_mode = WAL;
+             BEGIN IMMEDIATE;",
+        )
+        .expect("hold writer lock");
+
+    let writer = thread::spawn(move || {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_path).expect("writer database");
+        database
+            .insert_run_event(NewRunEvent {
+                id: "event-1",
+                chat_id: "chat-1",
+                run_id: "run-1",
+                sequence: 1,
+                event_type: "textDelta",
+                payload_json: r#"{"type":"textDelta","delta":"ok"}"#,
+            })
+            .expect("insert waits for lock");
+    });
+
+    thread::sleep(Duration::from_millis(100));
+    assert!(!writer.is_finished(), "writer should wait for the lock");
+    locker
+        .execute_batch("COMMIT;")
+        .expect("release writer lock");
+    writer.join().expect("writer thread");
+
+    let events = database
+        .run_events_for_run("run-1")
+        .expect("run events after lock release");
+    assert_eq!(events.len(), 1);
 }
 
 #[test]
