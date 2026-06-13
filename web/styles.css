@@ -2012,14 +2012,14 @@ body,
   .app-shell,
   .app-shell-with-context {
     grid-template-areas:
-      "main"
-      "diff";
-    grid-template-columns: minmax(0, 1fr);
+      "nav main"
+      "nav diff";
+    grid-template-columns: 3rem minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) minmax(14rem, 34dvh);
   }
 
   .foco-nav-rail {
-    display: none;
+    display: flex;
   }
 
   .workspace-sidebar {
@@ -2428,16 +2428,16 @@ body,
 
 @media (max-width: 767px) {
   .app-shell {
-    grid-template-areas: "main";
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "nav main";
+    grid-template-columns: 3rem minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
   }
 
   .app-shell.app-shell-with-context {
     grid-template-areas:
-      "main"
-      "diff";
-    grid-template-columns: minmax(0, 1fr);
+      "nav main"
+      "nav diff";
+    grid-template-columns: 3rem minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) minmax(14rem, 34dvh);
   }
 
