@@ -2033,9 +2033,11 @@ export function App() {
   const [activeRunInfoByChatKey, setActiveRunInfoByChatKey] = useState<
     Record<string, ActiveRunInfo>
   >({});
-  const [contextUsage, setContextUsage] =
-    useState<ContextUsageResponse | null>(null);
-  const [isLoadingContextUsage, setIsLoadingContextUsage] = useState(false);
+  const [contextUsageByChatKey, setContextUsageByChatKey] = useState<
+    Record<string, ContextUsageResponse>
+  >({});
+  const [contextUsageLoadingByChatKey, setContextUsageLoadingByChatKey] =
+    useState<Record<string, boolean>>({});
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
   const [isSavingTheme, setIsSavingTheme] = useState(false);
@@ -2055,9 +2057,15 @@ export function App() {
   const activeRunAbortByChatKeyRef = useRef<Map<string, AbortController>>(
     new Map(),
   );
-  const contextUsageAbortRef = useRef<AbortController | null>(null);
-  const contextUsageIdentityRef = useRef("");
-  const contextUsageRequestIdRef = useRef(0);
+  const contextUsageAbortByChatKeyRef = useRef<Map<string, AbortController>>(
+    new Map(),
+  );
+  const contextUsageIdentityByChatKeyRef = useRef<Map<string, string>>(
+    new Map(),
+  );
+  const contextUsageRequestIdByChatKeyRef = useRef<Map<string, number>>(
+    new Map(),
+  );
   const activeChatKeyRef = useRef<string | null>(null);
   const queuedRunRequestsByChatKeyRef = useRef<
     Record<string, RetryRunRequest[]>
@@ -2079,6 +2087,16 @@ export function App() {
     activeChatId === null || isPendingChatId(activeChatId)
       ? activeChatKeyRef.current
       : chatRunKey(activeWorkspaceId, activeChatId);
+  const activeContextUsageKey =
+    activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)
+      ? chatRunKey(activeWorkspaceId, activeChatId)
+      : null;
+  const contextUsage = activeContextUsageKey
+    ? contextUsageByChatKey[activeContextUsageKey] ?? null
+    : null;
+  const isLoadingContextUsage = activeContextUsageKey
+    ? contextUsageLoadingByChatKey[activeContextUsageKey] ?? false
+    : false;
   const activeRunInfo = activeChatKey
     ? activeRunInfoByChatKey[activeChatKey] ?? null
     : null;
@@ -2178,6 +2196,10 @@ export function App() {
   }, [activeChatId, activeWorkspaceId]);
 
   useEffect(() => {
+    const chatKey =
+      activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)
+        ? chatRunKey(activeWorkspaceId, activeChatId)
+        : null;
     const identity = [
       activeWorkspaceId,
       activeChatId ?? "",
@@ -2186,27 +2208,39 @@ export function App() {
       selectedThinkingLevel,
     ].join("\u0000");
 
-    if (contextUsageIdentityRef.current === identity) {
+    if (!chatKey) {
       return;
     }
 
-    contextUsageIdentityRef.current = identity;
+    if (contextUsageIdentityByChatKeyRef.current.get(chatKey) === identity) {
+      return;
+    }
+
+    contextUsageIdentityByChatKeyRef.current.set(chatKey, identity);
     if (isSendingMessage) {
       return;
     }
 
-    contextUsageAbortRef.current?.abort();
-    setContextUsage(null);
-    setIsLoadingContextUsage(false);
+    contextUsageAbortByChatKeyRef.current.get(chatKey)?.abort();
+    contextUsageAbortByChatKeyRef.current.delete(chatKey);
+    setContextUsageByChatKey((current) => {
+      if (!(chatKey in current)) {
+        return current;
+      }
 
-    if (
-      !activeWorkspaceId ||
-      !activeChatId ||
-      isPendingChatId(activeChatId) ||
-      !selectedModelId ||
-      !selectedProviderId
-    ) {
-      contextUsageRequestIdRef.current += 1;
+      const { [chatKey]: _removed, ...next } = current;
+      return next;
+    });
+    setContextUsageLoadingByChatKey((current) => ({
+      ...current,
+      [chatKey]: false,
+    }));
+
+    if (!selectedModelId || !selectedProviderId) {
+      contextUsageRequestIdByChatKeyRef.current.set(
+        chatKey,
+        (contextUsageRequestIdByChatKeyRef.current.get(chatKey) ?? 0) + 1,
+      );
       return;
     }
 
@@ -2232,7 +2266,10 @@ export function App() {
 
   useEffect(
     () => () => {
-      contextUsageAbortRef.current?.abort();
+      for (const abortController of contextUsageAbortByChatKeyRef.current.values()) {
+        abortController.abort();
+      }
+      contextUsageAbortByChatKeyRef.current.clear();
     },
     [],
   );
@@ -2847,10 +2884,86 @@ export function App() {
       activeChatKeyRef.current = toChatKey;
       setMessages((current) => updater(current));
     }
+
+    moveContextUsageForChatKey(fromChatKey, toChatKey);
   }
 
   function removeMessagesForChatKey(chatKey: string) {
     setChatMessagesByKey((current) => {
+      if (!(chatKey in current)) {
+        return current;
+      }
+
+      const { [chatKey]: _removed, ...next } = current;
+      return next;
+    });
+  }
+
+  function moveContextUsageForChatKey(fromChatKey: string, toChatKey: string) {
+    setContextUsageByChatKey((current) => {
+      if (!(fromChatKey in current)) {
+        return current;
+      }
+
+      const { [fromChatKey]: movedUsage, ...next } = current;
+      return { ...next, [toChatKey]: movedUsage };
+    });
+    setContextUsageLoadingByChatKey((current) => {
+      if (!(fromChatKey in current)) {
+        return current;
+      }
+
+      const { [fromChatKey]: movedLoading, ...next } = current;
+      return { ...next, [toChatKey]: movedLoading };
+    });
+
+    const abortController =
+      contextUsageAbortByChatKeyRef.current.get(fromChatKey);
+    if (abortController) {
+      contextUsageAbortByChatKeyRef.current.delete(fromChatKey);
+      contextUsageAbortByChatKeyRef.current.set(toChatKey, abortController);
+    }
+
+    const requestId =
+      contextUsageRequestIdByChatKeyRef.current.get(fromChatKey);
+    if (requestId !== undefined) {
+      contextUsageRequestIdByChatKeyRef.current.delete(fromChatKey);
+      contextUsageRequestIdByChatKeyRef.current.set(toChatKey, requestId);
+    }
+
+    const identity = contextUsageIdentityByChatKeyRef.current.get(fromChatKey);
+    if (identity !== undefined) {
+      contextUsageIdentityByChatKeyRef.current.delete(fromChatKey);
+      contextUsageIdentityByChatKeyRef.current.set(toChatKey, identity);
+    }
+  }
+
+  function cancelContextUsageRequestForChatKey(chatKey: string) {
+    contextUsageAbortByChatKeyRef.current.get(chatKey)?.abort();
+    contextUsageAbortByChatKeyRef.current.delete(chatKey);
+    contextUsageRequestIdByChatKeyRef.current.set(
+      chatKey,
+      (contextUsageRequestIdByChatKeyRef.current.get(chatKey) ?? 0) + 1,
+    );
+    setContextUsageLoadingByChatKey((current) => ({
+      ...current,
+      [chatKey]: false,
+    }));
+  }
+
+  function removeContextUsageForChatKey(chatKey: string) {
+    cancelContextUsageRequestForChatKey(chatKey);
+    contextUsageIdentityByChatKeyRef.current.delete(chatKey);
+    contextUsageRequestIdByChatKeyRef.current.delete(chatKey);
+    setContextUsageByChatKey((current) => {
+      if (!(chatKey in current)) {
+        return current;
+      }
+
+      const { [chatKey]: _removed, ...next } = current;
+      return next;
+    });
+    setContextUsageLoadingByChatKey((current) => {
       if (!(chatKey in current)) {
         return current;
       }
@@ -3170,6 +3283,7 @@ export function App() {
     );
     setChatRunFailed(chatKey, false);
     removeMessagesForChatKey(chatKey);
+    removeContextUsageForChatKey(chatKey);
 
     if (activeWorkspaceId !== workspaceId || activeChatId !== chatId) {
       return;
@@ -3251,6 +3365,7 @@ export function App() {
         });
       }
 
+      removeContextUsageForChatKey(chatRunKey(workspaceId, chatId));
       setRetryRunRequest((current) =>
         current?.chatId === chatId ? null : current,
       );
@@ -3807,12 +3922,17 @@ export function App() {
       return;
     }
 
-    const requestId = contextUsageRequestIdRef.current + 1;
-    contextUsageRequestIdRef.current = requestId;
-    contextUsageAbortRef.current?.abort();
+    const chatKey = chatRunKey(request.workspaceId, request.chatId);
+    const requestId =
+      (contextUsageRequestIdByChatKeyRef.current.get(chatKey) ?? 0) + 1;
+    contextUsageRequestIdByChatKeyRef.current.set(chatKey, requestId);
+    contextUsageAbortByChatKeyRef.current.get(chatKey)?.abort();
     const abortController = new AbortController();
-    contextUsageAbortRef.current = abortController;
-    setIsLoadingContextUsage(true);
+    contextUsageAbortByChatKeyRef.current.set(chatKey, abortController);
+    setContextUsageLoadingByChatKey((current) => ({
+      ...current,
+      [chatKey]: true,
+    }));
 
     try {
       const data = await requestJson<ContextUsageResponse>(
@@ -3836,21 +3956,27 @@ export function App() {
         },
       );
 
-      if (contextUsageRequestIdRef.current === requestId) {
-        setContextUsage(data);
+      if (contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId) {
+        setContextUsageByChatKey((current) => ({ ...current, [chatKey]: data }));
       }
     } catch (requestError) {
       const wasCancelled =
         requestError instanceof DOMException && requestError.name === "AbortError";
-      if (!wasCancelled && contextUsageRequestIdRef.current === requestId) {
+      if (
+        !wasCancelled &&
+        contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId
+      ) {
         setError(errorMessage(requestError));
       }
     } finally {
-      if (contextUsageAbortRef.current === abortController) {
-        contextUsageAbortRef.current = null;
+      if (contextUsageAbortByChatKeyRef.current.get(chatKey) === abortController) {
+        contextUsageAbortByChatKeyRef.current.delete(chatKey);
       }
-      if (contextUsageRequestIdRef.current === requestId) {
-        setIsLoadingContextUsage(false);
+      if (contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId) {
+        setContextUsageLoadingByChatKey((current) => ({
+          ...current,
+          [chatKey]: false,
+        }));
       }
     }
   }
@@ -4431,12 +4557,9 @@ export function App() {
     });
     setRetryRunRequest(null);
     setError(null);
-    contextUsageAbortRef.current?.abort();
-    contextUsageRequestIdRef.current += 1;
-    if (!request.chatId) {
-      setContextUsage(null);
+    if (request.chatId) {
+      cancelContextUsageRequestForChatKey(currentRunningChatKey);
     }
-    setIsLoadingContextUsage(false);
     activeRunAbortByChatKeyRef.current.set(
       currentRunningChatKey,
       abortController,

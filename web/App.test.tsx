@@ -1442,6 +1442,69 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("keeps context usage isolated between open chats", async () => {
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(chatStreamControllers.has("request-stream")).toBe(true),
+    );
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        type: "usage",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 70000,
+          outputTokens: 1000,
+        },
+      });
+    });
+    expect(
+      await screen.findByRole("status", { name: "Context usage 64%" }),
+    ).toHaveTextContent("64%");
+
+    await userEvent.click(await screen.findByText("Second chat"));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("status", { name: "Context usage 23%" }),
+    ).toHaveTextContent("23%");
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        type: "usage",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 70000,
+          outputTokens: 1000,
+        },
+      });
+    });
+
+    expect(
+      screen.getByRole("status", { name: "Context usage 23%" }),
+    ).toHaveTextContent("23%");
+
+    await userEvent.click(screen.getByRole("tab", { name: /Tool run/ }));
+    expect(
+      await screen.findByRole("status", { name: "Context usage 64%" }),
+    ).toHaveTextContent("64%");
+
+    await act(async () => {
+      chatStreamControllers.get("request-stream")?.close();
+    });
+  });
+
   it("collapses streaming thinking once answer text starts", async () => {
     render(<App />);
     await userEvent.click(await screen.findByText("Tool run"));
@@ -3897,6 +3960,7 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
     const body =
       typeof init?.body === "string"
         ? (JSON.parse(init.body) as {
+            chatId?: string | null;
             latestResponseUsage?: { inputTokens?: number | null };
           })
         : {};
@@ -3909,7 +3973,12 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
       });
     }
 
-    return jsonResponse(contextUsage);
+    return jsonResponse({
+      ...contextUsage,
+      usagePercent: body.chatId === "chat-2" ? 23 : contextUsage.usagePercent,
+      usedMessageTokens:
+        body.chatId === "chat-2" ? 25520 : contextUsage.usedMessageTokens,
+    });
   }
 
   if (path === "/api/workspaces/workspace-1/hooks/runs") {
@@ -4057,6 +4126,16 @@ function enqueueChatStreamEvent(value: unknown) {
   activeChatStreamController.enqueue(
     encoder.encode(`data: ${JSON.stringify(value)}\n\n`),
   );
+}
+
+function enqueueChatStreamEventForRun(runId: string, value: unknown) {
+  const controller = chatStreamControllers.get(runId);
+  if (!controller) {
+    throw new Error(`chat stream is not active: ${runId}`);
+  }
+
+  const encoder = new TextEncoder();
+  controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
 }
 
 function jsonResponse(value: unknown, init?: ResponseInit) {
