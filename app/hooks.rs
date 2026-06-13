@@ -9,7 +9,8 @@ use std::{
 use foco_mcp::{McpRegistry, encode_mcp_tool_name};
 use foco_providers::{
     NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStream,
-    NeutralChatStreamEvent, NeutralUsage, ProviderConnectionConfig, stream_chat,
+    NeutralChatStreamEvent, NeutralUsage, ProviderConnectionConfig,
+    serialize_provider_request_body, stream_chat,
 };
 use foco_store::{
     config::{
@@ -861,7 +862,7 @@ async fn audited_prompt_hook_stream(
         .ok_or_else(|| "prompt hook requires an active provider".to_string())?;
     let request_id = format!("llm-hook-{}", uuid_suffix());
     let request_started_at = utc_timestamp();
-    let request_body_json = serde_json::to_string(&hook_request)
+    let request_body_json = serialize_provider_request_body(provider_config.kind, &hook_request)
         .map_err(|source| format!("failed to serialize prompt hook provider request: {source}"))?;
     let mut database =
         WorkspaceDatabase::open_or_create(request.workspace_path).map_err(|source| {
