@@ -6123,7 +6123,10 @@ impl PreparedChatContext {
             );
             self.hook_context_messages.clear();
 
-            'agent_turns: for turn_index in 0..=MAX_AGENT_TOOL_ROUNDS {
+            let mut turn_index = 0usize;
+            let mut tool_rounds_since_last_compression = 0usize;
+
+            'agent_turns: loop {
                 if chat_run_was_cancelled(&app_shutdown_rx, &run_cancellation_rx) {
                     let message = chat_run_cancel_message(&app_shutdown_rx);
                     let event = match finish_cancelled_chat_run_with_message(
@@ -6688,6 +6691,7 @@ impl PreparedChatContext {
                                     ) {
                                         yield event;
                                     }
+                                    turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
                                 let assistant_message_text =
@@ -6728,6 +6732,7 @@ impl PreparedChatContext {
                                             stop_summary.additional_context.join("\n"),
                                         ],
                                     );
+                                    turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
                                 let git_diff_summary_result = git_diff_summary(
@@ -6827,9 +6832,49 @@ impl PreparedChatContext {
                                 return;
                             }
 
-                            if turn_index >= MAX_AGENT_TOOL_ROUNDS {
+                            if tool_rounds_since_last_compression >= MAX_AGENT_TOOL_ROUNDS {
+                                let recovered = match recover_after_tool_round_cap(
+                                    &mut self,
+                                    tool_calls,
+                                    turn_text,
+                                    non_empty_string(&turn_reasoning),
+                                ) {
+                                    Ok(recovered) => recovered,
+                                    Err(error) => {
+                                        let message = error.message;
+                                        let event = ChatSseEvent::Error {
+                                            message: message.clone(),
+                                        };
+                                        events.push(captured_event(&event));
+                                        let outcome = failed_chat_audit_outcome(
+                            &self,
+                            started_at,
+                            &mut events,
+                            &message,
+                            None,
+                        )
+                        .await;
+
+                                        if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
+                                            let event = ChatSseEvent::Error {
+                                                message: persist_error.message,
+                                            };
+                                            yield event;
+                                        } else {
+                                            yield event;
+                                        }
+
+                                        return;
+                                    }
+                                };
+                                if recovered {
+                                    tool_rounds_since_last_compression = 0;
+                                    turn_index = turn_index.saturating_add(1);
+                                    continue 'agent_turns;
+                                }
+
                                 let message = format!(
-                                    "agent run exceeded {MAX_AGENT_TOOL_ROUNDS} tool continuation rounds"
+                                    "agent run exceeded {MAX_AGENT_TOOL_ROUNDS} tool continuation rounds and had no runtime tool state to compress"
                                 );
                                 let event = ChatSseEvent::Error {
                                     message: message.clone(),
@@ -7137,6 +7182,8 @@ impl PreparedChatContext {
                                 non_empty_string(&turn_reasoning),
                             );
                             executed_tool_calls.extend(next_executed_tool_calls);
+                            tool_rounds_since_last_compression =
+                                tool_rounds_since_last_compression.saturating_add(1);
                             for event in append_guidance_events(
                                 &mut self.provider_request.messages,
                                 &mut self.message_source_sequences,
@@ -7179,6 +7226,7 @@ impl PreparedChatContext {
                 }
 
                 if completed_turn {
+                    turn_index = turn_index.saturating_add(1);
                     continue;
                 }
 
@@ -9492,8 +9540,11 @@ fn compress_runtime_tool_state_if_needed(
         return Ok(false);
     }
 
-    let summary =
-        runtime_tool_state_summary(&context.provider_request.messages, &covered_message_indices)?;
+    let summary = runtime_tool_state_summary(
+        &context.provider_request.messages,
+        &covered_message_indices,
+        true,
+    )?;
     let summary_tokens = estimate_text_tokens(&summary);
     if summary_tokens >= original_tokens {
         return Ok(false);
@@ -9522,14 +9573,92 @@ fn compress_runtime_tool_state_if_needed(
     Ok(true)
 }
 
+fn compress_all_runtime_tool_state(context: &mut PreparedChatContext) -> Result<bool, ApiError> {
+    validate_prompt_context_lengths(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+    )?;
+
+    let covered_message_indices = context
+        .message_context_sources
+        .iter()
+        .enumerate()
+        .filter_map(|(index, source)| {
+            matches!(
+                source,
+                PromptContextSource::RuntimeToolState { .. }
+                    | PromptContextSource::RuntimeToolStateSnapshot
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if covered_message_indices.is_empty() {
+        return Ok(false);
+    }
+
+    let summary = runtime_tool_state_summary(
+        &context.provider_request.messages,
+        &covered_message_indices,
+        false,
+    )?;
+    let snapshot = neutral_text_message(NeutralChatRole::User, summary);
+    context.provider_request.messages = replace_covered_messages_with_snapshot(
+        &context.provider_request.messages,
+        &covered_message_indices,
+        snapshot,
+    );
+    context.message_source_sequences = replace_covered_sequences_with_snapshot(
+        &context.message_source_sequences,
+        &covered_message_indices,
+    );
+    context.message_context_sources = replace_covered_sources_with_snapshot(
+        &context.message_context_sources,
+        &covered_message_indices,
+        PromptContextSource::RuntimeToolStateSnapshot,
+    );
+    context.active_tool_start_index = compressed_active_tool_start_index(
+        context.active_tool_start_index,
+        &covered_message_indices,
+    );
+
+    Ok(true)
+}
+
+fn recover_after_tool_round_cap(
+    context: &mut PreparedChatContext,
+    tool_calls: Vec<NeutralToolCall>,
+    assistant_text: String,
+    assistant_reasoning: Option<String>,
+) -> Result<bool, ApiError> {
+    append_pending_tool_state_messages(
+        &mut context.provider_request.messages,
+        &mut context.message_source_sequences,
+        &mut context.message_context_sources,
+        &mut context.next_runtime_tool_batch_index,
+        tool_calls,
+        assistant_text,
+        assistant_reasoning,
+    );
+    compress_all_runtime_tool_state(context)
+}
+
 fn runtime_tool_state_summary(
     messages: &[NeutralChatMessage],
     covered_indices: &[usize],
+    preserve_recent_tool_calls: bool,
 ) -> Result<String, ApiError> {
-    let mut lines = vec![
-        "Runtime tool-state compression snapshot: older completed tool calls/results from this same in-progress run were removed from the live prompt.".to_string(),
-        "Recent tool calls remain verbatim below this snapshot.".to_string(),
-    ];
+    let mut lines = if preserve_recent_tool_calls {
+        vec![
+            "Runtime tool-state compression snapshot: older completed tool calls/results from this same in-progress run were removed from the live prompt.".to_string(),
+            "Recent tool calls remain verbatim below this snapshot.".to_string(),
+        ]
+    } else {
+        vec![
+            "Runtime tool-state compression snapshot: all prior in-progress tool calls/results from this run were removed from the live prompt.".to_string(),
+            "Continue from the summarized tool evidence below without replaying the removed tool-call protocol messages.".to_string(),
+        ]
+    };
     let mut tool_call_count = 0usize;
     let mut tool_result_count = 0usize;
 
@@ -13584,6 +13713,31 @@ fn append_tool_state_messages(
         assistant_reasoning,
     ) {
         messages.push(message);
+        message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::RuntimeToolState { batch_index });
+    }
+}
+
+fn append_pending_tool_state_messages(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
+    next_runtime_tool_batch_index: &mut usize,
+    tool_calls: Vec<NeutralToolCall>,
+    assistant_text: String,
+    assistant_reasoning: Option<String>,
+) {
+    let batch_index = *next_runtime_tool_batch_index;
+    *next_runtime_tool_batch_index = next_runtime_tool_batch_index.saturating_add(1);
+    let mut assistant_text = Some(assistant_text);
+    let mut assistant_reasoning = assistant_reasoning;
+
+    for tool_call in tool_calls {
+        messages.push(neutral_assistant_tool_call_message(
+            tool_call,
+            assistant_text.take().unwrap_or_default(),
+            assistant_reasoning.take(),
+        ));
         message_source_sequences.push(None);
         message_context_sources.push(PromptContextSource::RuntimeToolState { batch_index });
     }
@@ -20367,6 +20521,140 @@ description:
     }
 
     #[test]
+    fn compress_all_runtime_tool_state_removes_tool_protocol_messages() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-runtime-tool-clear-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut context = test_prepared_chat_context(
+            workspace_dir.clone(),
+            vec![neutral_text_message(
+                NeutralChatRole::System,
+                "system".to_string(),
+            )],
+            vec![None],
+            vec![PromptContextSource::ReservedPrompt],
+            80,
+        );
+        context.active_tool_start_index = context.provider_request.messages.len();
+
+        for batch_index in 0..3 {
+            let call_id = format!("call-{batch_index}");
+            let tool_calls = vec![NeutralToolCall {
+                call_id: call_id.clone(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "app/main.rs", "timeoutMs": 10000 }),
+                thought_signatures: None,
+            }];
+            let tool_results = vec![ExecutedToolCall {
+                id: call_id,
+                name: "read_file".to_string(),
+                input: tool_calls[0].arguments.clone(),
+                output: json!({ "content": "x".repeat(500), "timeoutMs": 10000 }),
+                is_error: false,
+                started_at: "2026-06-13T09:00:00Z".to_string(),
+                completed_at: "2026-06-13T09:00:01Z".to_string(),
+            }];
+            append_tool_state_messages(
+                &mut context.provider_request.messages,
+                &mut context.message_source_sequences,
+                &mut context.message_context_sources,
+                &mut context.next_runtime_tool_batch_index,
+                tool_calls,
+                &tool_results,
+                String::new(),
+                None,
+            );
+        }
+
+        assert!(compress_all_runtime_tool_state(&mut context).expect("runtime tool-state clear"));
+
+        assert!(
+            context
+                .provider_request
+                .messages
+                .iter()
+                .all(|message| message.tool_calls.is_empty())
+        );
+        assert!(
+            context
+                .provider_request
+                .messages
+                .iter()
+                .all(|message| message.role != NeutralChatRole::Tool)
+        );
+        assert_eq!(
+            context
+                .message_context_sources
+                .iter()
+                .filter(|source| matches!(source, PromptContextSource::RuntimeToolState { .. }))
+                .count(),
+            0
+        );
+        assert_eq!(
+            context
+                .message_context_sources
+                .iter()
+                .filter(|source| matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+                .count(),
+            1
+        );
+        assert!(context.provider_request.messages.iter().any(|message| {
+            message
+                .content
+                .contains("all prior in-progress tool calls/results")
+        }));
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn recover_after_tool_round_cap_compresses_pending_tool_calls_once() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-tool-round-recover-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut context = test_prepared_chat_context(
+            workspace_dir.clone(),
+            vec![neutral_text_message(
+                NeutralChatRole::User,
+                "use tools".to_string(),
+            )],
+            vec![Some(0)],
+            vec![PromptContextSource::CurrentUser { sequence: 0 }],
+            200,
+        );
+        context.active_tool_start_index = context.provider_request.messages.len();
+
+        let recovered = recover_after_tool_round_cap(
+            &mut context,
+            vec![NeutralToolCall {
+                call_id: "pending-call".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "README.md", "timeoutMs": 10000 }),
+                thought_signatures: None,
+            }],
+            "Need one more file.".to_string(),
+            Some("Checking evidence.".to_string()),
+        )
+        .expect("recover after tool round cap");
+
+        assert!(recovered);
+        assert!(
+            context
+                .provider_request
+                .messages
+                .iter()
+                .all(|message| message.tool_calls.is_empty())
+        );
+        assert!(
+            context
+                .provider_request
+                .messages
+                .iter()
+                .any(|message| message.content.contains("pending-call"))
+        );
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
     fn neutral_messages_from_record_replays_saved_tool_state_in_order() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-tool-state-replay-test"));
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -22819,7 +23107,11 @@ Search memory before repo work.
             "- workspace directory: {}",
             workspace_dir.display()
         )));
-        assert!(environment_messages[0].content.contains("- git repository: "));
+        assert!(
+            environment_messages[0]
+                .content
+                .contains("- git repository: ")
+        );
         assert!(environment_messages[0].content.contains("- shell type: "));
         assert!(
             environment_messages[0]
