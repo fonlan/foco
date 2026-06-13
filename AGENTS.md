@@ -88,8 +88,8 @@
 - 浏览器统计页的详情弹窗通过 `GET /api/workspaces/{workspace_id}/ai-statistics/{request_id}` 读取单条审计请求的完整脱敏 request/response JSON；request 和 response 详情必须提供复制按钮，并以白底黑字、默认自动换行显示；详情弹窗不展示流事件。
 - 最小聊天流通过 `POST /api/workspaces/{workspace_id}/chat/stream` 返回 SSE；请求必须指定已启用且有 active provider 的模型，可选指定 chat 与 thinking level；请求可带 `attachments[]`，每项必须包含 `id`、`name`、`contentType` 和 `sizeBytes`，图片附件额外带 raw `contentBase64`（不得是 data URL），非图片附件额外带原始绝对 `path`；最多 6 个、单个最大 10MiB、总计最大 24MiB。非图片附件不得转成 base64 传给 provider，而是在 provider 可见的用户消息里追加 Files mentioned 路径块，由模型按需调用工具读取。
 - 新建 chat 时，后端会把 workspace 根目录的 `AGENTS.md` 作为额外 `user` 消息注入 provider-neutral messages；不默认加载 `%USERPROFILE%\.codex\AGENTS.md` / `~/.codex/AGENTS.md`。设置页 Prompts tab 允许用户添加提示词文件（例如 `%USERPROFILE%\.codex\AGENTS.md`）并填写额外提示词文本，已配置的提示词文件内容和额外提示词文本会在新建 chat 时作为额外 `user` 消息注入；system prompt 不重复包含这些内容；缺失文件忽略，存在但不是文件或不可读时必须明确报错；这些注入消息不写入聊天历史。
-- 新建 chat 时，后端还会注入一条额外 `user` 消息作为环境上下文，包含当前 workspace 目录、自动检测到的 shell 类型与可执行名、当前日期、本地时间戳、时区和是否处于 WSL；这条消息不写入聊天历史，后续同一 chat 请求不重复注入。
-- 聊天流由 `providers` crate 的 provider-neutral request/event 模型包住 `genai`；OpenAI Chat 和 OpenAI Responses 共用该路径。
+- 新建 chat 时，后端还会注入一条额外 `user` 消息作为环境上下文，包含当前 workspace 目录、当前 workspace 是否是 Git repository、自动检测到的 shell 类型与可执行名、当前日期、本地时间戳、时区和是否处于 WSL；这条消息不写入聊天历史，后续同一 chat 请求不重复注入。
+- 聊天流由 `providers` crate 的 provider-neutral request/event 模型包住 `genai`；OpenAI Chat 和 OpenAI Responses 共用该路径；provider stream 建立或读取失败时，错误消息必须包含非敏感诊断上下文（阶段、model、adapter、base URL 和是否启用 proxy），不得暴露 API key、URL 凭据、query 或 fragment；当前不对流式请求做自动重试，失败后由用户手动重试。
 - 聊天流支持文本、reasoning、usage、completion、error、tool call 和 tool result 事件。
 - 浏览器聊天气泡统一实时 Markdown 渲染；assistant 气泡必须按 SSE 实际到达顺序显示 reasoning、文本和工具调用块，不能在完成后把 reasoning 或工具调用重排到固定顶部/尾部；reasoning 流式展示期间保持展开，assistant 回复完成后自动折叠为单行预览并允许用户点击展开；reasoning 仍保存到 assistant message 的 `metadata_json.reasoning` 以支持 provider reasoning replay。
 - 用户消息附件保存到 user message metadata，历史回读的 `parts` 必须包含附件 part；图片附件 part 提供 `previewDataUrl` 缩略图，非图片附件保存并展示原始 `path` 且以文件名胶囊显示。

@@ -8669,10 +8669,10 @@ fn extra_prompt_message(content: &str) -> Option<NeutralChatMessage> {
         format!("{EXTRA_PROMPT_MESSAGE_PREFIX}\n\n{content}"),
     ))
 }
-
 fn environment_context_message(workspace_path: &Path) -> Result<NeutralChatMessage, ApiError> {
     let now = Local::now();
     let shell = detected_shell()?;
+    let git_repository = is_git_workspace(workspace_path)?;
     let wsl = is_wsl_environment();
 
     Ok(neutral_text_message(
@@ -8680,6 +8680,7 @@ fn environment_context_message(workspace_path: &Path) -> Result<NeutralChatMessa
         format!(
             "{ENVIRONMENT_CONTEXT_MESSAGE_PREFIX}:\n\
              - workspace directory: {}\n\
+             - git repository: {}\n\
              - shell type: {}\n\
              - shell executable: {}\n\
              - current date: {}\n\
@@ -8687,6 +8688,7 @@ fn environment_context_message(workspace_path: &Path) -> Result<NeutralChatMessa
              - time zone: {}\n\
              - wsl: {}",
             workspace_path.display(),
+            git_repository,
             shell.kind,
             shell.executable,
             now.format("%Y-%m-%d"),
@@ -21157,6 +21159,7 @@ Search memory before repo work.
             "- workspace directory: {}",
             workspace_dir.display()
         )));
+        assert!(environment_messages[0].content.contains("- git repository: "));
         assert!(environment_messages[0].content.contains("- shell type: "));
         assert!(
             environment_messages[0]

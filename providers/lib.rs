@@ -40,6 +40,13 @@ impl ProviderKind {
             Self::OpenAiResponses => AdapterKind::OpenAIResp,
         }
     }
+
+    fn adapter_label(self) -> &'static str {
+        match self {
+            Self::OpenAiChat => "OpenAI",
+            Self::OpenAiResponses => "OpenAIResp",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,8 +56,15 @@ pub struct ProviderConnectionConfig {
     pub api_key: Option<String>,
     pub proxy_url: Option<String>,
 }
-
 impl ProviderConnectionConfig {
+    fn provider_error_context(
+        &self,
+        phase: &'static str,
+        model_id: &str,
+    ) -> Result<ProviderErrorContext, ProviderConfigError> {
+        Ok(ProviderErrorContext::new(self, phase, model_id))
+    }
+
     pub fn genai_client(&self) -> Result<Client, ProviderConfigError> {
         let endpoint = Endpoint::from_owned(self.endpoint_url()?);
         let auth = self.auth_data()?;
@@ -273,6 +287,7 @@ pub struct NeutralUsage {
 
 pub struct NeutralChatStream {
     stream: genai::chat::ChatStream,
+    error_context: ProviderErrorContext,
 }
 
 impl NeutralChatStream {
@@ -282,7 +297,10 @@ impl NeutralChatStream {
         let event = self.stream.next().await?;
         Some(match event {
             Ok(event) => normalize_stream_event(event),
-            Err(source) => Err(ProviderConfigError::from_genai_error(source)),
+            Err(source) => Err(ProviderConfigError::from_genai_error_with_context(
+                source,
+                &self.error_context,
+            )),
         })
     }
 }
@@ -297,15 +315,20 @@ pub async fn stream_chat(
 
     let client = config.genai_client()?;
     let chat_request = genai_chat_request(&request)?;
+    let error_context =
+        config.provider_error_context("opening provider stream", &request.model_id)?;
     let options = genai_chat_options(&request)?;
-    let model = genai::ModelIden::new(config.kind.adapter_kind(), request.model_id);
+    let model = genai::ModelIden::new(config.kind.adapter_kind(), request.model_id.clone());
     let response = client
         .exec_chat_stream(model, chat_request, Some(&options))
         .await
-        .map_err(ProviderConfigError::from_genai_error)?;
+        .map_err(|source| {
+            ProviderConfigError::from_genai_error_with_context(source, &error_context)
+        })?;
 
     Ok(NeutralChatStream {
         stream: response.stream,
+        error_context: error_context.with_phase("reading provider stream"),
     })
 }
 
@@ -744,6 +767,63 @@ fn neutral_usage(usage: &Usage) -> NeutralUsage {
             .map(i64::from),
     }
 }
+struct ProviderErrorContext {
+    phase: &'static str,
+    model_id: String,
+    adapter: &'static str,
+    base_url: String,
+    proxy_configured: bool,
+}
+
+impl ProviderErrorContext {
+    fn new(config: &ProviderConnectionConfig, phase: &'static str, model_id: &str) -> Self {
+        Self {
+            phase,
+            model_id: model_id.to_string(),
+            adapter: config.kind.adapter_label(),
+            base_url: config.diagnostic_base_url(),
+            proxy_configured: config.proxy_url.is_some(),
+        }
+    }
+
+    fn with_phase(&self, phase: &'static str) -> Self {
+        Self {
+            phase,
+            model_id: self.model_id.clone(),
+            adapter: self.adapter,
+            base_url: self.base_url.clone(),
+            proxy_configured: self.proxy_configured,
+        }
+    }
+}
+
+impl fmt::Display for ProviderErrorContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let proxy = if self.proxy_configured {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        write!(
+            formatter,
+            "{} (model '{}', adapter {}, base URL '{}', proxy {})",
+            self.phase, self.model_id, self.adapter, self.base_url, proxy
+        )
+    }
+}
+
+impl ProviderConnectionConfig {
+    fn diagnostic_base_url(&self) -> String {
+        let Ok(mut url) = reqwest::Url::parse(&self.endpoint_url().unwrap_or_default()) else {
+            return "<invalid>".to_string();
+        };
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+        url.set_query(None);
+        url.set_fragment(None);
+        url.to_string()
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProviderConfigError {
@@ -784,11 +864,11 @@ impl ProviderConfigError {
         }
     }
 
-    fn from_genai_error(source: genai::Error) -> Self {
+    fn from_genai_error_with_context(source: genai::Error, context: &ProviderErrorContext) -> Self {
         let status_code = genai_error_status_code(&source).map(|status| status.as_u16());
 
         Self::Connection {
-            message: source.to_string(),
+            message: format!("{context}: {source}"),
             status_code,
         }
     }
@@ -931,6 +1011,30 @@ mod tests {
                 .expect("explicit socks proxy"),
             "socks5://127.0.0.1:7891"
         );
+    }
+
+    #[test]
+    fn provider_error_context_redacts_url_credentials_query_and_fragment() {
+        let config = ProviderConnectionConfig {
+            kind: ProviderKind::OpenAiResponses,
+            base_url: Some("https://user:secret@example.test/v1?api_key=hidden#frag".to_string()),
+            api_key: Some("sk-test".to_string()),
+            proxy_url: Some("http://127.0.0.1:7890".to_string()),
+        };
+
+        let context = config
+            .provider_error_context("reading provider stream", "gpt-5.5")
+            .expect("provider error context")
+            .to_string();
+
+        assert!(context.contains("reading provider stream"));
+        assert!(context.contains("model 'gpt-5.5'"));
+        assert!(context.contains("adapter OpenAIResp"));
+        assert!(context.contains("base URL 'https://example.test/v1/'"));
+        assert!(context.contains("proxy enabled"));
+        assert!(!context.contains("secret"));
+        assert!(!context.contains("api_key"));
+        assert!(!context.contains("frag"));
     }
 
     #[test]
