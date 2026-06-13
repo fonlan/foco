@@ -2576,6 +2576,7 @@ body,
   }
 
   .message-composer-control-row {
+    position: relative;
     flex-wrap: nowrap;
     gap: 0.25rem;
     overflow: visible;
@@ -2610,10 +2611,16 @@ body,
     display: none;
   }
 
+  .message-composer-control-row .composer-select-menu,
+  .message-composer-control-row > details.composer-branch-select {
+    position: static;
+  }
+
   .message-composer-control-row .composer-select-popover {
-    left: auto;
+    left: 0;
     right: 0;
-    max-width: min(16rem, calc(100vw - 1rem));
+    width: auto;
+    max-width: none;
   }
 
   .message-composer-actions-with-retry .composer-retry-button {
