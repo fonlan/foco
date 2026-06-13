@@ -220,7 +220,6 @@ pub struct NeutralChatAttachment {
 #[serde(rename_all = "lowercase")]
 pub enum NeutralChatRole {
     System,
-    Developer,
     User,
     Assistant,
     Tool,
@@ -437,22 +436,12 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
         ));
     }
 
-    let mut system_prompt = None;
     let mut messages = Vec::with_capacity(request.messages.len());
-    for (index, message) in request.messages.iter().enumerate() {
-        if index == 0 && message.role == NeutralChatRole::System {
-            validate_instruction_message(message)?;
-            system_prompt = Some(message.content.clone());
-            continue;
-        }
-
+    for message in &request.messages {
         messages.push(genai_message(message)?);
     }
 
     let mut chat_request = ChatRequest::from_messages(messages);
-    if let Some(system_prompt) = system_prompt {
-        chat_request = chat_request.with_system(system_prompt);
-    }
     if !request.tools.is_empty() {
         chat_request = chat_request.with_tools(request.tools.iter().map(genai_tool));
     }
@@ -462,8 +451,22 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
 
 fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderConfigError> {
     match message.role {
-        NeutralChatRole::System | NeutralChatRole::Developer => {
-            validate_instruction_message(message)?;
+        NeutralChatRole::System => {
+            if !message.attachments.is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "system messages cannot contain attachments".to_string(),
+                ));
+            }
+            if message.content.trim().is_empty() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "chat message content must not be empty".to_string(),
+                ));
+            }
+            if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
+                return Err(ProviderConfigError::InvalidRequest(
+                    "system and user messages cannot contain tool state".to_string(),
+                ));
+            }
 
             Ok(ChatMessage::system(message.content.clone()))
         }
@@ -609,26 +612,6 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
             Ok(ChatMessage::from(response))
         }
     }
-}
-
-fn validate_instruction_message(message: &NeutralChatMessage) -> Result<(), ProviderConfigError> {
-    if !message.attachments.is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "system and developer messages cannot contain attachments".to_string(),
-        ));
-    }
-    if message.content.trim().is_empty() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "chat message content must not be empty".to_string(),
-        ));
-    }
-    if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
-        return Err(ProviderConfigError::InvalidRequest(
-            "system, developer, and user messages cannot contain tool state".to_string(),
-        ));
-    }
-
-    Ok(())
 }
 
 fn genai_chat_options(request: &NeutralChatRequest) -> Result<ChatOptions, ProviderConfigError> {
@@ -986,18 +969,6 @@ fn webc_error_status_code(source: &genai::webc::Error) -> Option<StatusCode> {
 mod tests {
     use super::*;
 
-    fn neutral_text_message(role: NeutralChatRole, content: &str) -> NeutralChatMessage {
-        NeutralChatMessage {
-            role,
-            content: content.to_string(),
-            attachments: Vec::new(),
-            reasoning: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            tool_name: None,
-        }
-    }
-
     #[test]
     fn parses_supported_provider_kinds() {
         assert_eq!(
@@ -1098,34 +1069,6 @@ mod tests {
             normalized_tool_arguments(&serde_json::Value::String("plain text".to_string())),
             serde_json::Value::String("plain text".to_string())
         );
-    }
-
-    #[test]
-    fn converts_system_and_developer_instructions_for_genai_request() {
-        let request = NeutralChatRequest {
-            model_id: "gpt-4o-mini".to_string(),
-            messages: vec![
-                neutral_text_message(NeutralChatRole::System, "System rules."),
-                neutral_text_message(NeutralChatRole::Developer, "Developer workflow."),
-                neutral_text_message(NeutralChatRole::User, "Do the task."),
-            ],
-            tools: Vec::new(),
-            thinking_level: None,
-            max_output_tokens: None,
-            prompt_cache_key: None,
-            prompt_cache_retention: None,
-        };
-
-        let chat_request = genai_chat_request(&request).expect("chat request");
-
-        assert_eq!(chat_request.system.as_deref(), Some("System rules."));
-        assert_eq!(chat_request.messages.len(), 2);
-        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::System);
-        assert_eq!(
-            chat_request.messages[0].content.first_text(),
-            Some("Developer workflow.")
-        );
-        assert_eq!(chat_request.messages[1].role, genai::chat::ChatRole::User);
     }
 
     #[test]
