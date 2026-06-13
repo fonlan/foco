@@ -1742,6 +1742,162 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("schedules a new workspace chat until the current workspace run finishes", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "first task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(chatStreamControllers.has("request-stream")).toBe(true),
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "New chat in Default" }),
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "Scheduled task",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }), {
+      ctrlKey: true,
+    });
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const scheduledHistoryTitle =
+      within(workspaceList).getByText("Scheduled task");
+    const scheduledHistoryButton = scheduledHistoryTitle.closest("button");
+    if (!scheduledHistoryButton) {
+      throw new Error("Expected scheduled chat history item button");
+    }
+    expect(
+      scheduledHistoryButton.querySelector(".session-status-dot"),
+    ).toHaveClass("session-status-dot-scheduled");
+
+    const scheduledMessage = screen
+      .getAllByText("Scheduled task")
+      .find((element) => element.closest(".message-row"));
+    const scheduledMessageRow = scheduledMessage?.closest(".message-row");
+    expect(scheduledMessageRow).not.toBeNull();
+    expect(
+      within(scheduledMessageRow as HTMLElement).getByText("Queued"),
+    ).toBeInTheDocument();
+
+    const streamCallsBeforeComplete = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    expect(streamCallsBeforeComplete).toHaveLength(1);
+
+    await act(async () => {
+      chatStreamControllers.get("request-stream")?.close();
+    });
+
+    await waitFor(() => {
+      const streamCalls = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/chat/stream",
+      );
+      expect(streamCalls).toHaveLength(2);
+    });
+
+    const secondStreamCall = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    )[1];
+    expect(JSON.parse(String(secondStreamCall[1]?.body))).toMatchObject({
+      chatId: null,
+      message: "Scheduled task",
+    });
+
+    await act(async () => {
+      chatStreamControllers.get("request-stream-2")?.close();
+    });
+  });
+
+  it("schedules a new workspace chat with Ctrl+Enter", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "first task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(chatStreamControllers.has("request-stream")).toBe(true),
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "New chat in Default" }),
+    );
+    const composer = screen.getByPlaceholderText(defaultComposerPlaceholder);
+    await userEvent.type(composer, "Keyboard scheduled task");
+    fireEvent.keyDown(composer, {
+      ctrlKey: true,
+      key: "Enter",
+    });
+
+    const streamCallsBeforeComplete = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    expect(streamCallsBeforeComplete).toHaveLength(1);
+    const scheduledMessageRow = screen
+      .getAllByText("Keyboard scheduled task")
+      .find((element) => element.closest(".message-row"))
+      ?.closest(".message-row");
+    expect(scheduledMessageRow).not.toBeNull();
+    expect(
+      within(scheduledMessageRow as HTMLElement).getByText("Queued"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      chatStreamControllers.get("request-stream")?.close();
+    });
+
+    await waitFor(() => {
+      const streamCalls = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/chat/stream",
+      );
+      expect(streamCalls).toHaveLength(2);
+    });
+
+    await act(async () => {
+      chatStreamControllers.get("request-stream-2")?.close();
+    });
+  });
+
+  it("shows the queue tooltip while Ctrl is held over the send button", async () => {
+    render(<App />);
+
+    const sendButton = await screen.findByRole("button", {
+      name: "Send message",
+    });
+    expect(sendButton).toHaveAttribute("title", "Send");
+
+    fireEvent.keyDown(window, { ctrlKey: true, key: "Control" });
+    await waitFor(() =>
+      expect(sendButton).toHaveAttribute("title", "Send to queue"),
+    );
+
+    fireEvent.keyUp(window, { ctrlKey: false, key: "Control" });
+    await waitFor(() => expect(sendButton).toHaveAttribute("title", "Send"));
+  });
+
   it("adds native path attachments into the composer and sends them with the chat request", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);

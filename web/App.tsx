@@ -103,6 +103,12 @@ type ChatSummary = {
   codeChangeStats: GitDiffLineStats;
 };
 
+type WorkspaceChatListItem = ChatSummary & {
+  scheduledChatKey?: string;
+  scheduledRunId?: string;
+  scheduledStatus?: ScheduledWorkspaceRun["status"];
+};
+
 type WorkspaceSummary = {
   id: string;
   name: string;
@@ -1290,6 +1296,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Send guidance. Ctrl+click queues.": "发送引导。Ctrl+点击进入队列。",
     "Send guidance. Ctrl+click queues. {count} queued.":
       "发送引导。Ctrl+点击进入队列。已排队 {count} 条。",
+    "Send to queue": "发送到队列",
     "No active run is available for guidance.":
       "当前没有可引导的运行。",
     "Guidance pending": "引导待生效",
@@ -1877,7 +1884,21 @@ type RetryRunRequest = {
   providerId: string;
   thinkingLevel: string;
   skillIds: string[];
+  localChatKey?: string;
   pendingUserMessageId?: string;
+};
+
+type ScheduledWorkspaceRun = {
+  id: string;
+  workspaceId: string;
+  chatId: string;
+  chatKey: string;
+  createdChatId?: string;
+  title: string;
+  createdAt: string;
+  pendingUserMessageId: string;
+  request: RetryRunRequest;
+  status: "queued" | "starting";
 };
 
 type ActiveRunInfo = {
@@ -2006,6 +2027,9 @@ export function App() {
   const [queuedRunRequestsByChatKey, setQueuedRunRequestsByChatKey] = useState<
     Record<string, RetryRunRequest[]>
   >({});
+  const [scheduledWorkspaceRuns, setScheduledWorkspaceRuns] = useState<
+    ScheduledWorkspaceRun[]
+  >([]);
   const [activeRunInfoByChatKey, setActiveRunInfoByChatKey] = useState<
     Record<string, ActiveRunInfo>
   >({});
@@ -2038,6 +2062,7 @@ export function App() {
   const queuedRunRequestsByChatKeyRef = useRef<
     Record<string, RetryRunRequest[]>
   >({});
+  const scheduledWorkspaceRunsRef = useRef<ScheduledWorkspaceRun[]>([]);
   const pendingGuidanceMessageIdsRef = useRef<Map<string, string>>(new Map());
   const applyBrowserRouteRef = useRef<(route: BrowserRoute) => void>(() => {});
   const hasAppliedInitialBrowserRouteRef = useRef(false);
@@ -2051,7 +2076,7 @@ export function App() {
     [activeWorkspaceId, workspaces],
   );
   const activeChatKey =
-    activeChatId === null
+    activeChatId === null || isPendingChatId(activeChatId)
       ? activeChatKeyRef.current
       : chatRunKey(activeWorkspaceId, activeChatId);
   const activeRunInfo = activeChatKey
@@ -2147,7 +2172,9 @@ export function App() {
 
   useEffect(() => {
     activeChatKeyRef.current =
-      activeChatId === null ? null : chatRunKey(activeWorkspaceId, activeChatId);
+      activeChatId === null || isPendingChatId(activeChatId)
+        ? activeChatKeyRef.current
+        : chatRunKey(activeWorkspaceId, activeChatId);
   }, [activeChatId, activeWorkspaceId]);
 
   useEffect(() => {
@@ -2175,6 +2202,7 @@ export function App() {
     if (
       !activeWorkspaceId ||
       !activeChatId ||
+      isPendingChatId(activeChatId) ||
       !selectedModelId ||
       !selectedProviderId
     ) {
@@ -2462,7 +2490,11 @@ export function App() {
   ]);
 
   useEffect(() => {
-    if (!activeWorkspace?.id || !activeChatId) {
+    if (
+      !activeWorkspace?.id ||
+      !activeChatId ||
+      isPendingChatId(activeChatId)
+    ) {
       setTodoGraph(null);
       setTodoGraphError(null);
       setIsLoadingTodoGraph(false);
@@ -2492,6 +2524,38 @@ export function App() {
 
     void loadGitBranches(activeWorkspace.id);
   }, [activeWorkspace?.id, loadGitBranches]);
+
+  useEffect(() => {
+    const nextRun = scheduledWorkspaceRuns.find(
+      (run) =>
+        run.status === "queued" &&
+        !workspaceHasRunningOrStartingRun(run.workspaceId),
+    );
+    if (!nextRun) {
+      return;
+    }
+
+    updateScheduledWorkspaceRuns((current) =>
+      current.map((run) =>
+        run.id === nextRun.id ? { ...run, status: "starting" } : run,
+      ),
+    );
+
+    void (async () => {
+      const createdChatId = await runChatMessage(nextRun.request);
+      if (createdChatId) {
+        updateScheduledWorkspaceRuns((current) =>
+          current.map((run) =>
+            run.id === nextRun.id ? { ...run, createdChatId } : run,
+          ),
+        );
+      } else {
+        updateScheduledWorkspaceRuns((current) =>
+          current.filter((run) => run.id !== nextRun.id),
+        );
+      }
+    })();
+  }, [runningChatKeys, scheduledWorkspaceRuns]);
 
   useEffect(() => {
     setOpenChatTabs((current) => {
@@ -2545,6 +2609,7 @@ export function App() {
     });
 
     updateQueuedRunRequestsByWorkspaceList(workspaces);
+    updateScheduledWorkspaceRunsByWorkspaceList(workspaces);
   }, [workspaces]);
 
   useEffect(() => {
@@ -2930,6 +2995,61 @@ export function App() {
     setQueuedRunRequestsByChatKey(next);
   }
 
+  function updateScheduledWorkspaceRuns(
+    updater: (current: ScheduledWorkspaceRun[]) => ScheduledWorkspaceRun[],
+  ) {
+    const next = updater(scheduledWorkspaceRunsRef.current);
+    scheduledWorkspaceRunsRef.current = next;
+    setScheduledWorkspaceRuns(next);
+  }
+
+  function updateScheduledWorkspaceRunsByWorkspaceList(
+    nextWorkspaces: WorkspaceSummary[],
+  ) {
+    updateScheduledWorkspaceRuns((current) =>
+      current.filter((run) =>
+        nextWorkspaces.some(
+          (workspace) =>
+            workspace.id === run.workspaceId &&
+            (!run.createdChatId ||
+              !workspace.chats.some((chat) => chat.id === run.createdChatId)),
+        ),
+      ),
+    );
+  }
+
+  function scheduledWorkspaceRunsFor(workspaceId: string) {
+    return scheduledWorkspaceRuns.filter((run) => run.workspaceId === workspaceId);
+  }
+
+  function workspaceHasRunningOrStartingRun(workspaceId: string) {
+    return (
+      [...runningChatKeys].some(
+        (chatKey) => chatKeyWorkspaceId(chatKey) === workspaceId,
+      ) ||
+      scheduledWorkspaceRunsRef.current.some(
+        (run) => run.workspaceId === workspaceId && run.status === "starting",
+      )
+    );
+  }
+
+  function selectScheduledWorkspaceRun(run: ScheduledWorkspaceRun) {
+    const cachedMessages = chatMessagesByKey[run.chatKey] ?? [];
+    setActiveWorkspaceId(run.workspaceId);
+    setActiveChatId(run.chatId);
+    setExpandedWorkspaceId(run.workspaceId);
+    activeChatKeyRef.current = run.chatKey;
+    setMessages(cachedMessages);
+    setSelectedDiffPath(null);
+    setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
+    updateBrowserRoute({
+      chatId: null,
+      viewMode: "chat",
+      workspaceId: run.workspaceId,
+    });
+  }
+
   async function loadChatMessages(
     workspaceId: string,
     chatId: string,
@@ -2972,6 +3092,16 @@ export function App() {
     chatId: string,
     options: { updateUrl?: boolean } = {},
   ) {
+    if (isPendingChatId(chatId)) {
+      const scheduledRun = scheduledWorkspaceRuns.find(
+        (run) => run.workspaceId === workspaceId && run.chatId === chatId,
+      );
+      if (scheduledRun) {
+        selectScheduledWorkspaceRun(scheduledRun);
+      }
+      return;
+    }
+
     const chatKey = chatRunKey(workspaceId, chatId);
     const cachedMessages = chatMessagesByKey[chatKey];
 
@@ -3376,7 +3506,8 @@ export function App() {
     const skillIds = [...selectedSkillIds];
     return {
       attachments,
-      chatId: activeChatId,
+      chatId:
+        activeChatId && !isPendingChatId(activeChatId) ? activeChatId : null,
       content,
       modelId: selectedModelId,
       providerId: selectedProviderId,
@@ -3386,7 +3517,10 @@ export function App() {
     };
   }
 
-  async function handleSendMessage(event: FormEvent<HTMLFormElement>) {
+  async function handleSendMessage(
+    event: FormEvent<HTMLFormElement>,
+    options: { schedule?: boolean } = {},
+  ) {
     event.preventDefault();
 
     const request = currentDraftRunRequest();
@@ -3395,7 +3529,17 @@ export function App() {
     }
 
     if (isSendingMessage) {
+      if (options.schedule) {
+        handleQueueActiveRunWithRequest(request);
+        return;
+      }
+
       await guideActiveRun(request);
+      return;
+    }
+
+    if (options.schedule) {
+      handleScheduleMessage(request);
       return;
     }
 
@@ -3404,6 +3548,61 @@ export function App() {
     setDraftMessage("");
 
     await runChatMessage(request);
+  }
+
+  function handleScheduleMessage(request: RetryRunRequest) {
+    const runKey = localUiId("scheduled-chat");
+    const chatKey = pendingChatRunKey(request.workspaceId, runKey);
+    const pendingUserMessageId = localUiId("pending-scheduled-user");
+    const createdAt = new Date().toISOString();
+    const visibleUserContent = messageWithSelectedSkills(
+      detectedSkills,
+      request.skillIds,
+      request.content,
+    );
+
+    setSelectedSkillIds([]);
+    setDraftAttachments([]);
+    setDraftMessage("");
+    setError(null);
+    setActiveWorkspaceId(request.workspaceId);
+    setActiveChatId(runKey);
+    setExpandedWorkspaceId(request.workspaceId);
+    activeChatKeyRef.current = chatKey;
+    setSelectedDiffPath(null);
+    setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
+    updateBrowserRoute({
+      chatId: null,
+      viewMode: "chat",
+      workspaceId: request.workspaceId,
+    });
+    appendPendingUserMessage(
+      chatKey,
+      pendingUserMessageId,
+      visibleUserContent,
+      request.attachments,
+      "queued",
+    );
+
+    const scheduledRun: ScheduledWorkspaceRun = {
+      id: runKey,
+      workspaceId: request.workspaceId,
+      chatId: runKey,
+      chatKey,
+      title: chatTitleForDraft(request.content, request.attachments),
+      createdAt,
+      pendingUserMessageId,
+      request: {
+        ...request,
+        chatId: null,
+        localChatKey: chatKey,
+        pendingUserMessageId,
+      },
+      status: "queued",
+    };
+
+    updateScheduledWorkspaceRuns((current) => [...current, scheduledRun]);
   }
 
   async function handleGuideActiveRun() {
@@ -3420,6 +3619,10 @@ export function App() {
     if (!request) {
       return;
     }
+    handleQueueActiveRunWithRequest(request);
+  }
+
+  function handleQueueActiveRunWithRequest(request: RetryRunRequest) {
     const currentChatKey = activeChatKeyRef.current;
     const runInfo = activeRunInfo;
     if (
@@ -4118,7 +4321,7 @@ export function App() {
     }
   }
 
-  async function runChatMessage(request: RetryRunRequest) {
+  async function runChatMessage(request: RetryRunRequest): Promise<string | null> {
     const runKey =
       globalThis.crypto?.randomUUID?.() ??
       `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -4138,9 +4341,9 @@ export function App() {
     let assistantMessageId = localAssistantId;
     let currentAssistantMessageId = localAssistantId;
     let requestChatId = request.chatId;
-    let runMessagesKey = requestChatId
+    let runMessagesKey = request.localChatKey ?? (requestChatId
       ? chatRunKey(request.workspaceId, requestChatId)
-      : pendingChatRunKey(request.workspaceId, runKey);
+      : pendingChatRunKey(request.workspaceId, runKey));
     let currentRunningChatKey = runMessagesKey;
     let assistantDraft = "";
     let assistantDraftReasoning = "";
@@ -4336,6 +4539,11 @@ export function App() {
                 return message;
               }),
             );
+            if (request.localChatKey) {
+              updateScheduledWorkspaceRuns((current) =>
+                current.filter((run) => run.chatKey !== request.localChatKey),
+              );
+            }
             runMessagesKey = currentRunningChatKey;
           } else {
             setMessagesForChatKey(currentRunningChatKey, (current) =>
@@ -4366,10 +4574,13 @@ export function App() {
             runId: streamEvent.llmRequestId ?? null,
             workspaceId: request.workspaceId,
           });
-          if (
+          const shouldActivateStartedChat =
             activeChatKeyRef.current === currentRunningChatKey ||
+            activeChatKeyRef.current === request.localChatKey ||
             activeChatKeyRef.current === null ||
-            request.chatId
+            Boolean(request.chatId);
+          if (
+            shouldActivateStartedChat
           ) {
             setActiveChatId(streamEvent.chatId);
             activeChatKeyRef.current = currentRunningChatKey;
@@ -4637,6 +4848,8 @@ export function App() {
         });
       }
     }
+
+    return runSucceeded ? requestChatId : null;
   }
 
   function toggleWorkspace(workspaceId: string) {
@@ -4916,13 +5129,31 @@ export function App() {
                   const configuredVisibleChatCount =
                     workspaceChatVisibleCounts[workspace.id] ??
                     WORKSPACE_CHAT_HISTORY_PAGE_SIZE;
+                  const scheduledChats = scheduledWorkspaceRunsFor(
+                    workspace.id,
+                  ).map(
+                    (run): WorkspaceChatListItem => ({
+                      codeChangeStats: { additions: 0, deletions: 0 },
+                      createdAt: run.createdAt,
+                      id: run.chatId,
+                      scheduledChatKey: run.chatKey,
+                      scheduledRunId: run.id,
+                      scheduledStatus: run.status,
+                      title: run.title,
+                      updatedAt: run.createdAt,
+                    }),
+                  );
+                  const workspaceChats: WorkspaceChatListItem[] = [
+                    ...scheduledChats,
+                    ...workspace.chats,
+                  ];
                   const visibleChatCount =
                     selectedChatIndex >= configuredVisibleChatCount
                       ? selectedChatIndex + 1
                       : configuredVisibleChatCount;
-                  const visibleChats = workspace.chats.slice(0, visibleChatCount);
+                  const visibleChats = workspaceChats.slice(0, visibleChatCount);
                   const hiddenChatCount = Math.max(
-                    workspace.chats.length - visibleChats.length,
+                    workspaceChats.length - visibleChats.length,
                     0,
                   );
                   const nextVisibleChatCount = Math.min(
@@ -4978,18 +5209,34 @@ export function App() {
                       </div>
                       {isExpanded ? (
                         <div className="ml-4 mt-1 space-y-1 border-l border-stone-200/80 pl-2">
-                          {workspace.chats.length > 0 ? (
+                          {workspaceChats.length > 0 ? (
                             <>
                               {visibleChats.map((chat) => {
                                 const chatKey = chatRunKey(workspace.id, chat.id);
+                                const scheduledChatKey =
+                                  chat.scheduledChatKey ?? null;
                                 const isChatRunning =
-                                  runningChatKeys.has(chatKey);
-                                const isChatOpen = openChatKeySet.has(chatKey);
+                                  runningChatKeys.has(chatKey) ||
+                                  Boolean(
+                                    scheduledChatKey &&
+                                      runningChatKeys.has(scheduledChatKey),
+                                  );
+                                const isChatScheduled =
+                                  chat.scheduledStatus === "queued" ||
+                                  chat.scheduledStatus === "starting";
+                                const isChatOpen =
+                                  openChatKeySet.has(chatKey) ||
+                                  Boolean(
+                                    scheduledChatKey &&
+                                      activeChatKey === scheduledChatKey,
+                                  );
                                 const isChatFailed =
                                   isChatOpen && failedChatKeySet.has(chatKey);
                                 let statusDotClass = "session-status-dot-idle";
                                 if (isChatRunning) {
                                   statusDotClass = "session-status-dot-running";
+                                } else if (isChatScheduled) {
+                                  statusDotClass = "session-status-dot-scheduled";
                                 } else if (isChatFailed) {
                                   statusDotClass = "session-status-dot-error";
                                 } else if (isChatOpen) {
@@ -5066,6 +5313,7 @@ export function App() {
                                         title: chat.title,
                                       })}
                                       className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
+                                      disabled={Boolean(chat.scheduledRunId)}
                                       onClick={() =>
                                         requestDeleteWorkspaceChat(workspace, chat)
                                       }
@@ -5239,7 +5487,9 @@ export function App() {
               onRemoveAttachment={handleRemoveDraftAttachment}
               onRemoveSkill={removeSelectedSkill}
               onRetryRun={() => void handleRetryRun()}
-              onSubmit={handleSendMessage}
+              onSubmit={(event, options) =>
+                void handleSendMessage(event, options)
+              }
               onThinkingLevelChange={setSelectedThinkingLevel}
               onToggleSkill={toggleSelectedSkill}
               canRetryRun={retryRunRequest !== null && !isSendingMessage}
@@ -6479,7 +6729,10 @@ function ChatPanel({
   onRemoveSkill: (skillId: string) => void;
   onRetryRun: () => void;
   onSelectAttachments: () => void;
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onSubmit: (
+    event: FormEvent<HTMLFormElement>,
+    options?: { schedule?: boolean },
+  ) => void;
   onThinkingLevelChange: (value: string) => void;
   onToggleSkill: (skillId: string) => void;
   selectedGitBranch: string;
@@ -6501,6 +6754,7 @@ function ChatPanel({
   const copiedMessageTimerRef = useRef<number | null>(null);
   const shouldLockMessageScrollRef = useRef(true);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
   const skillQuery = activeSkillQuery(draftMessage);
   const selectedSkillSet = new Set(selectedSkillIds);
   const selectedSkills = selectedSkillIds
@@ -6551,12 +6805,15 @@ function ChatPanel({
     ? t("Send guidance")
     : t("Cancel run");
   const runningButtonTitle = runningButtonSendsMessage
-    ? queuedRunCount > 0
+    ? isCtrlKeyPressed
+      ? t("Send to queue")
+      : queuedRunCount > 0
       ? t("Send guidance. Ctrl+click queues. {count} queued.", {
           count: queuedRunCount,
         })
       : t("Send guidance. Ctrl+click queues.")
     : t("Cancel run");
+  const sendButtonTitle = isCtrlKeyPressed ? t("Send to queue") : t("Send");
 
   function scrollMessageListToBottom() {
     messageScrollEndRef.current?.scrollIntoView({
@@ -6610,6 +6867,33 @@ function ChatPanel({
       if (copiedMessageTimerRef.current !== null) {
         window.clearTimeout(copiedMessageTimerRef.current);
       }
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.ctrlKey) {
+        setIsCtrlKeyPressed(true);
+      }
+    }
+
+    function handleKeyUp(event: KeyboardEvent) {
+      if (event.key === "Control" || !event.ctrlKey) {
+        setIsCtrlKeyPressed(false);
+      }
+    }
+
+    function handleWindowBlur() {
+      setIsCtrlKeyPressed(false);
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleWindowBlur);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleWindowBlur);
     };
   }, []);
 
@@ -6893,7 +7177,6 @@ function ChatPanel({
               onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
                 if (
                   event.key !== "Enter" ||
-                  event.ctrlKey ||
                   event.shiftKey ||
                   event.nativeEvent.isComposing
                 ) {
@@ -6901,6 +7184,13 @@ function ChatPanel({
                 }
 
                 event.preventDefault();
+                if (event.ctrlKey) {
+                  onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
+                    schedule: true,
+                  });
+                  return;
+                }
+
                 event.currentTarget.form?.requestSubmit();
               }}
               onPaste={handlePaste}
@@ -7054,7 +7344,20 @@ function ChatPanel({
                     (!draftMessage.trim() && !draftAttachments.length) ||
                     !selectedModelId
                   }
-                  title={t("Send")}
+                  onClick={(event) => {
+                    if (event.ctrlKey) {
+                      event.preventDefault();
+                      const form = event.currentTarget.form;
+                      if (!form) {
+                        return;
+                      }
+
+                      onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
+                        schedule: true,
+                      });
+                    }
+                  }}
+                  title={sendButtonTitle}
                   type="submit"
                 >
                   <Send aria-hidden="true" className="size-4" />
@@ -19552,6 +19855,29 @@ function parseChatRunKey(chatKey: string) {
 
 function pendingChatRunKey(workspaceId: string, runKey: string) {
   return `${workspaceId}:pending:${runKey}`;
+}
+
+function isPendingChatId(chatId: string) {
+  return chatId.startsWith("scheduled-chat-") || chatId.startsWith("pending:");
+}
+
+function chatKeyWorkspaceId(chatKey: string) {
+  const separatorIndex = chatKey.indexOf(":");
+  return separatorIndex > 0 ? chatKey.slice(0, separatorIndex) : null;
+}
+
+function chatTitleForDraft(
+  content: string,
+  attachments: ChatAttachmentPayload[],
+) {
+  const normalized = content.trim().replace(/\s+/g, " ");
+  if (normalized) {
+    return normalized.length > 48 ? `${normalized.slice(0, 48)}...` : normalized;
+  }
+
+  return attachments.length === 1
+    ? attachments[0].name
+    : `${attachments.length} attachments`;
 }
 
 function localUiId(prefix: string) {

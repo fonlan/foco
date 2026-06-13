@@ -1340,6 +1340,10 @@ body,
   background: #22c55e;
 }
 
+.session-status-dot-scheduled {
+  background: #facc15;
+}
+
 .session-status-dot-error {
   background: #ef4444;
 }
