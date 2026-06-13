@@ -2710,6 +2710,41 @@ describe("App verification surfaces", () => {
     expect(screen.getByRole("status", { name: "Chat is running" })).toBeInTheDocument();
 
     await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        type: "usage",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 70000,
+          outputTokens: 1000,
+        },
+      });
+    });
+
+    expect(
+      await screen.findByRole("status", { name: "Context usage 64%" }),
+    ).toHaveTextContent("64%");
+    const usageCalls = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    );
+    const [, usageInit] = usageCalls.at(-1)!;
+    expect(typeof usageInit?.body).toBe("string");
+    expect(JSON.parse(usageInit?.body as string)).toMatchObject({
+      assistantDraft: "Still running.",
+      assistantDraftReasoning: null,
+      chatId: "chat-1",
+      draftMessage: null,
+      latestResponseUsage: {
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 70000,
+        outputTokens: 1000,
+      },
+    });
+
+    await act(async () => {
       activeChatStreamController?.close();
     });
   });

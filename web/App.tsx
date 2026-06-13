@@ -2075,6 +2075,9 @@ export function App() {
   const contextUsageRequestIdByChatKeyRef = useRef<Map<string, number>>(
     new Map(),
   );
+  const selectedModelIdRef = useRef("");
+  const selectedProviderIdRef = useRef("");
+  const selectedThinkingLevelRef = useRef("");
   const activeChatKeyRef = useRef<string | null>(null);
   const queuedRunRequestsByChatKeyRef = useRef<
     Record<string, RetryRunRequest[]>
@@ -2225,11 +2228,11 @@ export function App() {
       return;
     }
 
-    contextUsageIdentityByChatKeyRef.current.set(chatKey, identity);
     if (isSendingMessage) {
       return;
     }
 
+    contextUsageIdentityByChatKeyRef.current.set(chatKey, identity);
     contextUsageAbortByChatKeyRef.current.get(chatKey)?.abort();
     contextUsageAbortByChatKeyRef.current.delete(chatKey);
     setContextUsageByChatKey((current) => {
@@ -2272,6 +2275,18 @@ export function App() {
     selectedProviderId,
     selectedThinkingLevel,
   ]);
+
+  useLayoutEffect(() => {
+    selectedModelIdRef.current = selectedModelId;
+  }, [selectedModelId]);
+
+  useLayoutEffect(() => {
+    selectedProviderIdRef.current = selectedProviderId;
+  }, [selectedProviderId]);
+
+  useLayoutEffect(() => {
+    selectedThinkingLevelRef.current = selectedThinkingLevel;
+  }, [selectedThinkingLevel]);
 
   useEffect(
     () => () => {
@@ -4159,8 +4174,30 @@ export function App() {
     const abortController = new AbortController();
     let assistantMessageId = `active-assistant-${activeRun.runId}`;
     let currentAssistantMessageId = assistantMessageId;
+    let assistantDraft = "";
+    let assistantDraftReasoning = "";
+    let latestResponseUsage: ChatUsage | null = null;
     let hasGuidanceTurns = false;
     let streamHadError = false;
+    const refreshRunContextUsage = () => {
+      const modelId = selectedModelIdRef.current;
+      const providerId = selectedProviderIdRef.current;
+      if (!modelId || !providerId) {
+        return;
+      }
+
+      void refreshContextUsage({
+        assistantDraft,
+        assistantDraftReasoning,
+        chatId: activeRun.chatId,
+        latestResponseUsage,
+        modelId,
+        providerId,
+        skillIds: [],
+        thinkingLevel: selectedThinkingLevelRef.current,
+        workspaceId: activeRun.workspaceId,
+      });
+    };
 
     const ensureStreamingAssistantMessage = (
       nextAssistantMessageId: string,
@@ -4244,6 +4281,8 @@ export function App() {
         }
 
         if (streamEvent.type === "textDelta") {
+          assistantDraft += streamEvent.delta;
+          refreshRunContextUsage();
           ensureStreamingAssistantMessage(
             streamEvent.assistantMessageId ?? currentAssistantMessageId,
           );
@@ -4262,6 +4301,8 @@ export function App() {
         }
 
         if (streamEvent.type === "reasoningDelta") {
+          assistantDraftReasoning += streamEvent.delta;
+          refreshRunContextUsage();
           ensureStreamingAssistantMessage(
             streamEvent.assistantMessageId ?? currentAssistantMessageId,
           );
@@ -4280,6 +4321,13 @@ export function App() {
         }
 
         if (streamEvent.type === "usage") {
+          latestResponseUsage =
+            streamEvent.usage &&
+            streamEvent.usage.inputTokens !== null &&
+            streamEvent.usage.outputTokens !== null
+              ? streamEvent.usage
+              : null;
+          refreshRunContextUsage();
           return;
         }
 
@@ -4298,6 +4346,9 @@ export function App() {
         }
 
         if (streamEvent.type === "complete") {
+          assistantDraft = "";
+          assistantDraftReasoning = "";
+          refreshRunContextUsage();
           setChatRunFailed(chatKey, false);
           setRetryRunRequest(null);
           setPendingQuestion(null);
