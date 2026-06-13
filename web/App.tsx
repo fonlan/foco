@@ -2165,6 +2165,7 @@ export function App() {
   const contextUsageRequestIdByChatKeyRef = useRef<Map<string, number>>(
     new Map(),
   );
+  const todoGraphRequestIdRef = useRef(0);
   const selectedModelIdRef = useRef("");
   const selectedProviderIdRef = useRef("");
   const selectedThinkingLevelRef = useRef("");
@@ -2571,6 +2572,11 @@ export function App() {
 
   const loadTodoGraph = useCallback(async (workspaceId: string, chatId: string) => {
     const requestedChatKey = chatRunKey(workspaceId, chatId);
+    const requestId = todoGraphRequestIdRef.current + 1;
+    todoGraphRequestIdRef.current = requestId;
+    const isCurrentRequest = () =>
+      activeChatKeyRef.current === requestedChatKey &&
+      todoGraphRequestIdRef.current === requestId;
     setIsLoadingTodoGraph(true);
     setTodoGraphError(null);
 
@@ -2578,16 +2584,17 @@ export function App() {
       const data = await requestJson<TodoGraphResponse>(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/todo-graph`,
       );
-      if (activeChatKeyRef.current === requestedChatKey) {
+      if (isCurrentRequest()) {
         setTodoGraph(data);
+        setTodoGraphError(null);
       }
     } catch (requestError) {
-      if (activeChatKeyRef.current === requestedChatKey) {
+      if (isCurrentRequest()) {
         setTodoGraph(null);
         setTodoGraphError(errorMessage(requestError));
       }
     } finally {
-      if (activeChatKeyRef.current === requestedChatKey) {
+      if (isCurrentRequest()) {
         setIsLoadingTodoGraph(false);
       }
     }
@@ -2680,6 +2687,7 @@ export function App() {
       !activeChatId ||
       isPendingChatId(activeChatId)
     ) {
+      todoGraphRequestIdRef.current += 1;
       setTodoGraph(null);
       setTodoGraphError(null);
       setIsLoadingTodoGraph(false);

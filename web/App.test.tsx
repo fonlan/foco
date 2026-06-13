@@ -3950,6 +3950,63 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("does not keep a stale todo graph fetch error after a refresh succeeds", async () => {
+    const todoGraphRequests: Deferred<Response>[] = [];
+    const fetchMock = vi.fn(
+      (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/todo-graph") {
+          const request = deferred<Response>();
+          todoGraphRequests.push(request);
+          return request.promise;
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    render(<App />);
+
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    await waitFor(() => expect(todoGraphRequests).toHaveLength(1));
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        chatId: "chat-1",
+        type: "todoGraphRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
+    await waitFor(() => expect(todoGraphRequests).toHaveLength(2));
+
+    await act(async () => {
+      todoGraphRequests[0].reject(new TypeError("Failed to fetch"));
+    });
+    await act(async () => {
+      todoGraphRequests[1].resolve(jsonResponse(todoGraph));
+    });
+
+    expect(await screen.findByText("Inspect workspace changes")).toBeInTheDocument();
+    expect(screen.queryByText("Failed to fetch")).not.toBeInTheDocument();
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
   it("shows AI statistics and request details", async () => {
     render(<App />);
 
@@ -4506,4 +4563,21 @@ function jsonResponse(value: unknown, init?: ResponseInit) {
     status: 200,
     ...init,
   });
+}
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  reject: (reason?: unknown) => void;
+  resolve: (value: T | PromiseLike<T>) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let reject: Deferred<T>["reject"] = () => undefined;
+  let resolve: Deferred<T>["resolve"] = () => undefined;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+
+  return { promise, reject, resolve };
 }
