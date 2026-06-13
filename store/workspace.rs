@@ -307,6 +307,56 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    pub fn upsert_message_content(
+        &mut self,
+        message: NewMessage<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let metadata_json = message.metadata_json.unwrap_or("{}");
+
+        let changed = self
+            .connection
+            .execute(
+                "INSERT INTO messages
+                    (id, chat_id, role, content, sequence, created_at, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    content = excluded.content,
+                    metadata_json = excluded.metadata_json
+                 WHERE messages.chat_id = excluded.chat_id
+                    AND messages.role = excluded.role
+                    AND messages.sequence = excluded.sequence",
+                params![
+                    message.id,
+                    message.chat_id,
+                    message.role,
+                    message.content,
+                    message.sequence,
+                    now,
+                    metadata_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        if changed == 0 {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!(
+                    "message '{}' already exists with a different chat, role, or sequence",
+                    message.id
+                ),
+            });
+        }
+
+        self.connection
+            .execute(
+                "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
+                params![now, message.chat_id],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
     pub fn messages_for_chat(
         &self,
         chat_id: &str,

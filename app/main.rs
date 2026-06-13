@@ -339,6 +339,33 @@ struct ChatRunEventFrame {
     payload_json: String,
 }
 
+#[derive(Clone, Debug, Default)]
+struct StreamingAssistantDraft {
+    content: String,
+    reasoning: String,
+    status: StreamingAssistantStatus,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StreamingAssistantStatus {
+    #[default]
+    Pending,
+    Streaming,
+    Failed,
+    Cancelled,
+}
+
+impl StreamingAssistantStatus {
+    fn as_metadata_value(self) -> Option<&'static str> {
+        match self {
+            Self::Pending => None,
+            Self::Streaming => Some("streaming"),
+            Self::Failed => Some("failed"),
+            Self::Cancelled => Some("cancelled"),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ChatRunCancellation {
     tx: watch::Sender<bool>,
@@ -381,6 +408,9 @@ impl ActiveChatRunRegistry {
         run_id: String,
         workspace_id: String,
         chat_id: String,
+        assistant_message_id: String,
+        assistant_sequence: i64,
+        memories_used: Vec<ChatMemoryUsedSummary>,
         guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
     ) -> Result<ActiveChatRunRegistration, ApiError> {
         let mut runs = self
@@ -414,11 +444,15 @@ impl ActiveChatRunRegistry {
         Ok(ActiveChatRunRegistration {
             registry: self.clone(),
             run_id,
+            assistant_message_id,
+            assistant_sequence,
+            memories_used,
             cancellation,
             events,
             event_tx,
             completed_tx,
             next_sequence: 0,
+            assistant_draft: StreamingAssistantDraft::default(),
             completed: false,
         })
     }
@@ -576,11 +610,15 @@ impl ActiveChatRunRegistry {
 struct ActiveChatRunRegistration {
     registry: ActiveChatRunRegistry,
     run_id: String,
+    assistant_message_id: String,
+    assistant_sequence: i64,
+    memories_used: Vec<ChatMemoryUsedSummary>,
     cancellation: ChatRunCancellation,
     events: Arc<Mutex<Vec<ChatRunEventFrame>>>,
     event_tx: broadcast::Sender<ChatRunEventFrame>,
     completed_tx: watch::Sender<bool>,
     next_sequence: i64,
+    assistant_draft: StreamingAssistantDraft,
     completed: bool,
 }
 
@@ -618,6 +656,7 @@ impl ActiveChatRunRegistration {
                     payload_json: &event_frame.payload_json,
                 })
                 .map_err(ApiError::from_workspace_error)?;
+            self.persist_assistant_draft_for_event(&mut database, chat_id, event)?;
         }
 
         self.events
@@ -625,6 +664,73 @@ impl ActiveChatRunRegistration {
             .map_err(|_| ApiError::internal("active chat run event cache lock is poisoned"))?
             .push(event_frame.clone());
         let _ = self.event_tx.send(event_frame);
+
+        Ok(())
+    }
+
+    fn persist_assistant_draft_for_event(
+        &mut self,
+        database: &mut WorkspaceDatabase,
+        chat_id: &str,
+        event: &ChatSseEvent,
+    ) -> Result<(), ApiError> {
+        match event {
+            ChatSseEvent::TextDelta {
+                assistant_message_id,
+                delta,
+            } if assistant_message_id == &self.assistant_message_id => {
+                self.assistant_draft.content.push_str(delta);
+                self.assistant_draft.status = StreamingAssistantStatus::Streaming;
+            }
+            ChatSseEvent::ReasoningDelta {
+                assistant_message_id,
+                delta,
+            } if assistant_message_id == &self.assistant_message_id => {
+                self.assistant_draft.reasoning.push_str(delta);
+                self.assistant_draft.status = StreamingAssistantStatus::Streaming;
+            }
+            ChatSseEvent::Error { .. }
+                if self.assistant_draft.status == StreamingAssistantStatus::Streaming =>
+            {
+                self.assistant_draft.status = if self.cancellation_is_active() {
+                    StreamingAssistantStatus::Cancelled
+                } else {
+                    StreamingAssistantStatus::Failed
+                };
+            }
+            _ => return Ok(()),
+        }
+
+        self.persist_assistant_draft(database, chat_id)
+    }
+
+    fn cancellation_is_active(&self) -> bool {
+        *self.cancellation.subscribe().borrow()
+    }
+
+    fn persist_assistant_draft(
+        &mut self,
+        database: &mut WorkspaceDatabase,
+        chat_id: &str,
+    ) -> Result<(), ApiError> {
+        let reasoning = non_empty_string(&self.assistant_draft.reasoning);
+        let metadata_json = assistant_message_metadata_json(
+            reasoning.as_deref(),
+            &self.memories_used,
+            &CodeChangeStats::default(),
+            self.assistant_draft.status.as_metadata_value(),
+        )?;
+
+        database
+            .upsert_message_content(NewMessage {
+                id: &self.assistant_message_id,
+                chat_id,
+                role: "assistant",
+                content: &self.assistant_draft.content,
+                sequence: self.assistant_sequence,
+                metadata_json: Some(&metadata_json),
+            })
+            .map_err(ApiError::from_workspace_error)?;
 
         Ok(())
     }
@@ -3546,6 +3652,9 @@ async fn stream_chat_response(
         run_id.clone(),
         chat_context.workspace_id.clone(),
         chat_context.chat_id.clone(),
+        chat_context.assistant_message_id.clone(),
+        chat_context.assistant_sequence,
+        chat_context.memories_used.clone(),
         guidance_tx,
     )?;
     let subscription = state
@@ -9226,9 +9335,10 @@ fn persist_chat_result(
             assistant_reasoning,
             &context.memories_used,
             &context.code_change_stats,
+            None,
         )?;
         database
-            .insert_message(NewMessage {
+            .upsert_message_content(NewMessage {
                 id: &context.assistant_message_id,
                 chat_id: &context.chat_id,
                 role: "assistant",
@@ -16936,11 +17046,13 @@ fn assistant_message_metadata_json(
     reasoning: Option<&str>,
     memories_used: &[ChatMemoryUsedSummary],
     code_change_stats: &CodeChangeStats,
+    streaming_state: Option<&str>,
 ) -> Result<String, ApiError> {
     if reasoning.is_none()
         && memories_used.is_empty()
         && code_change_stats.additions == 0
         && code_change_stats.deletions == 0
+        && streaming_state.is_none()
     {
         return Ok("{}".to_string());
     }
@@ -16957,6 +17069,12 @@ fn assistant_message_metadata_json(
     }
     if code_change_stats.additions > 0 || code_change_stats.deletions > 0 {
         metadata.insert("codeChangeStats".to_string(), json!(code_change_stats));
+    }
+    if let Some(streaming_state) = streaming_state {
+        metadata.insert(
+            "streamingState".to_string(),
+            Value::String(streaming_state.to_string()),
+        );
     }
 
     serde_json::to_string(&Value::Object(metadata)).map_err(|source| {
@@ -19137,6 +19255,9 @@ description:
                 "run-1".to_string(),
                 "workspace-1".to_string(),
                 "chat-1".to_string(),
+                "assistant-1".to_string(),
+                1,
+                Vec::new(),
                 guidance_tx,
             )
             .expect("register active run");
@@ -19157,6 +19278,92 @@ description:
         let received = guidance_rx.try_recv().expect("guidance delivered");
         assert_eq!(received.id, guidance.id);
         assert_eq!(received.content, guidance.content);
+    }
+
+    #[test]
+    fn active_chat_run_record_event_persists_streaming_assistant_message() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-streaming-assistant-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-1", "Streaming chat")
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "Tell me something.",
+                sequence: 0,
+                metadata_json: None,
+            })
+            .expect("user message insert");
+        drop(database);
+
+        let registry = ActiveChatRunRegistry::default();
+        let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+        let mut registration = registry
+            .register(
+                "run-1".to_string(),
+                "workspace-1".to_string(),
+                "chat-1".to_string(),
+                "assistant-1".to_string(),
+                1,
+                Vec::new(),
+                guidance_tx,
+            )
+            .expect("register active run");
+
+        registration
+            .record_event(
+                &workspace_dir,
+                "chat-1",
+                &ChatSseEvent::TextDelta {
+                    assistant_message_id: "assistant-1".to_string(),
+                    delta: "Partial".to_string(),
+                },
+            )
+            .expect("text delta record");
+        registration
+            .record_event(
+                &workspace_dir,
+                "chat-1",
+                &ChatSseEvent::ReasoningDelta {
+                    assistant_message_id: "assistant-1".to_string(),
+                    delta: "Thinking".to_string(),
+                },
+            )
+            .expect("reasoning delta record");
+        registration
+            .record_event(
+                &workspace_dir,
+                "chat-1",
+                &ChatSseEvent::Error {
+                    message: "provider failed".to_string(),
+                },
+            )
+            .expect("error record");
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database reopen");
+        let messages = database
+            .messages_for_chat("chat-1")
+            .expect("messages for chat");
+        let assistant = messages
+            .iter()
+            .find(|message| message.id == "assistant-1")
+            .expect("assistant message");
+        let metadata = parse_json_value(&assistant.metadata_json, "assistant metadata")
+            .expect("assistant metadata json");
+
+        assert_eq!(assistant.content, "Partial");
+        assert_eq!(assistant.sequence, 1);
+        assert_eq!(metadata["reasoning"], "Thinking");
+        assert_eq!(metadata["streamingState"], "failed");
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }
 
     #[test]
@@ -19329,6 +19536,16 @@ description:
             database
                 .insert_chat("chat-1", "Status code chat")
                 .expect("chat insert");
+            database
+                .upsert_message_content(NewMessage {
+                    id: "assistant-1",
+                    chat_id: "chat-1",
+                    role: "assistant",
+                    content: "D",
+                    sequence: 1,
+                    metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+                })
+                .expect("streaming assistant draft insert");
         }
         let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
         let mcp_registry = Arc::new(McpRegistry::default());
@@ -19445,6 +19662,17 @@ description:
             .expect("llm request");
 
         assert_eq!(request.status_code, Some(200));
+        let assistant = database
+            .messages_for_chat("chat-1")
+            .expect("chat messages read")
+            .into_iter()
+            .find(|message| message.id == "assistant-1")
+            .expect("assistant message");
+        let metadata = parse_json_value(&assistant.metadata_json, "assistant metadata")
+            .expect("assistant metadata json");
+        assert_eq!(assistant.content, "Done.");
+        assert!(metadata.get("streamingState").is_none());
+
         let memory_database =
             MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
                 .expect("workspace memory database");
@@ -19747,6 +19975,9 @@ description:
                 "run-1".to_string(),
                 "workspace-1".to_string(),
                 "chat-1".to_string(),
+                "assistant-1".to_string(),
+                1,
+                Vec::new(),
                 guidance_tx,
             )
             .expect("register active run");

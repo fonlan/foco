@@ -463,6 +463,39 @@ fn repository_helpers_round_trip_core_records() {
     assert_eq!(messages[0].content, "Hello");
 
     database
+        .upsert_message_content(NewMessage {
+            id: "message-1",
+            chat_id: "chat-1",
+            role: "user",
+            content: "Hello again",
+            sequence: 0,
+            metadata_json: Some(r#"{"draft":true}"#),
+        })
+        .expect("message upsert update");
+    let messages = database
+        .messages_for_chat("chat-1")
+        .expect("messages for chat after upsert");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "Hello again");
+    assert_eq!(messages[0].metadata_json, r#"{"draft":true}"#);
+
+    database
+        .upsert_message_content(NewMessage {
+            id: "message-2",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Streaming reply",
+            sequence: 1,
+            metadata_json: None,
+        })
+        .expect("message upsert insert");
+    let messages = database
+        .messages_for_chat("chat-1")
+        .expect("messages for chat after inserted upsert");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].content, "Streaming reply");
+
+    database
         .insert_run_event(NewRunEvent {
             id: "event-1",
             chat_id: "chat-1",
