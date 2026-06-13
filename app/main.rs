@@ -123,6 +123,8 @@ const MAX_AGENT_TOOL_ROUNDS: usize = 128;
 const MAX_REPEATED_TOOL_CALL_BATCHES: usize = 3;
 // Number of newest chat messages kept verbatim when older history is compressed.
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
+// Number of newest in-progress tool batches kept verbatim inside a long agent run.
+const CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES: usize = 2;
 // Maximum characters kept from each covered message inside a compression snapshot summary.
 const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
 // Maximum compressed message entries shown in a single snapshot prompt summary.
@@ -4452,6 +4454,7 @@ struct ContextUsageResponse {
     compression_trigger_tokens: u64,
     compression_trigger_percent: u64,
     will_compress_on_next_send: bool,
+    token_breakdown: ContextTokenBreakdown,
 }
 
 struct PromptContextRequest {
@@ -5288,7 +5291,9 @@ struct PreparedChatContext {
     captured_llm_requests: Vec<CapturedLlmRequest>,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
+    message_context_sources: Vec<PromptContextSource>,
     active_tool_start_index: usize,
+    next_runtime_tool_batch_index: usize,
     hook_context_messages: Vec<String>,
     hook_notifications: Vec<HookNotification>,
     initial_git_diff_stats: Option<GitDiffStatsByFile>,
@@ -5308,6 +5313,7 @@ struct PreparedPromptContext {
     memories_used: Vec<ChatMemoryUsedSummary>,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
     message_source_sequences: Vec<Option<i64>>,
+    message_context_sources: Vec<PromptContextSource>,
     active_tool_start_index: usize,
     chat_id: Option<String>,
     raw_message: Option<String>,
@@ -5564,10 +5570,72 @@ struct NormalizedAiStatisticsFilters {
     offset: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PromptContextSource {
+    ReservedPrompt,
+    StableInjection,
+    TodoGraph,
+    CompressionSnapshot,
+    StoredMessage { sequence: i64 },
+    TurnMemory { sequence: i64 },
+    CurrentUser { sequence: i64 },
+    AssistantDraft,
+    HookContext,
+    Guidance,
+    RuntimeAssistant,
+    RuntimeToolState { batch_index: usize },
+    RuntimeToolStateSnapshot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PromptContextGroupKey {
+    MessageSequence(i64),
+    RuntimeToolBatch(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum PromptContextSourceBucket {
+    ReservedPrompt,
+    StableInjection,
+    TodoGraph,
+    CompressionSnapshot,
+    PersistedHistory,
+    TurnMemory,
+    CurrentUser,
+    AssistantDraft,
+    HookContext,
+    Guidance,
+    RuntimeAssistant,
+    RuntimeToolState,
+    RuntimeToolStateSnapshot,
+}
+
 struct ContextMessageGroup {
     message_indices: Vec<usize>,
     estimated_tokens: u64,
     must_keep: bool,
+    source_bucket: PromptContextSourceBucket,
+    runtime_tool_batch_index: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextTokenBreakdown {
+    required_tokens: u64,
+    optional_tokens: u64,
+    compressible_tokens: u64,
+    by_source: Vec<ContextSourceTokenBreakdown>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextSourceTokenBreakdown {
+    source: PromptContextSourceBucket,
+    tokens: u64,
+    required_tokens: u64,
+    optional_tokens: u64,
+    compressible_tokens: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -5854,6 +5922,7 @@ impl PreparedChatContext {
             append_hook_context_messages(
                 &mut self.provider_request.messages,
                 &mut self.message_source_sequences,
+                &mut self.message_context_sources,
                 &self.hook_context_messages,
             );
             self.hook_context_messages.clear();
@@ -5882,6 +5951,7 @@ impl PreparedChatContext {
                 for event in append_guidance_events(
                     &mut self.provider_request.messages,
                     &mut self.message_source_sequences,
+                    &mut self.message_context_sources,
                     &mut events,
                     drain_guidance_messages(&mut guidance_rx),
                     None,
@@ -5929,6 +5999,7 @@ impl PreparedChatContext {
                 let packed_messages = match pack_neutral_messages(
                     self.provider_request.messages.clone(),
                     &self.message_source_sequences,
+                    &self.message_context_sources,
                     &self.context_budget,
                     turn_active_tool_start_index,
                 ) {
@@ -6375,10 +6446,14 @@ impl PreparedChatContext {
                                             non_empty_string(&turn_reasoning),
                                         ));
                                         self.message_source_sequences.push(None);
+                                        self.message_context_sources.push(
+                                            PromptContextSource::RuntimeAssistant,
+                                        );
                                     }
                                     for event in append_guidance_events(
                                         &mut self.provider_request.messages,
                                         &mut self.message_source_sequences,
+                                        &mut self.message_context_sources,
                                         &mut events,
                                         guidance_messages,
                                         Some(turn_metrics.clone()),
@@ -6419,6 +6494,7 @@ impl PreparedChatContext {
                                     append_hook_context_messages(
                                         &mut self.provider_request.messages,
                                         &mut self.message_source_sequences,
+                                        &mut self.message_context_sources,
                                         &[
                                             format!("Stop hook blocked the assistant response: {reason}"),
                                             stop_summary.additional_context.join("\n"),
@@ -6783,6 +6859,7 @@ impl PreparedChatContext {
                             append_hook_context_messages(
                                 &mut self.provider_request.messages,
                                 &mut self.message_source_sequences,
+                                &mut self.message_context_sources,
                                 &batch_hook_summary.additional_context,
                             );
                             for executed_tool_call in &next_executed_tool_calls {
@@ -6824,6 +6901,8 @@ impl PreparedChatContext {
                             append_tool_state_messages(
                                 &mut self.provider_request.messages,
                                 &mut self.message_source_sequences,
+                                &mut self.message_context_sources,
+                                &mut self.next_runtime_tool_batch_index,
                                 tool_calls,
                                 &next_executed_tool_calls,
                                 turn_text,
@@ -6833,6 +6912,7 @@ impl PreparedChatContext {
                             for event in append_guidance_events(
                                 &mut self.provider_request.messages,
                                 &mut self.message_source_sequences,
+                                &mut self.message_context_sources,
                                 &mut events,
                                 next_guidance_messages_at_boundary(&mut guidance_rx).await,
                                 Some(turn_metrics.clone()),
@@ -7198,31 +7278,38 @@ async fn prepare_prompt_context(
             + 3,
     );
     let mut message_source_sequences = Vec::with_capacity(neutral_messages.capacity());
+    let mut message_context_sources = Vec::with_capacity(neutral_messages.capacity());
     neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
     message_source_sequences.push(None);
+    message_context_sources.push(PromptContextSource::ReservedPrompt);
     neutral_messages.push(neutral_text_message(
         NeutralChatRole::Developer,
         developer_prompt,
     ));
     message_source_sequences.push(None);
+    message_context_sources.push(PromptContextSource::ReservedPrompt);
     if let Some(available_tools_prompt) = available_tools_prompt {
         neutral_messages.push(neutral_text_message(
             NeutralChatRole::Developer,
             available_tools_prompt,
         ));
         message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::ReservedPrompt);
     }
     for stable_context_message in stable_context_messages.drain(..) {
         neutral_messages.push(stable_context_message);
         message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::StableInjection);
     }
     if let Some(todo_graph_context_message) = todo_graph_context_message {
         neutral_messages.push(todo_graph_context_message);
         message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::TodoGraph);
     }
     for snapshot in &compression_snapshots {
         neutral_messages.push(compression_snapshot_message(snapshot));
         message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::CompressionSnapshot);
     }
     let replay_database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
@@ -7235,11 +7322,13 @@ async fn prepare_prompt_context(
         for neutral_message in neutral_messages_from_record(&replay_database, existing_message)? {
             neutral_messages.push(neutral_message);
             message_source_sequences.push(Some(sequence));
+            message_context_sources.push(PromptContextSource::StoredMessage { sequence });
         }
         if let Some(turn_memory_messages) = existing_turn_memory_messages.get(&sequence) {
             for turn_memory_message in turn_memory_messages {
                 neutral_messages.push(turn_memory_message.clone());
                 message_source_sequences.push(Some(sequence));
+                message_context_sources.push(PromptContextSource::TurnMemory { sequence });
             }
         }
     }
@@ -7249,6 +7338,7 @@ async fn prepare_prompt_context(
             assistant_draft_reasoning,
         ));
         message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::AssistantDraft);
     }
     if message.is_some() || !attachments.is_empty() {
         neutral_messages.push(neutral_user_message(
@@ -7256,10 +7346,16 @@ async fn prepare_prompt_context(
             attachments.clone(),
         ));
         message_source_sequences.push(Some(user_sequence));
+        message_context_sources.push(PromptContextSource::CurrentUser {
+            sequence: user_sequence,
+        });
     }
     for turn_memory_message in current_turn_memory_messages {
         neutral_messages.push(turn_memory_message);
         message_source_sequences.push(Some(user_sequence));
+        message_context_sources.push(PromptContextSource::TurnMemory {
+            sequence: user_sequence,
+        });
     }
     let active_tool_start_index = neutral_messages.len();
 
@@ -7286,6 +7382,7 @@ async fn prepare_prompt_context(
         memories_used: memory_context.memories_used,
         compression_snapshots,
         message_source_sequences,
+        message_context_sources,
         active_tool_start_index,
         raw_message,
         message,
@@ -7416,6 +7513,7 @@ async fn prepare_chat_context(
         &prompt_context.model_id,
         &provider_request,
         &prompt_context.message_source_sequences,
+        &prompt_context.message_context_sources,
     )?);
     provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
     let request_body_json = serialize_provider_request(&provider_request)?;
@@ -7449,7 +7547,9 @@ async fn prepare_chat_context(
         captured_llm_requests: Vec::new(),
         compression_snapshots: prompt_context.compression_snapshots,
         message_source_sequences: prompt_context.message_source_sequences,
+        message_context_sources: prompt_context.message_context_sources,
         active_tool_start_index: prompt_context.active_tool_start_index,
+        next_runtime_tool_batch_index: 0,
         hook_context_messages,
         hook_notifications,
         initial_git_diff_stats,
@@ -8162,6 +8262,7 @@ fn prompt_cache_key(
     model_id: &str,
     request: &NeutralChatRequest,
     message_source_sequences: &[Option<i64>],
+    message_context_sources: &[PromptContextSource],
 ) -> Result<String, ApiError> {
     let mut hasher = Sha256::new();
     hasher.update(workspace_id.as_bytes());
@@ -8176,8 +8277,11 @@ fn prompt_cache_key(
         .messages
         .iter()
         .zip(message_source_sequences)
-        .take_while(|(_, source_sequence)| source_sequence.is_none())
-        .map(|(message, _)| message)
+        .zip(message_context_sources)
+        .take_while(|((_, source_sequence), source)| {
+            source_sequence.is_none() && prompt_context_source_is_stable_for_cache(source)
+        })
+        .map(|((message, _), _)| message)
         .collect::<Vec<_>>();
     let stable_messages_json = serde_json::to_string(&stable_messages).map_err(|source| {
         ApiError::internal(format!(
@@ -8196,6 +8300,16 @@ fn prompt_cache_key(
     let digest = hasher.finalize();
 
     Ok(format!("foco:{}", hex_encode(&digest[..16])))
+}
+
+fn prompt_context_source_is_stable_for_cache(source: &PromptContextSource) -> bool {
+    matches!(
+        source,
+        PromptContextSource::ReservedPrompt
+            | PromptContextSource::StableInjection
+            | PromptContextSource::TodoGraph
+            | PromptContextSource::CompressionSnapshot
+    )
 }
 
 fn memory_fts_query(text: &str) -> Option<String> {
@@ -8866,16 +8980,38 @@ fn is_wsl_environment() -> bool {
         .unwrap_or(false)
 }
 
-async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize, ApiError> {
-    if context.provider_request.messages.len() != context.message_source_sequences.len() {
+fn validate_prompt_context_lengths(
+    messages: &[NeutralChatMessage],
+    message_source_sequences: &[Option<i64>],
+    message_context_sources: &[PromptContextSource],
+) -> Result<(), ApiError> {
+    if messages.len() != message_source_sequences.len() {
         return Err(ApiError::internal(
             "context message source sequence count does not match prompt message count",
         ));
     }
+    if messages.len() != message_context_sources.len() {
+        return Err(ApiError::internal(
+            "context message source classification count does not match prompt message count",
+        ));
+    }
+
+    Ok(())
+}
+
+async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize, ApiError> {
+    validate_prompt_context_lengths(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+    )?;
+
+    let compressed_runtime_tool_state = compress_runtime_tool_state_if_needed(context, false)?;
 
     let message_groups = context_message_groups(
         &context.provider_request.messages,
         &context.message_source_sequences,
+        &context.message_context_sources,
         context.active_tool_start_index,
     )?;
     let pack_items = pack_items_from_message_groups(&message_groups);
@@ -8886,6 +9022,12 @@ async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result
         active_tool_start_group_index(&message_groups, context.active_tool_start_index),
         CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES,
     ) else {
+        if !compressed_runtime_tool_state {
+            let breakdown = context_token_breakdown(&message_groups);
+            if breakdown.required_tokens > context.context_budget.available_message_tokens {
+                compress_runtime_tool_state_if_needed(context, true)?;
+            }
+        }
         return Ok(context.active_tool_start_index);
     };
     let covered_indices = message_group_indices(&message_groups, &plan.covered_indices)?;
@@ -8933,6 +9075,7 @@ async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result
     append_hook_context_messages(
         &mut context.provider_request.messages,
         &mut context.message_source_sequences,
+        &mut context.message_context_sources,
         &pre_summary.additional_context,
     );
     if pre_summary.first_block_reason().is_some() {
@@ -9000,6 +9143,11 @@ async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result
         &context.message_source_sequences,
         &covered_indices,
     );
+    context.message_context_sources = replace_covered_sources_with_snapshot(
+        &context.message_context_sources,
+        &covered_indices,
+        PromptContextSource::CompressionSnapshot,
+    );
     context.active_tool_start_index =
         compressed_active_tool_start_index(context.active_tool_start_index, &covered_indices);
     context.compression_snapshots.push(snapshot);
@@ -9031,10 +9179,275 @@ async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result
     append_hook_context_messages(
         &mut context.provider_request.messages,
         &mut context.message_source_sequences,
+        &mut context.message_context_sources,
         &post_summary.additional_context,
     );
 
+    let message_groups = context_message_groups(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+        context.active_tool_start_index,
+    )?;
+    let breakdown = context_token_breakdown(&message_groups);
+    if breakdown.required_tokens > context.context_budget.available_message_tokens {
+        compress_runtime_tool_state_if_needed(context, true)?;
+    }
+
     Ok(context.active_tool_start_index)
+}
+
+fn compress_runtime_tool_state_if_needed(
+    context: &mut PreparedChatContext,
+    force: bool,
+) -> Result<bool, ApiError> {
+    validate_prompt_context_lengths(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+    )?;
+
+    let message_groups = context_message_groups(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &context.message_context_sources,
+        context.active_tool_start_index,
+    )?;
+    let runtime_tool_groups = message_groups
+        .iter()
+        .enumerate()
+        .filter_map(|(group_index, group)| {
+            group
+                .runtime_tool_batch_index
+                .map(|batch_index| (group_index, batch_index, group.estimated_tokens))
+        })
+        .collect::<Vec<_>>();
+
+    if runtime_tool_groups.len() <= CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES {
+        return Ok(false);
+    }
+
+    let used_tokens = message_groups
+        .iter()
+        .map(|group| group.estimated_tokens)
+        .sum::<u64>();
+    let breakdown = context_token_breakdown(&message_groups);
+    let should_compress = force
+        || used_tokens
+            > context_compression_trigger_tokens(context.context_budget.available_message_tokens)
+        || breakdown.required_tokens > context.context_budget.available_message_tokens;
+    if !should_compress {
+        return Ok(false);
+    }
+
+    let covered_tool_group_count =
+        runtime_tool_groups.len() - CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES;
+    let mut covered_group_indices = message_groups
+        .iter()
+        .enumerate()
+        .filter_map(|(group_index, group)| {
+            if group.source_bucket == PromptContextSourceBucket::RuntimeToolStateSnapshot {
+                Some(group_index)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    covered_group_indices.extend(
+        runtime_tool_groups
+            .iter()
+            .take(covered_tool_group_count)
+            .map(|(group_index, _, _)| *group_index),
+    );
+    covered_group_indices.sort_unstable();
+    covered_group_indices.dedup();
+    if covered_group_indices.is_empty() {
+        return Ok(false);
+    }
+    let covered_message_indices = message_group_indices(&message_groups, &covered_group_indices)?;
+    let original_tokens = covered_message_indices
+        .iter()
+        .map(|index| neutral_message_estimated_tokens(&context.provider_request.messages[*index]))
+        .sum::<u64>();
+    if original_tokens == 0 {
+        return Ok(false);
+    }
+
+    let summary =
+        runtime_tool_state_summary(&context.provider_request.messages, &covered_message_indices)?;
+    let summary_tokens = estimate_text_tokens(&summary);
+    if summary_tokens >= original_tokens {
+        return Ok(false);
+    }
+
+    let snapshot = neutral_text_message(NeutralChatRole::User, summary);
+    context.provider_request.messages = replace_covered_messages_with_snapshot(
+        &context.provider_request.messages,
+        &covered_message_indices,
+        snapshot,
+    );
+    context.message_source_sequences = replace_covered_sequences_with_snapshot(
+        &context.message_source_sequences,
+        &covered_message_indices,
+    );
+    context.message_context_sources = replace_covered_sources_with_snapshot(
+        &context.message_context_sources,
+        &covered_message_indices,
+        PromptContextSource::RuntimeToolStateSnapshot,
+    );
+    context.active_tool_start_index = compressed_active_tool_start_index(
+        context.active_tool_start_index,
+        &covered_message_indices,
+    );
+
+    Ok(true)
+}
+
+fn runtime_tool_state_summary(
+    messages: &[NeutralChatMessage],
+    covered_indices: &[usize],
+) -> Result<String, ApiError> {
+    let mut lines = vec![
+        "Runtime tool-state compression snapshot: older completed tool calls/results from this same in-progress run were removed from the live prompt.".to_string(),
+        "Recent tool calls remain verbatim below this snapshot.".to_string(),
+    ];
+    let mut tool_call_count = 0usize;
+    let mut tool_result_count = 0usize;
+
+    for index in covered_indices.iter().copied() {
+        let message = messages.get(index).ok_or_else(|| {
+            ApiError::internal("runtime tool compression covered message index is out of bounds")
+        })?;
+        for tool_call in &message.tool_calls {
+            tool_call_count += 1;
+            lines.push(format!(
+                "- tool call {}: {} input {}",
+                tool_call.call_id,
+                tool_call.name,
+                compact_json_for_runtime_tool_summary(&tool_call.arguments)
+            ));
+        }
+        if message.role == NeutralChatRole::Tool {
+            tool_result_count += 1;
+            let tool_name = message.tool_name.as_deref().unwrap_or("unknown_tool");
+            let call_id = message.tool_call_id.as_deref().unwrap_or("unknown_call");
+            lines.push(format!(
+                "- tool result {call_id}: {tool_name} output {}",
+                compact_tool_output_for_runtime_summary(tool_name, &message.content)
+            ));
+        } else if !message.content.trim().is_empty() && message.tool_calls.is_empty() {
+            lines.push(format!(
+                "- prior runtime note: {}",
+                truncate_for_context_snapshot(&message.content)
+            ));
+        }
+    }
+
+    lines.insert(
+        2,
+        format!("- compressed tool calls: {tool_call_count}; tool results: {tool_result_count}"),
+    );
+
+    Ok(lines.join("\n"))
+}
+
+fn compact_json_for_runtime_tool_summary(value: &Value) -> String {
+    if let Value::Object(map) = value {
+        let mut compact = serde_json::Map::new();
+        for key in [
+            "path",
+            "startLine",
+            "endLine",
+            "command",
+            "args",
+            "query",
+            "symbol",
+            "symbolId",
+            "scope",
+            "taskId",
+            "status",
+            "timeoutMs",
+        ] {
+            if let Some(value) = map.get(key) {
+                compact.insert(key.to_string(), compact_large_json_value(value));
+            }
+        }
+        if let Some(content) = map.get("content").and_then(Value::as_str) {
+            compact.insert(
+                "contentSummary".to_string(),
+                json!({
+                    "chars": content.chars().count(),
+                    "preview": truncate_for_context_snapshot(content),
+                }),
+            );
+        }
+        if !compact.is_empty() {
+            return Value::Object(compact).to_string();
+        }
+    }
+
+    truncate_for_context_snapshot(&value.to_string())
+}
+
+fn compact_large_json_value(value: &Value) -> Value {
+    match value {
+        Value::String(text) if text.chars().count() > CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS => {
+            json!({
+                "chars": text.chars().count(),
+                "preview": truncate_for_context_snapshot(text),
+            })
+        }
+        Value::Array(values) if values.len() > 12 => json!({
+            "items": values.len(),
+            "preview": values.iter().take(12).cloned().collect::<Vec<_>>(),
+        }),
+        other => other.clone(),
+    }
+}
+
+fn compact_tool_output_for_runtime_summary(tool_name: &str, content: &str) -> String {
+    match serde_json::from_str::<Value>(content) {
+        Ok(Value::Object(map)) => {
+            let mut compact = serde_json::Map::new();
+            for key in [
+                "path",
+                "bytes",
+                "truncated",
+                "exitCode",
+                "status",
+                "timeoutMs",
+                "exists",
+            ] {
+                if let Some(value) = map.get(key) {
+                    compact.insert(key.to_string(), compact_large_json_value(value));
+                }
+            }
+            if let Some(output_content) = map.get("content").and_then(Value::as_str) {
+                compact.insert(
+                    "contentSummary".to_string(),
+                    json!({
+                        "chars": output_content.chars().count(),
+                        "preview": truncate_for_context_snapshot(output_content),
+                    }),
+                );
+            }
+            for key in ["stdout", "stderr", "text", "summary"] {
+                if let Some(value) = map.get(key) {
+                    compact.insert(key.to_string(), compact_large_json_value(value));
+                }
+            }
+            if !compact.is_empty() {
+                Value::Object(compact).to_string()
+            } else {
+                format!(
+                    "{} result {}",
+                    tool_name,
+                    truncate_for_context_snapshot(content)
+                )
+            }
+        }
+        _ => truncate_for_context_snapshot(content),
+    }
 }
 
 fn snapshot_covered_sequences(snapshots: &[ContextCompressionSnapshotRecord]) -> HashSet<i64> {
@@ -9268,6 +9681,30 @@ fn replace_covered_sequences_with_snapshot(
     next_sequences
 }
 
+fn replace_covered_sources_with_snapshot(
+    message_context_sources: &[PromptContextSource],
+    covered_indices: &[usize],
+    snapshot_source: PromptContextSource,
+) -> Vec<PromptContextSource> {
+    let covered = covered_indices.iter().copied().collect::<HashSet<_>>();
+    let first_covered = covered_indices.first().copied();
+    let mut next_sources = Vec::with_capacity(message_context_sources.len() - covered.len() + 1);
+
+    for (index, source) in message_context_sources.iter().enumerate() {
+        if Some(index) == first_covered {
+            next_sources.push(snapshot_source.clone());
+        }
+
+        if covered.contains(&index) {
+            continue;
+        }
+
+        next_sources.push(source.clone());
+    }
+
+    next_sources
+}
+
 fn compressed_active_tool_start_index(
     active_tool_start_index: usize,
     covered_indices: &[usize],
@@ -9277,7 +9714,11 @@ fn compressed_active_tool_start_index(
         .filter(|index| **index < active_tool_start_index)
         .count();
 
-    active_tool_start_index - removed_before_active_tool + 1
+    let inserted_before_active_tool = covered_indices
+        .first()
+        .is_some_and(|index| *index < active_tool_start_index);
+
+    active_tool_start_index - removed_before_active_tool + usize::from(inserted_before_active_tool)
 }
 
 fn next_context_snapshot_sequence(
@@ -11245,11 +11686,17 @@ fn estimate_tool_schema_tokens(tools: &[NeutralToolDefinition]) -> u64 {
 fn context_message_groups(
     messages: &[NeutralChatMessage],
     message_source_sequences: &[Option<i64>],
+    message_context_sources: &[PromptContextSource],
     active_tool_start_index: usize,
 ) -> Result<Vec<ContextMessageGroup>, ApiError> {
     if messages.len() != message_source_sequences.len() {
         return Err(ApiError::internal(
             "context message source sequence count does not match prompt message count",
+        ));
+    }
+    if messages.len() != message_context_sources.len() {
+        return Err(ApiError::internal(
+            "context message source classification count does not match prompt message count",
         ));
     }
 
@@ -11261,10 +11708,19 @@ fn context_message_groups(
 
     while index < messages.len() {
         let source_sequence = message_source_sequences[index];
+        let group_key = prompt_context_group_key(&message_context_sources[index]);
         let mut message_indices = vec![index];
         index += 1;
 
-        if source_sequence.is_some() {
+        if let Some(group_key) = group_key {
+            while index < messages.len()
+                && prompt_context_group_key(&message_context_sources[index]).as_ref()
+                    == Some(&group_key)
+            {
+                message_indices.push(index);
+                index += 1;
+            }
+        } else if source_sequence.is_some() {
             while index < messages.len() && message_source_sequences[index] == source_sequence {
                 message_indices.push(index);
                 index += 1;
@@ -11274,17 +11730,28 @@ fn context_message_groups(
         let estimated_tokens = message_indices
             .iter()
             .map(|message_index| {
-                if *message_index == 0 {
+                if matches!(
+                    message_context_sources[*message_index],
+                    PromptContextSource::ReservedPrompt
+                ) {
                     0
                 } else {
                     neutral_message_estimated_tokens(&messages[*message_index])
                 }
             })
             .sum();
+        let source_bucket =
+            prompt_context_source_bucket(&message_context_sources[message_indices[0]]);
+        let runtime_tool_batch_index = message_indices.iter().find_map(|message_index| {
+            match message_context_sources[*message_index] {
+                PromptContextSource::RuntimeToolState { batch_index } => Some(batch_index),
+                _ => None,
+            }
+        });
         let must_keep = message_indices.iter().any(|message_index| {
             messages[*message_index].role == NeutralChatRole::System
                 || messages[*message_index].role == NeutralChatRole::Developer
-                || message_source_sequences[*message_index].is_none()
+                || prompt_context_source_is_required(&message_context_sources[*message_index])
                 || Some(*message_index) == latest_user_index
                 || *message_index >= active_tool_start_index
         });
@@ -11293,10 +11760,54 @@ fn context_message_groups(
             message_indices,
             estimated_tokens,
             must_keep,
+            source_bucket,
+            runtime_tool_batch_index,
         });
     }
 
     Ok(groups)
+}
+
+fn prompt_context_group_key(source: &PromptContextSource) -> Option<PromptContextGroupKey> {
+    match source {
+        PromptContextSource::StoredMessage { sequence }
+        | PromptContextSource::TurnMemory { sequence } => {
+            Some(PromptContextGroupKey::MessageSequence(*sequence))
+        }
+        PromptContextSource::RuntimeToolState { batch_index } => {
+            Some(PromptContextGroupKey::RuntimeToolBatch(*batch_index))
+        }
+        _ => None,
+    }
+}
+
+fn prompt_context_source_bucket(source: &PromptContextSource) -> PromptContextSourceBucket {
+    match source {
+        PromptContextSource::ReservedPrompt => PromptContextSourceBucket::ReservedPrompt,
+        PromptContextSource::StableInjection => PromptContextSourceBucket::StableInjection,
+        PromptContextSource::TodoGraph => PromptContextSourceBucket::TodoGraph,
+        PromptContextSource::CompressionSnapshot => PromptContextSourceBucket::CompressionSnapshot,
+        PromptContextSource::StoredMessage { .. } => PromptContextSourceBucket::PersistedHistory,
+        PromptContextSource::TurnMemory { .. } => PromptContextSourceBucket::TurnMemory,
+        PromptContextSource::CurrentUser { .. } => PromptContextSourceBucket::CurrentUser,
+        PromptContextSource::AssistantDraft => PromptContextSourceBucket::AssistantDraft,
+        PromptContextSource::HookContext => PromptContextSourceBucket::HookContext,
+        PromptContextSource::Guidance => PromptContextSourceBucket::Guidance,
+        PromptContextSource::RuntimeAssistant => PromptContextSourceBucket::RuntimeAssistant,
+        PromptContextSource::RuntimeToolState { .. } => PromptContextSourceBucket::RuntimeToolState,
+        PromptContextSource::RuntimeToolStateSnapshot => {
+            PromptContextSourceBucket::RuntimeToolStateSnapshot
+        }
+    }
+}
+
+fn prompt_context_source_is_required(source: &PromptContextSource) -> bool {
+    !matches!(
+        source,
+        PromptContextSource::StoredMessage { .. }
+            | PromptContextSource::TurnMemory { .. }
+            | PromptContextSource::RuntimeToolState { .. }
+    )
 }
 
 fn pack_items_from_message_groups(groups: &[ContextMessageGroup]) -> Vec<ContextPackItem> {
@@ -11311,6 +11822,136 @@ fn pack_items_from_message_groups(groups: &[ContextMessageGroup]) -> Vec<Context
         .collect()
 }
 
+fn context_token_breakdown(groups: &[ContextMessageGroup]) -> ContextTokenBreakdown {
+    const SOURCES: &[PromptContextSourceBucket] = &[
+        PromptContextSourceBucket::ReservedPrompt,
+        PromptContextSourceBucket::StableInjection,
+        PromptContextSourceBucket::TodoGraph,
+        PromptContextSourceBucket::CompressionSnapshot,
+        PromptContextSourceBucket::PersistedHistory,
+        PromptContextSourceBucket::TurnMemory,
+        PromptContextSourceBucket::CurrentUser,
+        PromptContextSourceBucket::AssistantDraft,
+        PromptContextSourceBucket::HookContext,
+        PromptContextSourceBucket::Guidance,
+        PromptContextSourceBucket::RuntimeAssistant,
+        PromptContextSourceBucket::RuntimeToolState,
+        PromptContextSourceBucket::RuntimeToolStateSnapshot,
+    ];
+
+    let mut by_source = SOURCES
+        .iter()
+        .copied()
+        .map(|source| ContextSourceTokenBreakdown {
+            source,
+            tokens: 0,
+            required_tokens: 0,
+            optional_tokens: 0,
+            compressible_tokens: 0,
+        })
+        .collect::<Vec<_>>();
+
+    for group in groups {
+        let entry = by_source
+            .iter_mut()
+            .find(|entry| entry.source == group.source_bucket)
+            .expect("all prompt context source buckets must be listed");
+        entry.tokens = entry.tokens.saturating_add(group.estimated_tokens);
+        if group.must_keep {
+            entry.required_tokens = entry.required_tokens.saturating_add(group.estimated_tokens);
+        } else {
+            entry.optional_tokens = entry.optional_tokens.saturating_add(group.estimated_tokens);
+        }
+        if context_group_is_compressible(group) {
+            entry.compressible_tokens = entry
+                .compressible_tokens
+                .saturating_add(group.estimated_tokens);
+        }
+    }
+
+    by_source.retain(|entry| {
+        entry.tokens > 0 || entry.source == PromptContextSourceBucket::ReservedPrompt
+    });
+    let required_tokens = by_source
+        .iter()
+        .map(|entry| entry.required_tokens)
+        .sum::<u64>();
+    let optional_tokens = by_source
+        .iter()
+        .map(|entry| entry.optional_tokens)
+        .sum::<u64>();
+    let compressible_tokens = by_source
+        .iter()
+        .map(|entry| entry.compressible_tokens)
+        .sum::<u64>();
+
+    ContextTokenBreakdown {
+        required_tokens,
+        optional_tokens,
+        compressible_tokens,
+        by_source,
+    }
+}
+
+fn context_group_is_compressible(group: &ContextMessageGroup) -> bool {
+    group.estimated_tokens > 0
+        && matches!(
+            group.source_bucket,
+            PromptContextSourceBucket::PersistedHistory
+                | PromptContextSourceBucket::TurnMemory
+                | PromptContextSourceBucket::RuntimeToolState
+                | PromptContextSourceBucket::CompressionSnapshot
+        )
+}
+
+fn required_context_overflow_error(
+    required_tokens: u64,
+    available_tokens: u64,
+    breakdown: &ContextTokenBreakdown,
+) -> ApiError {
+    ApiError::bad_request(format!(
+        "required context messages need {required_tokens} tokens but only {available_tokens} are available; breakdown: {}",
+        context_breakdown_summary(breakdown)
+    ))
+}
+
+fn context_breakdown_summary(breakdown: &ContextTokenBreakdown) -> String {
+    breakdown
+        .by_source
+        .iter()
+        .filter(|entry| entry.tokens > 0 || entry.required_tokens > 0)
+        .map(|entry| {
+            format!(
+                "{} total={} required={} optional={} compressible={}",
+                prompt_context_source_bucket_label(entry.source),
+                entry.tokens,
+                entry.required_tokens,
+                entry.optional_tokens,
+                entry.compressible_tokens
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn prompt_context_source_bucket_label(source: PromptContextSourceBucket) -> &'static str {
+    match source {
+        PromptContextSourceBucket::ReservedPrompt => "reservedPrompt",
+        PromptContextSourceBucket::StableInjection => "stableInjection",
+        PromptContextSourceBucket::TodoGraph => "todoGraph",
+        PromptContextSourceBucket::CompressionSnapshot => "compressionSnapshot",
+        PromptContextSourceBucket::PersistedHistory => "persistedHistory",
+        PromptContextSourceBucket::TurnMemory => "turnMemory",
+        PromptContextSourceBucket::CurrentUser => "currentUser",
+        PromptContextSourceBucket::AssistantDraft => "assistantDraft",
+        PromptContextSourceBucket::HookContext => "hookContext",
+        PromptContextSourceBucket::Guidance => "guidance",
+        PromptContextSourceBucket::RuntimeAssistant => "runtimeAssistant",
+        PromptContextSourceBucket::RuntimeToolState => "runtimeToolState",
+        PromptContextSourceBucket::RuntimeToolStateSnapshot => "runtimeToolStateSnapshot",
+    }
+}
+
 fn context_usage_response(
     context: &PreparedPromptContext,
     latest_response_usage: Option<&NeutralUsage>,
@@ -11318,6 +11959,7 @@ fn context_usage_response(
     let message_groups = context_message_groups(
         &context.provider_request.messages,
         &context.message_source_sequences,
+        &context.message_context_sources,
         context.active_tool_start_index,
     )?;
     let pack_items = pack_items_from_message_groups(&message_groups);
@@ -11334,6 +11976,7 @@ fn context_usage_response(
     let usage_percent = percentage_ceil(used_message_tokens, available_message_tokens);
     let compression_trigger_percent =
         percentage_ceil(compression_trigger_tokens, available_message_tokens);
+    let token_breakdown = context_token_breakdown(&message_groups);
     let will_compress_on_next_send = plan_context_compression(
         &pack_items,
         available_message_tokens,
@@ -11351,6 +11994,7 @@ fn context_usage_response(
         compression_trigger_tokens,
         compression_trigger_percent,
         will_compress_on_next_send,
+        token_breakdown,
     })
 }
 
@@ -11430,6 +12074,7 @@ fn message_group_indices(
 fn pack_neutral_messages(
     messages: Vec<NeutralChatMessage>,
     message_source_sequences: &[Option<i64>],
+    message_context_sources: &[PromptContextSource],
     budget: &foco_agent::ContextBudget,
     active_tool_start_index: usize,
 ) -> Result<Vec<NeutralChatMessage>, ApiError> {
@@ -11439,9 +12084,21 @@ fn pack_neutral_messages(
         ));
     }
 
-    let message_groups =
-        context_message_groups(&messages, message_source_sequences, active_tool_start_index)?;
+    let message_groups = context_message_groups(
+        &messages,
+        message_source_sequences,
+        message_context_sources,
+        active_tool_start_index,
+    )?;
     let pack_items = pack_items_from_message_groups(&message_groups);
+    let breakdown = context_token_breakdown(&message_groups);
+    if breakdown.required_tokens > budget.available_message_tokens {
+        return Err(required_context_overflow_error(
+            breakdown.required_tokens,
+            budget.available_message_tokens,
+            &breakdown,
+        ));
+    }
     let packed = pack_context(&pack_items, budget.available_message_tokens)
         .map_err(|source| ApiError::bad_request(source.to_string()))?;
 
@@ -12693,11 +13350,16 @@ fn non_empty_trimmed(value: String, field_name: &str) -> Result<String, ApiError
 fn append_tool_state_messages(
     messages: &mut Vec<NeutralChatMessage>,
     message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
+    next_runtime_tool_batch_index: &mut usize,
     tool_calls: Vec<NeutralToolCall>,
     tool_results: &[ExecutedToolCall],
     assistant_text: String,
     assistant_reasoning: Option<String>,
 ) {
+    let batch_index = *next_runtime_tool_batch_index;
+    *next_runtime_tool_batch_index = next_runtime_tool_batch_index.saturating_add(1);
+
     for message in interleaved_tool_state_messages(
         tool_calls,
         tool_results,
@@ -12706,12 +13368,14 @@ fn append_tool_state_messages(
     ) {
         messages.push(message);
         message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::RuntimeToolState { batch_index });
     }
 }
 
 fn append_hook_context_messages(
     messages: &mut Vec<NeutralChatMessage>,
     message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
     contexts: &[String],
 ) {
     for context in contexts.iter().filter(|context| !context.trim().is_empty()) {
@@ -12720,12 +13384,14 @@ fn append_hook_context_messages(
             format!("Hook additional context:\n\n{}", context.trim()),
         ));
         message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::HookContext);
     }
 }
 
 fn append_guidance_message(
     messages: &mut Vec<NeutralChatMessage>,
     message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
     guidance: &GuidanceMessage,
 ) {
     messages.push(neutral_user_message(
@@ -12736,6 +13402,7 @@ fn append_guidance_message(
         guidance.attachments.clone(),
     ));
     message_source_sequences.push(None);
+    message_context_sources.push(PromptContextSource::Guidance);
 }
 
 fn drain_guidance_messages(
@@ -12768,6 +13435,7 @@ async fn next_guidance_messages_at_boundary(
 fn append_guidance_events(
     messages: &mut Vec<NeutralChatMessage>,
     message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
     events: &mut Vec<CapturedAuditEvent>,
     guidance_messages: Vec<GuidanceMessage>,
     interrupted_assistant_metrics: Option<ChatReplyMetrics>,
@@ -12776,7 +13444,12 @@ fn append_guidance_events(
     guidance_messages
         .into_iter()
         .map(|guidance| {
-            append_guidance_message(messages, message_source_sequences, &guidance);
+            append_guidance_message(
+                messages,
+                message_source_sequences,
+                message_context_sources,
+                &guidance,
+            );
             let event = ChatSseEvent::GuidanceApplied {
                 id: guidance.id,
                 content: guidance.content,
@@ -18091,6 +18764,74 @@ mod tests {
             .expect("available tools message")
     }
 
+    fn test_prepared_chat_context(
+        workspace_dir: PathBuf,
+        messages: Vec<NeutralChatMessage>,
+        message_source_sequences: Vec<Option<i64>>,
+        message_context_sources: Vec<PromptContextSource>,
+        available_message_tokens: u64,
+    ) -> PreparedChatContext {
+        let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
+        let mcp_registry = Arc::new(McpRegistry::default());
+
+        PreparedChatContext {
+            workspace_id: "workspace-1".to_string(),
+            workspace_path: workspace_dir.clone(),
+            memory_database_file: workspace_dir.join("global-memory.sqlite"),
+            chat_id: "chat-1".to_string(),
+            provider_id: "openai-responses".to_string(),
+            model_id: "gpt-5.4".to_string(),
+            user_message_id: "user-1".to_string(),
+            assistant_message_id: "assistant-1".to_string(),
+            llm_request_id: "request-1".to_string(),
+            assistant_sequence: 1,
+            provider_config: ProviderConnectionConfig {
+                kind: foco_providers::ProviderKind::OpenAiResponses,
+                base_url: None,
+                api_key: Some("test-key".to_string()),
+                proxy_url: None,
+            },
+            provider_request: NeutralChatRequest {
+                model_id: "gpt-5.4".to_string(),
+                messages,
+                tools: Vec::new(),
+                thinking_level: None,
+                max_output_tokens: Some(16),
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+            },
+            hook_runtime: HookRuntime::new(mcp_registry.clone()),
+            global_hooks: HookConfig::default(),
+            mcp_registry,
+            question_registry: QuestionRegistry::default(),
+            tool_resource_locks: ToolResourceLockRegistry::default(),
+            app_shutdown_rx,
+            context_budget: foco_agent::ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 16,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens,
+            },
+            global_config: GlobalConfig::first_run(workspace_dir),
+            memory_settings: MemorySettings::default(),
+            memories_used: Vec::new(),
+            memory_target_status: MemoryStatus::Pending,
+            request_body_json: "{}".to_string(),
+            captured_llm_requests: Vec::new(),
+            compression_snapshots: Vec::new(),
+            message_source_sequences,
+            message_context_sources,
+            active_tool_start_index: 1,
+            next_runtime_tool_batch_index: 0,
+            hook_context_messages: Vec::new(),
+            hook_notifications: Vec::new(),
+            initial_git_diff_stats: None,
+            code_change_stats: CodeChangeStats::default(),
+        }
+    }
+
     #[tokio::test]
     async fn tool_resource_registry_blocks_same_file_read_write() {
         let registry = ToolResourceLockRegistry::default();
@@ -19016,6 +19757,8 @@ description:
     fn append_tool_state_messages_interleaves_each_tool_call_and_result() {
         let mut messages = Vec::new();
         let mut message_source_sequences = Vec::new();
+        let mut message_context_sources = Vec::new();
+        let mut next_runtime_tool_batch_index = 0;
         let tool_calls = vec![
             NeutralToolCall {
                 call_id: "call-1".to_string(),
@@ -19054,6 +19797,8 @@ description:
         append_tool_state_messages(
             &mut messages,
             &mut message_source_sequences,
+            &mut message_context_sources,
+            &mut next_runtime_tool_batch_index,
             tool_calls,
             &tool_results,
             "Checking files.".to_string(),
@@ -19083,6 +19828,194 @@ description:
         );
         assert!(messages[2].content.is_empty());
         assert_eq!(message_source_sequences, vec![None, None, None, None]);
+        assert_eq!(
+            message_context_sources,
+            vec![
+                PromptContextSource::RuntimeToolState { batch_index: 0 },
+                PromptContextSource::RuntimeToolState { batch_index: 0 },
+                PromptContextSource::RuntimeToolState { batch_index: 0 },
+                PromptContextSource::RuntimeToolState { batch_index: 0 },
+            ]
+        );
+        assert_eq!(next_runtime_tool_batch_index, 1);
+    }
+
+    #[test]
+    fn context_message_groups_do_not_double_count_reserved_prompt_tokens() {
+        let messages = vec![
+            neutral_text_message(NeutralChatRole::System, "system prompt".repeat(100)),
+            neutral_text_message(NeutralChatRole::Developer, "developer prompt".repeat(100)),
+            neutral_text_message(NeutralChatRole::Developer, "tools prompt".repeat(100)),
+            neutral_text_message(NeutralChatRole::User, "hello".to_string()),
+        ];
+        let message_source_sequences = vec![None, None, None, Some(0)];
+        let message_context_sources = vec![
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::CurrentUser { sequence: 0 },
+        ];
+
+        let groups = context_message_groups(
+            &messages,
+            &message_source_sequences,
+            &message_context_sources,
+            messages.len(),
+        )
+        .expect("message groups");
+        let reserved_tokens = groups
+            .iter()
+            .filter(|group| group.source_bucket == PromptContextSourceBucket::ReservedPrompt)
+            .map(|group| group.estimated_tokens)
+            .sum::<u64>();
+        let breakdown = context_token_breakdown(&groups);
+
+        assert_eq!(reserved_tokens, 0);
+        assert_eq!(
+            breakdown
+                .by_source
+                .iter()
+                .find(|entry| entry.source == PromptContextSourceBucket::ReservedPrompt)
+                .expect("reserved prompt breakdown")
+                .required_tokens,
+            0
+        );
+    }
+
+    #[test]
+    fn compress_runtime_tool_state_keeps_recent_batches_verbatim() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-runtime-tool-compress-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut context = test_prepared_chat_context(
+            workspace_dir.clone(),
+            vec![neutral_text_message(
+                NeutralChatRole::System,
+                "system".to_string(),
+            )],
+            vec![None],
+            vec![PromptContextSource::ReservedPrompt],
+            80,
+        );
+        context.active_tool_start_index = context.provider_request.messages.len();
+
+        for batch_index in 0..4 {
+            let call_id = format!("call-{batch_index}");
+            let tool_calls = vec![NeutralToolCall {
+                call_id: call_id.clone(),
+                name: "read_file".to_string(),
+                arguments: json!({
+                    "path": "app/main.rs",
+                    "startLine": batch_index * 10 + 1,
+                    "endLine": batch_index * 10 + 10,
+                    "timeoutMs": 10000
+                }),
+                thought_signatures: None,
+            }];
+            let tool_results = vec![ExecutedToolCall {
+                id: call_id,
+                name: "read_file".to_string(),
+                input: tool_calls[0].arguments.clone(),
+                output: json!({
+                    "path": "app/main.rs",
+                    "bytes": 40_000,
+                    "content": "x".repeat(2_000),
+                    "timeoutMs": 10000
+                }),
+                is_error: false,
+                started_at: "2026-06-13T09:00:00Z".to_string(),
+                completed_at: "2026-06-13T09:00:01Z".to_string(),
+            }];
+            append_tool_state_messages(
+                &mut context.provider_request.messages,
+                &mut context.message_source_sequences,
+                &mut context.message_context_sources,
+                &mut context.next_runtime_tool_batch_index,
+                tool_calls,
+                &tool_results,
+                String::new(),
+                None,
+            );
+        }
+
+        assert!(
+            compress_runtime_tool_state_if_needed(&mut context, true).expect("runtime compression")
+        );
+        let snapshot_count = context
+            .message_context_sources
+            .iter()
+            .filter(|source| matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+            .count();
+        let remaining_tool_messages = context
+            .provider_request
+            .messages
+            .iter()
+            .filter(|message| message.role == NeutralChatRole::Tool)
+            .count();
+        let remaining_batch_indices = context
+            .message_context_sources
+            .iter()
+            .filter_map(|source| match source {
+                PromptContextSource::RuntimeToolState { batch_index } => Some(*batch_index),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(snapshot_count, 1);
+        assert_eq!(
+            remaining_tool_messages,
+            CONTEXT_COMPRESSION_PRESERVE_RECENT_TOOL_BATCHES
+        );
+        assert_eq!(remaining_batch_indices, BTreeSet::from([2, 3]));
+        assert!(context.provider_request.messages.iter().any(|message| {
+            message
+                .content
+                .contains("Runtime tool-state compression snapshot")
+        }));
+
+        for batch_index in 4..6 {
+            let call_id = format!("call-{batch_index}");
+            let tool_calls = vec![NeutralToolCall {
+                call_id: call_id.clone(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "app/main.rs", "timeoutMs": 10000 }),
+                thought_signatures: None,
+            }];
+            let tool_results = vec![ExecutedToolCall {
+                id: call_id,
+                name: "read_file".to_string(),
+                input: tool_calls[0].arguments.clone(),
+                output: json!({
+                    "path": "app/main.rs",
+                    "bytes": 40_000,
+                    "content": "y".repeat(2_000),
+                    "timeoutMs": 10000
+                }),
+                is_error: false,
+                started_at: "2026-06-13T09:00:00Z".to_string(),
+                completed_at: "2026-06-13T09:00:01Z".to_string(),
+            }];
+            append_tool_state_messages(
+                &mut context.provider_request.messages,
+                &mut context.message_source_sequences,
+                &mut context.message_context_sources,
+                &mut context.next_runtime_tool_batch_index,
+                tool_calls,
+                &tool_results,
+                String::new(),
+                None,
+            );
+        }
+        assert!(
+            compress_runtime_tool_state_if_needed(&mut context, true).expect("second compression")
+        );
+        let snapshot_count = context
+            .message_context_sources
+            .iter()
+            .filter(|source| matches!(source, PromptContextSource::RuntimeToolStateSnapshot))
+            .count();
+        assert_eq!(snapshot_count, 1);
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     }
 
     #[test]
@@ -19625,7 +20558,9 @@ description:
             captured_llm_requests: Vec::new(),
             compression_snapshots: Vec::new(),
             message_source_sequences: vec![Some(0)],
+            message_context_sources: vec![PromptContextSource::StoredMessage { sequence: 0 }],
             active_tool_start_index: 1,
+            next_runtime_tool_batch_index: 0,
             hook_context_messages: Vec::new(),
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
@@ -19786,7 +20721,9 @@ description:
             ],
             compression_snapshots: Vec::new(),
             message_source_sequences: vec![Some(0)],
+            message_context_sources: vec![PromptContextSource::StoredMessage { sequence: 0 }],
             active_tool_start_index: 1,
+            next_runtime_tool_batch_index: 0,
             hook_context_messages: Vec::new(),
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
@@ -19913,7 +20850,9 @@ description:
             captured_llm_requests: Vec::new(),
             compression_snapshots: Vec::new(),
             message_source_sequences: vec![Some(0)],
+            message_context_sources: vec![PromptContextSource::StoredMessage { sequence: 0 }],
             active_tool_start_index: 1,
+            next_runtime_tool_batch_index: 0,
             hook_context_messages: Vec::new(),
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
@@ -21108,8 +22047,20 @@ description:
             neutral_text_message(NeutralChatRole::User, "latest".to_string()),
         ];
         let message_source_sequences = vec![None, Some(0), Some(1), Some(1), Some(2)];
-        let groups = context_message_groups(&messages, &message_source_sequences, messages.len())
-            .expect("message groups");
+        let message_context_sources = vec![
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::StoredMessage { sequence: 0 },
+            PromptContextSource::StoredMessage { sequence: 1 },
+            PromptContextSource::StoredMessage { sequence: 1 },
+            PromptContextSource::CurrentUser { sequence: 2 },
+        ];
+        let groups = context_message_groups(
+            &messages,
+            &message_source_sequences,
+            &message_context_sources,
+            messages.len(),
+        )
+        .expect("message groups");
         let required_tokens = groups
             .iter()
             .filter(|group| group.must_keep)
@@ -21132,6 +22083,7 @@ description:
         let packed = pack_neutral_messages(
             messages.clone(),
             &message_source_sequences,
+            &message_context_sources,
             &tight_budget,
             messages.len(),
         )
@@ -21150,6 +22102,7 @@ description:
         let packed = pack_neutral_messages(
             messages,
             &message_source_sequences,
+            &message_context_sources,
             &full_budget,
             message_source_sequences.len(),
         )
