@@ -2,6 +2,10 @@ use std::{fs, thread, time::Duration};
 
 use foco_store::{
     config::WorkspaceConfig,
+    memory::{
+        MemoryDatabase, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact,
+        NewMemorySource,
+    },
     workspace::{
         LlmRequestAuditFilters, LlmRequestRecord, NewCodeGraphEdge, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
@@ -281,6 +285,129 @@ fn chat_memory_facts_cascade_when_chat_is_deleted() {
     assert_eq!(table_count(&connection, "memory_fact_sources"), 0);
     assert_eq!(table_count(&connection, "memory_fts_data"), 0);
     assert_eq!(table_count(&connection, "memory_fts_index"), 0);
+}
+
+#[test]
+fn chat_statistics_memory_sources_follow_message_and_tool_references() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Statistics chat")
+        .expect("chat insert");
+    database
+        .insert_chat("chat-2", "Other chat")
+        .expect("second chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Read the file.",
+            sequence: 0,
+            metadata_json: Some("{}"),
+        })
+        .expect("assistant message insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-2",
+            chat_id: "chat-2",
+            role: "assistant",
+            content: "Other chat.",
+            sequence: 0,
+            metadata_json: Some("{}"),
+        })
+        .expect("other assistant message insert");
+    database
+        .insert_tool_call(NewToolCall {
+            id: "tool-call-1",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md"}"#,
+            status: "completed",
+            started_at: "2026-06-10T00:00:00Z",
+            completed_at: Some("2026-06-10T00:00:01Z"),
+        })
+        .expect("tool call insert");
+
+    let tool_counts = database
+        .tool_call_counts_for_chat("chat-1")
+        .expect("tool count");
+    assert_eq!(tool_counts.len(), 1);
+    assert_eq!(tool_counts[0].tool_name, "read_file");
+    assert_eq!(tool_counts[0].call_count, 1);
+    drop(database);
+
+    let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+        .expect("memory database");
+    for (source_id, source_type, source_ref, content) in [
+        (
+            "source-message",
+            MemorySourceType::AssistantMessage,
+            "assistant-1",
+            "Assistant evidence.",
+        ),
+        (
+            "source-tool",
+            MemorySourceType::ToolCall,
+            "tool-call-1",
+            "Tool evidence.",
+        ),
+        (
+            "source-other",
+            MemorySourceType::AssistantMessage,
+            "assistant-2",
+            "Other evidence.",
+        ),
+    ] {
+        memory
+            .insert_source(NewMemorySource {
+                id: source_id,
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                source_type,
+                source_id: Some(source_ref),
+                title: source_id,
+                content,
+                metadata_json: "{}",
+            })
+            .expect("memory source insert");
+    }
+    for (fact_id, source_id, fact) in [
+        (
+            "fact-message",
+            "source-message",
+            "Remember assistant evidence.",
+        ),
+        ("fact-tool", "source-tool", "Remember tool evidence."),
+        ("fact-other", "source-other", "Remember other evidence."),
+    ] {
+        memory
+            .insert_fact(NewMemoryFact {
+                id: fact_id,
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::ProjectFact,
+                fact,
+                confidence: Some(1.0),
+                pinned: false,
+                source_ids: &[source_id],
+                metadata_json: "{}",
+            })
+            .expect("memory fact insert");
+    }
+
+    let fact_ids = memory
+        .facts_created_from_chat_sources("chat-1")
+        .expect("chat source facts")
+        .into_iter()
+        .map(|fact| fact.id)
+        .collect::<Vec<_>>();
+    assert_eq!(fact_ids, vec!["fact-message", "fact-tool"]);
 }
 
 #[test]

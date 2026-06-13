@@ -757,9 +757,79 @@ const contextUsage = {
   compressionTriggerTokens: 88768,
   memoryBudgetTokens: 13315,
   memoryContextTokens: 120,
+  tokenBreakdown: {
+    bySource: [
+      {
+        compressibleTokens: 32000,
+        optionalTokens: 32000,
+        requiredTokens: 0,
+        source: "persistedHistory",
+        tokens: 32000,
+      },
+      {
+        compressibleTokens: 120,
+        optionalTokens: 120,
+        requiredTokens: 0,
+        source: "turnMemory",
+        tokens: 120,
+      },
+      {
+        compressibleTokens: 0,
+        optionalTokens: 0,
+        requiredTokens: 20220,
+        source: "currentUser",
+        tokens: 20220,
+      },
+    ],
+    compressibleTokens: 32120,
+    optionalTokens: 32120,
+    requiredTokens: 20220,
+  },
   usagePercent: 47,
   usedMessageTokens: 52340,
   willCompressOnNextSend: false,
+};
+
+const chatStatistics = {
+  assistantMessageCount: 1,
+  averageLatencyMs: 6200,
+  chatId: "chat-1",
+  codeChangeStats: { additions: 12, deletions: 3 },
+  compression: {
+    originalTokenCount: 9000,
+    savedTokenCount: 6800,
+    snapshotCount: 1,
+    summaryTokenCount: 2200,
+  },
+  createdMemories: 2,
+  failedRequests: 0,
+  memoryReferences: 3,
+  messageCount: 2,
+  modelBreakdown: [
+    { modelId: "gpt-test", requestCount: 2, totalTokens: 17600 },
+  ],
+  providerBreakdown: [
+    {
+      averageLatencyMs: 6200,
+      failedCount: 0,
+      providerId: "openai",
+      requestCount: 2,
+      successCount: 2,
+      successRate: 1,
+      totalTokens: 17600,
+    },
+  ],
+  toolBreakdown: [{ callCount: 1, toolName: "read_file" }],
+  toolMessageCount: 0,
+  totalCacheReadTokens: 1200,
+  totalCacheWriteTokens: 600,
+  totalInputTokens: 12000,
+  totalLatencyMs: 12400,
+  totalOutputTokens: 5600,
+  totalRequests: 2,
+  totalTokens: 17600,
+  userMessageCount: 1,
+  workspaceId: "workspace-1",
 };
 
 const hookSettings = {
@@ -3831,6 +3901,31 @@ describe("App verification surfaces", () => {
     confirmSpy.mockRestore();
   });
 
+  it("shows active chat statistics in the right panel", async () => {
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Stats" }));
+
+    expect(await screen.findByText("Session statistics")).toBeInTheDocument();
+    expect(screen.getByText("17.6K")).toBeInTheDocument();
+    expect(
+      within(screen.getByText("Memory refs").closest(".context-stat-metric")!)
+        .getByText("3"),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByText("New memories").closest(".context-stat-metric")!)
+        .getByText("2"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("+12 / -3")).toBeInTheDocument();
+    expect(screen.getByText("gpt-test")).toBeInTheDocument();
+    expect(
+      within(screen.getByText("Tools and compression").parentElement!)
+        .getByText("read_file"),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("History").length).toBeGreaterThan(0);
+  });
+
   it("opens the todo graph sidebar when a todo graph refresh arrives", async () => {
     render(<App />);
 
@@ -4260,6 +4355,10 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
     return jsonResponse(todoGraph);
   }
 
+  if (path === "/api/workspaces/workspace-1/chats/chat-1/statistics") {
+    return jsonResponse(chatStatistics);
+  }
+
   if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
     return jsonResponse({ ...secondChatMessages, activeRun: null });
   }
@@ -4271,6 +4370,15 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
       exists: false,
       tasks: [],
       updatedAt: null,
+    });
+  }
+
+  if (path === "/api/workspaces/workspace-1/chats/chat-2/statistics") {
+    return jsonResponse({
+      ...chatStatistics,
+      chatId: "chat-2",
+      messageCount: 2,
+      totalTokens: 0,
     });
   }
 

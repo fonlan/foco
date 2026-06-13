@@ -273,6 +273,42 @@ impl WorkspaceDatabase {
         Ok(stats_by_chat)
     }
 
+    pub fn code_change_stats_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<CodeChangeStats, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT metadata_json
+                 FROM messages
+                 WHERE chat_id = ?1 AND role = 'assistant'",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| row.get::<_, String>(0))
+            .map_err(|source| self.sqlite_error(source))?;
+        let mut total = CodeChangeStats::default();
+
+        for row in rows {
+            let metadata_json = row.map_err(|source| self.sqlite_error(source))?;
+            let metadata = serde_json::from_str::<Value>(&metadata_json).map_err(|source| {
+                WorkspaceDatabaseError::InvalidAuditJson {
+                    field: "message metadata_json",
+                    source,
+                }
+            })?;
+            let Some(stats_value) = metadata.get("codeChangeStats") else {
+                continue;
+            };
+            let stats = CodeChangeStats::from_metadata(stats_value)?;
+            total.additions += stats.additions;
+            total.deletions += stats.deletions;
+        }
+
+        Ok(total)
+    }
+
     pub fn insert_message(
         &mut self,
         message: NewMessage<'_>,
@@ -547,6 +583,32 @@ impl WorkspaceDatabase {
                         }),
                         None => None,
                     },
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn tool_call_counts_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<ToolCallCountRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT tool_name, COUNT(*)
+                 FROM tool_calls
+                 WHERE chat_id = ?1
+                 GROUP BY tool_name
+                 ORDER BY COUNT(*) DESC, tool_name ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(ToolCallCountRecord {
+                    tool_name: row.get(0)?,
+                    call_count: row.get(1)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -2027,14 +2089,16 @@ impl CodeChangeStats {
             });
         };
 
-        let additions =
-            usize::try_from(additions).map_err(|_| WorkspaceDatabaseError::InvalidMessageMetadata {
+        let additions = usize::try_from(additions).map_err(|_| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
                 message: "message metadata.codeChangeStats.additions is too large".to_string(),
-            })?;
-        let deletions =
-            usize::try_from(deletions).map_err(|_| WorkspaceDatabaseError::InvalidMessageMetadata {
+            }
+        })?;
+        let deletions = usize::try_from(deletions).map_err(|_| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
                 message: "message metadata.codeChangeStats.deletions is too large".to_string(),
-            })?;
+            }
+        })?;
 
         Ok(Self {
             additions,
@@ -2128,6 +2192,12 @@ pub struct ToolResultRecord {
     pub output_json: String,
     pub is_error: bool,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCallCountRecord {
+    pub tool_name: String,
+    pub call_count: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

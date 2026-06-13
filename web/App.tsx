@@ -899,6 +899,59 @@ type ContextUsageResponse = {
   compressionTriggerTokens: number;
   compressionTriggerPercent: number;
   willCompressOnNextSend: boolean;
+  tokenBreakdown: ContextTokenBreakdown;
+};
+
+type ContextTokenBreakdown = {
+  requiredTokens: number;
+  optionalTokens: number;
+  compressibleTokens: number;
+  bySource: ContextSourceTokenBreakdown[];
+};
+
+type ContextSourceTokenBreakdown = {
+  source: string;
+  tokens: number;
+  requiredTokens: number;
+  optionalTokens: number;
+  compressibleTokens: number;
+};
+
+type ChatStatisticsResponse = {
+  workspaceId: string;
+  chatId: string;
+  messageCount: number;
+  userMessageCount: number;
+  assistantMessageCount: number;
+  toolMessageCount: number;
+  totalRequests: number;
+  failedRequests: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+  totalTokens: number;
+  totalLatencyMs: number;
+  averageLatencyMs: number | null;
+  memoryReferences: number;
+  createdMemories: number;
+  codeChangeStats: GitDiffLineStats;
+  modelBreakdown: AiStatisticsModelBreakdown[];
+  providerBreakdown: AiStatisticsProviderBreakdown[];
+  toolBreakdown: ChatToolBreakdown[];
+  compression: ChatCompressionStatistics;
+};
+
+type ChatToolBreakdown = {
+  toolName: string;
+  callCount: number;
+};
+
+type ChatCompressionStatistics = {
+  snapshotCount: number;
+  originalTokenCount: number;
+  summaryTokenCount: number;
+  savedTokenCount: number;
 };
 
 type ChatReplyMetrics = {
@@ -1034,7 +1087,7 @@ type SettingsSection =
   | "skills"
   | "workspaces";
 type ViewMode = "chat" | "settings" | "stats";
-type ContextPanelTab = "todo" | "git" | "memory";
+type ContextPanelTab = "todo" | "git" | "memory" | "stats";
 type BrowserRoute =
   | { viewMode: "chat"; workspaceId: string | null; chatId: string | null }
   | { viewMode: "settings"; section: SettingsSection }
@@ -1345,6 +1398,34 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Channel response time": "渠道请求响应时间",
     "No statistics yet": "暂无统计数据",
     "No chart data": "暂无图表数据",
+    "Session statistics": "会话统计",
+    Messages: "消息",
+    "Memory refs": "参考记忆",
+    "New memories": "新建记忆",
+    "LLM calls": "模型调用",
+    "Code changed": "代码改动",
+    "Token usage": "Token 使用",
+    "Model calls": "模型调用分布",
+    "Context mix": "上下文构成",
+    "Tools and compression": "工具与压缩",
+    "No statistics for the active session yet.": "当前会话暂无统计信息。",
+    "No token usage yet.": "暂无 token 使用记录。",
+    "No model calls yet.": "暂无模型调用。",
+    "No context usage yet.": "暂无上下文使用记录。",
+    "No tools used yet.": "暂无工具调用。",
+    "Context usage unavailable.": "上下文使用量不可用。",
+    "Compression snapshots": "压缩快照",
+    "Tokens saved": "节省 token",
+    "Stable context": "稳定上下文",
+    History: "历史消息",
+    "Current user": "当前用户",
+    "Assistant draft": "助手草稿",
+    Guidance: "引导消息",
+    "Hook context": "Hook 上下文",
+    "Runtime assistant": "运行中助手",
+    "Runtime tools": "运行中工具",
+    "Tool snapshot": "工具快照",
+    Compression: "压缩",
     "No workspace selected": "未选择工作区",
     "Workspace chats": "工作区聊天",
     "Enabled providers": "已启用供应商",
@@ -2016,6 +2097,12 @@ export function App() {
   const [todoGraph, setTodoGraph] = useState<TodoGraphResponse | null>(null);
   const [isLoadingTodoGraph, setIsLoadingTodoGraph] = useState(false);
   const [todoGraphError, setTodoGraphError] = useState<string | null>(null);
+  const [chatStatistics, setChatStatistics] =
+    useState<ChatStatisticsResponse | null>(null);
+  const [isLoadingChatStatistics, setIsLoadingChatStatistics] = useState(false);
+  const [chatStatisticsError, setChatStatisticsError] = useState<string | null>(
+    null,
+  );
   const [contextMemories, setContextMemories] = useState<ContextMemoryState>({
     global: [],
     workspace: [],
@@ -2506,6 +2593,33 @@ export function App() {
     }
   }, []);
 
+  const loadChatStatistics = useCallback(
+    async (workspaceId: string, chatId: string) => {
+      const requestedChatKey = chatRunKey(workspaceId, chatId);
+      setIsLoadingChatStatistics(true);
+      setChatStatisticsError(null);
+
+      try {
+        const data = await requestJson<ChatStatisticsResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/statistics`,
+        );
+        if (activeChatKeyRef.current === requestedChatKey) {
+          setChatStatistics(data);
+        }
+      } catch (requestError) {
+        if (activeChatKeyRef.current === requestedChatKey) {
+          setChatStatistics(null);
+          setChatStatisticsError(errorMessage(requestError));
+        }
+      } finally {
+        if (activeChatKeyRef.current === requestedChatKey) {
+          setIsLoadingChatStatistics(false);
+        }
+      }
+    },
+    [],
+  );
+
   const loadGitBranches = useCallback(async (workspaceId: string) => {
     setIsLoadingBranches(true);
     setBranchError(null);
@@ -2576,6 +2690,36 @@ export function App() {
     setTodoGraphError(null);
     void loadTodoGraph(activeWorkspace.id, activeChatId);
   }, [activeChatId, activeWorkspace?.id, loadTodoGraph]);
+
+  useEffect(() => {
+    if (
+      !activeWorkspace?.id ||
+      !activeChatId ||
+      isPendingChatId(activeChatId)
+    ) {
+      setChatStatistics(null);
+      setChatStatisticsError(null);
+      setIsLoadingChatStatistics(false);
+      return;
+    }
+
+    setChatStatistics(null);
+    setChatStatisticsError(null);
+    void loadChatStatistics(activeWorkspace.id, activeChatId);
+  }, [activeChatId, activeWorkspace?.id, loadChatStatistics]);
+
+  useEffect(() => {
+    if (
+      contextPanelTab !== "stats" ||
+      !activeWorkspace?.id ||
+      !activeChatId ||
+      isPendingChatId(activeChatId)
+    ) {
+      return;
+    }
+
+    void loadChatStatistics(activeWorkspace.id, activeChatId);
+  }, [activeChatId, activeWorkspace?.id, contextPanelTab, loadChatStatistics]);
 
   useEffect(() => {
     if (contextPanelTab !== "memory" || !activeWorkspace?.id) {
@@ -4472,6 +4616,7 @@ export function App() {
           assistantDraft = "";
           assistantDraftReasoning = "";
           refreshRunContextUsage();
+          void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           setChatRunFailed(chatKey, false);
           setRetryRunRequest(null);
           setPendingQuestion(null);
@@ -4563,6 +4708,7 @@ export function App() {
           if (isContextPanelOpen && contextPanelTab === "git") {
             void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
           }
+          void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           return;
         }
 
@@ -4577,6 +4723,7 @@ export function App() {
         }
 
         if (streamEvent.type === "memoryExtractionComplete") {
+          void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           setMessagesForChatKey(chatKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -4966,6 +5113,9 @@ export function App() {
           assistantDraft = "";
           assistantDraftReasoning = "";
           refreshRunContextUsage();
+          if (requestChatId) {
+            void loadChatStatistics(request.workspaceId, requestChatId);
+          }
           setChatRunFailed(runMessagesKey, false);
           setRetryRunRequest(null);
           setPendingQuestion(null);
@@ -5058,6 +5208,9 @@ export function App() {
           if (isContextPanelOpen && contextPanelTab === "git") {
             void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
           }
+          if (requestChatId) {
+            void loadChatStatistics(request.workspaceId, requestChatId);
+          }
           return;
         }
 
@@ -5075,6 +5228,9 @@ export function App() {
         }
 
         if (streamEvent.type === "memoryExtractionComplete") {
+          if (requestChatId) {
+            void loadChatStatistics(request.workspaceId, requestChatId);
+          }
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5863,12 +6019,16 @@ export function App() {
             />
             <ContextPanel
               activeTab={contextPanelTab}
+              chatStatistics={chatStatistics}
+              chatStatisticsError={chatStatisticsError}
               contextMemories={contextMemories}
               deletingContextMemoryId={deletingContextMemoryId}
+              contextUsage={contextUsage}
               contextMemoryError={contextMemoryError}
               diffError={diffError}
               diffResponse={gitDiff}
               files={gitDiff?.files ?? []}
+              isLoadingChatStatistics={isLoadingChatStatistics}
               isLoadingDiff={isLoadingDiff}
               isLoadingContextMemories={isLoadingContextMemories}
               isLoadingTodoGraph={isLoadingTodoGraph}
@@ -10682,12 +10842,16 @@ function TodoGraphPanel({
 
 function ContextPanel({
   activeTab,
+  chatStatistics,
+  chatStatisticsError,
   contextMemories,
+  contextUsage,
   deletingContextMemoryId,
   contextMemoryError,
   diffError,
   diffResponse,
   files,
+  isLoadingChatStatistics,
   isLoadingContextMemories,
   isLoadingDiff,
   isLoadingTodoGraph,
@@ -10700,12 +10864,16 @@ function ContextPanel({
   todoGraphError,
 }: {
   activeTab: ContextPanelTab;
+  chatStatistics: ChatStatisticsResponse | null;
+  chatStatisticsError: string | null;
   contextMemories: ContextMemoryState;
+  contextUsage: ContextUsageResponse | null;
   deletingContextMemoryId: string | null;
   contextMemoryError: string | null;
   diffError: string | null;
   diffResponse: GitDiffResponse | null;
   files: GitStatusFileSummary[];
+  isLoadingChatStatistics: boolean;
   isLoadingContextMemories: boolean;
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
@@ -10722,6 +10890,7 @@ function ContextPanel({
     { id: "todo", label: "ToDo", icon: ListChecks },
     { id: "git", label: "Git", icon: GitCompare },
     { id: "memory", label: "Memory", icon: Brain },
+    { id: "stats", label: "Stats", icon: BarChart3 },
   ];
 
   return (
@@ -10777,6 +10946,15 @@ function ContextPanel({
             isLoading={isLoadingContextMemories}
             memories={contextMemories}
             onForgetMemory={onForgetContextMemory}
+          />
+        ) : null}
+
+        {activeTab === "stats" ? (
+          <ContextStatsTab
+            contextUsage={contextUsage}
+            error={chatStatisticsError}
+            isLoading={isLoadingChatStatistics}
+            statistics={chatStatistics}
           />
         ) : null}
       </div>
@@ -10917,6 +11095,266 @@ function ContextMemoryGroup({
       ) : (
         <div className="context-empty-inline">{emptyLabel}</div>
       )}
+    </div>
+  );
+}
+
+function ContextStatsTab({
+  contextUsage,
+  error,
+  isLoading,
+  statistics,
+}: {
+  contextUsage: ContextUsageResponse | null;
+  error: string | null;
+  isLoading: boolean;
+  statistics: ChatStatisticsResponse | null;
+}) {
+  const { language, t } = useI18n();
+
+  if (isLoading && !statistics) {
+    return (
+      <div className="context-empty-state">
+        <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+        <h2>{t("Stats")}</h2>
+        <p>{t("Loading...")}</p>
+      </div>
+    );
+  }
+
+  if (error && !statistics) {
+    return (
+      <div className="context-empty-state">
+        <BarChart3 aria-hidden="true" className="size-5" />
+        <h2>{t("Stats")}</h2>
+        <p>{error}</p>
+      </div>
+    );
+  }
+
+  if (!statistics) {
+    return (
+      <div className="context-empty-state">
+        <BarChart3 aria-hidden="true" className="size-5" />
+        <h2>{t("Stats")}</h2>
+        <p>{t("No statistics for the active session yet.")}</p>
+      </div>
+    );
+  }
+
+  const tokenChart = [
+    { id: "input", label: t("Input"), value: statistics.totalInputTokens },
+    { id: "output", label: t("Output"), value: statistics.totalOutputTokens },
+    { id: "cacheRead", label: t("Cache read"), value: statistics.totalCacheReadTokens },
+    { id: "cacheWrite", label: t("Cache write"), value: statistics.totalCacheWriteTokens },
+  ].filter((item) => item.value > 0);
+  const modelChart = statistics.modelBreakdown.map((item) => ({
+    id: item.modelId,
+    label: item.modelId,
+    value: item.requestCount,
+  }));
+  const contextChart = contextUsage
+    ? contextUsage.tokenBreakdown.bySource
+        .filter((item) => item.tokens > 0)
+        .map((item) => ({
+          id: item.source,
+          label: contextSourceLabel(item.source, t),
+          value: item.tokens,
+        }))
+    : [];
+
+  return (
+    <div className="context-stats-panel panel-scroll">
+      <div className="context-stats-header">
+        <div>
+          <h2>{t("Session statistics")}</h2>
+          <p>
+            {t("Messages")}: {formatNumber(statistics.messageCount, language)}
+          </p>
+        </div>
+        {isLoading ? (
+          <LoaderCircle aria-label={t("Loading...")} className="size-4 animate-spin" />
+        ) : null}
+      </div>
+
+      <div className="context-stats-metrics">
+        <ContextStatMetric
+          label={t("Total tokens")}
+          value={formatCompactNumber(statistics.totalTokens, language)}
+        />
+        <ContextStatMetric
+          label={t("Total time")}
+          value={formatDurationMs(statistics.totalLatencyMs, language)}
+        />
+        <ContextStatMetric
+          label={t("Memory refs")}
+          value={formatNumber(statistics.memoryReferences, language)}
+        />
+        <ContextStatMetric
+          label={t("New memories")}
+          value={formatNumber(statistics.createdMemories, language)}
+        />
+        <ContextStatMetric
+          label={t("LLM calls")}
+          value={formatNumber(statistics.totalRequests, language)}
+        />
+        <ContextStatMetric
+          label={t("Code changed")}
+          value={`+${formatNumber(statistics.codeChangeStats.additions, language)} / -${formatNumber(statistics.codeChangeStats.deletions, language)}`}
+        />
+      </div>
+
+      <ContextStatsSection title={t("Token usage")}>
+        <ContextMiniBarChart
+          data={tokenChart}
+          emptyLabel={t("No token usage yet.")}
+          valueFormatter={(value) => formatNumber(value, language)}
+        />
+      </ContextStatsSection>
+
+      <ContextStatsSection title={t("Model calls")}>
+        <ContextMiniBarChart
+          data={modelChart}
+          emptyLabel={t("No model calls yet.")}
+          valueFormatter={(value) => formatNumber(value, language)}
+        />
+      </ContextStatsSection>
+
+      <ContextStatsSection title={t("Context mix")}>
+        {contextUsage ? (
+          <>
+            <div className="context-stats-inline">
+              <span>{t("Context usage")}</span>
+              <strong>
+                {formatNumber(contextUsage.usedMessageTokens, language)} /{" "}
+                {formatNumber(contextUsage.availableMessageTokens, language)}
+              </strong>
+            </div>
+            <ContextMiniBarChart
+              data={contextChart}
+              emptyLabel={t("No context usage yet.")}
+              valueFormatter={(value) => formatNumber(value, language)}
+            />
+          </>
+        ) : (
+          <div className="context-empty-inline">{t("Context usage unavailable.")}</div>
+        )}
+      </ContextStatsSection>
+
+      <ContextStatsSection title={t("Tools and compression")}>
+        <ContextStatsRows
+          emptyLabel={t("No tools used yet.")}
+          rows={[
+            ...statistics.toolBreakdown.map((item) => ({
+              label: item.toolName,
+              value: formatNumber(item.callCount, language),
+            })),
+            {
+              label: t("Compression snapshots"),
+              value: formatNumber(statistics.compression.snapshotCount, language),
+            },
+            {
+              label: t("Tokens saved"),
+              value: formatNumber(statistics.compression.savedTokenCount, language),
+            },
+          ]}
+        />
+      </ContextStatsSection>
+    </div>
+  );
+}
+
+function ContextStatMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="context-stat-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function ContextStatsSection({
+  children,
+  title,
+}: {
+  children: ReactNode;
+  title: string;
+}) {
+  return (
+    <section className="context-stats-section">
+      <div className="context-panel-section-title">{title}</div>
+      {children}
+    </section>
+  );
+}
+
+function ContextMiniBarChart({
+  data,
+  emptyLabel,
+  valueFormatter,
+}: {
+  data: { id: string; label: string; value: number }[];
+  emptyLabel: string;
+  valueFormatter: (value: number) => string;
+}) {
+  if (!data.length) {
+    return <div className="context-empty-inline">{emptyLabel}</div>;
+  }
+
+  const chartMax = Math.max(...data.map((item) => item.value), 1);
+
+  return (
+    <div className="context-mini-chart">
+      <ResponsiveContainer height={Math.max(112, data.length * 34)} width="100%">
+        <BarChart
+          data={data}
+          layout="vertical"
+          margin={{ bottom: 0, left: 4, right: 12, top: 0 }}
+        >
+          <XAxis domain={[0, chartMax]} hide type="number" />
+          <YAxis
+            axisLine={false}
+            dataKey="label"
+            tick={{ fill: "#57534e", fontSize: 11 }}
+            tickLine={false}
+            type="category"
+            width={96}
+          />
+          <Tooltip
+            contentStyle={chartTooltipStyle}
+            formatter={(value) => valueFormatter(Number(value))}
+            labelStyle={chartTooltipLabelStyle}
+          />
+          <Bar dataKey="value" radius={[4, 4, 4, 4]}>
+            {data.map((item, index) => (
+              <Cell fill={chartColor(index)} key={item.id} />
+            ))}
+          </Bar>
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function ContextStatsRows({
+  emptyLabel,
+  rows,
+}: {
+  emptyLabel: string;
+  rows: { label: string; value: string }[];
+}) {
+  if (!rows.length) {
+    return <div className="context-empty-inline">{emptyLabel}</div>;
+  }
+
+  return (
+    <div className="context-stats-rows">
+      {rows.map((row) => (
+        <div className="context-stats-row" key={row.label}>
+          <span>{row.label}</span>
+          <strong>{row.value}</strong>
+        </div>
+      ))}
     </div>
   );
 }
@@ -20121,6 +20559,16 @@ function formatNullableLatencySeconds(
   }).format(value / 1000)} s`;
 }
 
+function formatDurationMs(value: number, language: AppLanguageId = "en") {
+  if (value < 1000) {
+    return `${formatNumber(value, language)} ms`;
+  }
+
+  return `${new Intl.NumberFormat(language, {
+    maximumFractionDigits: 1,
+  }).format(value / 1000)} s`;
+}
+
 function formatTokensPerSecond(
   metrics: ChatReplyMetrics,
   language: AppLanguageId = "en",
@@ -20158,6 +20606,26 @@ function formatCompactNumber(value: number, _language: AppLanguageId = "en") {
     maximumFractionDigits: 1,
     notation: "compact",
   }).format(value);
+}
+
+function contextSourceLabel(source: string, t: Translate) {
+  const labels: Record<string, string> = {
+    assistantDraft: t("Assistant draft"),
+    compressionSnapshot: t("Compression"),
+    currentUser: t("Current user"),
+    guidance: t("Guidance"),
+    hookContext: t("Hook context"),
+    persistedHistory: t("History"),
+    reservedPrompt: t("Prompt"),
+    runtimeAssistant: t("Runtime assistant"),
+    runtimeToolState: t("Runtime tools"),
+    runtimeToolStateSnapshot: t("Tool snapshot"),
+    stableInjection: t("Stable context"),
+    todoGraph: t("ToDo"),
+    turnMemory: t("Memory"),
+  };
+
+  return labels[source] ?? source;
 }
 
 function formatChatCreatedAt(value: string) {

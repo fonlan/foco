@@ -1049,6 +1049,97 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn facts_created_from_chat_sources(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        require_non_empty("chat_id", chat_id)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
+                        f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                        f.updated_at
+                 FROM memory_facts f
+                 JOIN memory_fact_sources fs ON fs.fact_id = f.id
+                 JOIN memory_sources s ON s.id = fs.source_id
+                 WHERE s.chat_id = ?1
+                    OR f.chat_id = ?1
+                    OR (
+                        s.source_type IN ('chat_message', 'assistant_message')
+                        AND s.source_id IN (SELECT id FROM messages WHERE chat_id = ?1)
+                    )
+                    OR (
+                        s.source_type = 'tool_call'
+                        AND s.source_id IN (SELECT id FROM tool_calls WHERE chat_id = ?1)
+                    )
+                    OR (
+                        s.source_type = 'tool_result'
+                        AND s.source_id IN (
+                            SELECT tool_results.id
+                            FROM tool_results
+                            JOIN tool_calls ON tool_calls.id = tool_results.tool_call_id
+                            WHERE tool_calls.chat_id = ?1
+                        )
+                    )
+                 ORDER BY f.created_at ASC, f.id ASC",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(params![chat_id], memory_fact_from_row)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn facts_created_from_source_run_ids(
+        &self,
+        run_ids: &HashSet<String>,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
+                        f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                        f.updated_at, s.metadata_json
+                 FROM memory_facts f
+                 JOIN memory_fact_sources fs ON fs.fact_id = f.id
+                 JOIN memory_sources s ON s.id = fs.source_id
+                 ORDER BY f.created_at ASC, f.id ASC",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((memory_fact_from_row(row)?, row.get::<_, String>(13)?))
+            })
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let mut seen = HashSet::new();
+        let mut facts = Vec::new();
+
+        for row in rows {
+            let (fact, metadata_json) =
+                row.map_err(|source| sqlite_error(&self.database_path, source))?;
+            let metadata = serde_json::from_str::<Value>(&metadata_json).map_err(|source| {
+                MemoryDatabaseError::InvalidMemoryJson {
+                    field: "memory source metadata_json",
+                    source,
+                }
+            })?;
+            let Some(run_id) = metadata.get("runId").and_then(Value::as_str) else {
+                continue;
+            };
+            if run_ids.contains(run_id) && seen.insert(fact.id.clone()) {
+                facts.push(fact);
+            }
+        }
+
+        Ok(facts)
+    }
+
     pub fn facts_for_source_reference(
         &self,
         source_type: MemorySourceType,

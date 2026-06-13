@@ -1962,6 +1962,117 @@ body,
   font-size: var(--foco-font-micro);
 }
 
+.context-stats-header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.context-stats-header h2 {
+  color: var(--foco-text);
+  font-size: var(--foco-font-ui);
+  font-weight: 700;
+}
+
+.context-stats-header p {
+  margin-top: 0.125rem;
+  color: var(--foco-text-muted);
+  font-size: var(--foco-font-compact);
+}
+
+.context-stats-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.context-stat-metric {
+  min-width: 0;
+  border: 1px solid var(--foco-border);
+  border-radius: 0.5rem;
+  background: var(--foco-panel-soft);
+  padding: 0.5rem;
+}
+
+.context-stat-metric span {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--foco-text-muted);
+  font-size: var(--foco-font-micro);
+  font-weight: 650;
+}
+
+.context-stat-metric strong {
+  display: block;
+  margin-top: 0.25rem;
+  overflow-wrap: anywhere;
+  color: var(--foco-text);
+  font-size: 1rem;
+  font-weight: 750;
+  line-height: 1.15;
+}
+
+.context-stats-section {
+  min-width: 0;
+}
+
+.context-mini-chart {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--foco-border);
+  border-radius: 0.5rem;
+  background: var(--foco-panel);
+  padding: 0.375rem 0.125rem;
+}
+
+.context-stats-inline,
+.context-stats-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.context-stats-inline {
+  margin-bottom: 0.375rem;
+  color: var(--foco-text-muted);
+  font-size: var(--foco-font-compact);
+}
+
+.context-stats-inline strong,
+.context-stats-row strong {
+  flex: 0 0 auto;
+  color: var(--foco-text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.context-stats-rows {
+  border: 1px solid var(--foco-border);
+  border-radius: 0.5rem;
+  background: var(--foco-panel);
+}
+
+.context-stats-row {
+  padding: 0.5rem;
+  border-bottom: 1px solid var(--foco-border);
+  color: var(--foco-text-muted);
+  font-size: var(--foco-font-compact);
+}
+
+.context-stats-row:last-child {
+  border-bottom: 0;
+}
+
+.context-stats-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .context-metric {
   display: flex;
   align-items: center;

@@ -77,8 +77,8 @@ use foco_store::{
         MessageRecord, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
         NewMessage, NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall,
         NewToolResult, PromptContextInjectionRecord, TodoGraphFilter, TodoGraphRecord,
-        TodoGraphTask, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        initialize_workspace_databases, workspace_database_path,
+        TodoGraphTask, ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome,
+        WorkspaceDatabase, initialize_workspace_databases, workspace_database_path,
     },
 };
 use foco_tools::{
@@ -1378,6 +1378,10 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/todo-graph",
             get(chat_todo_graph),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/statistics",
+            get(chat_statistics),
         )
         .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/delete",
@@ -3964,6 +3968,89 @@ async fn chat_todo_graph(
     Ok(Json(todo_graph_response(chat_id, graph)))
 }
 
+async fn chat_statistics(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
+) -> Result<Json<ChatStatisticsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace_id = workspace_id.trim();
+    let chat_id = chat_id.trim();
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+
+    if database
+        .chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+        .is_none()
+    {
+        return Err(ApiError::bad_request(format!(
+            "chat was not found: {chat_id}"
+        )));
+    }
+
+    let messages = database
+        .messages_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let llm_rows = database
+        .llm_request_audit_count(LlmRequestAuditFilters {
+            chat_id: Some(chat_id),
+            ..LlmRequestAuditFilters::default()
+        })
+        .and_then(|request_count| {
+            database.llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some(chat_id),
+                limit: Some(request_count),
+                offset: Some(0),
+                ..LlmRequestAuditFilters::default()
+            })
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    let prompt_injections = database
+        .prompt_context_injections_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let compression_snapshots = database
+        .context_compression_snapshots_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let code_change_stats = database
+        .code_change_stats_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let tool_breakdown = database
+        .tool_call_counts_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .map(chat_tool_breakdown)
+        .collect();
+    let created_workspace_memories =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
+            .map_err(ApiError::from_memory_error)?
+            .facts_created_from_chat_sources(chat_id)
+            .map_err(ApiError::from_memory_error)?
+            .len() as i64;
+    let run_ids = llm_rows
+        .iter()
+        .map(|row| row.id.clone())
+        .collect::<HashSet<_>>();
+    let created_global_memories =
+        MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+            .map_err(ApiError::from_memory_error)?
+            .facts_created_from_source_run_ids(&run_ids)
+            .map_err(ApiError::from_memory_error)?
+            .len() as i64;
+
+    Ok(Json(chat_statistics_response(
+        workspace_id,
+        chat_id,
+        messages,
+        llm_rows,
+        prompt_injections,
+        compression_snapshots,
+        code_change_stats,
+        tool_breakdown,
+        created_workspace_memories + created_global_memories,
+    )?))
+}
+
 async fn delete_chat(
     State(state): State<AppState>,
     AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
@@ -4947,6 +5034,49 @@ struct TodoGraphResponse {
     tasks: Vec<TodoGraphTask>,
     created_at: Option<String>,
     updated_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatStatisticsResponse {
+    workspace_id: String,
+    chat_id: String,
+    message_count: i64,
+    user_message_count: i64,
+    assistant_message_count: i64,
+    tool_message_count: i64,
+    total_requests: i64,
+    failed_requests: i64,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cache_read_tokens: i64,
+    total_cache_write_tokens: i64,
+    total_tokens: i64,
+    total_latency_ms: i64,
+    average_latency_ms: Option<i64>,
+    memory_references: i64,
+    created_memories: i64,
+    code_change_stats: CodeChangeStats,
+    model_breakdown: Vec<AiStatisticsModelBreakdown>,
+    provider_breakdown: Vec<AiStatisticsProviderBreakdown>,
+    tool_breakdown: Vec<ChatToolBreakdown>,
+    compression: ChatCompressionStatistics,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatToolBreakdown {
+    tool_name: String,
+    call_count: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatCompressionStatistics {
+    snapshot_count: i64,
+    original_token_count: i64,
+    summary_token_count: i64,
+    saved_token_count: i64,
 }
 
 #[derive(Serialize)]
@@ -17442,6 +17572,108 @@ fn chat_summary(chat: ChatRecord, code_change_stats: CodeChangeStats) -> ChatSum
         created_at: chat.created_at,
         updated_at: chat.updated_at,
         code_change_stats,
+    }
+}
+
+fn chat_statistics_response(
+    workspace_id: &str,
+    chat_id: &str,
+    messages: Vec<MessageRecord>,
+    llm_rows: Vec<LlmRequestAuditRow>,
+    prompt_injections: Vec<PromptContextInjectionRecord>,
+    compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
+    code_change_stats: CodeChangeStats,
+    tool_breakdown: Vec<ChatToolBreakdown>,
+    created_memories: i64,
+) -> Result<ChatStatisticsResponse, ApiError> {
+    let mut ai_summary = AiStatisticsSummaryAccumulator::default();
+    ai_summary.add_rows(&llm_rows);
+    let ai_summary = ai_summary.finish();
+    let total_latency_ms = llm_rows
+        .iter()
+        .filter_map(|row| row.total_latency_ms)
+        .sum::<i64>();
+    let message_count = messages.len() as i64;
+    let user_message_count = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .count() as i64;
+    let assistant_message_count = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .count() as i64;
+    let tool_message_count = messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .count() as i64;
+    let memory_references = unique_prompt_context_memory_keys(&prompt_injections)? as i64;
+    let compression = chat_compression_statistics(&compression_snapshots);
+
+    Ok(ChatStatisticsResponse {
+        workspace_id: workspace_id.to_string(),
+        chat_id: chat_id.to_string(),
+        message_count,
+        user_message_count,
+        assistant_message_count,
+        tool_message_count,
+        total_requests: ai_summary.total_requests,
+        failed_requests: ai_summary.failed_requests,
+        total_input_tokens: ai_summary.total_input_tokens,
+        total_output_tokens: ai_summary.total_output_tokens,
+        total_cache_read_tokens: ai_summary.total_cache_read_tokens,
+        total_cache_write_tokens: ai_summary.total_cache_write_tokens,
+        total_tokens: ai_summary.total_tokens,
+        total_latency_ms,
+        average_latency_ms: ai_summary.average_latency_ms,
+        memory_references,
+        created_memories,
+        code_change_stats,
+        model_breakdown: ai_summary.model_breakdown,
+        provider_breakdown: ai_summary.provider_breakdown,
+        tool_breakdown,
+        compression,
+    })
+}
+
+fn unique_prompt_context_memory_keys(
+    prompt_injections: &[PromptContextInjectionRecord],
+) -> Result<usize, ApiError> {
+    let mut keys = HashSet::new();
+
+    for injection in prompt_injections {
+        keys.extend(stored_prompt_context_record_memory_keys(injection)?);
+    }
+
+    Ok(keys
+        .into_iter()
+        .filter(|key| !key.trim().is_empty())
+        .count())
+}
+
+fn chat_compression_statistics(
+    snapshots: &[ContextCompressionSnapshotRecord],
+) -> ChatCompressionStatistics {
+    let original_token_count = snapshots
+        .iter()
+        .map(|snapshot| snapshot.original_token_count)
+        .sum::<i64>();
+    let summary_token_count = snapshots
+        .iter()
+        .map(|snapshot| snapshot.summary_token_count)
+        .sum::<i64>();
+
+    ChatCompressionStatistics {
+        snapshot_count: snapshots.len() as i64,
+        original_token_count,
+        summary_token_count,
+        saved_token_count: (original_token_count - summary_token_count).max(0),
+    }
+}
+
+fn chat_tool_breakdown(record: ToolCallCountRecord) -> ChatToolBreakdown {
+    ChatToolBreakdown {
+        tool_name: record.tool_name,
+        call_count: record.call_count,
     }
 }
 
