@@ -5948,6 +5948,23 @@ impl CapturedLlmRequest {
             outcome,
         }
     }
+
+    fn cancelled(
+        request_id: &str,
+        request_started_at: &str,
+        request_body_json: &str,
+        events: &[CapturedAuditEvent],
+        started_at: Instant,
+        message: &str,
+    ) -> Self {
+        Self {
+            id: request_id.to_string(),
+            request_started_at: request_started_at.to_string(),
+            request_body_json: request_body_json.to_string(),
+            events: events.to_vec(),
+            outcome: cancelled_audit_outcome(started_at, message),
+        }
+    }
 }
 
 async fn run_chat_context_in_background(
@@ -6034,6 +6051,26 @@ fn chat_run_subscription_stream(
 }
 
 impl PreparedChatContext {
+    fn capture_cancelled_llm_request(
+        &mut self,
+        request_id: &str,
+        request_started_at: &str,
+        request_body_json: &str,
+        events: &[CapturedAuditEvent],
+        started_at: Instant,
+        message: &str,
+    ) {
+        self.captured_llm_requests
+            .push(CapturedLlmRequest::cancelled(
+                request_id,
+                request_started_at,
+                request_body_json,
+                events,
+                started_at,
+                message,
+            ));
+    }
+
     fn into_sse_stream(
         mut self,
         cancellation: ChatRunCancellation,
@@ -6247,6 +6284,14 @@ impl PreparedChatContext {
                     changed = app_shutdown_rx.changed() => {
                         if changed.is_err() || *app_shutdown_rx.borrow() {
                             cancellation.cancel();
+                            self.capture_cancelled_llm_request(
+                                &turn_llm_request_id,
+                                &turn_request_started_at,
+                                &turn_request_body_json,
+                                &turn_events,
+                                turn_started_at,
+                                SHUTDOWN_MESSAGE,
+                            );
                             let event = match finish_cancelled_chat_run(
                                 &self,
                                 &request_started_at,
@@ -6267,6 +6312,14 @@ impl PreparedChatContext {
                     }
                     changed = run_cancellation_rx.changed() => {
                         if changed.is_err() || *run_cancellation_rx.borrow() {
+                            self.capture_cancelled_llm_request(
+                                &turn_llm_request_id,
+                                &turn_request_started_at,
+                                &turn_request_body_json,
+                                &turn_events,
+                                turn_started_at,
+                                "chat run cancelled",
+                            );
                             let event = match finish_cancelled_chat_run_with_message(
                                 &self,
                                 &request_started_at,
@@ -6335,6 +6388,14 @@ impl PreparedChatContext {
                         changed = app_shutdown_rx.changed() => {
                             if changed.is_err() || *app_shutdown_rx.borrow() {
                                 cancellation.cancel();
+                                self.capture_cancelled_llm_request(
+                                    &turn_llm_request_id,
+                                    &turn_request_started_at,
+                                    &turn_request_body_json,
+                                    &turn_events,
+                                    turn_started_at,
+                                    SHUTDOWN_MESSAGE,
+                                );
                                 let event = match finish_cancelled_chat_run(
                                     &self,
                                     &request_started_at,
@@ -6355,6 +6416,14 @@ impl PreparedChatContext {
                         }
                         changed = run_cancellation_rx.changed() => {
                             if changed.is_err() || *run_cancellation_rx.borrow() {
+                                self.capture_cancelled_llm_request(
+                                    &turn_llm_request_id,
+                                    &turn_request_started_at,
+                                    &turn_request_body_json,
+                                    &turn_events,
+                                    turn_started_at,
+                                    "chat run cancelled",
+                                );
                                 let event = match finish_cancelled_chat_run_with_message(
                                     &self,
                                     &request_started_at,
@@ -21073,6 +21142,116 @@ description:
                 .llm_request("request-2")
                 .expect("second request lookup")
                 .is_some()
+        );
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn persist_chat_result_writes_cancelled_captured_llm_request() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-cancelled-audit-request-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            database
+                .insert_chat("chat-1", "Cancelled audit chat")
+                .expect("chat insert");
+        }
+        let mut context = test_prepared_chat_context(
+            workspace_dir.clone(),
+            vec![neutral_text_message(
+                NeutralChatRole::User,
+                "Hello".to_string(),
+            )],
+            vec![Some(0)],
+            vec![PromptContextSource::StoredMessage { sequence: 0 }],
+            984,
+        );
+        context.llm_request_id = "run-1".to_string();
+        let turn_events = vec![CapturedAuditEvent {
+            event_at: "2026-06-06T09:00:00Z".to_string(),
+            event_type: "start".to_string(),
+            normalized_event_json: json!({
+                "type": "start",
+                "chatId": "chat-1",
+                "userMessageId": "user-1",
+                "assistantMessageId": "assistant-1",
+                "llmRequestId": "llm-cancelled",
+                "runId": "run-1",
+                "turnIndex": 1,
+            })
+            .to_string(),
+        }];
+        context.captured_llm_requests.push(CapturedLlmRequest {
+            id: "llm-succeeded".to_string(),
+            request_started_at: "2026-06-06T08:59:00Z".to_string(),
+            request_body_json: "{}".to_string(),
+            events: Vec::new(),
+            outcome: ChatAuditOutcome {
+                first_token_at: Some("2026-06-06T08:59:00Z".to_string()),
+                completed_at: "2026-06-06T08:59:01Z".to_string(),
+                first_token_latency_ms: Some(100),
+                total_latency_ms: 1_000,
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                status_code: Some(200),
+                final_state: "succeeded",
+                response_body_json: Some("{}".to_string()),
+            },
+        });
+        context.capture_cancelled_llm_request(
+            "llm-cancelled",
+            "2026-06-06T09:00:00Z",
+            r#"{"model":"gpt-5.4"}"#,
+            &turn_events,
+            Instant::now(),
+            "chat run cancelled",
+        );
+        let outcome = cancelled_audit_outcome(Instant::now(), "chat run cancelled");
+
+        persist_chat_result(
+            &context,
+            "2026-06-06T08:59:00Z",
+            outcome,
+            &[],
+            None,
+            None,
+            &[],
+        )
+        .expect("persist cancelled chat result");
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        assert!(
+            database
+                .llm_request("run-1")
+                .expect("run audit lookup")
+                .is_none()
+        );
+        let cancelled_request = database
+            .llm_request("llm-cancelled")
+            .expect("cancelled request lookup")
+            .expect("cancelled request");
+        assert_eq!(cancelled_request.final_state, "cancelled");
+        assert!(
+            cancelled_request
+                .response_body_json
+                .as_deref()
+                .expect("cancelled response json")
+                .contains("chat run cancelled")
+        );
+        assert_eq!(
+            database
+                .llm_request_audit_count(LlmRequestAuditFilters {
+                    final_state: Some("cancelled"),
+                    ..LlmRequestAuditFilters::default()
+                })
+                .expect("cancelled audit count"),
+            1
         );
 
         drop(database);
