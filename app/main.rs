@@ -34,9 +34,10 @@ use chrono::{Duration as ChronoDuration, Local, SecondsFormat, Utc};
 use foco_agent::{
     ContextPackItem, PendingToolCall, ToolExecutionMode, ToolExecutionPlan, ToolPromptInfo,
     ToolResource, ToolResourceAccess, ToolResourceLock, build_available_tools_prompt,
-    build_default_system_prompt, calculate_context_budget, context_compression_trigger_tokens,
-    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
-    plan_tool_execution, tool_resource_locks, tool_resource_locks_conflict,
+    build_default_developer_prompt, build_default_system_prompt, calculate_context_budget,
+    context_compression_trigger_tokens, estimate_json_tokens, estimate_text_tokens, pack_context,
+    plan_context_compression, plan_tool_execution, tool_resource_locks,
+    tool_resource_locks_conflict,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{
@@ -7085,8 +7086,10 @@ async fn prepare_prompt_context(
         &mcp_tools,
     );
     let system_prompt = active_system_prompt(&config.prompts);
+    let developer_prompt = build_default_developer_prompt();
     let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos);
     let system_prompt_tokens = estimate_text_tokens(&system_prompt)
+        + estimate_text_tokens(&developer_prompt)
         + available_tools_prompt
             .as_ref()
             .map(|prompt| estimate_text_tokens(prompt))
@@ -7192,14 +7195,19 @@ async fn prepare_prompt_context(
             + existing_turn_memory_messages.len()
             + current_turn_memory_messages.len()
             + usize::from(assistant_draft.is_some() || assistant_draft_reasoning.is_some())
-            + 2,
+            + 3,
     );
     let mut message_source_sequences = Vec::with_capacity(neutral_messages.capacity());
     neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
     message_source_sequences.push(None);
+    neutral_messages.push(neutral_text_message(
+        NeutralChatRole::Developer,
+        developer_prompt,
+    ));
+    message_source_sequences.push(None);
     if let Some(available_tools_prompt) = available_tools_prompt {
         neutral_messages.push(neutral_text_message(
-            NeutralChatRole::System,
+            NeutralChatRole::Developer,
             available_tools_prompt,
         ));
         message_source_sequences.push(None);
@@ -8460,6 +8468,7 @@ fn neutral_messages_from_record(
 ) -> Result<Vec<NeutralChatMessage>, ApiError> {
     let role = match message.role.as_str() {
         "system" => NeutralChatRole::System,
+        "developer" => NeutralChatRole::Developer,
         "user" => NeutralChatRole::User,
         "assistant" => NeutralChatRole::Assistant,
         "tool" => NeutralChatRole::Tool,
@@ -9301,6 +9310,7 @@ fn serialize_provider_request(request: &NeutralChatRequest) -> Result<String, Ap
 fn neutral_role_label(role: &NeutralChatRole) -> &'static str {
     match role {
         NeutralChatRole::System => "system",
+        NeutralChatRole::Developer => "developer",
         NeutralChatRole::User => "user",
         NeutralChatRole::Assistant => "assistant",
         NeutralChatRole::Tool => "tool",
@@ -11273,6 +11283,7 @@ fn context_message_groups(
             .sum();
         let must_keep = message_indices.iter().any(|message_index| {
             messages[*message_index].role == NeutralChatRole::System
+                || messages[*message_index].role == NeutralChatRole::Developer
                 || message_source_sequences[*message_index].is_none()
                 || Some(*message_index) == latest_user_index
                 || *message_index >= active_tool_start_index
@@ -18073,6 +18084,13 @@ mod tests {
         }
     }
 
+    fn available_tools_message(messages: &[NeutralChatMessage]) -> &NeutralChatMessage {
+        messages
+            .iter()
+            .find(|message| message.content.contains("Available tools:"))
+            .expect("available tools message")
+    }
+
     #[tokio::test]
     async fn tool_resource_registry_blocks_same_file_read_write() {
         let registry = ToolResourceLockRegistry::default();
@@ -21390,7 +21408,11 @@ Search memory before repo work.
             "- workspace directory: {}",
             workspace_dir.display()
         )));
-        assert!(environment_messages[0].content.contains("- git repository: "));
+        assert!(
+            environment_messages[0]
+                .content
+                .contains("- git repository: ")
+        );
         assert!(environment_messages[0].content.contains("- shell type: "));
         assert!(
             environment_messages[0]
@@ -21670,12 +21692,8 @@ Use the existing product UI conventions.
 
         assert!(!tool_names.contains(MEMORY_SEARCH_TOOL_NAME));
         assert!(!tool_names.contains(MEMORY_WRITE_TOOL_NAME));
-        let available_tools_message = context
-            .provider_request
-            .messages
-            .get(1)
-            .expect("available tools message");
-        assert_eq!(available_tools_message.role, NeutralChatRole::System);
+        let available_tools_message = available_tools_message(&context.provider_request.messages);
+        assert_eq!(available_tools_message.role, NeutralChatRole::Developer);
         assert!(available_tools_message.content.contains("Available tools:"));
         assert!(
             !available_tools_message
@@ -21759,12 +21777,8 @@ Use the existing product UI conventions.
             .collect::<BTreeSet<_>>();
 
         assert!(!tool_names.contains(SEARCH_TEXT_TOOL));
-        let available_tools_message = context
-            .provider_request
-            .messages
-            .get(1)
-            .expect("available tools message");
-        assert_eq!(available_tools_message.role, NeutralChatRole::System);
+        let available_tools_message = available_tools_message(&context.provider_request.messages);
+        assert_eq!(available_tools_message.role, NeutralChatRole::Developer);
         assert!(available_tools_message.content.contains("Available tools:"));
         assert!(!available_tools_message.content.contains(SEARCH_TEXT_TOOL));
 
@@ -21845,12 +21859,15 @@ Use the existing product UI conventions.
                 .content
                 .contains("Available tools:")
         );
-        let available_tools_message = context
+        let developer_message = context
             .provider_request
             .messages
             .get(1)
-            .expect("available tools message");
-        assert_eq!(available_tools_message.role, NeutralChatRole::System);
+            .expect("developer prompt message");
+        assert_eq!(developer_message.role, NeutralChatRole::Developer);
+        assert!(developer_message.content.contains("You are Foco"));
+        let available_tools_message = available_tools_message(&context.provider_request.messages);
+        assert_eq!(available_tools_message.role, NeutralChatRole::Developer);
         assert!(available_tools_message.content.contains("Available tools:"));
         assert!(available_tools_message.content.contains("read_file"));
 
@@ -22069,7 +22086,10 @@ Use the existing product UI conventions.
         .expect("prompt context");
         let messages = &context.provider_request.messages;
 
-        assert!(messages[0].content.contains("You are Foco"));
+        assert_eq!(messages[0].role, NeutralChatRole::System);
+        assert!(messages[0].content.contains("Model-Layer Rules"));
+        assert_eq!(messages[1].role, NeutralChatRole::Developer);
+        assert!(messages[1].content.contains("You are Foco"));
         let current_user_index = messages
             .iter()
             .position(|message| message.content == "renderer prompt assembly")
