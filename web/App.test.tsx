@@ -2051,6 +2051,59 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("starts a new chat instead of sending guidance while another chat is running", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "first task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(chatStreamControllers.has("request-stream")).toBe(true),
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "New chat in Default" }),
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "new chat task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const streamCalls = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/chat/stream",
+      );
+      expect(streamCalls).toHaveLength(2);
+    });
+    const guidanceCalls = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/guidance",
+    );
+    expect(guidanceCalls).toHaveLength(0);
+    const secondStreamCall = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    )[1];
+    expect(JSON.parse(String(secondStreamCall[1]?.body))).toMatchObject({
+      chatId: null,
+      message: "new chat task",
+    });
+
+    await act(async () => {
+      chatStreamControllers.get("request-stream")?.close();
+      chatStreamControllers.get("request-stream-2")?.close();
+    });
+  });
+
   it("schedules a new workspace chat until the current workspace run finishes", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);

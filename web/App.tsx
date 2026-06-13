@@ -2170,6 +2170,10 @@ export function App() {
   const selectedProviderIdRef = useRef("");
   const selectedThinkingLevelRef = useRef("");
   const activeChatKeyRef = useRef<string | null>(null);
+  const activeWorkspaceIdRef = useRef("");
+  const activeChatIdRef = useRef<string | null>(null);
+  const runningChatKeysRef = useRef<Set<string>>(new Set());
+  const activeRunInfoByChatKeyRef = useRef<Record<string, ActiveRunInfo>>({});
   const queuedRunRequestsByChatKeyRef = useRef<
     Record<string, RetryRunRequest[]>
   >({});
@@ -2299,6 +2303,8 @@ export function App() {
   }, [theme]);
 
   useEffect(() => {
+    activeWorkspaceIdRef.current = activeWorkspaceId;
+    activeChatIdRef.current = activeChatId;
     activeChatKeyRef.current =
       activeChatId === null || isPendingChatId(activeChatId)
         ? activeChatKeyRef.current
@@ -3212,6 +3218,11 @@ export function App() {
   }
 
   function setChatRunning(chatKey: string, running: boolean) {
+    if (running) {
+      runningChatKeysRef.current.add(chatKey);
+    } else {
+      runningChatKeysRef.current.delete(chatKey);
+    }
     setRunningChatKeys((current) => {
       if (current.has(chatKey) === running) {
         return current;
@@ -3231,6 +3242,13 @@ export function App() {
     chatKey: string,
     runInfo: ActiveRunInfo | null,
   ) {
+    const nextRef = { ...activeRunInfoByChatKeyRef.current };
+    if (runInfo) {
+      nextRef[chatKey] = runInfo;
+    } else {
+      delete nextRef[chatKey];
+    }
+    activeRunInfoByChatKeyRef.current = nextRef;
     setActiveRunInfoByChatKey((current) => {
       if (!runInfo) {
         if (!(chatKey in current)) {
@@ -3321,6 +3339,13 @@ export function App() {
     return scheduledWorkspaceRuns.filter((run) => run.workspaceId === workspaceId);
   }
 
+  function setActiveWorkspaceChatRefs(workspaceId: string, chatId: string | null) {
+    activeWorkspaceIdRef.current = workspaceId;
+    activeChatIdRef.current = chatId;
+    activeChatKeyRef.current =
+      chatId && !isPendingChatId(chatId) ? chatRunKey(workspaceId, chatId) : null;
+  }
+
   function workspaceHasRunningOrStartingRun(workspaceId: string) {
     return (
       [...runningChatKeys].some(
@@ -3337,6 +3362,8 @@ export function App() {
     setActiveWorkspaceId(run.workspaceId);
     setActiveChatId(run.chatId);
     setExpandedWorkspaceId(run.workspaceId);
+    activeWorkspaceIdRef.current = run.workspaceId;
+    activeChatIdRef.current = run.chatId;
     activeChatKeyRef.current = run.chatKey;
     setMessages(cachedMessages);
     setSelectedDiffPath(null);
@@ -3363,6 +3390,7 @@ export function App() {
       const chatKey = chatRunKey(workspaceId, chatId);
       const nextMessages = data.messages.map(normalizeChatMessageSummary);
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
+      setActiveWorkspaceChatRefs(workspaceId, chatId);
       setActiveWorkspaceId(workspaceId);
       setActiveChatId(chatId);
       setExpandedWorkspaceId(workspaceId);
@@ -3413,7 +3441,7 @@ export function App() {
     setActiveChatId(chatId);
     setExpandedWorkspaceId(workspaceId);
     openChatTab(workspaceId, chatId);
-    activeChatKeyRef.current = chatKey;
+    setActiveWorkspaceChatRefs(workspaceId, chatId);
     setMessages(cachedMessages);
     setViewMode("chat");
     setIsMobileWorkspaceOpen(false);
@@ -3427,9 +3455,9 @@ export function App() {
     options: { updateUrl?: boolean } = {},
   ) {
     setExpandedWorkspaceId(workspaceId);
+    setActiveWorkspaceChatRefs(workspaceId, null);
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
-    activeChatKeyRef.current = null;
     setMessages([]);
     setSelectedDiffPath(null);
     setViewMode("chat");
@@ -3486,8 +3514,8 @@ export function App() {
       return;
     }
 
+    setActiveWorkspaceChatRefs(activeWorkspaceId || workspaceId, null);
     setActiveChatId(null);
-    activeChatKeyRef.current = null;
     setMessages([]);
     updateBrowserRoute({
       chatId: null,
@@ -3541,6 +3569,7 @@ export function App() {
       );
 
       if (activeChatId === chatId) {
+        setActiveWorkspaceChatRefs(workspaceId, null);
         setActiveWorkspaceId(workspaceId);
         setActiveChatId(null);
         setMessages([]);
@@ -3789,7 +3818,13 @@ export function App() {
       return null;
     }
 
-    if (!activeWorkspace) {
+    const currentWorkspaceId = activeWorkspaceIdRef.current || activeWorkspace?.id || "";
+    const currentWorkspace =
+      workspaces.find((workspace) => workspace.id === currentWorkspaceId) ??
+      activeWorkspace;
+    const currentChatId = activeChatIdRef.current;
+
+    if (!currentWorkspace) {
       setError(t("Select a workspace before sending."));
       return null;
     }
@@ -3808,14 +3843,51 @@ export function App() {
     return {
       attachments,
       chatId:
-        activeChatId && !isPendingChatId(activeChatId) ? activeChatId : null,
+        currentChatId && !isPendingChatId(currentChatId)
+          ? currentChatId
+          : null,
       content,
       modelId: selectedModelId,
       providerId: selectedProviderId,
       skillIds,
       thinkingLevel: selectedThinkingLevel,
-      workspaceId: activeWorkspace.id,
+      workspaceId: currentWorkspace.id,
     };
+  }
+
+  function activeRunForRequest(request: RetryRunRequest): ActiveRunInfo | null {
+    if (!request.chatId) {
+      return null;
+    }
+
+    const currentWorkspaceId = activeWorkspaceIdRef.current;
+    const currentChatId = activeChatIdRef.current;
+    if (
+      currentWorkspaceId !== request.workspaceId ||
+      currentChatId !== request.chatId
+    ) {
+      return null;
+    }
+
+    const currentChatKey = activeChatKeyRef.current;
+    const requestChatKey = chatRunKey(request.workspaceId, request.chatId);
+    if (currentChatKey !== requestChatKey) {
+      return null;
+    }
+
+    const runInfo = activeRunInfoByChatKeyRef.current[requestChatKey] ?? null;
+    if (
+      !runInfo ||
+      runInfo.chatKey !== requestChatKey ||
+      runInfo.workspaceId !== request.workspaceId ||
+      runInfo.chatId !== request.chatId ||
+      !runInfo.runId ||
+      !runningChatKeysRef.current.has(requestChatKey)
+    ) {
+      return null;
+    }
+
+    return runInfo;
   }
 
   async function handleSendMessage(
@@ -3829,13 +3901,14 @@ export function App() {
       return;
     }
 
-    if (isSendingMessage) {
+    const requestActiveRun = activeRunForRequest(request);
+    if (requestActiveRun) {
       if (options.schedule) {
-        handleQueueActiveRunWithRequest(request);
+        handleQueueActiveRunWithRequest(request, requestActiveRun);
         return;
       }
 
-      await guideActiveRun(request);
+      await guideActiveRun(request, requestActiveRun);
       return;
     }
 
@@ -3869,6 +3942,8 @@ export function App() {
     setActiveWorkspaceId(request.workspaceId);
     setActiveChatId(runKey);
     setExpandedWorkspaceId(request.workspaceId);
+    activeWorkspaceIdRef.current = request.workspaceId;
+    activeChatIdRef.current = runKey;
     activeChatKeyRef.current = chatKey;
     setSelectedDiffPath(null);
     setViewMode("chat");
@@ -3912,7 +3987,13 @@ export function App() {
       return;
     }
 
-    await guideActiveRun(request);
+    const runInfo = activeRunForRequest(request);
+    if (!runInfo) {
+      setError(t("No active run is available for guidance."));
+      return;
+    }
+
+    await guideActiveRun(request, runInfo);
   }
 
   function handleQueueActiveRun() {
@@ -3920,21 +4001,19 @@ export function App() {
     if (!request) {
       return;
     }
-    handleQueueActiveRunWithRequest(request);
-  }
-
-  function handleQueueActiveRunWithRequest(request: RetryRunRequest) {
-    const currentChatKey = activeChatKeyRef.current;
-    const runInfo = activeRunInfo;
-    if (
-      !currentChatKey ||
-      !runInfo?.chatKey ||
-      runInfo.chatKey !== currentChatKey
-    ) {
+    const runInfo = activeRunForRequest(request);
+    if (!runInfo) {
       setError(t("No active run is available for guidance."));
       return;
     }
 
+    handleQueueActiveRunWithRequest(request, runInfo);
+  }
+
+  function handleQueueActiveRunWithRequest(
+    request: RetryRunRequest,
+    runInfo: ActiveRunInfo,
+  ) {
     setSelectedSkillIds([]);
     setDraftAttachments([]);
     setDraftMessage("");
@@ -3985,15 +4064,17 @@ export function App() {
   }
 
   async function handleGuideQueuedMessage(messageId: string) {
-    const runInfo = activeRunInfo;
     const chatKey = activeChatKeyRef.current;
+    const runInfo = chatKey
+      ? activeRunInfoByChatKeyRef.current[chatKey] ?? null
+      : null;
     if (
       !chatKey ||
-      !isSendingMessage ||
       !runInfo ||
       !runInfo.chatId ||
       !runInfo.runId ||
-      runInfo.chatKey !== chatKey
+      runInfo.chatKey !== chatKey ||
+      !runningChatKeysRef.current.has(chatKey)
     ) {
       setError(t("No active run is available for guidance."));
       return;
@@ -4080,6 +4161,8 @@ export function App() {
     }
 
     const retryRequest = retryRunRequest;
+    activeWorkspaceIdRef.current = retryRequest.workspaceId;
+    activeChatIdRef.current = retryRequest.chatId;
     setActiveWorkspaceId(retryRequest.workspaceId);
     setActiveChatId(retryRequest.chatId);
     updateBrowserRoute({
@@ -4381,19 +4464,10 @@ export function App() {
     });
   }
 
-  async function guideActiveRun(request: RetryRunRequest) {
-    const runInfo = activeRunInfo;
-    if (
-      !isSendingMessage ||
-      !runInfo ||
-      !runInfo.chatId ||
-      !runInfo.runId ||
-      runInfo.chatKey !== activeChatKeyRef.current
-    ) {
-      setError(t("No active run is available for guidance."));
-      return;
-    }
-
+  async function guideActiveRun(
+    request: RetryRunRequest,
+    runInfo: ActiveRunInfo,
+  ) {
     const pendingUserMessageId = localUiId("pending-guidance-user");
     const visibleUserContent = messageWithSelectedSkills(
       detectedSkills,
@@ -5043,8 +5117,8 @@ export function App() {
           if (
             shouldActivateStartedChat
           ) {
+            setActiveWorkspaceChatRefs(request.workspaceId, streamEvent.chatId);
             setActiveChatId(streamEvent.chatId);
-            activeChatKeyRef.current = currentRunningChatKey;
             updateBrowserRoute({
               chatId: streamEvent.chatId,
               viewMode: "chat",
@@ -10746,13 +10820,16 @@ function AuditJsonBlock({
           </button>
           <button
             aria-label={t("Copy {label}", { label })}
-            className="audit-json-copy-button"
+            className="audit-json-icon-button"
             onClick={onCopy}
             title={t("Copy {label}", { label })}
             type="button"
           >
-            <Copy aria-hidden="true" className="size-3.5" />
-            {copied ? t("Copied") : t("Copy")}
+            {copied ? (
+              <CheckCircle2 aria-hidden="true" className="size-3.5" />
+            ) : (
+              <Copy aria-hidden="true" className="size-3.5" />
+            )}
           </button>
         </div>
       </div>

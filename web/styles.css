@@ -2628,10 +2628,42 @@ body,
   }
 
   .settings-layout {
-    grid-template-columns: minmax(9.5rem, 36vw) minmax(0, 1fr);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .settings-section-nav-card {
+    position: sticky;
+    z-index: 10;
+    top: 0;
+    height: auto;
+    flex: 0 0 auto;
+    align-self: stretch;
+    border-width: 0 0 1px;
+    border-radius: 0;
+  }
+
+  .settings-sidebar-header {
+    flex: 0 0 auto;
+    min-height: 2.75rem;
+    height: auto;
+  }
+
+  .settings-section-nav {
+    flex: 0 0 auto;
+    flex-direction: row;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.5rem;
+  }
+
+  .settings-section-nav > button {
+    width: auto;
+    min-width: max-content;
   }
 
   .settings-layout > .min-w-0 {
+    flex: 1 1 auto;
     padding: 0.75rem;
   }
 }
