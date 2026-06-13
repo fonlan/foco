@@ -125,6 +125,7 @@
 - 聊天流在 `write_file`、`patch_file` 或 `run_command` 工具完成后会发送 `gitDiffRefresh` SSE 事件，前端收到后刷新右侧 diff 面板。
 - 聊天流在 `create_todo_graph` 或 `update_todo_graph` 工具完成后会发送 `todoGraphRefresh` SSE 事件，前端收到当前 chat 的 ToDo 图刷新事件后必须自动打开右侧 ToDo/Git diff 侧边栏并刷新 todo graph；同一模型 turn 中只要包含 todo graph 写工具，该批工具会按顺序执行以避免同一 chat 的 ToDo 图被并发覆盖。
 - 浏览器聊天 UI 支持取消当前 active run，并在失败或取消后重试上一轮 run；应用级 shutdown 也必须通知 active agent run，已开始的 run 需要以 `cancelled` 审计状态落库。
+- 浏览器聊天 UI 在 active run 期间排队的 user message 必须在消息右上角提供撤回和转为引导消息按钮；撤回只移除尚未开始发送的队列项，转为引导消息必须从发送队列移除并通过现有 guidance API 注入当前 active run。
 - 聊天 API 会先持久化用户消息，provider 完成后持久化 assistant 消息，并为真实请求写入 `llm_requests` 与 `llm_request_events`。
 - 聊天上下文在接近模型上下文上限前会把较早的可选历史消息压缩为结构化 snapshot；snapshot 写入 workspace 数据库的 `context_compression_snapshots`，并在后续 prompt assembly 中作为 system context 注入。
 - context compression 只覆盖带有数据库 sequence 的旧消息；已有 compression snapshot、最新用户消息和 active tool state 必须保留，不参与压缩。

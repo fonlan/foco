@@ -1582,6 +1582,12 @@ body,
   white-space: nowrap;
 }
 
+.message-action-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+}
+
 .message-action-menu {
   display: inline-flex;
   width: 1.75rem;

@@ -1277,6 +1277,9 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Message Foco": "给 Foco 发送消息",
     "Ask Foco anything about {name}...": "询问 Foco 关于 {name} 的任何问题...",
     "Copy message": "复制消息",
+    "Withdraw queued message": "撤回队列消息",
+    "Convert queued message to guidance": "转为引导消息",
+    "Queued message is no longer available.": "队列消息已不存在。",
     "Copied message": "已复制消息",
     "Select skill {name}": "选择技能 {name}",
     "Skill is disabled": "技能已禁用",
@@ -2117,6 +2120,13 @@ export function App() {
   const queuedRunRequests = activeChatKey
     ? queuedRunRequestsByChatKey[activeChatKey] ?? []
     : [];
+  const queuedMessageIds = useMemo(
+    () =>
+      new Set(
+        queuedRunRequests.flatMap((request) => request.pendingUserMessageId ?? []),
+      ),
+    [queuedRunRequests],
+  );
   const chatTabs = useMemo(
     () => openChatTabs.map((tab) => hydrateChatTab(tab, workspaces)),
     [openChatTabs, workspaces],
@@ -3797,6 +3807,119 @@ export function App() {
       ...current,
       queuedRequest,
     ]);
+  }
+
+  function handleWithdrawQueuedMessage(messageId: string) {
+    const chatKey = activeChatKeyRef.current;
+    if (!chatKey) {
+      return;
+    }
+
+    const queuedRequests = queuedRunRequestsByChatKeyRef.current[chatKey] ?? [];
+    if (
+      !queuedRequests.some(
+        (request) => request.pendingUserMessageId === messageId,
+      )
+    ) {
+      setError(t("Queued message is no longer available."));
+      return;
+    }
+
+    updateQueuedRunRequestsForChatKey(chatKey, (current) =>
+      current.filter((request) => request.pendingUserMessageId !== messageId),
+    );
+    removeMessageForChatKey(chatKey, messageId);
+    setError(null);
+  }
+
+  async function handleGuideQueuedMessage(messageId: string) {
+    const runInfo = activeRunInfo;
+    const chatKey = activeChatKeyRef.current;
+    if (
+      !chatKey ||
+      !isSendingMessage ||
+      !runInfo ||
+      !runInfo.chatId ||
+      !runInfo.runId ||
+      runInfo.chatKey !== chatKey
+    ) {
+      setError(t("No active run is available for guidance."));
+      return;
+    }
+
+    const queuedRequests = queuedRunRequestsByChatKeyRef.current[chatKey] ?? [];
+    const queuedIndex = queuedRequests.findIndex(
+      (request) => request.pendingUserMessageId === messageId,
+    );
+    if (queuedIndex < 0) {
+      setError(t("Queued message is no longer available."));
+      return;
+    }
+
+    const queuedRequest = queuedRequests[queuedIndex];
+    const visibleUserContent = messageWithSelectedSkills(
+      detectedSkills,
+      queuedRequest.skillIds,
+      queuedRequest.content,
+    );
+    const visibleParts = userMessageParts(
+      visibleUserContent,
+      queuedRequest.attachments,
+    );
+
+    updateQueuedRunRequestsForChatKey(chatKey, (current) =>
+      current.filter((request) => request.pendingUserMessageId !== messageId),
+    );
+    setMessagesForChatKey(chatKey, (current) =>
+      current.map((message) =>
+        message.id === messageId && message.pendingMode === "queued"
+          ? {
+              ...message,
+              content: visibleUserContent,
+              pendingMode: "guidance",
+              parts: visibleParts,
+            }
+          : message,
+      ),
+    );
+    setError(null);
+
+    try {
+      const guidance = await requestJson<{
+        id: string;
+        content: string;
+        parts: ChatMessagePart[];
+      }>(
+        `/api/workspaces/${encodeURIComponent(runInfo.workspaceId)}/chat/guidance`,
+        {
+          body: JSON.stringify({
+            attachments: queuedRequest.attachments,
+            chatId: runInfo.chatId,
+            message: visibleUserContent,
+            runId: runInfo.runId,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      pendingGuidanceMessageIdsRef.current.set(guidance.id, messageId);
+    } catch (requestError) {
+      updateQueuedRunRequestsForChatKey(chatKey, (current) => {
+        const next = current.filter(
+          (request) => request.pendingUserMessageId !== messageId,
+        );
+        next.splice(Math.min(queuedIndex, next.length), 0, queuedRequest);
+        return next;
+      });
+      setMessagesForChatKey(chatKey, (current) =>
+        current.map((message) =>
+          message.id === messageId
+            ? { ...message, pendingMode: "queued" }
+            : message,
+        ),
+      );
+      setError(errorMessage(requestError));
+    }
   }
 
   async function handleRetryRun() {
@@ -5661,6 +5784,9 @@ export function App() {
               }
               onBranchChange={(branch) => void handleGitBranchChange(branch)}
               onDraftMessageChange={setDraftMessage}
+              onGuideQueuedMessage={(messageId) =>
+                void handleGuideQueuedMessage(messageId)
+              }
               onSelectAttachments={() => void handleSelectDraftAttachments()}
               onCancelRun={() => void handleCancelRun()}
               onGuideActiveRun={() => void handleGuideActiveRun()}
@@ -5675,8 +5801,10 @@ export function App() {
               }
               onThinkingLevelChange={setSelectedThinkingLevel}
               onToggleSkill={toggleSelectedSkill}
+              onWithdrawQueuedMessage={handleWithdrawQueuedMessage}
               canRetryRun={retryRunRequest !== null && !isSendingMessage}
               queuedRunCount={queuedRunRequests.length}
+              queuedMessageIds={queuedMessageIds}
               selectedGitBranch={selectedGitBranch}
               selectedModelId={selectedModelId}
               selectedProviderId={selectedProviderId}
@@ -6862,6 +6990,7 @@ function ChatPanel({
   onCancelRun,
   onDraftMessageChange,
   onGuideActiveRun,
+  onGuideQueuedMessage,
   onModelChange,
   onProviderChange,
   onQueueActiveRun,
@@ -6872,6 +7001,7 @@ function ChatPanel({
   onSubmit,
   onThinkingLevelChange,
   onToggleSkill,
+  onWithdrawQueuedMessage,
   selectedGitBranch,
   selectedModelId,
   selectedProviderId,
@@ -6880,6 +7010,7 @@ function ChatPanel({
   settings,
   providers,
   skills,
+  queuedMessageIds,
   thinkingLevels,
   workspaces,
 }: {
@@ -6905,6 +7036,7 @@ function ChatPanel({
   onCancelRun: () => void;
   onDraftMessageChange: (value: string) => void;
   onGuideActiveRun: () => void;
+  onGuideQueuedMessage: (messageId: string) => void;
   onModelChange: (value: string) => void;
   onProviderChange: (value: string) => void;
   onQueueActiveRun: () => void;
@@ -6918,6 +7050,7 @@ function ChatPanel({
   ) => void;
   onThinkingLevelChange: (value: string) => void;
   onToggleSkill: (skillId: string) => void;
+  onWithdrawQueuedMessage: (messageId: string) => void;
   selectedGitBranch: string;
   selectedModelId: string;
   selectedProviderId: string;
@@ -6926,6 +7059,7 @@ function ChatPanel({
   settings: SettingsResponse | null;
   providers: ConfiguredProviderSummary[];
   skills: ConfiguredSkillSummary[];
+  queuedMessageIds: ReadonlySet<string>;
   thinkingLevels: ThinkingLevelSummary[];
   workspaces: WorkspaceSummary[];
 }) {
@@ -7198,6 +7332,10 @@ function ChatPanel({
                     ? t("Queued")
                     : null;
               const isPendingUserMessage = isUser && pendingLabel !== null;
+              const canManageQueuedMessage =
+                isUser &&
+                message.pendingMode === "queued" &&
+                queuedMessageIds.has(message.id);
 
               return (
                 <div
@@ -7254,25 +7392,62 @@ function ChatPanel({
                               {createdAtLabel}
                             </time>
                           </span>
-                          <button
-                            aria-label={copyLabel}
-                            className="message-action-menu"
-                            disabled={!copyText}
-                            onClick={() =>
-                              void handleCopyMessage(message.id, copyText)
-                            }
-                            title={copyLabel}
-                            type="button"
-                          >
-                            {copiedMessageId === message.id ? (
-                              <CheckCircle2
-                                aria-hidden="true"
-                                className="size-3.5"
-                              />
-                            ) : (
-                              <Copy aria-hidden="true" className="size-3.5" />
-                            )}
-                          </button>
+                          <span className="message-action-group">
+                            {canManageQueuedMessage ? (
+                              <>
+                                <button
+                                  aria-label={t(
+                                    "Convert queued message to guidance",
+                                  )}
+                                  className="message-action-menu"
+                                  onClick={() => onGuideQueuedMessage(message.id)}
+                                  title={t(
+                                    "Convert queued message to guidance",
+                                  )}
+                                  type="button"
+                                >
+                                  <ArrowUp
+                                    aria-hidden="true"
+                                    className="size-3.5"
+                                  />
+                                </button>
+                                <button
+                                  aria-label={t("Withdraw queued message")}
+                                  className="message-action-menu"
+                                  onClick={() => onWithdrawQueuedMessage(message.id)}
+                                  title={t("Withdraw queued message")}
+                                  type="button"
+                                >
+                                  <X
+                                    aria-hidden="true"
+                                    className="size-3.5"
+                                  />
+                                </button>
+                              </>
+                            ) : null}
+                            <button
+                              aria-label={copyLabel}
+                              className="message-action-menu"
+                              disabled={!copyText}
+                              onClick={() =>
+                                void handleCopyMessage(message.id, copyText)
+                              }
+                              title={copyLabel}
+                              type="button"
+                            >
+                              {copiedMessageId === message.id ? (
+                                <CheckCircle2
+                                  aria-hidden="true"
+                                  className="size-3.5"
+                                />
+                              ) : (
+                                <Copy
+                                  aria-hidden="true"
+                                  className="size-3.5"
+                                />
+                              )}
+                            </button>
+                          </span>
                         </div>
                         {!isUser ? (
                           <MemoriesUsedBlock memories={message.memoriesUsed} />

@@ -1755,6 +1755,180 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("withdraws a queued message before it is sent", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "first task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "next task",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
+      ctrlKey: true,
+    });
+    const pendingQueuedMessage = screen.getByText("next task");
+    const pendingQueuedRow = pendingQueuedMessage.closest(".message-row");
+    expect(pendingQueuedRow).not.toBeNull();
+
+    await userEvent.click(
+      within(pendingQueuedRow as HTMLElement).getByRole("button", {
+        name: "Withdraw queued message",
+      }),
+    );
+
+    expect(screen.queryByText("next task")).not.toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 10,
+        },
+        reasoning: null,
+        stopReason: null,
+        text: "Done.",
+        type: "complete",
+        usage: null,
+      });
+      activeChatStreamController?.close();
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Cancel run" }),
+      ).not.toBeInTheDocument(),
+    );
+    const streamCalls = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    expect(streamCalls).toHaveLength(1);
+  });
+
+  it("converts a queued message into active-run guidance", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "first task",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "next task",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
+      ctrlKey: true,
+    });
+    const pendingQueuedMessage = screen.getByText("next task");
+    const pendingQueuedRow = pendingQueuedMessage.closest(".message-row");
+    expect(pendingQueuedRow).not.toBeNull();
+
+    await userEvent.click(
+      within(pendingQueuedRow as HTMLElement).getByRole("button", {
+        name: "Convert queued message to guidance",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-1/chat/guidance",
+        ),
+      ).toBe(true);
+    });
+    const guidanceCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/guidance",
+    );
+    expect(JSON.parse(String(guidanceCall?.[1]?.body))).toMatchObject({
+      chatId: "chat-1",
+      message: "next task",
+      runId: "request-stream",
+    });
+
+    const pendingGuidanceMessage = screen.getByText("next task");
+    const pendingGuidanceRow = pendingGuidanceMessage.closest(".message-row");
+    expect(pendingGuidanceRow).not.toBeNull();
+    expect(
+      within(pendingGuidanceRow as HTMLElement).getByText("Guidance pending"),
+    ).toBeInTheDocument();
+    expect(
+      within(pendingGuidanceRow as HTMLElement).queryByText("Queued"),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        content: "next task",
+        id: "guidance-1",
+        interruptedAssistantMetrics: null,
+        parts: [],
+        type: "guidanceApplied",
+      });
+    });
+    const guidanceMessage = screen.getByText("next task");
+    const guidanceRow = guidanceMessage.closest(".message-row");
+    expect(guidanceRow).not.toBeNull();
+    expect(
+      within(guidanceRow as HTMLElement).queryByText("Guidance pending"),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "guidance-1-assistant",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 10,
+        },
+        reasoning: null,
+        stopReason: null,
+        text: "Guided done.",
+        type: "complete",
+        usage: null,
+      });
+      activeChatStreamController?.close();
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Cancel run" }),
+      ).not.toBeInTheDocument(),
+    );
+    const streamCalls = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    expect(streamCalls).toHaveLength(1);
+  });
+
   it("starts another chat stream while a different chat is still running", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
