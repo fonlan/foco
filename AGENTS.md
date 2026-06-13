@@ -139,7 +139,7 @@
 - 终端后端位于 `app/terminal.rs`，使用 `portable-pty` 按当前 workspace 的 `terminal_shell` 启动 `powershell.exe`、`cmd.exe`、`bash` 或 `zsh`；配置的 shell 启动失败必须明确报错，不得静默切换到另一个 shell。WebSocket JSON 协议只包含 `input`、`resize`、`started`、`output`、`cwd`、`exit` 和 `error`。
 - 终端 cwd 目前通过 PowerShell prompt 写出的 OSC 7 事件回传并持久化到 workspace 数据库的 `terminal_sessions.working_directory`；如果报告的 cwd 不存在或不是绝对路径，应明确报错。
 - 终端 WebSocket 断开、用户关闭终端面板或 app Ctrl+C shutdown 时必须清理 PTY 子进程，并把 session 标记 closed；下一次创建 session 会从最近一次 terminal cwd 恢复。
-- `foco-graph` 在后端启动时会对每个已注册 workspace 运行一次初始 code graph 索引，并启动带 debounce 的 filesystem watcher；索引或 watcher 启动失败应作为显式启动错误处理。
+- `foco-graph` 在后端启动后会后台对每个已注册 workspace 运行一次初始 code graph 索引，并启动带 debounce 的 filesystem watcher；索引或 watcher 启动失败必须记录明确错误，但不得阻塞 HTTP 服务启动。
 - code graph 扫描使用 `.gitignore` 等 ignore 规则，并固定跳过 `.foco`、`.git`、`.codegraph`、`.mem`、`node_modules`、`target` 和 `dist` 等内部或生成目录。
 - code graph 当前通过 Tree-sitter 解析 Rust、TypeScript、TSX、JavaScript、Python、Go、C、C++、C#、Java、JSON 和 TOML；Markdown 进入文件/FTS 索引但不抽取 AST 符号。
 - workspace SQLite schema v4 新增真正的 FTS5 虚拟表 `code_graph_fts_index`，并继续用 `code_graph_fts_data` 保存 files、symbols 和 documentation text 的普通数据行。

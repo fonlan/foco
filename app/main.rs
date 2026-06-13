@@ -297,7 +297,7 @@ struct AppState {
     question_registry: QuestionRegistry,
     active_chat_runs: ActiveChatRunRegistry,
     tool_resource_locks: ToolResourceLockRegistry,
-    _code_graph_watchers: Arc<Vec<CodeGraphWatcher>>,
+    _code_graph_watchers: Arc<Mutex<Vec<CodeGraphWatcher>>>,
     #[cfg(all(windows, not(debug_assertions)))]
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
 }
@@ -1219,7 +1219,6 @@ async fn run_server_until_shutdown(
         count = workspace_databases.len(),
         "initialized workspace databases"
     );
-    let code_graph_watchers = initialize_code_graph_indexes(&loaded_config.config.workspaces)?;
     let mcp_registry = Arc::new(McpRegistry::default());
     sync_all_mcp_workspaces(&mcp_registry, &loaded_config.config).await?;
     let hook_runtime = HookRuntime::new(mcp_registry.clone());
@@ -1239,6 +1238,8 @@ async fn run_server_until_shutdown(
 
     let addr = local_addr(&loaded_config.config)?;
     verify_frontend_assets()?;
+    let code_graph_workspaces = loaded_config.config.workspaces.clone();
+    let code_graph_watchers = Arc::new(Mutex::new(Vec::new()));
     let (terminal_shutdown_tx, _) = broadcast::channel(16);
     let (owned_shutdown_tx, owned_shutdown_rx);
     let (shutdown_tx, app_shutdown_rx) = match shutdown_rx {
@@ -1264,12 +1265,14 @@ async fn run_server_until_shutdown(
         question_registry: QuestionRegistry::default(),
         active_chat_runs: ActiveChatRunRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
-        _code_graph_watchers: Arc::new(code_graph_watchers),
+        _code_graph_watchers: code_graph_watchers.clone(),
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
     };
     let app = app_router(state);
     let listener = TcpListener::bind(addr).await?;
+    let _code_graph_index_thread =
+        spawn_code_graph_index_initialization(code_graph_workspaces, code_graph_watchers)?;
 
     tracing::info!(%addr, "starting local HTTP server");
     println!("Foco is running at http://{addr}");
@@ -1622,34 +1625,61 @@ fn open_foco_ui(ui_url: &str) {
     }
 }
 
+fn spawn_code_graph_index_initialization(
+    workspaces: Vec<WorkspaceConfig>,
+    watchers: Arc<Mutex<Vec<CodeGraphWatcher>>>,
+) -> AppResult<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("foco-code-graph-startup".to_string())
+        .spawn(move || initialize_code_graph_indexes(&workspaces, &watchers))
+        .map_err(Into::into)
+}
+
 fn initialize_code_graph_indexes(
     workspaces: &[WorkspaceConfig],
-) -> AppResult<Vec<CodeGraphWatcher>> {
-    let mut watchers = Vec::with_capacity(workspaces.len());
-
+    watchers: &Arc<Mutex<Vec<CodeGraphWatcher>>>,
+) {
     for workspace in workspaces {
-        let report = index_workspace(&workspace.path)?;
-        tracing::info!(
-            workspace_id = %workspace.id,
-            workspace_path = %workspace.path.display(),
-            scanned_files = report.scanned_files,
-            indexed_files = report.indexed_files,
-            unchanged_files = report.unchanged_files,
-            skipped_files = report.skipped_files,
-            deleted_files = report.deleted_files,
-            parse_errors = report.parse_errors,
-            "initialized code graph index"
-        );
-        let watcher = start_code_graph_watcher(&workspace.path)?;
-        tracing::info!(
-            workspace_id = %workspace.id,
-            workspace_path = %workspace.path.display(),
-            "started code graph filesystem watcher"
-        );
-        watchers.push(watcher);
+        match initialize_code_graph_workspace(workspace) {
+            Ok(watcher) => {
+                watchers
+                    .lock()
+                    .expect("code graph watcher lock poisoned")
+                    .push(watcher);
+            }
+            Err(error) => {
+                tracing::error!(
+                    workspace_id = %workspace.id,
+                    workspace_path = %workspace.path.display(),
+                    error = %error,
+                    "failed to initialize code graph index"
+                );
+            }
+        }
     }
+}
 
-    Ok(watchers)
+fn initialize_code_graph_workspace(workspace: &WorkspaceConfig) -> AppResult<CodeGraphWatcher> {
+    let report = index_workspace(&workspace.path)?;
+    tracing::info!(
+        workspace_id = %workspace.id,
+        workspace_path = %workspace.path.display(),
+        scanned_files = report.scanned_files,
+        indexed_files = report.indexed_files,
+        unchanged_files = report.unchanged_files,
+        skipped_files = report.skipped_files,
+        deleted_files = report.deleted_files,
+        parse_errors = report.parse_errors,
+        "initialized code graph index"
+    );
+    let watcher = start_code_graph_watcher(&workspace.path)?;
+    tracing::info!(
+        workspace_id = %workspace.id,
+        workspace_path = %workspace.path.display(),
+        "started code graph filesystem watcher"
+    );
+
+    Ok(watcher)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -19231,6 +19261,44 @@ mod tests {
     }
 
     #[test]
+    fn background_code_graph_initialization_indexes_workspace_and_keeps_watcher() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-background-graph-test"));
+        remove_dir_if_exists(&workspace_dir);
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        fs::write(
+            workspace_dir.join("lib.rs"),
+            "pub fn helper() -> i32 { 1 }\n",
+        )
+        .expect("workspace source write");
+        let workspaces = vec![WorkspaceConfig {
+            id: "workspace-1".to_string(),
+            name: "Workspace 1".to_string(),
+            path: workspace_dir.clone(),
+            pinned: false,
+            terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
+        }];
+        let watchers = Arc::new(Mutex::new(Vec::new()));
+
+        let thread = spawn_code_graph_index_initialization(workspaces, watchers.clone())
+            .expect("spawn code graph initialization");
+        thread.join().expect("code graph initialization thread");
+
+        assert_eq!(
+            watchers.lock().expect("watcher lock").len(),
+            1,
+            "watcher must be retained after background indexing"
+        );
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let context = database.code_graph_context().expect("code graph context");
+        assert_eq!(context.indexed_files, 1);
+        drop(database);
+        watchers.lock().expect("watcher lock").clear();
+        remove_dir_if_exists(&workspace_dir);
+    }
+
+    #[test]
     fn repeated_tool_call_detector_rejects_third_identical_batch() {
         let mut detector = RepeatedToolCallDetector::default();
 
@@ -24411,7 +24479,7 @@ description: Project memory.
             question_registry: QuestionRegistry::default(),
             active_chat_runs: ActiveChatRunRegistry::default(),
             tool_resource_locks: ToolResourceLockRegistry::default(),
-            _code_graph_watchers: Arc::new(Vec::new()),
+            _code_graph_watchers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
