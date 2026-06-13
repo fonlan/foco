@@ -706,6 +706,8 @@ impl Default for MemorySettings {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PromptSettings {
     #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
     pub files: Vec<PathBuf>,
     #[serde(default)]
     pub extra_text: String,
@@ -1249,6 +1251,14 @@ fn validate_prompt_settings(
     settings: &PromptSettings,
 ) -> Result<(), ConfigError> {
     let mut prompt_files = HashSet::new();
+
+    if settings
+        .system_prompt
+        .as_ref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return invalid_config(config_path, "prompts.system_prompt must not be empty");
+    }
 
     for file in &settings.files {
         if !file.is_absolute() {
@@ -1946,6 +1956,26 @@ mod tests {
             error
                 .to_string()
                 .contains("workspace.terminal_shell 'fish' is unsupported")
+        );
+    }
+
+    #[test]
+    fn load_rejects_empty_custom_system_prompt() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.prompts.system_prompt = Some("   ".to_string());
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("empty custom system prompt should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("prompts.system_prompt must not be empty")
         );
     }
 

@@ -32,11 +32,11 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{Duration as ChronoDuration, Local, SecondsFormat, Utc};
 use foco_agent::{
-    ContextPackItem, PendingToolCall, SystemPromptInput, ToolExecutionMode, ToolExecutionPlan,
-    ToolPromptInfo, ToolResource, ToolResourceAccess, ToolResourceLock, build_system_prompt,
-    calculate_context_budget, context_compression_trigger_tokens, estimate_json_tokens,
-    estimate_text_tokens, pack_context, plan_context_compression, plan_tool_execution,
-    tool_resource_locks, tool_resource_locks_conflict,
+    ContextPackItem, PendingToolCall, ToolExecutionMode, ToolExecutionPlan, ToolPromptInfo,
+    ToolResource, ToolResourceAccess, ToolResourceLock, build_available_tools_prompt,
+    build_default_system_prompt, calculate_context_budget, context_compression_trigger_tokens,
+    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
+    plan_tool_execution, tool_resource_locks, tool_resource_locks_conflict,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{
@@ -2352,8 +2352,19 @@ async fn save_prompt_settings(
     Json(request): Json<ManualPromptSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
+    let system_prompt = match request.system_prompt {
+        Some(value) => {
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                return Err(ApiError::bad_request("system prompt must not be empty"));
+            }
+            Some(value)
+        }
+        None => None,
+    };
 
     config.prompts = PromptSettings {
+        system_prompt,
         files: normalize_prompt_file_paths(request.files)?,
         extra_text: request.extra_text.trim().to_string(),
     };
@@ -4113,6 +4124,7 @@ struct ManualMemorySettingsRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManualPromptSettingsRequest {
+    system_prompt: Option<String>,
     files: Vec<String>,
     extra_text: String,
 }
@@ -4501,6 +4513,8 @@ struct MemoryExtractionModeSummary {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PromptSettingsSummary {
+    system_prompt: Option<String>,
+    default_system_prompt: String,
     files: Vec<String>,
     extra_text: String,
 }
@@ -6936,7 +6950,14 @@ async fn prepare_prompt_context(
     let user_sequence = next_message_sequence(&existing_messages);
     drop(database);
 
-    let builtin_tool_definitions = builtin_tool_definitions();
+    let ripgrep_available = {
+        let status = state
+            .ripgrep_status
+            .lock()
+            .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
+        status.available
+    };
+    let builtin_tool_definitions = builtin_tool_definitions_for_runtime(ripgrep_available);
     let memory_tool_definitions = if config.memory.enabled {
         memory_tool_definitions()
     } else {
@@ -6949,34 +6970,22 @@ async fn prepare_prompt_context(
         .collect::<Vec<_>>();
     neutral_tools.extend(memory_tool_definitions.iter().cloned());
     neutral_tools.extend(mcp_tools.iter().map(neutral_mcp_tool_definition));
-    let tool_prompt_infos = builtin_tool_definitions
-        .iter()
-        .map(|tool| ToolPromptInfo {
-            name: tool.name.to_string(),
-            description: tool.description.to_string(),
-        })
-        .chain(memory_tool_definitions.iter().map(|tool| ToolPromptInfo {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-        }))
-        .chain(mcp_tools.iter().map(|tool| ToolPromptInfo {
-            name: tool.name.clone(),
-            description: format!(
-                "{} MCP server '{}': {}",
-                tool.original_name, tool.server_name, tool.description
-            ),
-        }))
-        .collect();
-    let system_prompt = build_system_prompt(SystemPromptInput {
-        workspace_id: workspace.id.clone(),
-        workspace_name: workspace.name.clone(),
-        workspace_path: workspace.path.display().to_string(),
-        tools: tool_prompt_infos,
-    });
+    let tool_prompt_infos = tool_prompt_infos(
+        &builtin_tool_definitions,
+        &memory_tool_definitions,
+        &mcp_tools,
+    );
+    let system_prompt = active_system_prompt(&config.prompts);
+    let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos);
+    let system_prompt_tokens = estimate_text_tokens(&system_prompt)
+        + available_tools_prompt
+            .as_ref()
+            .map(|prompt| estimate_text_tokens(prompt))
+            .unwrap_or(0);
     let context_budget = calculate_context_budget(
         limits.context_window,
         limits.max_output_tokens,
-        estimate_text_tokens(&system_prompt),
+        system_prompt_tokens,
         estimate_tool_schema_tokens(&neutral_tools),
     )
     .map_err(|source| ApiError::bad_request(source.to_string()))?;
@@ -7079,6 +7088,13 @@ async fn prepare_prompt_context(
     let mut message_source_sequences = Vec::with_capacity(neutral_messages.capacity());
     neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
     message_source_sequences.push(None);
+    if let Some(available_tools_prompt) = available_tools_prompt {
+        neutral_messages.push(neutral_text_message(
+            NeutralChatRole::System,
+            available_tools_prompt,
+        ));
+        message_source_sequences.push(None);
+    }
     for stable_context_message in stable_context_messages.drain(..) {
         neutral_messages.push(stable_context_message);
         message_source_sequences.push(None);
@@ -7282,6 +7298,7 @@ async fn prepare_chat_context(
         &prompt_context.provider_id,
         &prompt_context.model_id,
         &provider_request,
+        &prompt_context.message_source_sequences,
     )?);
     provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
     let request_body_json = serialize_provider_request(&provider_request)?;
@@ -8027,6 +8044,7 @@ fn prompt_cache_key(
     provider_id: &str,
     model_id: &str,
     request: &NeutralChatRequest,
+    message_source_sequences: &[Option<i64>],
 ) -> Result<String, ApiError> {
     let mut hasher = Sha256::new();
     hasher.update(workspace_id.as_bytes());
@@ -8036,6 +8054,20 @@ fn prompt_cache_key(
     hasher.update(provider_id.as_bytes());
     hasher.update(b"\0");
     hasher.update(model_id.as_bytes());
+    hasher.update(b"\0");
+    let stable_messages = request
+        .messages
+        .iter()
+        .zip(message_source_sequences)
+        .take_while(|(_, source_sequence)| source_sequence.is_none())
+        .map(|(message, _)| message)
+        .collect::<Vec<_>>();
+    let stable_messages_json = serde_json::to_string(&stable_messages).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize stable prompt messages for cache key: {source}"
+        ))
+    })?;
+    hasher.update(stable_messages_json.as_bytes());
     hasher.update(b"\0");
     let tools_json = serde_json::to_string(&request.tools).map_err(|source| {
         ApiError::internal(format!(
@@ -8516,6 +8548,47 @@ fn interleaved_tool_state_messages(
     }
 
     messages
+}
+
+fn active_system_prompt(settings: &PromptSettings) -> String {
+    match settings.system_prompt.as_deref() {
+        Some(system_prompt) => system_prompt.to_string(),
+        None => build_default_system_prompt(),
+    }
+}
+
+fn builtin_tool_definitions_for_runtime(
+    ripgrep_available: bool,
+) -> Vec<foco_tools::ToolDefinition> {
+    builtin_tool_definitions()
+        .into_iter()
+        .filter(|tool| ripgrep_available || tool.name != SEARCH_TEXT_TOOL)
+        .collect()
+}
+
+fn tool_prompt_infos(
+    builtin_tools: &[foco_tools::ToolDefinition],
+    memory_tools: &[NeutralToolDefinition],
+    mcp_tools: &[McpToolDefinition],
+) -> Vec<ToolPromptInfo> {
+    builtin_tools
+        .iter()
+        .map(|tool| ToolPromptInfo {
+            name: tool.name.to_string(),
+            description: tool.description.to_string(),
+        })
+        .chain(memory_tools.iter().map(|tool| ToolPromptInfo {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+        }))
+        .chain(mcp_tools.iter().map(|tool| ToolPromptInfo {
+            name: tool.name.clone(),
+            description: format!(
+                "{} MCP server '{}': {}",
+                tool.original_name, tool.server_name, tool.description
+            ),
+        }))
+        .collect()
 }
 
 fn agents_prompt_messages(workspace_path: &Path) -> Result<Vec<NeutralChatMessage>, ApiError> {
@@ -14428,6 +14501,7 @@ async fn settings_response(
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let active_workspace_id = config.app.active_workspace_id.clone();
     let mcp_statuses = state.mcp_registry.statuses(&active_workspace_id).await;
+    let default_system_prompt = build_default_system_prompt();
 
     Ok(Json(SettingsResponse {
         general: GeneralSettingsSummary {
@@ -14500,6 +14574,8 @@ async fn settings_response(
             ],
         },
         prompts: PromptSettingsSummary {
+            system_prompt: config.prompts.system_prompt.clone(),
+            default_system_prompt,
             files: config
                 .prompts
                 .files
@@ -18757,6 +18833,7 @@ description:
 
         let agents_messages = agents_prompt_messages(&workspace_dir).expect("agents messages");
         let prompt_messages = configured_prompt_messages(&PromptSettings {
+            system_prompt: None,
             files: vec![configured_prompt_file],
             extra_text: "Extra prompt instructions.\n".to_string(),
         })
@@ -21359,6 +21436,274 @@ Use the existing product UI conventions.
 
         assert!(!tool_names.contains(MEMORY_SEARCH_TOOL_NAME));
         assert!(!tool_names.contains(MEMORY_WRITE_TOOL_NAME));
+        let available_tools_message = context
+            .provider_request
+            .messages
+            .get(1)
+            .expect("available tools message");
+        assert_eq!(available_tools_message.role, NeutralChatRole::System);
+        assert!(available_tools_message.content.contains("Available tools:"));
+        assert!(
+            !available_tools_message
+                .content
+                .contains(MEMORY_SEARCH_TOOL_NAME)
+        );
+        assert!(
+            !available_tools_message
+                .content
+                .contains(MEMORY_WRITE_TOOL_NAME)
+        );
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
+    async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-ripgrep-tools-disabled-test"));
+        let profile_dir =
+            env::temp_dir().join(unique_id("foco-ripgrep-tools-disabled-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        {
+            let mut status = state.ripgrep_status.lock().expect("ripgrep status lock");
+            status.available = false;
+            status.path = None;
+        }
+
+        let context = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: Some("hello".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+                attachments: Vec::new(),
+            },
+            PromptAssemblyPurpose::ChatRun,
+        )
+        .await
+        .expect("prompt context");
+        let tool_names = context
+            .provider_request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(!tool_names.contains(SEARCH_TEXT_TOOL));
+        let available_tools_message = context
+            .provider_request
+            .messages
+            .get(1)
+            .expect("available tools message");
+        assert_eq!(available_tools_message.role, NeutralChatRole::System);
+        assert!(available_tools_message.content.contains("Available tools:"));
+        assert!(!available_tools_message.content.contains(SEARCH_TEXT_TOOL));
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
+    async fn prepare_prompt_context_uses_custom_system_prompt() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-custom-system-prompt-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-custom-system-prompt-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.prompts.system_prompt = Some("Custom Foco system prompt.".to_string());
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+
+        let context = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: Some("hello".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+                attachments: Vec::new(),
+            },
+            PromptAssemblyPurpose::ChatRun,
+        )
+        .await
+        .expect("prompt context");
+
+        assert_eq!(
+            context.provider_request.messages[0].role,
+            NeutralChatRole::System
+        );
+        assert_eq!(
+            context.provider_request.messages[0].content,
+            "Custom Foco system prompt."
+        );
+        assert!(
+            !context.provider_request.messages[0]
+                .content
+                .contains("You are Foco")
+        );
+        assert!(
+            !context.provider_request.messages[0]
+                .content
+                .contains("Available tools:")
+        );
+        let available_tools_message = context
+            .provider_request
+            .messages
+            .get(1)
+            .expect("available tools message");
+        assert_eq!(available_tools_message.role, NeutralChatRole::System);
+        assert!(available_tools_message.content.contains("Available tools:"));
+        assert!(available_tools_message.content.contains("read_file"));
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_key_changes_with_custom_system_prompt() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-system-prompt-cache-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-system-prompt-cache-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        let first_context = prepare_chat_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            ChatStreamRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: "hello".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("first chat context");
+        let first_cache_key = first_context
+            .provider_request
+            .prompt_cache_key
+            .clone()
+            .expect("first cache key");
+
+        config.prompts.system_prompt = Some("Custom cache-sensitive system prompt.".to_string());
+        let second_context = prepare_chat_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            ChatStreamRequest {
+                chat_id: Some(first_context.chat_id.clone()),
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: "next".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("second chat context");
+
+        assert_ne!(
+            first_cache_key,
+            second_context
+                .provider_request
+                .prompt_cache_key
+                .expect("second cache key")
+        );
 
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
         remove_dir_if_exists(&profile_dir);
@@ -22046,7 +22391,7 @@ Use the existing product UI conventions.
             metadata_source_url: None,
             metadata_refreshed_at: None,
             limits: Some(ModelLimits {
-                context_window: 10_000,
+                context_window: 20_000,
                 max_output_tokens: 1_000,
             }),
         });
@@ -22077,7 +22422,7 @@ Use the existing product UI conventions.
                 provider_id: None,
                 thinking_level: None,
                 skill_ids: None,
-                message: Some("Preview usage".to_string()),
+                message: Some("Preview workspace memory usage".to_string()),
                 assistant_draft: None,
                 assistant_draft_reasoning: None,
                 attachments: Vec::new(),
@@ -22113,7 +22458,7 @@ Use the existing product UI conventions.
                 provider_id: None,
                 thinking_level: None,
                 skill_ids: None,
-                message: Some("Preview usage".to_string()),
+                message: Some("Preview workspace memory usage".to_string()),
                 assistant_draft: Some("Streaming assistant reply adds context.".to_string()),
                 assistant_draft_reasoning: Some(
                     "Streaming reasoning also adds context.".to_string(),

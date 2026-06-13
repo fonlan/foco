@@ -149,8 +149,10 @@ const settings = {
     retentionDays: null,
   },
   prompts: {
+    defaultSystemPrompt: "You are Foco, a local coding agent.",
     extraText: "",
     files: [],
+    systemPrompt: null,
   },
   mcpServers: [
     {
@@ -3234,6 +3236,10 @@ describe("App verification surfaces", () => {
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
 
+    const systemPromptInput = screen.getByLabelText("System prompt");
+    expect(systemPromptInput).toHaveValue("You are Foco, a local coding agent.");
+    await userEvent.clear(systemPromptInput);
+    await userEvent.type(systemPromptInput, "Custom system prompt.");
     await userEvent.type(
       screen.getByLabelText("Prompt file path"),
       "C:/Users/fonla/.codex/AGENTS.md",
@@ -3249,6 +3255,38 @@ describe("App verification surfaces", () => {
           body: JSON.stringify({
             extraText: "Keep replies concise.",
             files: ["C:/Users/fonla/.codex/AGENTS.md"],
+            systemPrompt: "Custom system prompt.",
+          }),
+          method: "POST",
+        }),
+      );
+    });
+  });
+
+  it("restores the default system prompt", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+
+    const systemPromptInput = screen.getByLabelText("System prompt");
+    await userEvent.clear(systemPromptInput);
+    await userEvent.type(systemPromptInput, "Custom system prompt.");
+    await userEvent.click(screen.getByRole("button", { name: "Restore default system prompt" }));
+    expect(systemPromptInput).toHaveValue("You are Foco, a local coding agent.");
+
+    await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/prompts",
+        expect.objectContaining({
+          body: JSON.stringify({
+            extraText: "",
+            files: [],
+            systemPrompt: null,
           }),
           method: "POST",
         }),
@@ -3800,11 +3838,18 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
   }
 
   if (path === "/api/settings/prompts") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      extraText?: string;
+      files?: string[];
+      systemPrompt?: string | null;
+    };
     return jsonResponse({
       ...settings,
       prompts: {
-        extraText: "Keep replies concise.",
-        files: ["C:/Users/fonla/.codex/AGENTS.md"],
+        defaultSystemPrompt: settings.prompts.defaultSystemPrompt,
+        extraText: body.extraText ?? "Keep replies concise.",
+        files: body.files ?? ["C:/Users/fonla/.codex/AGENTS.md"],
+        systemPrompt: body.systemPrompt ?? null,
       },
     });
   }

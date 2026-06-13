@@ -286,6 +286,8 @@ type MemorySettingsSummary = {
 };
 
 type PromptSettingsSummary = {
+  systemPrompt: string | null;
+  defaultSystemPrompt: string;
   files: string[];
   extraText: string;
 };
@@ -454,6 +456,8 @@ type GeneralFormState = {
 };
 
 type PromptSettingsFormState = {
+  systemPrompt: string;
+  useDefaultSystemPrompt: boolean;
   files: string[];
   extraText: string;
   pendingFile: string;
@@ -1528,7 +1532,8 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No extraction failures": "暂无抽取失败",
     "Memory extraction failed": "记忆抽取失败",
     "Web service listen address": "Web 服务监听地址",
-    "Prompt files and extra instructions": "提示词文件与额外指令",
+    "System prompt, prompt files, and extra instructions":
+      "系统提示词、提示词文件与额外指令",
     "Provider credentials and connection checks": "供应商凭据与连接检查",
     "Workspace-scoped MCP server runtimes": "工作区级 MCP 服务运行时",
     "Skill discovery and enablement": "技能发现与启用",
@@ -1565,6 +1570,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Save general settings": "保存常规设置",
     Save: "保存",
     "Reload general settings": "重新加载常规设置",
+    "System prompt": "系统提示词",
+    Custom: "自定义",
+    "Restore default system prompt": "恢复默认系统提示词",
+    "Restore default": "恢复默认",
     "Prompt files": "提示词文件",
     "Prompt file path": "提示词文件路径",
     "Add prompt file": "添加提示词文件",
@@ -11271,6 +11280,8 @@ function SettingsPanel({
       extraText: data.prompts.extraText,
       files: data.prompts.files,
       pendingFile: "",
+      systemPrompt: data.prompts.systemPrompt ?? data.prompts.defaultSystemPrompt,
+      useDefaultSystemPrompt: data.prompts.systemPrompt === null,
     });
   }
 
@@ -11800,6 +11811,9 @@ function SettingsPanel({
         body: JSON.stringify({
           extraText: promptSettingsForm.extraText,
           files,
+          systemPrompt: promptSettingsForm.useDefaultSystemPrompt
+            ? null
+            : promptSettingsForm.systemPrompt,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -13526,7 +13540,57 @@ function SettingsPanel({
             className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
             onSubmit={(event) => void savePromptSettings(event)}
           >
-            <div className="flex items-center gap-2">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Bot aria-hidden="true" className="size-5 text-teal-700" />
+                <h3 className="text-sm font-semibold text-stone-950">
+                  {t("System prompt")}
+                </h3>
+              </div>
+              <span className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 text-xs font-semibold text-stone-600">
+                {promptSettingsForm.useDefaultSystemPrompt
+                  ? t("Default")
+                  : t("Custom")}
+              </span>
+            </div>
+            <label className="mt-4 block">
+              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                {t("System prompt")}
+              </span>
+              <textarea
+                className="min-h-72 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                onChange={(event) =>
+                  setPromptSettingsForm((current) => ({
+                    ...current,
+                    systemPrompt: event.target.value,
+                    useDefaultSystemPrompt: false,
+                  }))
+                }
+                value={promptSettingsForm.systemPrompt}
+              />
+            </label>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                aria-label={t("Restore default system prompt")}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                disabled={isLoadingSettings || !settings}
+                onClick={() =>
+                  setPromptSettingsForm((current) => ({
+                    ...current,
+                    systemPrompt:
+                      settings?.prompts.defaultSystemPrompt ?? current.systemPrompt,
+                    useDefaultSystemPrompt: true,
+                  }))
+                }
+                title={t("Restore default system prompt")}
+                type="button"
+              >
+                <RefreshCw aria-hidden="true" className="size-4" />
+                {t("Restore default")}
+              </button>
+            </div>
+
+            <div className="mt-6 flex items-center gap-2 border-t border-stone-200 pt-4">
               <ScrollText aria-hidden="true" className="size-5 text-teal-700" />
               <h3 className="text-sm font-semibold text-stone-950">
                 {t("Prompt files")}
@@ -17395,7 +17459,7 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
   }
 
   if (section === "prompts") {
-    return t("Prompt files and extra instructions");
+    return t("System prompt, prompt files, and extra instructions");
   }
 
   if (section === "hooks") {
@@ -17798,6 +17862,8 @@ function emptyPromptSettingsForm(): PromptSettingsFormState {
     extraText: "",
     files: [],
     pendingFile: "",
+    systemPrompt: "",
+    useDefaultSystemPrompt: true,
   };
 }
 
