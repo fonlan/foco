@@ -11588,7 +11588,7 @@ function ContextStatsTab({
         />
         <ContextStatMetric
           label={t("Total time")}
-          value={formatDurationMs(statistics.totalLatencyMs, language)}
+          value={formatLatencySeconds(statistics.totalLatencyMs, language)}
         />
         <ContextStatMetric
           label={t("Memory refs")}
@@ -21201,6 +21201,12 @@ function formatNullableLatencySeconds(
 
   return `${new Intl.NumberFormat(language, {
     maximumFractionDigits: 2,
+  }).format(value / 1000)} s`;
+}
+
+function formatLatencySeconds(value: number, language: AppLanguageId = "en") {
+  return `${new Intl.NumberFormat(language, {
+    maximumFractionDigits: 0,
   }).format(value / 1000)} s`;
 }
 
