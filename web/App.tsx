@@ -233,6 +233,7 @@ type RipgrepToolSummary = {
 };
 
 type NativeToolsSummary = {
+  browserProbePort: number;
   ripgrep: RipgrepToolSummary;
 };
 
@@ -1330,6 +1331,9 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Select a workspace before sending.": "发送前请先选择工作区。",
     "Select an enabled model before sending.": "发送前请先选择已启用的模型。",
     "Add attachment": "添加附件",
+    "Local Foco browser required": "需要在 Foco 所在电脑的浏览器中使用",
+    "Native file browsing is only available from a browser running on the Foco computer.":
+      "只有在运行 Foco 的电脑上的浏览器中才能浏览本机文件。",
     "Remove attachment {name}": "移除附件 {name}",
     "At most {count} attachments are allowed.": "最多允许 {count} 个附件。",
     "Attachment {name} exceeds the {size} limit.":
@@ -2114,6 +2118,7 @@ export function App() {
     Record<string, ShellMessage[]>
   >({});
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [nativeBrowserToken, setNativeBrowserToken] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedProviderId, setSelectedProviderId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
@@ -2322,6 +2327,7 @@ export function App() {
     authStatus && (!authStatus.enabled || authStatus.authenticated),
   );
   const canLogout = Boolean(settings?.general.webServer.passwordEnabled);
+  const canUseNativePicker = nativeBrowserToken !== null;
   const language = settings?.general.language ?? "en";
   const theme = settings?.general.theme ?? "light";
   const t = useCallback<Translate>(
@@ -2740,6 +2746,28 @@ export function App() {
   }, [canUseApp, loadSettings, refreshWorkspaces]);
 
   useEffect(() => {
+    const probePort = settings?.nativeTools.browserProbePort;
+    if (!canUseApp || typeof probePort !== "number") {
+      setNativeBrowserToken(null);
+      return;
+    }
+
+    let isCurrent = true;
+    const token = createNativeBrowserToken();
+    setNativeBrowserToken(null);
+
+    void probeNativeBrowser(probePort, token).then((available) => {
+      if (isCurrent) {
+        setNativeBrowserToken(available ? token : null);
+      }
+    });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [canUseApp, settings?.nativeTools.browserProbePort]);
+
+  useEffect(() => {
     if (!activeWorkspace?.id) {
       setGitDiff(null);
       setSelectedDiffPath(null);
@@ -3095,13 +3123,22 @@ export function App() {
   }
 
   async function handleSelectWorkspacePath() {
+    if (!nativeBrowserToken) {
+      setError(
+        t(
+          "Native file browsing is only available from a browser running on the Foco computer.",
+        ),
+      );
+      return;
+    }
+
     setIsSelectingWorkspacePath(true);
     setError(null);
 
     try {
       const data = await requestJson<{ path: string | null }>(
         "/api/native/select-directory",
-        { method: "POST" },
+        nativePickerRequestInit(nativeBrowserToken),
       );
 
       if (data.path) {
@@ -4011,13 +4048,22 @@ export function App() {
   }
 
   async function handleSelectDraftAttachments() {
+    if (!nativeBrowserToken) {
+      setError(
+        t(
+          "Native file browsing is only available from a browser running on the Foco computer.",
+        ),
+      );
+      return;
+    }
+
     setIsSelectingAttachments(true);
     setError(null);
 
     try {
       const data = await requestJson<{ files: NativeSelectedFile[] }>(
         "/api/native/select-files",
-        { method: "POST" },
+        nativePickerRequestInit(nativeBrowserToken),
       );
       const attachments = data.files.map(nativeSelectedFileToComposerAttachment);
       await handleAddDraftAttachments(attachments);
@@ -5979,7 +6025,9 @@ export function App() {
             {viewMode === "settings" ? (
               <SettingsPanel
                 canLogout={canLogout}
+                canUseNativePicker={canUseNativePicker}
                 activeSection={settingsSection}
+                nativeBrowserToken={nativeBrowserToken}
                 onAddWorkspace={openWorkspaceDialog}
                 onActiveSectionChange={openSettingsSection}
                 onLogout={handleLogout}
@@ -6447,6 +6495,7 @@ export function App() {
                 activeRunInfo?.chatKey === activeChatKey &&
                 activeRunInfo.runId !== null
               }
+              canUseNativePicker={canUseNativePicker}
               draftAttachments={draftAttachments}
               draftMessage={draftMessage}
               gitBranches={gitBranches}
@@ -6576,6 +6625,7 @@ export function App() {
       )}
       {isWorkspaceDialogOpen ? (
         <WorkspaceDialog
+          canUseNativePicker={canUseNativePicker}
           isSelectingPath={isSelectingWorkspacePath}
           isSaving={isSavingWorkspace}
           name={workspaceName}
@@ -6729,6 +6779,7 @@ function RipgrepMissingDialog({
 }
 
 function WorkspaceDialog({
+  canUseNativePicker,
   isSelectingPath,
   isSaving,
   name,
@@ -6739,6 +6790,7 @@ function WorkspaceDialog({
   onSubmit,
   path,
 }: {
+  canUseNativePicker: boolean;
   isSelectingPath: boolean;
   isSaving: boolean;
   name: string;
@@ -6819,9 +6871,13 @@ function WorkspaceDialog({
               <button
                 aria-label={t("Choose workspace path")}
                 className="inline-flex size-11 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-                disabled={isSelectingPath}
+                disabled={isSelectingPath || !canUseNativePicker}
                 onClick={onSelectPath}
-                title={t("Choose workspace path")}
+                title={
+                  canUseNativePicker
+                    ? t("Choose workspace path")
+                    : t("Local Foco browser required")
+                }
                 type="button"
               >
                 {isSelectingPath ? (
@@ -7658,6 +7714,7 @@ function ChatPanel({
   chatScrollKey,
   canGuideActiveRun,
   canRetryRun,
+  canUseNativePicker,
   contextUsage,
   draftAttachments,
   draftMessage,
@@ -7704,6 +7761,7 @@ function ChatPanel({
   chatScrollKey: string;
   canGuideActiveRun: boolean;
   canRetryRun: boolean;
+  canUseNativePicker: boolean;
   contextUsage: ContextUsageResponse | null;
   draftAttachments: ComposerAttachment[];
   draftMessage: string;
@@ -8287,9 +8345,13 @@ function ChatPanel({
               <button
                 aria-label={t("Add attachment")}
                 className="composer-tool-button"
-                disabled={isSelectingAttachments}
+                disabled={isSelectingAttachments || !canUseNativePicker}
                 onClick={onSelectAttachments}
-                title={t("Add attachment")}
+                title={
+                  canUseNativePicker
+                    ? t("Add attachment")
+                    : t("Local Foco browser required")
+                }
                 type="button"
               >
                 {isSelectingAttachments ? (
@@ -12165,6 +12227,8 @@ function InlineGitDiffNotice({ children }: { children: ReactNode }) {
 function SettingsPanel({
   activeSection,
   canLogout,
+  canUseNativePicker,
+  nativeBrowserToken,
   onAddWorkspace,
   onActiveSectionChange,
   onLogout,
@@ -12174,6 +12238,8 @@ function SettingsPanel({
 }: {
   activeSection: SettingsSection;
   canLogout: boolean;
+  canUseNativePicker: boolean;
+  nativeBrowserToken: string | null;
   onAddWorkspace: () => void;
   onActiveSectionChange: (section: SettingsSection) => void;
   onLogout: () => Promise<void>;
@@ -13150,13 +13216,22 @@ function SettingsPanel({
   }
 
   async function selectPromptFile() {
+    if (!nativeBrowserToken) {
+      setError(
+        t(
+          "Native file browsing is only available from a browser running on the Foco computer.",
+        ),
+      );
+      return;
+    }
+
     setIsSelectingPromptFile(true);
     setError(null);
 
     try {
       const data = await requestJson<{ files: NativeSelectedFile[] }>(
         "/api/native/select-files",
-        { method: "POST" },
+        nativePickerRequestInit(nativeBrowserToken),
       );
       setPromptSettingsForm((current) => {
         const files = [...current.files];
@@ -13733,13 +13808,22 @@ function SettingsPanel({
   }
 
   async function selectWorkspaceFormPath() {
+    if (!nativeBrowserToken) {
+      setError(
+        t(
+          "Native file browsing is only available from a browser running on the Foco computer.",
+        ),
+      );
+      return;
+    }
+
     setIsSelectingWorkspaceFormPath(true);
     setError(null);
 
     try {
       const data = await requestJson<{ path: string | null }>(
         "/api/native/select-directory",
-        { method: "POST" },
+        nativePickerRequestInit(nativeBrowserToken),
       );
 
       if (data.path) {
@@ -15005,9 +15089,13 @@ function SettingsPanel({
                   <button
                     aria-label={t("Choose prompt file")}
                     className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-                    disabled={isSelectingPromptFile}
+                    disabled={isSelectingPromptFile || !canUseNativePicker}
                     onClick={() => void selectPromptFile()}
-                    title={t("Choose prompt file")}
+                    title={
+                      canUseNativePicker
+                        ? t("Choose prompt file")
+                        : t("Local Foco browser required")
+                    }
                     type="button"
                   >
                     {isSelectingPromptFile ? (
@@ -16139,9 +16227,13 @@ function SettingsPanel({
                       <button
                         aria-label={t("Choose workspace path")}
                         className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-                        disabled={isSelectingWorkspaceFormPath}
+                        disabled={isSelectingWorkspaceFormPath || !canUseNativePicker}
                         onClick={() => void selectWorkspaceFormPath()}
-                        title={t("Choose workspace path")}
+                        title={
+                          canUseNativePicker
+                            ? t("Choose workspace path")
+                            : t("Local Foco browser required")
+                        }
                         type="button"
                       >
                         {isSelectingWorkspaceFormPath ? (
@@ -23117,6 +23209,87 @@ async function requestJson<T>(
   }
 
   return data as T;
+}
+
+function nativePickerRequestInit(nativeBrowserToken: string): RequestInit {
+  return {
+    body: JSON.stringify({ nativeBrowserToken }),
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+  };
+}
+
+function createNativeBrowserToken() {
+  const token =
+    globalThis.crypto?.randomUUID?.() ??
+    `native-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  return token.replace(/[^A-Za-z0-9_-]/g, "-");
+}
+
+function probeNativeBrowser(port: number, token: string): Promise<boolean> {
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    return Promise.resolve(false);
+  }
+
+  const query = `token=${encodeURIComponent(token)}&t=${Date.now()}`;
+  const urls = [
+    `http://127.0.0.1:${port}/api/native/browser-probe.svg?${query}`,
+    `http://localhost:${port}/api/native/browser-probe.svg?${query}`,
+    `http://[::1]:${port}/api/native/browser-probe.svg?${query}`,
+  ];
+
+  return new Promise((resolve) => {
+    let pending = urls.length;
+    let resolved = false;
+
+    const finish = (available: boolean) => {
+      if (resolved) {
+        return;
+      }
+      if (available) {
+        resolved = true;
+        resolve(true);
+        return;
+      }
+
+      pending -= 1;
+      if (pending === 0) {
+        resolved = true;
+        resolve(false);
+      }
+    };
+
+    for (const url of urls) {
+      void loadNativeProbeImage(url).then(finish);
+    }
+  });
+}
+
+function loadNativeProbeImage(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const image = new Image();
+    let settled = false;
+    const timeoutId = window.setTimeout(() => finish(false), 1500);
+
+    function finish(available: boolean) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      window.clearTimeout(timeoutId);
+      image.onload = null;
+      image.onerror = null;
+      if (!available) {
+        image.src = "";
+      }
+      resolve(available);
+    }
+
+    image.onload = () => finish(true);
+    image.onerror = () => finish(false);
+    image.src = url;
+  });
 }
 
 function isErrorResponse(value: unknown): value is { error: string } {

@@ -20,7 +20,10 @@ use std::os::windows::process::CommandExt;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State, ws::WebSocketUpgrade},
+    extract::{
+        ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, Request, State,
+        ws::WebSocketUpgrade,
+    },
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{
@@ -203,6 +206,9 @@ const CHAT_ATTACHMENT_BODY_LIMIT_BYTES: usize = 40 * 1024 * 1024;
 const MAX_WORKSPACE_LOGO_BYTES: u64 = 2 * 1024 * 1024;
 // HTTP request body limit for workspace logo upload and save endpoints.
 const WORKSPACE_LOGO_BODY_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+// Browser-local proof for native file pickers is refreshed on use and discarded after idle time.
+const NATIVE_BROWSER_AUTHORIZATION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+const NATIVE_BROWSER_PROBE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="#0f766e"/></svg>"##;
 // File extensions accepted for persisted workspace logo images.
 const WORKSPACE_LOGO_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "gif", "svg"];
 // Prefix used to identify injected AGENTS.md instruction messages.
@@ -285,8 +291,10 @@ struct AppState {
     config_file: PathBuf,
     memory_database_file: PathBuf,
     model_metadata_file: PathBuf,
+    listen_addr: SocketAddr,
     ripgrep_install_lock: Arc<AsyncMutex<()>>,
     ripgrep_status: Arc<Mutex<RipgrepStatus>>,
+    native_browser_authorizations: NativeBrowserAuthorizations,
     user_profile_dir: PathBuf,
     terminal_registry: terminal::TerminalRegistry,
     terminal_shutdown_tx: broadcast::Sender<()>,
@@ -306,6 +314,37 @@ struct RipgrepStatus {
     available: bool,
     path: Option<PathBuf>,
     install_dir: PathBuf,
+}
+
+#[derive(Clone, Default)]
+struct NativeBrowserAuthorizations {
+    tokens: Arc<Mutex<HashMap<String, Instant>>>,
+}
+
+impl NativeBrowserAuthorizations {
+    fn authorize(&self, token: &str) -> Result<(), ApiError> {
+        let mut tokens = self
+            .tokens
+            .lock()
+            .map_err(|_| ApiError::internal("native browser authorization lock was poisoned"))?;
+        prune_native_browser_authorizations(&mut tokens);
+        tokens.insert(token.to_string(), Instant::now());
+        Ok(())
+    }
+
+    fn is_authorized(&self, token: &str) -> Result<bool, ApiError> {
+        let mut tokens = self
+            .tokens
+            .lock()
+            .map_err(|_| ApiError::internal("native browser authorization lock was poisoned"))?;
+        prune_native_browser_authorizations(&mut tokens);
+        if let Some(authorized_at) = tokens.get_mut(token) {
+            *authorized_at = Instant::now();
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1267,8 +1306,10 @@ async fn run_server_until_shutdown(
         config_file: loaded_config.paths.config_file,
         memory_database_file: loaded_config.paths.memory_database_file,
         model_metadata_file: loaded_config.paths.root_dir.join("models.dev.json"),
+        listen_addr: addr,
         ripgrep_install_lock: Arc::new(AsyncMutex::new(())),
         ripgrep_status: Arc::new(Mutex::new(ripgrep_status)),
+        native_browser_authorizations: NativeBrowserAuthorizations::default(),
         user_profile_dir: loaded_config.paths.user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
         terminal_shutdown_tx: terminal_shutdown_tx.clone(),
@@ -1289,14 +1330,17 @@ async fn run_server_until_shutdown(
 
     tracing::info!(%addr, "starting local HTTP server");
     println!("Foco is running at http://{addr}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(
-            shutdown_tx,
-            app_shutdown_rx,
-            terminal_shutdown_tx,
-            mcp_registry,
-        ))
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal(
+        shutdown_tx,
+        app_shutdown_rx,
+        terminal_shutdown_tx,
+        mcp_registry,
+    ))
+    .await?;
 
     Ok(())
 }
@@ -1320,6 +1364,7 @@ fn app_router(state: AppState) -> Router {
                 .delete(clear_workspace_logo)
                 .layer(DefaultBodyLimit::max(WORKSPACE_LOGO_BODY_LIMIT_BYTES)),
         )
+        .route("/api/native/browser-probe.svg", get(native_browser_probe))
         .route("/api/native/select-directory", post(select_directory))
         .route("/api/native/select-files", post(select_files))
         .route("/api/native/install-ripgrep", post(install_ripgrep))
@@ -1724,6 +1769,7 @@ fn auth_route_is_public(path: &str) -> bool {
         || path == "/api/auth/status"
         || path == "/api/auth/login"
         || path == "/api/auth/logout"
+        || path == "/api/native/browser-probe.svg"
         || !path.starts_with("/api/")
 }
 
@@ -2003,16 +2049,112 @@ async fn clear_workspace_logo(
     settings_response(&state, &config).await
 }
 
-async fn select_directory() -> Result<Json<SelectDirectoryResponse>, ApiError> {
+async fn native_browser_probe(
+    State(state): State<AppState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<NativeBrowserProbeQuery>,
+) -> Result<Response, ApiError> {
+    let token = validate_native_browser_token(&query.token)?;
+    if !remote_addr.ip().is_loopback() || !native_probe_host_is_loopback(&headers) {
+        return Err(ApiError::forbidden(
+            "native picker probe must come from this computer",
+        ));
+    }
+
+    state.native_browser_authorizations.authorize(token)?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/svg+xml")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(NATIVE_BROWSER_PROBE_SVG))
+        .expect("native browser probe response is valid"))
+}
+
+async fn select_directory(
+    State(state): State<AppState>,
+    Json(request): Json<NativePickerRequest>,
+) -> Result<Json<SelectDirectoryResponse>, ApiError> {
+    require_native_browser_authorization(&state, &request.native_browser_token)?;
+
     let path = native_select_directory()?;
 
     Ok(Json(SelectDirectoryResponse { path }))
 }
 
-async fn select_files() -> Result<Json<SelectFilesResponse>, ApiError> {
+async fn select_files(
+    State(state): State<AppState>,
+    Json(request): Json<NativePickerRequest>,
+) -> Result<Json<SelectFilesResponse>, ApiError> {
+    require_native_browser_authorization(&state, &request.native_browser_token)?;
+
     let files = native_select_files()?;
 
     Ok(Json(SelectFilesResponse { files }))
+}
+
+fn require_native_browser_authorization(state: &AppState, token: &str) -> Result<(), ApiError> {
+    let token = validate_native_browser_token(token)?;
+    if state.native_browser_authorizations.is_authorized(token)? {
+        return Ok(());
+    }
+
+    Err(ApiError::forbidden(
+        "native picker is only available from a browser running on the Foco computer",
+    ))
+}
+
+fn validate_native_browser_token(token: &str) -> Result<&str, ApiError> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(ApiError::bad_request(
+            "native browser token must not be empty",
+        ));
+    }
+    if token.len() > 128 {
+        return Err(ApiError::bad_request("native browser token is too long"));
+    }
+    if !token
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(ApiError::bad_request(
+            "native browser token contains unsupported characters",
+        ));
+    }
+
+    Ok(token)
+}
+
+fn native_probe_host_is_loopback(headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+
+    let host = host.trim().to_ascii_lowercase();
+    let host_name = if let Some(without_opening_bracket) = host.strip_prefix('[') {
+        without_opening_bracket
+            .split_once(']')
+            .map(|(name, _)| name)
+            .unwrap_or(without_opening_bracket)
+    } else {
+        host.split_once(':')
+            .map(|(name, _)| name)
+            .unwrap_or(host.as_str())
+    };
+
+    matches!(host_name, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn prune_native_browser_authorizations(tokens: &mut HashMap<String, Instant>) {
+    let now = Instant::now();
+    tokens.retain(|_, authorized_at| {
+        now.duration_since(*authorized_at) <= NATIVE_BROWSER_AUTHORIZATION_TTL
+    });
 }
 
 async fn install_ripgrep(
@@ -4400,6 +4542,17 @@ struct SelectDirectoryResponse {
     path: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativePickerRequest {
+    native_browser_token: String,
+}
+
+#[derive(Deserialize)]
+struct NativeBrowserProbeQuery {
+    token: String,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SelectFilesResponse {
@@ -4793,6 +4946,7 @@ struct SettingsResponse {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeToolsSummary {
+    browser_probe_port: u16,
     ripgrep: RipgrepToolSummary,
 }
 
@@ -14849,6 +15003,13 @@ impl ApiError {
         }
     }
 
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -16279,6 +16440,7 @@ async fn settings_response(
                 .collect(),
         },
         native_tools: NativeToolsSummary {
+            browser_probe_port: state.listen_addr.port(),
             ripgrep: {
                 let status = state
                     .ripgrep_status
@@ -25773,8 +25935,10 @@ description: Project memory.
                 foco_root_dir.clone(),
             ),
             model_metadata_file: foco_root_dir.join("models.dev.json"),
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 3210)),
             ripgrep_install_lock: Arc::new(AsyncMutex::new(())),
             ripgrep_status: Arc::new(Mutex::new(detect_ripgrep(&foco_root_dir))),
+            native_browser_authorizations: NativeBrowserAuthorizations::default(),
             user_profile_dir,
             terminal_registry: terminal::TerminalRegistry::default(),
             terminal_shutdown_tx,
