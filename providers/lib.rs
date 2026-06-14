@@ -616,6 +616,8 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
 
 fn genai_chat_options(request: &NeutralChatRequest) -> Result<ChatOptions, ProviderConfigError> {
     let mut options = ChatOptions::default()
+        .with_temperature(0.0)
+        .with_top_p(1.0)
         .with_capture_usage(true)
         .with_capture_content(true)
         .with_capture_reasoning_content(true)
@@ -1210,6 +1212,8 @@ mod tests {
 
         let options = genai_chat_options(&request).expect("chat options");
 
+        assert_eq!(options.temperature, Some(0.0));
+        assert_eq!(options.top_p, Some(1.0));
         assert_eq!(
             options.prompt_cache_key.as_deref(),
             Some("foco:workspace:chat")
