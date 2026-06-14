@@ -95,6 +95,8 @@ import {
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+const DEFAULT_SYSTEM_PROMPT_NAME = "Default";
+
 type ChatSummary = {
   id: string;
   title: string;
@@ -169,6 +171,7 @@ type ConfiguredModelSummary = {
   providerIds: string[];
   activeProviderId: string | null;
   thinkingLevel: string | null;
+  systemPromptName: string;
   supportsThinking: boolean;
   warnings: string[];
 };
@@ -190,6 +193,7 @@ type ModelFormState = {
   providerIds: string[];
   activeProviderId: string;
   thinkingLevel: string;
+  systemPromptName: string;
 };
 
 type ProviderKindSummary = {
@@ -285,9 +289,15 @@ type MemorySettingsSummary = {
   retrievalModes: MemoryExtractionModeSummary[];
 };
 
+type SystemPromptSummary = {
+  name: string;
+  content: string;
+};
+
 type PromptSettingsSummary = {
   systemPrompt: string | null;
   defaultSystemPrompt: string;
+  systemPrompts?: SystemPromptSummary[];
   files: string[];
   extraText: string;
 };
@@ -456,11 +466,12 @@ type GeneralFormState = {
 };
 
 type PromptSettingsFormState = {
-  systemPrompt: string;
-  useDefaultSystemPrompt: boolean;
+  activeSystemPromptName: string;
+  systemPrompts: SystemPromptSummary[];
   files: string[];
   extraText: string;
   pendingFile: string;
+  pendingSystemPromptName: string;
 };
 
 type AuthStatusResponse = {
@@ -1664,6 +1675,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Reload general settings": "重新加载常规设置",
     "System prompt": "系统提示词",
     Custom: "自定义",
+    "Prompt name": "提示词名称",
+    "Add system prompt": "添加系统提示词",
+    "Remove system prompt": "移除系统提示词",
+    "Remove system prompt {name}": "移除系统提示词 {name}",
     "Restore default system prompt": "恢复默认系统提示词",
     "Restore default": "恢复默认",
     "Prompt files": "提示词文件",
@@ -12319,6 +12334,17 @@ function SettingsPanel({
     ];
   const hasSavedProviderKey = editingProvider?.hasApiKey ?? false;
   const selectedProviderIds = new Set(form.providerIds);
+  const systemPrompts = promptSettingsForm.systemPrompts;
+  const savedSystemPrompts = settings
+    ? normalizedSystemPromptSummaries(settings.prompts)
+    : systemPrompts;
+  const activeSystemPrompt =
+    systemPrompts.find(
+      (prompt) => prompt.name === promptSettingsForm.activeSystemPromptName,
+    ) ??
+    systemPrompts.find((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME) ??
+    systemPrompts[0] ??
+    null;
 
   function syncSkillsForm(data: SettingsResponse) {
     setEnabledSkillIds(
@@ -12344,12 +12370,18 @@ function SettingsPanel({
   }
 
   function syncPromptSettingsForm(data: SettingsResponse) {
+    const systemPrompts = normalizedSystemPromptSummaries(data.prompts);
     setPromptSettingsForm({
+      activeSystemPromptName:
+        systemPrompts.find((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)
+          ?.name ??
+        systemPrompts[0]?.name ??
+        DEFAULT_SYSTEM_PROMPT_NAME,
       extraText: data.prompts.extraText,
       files: data.prompts.files,
       pendingFile: "",
-      systemPrompt: data.prompts.systemPrompt ?? data.prompts.defaultSystemPrompt,
-      useDefaultSystemPrompt: data.prompts.systemPrompt === null,
+      pendingSystemPromptName: "",
+      systemPrompts,
     });
   }
 
@@ -12582,6 +12614,7 @@ function SettingsPanel({
       providerIds: [],
       activeProviderId: "",
       thinkingLevel: "",
+      systemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
     });
     setIsModelDialogOpen(true);
   }
@@ -12636,6 +12669,7 @@ function SettingsPanel({
       providerIds: model.providerIds,
       activeProviderId: model.activeProviderId ?? "",
       thinkingLevel: model.thinkingLevel ?? "",
+      systemPromptName: model.systemPromptName || DEFAULT_SYSTEM_PROMPT_NAME,
     });
     setIsModelDialogOpen(true);
   }
@@ -12879,9 +12913,7 @@ function SettingsPanel({
         body: JSON.stringify({
           extraText: promptSettingsForm.extraText,
           files,
-          systemPrompt: promptSettingsForm.useDefaultSystemPrompt
-            ? null
-            : promptSettingsForm.systemPrompt,
+          systemPrompts: promptSettingsForm.systemPrompts,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -12894,6 +12926,85 @@ function SettingsPanel({
     } finally {
       setIsSavingPromptSettings(false);
     }
+  }
+
+  function addSystemPrompt(name: string) {
+    const nextName = name.trim();
+    if (!nextName) {
+      return;
+    }
+
+    setPromptSettingsForm((current) => {
+      if (current.systemPrompts.some((prompt) => prompt.name === nextName)) {
+        return {
+          ...current,
+          activeSystemPromptName: nextName,
+          pendingSystemPromptName: "",
+        };
+      }
+
+      return {
+        ...current,
+        activeSystemPromptName: nextName,
+        pendingSystemPromptName: "",
+        systemPrompts: [
+          ...current.systemPrompts,
+          {
+            name: nextName,
+            content: "",
+          },
+        ],
+      };
+    });
+  }
+
+  function removeSystemPrompt(name: string) {
+    if (name === DEFAULT_SYSTEM_PROMPT_NAME) {
+      return;
+    }
+
+    setPromptSettingsForm((current) => {
+      const systemPrompts = current.systemPrompts.filter(
+        (prompt) => prompt.name !== name,
+      );
+      return {
+        ...current,
+        activeSystemPromptName:
+          current.activeSystemPromptName === name
+            ? DEFAULT_SYSTEM_PROMPT_NAME
+            : current.activeSystemPromptName,
+        systemPrompts,
+      };
+    });
+  }
+
+  function updateActiveSystemPromptContent(content: string) {
+    setPromptSettingsForm((current) => ({
+      ...current,
+      systemPrompts: current.systemPrompts.map((prompt) =>
+        prompt.name === current.activeSystemPromptName
+          ? {
+              ...prompt,
+              content,
+            }
+          : prompt,
+      ),
+    }));
+  }
+
+  function restoreDefaultSystemPrompt() {
+    setPromptSettingsForm((current) => ({
+      ...current,
+      activeSystemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
+      systemPrompts: current.systemPrompts.map((prompt) =>
+        prompt.name === DEFAULT_SYSTEM_PROMPT_NAME
+          ? {
+              ...prompt,
+              content: settings?.prompts.defaultSystemPrompt ?? prompt.content,
+            }
+          : prompt,
+      ),
+    }));
   }
 
   function addPromptFilePath(path: string) {
@@ -13323,6 +13434,7 @@ function SettingsPanel({
             activeProviderId: form.activeProviderId,
             thinkingLevel: form.thinkingLevel || null,
             clearThinkingLevel: !form.thinkingLevel,
+            systemPromptName: form.systemPromptName,
           }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
@@ -14616,40 +14728,103 @@ function SettingsPanel({
                 </h3>
               </div>
               <span className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 text-xs font-semibold text-stone-600">
-                {promptSettingsForm.useDefaultSystemPrompt
-                  ? t("Default")
-                  : t("Custom")}
+                {activeSystemPrompt?.name ?? DEFAULT_SYSTEM_PROMPT_NAME}
               </span>
             </div>
-            <label className="mt-4 block">
-              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                {t("System prompt")}
-              </span>
-              <textarea
-                className="min-h-72 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                onChange={(event) =>
-                  setPromptSettingsForm((current) => ({
-                    ...current,
-                    systemPrompt: event.target.value,
-                    useDefaultSystemPrompt: false,
-                  }))
-                }
-                value={promptSettingsForm.systemPrompt}
-              />
-            </label>
+            <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(180px,240px)_minmax(0,1fr)]">
+              <div className="grid content-start gap-2">
+                <div className="rounded-xl border border-stone-200 bg-stone-50/80">
+                  {systemPrompts.map((prompt) => (
+                    <div
+                      className={`flex items-center gap-2 px-3 py-2 ${
+                        prompt.name === promptSettingsForm.activeSystemPromptName
+                          ? "bg-teal-50"
+                          : "hover:bg-white"
+                      }`}
+                      key={prompt.name}
+                    >
+                      <button
+                        className={`min-w-0 flex-1 truncate text-left text-sm font-semibold ${
+                          prompt.name === promptSettingsForm.activeSystemPromptName
+                            ? "text-teal-900"
+                            : "text-stone-700"
+                        }`}
+                        onClick={() =>
+                          setPromptSettingsForm((current) => ({
+                            ...current,
+                            activeSystemPromptName: prompt.name,
+                          }))
+                        }
+                        type="button"
+                      >
+                        {prompt.name}
+                      </button>
+                      {prompt.name !== DEFAULT_SYSTEM_PROMPT_NAME ? (
+                        <button
+                          aria-label={t("Remove system prompt {name}", {
+                            name: prompt.name,
+                          })}
+                          className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                          onClick={() => removeSystemPrompt(prompt.name)}
+                          title={t("Remove system prompt")}
+                          type="button"
+                        >
+                          <Trash2 aria-hidden="true" className="size-4" />
+                        </button>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+                <div className="flex gap-2">
+                  <input
+                    autoComplete="off"
+                    className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    onChange={(event) =>
+                      setPromptSettingsForm((current) => ({
+                        ...current,
+                        pendingSystemPromptName: event.target.value,
+                      }))
+                    }
+                    placeholder={t("Prompt name")}
+                    value={promptSettingsForm.pendingSystemPromptName}
+                  />
+                  <button
+                    aria-label={t("Add system prompt")}
+                    className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                    disabled={!promptSettingsForm.pendingSystemPromptName.trim()}
+                    onClick={() =>
+                      addSystemPrompt(promptSettingsForm.pendingSystemPromptName)
+                    }
+                    title={t("Add system prompt")}
+                    type="button"
+                  >
+                    <Plus aria-hidden="true" className="size-4" />
+                  </button>
+                </div>
+              </div>
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  {t("System prompt")}
+                </span>
+                <textarea
+                  className="min-h-72 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) =>
+                    updateActiveSystemPromptContent(event.target.value)
+                  }
+                  value={activeSystemPrompt?.content ?? ""}
+                />
+              </label>
+            </div>
             <div className="mt-3 flex flex-wrap gap-2">
               <button
                 aria-label={t("Restore default system prompt")}
                 className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-                disabled={isLoadingSettings || !settings}
-                onClick={() =>
-                  setPromptSettingsForm((current) => ({
-                    ...current,
-                    systemPrompt:
-                      settings?.prompts.defaultSystemPrompt ?? current.systemPrompt,
-                    useDefaultSystemPrompt: true,
-                  }))
+                disabled={
+                  isLoadingSettings ||
+                  !settings ||
+                  activeSystemPrompt?.name !== DEFAULT_SYSTEM_PROMPT_NAME
                 }
+                onClick={restoreDefaultSystemPrompt}
                 title={t("Restore default system prompt")}
                 type="button"
               >
@@ -18252,6 +18427,27 @@ function SettingsPanel({
                       ))}
                     </select>
                   </label>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("System prompt")}
+                    </span>
+                    <select
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setForm((current) => ({
+                          ...current,
+                          systemPromptName: event.target.value,
+                        }))
+                      }
+                      value={form.systemPromptName}
+                    >
+                      {savedSystemPrompts.map((prompt) => (
+                        <option key={prompt.name} value={prompt.name}>
+                          {prompt.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                   {enabledNeedsLimits ? (
                     <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
                       <CircleAlert
@@ -18908,6 +19104,7 @@ function emptyModelForm(): ModelFormState {
     providerIds: [],
     activeProviderId: "",
     thinkingLevel: "",
+    systemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
   };
 }
 
@@ -18939,12 +19136,38 @@ function emptyGeneralForm(): GeneralFormState {
 
 function emptyPromptSettingsForm(): PromptSettingsFormState {
   return {
+    activeSystemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
     extraText: "",
     files: [],
     pendingFile: "",
-    systemPrompt: "",
-    useDefaultSystemPrompt: true,
+    pendingSystemPromptName: "",
+    systemPrompts: [],
   };
+}
+
+function normalizedSystemPromptSummaries(
+  prompts: PromptSettingsSummary,
+): SystemPromptSummary[] {
+  const systemPrompts = prompts.systemPrompts?.length
+    ? prompts.systemPrompts
+    : [
+        {
+          name: DEFAULT_SYSTEM_PROMPT_NAME,
+          content: prompts.systemPrompt ?? prompts.defaultSystemPrompt,
+        },
+      ];
+
+  if (systemPrompts.some((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)) {
+    return systemPrompts;
+  }
+
+  return [
+    {
+      name: DEFAULT_SYSTEM_PROMPT_NAME,
+      content: prompts.defaultSystemPrompt,
+    },
+    ...systemPrompts,
+  ];
 }
 
 function emptyMemorySettingsForm(): MemorySettingsFormState {

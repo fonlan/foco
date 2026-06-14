@@ -29,6 +29,7 @@ pub const SUPPORTED_APP_THEMES: &[&str] = &["light", "dark"];
 pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
 pub const SUPPORTED_API_PROXY_TYPES: &[&str] = &[HTTP_PROXY_KIND, SOCKS_PROXY_KIND];
+pub const DEFAULT_SYSTEM_PROMPT_NAME: &str = "Default";
 pub const FOCO_CONFIG_DIR_ENV: &str = "FOCO_CONFIG_DIR";
 pub const WORKSPACE_HOOK_CONFIG_FILE: &str = "hooks.json";
 pub const SUPPORTED_HOOK_EVENTS: &[&str] = &[
@@ -492,6 +493,21 @@ impl GlobalConfig {
                 validate_id(config_path, "model.thinking_level", thinking_level)?;
             }
 
+            require_non_empty(
+                config_path,
+                "model.system_prompt_name",
+                &model.system_prompt_name,
+            )?;
+            if !prompt_settings_contains_system_prompt(&self.prompts, &model.system_prompt_name) {
+                return invalid_config(
+                    config_path,
+                    format!(
+                        "model '{}' system_prompt_name '{}' references missing system prompt",
+                        model.id, model.system_prompt_name
+                    ),
+                );
+            }
+
             for provider_id in &model.provider_ids {
                 validate_id(config_path, "model.provider_ids", provider_id)?;
 
@@ -706,11 +722,20 @@ impl Default for MemorySettings {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PromptSettings {
     #[serde(default)]
+    pub system_prompts: Vec<SystemPromptSettings>,
+    #[serde(default, skip_serializing)]
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub files: Vec<PathBuf>,
     #[serde(default)]
     pub extra_text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SystemPromptSettings {
+    pub name: String,
+    pub content: String,
 }
 
 pub type HookEventMap = std::collections::BTreeMap<String, Vec<HookMatcherGroup>>;
@@ -792,6 +817,10 @@ fn default_memory_retrieval_mode() -> String {
     "fts".to_string()
 }
 
+fn default_system_prompt_name() -> String {
+    DEFAULT_SYSTEM_PROMPT_NAME.to_string()
+}
+
 impl Default for WebServerSettings {
     fn default() -> Self {
         Self {
@@ -824,6 +853,8 @@ pub struct ModelSettings {
     pub provider_ids: Vec<String>,
     pub active_provider_id: Option<String>,
     pub thinking_level: Option<String>,
+    #[serde(default = "default_system_prompt_name")]
+    pub system_prompt_name: String,
     pub metadata_key: Option<String>,
     pub metadata_source_url: Option<String>,
     pub metadata_refreshed_at: Option<String>,
@@ -1250,6 +1281,7 @@ fn validate_prompt_settings(
     config_path: Option<&Path>,
     settings: &PromptSettings,
 ) -> Result<(), ConfigError> {
+    let mut system_prompt_names = HashSet::new();
     let mut prompt_files = HashSet::new();
 
     if settings
@@ -1258,6 +1290,34 @@ fn validate_prompt_settings(
         .is_some_and(|value| value.trim().is_empty())
     {
         return invalid_config(config_path, "prompts.system_prompt must not be empty");
+    }
+
+    for prompt in &settings.system_prompts {
+        require_non_empty(config_path, "prompts.system_prompts.name", &prompt.name)?;
+        require_non_empty(
+            config_path,
+            "prompts.system_prompts.content",
+            &prompt.content,
+        )?;
+
+        if !system_prompt_names.insert(prompt.name.as_str()) {
+            return invalid_config(
+                config_path,
+                format!("duplicate system prompt name '{}'", prompt.name),
+            );
+        }
+    }
+
+    if !settings.system_prompts.is_empty()
+        && !system_prompt_names.contains(DEFAULT_SYSTEM_PROMPT_NAME)
+    {
+        return invalid_config(
+            config_path,
+            format!(
+                "prompts.system_prompts must include '{}'",
+                DEFAULT_SYSTEM_PROMPT_NAME
+            ),
+        );
     }
 
     for file in &settings.files {
@@ -1277,6 +1337,14 @@ fn validate_prompt_settings(
     }
 
     Ok(())
+}
+
+fn prompt_settings_contains_system_prompt(settings: &PromptSettings, name: &str) -> bool {
+    name == DEFAULT_SYSTEM_PROMPT_NAME
+        || settings
+            .system_prompts
+            .iter()
+            .any(|prompt| prompt.name == name)
 }
 
 fn validate_hook_config(
@@ -1980,6 +2048,65 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_duplicate_system_prompt_name() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.prompts.system_prompts = vec![
+            SystemPromptSettings {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: "Default prompt.".to_string(),
+            },
+            SystemPromptSettings {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: "Duplicate prompt.".to_string(),
+            },
+        ];
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("duplicate system prompt name should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate system prompt name 'Default'")
+        );
+    }
+
+    #[test]
+    fn model_system_prompt_must_exist() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.models.push(ModelSettings {
+            id: "manual-model".to_string(),
+            display_name: "Manual Model".to_string(),
+            enabled: false,
+            provider_ids: Vec::new(),
+            active_provider_id: None,
+            thinking_level: None,
+            system_prompt_name: "Missing".to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: None,
+        });
+
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("missing model system prompt should fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("system_prompt_name 'Missing' references missing system prompt")
+        );
+    }
+
+    #[test]
     fn load_rejects_workspace_common_command_without_command() {
         let profile = tempfile::tempdir().expect("temp profile");
         let paths = FocoPaths::from_user_profile(profile.path());
@@ -2193,6 +2320,7 @@ mod tests {
             provider_ids: Vec::new(),
             active_provider_id: None,
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -2216,6 +2344,7 @@ mod tests {
             provider_ids: Vec::new(),
             active_provider_id: None,
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,

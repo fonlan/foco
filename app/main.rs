@@ -51,14 +51,14 @@ use foco_providers::{
 };
 use foco_store::{
     config::{
-        ApiProxySettings, DEFAULT_TERMINAL_SHELL, GlobalConfig, HookConfig, HookEventMap,
-        McpServerConfig, MemorySettings, ModelLimits, ModelSettings, PromptSettings,
-        ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES,
-        SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_HOOK_EVENTS,
-        SUPPORTED_TERMINAL_SHELLS, SkillSettings, UNSUPPORTED_HOOK_EVENTS, WebServerSettings,
-        WorkspaceCommonCommand, WorkspaceConfig, load_or_create_global_config,
-        load_workspace_hook_config, save_global_config, save_workspace_hook_config,
-        workspace_hook_config_path,
+        ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL, GlobalConfig,
+        HookConfig, HookEventMap, McpServerConfig, MemorySettings, ModelLimits, ModelSettings,
+        PromptSettings, ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE,
+        SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
+        SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings, SystemPromptSettings,
+        UNSUPPORTED_HOOK_EVENTS, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
+        load_or_create_global_config, load_workspace_hook_config, save_global_config,
+        save_workspace_hook_config, workspace_hook_config_path,
     },
     memory::{
         MemoryDatabase, MemoryDatabaseError, MemoryExtractionJobStatus, MemoryFactRecord,
@@ -1828,7 +1828,7 @@ struct AuthStatusResponse {
 async fn workspaces(State(state): State<AppState>) -> Result<Json<WorkspacesResponse>, ApiError> {
     let config = config_snapshot(&state)?;
 
-    workspace_response_from_config(&config)
+    workspace_response_from_config(&config, &state.active_chat_runs)
 }
 
 async fn add_workspace(
@@ -2109,6 +2109,79 @@ fn normalize_prompt_file_paths(files: Vec<String>) -> Result<Vec<PathBuf>, ApiEr
             )));
         }
         normalized.push(path);
+    }
+
+    Ok(normalized)
+}
+
+fn normalize_system_prompt_requests(
+    system_prompts: Option<Vec<ManualSystemPromptRequest>>,
+    legacy_system_prompt: Option<String>,
+    default_system_prompt: &str,
+) -> Result<Vec<SystemPromptSettings>, ApiError> {
+    let requests = match system_prompts {
+        Some(system_prompts) => system_prompts,
+        None => {
+            let content = match legacy_system_prompt {
+                Some(value) => {
+                    let value = value.trim().to_string();
+                    if value.is_empty() {
+                        return Err(ApiError::bad_request("system prompt must not be empty"));
+                    }
+                    value
+                }
+                None => default_system_prompt.to_string(),
+            };
+
+            return Ok(vec![SystemPromptSettings {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content,
+            }]);
+        }
+    };
+    let mut normalized = Vec::with_capacity(requests.len());
+    let mut names = HashSet::new();
+    let mut has_default = false;
+
+    for prompt in requests {
+        let name = prompt.name.trim();
+        let content = prompt.content.trim();
+
+        if name.is_empty() {
+            return Err(ApiError::bad_request(
+                "system prompt name must not be empty",
+            ));
+        }
+
+        if content.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "system prompt '{}' content must not be empty",
+                name
+            )));
+        }
+
+        if !names.insert(name.to_string()) {
+            return Err(ApiError::bad_request(format!(
+                "duplicate system prompt name '{}'",
+                name
+            )));
+        }
+
+        if name == DEFAULT_SYSTEM_PROMPT_NAME {
+            has_default = true;
+        }
+
+        normalized.push(SystemPromptSettings {
+            name: name.to_string(),
+            content: content.to_string(),
+        });
+    }
+
+    if !has_default {
+        return Err(ApiError::bad_request(format!(
+            "system prompts must include '{}'",
+            DEFAULT_SYSTEM_PROMPT_NAME
+        )));
     }
 
     Ok(normalized)
@@ -2508,19 +2581,15 @@ async fn save_prompt_settings(
     Json(request): Json<ManualPromptSettingsRequest>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
-    let system_prompt = match request.system_prompt {
-        Some(value) => {
-            let value = value.trim().to_string();
-            if value.is_empty() {
-                return Err(ApiError::bad_request("system prompt must not be empty"));
-            }
-            Some(value)
-        }
-        None => None,
-    };
+    let system_prompts = normalize_system_prompt_requests(
+        request.system_prompts,
+        request.system_prompt,
+        &build_default_system_prompt(),
+    )?;
 
     config.prompts = PromptSettings {
-        system_prompt,
+        system_prompts,
+        system_prompt: None,
         files: normalize_prompt_file_paths(request.files)?,
         extra_text: request.extra_text.trim().to_string(),
     };
@@ -2864,6 +2933,7 @@ async fn save_manual_model(
     let requested_active_provider_id = request.active_provider_id;
     let requested_thinking_level = request.thinking_level;
     let clear_thinking_level = request.clear_thinking_level.unwrap_or(false);
+    let requested_system_prompt_name = request.system_prompt_name;
     let metadata_key = request
         .metadata_key
         .as_ref()
@@ -2940,6 +3010,20 @@ async fn save_manual_model(
         None if clear_thinking_level => None,
         None => existing_model.and_then(|model| model.thinking_level.clone()),
     };
+    let system_prompt_name = match requested_system_prompt_name {
+        Some(value) => {
+            let value = value.trim().to_string();
+            if value.is_empty() {
+                return Err(ApiError::bad_request(
+                    "model system prompt name must not be empty",
+                ));
+            }
+            value
+        }
+        None => existing_model
+            .map(|model| model.system_prompt_name.clone())
+            .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT_NAME.to_string()),
+    };
 
     validate_model_provider_references(&config, &provider_ids, active_provider_id.as_deref())?;
 
@@ -2950,6 +3034,7 @@ async fn save_manual_model(
         provider_ids,
         active_provider_id,
         thinking_level,
+        system_prompt_name,
         metadata_key: metadata_key
             .clone()
             .or_else(|| metadata_record.as_ref().map(|record| record.key.clone())),
@@ -4366,9 +4451,17 @@ struct ManualMemorySettingsRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManualPromptSettingsRequest {
+    system_prompts: Option<Vec<ManualSystemPromptRequest>>,
     system_prompt: Option<String>,
     files: Vec<String>,
     extra_text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualSystemPromptRequest {
+    name: String,
+    content: String,
 }
 
 #[derive(Deserialize)]
@@ -4398,6 +4491,7 @@ struct ManualModelRequest {
     active_provider_id: Option<String>,
     thinking_level: Option<String>,
     clear_thinking_level: Option<bool>,
+    system_prompt_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4758,8 +4852,16 @@ struct MemoryExtractionModeSummary {
 struct PromptSettingsSummary {
     system_prompt: Option<String>,
     default_system_prompt: String,
+    system_prompts: Vec<SystemPromptSummary>,
     files: Vec<String>,
     extra_text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemPromptSummary {
+    name: String,
+    content: String,
 }
 
 #[derive(Serialize)]
@@ -5035,6 +5137,7 @@ struct ConfiguredModelSummary {
     provider_ids: Vec<String>,
     active_provider_id: Option<String>,
     thinking_level: Option<String>,
+    system_prompt_name: String,
     supports_thinking: bool,
     warnings: Vec<String>,
 }
@@ -7455,7 +7558,7 @@ async fn prepare_prompt_context(
         &memory_tool_definitions,
         &mcp_tools,
     );
-    let system_prompt = active_system_prompt(&config.prompts);
+    let system_prompt = active_system_prompt(&config.prompts, &model.system_prompt_name)?;
     let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos);
     let system_prompt_tokens = estimate_text_tokens(&system_prompt)
         + available_tools_prompt
@@ -9063,11 +9166,59 @@ fn interleaved_tool_state_messages(
     messages
 }
 
-fn active_system_prompt(settings: &PromptSettings) -> String {
-    match settings.system_prompt.as_deref() {
-        Some(system_prompt) => system_prompt.to_string(),
-        None => build_default_system_prompt(),
+fn active_system_prompt(settings: &PromptSettings, name: &str) -> Result<String, ApiError> {
+    if let Some(prompt) = settings
+        .system_prompts
+        .iter()
+        .find(|prompt| prompt.name == name)
+    {
+        return Ok(prompt.content.clone());
     }
+
+    if name == DEFAULT_SYSTEM_PROMPT_NAME {
+        return Ok(settings
+            .system_prompt
+            .clone()
+            .unwrap_or_else(build_default_system_prompt));
+    }
+
+    Err(ApiError::bad_request(format!(
+        "system prompt '{}' was not found",
+        name
+    )))
+}
+
+fn system_prompt_summaries(
+    settings: &PromptSettings,
+    default_system_prompt: &str,
+) -> Vec<SystemPromptSummary> {
+    let mut summaries = Vec::new();
+    let mut has_default = false;
+
+    for prompt in &settings.system_prompts {
+        if prompt.name == DEFAULT_SYSTEM_PROMPT_NAME {
+            has_default = true;
+        }
+        summaries.push(SystemPromptSummary {
+            name: prompt.name.clone(),
+            content: prompt.content.clone(),
+        });
+    }
+
+    if !has_default {
+        summaries.insert(
+            0,
+            SystemPromptSummary {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: settings
+                    .system_prompt
+                    .clone()
+                    .unwrap_or_else(|| default_system_prompt.to_string()),
+            },
+        );
+    }
+
+    summaries
 }
 
 fn builtin_tool_definitions_for_runtime(
@@ -15839,7 +15990,8 @@ async fn settings_response(
         },
         prompts: PromptSettingsSummary {
             system_prompt: config.prompts.system_prompt.clone(),
-            default_system_prompt,
+            default_system_prompt: default_system_prompt.clone(),
+            system_prompts: system_prompt_summaries(&config.prompts, &default_system_prompt),
             files: config
                 .prompts
                 .files
@@ -17237,6 +17389,7 @@ fn configured_model_summary(model: &ModelSettings) -> ConfiguredModelSummary {
         provider_ids: model.provider_ids.clone(),
         active_provider_id: model.active_provider_id.clone(),
         thinking_level: model.thinking_level.clone(),
+        system_prompt_name: model.system_prompt_name.clone(),
         supports_thinking: false,
         warnings: Vec::new(),
     }
@@ -20494,6 +20647,7 @@ description:
 
         let agents_messages = agents_prompt_messages(&workspace_dir).expect("agents messages");
         let prompt_messages = configured_prompt_messages(&PromptSettings {
+            system_prompts: Vec::new(),
             system_prompt: None,
             files: vec![configured_prompt_file],
             extra_text: "Extra prompt instructions.\n".to_string(),
@@ -23292,6 +23446,7 @@ Search memory before repo work.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -23552,6 +23707,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -23632,6 +23788,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -23716,6 +23873,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -23772,14 +23930,23 @@ Use the existing product UI conventions.
     }
 
     #[tokio::test]
-    async fn prepare_prompt_context_uses_custom_system_prompt() {
+    async fn prepare_prompt_context_uses_model_system_prompt() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-custom-system-prompt-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-custom-system-prompt-profile-test"));
 
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
 
         let mut config = GlobalConfig::first_run(workspace_dir.clone());
-        config.prompts.system_prompt = Some("Custom Foco system prompt.".to_string());
+        config.prompts.system_prompts = vec![
+            SystemPromptSettings {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: "Default Foco system prompt.".to_string(),
+            },
+            SystemPromptSettings {
+                name: "Review".to_string(),
+                content: "Review Foco system prompt.".to_string(),
+            },
+        ];
         config.providers.push(ProviderSettings {
             id: "provider".to_string(),
             name: "Provider".to_string(),
@@ -23796,6 +23963,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: "Review".to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -23832,7 +24000,7 @@ Use the existing product UI conventions.
         );
         assert_eq!(
             context.provider_request.messages[0].content,
-            "Custom Foco system prompt."
+            "Review Foco system prompt."
         );
         assert!(
             !context.provider_request.messages[0]
@@ -23858,13 +24026,23 @@ Use the existing product UI conventions.
     }
 
     #[tokio::test]
-    async fn prompt_cache_key_changes_with_custom_system_prompt() {
+    async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-system-prompt-cache-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-system-prompt-cache-profile-test"));
 
         fs::create_dir_all(&workspace_dir).expect("workspace directory");
 
         let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.prompts.system_prompts = vec![
+            SystemPromptSettings {
+                name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                content: "Default cache prompt.".to_string(),
+            },
+            SystemPromptSettings {
+                name: "Review".to_string(),
+                content: "Review cache prompt.".to_string(),
+            },
+        ];
         config.providers.push(ProviderSettings {
             id: "provider".to_string(),
             name: "Provider".to_string(),
@@ -23881,6 +24059,23 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        config.models.push(ModelSettings {
+            id: "review-model".to_string(),
+            display_name: "Review Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            system_prompt_name: "Review".to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -23911,15 +24106,18 @@ Use the existing product UI conventions.
             .prompt_cache_key
             .clone()
             .expect("first cache key");
+        assert_eq!(
+            first_context.provider_request.messages[0].content,
+            "Default cache prompt."
+        );
 
-        config.prompts.system_prompt = Some("Custom cache-sensitive system prompt.".to_string());
         let second_context = prepare_chat_context(
             &state,
             &config,
             &config.workspaces[0].id,
             ChatStreamRequest {
                 chat_id: Some(first_context.chat_id.clone()),
-                model_id: "model".to_string(),
+                model_id: "review-model".to_string(),
                 provider_id: None,
                 thinking_level: None,
                 skill_ids: None,
@@ -23930,6 +24128,10 @@ Use the existing product UI conventions.
         .await
         .expect("second chat context");
 
+        assert_eq!(
+            second_context.provider_request.messages[0].content,
+            "Review cache prompt."
+        );
         assert_ne!(
             first_cache_key,
             second_context
@@ -23967,6 +24169,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -24168,6 +24371,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -24294,6 +24498,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -24485,6 +24690,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -24620,6 +24826,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -24771,6 +24978,7 @@ Use the existing product UI conventions.
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,
@@ -24969,6 +25177,7 @@ description: Project memory.
             provider_ids: Vec::new(),
             active_provider_id: None,
             thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
             metadata_refreshed_at: None,

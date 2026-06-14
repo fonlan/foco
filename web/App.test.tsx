@@ -101,6 +101,7 @@ const settings = {
       missingLimits: [],
       providerIds: ["openai", "anthropic"],
       supportsThinking: true,
+      systemPromptName: "Default",
       thinkingLevel: null,
       warnings: [],
     },
@@ -153,6 +154,12 @@ const settings = {
     extraText: "",
     files: [],
     systemPrompt: null,
+    systemPrompts: [
+      {
+        content: "You are Foco, a local coding agent.",
+        name: "Default",
+      },
+    ],
   },
   mcpServers: [
     {
@@ -520,6 +527,7 @@ const savedModelMetadata = {
       missingLimits: [],
       providerIds: ["openai"],
       supportsThinking: false,
+      systemPromptName: "Default",
       thinkingLevel: null,
       warnings: [],
     },
@@ -3841,6 +3849,10 @@ describe("App verification surfaces", () => {
     expect(systemPromptInput).toHaveValue("You are Foco, a local coding agent.");
     await userEvent.clear(systemPromptInput);
     await userEvent.type(systemPromptInput, "Custom system prompt.");
+    await userEvent.type(screen.getByPlaceholderText("Prompt name"), "Review");
+    await userEvent.click(screen.getByRole("button", { name: "Add system prompt" }));
+    expect(screen.getAllByText("Review").length).toBeGreaterThan(0);
+    await userEvent.type(screen.getByLabelText("System prompt"), "Review as senior engineer.");
     await userEvent.type(
       screen.getByLabelText("Prompt file path"),
       "C:/Users/fonla/.codex/AGENTS.md",
@@ -3856,7 +3868,16 @@ describe("App verification surfaces", () => {
           body: JSON.stringify({
             extraText: "Keep replies concise.",
             files: ["C:/Users/fonla/.codex/AGENTS.md"],
-            systemPrompt: "Custom system prompt.",
+            systemPrompts: [
+              {
+                content: "Custom system prompt.",
+                name: "Default",
+              },
+              {
+                name: "Review",
+                content: "Review as senior engineer.",
+              },
+            ],
           }),
           method: "POST",
         }),
@@ -3887,7 +3908,12 @@ describe("App verification surfaces", () => {
           body: JSON.stringify({
             extraText: "",
             files: [],
-            systemPrompt: null,
+            systemPrompts: [
+              {
+                content: "You are Foco, a local coding agent.",
+                name: "Default",
+              },
+            ],
           }),
           method: "POST",
         }),
@@ -3945,6 +3971,13 @@ describe("App verification surfaces", () => {
         }),
       );
     });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/models/manual",
+      expect.objectContaining({
+        body: expect.stringContaining('"systemPromptName":"Default"'),
+        method: "POST",
+      }),
+    );
 
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
     await userEvent.click(within(settingsNav).getByRole("button", { name: "MCP" }));
@@ -4524,15 +4557,25 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
     const body = JSON.parse(String(init?.body ?? "{}")) as {
       extraText?: string;
       files?: string[];
+      systemPrompts?: Array<{ content: string; name: string }>;
       systemPrompt?: string | null;
     };
+    const systemPrompts =
+      body.systemPrompts ??
+      [
+        {
+          content: body.systemPrompt ?? settings.prompts.defaultSystemPrompt,
+          name: "Default",
+        },
+      ];
     return jsonResponse({
       ...settings,
       prompts: {
         defaultSystemPrompt: settings.prompts.defaultSystemPrompt,
         extraText: body.extraText ?? "Keep replies concise.",
         files: body.files ?? ["C:/Users/fonla/.codex/AGENTS.md"],
-        systemPrompt: body.systemPrompt ?? null,
+        systemPrompt: null,
+        systemPrompts,
       },
     });
   }
