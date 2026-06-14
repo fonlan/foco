@@ -97,7 +97,7 @@
 - assistant 气泡完成后必须在底部小字显示该次回复的模型、provider 渠道、总耗时、输出 token/s 和首 token 延迟；这些指标来自同一条 `llm_requests` 审计记录，历史回读不得从消息文本或 UI 状态推断。
 - 浏览器工具调用折叠摘要必须直接显示关键输入细节，例如 `read_file` 的文件路径和 `run_command` 的完整命令；展开后继续显示完整 Input/Output JSON。
 - 浏览器聊天消息列表在用户未主动向上滚动时会随消息追加、流式更新和内容尺寸变化锁定到底部；用户滚离底部后停止自动滚动，切换 chat 时重新默认锁定底部。
-- 内置工具运行时位于 `tools/lib.rs`，当前提供 `read_file`、`list_files`、`graph_find_symbols`、`graph_find_callers`、`graph_find_callees`、`graph_find_references`、`graph_related_files`、`search_text`、`write_file`、`patch_file`、`create_todo_graph`、`update_todo_graph`、`get_todo_graph`、`ask_question`、`run_command` 和 `sleep`。
+- 内置工具运行时位于 `tools/lib.rs`，当前提供 `read_file`、`list_files`、`graph_find_symbols`、`graph_find_callers`、`graph_find_callees`、`graph_find_references`、`graph_related_files`、`search_text`、`write_file`、`edit_file`、`create_todo_graph`、`update_todo_graph`、`get_todo_graph`、`ask_question`、`run_command` 和 `sleep`。
 - todo graph 工具绑定当前 chat：`create_todo_graph` 创建或替换当前 chat 的 ToDo 图，task 必须包含 `id`、`title`、`status`、`dependsOn`、`acceptance`、`summary`、`createdAt`、`updatedAt` 和 `subtasks`，其中时间戳由后端生成并覆盖输入值。
 - todo graph 状态只允许 `pending`、`ready`、`running`、`blocked`、`completed`、`failed` 和 `cancelled`；task id 必须全图唯一，`dependsOn` 必须指向已存在 task，不能自依赖或形成环。
 - `update_todo_graph` 只接受某个 task 的 patch，不接受整图替换；patch 至少修改一个字段，替换 subtasks 时会重新生成这些 subtask 的时间戳。
@@ -109,7 +109,7 @@
 - `list_files` 支持可选 `include` 和 `exclude` glob 数组，规则匹配返回的 workspace-relative path；无效或空 glob 必须明确报错。
 - `search_text` 通过 `rg --json` 执行，并返回 workspace-relative path、line、text 和 truncated 状态。
 - `write_file` 支持完整文件写入，也支持用 1-based 闭区间 `startLine`/`endLine` 替换已有文件指定行；已有文件按原编码写回，支持 UTF-8、UTF-8 BOM、UTF-16 LE BOM 和 UTF-16 BE BOM，不支持的编码必须明确报错；新建文件默认写 UTF-8；目标父目录必须已存在，文件可新建或覆盖，不创建缺失目录。
-- `patch_file` 支持对已有文本文件应用单文件 unified diff；hunk context 和删除行必须精确匹配当前文件，成功后按原文件编码写回，不支持的编码必须明确报错。
+- `edit_file` 支持对已有文本文件做精确字符串替换；调用前必须先用 `read_file` 获取最新文件内容，`oldStr` 必须来自当前文件内容；`replaceAll` 为 `false` 或 `null` 时必须只匹配一次，匹配 0 次或多次都明确报错，只有 `replaceAll=true` 时允许批量替换；成功后按原文件编码写回，不支持的编码必须明确报错。
 - `run_command` 接受 `command` 和 `args` 数组并直接执行进程，不通过 shell 拼接命令；非零退出作为工具结果返回，不作为工具执行错误吞掉；大模型需要 git 状态或 diff 时应通过 `run_command` 自主调用 `git status`、`git diff` 等命令。
 - `sleep` 接受 `durationMs` 暂停指定毫秒数；`durationMs` 必须大于 0 且不超过工具 `timeoutMs`。
 - 后端 Git API 使用 `gix` 直接读取和操作 Git 仓库，不依赖外部 `git` 可执行文件。
@@ -119,10 +119,10 @@
 - 工具调用在 provider completion 后执行一次，结果通过 SSE 挂在同一条 assistant message 内，并写入 workspace 数据库的 `tool_calls` / `tool_results`。
 - `ask_question` 工具调用会发送 `questionRequest` SSE 事件，payload 包含 `questions[]`；浏览器 UI 必须弹出问题对话框并要求用户回答全部问题，用户通过 `POST /api/chat/questions/{question_id}/answer` 返回 `answers[]` 后，后端才继续同一轮 agent loop。
 - TODO step 10 已实现首个 agent loop：聊天流会组装 system rules、workspace context、聊天历史和工具 schema，按模型 limits 打包上下文，并在工具结果返回后继续同一轮模型运行。
-- 同一模型 turn 内多个工具调用会并行执行；`write_file` 和 `patch_file` 这类写入工具如果在同一 turn 指向同一 workspace-relative path，必须在执行前失败并给出明确冲突错误。
+- 同一模型 turn 内多个工具调用会并行执行；`write_file` 和 `edit_file` 这类写入工具如果在同一 turn 指向同一 workspace-relative path，必须在执行前失败并给出明确冲突错误。
 - 浏览器右侧 git diff 面板从 `GET /api/workspaces/{workspace_id}/git/diff` 加载当前 workspace diff，并支持按文件路径过滤 diff。
 - 浏览器通过 `GET /api/workspaces/{workspace_id}/chats/{chat_id}/todo-graph` 读取当前 chat 的 todo graph；当前会话存在 todo graph 时，右侧面板 ToDo tab 显示 ToDo graph，Git tab 保持 Git diff。
-- 聊天流在 `write_file`、`patch_file` 或 `run_command` 工具完成后会发送 `gitDiffRefresh` SSE 事件，前端收到后刷新右侧 diff 面板。
+- 聊天流在 `write_file`、`edit_file` 或 `run_command` 工具完成后会发送 `gitDiffRefresh` SSE 事件，前端收到后刷新右侧 diff 面板。
 - 聊天流在 `create_todo_graph` 或 `update_todo_graph` 工具完成后会发送 `todoGraphRefresh` SSE 事件，前端收到当前 chat 的 ToDo 图刷新事件后必须自动打开右侧 ToDo/Git diff 侧边栏并刷新 todo graph；同一模型 turn 中只要包含 todo graph 写工具，该批工具会按顺序执行以避免同一 chat 的 ToDo 图被并发覆盖。
 - 浏览器聊天 UI 支持取消当前 active run，并在失败或取消后重试上一轮 run；应用级 shutdown 也必须通知 active agent run，已开始的 run 需要以 `cancelled` 审计状态落库。
 - 浏览器聊天 UI 在 active run 期间排队的 user message 必须在消息右上角提供撤回和转为引导消息按钮；撤回只移除尚未开始发送的队列项，转为引导消息必须从发送队列移除并通过现有 guidance API 注入当前 active run。

@@ -7,7 +7,7 @@ const DEFAULT_CONTEXT_SAFETY_TOKENS: u64 = 256;
 const CONTEXT_COMPRESSION_TRIGGER_NUMERATOR: u64 = 4;
 const CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR: u64 = 5;
 pub const WRITE_FILE_TOOL_NAME: &str = "write_file";
-pub const PATCH_FILE_TOOL_NAME: &str = "patch_file";
+pub const EDIT_FILE_TOOL_NAME: &str = "edit_file";
 const READ_FILE_TOOL_NAME: &str = "read_file";
 const LIST_FILES_TOOL_NAME: &str = "list_files";
 const SEARCH_TEXT_TOOL_NAME: &str = "search_text";
@@ -191,10 +191,10 @@ pub fn default_system_prompt_body() -> String {
          - Prefer code graph tools before text search when locating symbols, callers, callees, references, or related files.\n\
          - When code graph names may be ambiguous, start with symbol lookup and use returned symbol ids for caller, callee, and reference queries when those tools are available.\n\
          - Use text search for literal text, config keys, error messages, or when code graph results are insufficient and a text search tool is available.\n\
-         - Read files before editing them. For small single-location edits, prefer precise 1-based inclusive line-range replacement when the available file writing tool supports it.\n\
+         - Read files before editing them. Before calling edit_file, call read_file to get the latest file content and copy oldStr exactly from that current content.\n\
+         - For exact text replacements, use edit_file when available. With edit_file, keep replaceAll false or null unless every match should be replaced; if oldStr is ambiguous, read a narrower range and make oldStr more specific.\n\
          - Use directory listing tools to inspect directory shape when needed.\n\
          - Use file writing tools for complete-file writes or explicit line-range replacements. Do not create missing parent directories unless the task requires it and the available tool supports it.\n\
-         - Use patching tools only for multi-hunk or multi-location edits when the unified diff was produced or checked from current file content. Before applying a patch, read the target file range and confirm every context/removal line in the diff exactly matches the current file. If patching fails, read the suggested or target range again before retrying; do not retry by only adjusting hunk counts or headers from the failed diff.\n\
          - Use command execution tools for local commands, including git status and git diff. There is no dedicated git diff tool unless the available tool list says otherwise.\n\
          - Command execution tools run a command plus args directly. Put the executable in command and each argument in args. Do not concatenate shell commands into one string. If shell features are truly required, call the detected shell explicitly.\n\
          - Treat non-zero command exits as evidence to inspect, not as something to ignore.\n\
@@ -479,7 +479,7 @@ pub fn tool_resource_locks(
             resource: ToolResource::File(required_path(tool_call)?),
             access: ToolResourceAccess::Read,
         }]),
-        WRITE_FILE_TOOL_NAME | PATCH_FILE_TOOL_NAME => Ok(vec![ToolResourceLock {
+        WRITE_FILE_TOOL_NAME | EDIT_FILE_TOOL_NAME => Ok(vec![ToolResourceLock {
             resource: ToolResource::File(required_path(tool_call)?),
             access: ToolResourceAccess::Write,
         }]),
@@ -918,7 +918,7 @@ mod tests {
             },
             PendingToolCall {
                 id: "call-c".to_string(),
-                name: PATCH_FILE_TOOL_NAME.to_string(),
+                name: EDIT_FILE_TOOL_NAME.to_string(),
                 arguments: json!({ "path": ".\\src\\main.rs" }),
             },
         ];
@@ -973,7 +973,7 @@ mod tests {
             },
             PendingToolCall {
                 id: "call-b".to_string(),
-                name: PATCH_FILE_TOOL_NAME.to_string(),
+                name: EDIT_FILE_TOOL_NAME.to_string(),
                 arguments: json!({ "path": "src/main.rs" }),
             },
         ];
@@ -1002,7 +1002,7 @@ mod tests {
             },
             PendingToolCall {
                 id: "call-b".to_string(),
-                name: PATCH_FILE_TOOL_NAME.to_string(),
+                name: EDIT_FILE_TOOL_NAME.to_string(),
                 arguments: json!({ "path": "src/b.rs" }),
             },
         ];

@@ -28,7 +28,7 @@ pub const READ_FILE_TOOL: &str = "read_file";
 pub const LIST_FILES_TOOL: &str = "list_files";
 pub const SEARCH_TEXT_TOOL: &str = "search_text";
 pub const WRITE_FILE_TOOL: &str = "write_file";
-pub const PATCH_FILE_TOOL: &str = "patch_file";
+pub const EDIT_FILE_TOOL: &str = "edit_file";
 pub const RUN_COMMAND_TOOL: &str = "run_command";
 pub const SLEEP_TOOL: &str = "sleep";
 pub const GRAPH_FIND_SYMBOLS_TOOL: &str = "graph_find_symbols";
@@ -108,7 +108,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         graph_related_files_definition(),
         search_text_definition(),
         write_file_definition(),
-        patch_file_definition(),
+        edit_file_definition(),
         create_todo_graph_definition(),
         update_todo_graph_definition(),
         get_todo_graph_definition(),
@@ -191,7 +191,6 @@ fn tool_error_output(error: &ToolRuntimeError) -> Value {
             "pid": pid,
             "timeoutMs": timeout_ms
         }),
-        ToolRuntimeError::PatchRejected(rejection) => rejection.to_json(),
         _ => json!({ "error": error.to_string() }),
     }
 }
@@ -205,7 +204,7 @@ pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64
         | GRAPH_FIND_REFERENCES_TOOL
         | GRAPH_RELATED_FILES_TOOL => DEFAULT_GRAPH_TOOL_TIMEOUT_MS,
         SEARCH_TEXT_TOOL => DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
-        WRITE_FILE_TOOL | PATCH_FILE_TOOL => DEFAULT_WRITE_FILE_TIMEOUT_MS,
+        WRITE_FILE_TOOL | EDIT_FILE_TOOL => DEFAULT_WRITE_FILE_TIMEOUT_MS,
         CREATE_TODO_GRAPH_TOOL | UPDATE_TODO_GRAPH_TOOL | GET_TODO_GRAPH_TOOL => {
             DEFAULT_TODO_GRAPH_TIMEOUT_MS
         }
@@ -239,7 +238,7 @@ fn execute_builtin_tool_inner(
         GRAPH_RELATED_FILES_TOOL => graph_related_files(workspace_path, arguments),
         SEARCH_TEXT_TOOL => search_text(workspace_path, arguments, cancellation_token),
         WRITE_FILE_TOOL => write_file(workspace_path, arguments),
-        PATCH_FILE_TOOL => patch_file(workspace_path, arguments),
+        EDIT_FILE_TOOL => edit_file(workspace_path, arguments),
         CREATE_TODO_GRAPH_TOOL => create_todo_graph(workspace_path, chat_id, arguments),
         UPDATE_TODO_GRAPH_TOOL => update_todo_graph(workspace_path, chat_id, arguments),
         GET_TODO_GRAPH_TOOL => get_todo_graph(workspace_path, chat_id, arguments),
@@ -665,17 +664,41 @@ fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
     }))
 }
 
-fn patch_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: PatchFileInput = parse_arguments(arguments)?;
+fn edit_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+    let request: EditFileInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_WRITE_FILE_TIMEOUT_MS)?;
+    if request.old_str.is_empty() {
+        return Err(ToolRuntimeError::InvalidArguments(
+            "oldStr must not be empty".to_string(),
+        ));
+    }
+
+    let replace_all = request.replace_all.unwrap_or(false);
+    let normalized_path = normalize_workspace_path_text(&request.path)?;
     let path = resolve_workspace_file(workspace_path, &request.path)?;
     let bytes = fs::read(&path).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
         source,
     })?;
     let (existing_content, encoding) = decode_text_file(&path, &bytes)?;
-    let (content, applied_hunks) = apply_file_diff(&existing_content, &request.diff)
-        .map_err(ToolRuntimeError::PatchRejected)?;
+    let match_count = existing_content.matches(&request.old_str).count();
+
+    if match_count == 0 {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "oldStr was not found in {normalized_path}; call read_file to get the latest file content before retrying"
+        )));
+    }
+    if match_count > 1 && !replace_all {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "oldStr matched {match_count} times in {normalized_path}; set replaceAll to true to replace all matches, or provide a more specific oldStr from the latest read_file output"
+        )));
+    }
+
+    let content = if replace_all {
+        existing_content.replace(&request.old_str, &request.new_str)
+    } else {
+        existing_content.replacen(&request.old_str, &request.new_str, 1)
+    };
     let encoded = encode_text_file(&content, encoding);
 
     fs::write(&path, &encoded).map_err(|source| ToolRuntimeError::Io {
@@ -684,9 +707,10 @@ fn patch_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
     })?;
 
     Ok(json!({
-        "path": normalize_workspace_path_text(&request.path)?,
+        "path": normalized_path,
         "bytes": encoded.len(),
-        "appliedHunks": applied_hunks,
+        "replacements": match_count,
+        "replaceAll": replace_all,
         "timeoutMs": timeout_ms
     }))
 }
@@ -1413,474 +1437,6 @@ fn ends_with_line_ending(content: &str) -> bool {
     content.ends_with('\n') || content.ends_with('\r')
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct FileLine {
-    body: String,
-    line_ending: Option<String>,
-}
-
-#[derive(Debug, PartialEq)]
-struct DiffHunk {
-    old_start: usize,
-    old_count: usize,
-    new_start: usize,
-    new_count: usize,
-    lines: Vec<DiffLine>,
-}
-
-#[derive(Debug, PartialEq)]
-enum DiffLine {
-    Context(String),
-    Remove(String),
-    Add { body: String, no_newline: bool },
-}
-
-impl DiffHunk {
-    fn actual_line_counts(&self) -> (usize, usize) {
-        let old_lines = self
-            .lines
-            .iter()
-            .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Remove(_)))
-            .count();
-        let new_lines = self
-            .lines
-            .iter()
-            .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Add { .. }))
-            .count();
-
-        (old_lines, new_lines)
-    }
-
-    fn suggested_read_range(&self) -> LineRange {
-        suggested_read_range_around(self.old_start.max(1), self.old_count.max(1))
-    }
-}
-
-#[derive(Debug)]
-struct PatchRejection {
-    message: String,
-    hunk: Option<PatchHunkDiagnostic>,
-    first_mismatch: Option<PatchMismatchDiagnostic>,
-    suggested_read_range: Option<LineRange>,
-}
-
-#[derive(Debug)]
-struct PatchHunkDiagnostic {
-    old_start: usize,
-    old_count: usize,
-    new_start: usize,
-    new_count: usize,
-    actual_old_count: usize,
-    actual_new_count: usize,
-}
-
-#[derive(Debug)]
-struct PatchMismatchDiagnostic {
-    kind: String,
-    line: usize,
-    expected: String,
-    actual: String,
-}
-
-impl PatchRejection {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            hunk: None,
-            first_mismatch: None,
-            suggested_read_range: None,
-        }
-    }
-
-    fn with_hunk_summary(mut self, hunk: &DiffHunk) -> Self {
-        let (actual_old_count, actual_new_count) = hunk.actual_line_counts();
-        self.hunk = Some(PatchHunkDiagnostic {
-            old_start: hunk.old_start,
-            old_count: hunk.old_count,
-            new_start: hunk.new_start,
-            new_count: hunk.new_count,
-            actual_old_count,
-            actual_new_count,
-        });
-        self
-    }
-
-    fn with_actual_counts(mut self, actual_old_count: usize, actual_new_count: usize) -> Self {
-        if let Some(hunk) = self.hunk.as_mut() {
-            hunk.actual_old_count = actual_old_count;
-            hunk.actual_new_count = actual_new_count;
-        }
-        self
-    }
-
-    fn with_first_mismatch(
-        mut self,
-        kind: &str,
-        line: usize,
-        expected: &str,
-        actual: &str,
-    ) -> Self {
-        self.first_mismatch = Some(PatchMismatchDiagnostic {
-            kind: kind.to_string(),
-            line,
-            expected: expected.to_string(),
-            actual: actual.to_string(),
-        });
-        self
-    }
-
-    fn with_suggested_read_range(mut self, range: LineRange) -> Self {
-        self.suggested_read_range = Some(range);
-        self
-    }
-
-    fn to_json(&self) -> Value {
-        let mut output = json!({
-            "error": self.message,
-            "suggestion": "Run read_file for suggestedReadRange before retrying patch_file; do not retry by only changing hunk counts or headers."
-        });
-
-        if let Some(hunk) = &self.hunk {
-            output["hunk"] = json!({
-                "declaredOldStart": hunk.old_start,
-                "declaredOldCount": hunk.old_count,
-                "declaredNewStart": hunk.new_start,
-                "declaredNewCount": hunk.new_count,
-                "actualOldCount": hunk.actual_old_count,
-                "actualNewCount": hunk.actual_new_count
-            });
-        }
-
-        if let Some(mismatch) = &self.first_mismatch {
-            output["firstMismatch"] = json!({
-                "kind": mismatch.kind,
-                "line": mismatch.line,
-                "expected": mismatch.expected,
-                "actual": mismatch.actual
-            });
-        }
-
-        if let Some(range) = self.suggested_read_range {
-            output["suggestedReadRange"] = json!({
-                "startLine": range.start,
-                "endLine": range.end
-            });
-        }
-
-        output
-    }
-}
-
-impl fmt::Display for PatchRejection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-fn suggested_read_range_around(line: usize, old_count: usize) -> LineRange {
-    let start = line.saturating_sub(3).max(1);
-    let end = line + old_count.max(1) + 3;
-    LineRange { start, end }
-}
-
-fn apply_file_diff(content: &str, diff: &str) -> Result<(String, usize), PatchRejection> {
-    let hunks = parse_file_diff(diff)?;
-    let mut lines = split_file_lines(content);
-    let default_line_ending = default_line_ending(&lines);
-    let mut line_delta = 0isize;
-
-    for hunk in &hunks {
-        let original_index = if hunk.old_count == 0 {
-            hunk.old_start
-        } else {
-            hunk.old_start.checked_sub(1).ok_or_else(|| {
-                PatchRejection::new("diff hunk old start must be 1-based")
-                    .with_hunk_summary(hunk)
-                    .with_suggested_read_range(hunk.suggested_read_range())
-            })?
-        };
-        let patched_index = original_index as isize + line_delta;
-        if patched_index < 0 {
-            return Err(PatchRejection::new(format!(
-                "diff hunk starting at original line {} resolves before the file start",
-                hunk.old_start
-            ))
-            .with_hunk_summary(hunk)
-            .with_suggested_read_range(hunk.suggested_read_range()));
-        }
-        let start_index = usize::try_from(patched_index).map_err(|_| {
-            PatchRejection::new("diff hunk line index is too large")
-                .with_hunk_summary(hunk)
-                .with_suggested_read_range(hunk.suggested_read_range())
-        })?;
-        if start_index > lines.len() {
-            return Err(PatchRejection::new(format!(
-                "diff hunk starting at original line {} is outside the file; file has {} lines",
-                hunk.old_start,
-                lines.len()
-            ))
-            .with_hunk_summary(hunk)
-            .with_suggested_read_range(hunk.suggested_read_range()));
-        }
-
-        let mut index = start_index;
-        let mut replacement = Vec::new();
-        for diff_line in &hunk.lines {
-            match diff_line {
-                DiffLine::Context(body) => {
-                    let existing = lines.get(index).ok_or_else(|| {
-                        PatchRejection::new(format!(
-                            "diff context at original line {} extends past the file end",
-                            hunk.old_start
-                        ))
-                        .with_hunk_summary(hunk)
-                        .with_suggested_read_range(hunk.suggested_read_range())
-                    })?;
-                    validate_patch_line("context", body, existing, index + 1, hunk)?;
-                    replacement.push(existing.clone());
-                    index += 1;
-                }
-                DiffLine::Remove(body) => {
-                    let existing = lines.get(index).ok_or_else(|| {
-                        PatchRejection::new(format!(
-                            "diff removal at original line {} extends past the file end",
-                            hunk.old_start
-                        ))
-                        .with_hunk_summary(hunk)
-                        .with_suggested_read_range(hunk.suggested_read_range())
-                    })?;
-                    validate_patch_line("removal", body, existing, index + 1, hunk)?;
-                    index += 1;
-                }
-                DiffLine::Add { body, no_newline } => {
-                    replacement.push(FileLine {
-                        body: body.clone(),
-                        line_ending: if *no_newline {
-                            None
-                        } else {
-                            Some(default_line_ending.clone())
-                        },
-                    });
-                }
-            }
-        }
-
-        let consumed = index - start_index;
-        lines.splice(start_index..index, replacement.iter().cloned());
-        line_delta += replacement.len() as isize - consumed as isize;
-    }
-
-    Ok((join_file_lines(&lines), hunks.len()))
-}
-
-fn parse_file_diff(diff: &str) -> Result<Vec<DiffHunk>, PatchRejection> {
-    if diff.trim().is_empty() {
-        return Err(PatchRejection::new("diff must not be empty"));
-    }
-
-    let mut hunks = Vec::new();
-    let mut current_hunk: Option<DiffHunk> = None;
-
-    for line in diff.lines() {
-        if line.starts_with("@@ ") {
-            if let Some(hunk) = current_hunk.take() {
-                validate_diff_hunk(&hunk)?;
-                hunks.push(hunk);
-            }
-            current_hunk = Some(parse_hunk_header(line)?);
-            continue;
-        }
-
-        let Some(hunk) = current_hunk.as_mut() else {
-            continue;
-        };
-
-        if line == r"\ No newline at end of file" {
-            mark_previous_added_line_no_newline(hunk)?;
-            continue;
-        }
-
-        if line.is_empty() {
-            return Err(PatchRejection::new(
-                "diff hunk lines must start with space, -, +, or a no-newline marker",
-            )
-            .with_hunk_summary(hunk)
-            .with_suggested_read_range(hunk.suggested_read_range()));
-        }
-        let (prefix, body) = line.split_at(1);
-
-        match prefix {
-            " " => hunk.lines.push(DiffLine::Context(body.to_string())),
-            "-" => hunk.lines.push(DiffLine::Remove(body.to_string())),
-            "+" => hunk.lines.push(DiffLine::Add {
-                body: body.to_string(),
-                no_newline: false,
-            }),
-            _ => {
-                return Err(PatchRejection::new(format!(
-                    "invalid diff hunk line prefix: {prefix}"
-                ))
-                .with_hunk_summary(hunk)
-                .with_suggested_read_range(hunk.suggested_read_range()));
-            }
-        }
-    }
-
-    if let Some(hunk) = current_hunk {
-        validate_diff_hunk(&hunk)?;
-        hunks.push(hunk);
-    }
-
-    if hunks.is_empty() {
-        return Err(PatchRejection::new(
-            "diff must contain at least one unified diff hunk",
-        ));
-    }
-
-    Ok(hunks)
-}
-
-fn parse_hunk_header(line: &str) -> Result<DiffHunk, PatchRejection> {
-    let header = line
-        .strip_prefix("@@ ")
-        .and_then(|value| value.split_once(" @@").map(|(header, _)| header))
-        .ok_or_else(|| PatchRejection::new(format!("invalid unified diff hunk header: {line}")))?;
-    let mut parts = header.split_whitespace();
-    let old_range = parts
-        .next()
-        .ok_or_else(|| PatchRejection::new(format!("missing old range in hunk header: {line}")))?;
-    let new_range = parts
-        .next()
-        .ok_or_else(|| PatchRejection::new(format!("missing new range in hunk header: {line}")))?;
-
-    if parts.next().is_some() {
-        return Err(PatchRejection::new(format!(
-            "invalid unified diff hunk header: {line}"
-        )));
-    }
-
-    let (old_start, old_count) = parse_hunk_range(old_range, '-')?;
-    let (new_start, new_count) = parse_hunk_range(new_range, '+')?;
-
-    Ok(DiffHunk {
-        old_start,
-        old_count,
-        new_start,
-        new_count,
-        lines: Vec::new(),
-    })
-}
-
-fn parse_hunk_range(range: &str, prefix: char) -> Result<(usize, usize), PatchRejection> {
-    let value = range.strip_prefix(prefix).ok_or_else(|| {
-        PatchRejection::new(format!("diff hunk range must start with {prefix}: {range}"))
-    })?;
-    let (start, count) = match value.split_once(',') {
-        Some((start, count)) => (
-            start,
-            count.parse::<usize>().map_err(|_| {
-                PatchRejection::new(format!("invalid diff hunk line count: {range}"))
-            })?,
-        ),
-        None => (value, 1),
-    };
-    let start = start
-        .parse::<usize>()
-        .map_err(|_| PatchRejection::new(format!("invalid diff hunk line start: {range}")))?;
-
-    if start == 0 && count != 0 {
-        return Err(PatchRejection::new(format!(
-            "diff hunk range start may be 0 only when count is 0: {range}"
-        )));
-    }
-
-    Ok((start, count))
-}
-
-fn validate_diff_hunk(hunk: &DiffHunk) -> Result<(), PatchRejection> {
-    let (old_lines, new_lines) = hunk.actual_line_counts();
-
-    if old_lines != hunk.old_count || new_lines != hunk.new_count {
-        return Err(PatchRejection::new(format!(
-            "diff hunk line counts do not match header -{},{} +{},{}",
-            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
-        ))
-        .with_hunk_summary(hunk)
-        .with_actual_counts(old_lines, new_lines)
-        .with_suggested_read_range(hunk.suggested_read_range()));
-    }
-
-    Ok(())
-}
-
-fn mark_previous_added_line_no_newline(hunk: &mut DiffHunk) -> Result<(), PatchRejection> {
-    match hunk.lines.last_mut() {
-        Some(DiffLine::Add { no_newline, .. }) => {
-            *no_newline = true;
-            Ok(())
-        }
-        Some(DiffLine::Context(_) | DiffLine::Remove(_)) => Ok(()),
-        None => Err(PatchRejection::new(
-            "no-newline marker must follow a diff line",
-        )),
-    }
-}
-
-fn validate_patch_line(
-    line_kind: &str,
-    expected_body: &str,
-    existing: &FileLine,
-    line_number: usize,
-    hunk: &DiffHunk,
-) -> Result<(), PatchRejection> {
-    if existing.body == expected_body {
-        Ok(())
-    } else {
-        Err(PatchRejection::new(format!(
-            "diff {line_kind} line does not match file line {line_number}"
-        ))
-        .with_hunk_summary(hunk)
-        .with_first_mismatch(line_kind, line_number, expected_body, &existing.body)
-        .with_suggested_read_range(suggested_read_range_around(line_number, hunk.old_count)))
-    }
-}
-
-fn split_file_lines(content: &str) -> Vec<FileLine> {
-    line_spans(content)
-        .into_iter()
-        .map(|span| {
-            let raw_line = &content[span.start_byte..span.end_byte];
-            let body_end = span
-                .line_ending
-                .map(|line_ending| raw_line.len() - line_ending.len())
-                .unwrap_or(raw_line.len());
-
-            FileLine {
-                body: raw_line[..body_end].to_string(),
-                line_ending: span.line_ending.map(str::to_string),
-            }
-        })
-        .collect()
-}
-
-fn default_line_ending(lines: &[FileLine]) -> String {
-    lines
-        .iter()
-        .find_map(|line| line.line_ending.clone())
-        .unwrap_or_else(|| "\n".to_string())
-}
-
-fn join_file_lines(lines: &[FileLine]) -> String {
-    let mut content = String::new();
-    for line in lines {
-        content.push_str(&line.body);
-        if let Some(line_ending) = &line.line_ending {
-            content.push_str(line_ending);
-        }
-    }
-    content
-}
-
 fn resolve_workspace_file(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
     let path = resolve_workspace_path(workspace_path, input)?;
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
@@ -2238,7 +1794,7 @@ fn limited_output_text(output: &[u8]) -> (String, bool) {
 fn read_file_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_FILE_TOOL,
-        description: "Read a text file inside the active workspace, optionally restricted to a 1-based inclusive line range. The returned content is prefixed with real 1-based file line numbers for patch targeting; line-number prefixes are not file content and must not be copied into write_file content or patch_file context/removal lines.",
+        description: "Read a text file inside the active workspace, optionally restricted to a 1-based inclusive line range. The returned content is prefixed with real 1-based file line numbers for edit targeting; line-number prefixes are not file content and must not be copied into write_file content or edit_file oldStr/newStr values.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2528,28 +2084,36 @@ fn write_file_definition() -> ToolDefinition {
     }
 }
 
-fn patch_file_definition() -> ToolDefinition {
+fn edit_file_definition() -> ToolDefinition {
     ToolDefinition {
-        name: PATCH_FILE_TOOL,
-        description: "Apply a strict single-file unified diff to an existing text file inside the active workspace. Use this mainly for multi-hunk or multi-location edits when the diff was produced or checked from current file content; prefer write_file line-range mode for small single-location edits. Before calling this tool, use read_file to confirm the target lines and ensure every context/removal line in the diff exactly matches the current file. If this tool fails, read the suggested range before retrying.",
+        name: EDIT_FILE_TOOL,
+        description: "Replace exact text in an existing workspace text file. Before calling edit_file, call read_file for the latest file content and copy oldStr exactly from that current content. By default this tool only edits when oldStr matches exactly once; set replaceAll to true only when every match should be replaced.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative existing file path to patch."
+                    "description": "Workspace-relative existing file path to edit."
                 },
-                "diff": {
+                "oldStr": {
                     "type": "string",
-                    "description": "Unified diff text containing one or more valid @@ -old,count +new,count @@ hunks for this file. Header line counts, context lines, and removed lines must exactly match the current file lines previously confirmed with read_file, excluding read_file line-number prefixes."
+                    "description": "Exact text to replace. It must come from the latest read_file output after removing read_file line-number prefixes."
+                },
+                "newStr": {
+                    "type": "string",
+                    "description": "Replacement text."
+                },
+                "replaceAll": {
+                    "type": ["boolean", "null"],
+                    "description": "Set true to replace every exact oldStr match. Set false or null to require exactly one match."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["path", "diff", "timeoutMs"]
+            "required": ["path", "oldStr", "newStr", "replaceAll", "timeoutMs"]
         }),
         strict: true,
     }
@@ -2916,9 +2480,11 @@ struct WriteFileInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PatchFileInput {
+struct EditFileInput {
     path: String,
-    diff: String,
+    old_str: String,
+    new_str: String,
+    replace_all: Option<bool>,
     timeout_ms: Option<u64>,
 }
 
@@ -3025,7 +2591,6 @@ enum ToolRuntimeError {
     },
     NotDirectory(PathBuf),
     NotFile(PathBuf),
-    PatchRejected(PatchRejection),
     UnsupportedEncoding(PathBuf),
     UnknownTool(String),
     WorkspaceDatabase(WorkspaceDatabaseError),
@@ -3075,7 +2640,6 @@ impl fmt::Display for ToolRuntimeError {
             Self::Io { path, source } => write!(formatter, "{}: {}", path.display(), source),
             Self::NotDirectory(path) => write!(formatter, "{} is not a directory", path.display()),
             Self::NotFile(path) => write!(formatter, "{} is not a file", path.display()),
-            Self::PatchRejected(rejection) => write!(formatter, "{rejection}"),
             Self::UnsupportedEncoding(path) => write!(
                 formatter,
                 "{} uses an unsupported text encoding; supported encodings are UTF-8, UTF-8 BOM, UTF-16 LE BOM, and UTF-16 BE BOM",
@@ -3105,7 +2669,6 @@ impl std::error::Error for ToolRuntimeError {
             | Self::Io { .. }
             | Self::NotDirectory(_)
             | Self::NotFile(_)
-            | Self::PatchRejected(_)
             | Self::UnsupportedEncoding(_)
             | Self::UnknownTool(_) => None,
         }
@@ -3488,6 +3051,20 @@ mod tests {
         assert_eq!(write_file.start_line, None);
         assert_eq!(write_file.end_line, None);
         assert_eq!(write_file.timeout_ms, None);
+
+        let edit_file: EditFileInput = parse_arguments(json!({
+            "path": "note.txt",
+            "oldStr": "hello",
+            "newStr": "hi",
+            "replaceAll": null,
+            "timeoutMs": null
+        }))
+        .expect("edit file input");
+        assert_eq!(edit_file.path, "note.txt");
+        assert_eq!(edit_file.old_str, "hello");
+        assert_eq!(edit_file.new_str, "hi");
+        assert_eq!(edit_file.replace_all, None);
+        assert_eq!(edit_file.timeout_ms, None);
     }
 
     #[test]
@@ -3746,22 +3323,25 @@ mod tests {
     }
 
     #[test]
-    fn patches_workspace_file_with_unified_diff() {
+    fn edits_workspace_file_with_single_match() {
         let workspace = tempfile::tempdir().expect("workspace");
         fs::write(workspace.path().join("note.txt"), "one\ntwo\nthree\n").expect("write note");
 
         let result = execute_builtin_tool(
             workspace.path(),
-            PATCH_FILE_TOOL,
+            EDIT_FILE_TOOL,
             json!({
                 "path": "note.txt",
-                "diff": "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n",
+                "oldStr": "two",
+                "newStr": "TWO",
+                "replaceAll": null,
                 "timeoutMs": null
             }),
         );
 
         assert!(!result.is_error);
-        assert_eq!(result.output["appliedHunks"], 1);
+        assert_eq!(result.output["replacements"], 1);
+        assert_eq!(result.output["replaceAll"], false);
         assert_eq!(
             fs::read_to_string(workspace.path().join("note.txt")).expect("read note"),
             "one\nTWO\nthree\n"
@@ -3769,16 +3349,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_patch_file_when_context_does_not_match() {
+    fn rejects_edit_file_when_old_str_is_missing() {
         let workspace = tempfile::tempdir().expect("workspace");
         fs::write(workspace.path().join("note.txt"), "one\ntwo\n").expect("write note");
 
         let result = execute_builtin_tool(
             workspace.path(),
-            PATCH_FILE_TOOL,
+            EDIT_FILE_TOOL,
             json!({
                 "path": "note.txt",
-                "diff": "@@ -1,2 +1,2 @@\n one\n-three\n+THREE\n",
+                "oldStr": "three",
+                "newStr": "THREE",
+                "replaceAll": false,
                 "timeoutMs": null
             }),
         );
@@ -3790,33 +3372,27 @@ mod tests {
                 .get("error")
                 .and_then(Value::as_str)
                 .expect("error")
-                .contains("diff removal line does not match")
+                .contains("oldStr was not found")
         );
-        assert_eq!(result.output["hunk"]["declaredOldStart"], 1);
-        assert_eq!(result.output["hunk"]["declaredOldCount"], 2);
-        assert_eq!(result.output["hunk"]["declaredNewStart"], 1);
-        assert_eq!(result.output["hunk"]["declaredNewCount"], 2);
-        assert_eq!(result.output["hunk"]["actualOldCount"], 2);
-        assert_eq!(result.output["hunk"]["actualNewCount"], 2);
-        assert_eq!(result.output["firstMismatch"]["kind"], "removal");
-        assert_eq!(result.output["firstMismatch"]["line"], 2);
-        assert_eq!(result.output["firstMismatch"]["expected"], "three");
-        assert_eq!(result.output["firstMismatch"]["actual"], "two");
-        assert_eq!(result.output["suggestedReadRange"]["startLine"], 1);
-        assert_eq!(result.output["suggestedReadRange"]["endLine"], 7);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("note.txt")).expect("read note"),
+            "one\ntwo\n"
+        );
     }
 
     #[test]
-    fn rejects_patch_file_with_hunk_count_diagnostics() {
+    fn rejects_edit_file_when_old_str_matches_multiple_without_replace_all() {
         let workspace = tempfile::tempdir().expect("workspace");
-        fs::write(workspace.path().join("note.txt"), "one\ntwo\nthree\n").expect("write note");
+        fs::write(workspace.path().join("note.txt"), "one\ntwo\ntwo\n").expect("write note");
 
         let result = execute_builtin_tool(
             workspace.path(),
-            PATCH_FILE_TOOL,
+            EDIT_FILE_TOOL,
             json!({
                 "path": "note.txt",
-                "diff": "@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n three\n",
+                "oldStr": "two",
+                "newStr": "TWO",
+                "replaceAll": false,
                 "timeoutMs": null
             }),
         );
@@ -3828,16 +3404,38 @@ mod tests {
                 .get("error")
                 .and_then(Value::as_str)
                 .expect("error")
-                .contains("diff hunk line counts do not match")
+                .contains("oldStr matched 2 times")
         );
-        assert_eq!(result.output["hunk"]["declaredOldStart"], 1);
-        assert_eq!(result.output["hunk"]["declaredOldCount"], 2);
-        assert_eq!(result.output["hunk"]["declaredNewStart"], 1);
-        assert_eq!(result.output["hunk"]["declaredNewCount"], 2);
-        assert_eq!(result.output["hunk"]["actualOldCount"], 3);
-        assert_eq!(result.output["hunk"]["actualNewCount"], 3);
-        assert_eq!(result.output["suggestedReadRange"]["startLine"], 1);
-        assert_eq!(result.output["suggestedReadRange"]["endLine"], 6);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("note.txt")).expect("read note"),
+            "one\ntwo\ntwo\n"
+        );
+    }
+
+    #[test]
+    fn edits_all_matches_when_replace_all_is_true() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "one\ntwo\ntwo\n").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            EDIT_FILE_TOOL,
+            json!({
+                "path": "note.txt",
+                "oldStr": "two",
+                "newStr": "TWO",
+                "replaceAll": true,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["replacements"], 2);
+        assert_eq!(result.output["replaceAll"], true);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("note.txt")).expect("read note"),
+            "one\nTWO\nTWO\n"
+        );
     }
 
     #[test]

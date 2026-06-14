@@ -81,7 +81,7 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    ASK_QUESTION_TOOL, CREATE_TODO_GRAPH_TOOL, PATCH_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
+    ASK_QUESTION_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
     SLEEP_TOOL, ToolCancellationToken, ToolExecution, UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL,
     builtin_tool_definitions, builtin_tool_timeout_ms,
     execute_builtin_tool_for_chat_with_cancellation, set_ripgrep_path,
@@ -13982,7 +13982,7 @@ fn tool_results_affect_git_diff(tool_results: &[ExecutedToolCall]) -> bool {
     tool_results.iter().any(|tool_result| {
         matches!(
             tool_result.name.as_str(),
-            WRITE_FILE_TOOL | PATCH_FILE_TOOL | RUN_COMMAND_TOOL
+            WRITE_FILE_TOOL | EDIT_FILE_TOOL | RUN_COMMAND_TOOL
         )
     })
 }
