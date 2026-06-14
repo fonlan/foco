@@ -5512,6 +5512,7 @@ enum ChatSseEvent {
     },
     GitDiffRefresh {
         workspace_id: String,
+        code_change_stats: CodeChangeStats,
     },
     TodoGraphRefresh {
         workspace_id: String,
@@ -7266,6 +7267,12 @@ impl PreparedChatContext {
                             if tool_results_affect_git_diff(&next_executed_tool_calls) {
                                 let event = ChatSseEvent::GitDiffRefresh {
                                     workspace_id: self.workspace_id.clone(),
+                                    code_change_stats: code_change_stats_from_changed_files(
+                                        &git_diff_changed_files_for_workspace(
+                                            &self.initial_git_diff_stats,
+                                            &self.workspace_path,
+                                        ),
+                                    ),
                                 };
                                 events.push(captured_event(&event));
                                 yield event;
@@ -18311,19 +18318,7 @@ fn git_diff_summary(
     workspace_path: &Path,
     language: &str,
 ) -> GitDiffSummary {
-    let Some(initial_stats) = initial_stats else {
-        return GitDiffSummary {
-            text: assistant_text.to_string(),
-            stats: CodeChangeStats::default(),
-        };
-    };
-    let Some(final_stats) = git_diff_stats_for_workspace(workspace_path) else {
-        return GitDiffSummary {
-            text: assistant_text.to_string(),
-            stats: CodeChangeStats::default(),
-        };
-    };
-    let changed_files = git_diff_changed_files(initial_stats, &final_stats);
+    let changed_files = git_diff_changed_files_for_workspace(initial_stats, workspace_path);
     if changed_files.is_empty() {
         return GitDiffSummary {
             text: assistant_text.to_string(),
@@ -18361,6 +18356,20 @@ fn git_diff_summary(
     }
 
     GitDiffSummary { text, stats }
+}
+
+fn git_diff_changed_files_for_workspace(
+    initial_stats: &Option<GitDiffStatsByFile>,
+    workspace_path: &Path,
+) -> Vec<(String, GitDiffFileLineStats)> {
+    let Some(initial_stats) = initial_stats else {
+        return Vec::new();
+    };
+    let Some(final_stats) = git_diff_stats_for_workspace(workspace_path) else {
+        return Vec::new();
+    };
+
+    git_diff_changed_files(initial_stats, &final_stats)
 }
 
 fn code_change_stats_from_changed_files(

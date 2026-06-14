@@ -971,6 +971,7 @@ type LiveChatStatistics = {
   modelId: string;
   providerId: string;
   startedAtMs: number;
+  codeChangeStats?: GitDiffLineStats;
 };
 
 type ChatReplyMetrics = {
@@ -1076,6 +1077,7 @@ type ChatStreamEvent =
   | {
       type: "gitDiffRefresh";
       workspaceId: string;
+      codeChangeStats: GitDiffLineStats;
     }
   | {
       type: "todoGraphRefresh";
@@ -3339,7 +3341,13 @@ export function App() {
 
     setLiveChatStatisticsByKey((current) => ({
       ...current,
-      [chatKey]: updater,
+      [chatKey]: {
+        ...updater,
+        codeChangeStats:
+          updater.codeChangeStats ??
+          current[chatKey]?.codeChangeStats ??
+          emptyGitDiffLineStats(),
+      },
     }));
   }
 
@@ -5046,6 +5054,13 @@ export function App() {
           if (isContextPanelOpen && contextPanelTab === "git") {
             void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
           }
+          updateLiveChatStatistics(chatKey, {
+            codeChangeStats: streamEvent.codeChangeStats,
+            modelId: selectedModelIdRef.current,
+            providerId: selectedProviderIdRef.current,
+            startedAtMs: liveStartedAtMs,
+            usage: latestResponseUsage,
+          });
           void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           return;
         }
@@ -5617,6 +5632,13 @@ export function App() {
           if (isContextPanelOpen && contextPanelTab === "git") {
             void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
           }
+          updateLiveChatStatistics(runMessagesKey, {
+            codeChangeStats: streamEvent.codeChangeStats,
+            modelId: request.modelId,
+            providerId: request.providerId,
+            startedAtMs: liveStartedAtMs,
+            usage: latestResponseUsage,
+          });
           if (requestChatId) {
             void loadChatStatistics(request.workspaceId, requestChatId);
           }
@@ -20669,6 +20691,7 @@ function withLiveChatStatistics(
   const cacheReadTokens = live.usage?.cacheReadTokens ?? 0;
   const cacheWriteTokens = live.usage?.cacheWriteTokens ?? 0;
   const totalTokens = inputTokens + outputTokens;
+  const codeChangeStats = live.codeChangeStats ?? emptyGitDiffLineStats();
   const liveLatencyMs = Math.max(0, Date.now() - live.startedAtMs);
   const base =
     statistics ?? emptyChatStatistics(workspaceId, chatId, emptyAiStatisticsSummary());
@@ -20684,6 +20707,10 @@ function withLiveChatStatistics(
     ...base,
     assistantMessageCount,
     averageLatencyMs: Math.round(totalLatencyMs / totalRequests),
+    codeChangeStats: {
+      additions: base.codeChangeStats.additions + codeChangeStats.additions,
+      deletions: base.codeChangeStats.deletions + codeChangeStats.deletions,
+    },
     messageCount,
     modelBreakdown: addLiveModelBreakdown(
       base.modelBreakdown,
@@ -20743,6 +20770,10 @@ function emptyChatStatistics(
       savedTokenCount: 0,
     },
   };
+}
+
+function emptyGitDiffLineStats(): GitDiffLineStats {
+  return { additions: 0, deletions: 0 };
 }
 
 function countMessagesByRole(messages: ShellMessage[], role: string) {
@@ -21706,6 +21737,27 @@ function hasGitDiffStats(stats: GitDiffLineStats) {
   return stats.additions > 0 || stats.deletions > 0;
 }
 
+function parseGitDiffLineStats(value: unknown): GitDiffLineStats | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const additions = fieldValue(value, "additions");
+  const deletions = fieldValue(value, "deletions");
+  if (
+    typeof additions !== "number" ||
+    typeof deletions !== "number" ||
+    !Number.isSafeInteger(additions) ||
+    !Number.isSafeInteger(deletions) ||
+    additions < 0 ||
+    deletions < 0
+  ) {
+    return null;
+  }
+
+  return { additions, deletions };
+}
+
 function parseGitDiffFiles(diffText: string): GitDiffFile[] {
   const files: GitDiffFile[] = [];
   let current: GitDiffFile | null = null;
@@ -22162,12 +22214,21 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
 
   if (value.type === "gitDiffRefresh" || value.type === "git_diff_refresh") {
     const workspaceId = stringField(value, "workspaceId", "workspace_id");
+    const codeChangeStatsValue = fieldValue(
+      value,
+      "codeChangeStats",
+      "code_change_stats",
+    );
+    const codeChangeStats =
+      typeof codeChangeStatsValue === "undefined"
+        ? emptyGitDiffLineStats()
+        : parseGitDiffLineStats(codeChangeStatsValue);
 
-    if (!workspaceId) {
+    if (!workspaceId || !codeChangeStats) {
       return null;
     }
 
-    return { type: "gitDiffRefresh", workspaceId };
+    return { type: "gitDiffRefresh", workspaceId, codeChangeStats };
   }
 
   if (

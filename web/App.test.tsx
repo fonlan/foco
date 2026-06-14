@@ -4325,6 +4325,36 @@ describe("App verification surfaces", () => {
     expect(screen.getAllByText("History").length).toBeGreaterThan(0);
   });
 
+  it("updates active chat code change statistics from git diff refresh events", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    render(<App />);
+
+    await user.click(await screen.findByRole("tab", { name: "Stats" }));
+    expect(await screen.findByText("+12 / -3")).toBeInTheDocument();
+
+    await user.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "edit the file",
+    );
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        codeChangeStats: { additions: 5, deletions: 1 },
+        type: "gitDiffRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
+
+    expect(await screen.findByText("+17 / -4")).toBeInTheDocument();
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
   it("opens the todo graph sidebar when a todo graph refresh arrives", async () => {
     render(<App />);
 
