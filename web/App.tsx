@@ -2070,9 +2070,17 @@ type ScheduledContextUsageRefresh = {
   timeoutId: number;
 };
 
+type ContextMemoryScopeState = {
+  memories: MemoryFactRecord[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
+};
+
 type ContextMemoryState = {
-  global: MemoryFactRecord[];
-  workspace: MemoryFactRecord[];
+  global: ContextMemoryScopeState;
+  workspace: ContextMemoryScopeState;
 };
 
 type QuestionAnswerSubmission = {
@@ -2165,8 +2173,15 @@ export function App() {
     Record<string, LiveChatStatistics>
   >({});
   const [contextMemories, setContextMemories] = useState<ContextMemoryState>({
-    global: [],
-    workspace: [],
+    global: { memories: [], page: 1, pageSize: 10, totalCount: 0, totalPages: 0 },
+    workspace: { memories: [], page: 1, pageSize: 10, totalCount: 0, totalPages: 0 },
+  });
+  const [contextMemoryPages, setContextMemoryPages] = useState<{
+    global: { page: number; pageSize: number };
+    workspace: { page: number; pageSize: number };
+  }>({
+    global: { page: 1, pageSize: 10 },
+    workspace: { page: 1, pageSize: 10 },
   });
   const [isLoadingContextMemories, setIsLoadingContextMemories] =
     useState(false);
@@ -2593,12 +2608,14 @@ export function App() {
 
     try {
       const globalParams = new URLSearchParams({
-        limit: "20",
+        page: String(contextMemoryPages.global.page),
+        pageSize: String(contextMemoryPages.global.pageSize),
         scope: "global",
         status: "active",
       });
       const workspaceParams = new URLSearchParams({
-        limit: "20",
+        page: String(contextMemoryPages.workspace.page),
+        pageSize: String(contextMemoryPages.workspace.pageSize),
         scope: "workspace",
         status: "active",
         workspaceId,
@@ -2611,16 +2628,31 @@ export function App() {
       ]);
 
       setContextMemories({
-        global: globalData.memories,
-        workspace: workspaceData.memories,
+        global: {
+          memories: globalData.memories,
+          page: globalData.page,
+          pageSize: globalData.pageSize,
+          totalCount: globalData.totalCount,
+          totalPages: globalData.totalPages,
+        },
+        workspace: {
+          memories: workspaceData.memories,
+          page: workspaceData.page,
+          pageSize: workspaceData.pageSize,
+          totalCount: workspaceData.totalCount,
+          totalPages: workspaceData.totalPages,
+        },
       });
     } catch (requestError) {
-      setContextMemories({ global: [], workspace: [] });
+      setContextMemories({
+        global: { memories: [], page: 1, pageSize: 10, totalCount: 0, totalPages: 0 },
+        workspace: { memories: [], page: 1, pageSize: 10, totalCount: 0, totalPages: 0 },
+      });
       setContextMemoryError(errorMessage(requestError));
     } finally {
       setIsLoadingContextMemories(false);
     }
-  }, []);
+  }, [contextMemoryPages]);
 
   const forgetContextMemory = useCallback(
     async (memory: MemoryFactRecord) => {
@@ -2655,6 +2687,16 @@ export function App() {
       }
     },
     [activeWorkspace?.id, loadContextMemories, t],
+  );
+
+  const goToContextMemoryPage = useCallback(
+    (scope: "global" | "workspace", page: number) => {
+      setContextMemoryPages((current) => ({
+        ...current,
+        [scope]: { ...current[scope], page },
+      }));
+    },
+    [],
   );
 
   const loadTodoGraph = useCallback(async (workspaceId: string, chatId: string) => {
@@ -2852,6 +2894,13 @@ export function App() {
 
     void loadContextMemories(activeWorkspace.id);
   }, [activeWorkspace?.id, contextPanelTab, loadContextMemories]);
+
+  useEffect(() => {
+    setContextMemoryPages({
+      global: { page: 1, pageSize: 10 },
+      workspace: { page: 1, pageSize: 10 },
+    });
+  }, [activeWorkspace?.id]);
 
   useEffect(() => {
     if (!activeWorkspace?.id) {
@@ -6613,6 +6662,7 @@ export function App() {
                 }
               }}
               onForgetContextMemory={(memory) => void forgetContextMemory(memory)}
+              onMemoryPageChange={goToContextMemoryPage}
               onSelectDiffFile={setSelectedDiffPath}
               onTabChange={(tab) => {
                 setContextPanelTab(tab);
@@ -11449,6 +11499,7 @@ function ContextPanel({
   isLoadingDiff,
   isLoadingTodoGraph,
   onForgetContextMemory,
+  onMemoryPageChange,
   onRefreshDiff,
   onSelectDiffFile,
   onTabChange,
@@ -11471,6 +11522,7 @@ function ContextPanel({
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
   onForgetContextMemory: (memory: MemoryFactRecord) => void;
+  onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
   onRefreshDiff: () => void;
   onSelectDiffFile: (path: string | null) => void;
   onTabChange: (tab: ContextPanelTab) => void;
@@ -11539,6 +11591,7 @@ function ContextPanel({
             isLoading={isLoadingContextMemories}
             memories={contextMemories}
             onForgetMemory={onForgetContextMemory}
+            onPageChange={onMemoryPageChange}
           />
         ) : null}
 
@@ -11591,12 +11644,14 @@ function ContextMemoryTab({
   isLoading,
   memories,
   onForgetMemory,
+  onPageChange,
 }: {
   deletingMemoryId: string | null;
   error: string | null;
   isLoading: boolean;
   memories: ContextMemoryState;
   onForgetMemory: (memory: MemoryFactRecord) => void;
+  onPageChange: (scope: "global" | "workspace", page: number) => void;
 }) {
   const { t } = useI18n();
 
@@ -11620,15 +11675,29 @@ function ContextMemoryTab({
             deletingMemoryId={deletingMemoryId}
             emptyLabel={t("No memories")}
             label={t("Global memory")}
-            memories={memories.global}
+            memories={memories.global.memories}
+            meta={{
+              page: memories.global.page,
+              pageSize: memories.global.pageSize,
+              totalCount: memories.global.totalCount,
+              totalPages: memories.global.totalPages,
+            }}
             onForgetMemory={onForgetMemory}
+            onPageChange={(page) => onPageChange("global", page)}
           />
           <ContextMemoryGroup
             deletingMemoryId={deletingMemoryId}
             emptyLabel={t("No memories")}
             label={t("Workspace memory")}
-            memories={memories.workspace}
+            memories={memories.workspace.memories}
+            meta={{
+              page: memories.workspace.page,
+              pageSize: memories.workspace.pageSize,
+              totalCount: memories.workspace.totalCount,
+              totalPages: memories.workspace.totalPages,
+            }}
             onForgetMemory={onForgetMemory}
+            onPageChange={(page) => onPageChange("workspace", page)}
           />
         </>
       )}
@@ -11640,51 +11709,120 @@ function ContextMemoryGroup({
   deletingMemoryId,
   emptyLabel,
   label,
+  meta,
   memories,
   onForgetMemory,
+  onPageChange,
 }: {
   deletingMemoryId: string | null;
   emptyLabel: string;
   label: string;
+  meta: { page: number; pageSize: number; totalCount: number; totalPages: number };
   memories: MemoryFactRecord[];
   onForgetMemory: (memory: MemoryFactRecord) => void;
+  onPageChange: (page: number) => void;
 }) {
-  const { t } = useI18n();
+  const { language, t } = useI18n();
+  const paginationItems = auditPaginationItems(meta.page, meta.totalPages);
 
   return (
     <div className="context-memory-group">
       <div className="context-panel-section-title">{label}</div>
       {memories.length ? (
-        memories.map((memory) => (
-          <article className="context-memory-item" key={memory.id}>
-            <div className="context-memory-item-header">
-              <div className="context-memory-badges">
-                <span className="context-memory-kind">{memory.kind}</span>
-                {memory.pinned ? (
-                  <span className="context-memory-pin">pinned</span>
-                ) : null}
+        <>
+          {memories.map((memory) => (
+            <article className="context-memory-item" key={memory.id}>
+              <div className="context-memory-item-header">
+                <div className="context-memory-badges">
+                  <span className="context-memory-kind">{memory.kind}</span>
+                  {memory.pinned ? (
+                    <span className="context-memory-pin">pinned</span>
+                  ) : null}
+                </div>
+                <button
+                  aria-label={t("Delete memory")}
+                  className="context-memory-delete-button"
+                  disabled={deletingMemoryId === memory.id}
+                  onClick={() => onForgetMemory(memory)}
+                  title={t("Delete memory")}
+                  type="button"
+                >
+                  {deletingMemoryId === memory.id ? (
+                    <LoaderCircle aria-hidden="true" className="animate-spin" />
+                  ) : (
+                    <Trash2 aria-hidden="true" />
+                  )}
+                </button>
               </div>
-              <button
-                aria-label={t("Delete memory")}
-                className="context-memory-delete-button"
-                disabled={deletingMemoryId === memory.id}
-                onClick={() => onForgetMemory(memory)}
-                title={t("Delete memory")}
-                type="button"
+              <p>{memory.fact}</p>
+              <small>
+                {memory.scope} · {formatTodoGraphDate(memory.updatedAt)}
+              </small>
+            </article>
+          ))}
+          {meta.totalPages > 1 ? (
+            <div className="flex flex-wrap items-center justify-end gap-3 mt-3 px-1">
+              <nav
+                aria-label={t("Memory pagination")}
+                className="flex items-center gap-1"
               >
-                {deletingMemoryId === memory.id ? (
-                  <LoaderCircle aria-hidden="true" className="animate-spin" />
-                ) : (
-                  <Trash2 aria-hidden="true" />
+                <button
+                  aria-label={t("Previous page")}
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                  disabled={meta.page <= 1}
+                  onClick={() => onPageChange(meta.page - 1)}
+                  title={t("Previous page")}
+                  type="button"
+                >
+                  <ChevronLeft aria-hidden="true" className="size-4" />
+                </button>
+                {paginationItems.map((item, index) =>
+                  item === "ellipsis" ? (
+                    <span
+                      aria-hidden="true"
+                      className="inline-flex size-9 items-center justify-center text-stone-400"
+                      key={`cm-ellipsis-${index}`}
+                    >
+                      ...
+                    </span>
+                  ) : (
+                    <button
+                      aria-current={
+                        item === meta.page ? "page" : undefined
+                      }
+                      aria-label={t("Go to page {page}", {
+                        page: formatNumber(item, language),
+                      })}
+                      className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${
+                        item === meta.page
+                          ? "border-teal-700 bg-teal-700 text-white"
+                          : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      }`}
+                      key={item}
+                      onClick={() => onPageChange(item)}
+                      title={t("Go to page {page}", {
+                        page: formatNumber(item, language),
+                      })}
+                      type="button"
+                    >
+                      {formatNumber(item, language)}
+                    </button>
+                  ),
                 )}
-              </button>
+                <button
+                  aria-label={t("Next page")}
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                  disabled={meta.totalPages === 0 || meta.page >= meta.totalPages}
+                  onClick={() => onPageChange(meta.page + 1)}
+                  title={t("Next page")}
+                  type="button"
+                >
+                  <ChevronRight aria-hidden="true" className="size-4" />
+                </button>
+              </nav>
             </div>
-            <p>{memory.fact}</p>
-            <small>
-              {memory.scope} · {formatTodoGraphDate(memory.updatedAt)}
-            </small>
-          </article>
-        ))
+          ) : null}
+        </>
       ) : (
         <div className="context-empty-inline">{emptyLabel}</div>
       )}
