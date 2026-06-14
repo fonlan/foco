@@ -302,6 +302,7 @@ impl GlobalConfig {
                 language: DEFAULT_APP_LANGUAGE.to_string(),
                 theme: DEFAULT_APP_THEME.to_string(),
                 llm_request_retry_count: DEFAULT_LLM_REQUEST_RETRY_COUNT,
+                auto_start_enabled: false,
                 web_server: WebServerSettings::default(),
             },
             hooks: HookConfig::default(),
@@ -636,6 +637,8 @@ pub struct AppSettings {
     pub theme: String,
     #[serde(default = "default_llm_request_retry_count")]
     pub llm_request_retry_count: u32,
+    #[serde(default)]
+    pub auto_start_enabled: bool,
     #[serde(default)]
     pub web_server: WebServerSettings,
 }
@@ -1879,6 +1882,7 @@ mod tests {
 
         assert_eq!(loaded.app.language, DEFAULT_APP_LANGUAGE);
         assert_eq!(loaded.app.theme, DEFAULT_APP_THEME);
+        assert!(!loaded.app.auto_start_enabled);
         assert_eq!(loaded.app.web_server, WebServerSettings::default());
         assert!(!loaded.workspaces[0].pinned);
         assert_eq!(loaded.workspaces[0].terminal_shell, DEFAULT_TERMINAL_SHELL);

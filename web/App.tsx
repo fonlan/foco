@@ -267,6 +267,7 @@ type AppThemeSummary = {
 };
 
 type GeneralSettingsSummary = {
+  autoStartEnabled: boolean;
   hookAuditEnabled: boolean;
   language: AppLanguageId;
   llmRequestRetryCount: number;
@@ -461,6 +462,7 @@ type ProviderFormState = {
 };
 
 type GeneralFormState = {
+  autoStartEnabled: boolean;
   hookAuditEnabled: boolean;
   language: string;
   listenHost: string;
@@ -1670,6 +1672,8 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Web service": "Web 服务",
     "Listen address": "监听地址",
     "Listen port": "监听端口",
+    Startup: "启动",
+    "Start Foco when Windows starts": "Windows 启动时打开 Foco",
     "Browser authentication": "浏览器认证",
     "Authentication password": "认证密码",
     "Password required": "需要密码",
@@ -12534,6 +12538,7 @@ function SettingsPanel({
     setIsEditingGeneralPassword(false);
     setIsGeneralPasswordVisible(false);
     setGeneralForm({
+      autoStartEnabled: data.general.autoStartEnabled,
       hookAuditEnabled: data.general.hookAuditEnabled,
       language: data.general.language,
       listenHost: data.general.webServer.listenHost,
@@ -12964,8 +12969,17 @@ function SettingsPanel({
 
     try {
       const password = generalForm.password;
+      const shouldSaveAutoStart =
+        generalForm.autoStartEnabled ||
+        Boolean(
+          settings &&
+            generalForm.autoStartEnabled !== settings.general.autoStartEnabled,
+        );
       const data = await requestJson<SettingsResponse>("/api/settings/general", {
         body: JSON.stringify({
+          ...(shouldSaveAutoStart
+            ? { autoStartEnabled: generalForm.autoStartEnabled }
+            : {}),
           clearPassword: false,
           listenHost: generalForm.listenHost,
           listenPort: optionalPositiveInteger(
@@ -14713,6 +14727,46 @@ function SettingsPanel({
                   value={generalForm.llmRequestRetryCount}
                 />
               </label>
+              <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                <legend className="px-1 text-xs font-semibold text-stone-600">
+                  {t("Startup")}
+                </legend>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <Play
+                      aria-hidden="true"
+                      className="size-4 shrink-0 fill-current text-teal-700"
+                    />
+                    <p className="text-sm font-semibold text-stone-800">
+                      {t("Start Foco when Windows starts")}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <CapabilityPill
+                      label={
+                        generalForm.autoStartEnabled ? t("enabled") : t("disabled")
+                      }
+                      ok={generalForm.autoStartEnabled}
+                    />
+                    <label
+                      aria-label={t("Start Foco when Windows starts")}
+                      className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                    >
+                      <input
+                        checked={generalForm.autoStartEnabled}
+                        className="size-4 accent-teal-700"
+                        onChange={(event) =>
+                          setGeneralForm((current) => ({
+                            ...current,
+                            autoStartEnabled: event.target.checked,
+                          }))
+                        }
+                        type="checkbox"
+                      />
+                    </label>
+                  </div>
+                </div>
+              </fieldset>
             </div>
             <div className="mt-4 border-t border-stone-200 pt-4">
               <div className="flex items-center justify-between gap-3">
@@ -19351,6 +19405,7 @@ function emptyProviderForm(): ProviderFormState {
 
 function emptyGeneralForm(): GeneralFormState {
   return {
+    autoStartEnabled: false,
     hookAuditEnabled: false,
     language: "en",
     listenHost: "127.0.0.1",

@@ -115,6 +115,7 @@ const settings = {
     },
   ],
   general: {
+    autoStartEnabled: false,
     hookAuditEnabled: false,
     language: "en",
     llmRequestRetryCount: 3,
@@ -986,6 +987,10 @@ function savedGeneralSettings(init?: RequestInit) {
     ...settings,
     general: {
       ...settings.general,
+      autoStartEnabled:
+        typeof body.autoStartEnabled === "boolean"
+          ? body.autoStartEnabled
+          : settings.general.autoStartEnabled,
       hookAuditEnabled:
         typeof body.hookAuditEnabled === "boolean"
           ? body.hookAuditEnabled
@@ -3536,6 +3541,29 @@ describe("App verification surfaces", () => {
     });
     await waitFor(() => {
       expect(document.documentElement.dataset.focoTheme).toBe("dark");
+    });
+  });
+
+  it("saves Windows auto start from general settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(
+      await screen.findByRole("checkbox", {
+        name: "Start Foco when Windows starts",
+      }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Save general settings" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/general",
+        expect.objectContaining({
+          body: expect.stringContaining('"autoStartEnabled":true'),
+          method: "POST",
+        }),
+      );
     });
   });
 
