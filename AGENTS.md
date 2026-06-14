@@ -42,7 +42,7 @@
 - 浏览器 UI 的 workspace 侧边栏中，workspace 名称行点击负责展开/收起该 workspace 的 chat list；右侧 `+` 按钮只负责在该 workspace 新建 chat，若该 workspace 已收起则必须同时自动展开，hover/active 高亮应覆盖整行菜单区域。workspace 行和会话行必须有明确视觉层级区分；同一时间只能展开一个 workspace，点击历史会话或切换会话标签时必须自动收起其他 workspace 并展开该会话所属 workspace，但之后用户仍可手动收起或展开任意 workspace；新建聊天占位行必须保持与普通会话一致的行高和可点击宽度。
 - 浏览器 UI 的 workspace chat list 会在标题下方显示 chat 创建时间，当前正在等待模型返回的 chat 会把左侧气泡图标替换为旋转加载图标直到流结束。
 - 浏览器 UI 的中间聊天面板使用打开会话标签页；点击左侧会话列表会打开或切换对应标签，标签标题显示会话名、下方显示所属 workspace 名，关闭标签只关闭当前浏览器 UI 标签而不删除 chat 历史，正在 streaming 的标签右侧显示旋转加载图标而不是关闭按钮。
-- 手机宽度浏览器 UI 不常驻 workspace 侧边栏；聊天页顶部通过文件夹按钮打开 workspace 抽屉，选择或新建会话后自动收起抽屉，Git diff/任务图面板在底部覆盖显示以避免挤压聊天主区。
+- 手机宽度浏览器 UI 不常驻 workspace 侧边栏；聊天页通过左侧导航栏 Home 按钮打开/关闭 workspace 抽屉，选择或新建会话后自动收起抽屉，Git diff/任务图面板在底部覆盖显示以避免挤压聊天主区。
 - 浏览器 UI 只展示一个添加工作区入口；路径输入框右侧的选择按钮通过 `POST /api/native/select-directory` 打开本机目录选择器并回填路径。
 - `POST /api/workspaces/add` 负责添加工作区：路径不存在时创建目录后注册，路径已存在且是目录时直接注册；该接口会写回 `%USERPROFILE%\.foco\config.json` 并初始化 workspace-local SQLite，路径已存在但不是目录时必须明确报错。
 - `POST /api/workspaces/manual` 负责保存单个 workspace 的名称、路径、置顶状态和终端 shell；路径必须是绝对目录路径，保存和响应时不得把 Windows `\\?\` verbatim 前缀暴露给配置或 UI；终端 shell 只支持 `powershell`、`cmd`、`bash` 和 `zsh`，未知值必须明确报错。

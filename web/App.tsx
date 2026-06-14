@@ -2087,6 +2087,7 @@ export function App() {
   const [sidebarWidth, setSidebarWidth] = useState(WORKSPACE_SIDEBAR_MIN_WIDTH);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [isMobileWorkspaceOpen, setIsMobileWorkspaceOpen] = useState(false);
+  const [isWorkspaceSidebarOpen, setIsWorkspaceSidebarOpen] = useState(true);
   const [terminalOpenWorkspaceIds, setTerminalOpenWorkspaceIds] = useState<
     Set<string>
   >(() => new Set());
@@ -4209,6 +4210,20 @@ export function App() {
     updateBrowserRoute(currentChatBrowserRoute());
   }
 
+  function handleHomeNavClick() {
+    if (viewMode !== "chat") {
+      openCurrentChatView();
+      return;
+    }
+
+    if (typeof window !== "undefined" && window.innerWidth < 768) {
+      setIsMobileWorkspaceOpen((current) => !current);
+      return;
+    }
+
+    setIsWorkspaceSidebarOpen((current) => !current);
+  }
+
   function applyBrowserRoute(route: BrowserRoute) {
     if (route.viewMode === "settings") {
       setSettingsSection(route.section);
@@ -5534,6 +5549,7 @@ export function App() {
             onLogout={handleLogout}
             onOpenSettings={() => openSettingsSection("general")}
             onOpenStats={openStatsView}
+            onHomeClick={handleHomeNavClick}
             onReturnHome={openCurrentChatView}
             onToggleTheme={() =>
               void saveAppTheme(theme === "dark" ? "light" : "dark")
@@ -5562,7 +5578,9 @@ export function App() {
         </div>
       ) : (
         <div
-          className={`app-shell ${showContextPanel ? "app-shell-with-context" : ""}`}
+          className={`app-shell ${showContextPanel ? "app-shell-with-context" : ""} ${
+            isWorkspaceSidebarOpen ? "" : "app-shell-workspace-closed"
+          }`}
           style={
             {
               "--diff-panel-width": `${diffPanelWidth}px`,
@@ -5586,6 +5604,7 @@ export function App() {
           onLogout={handleLogout}
           onOpenSettings={() => openSettingsSection("general")}
           onOpenStats={openStatsView}
+          onHomeClick={handleHomeNavClick}
           onReturnHome={openCurrentChatView}
           onToggleTheme={() =>
             void saveAppTheme(theme === "dark" ? "light" : "dark")
@@ -5943,15 +5962,6 @@ export function App() {
         <section className="app-main-panel flex min-w-0 flex-col">
               <header className="app-toolbar shrink-0 border-b border-stone-200/80 bg-white/80 backdrop-blur">
                 <div className="flex min-w-0 items-center justify-between gap-2">
-                  <button
-                    aria-label={t("Workspaces")}
-                    className="mobile-workspace-button inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 md:hidden"
-                    onClick={() => setIsMobileWorkspaceOpen(true)}
-                    title={t("Workspaces")}
-                    type="button"
-                  >
-                    <Folder aria-hidden="true" className="size-4" />
-                  </button>
                   <ChatTabBar
                     activeChatId={activeChatId}
                     activeWorkspaceId={activeWorkspaceId}
@@ -7112,6 +7122,7 @@ function FocoNavRail({
   isSavingTheme,
   onAddWorkspace,
   onLogout,
+  onHomeClick,
   onOpenSettings,
   onOpenStats,
   onReturnHome,
@@ -7123,6 +7134,7 @@ function FocoNavRail({
   isSavingTheme: boolean;
   onAddWorkspace: () => void;
   onLogout: () => Promise<void>;
+  onHomeClick: () => void;
   onOpenSettings: () => void;
   onOpenStats: () => void;
   onReturnHome: () => void;
@@ -7149,7 +7161,7 @@ function FocoNavRail({
           active={activeMode === "chat"}
           icon={Home}
           label={t("Home")}
-          onClick={onReturnHome}
+          onClick={onHomeClick}
         />
         <NavRailButton
           active={activeMode === "stats"}

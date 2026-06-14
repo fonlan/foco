@@ -143,8 +143,7 @@ summary:focus-visible {
 }
 
 .mobile-sidebar-backdrop,
-.mobile-sidebar-close,
-.mobile-workspace-button {
+.mobile-sidebar-close {
   display: none;
 }
 
@@ -782,8 +781,7 @@ summary:focus-visible {
     backdrop-filter: blur(3px);
   }
 
-  .mobile-sidebar-close,
-  .mobile-workspace-button {
+  .mobile-sidebar-close {
     display: inline-flex;
   }
 
@@ -1137,6 +1135,7 @@ body,
     minmax(0, 1fr)
     var(--diff-panel-width, 26.25rem);
 }
+
 
 .foco-nav-rail {
   grid-area: nav;
@@ -2236,6 +2235,15 @@ body,
     minmax(0, 1fr);
 }
 
+.app-shell.app-shell-workspace-closed {
+  grid-template-areas: "nav main";
+  grid-template-columns: 3rem minmax(0, 1fr);
+}
+
+.app-shell.app-shell-workspace-closed .workspace-sidebar {
+  display: none;
+}
+
 .app-shell.app-shell-with-context {
   grid-template-areas: "nav sidebar main diff";
   grid-template-columns:
@@ -2243,6 +2251,11 @@ body,
     var(--sidebar-width, 16.25rem)
     minmax(0, 1fr)
     var(--diff-panel-width, 26.25rem);
+}
+
+.app-shell.app-shell-with-context.app-shell-workspace-closed {
+  grid-template-areas: "nav main diff";
+  grid-template-columns: 3rem minmax(0, 1fr) var(--diff-panel-width, 26.25rem);
 }
 
 .settings-shell {
@@ -2556,6 +2569,10 @@ body,
       "nav diff";
     grid-template-columns: 3rem minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) minmax(14rem, 34dvh);
+  }
+
+  .app-shell.app-shell-workspace-closed .workspace-sidebar {
+    display: block;
   }
 
   .global-shell {
