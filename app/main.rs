@@ -83,12 +83,14 @@ use foco_store::{
     },
     workspace::{
         ChatRecord, CodeChangeStats, ContextCompressionSnapshotRecord, HookRunRecord,
-        LlmRequestAuditFilters, LlmRequestAuditRow, LlmRequestEventRecord, LlmRequestRecord,
-        MessageRecord, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
-        NewMessage, NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall,
-        NewToolResult, PromptContextInjectionRecord, TodoGraphFilter, TodoGraphRecord,
-        TodoGraphTask, ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome,
-        WorkspaceDatabase, initialize_workspace_databases, workspace_database_path,
+        LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
+        LlmRequestAuditRow, LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint,
+        LlmRequestEventRecord, LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot,
+        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewRunEvent,
+        NewTerminalSession, NewToolCall, NewToolResult, PromptContextInjectionRecord,
+        TodoGraphFilter, TodoGraphRecord, TodoGraphTask, ToolCallCountRecord,
+        ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        initialize_workspace_databases, workspace_database_path,
     },
 };
 use foco_tools::{
@@ -4204,7 +4206,11 @@ async fn ai_statistics(
     let filters = normalized_ai_statistics_query(query)?;
     let workspaces = ai_statistics_workspaces(&config, filters.workspace_id.as_deref())?;
     let mut requests = Vec::new();
-    let mut summary = AiStatisticsSummaryAccumulator::default();
+    let mut merged_summary: Option<LlmRequestAuditSummaryRow> = None;
+    let mut merged_trend: BTreeMap<String, LlmRequestAuditTrendPoint> = BTreeMap::new();
+    let mut merged_models: BTreeMap<String, LlmRequestAuditModelBreakdown> = BTreeMap::new();
+    let mut merged_providers: BTreeMap<String, LlmRequestAuditProviderBreakdown> =
+        BTreeMap::new();
     let mut total_count = 0_i64;
     let page_limit = filters
         .offset
@@ -4232,14 +4238,49 @@ async fn ai_statistics(
             .map_err(ApiError::from_workspace_error)?;
         total_count += workspace_count;
         if workspace_count > 0 {
-            let summary_rows = database
-                .llm_request_audit_rows(LlmRequestAuditFilters {
-                    limit: Some(workspace_count),
-                    offset: Some(0),
-                    ..audit_filters
-                })
+            let workspace_summary = database
+                .llm_request_audit_summary(audit_filters)
                 .map_err(ApiError::from_workspace_error)?;
-            summary.add_rows(&summary_rows);
+            merge_llm_request_audit_summary(&mut merged_summary, &workspace_summary);
+            let trend = database
+                .llm_request_audit_trend_breakdown(audit_filters)
+                .map_err(ApiError::from_workspace_error)?;
+            for point in trend {
+                merged_trend
+                    .entry(point.bucket.clone())
+                    .and_modify(|entry| {
+                        entry.request_count += point.request_count;
+                        entry.total_tokens += point.total_tokens;
+                    })
+                    .or_insert(point);
+            }
+            let model_rows = database
+                .llm_request_audit_model_breakdown(audit_filters)
+                .map_err(ApiError::from_workspace_error)?;
+            for row in model_rows {
+                merged_models
+                    .entry(row.model_id.clone())
+                    .and_modify(|entry| {
+                        entry.request_count += row.request_count;
+                        entry.total_tokens += row.total_tokens;
+                    })
+                    .or_insert(row);
+            }
+            let provider_rows = database
+                .llm_request_audit_provider_breakdown(audit_filters)
+                .map_err(ApiError::from_workspace_error)?;
+            for row in provider_rows {
+                merged_providers
+                    .entry(row.provider_id.clone())
+                    .and_modify(|entry| {
+                        entry.request_count += row.request_count;
+                        entry.success_count += row.success_count;
+                        entry.total_tokens += row.total_tokens;
+                        entry.latency_count += row.latency_count;
+                        entry.latency_sum += row.latency_sum;
+                    })
+                    .or_insert(row);
+            }
         }
         let rows = database
             .llm_request_audit_rows(audit_filters)
@@ -4266,11 +4307,18 @@ async fn ai_statistics(
         (total_count + filters.page_size - 1) / filters.page_size
     };
 
+    let summary = ai_statistics_summary_from_aggregates(
+        merged_summary,
+        merged_trend,
+        merged_models,
+        merged_providers,
+    );
+
     Ok(Json(AiStatisticsResponse {
         page: filters.page,
         page_size: filters.page_size,
         requests,
-        summary: summary.finish(),
+        summary,
         total_count,
         total_pages,
     }))
@@ -18457,164 +18505,88 @@ fn chat_title_map(database: &WorkspaceDatabase) -> Result<HashMap<String, String
         .collect())
 }
 
-#[derive(Default)]
-struct AiStatisticsSummaryAccumulator {
-    failed_requests: i64,
-    latency_count: i64,
-    latency_sum: i64,
-    model_breakdown: BTreeMap<String, AiStatisticsBreakdownAccumulator>,
-    provider_breakdown: BTreeMap<String, AiStatisticsProviderAccumulator>,
-    total_cache_read_tokens: i64,
-    total_cache_write_tokens: i64,
-    total_input_tokens: i64,
-    total_output_tokens: i64,
-    total_requests: i64,
-    total_tokens: i64,
-    trend: BTreeMap<String, AiStatisticsBreakdownAccumulator>,
+fn merge_llm_request_audit_summary(
+    target: &mut Option<LlmRequestAuditSummaryRow>,
+    source: &LlmRequestAuditSummaryRow,
+) {
+    let existing = target.get_or_insert_with(LlmRequestAuditSummaryRow::default);
+    existing.total_requests += source.total_requests;
+    existing.failed_requests += source.failed_requests;
+    existing.total_input_tokens += source.total_input_tokens;
+    existing.total_output_tokens += source.total_output_tokens;
+    existing.total_cache_read_tokens += source.total_cache_read_tokens;
+    existing.total_cache_write_tokens += source.total_cache_write_tokens;
+    existing.total_tokens += source.total_tokens;
+    existing.latency_count += source.latency_count;
+    existing.latency_sum += source.latency_sum;
 }
 
-impl AiStatisticsSummaryAccumulator {
-    fn add_rows(&mut self, rows: &[LlmRequestAuditRow]) {
-        for row in rows {
-            self.add_row(row);
-        }
+fn ai_statistics_summary_from_aggregates(
+    merged_summary: Option<LlmRequestAuditSummaryRow>,
+    merged_trend: BTreeMap<String, LlmRequestAuditTrendPoint>,
+    merged_models: BTreeMap<String, LlmRequestAuditModelBreakdown>,
+    merged_providers: BTreeMap<String, LlmRequestAuditProviderBreakdown>,
+) -> AiStatisticsSummary {
+    let summary = merged_summary.unwrap_or_default();
+    let mut model_breakdown: Vec<AiStatisticsModelBreakdown> = merged_models
+        .into_iter()
+        .map(|(model_id, row)| AiStatisticsModelBreakdown {
+            model_id,
+            request_count: row.request_count,
+            total_tokens: row.total_tokens,
+        })
+        .collect();
+    model_breakdown.sort_by(|left, right| {
+        right
+            .total_tokens
+            .cmp(&left.total_tokens)
+            .then_with(|| right.request_count.cmp(&left.request_count))
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+    let mut provider_breakdown: Vec<AiStatisticsProviderBreakdown> = merged_providers
+        .into_iter()
+        .map(|(provider_id, row)| AiStatisticsProviderBreakdown {
+            average_latency_ms: average_i64(row.latency_sum, row.latency_count),
+            failed_count: row.request_count - row.success_count,
+            provider_id,
+            request_count: row.request_count,
+            success_count: row.success_count,
+            success_rate: if row.request_count == 0 {
+                None
+            } else {
+                Some(row.success_count as f64 / row.request_count as f64)
+            },
+            total_tokens: row.total_tokens,
+        })
+        .collect();
+    provider_breakdown.sort_by(|left, right| {
+        right
+            .total_tokens
+            .cmp(&left.total_tokens)
+            .then_with(|| right.request_count.cmp(&left.request_count))
+            .then_with(|| left.provider_id.cmp(&right.provider_id))
+    });
+    let trend: Vec<AiStatisticsTrendPoint> = merged_trend
+        .into_iter()
+        .map(|(bucket, point)| AiStatisticsTrendPoint {
+            bucket,
+            request_count: point.request_count,
+            total_tokens: point.total_tokens,
+        })
+        .collect();
+    AiStatisticsSummary {
+        average_latency_ms: average_i64(summary.latency_sum, summary.latency_count),
+        failed_requests: summary.failed_requests,
+        model_breakdown,
+        provider_breakdown,
+        total_cache_read_tokens: summary.total_cache_read_tokens,
+        total_cache_write_tokens: summary.total_cache_write_tokens,
+        total_input_tokens: summary.total_input_tokens,
+        total_output_tokens: summary.total_output_tokens,
+        total_requests: summary.total_requests,
+        total_tokens: summary.total_tokens,
+        trend,
     }
-
-    fn add_row(&mut self, row: &LlmRequestAuditRow) {
-        let input_tokens = row.input_tokens.unwrap_or(0);
-        let output_tokens = row.output_tokens.unwrap_or(0);
-        let cache_read_tokens = row.cache_read_tokens.unwrap_or(0);
-        let cache_write_tokens = row.cache_write_tokens.unwrap_or(0);
-        let total_tokens = input_tokens + output_tokens;
-        let is_success = ai_request_succeeded(&row.final_state);
-
-        self.total_requests += 1;
-        self.total_input_tokens += input_tokens;
-        self.total_output_tokens += output_tokens;
-        self.total_cache_read_tokens += cache_read_tokens;
-        self.total_cache_write_tokens += cache_write_tokens;
-        self.total_tokens += total_tokens;
-        if !is_success {
-            self.failed_requests += 1;
-        }
-        if let Some(latency) = row.total_latency_ms {
-            self.latency_sum += latency;
-            self.latency_count += 1;
-        }
-
-        let bucket = ai_statistics_trend_bucket(&row.request_started_at);
-        self.trend
-            .entry(bucket)
-            .or_default()
-            .add(total_tokens, is_success, row.total_latency_ms);
-        self.model_breakdown
-            .entry(row.model_id.clone())
-            .or_default()
-            .add(total_tokens, is_success, row.total_latency_ms);
-        self.provider_breakdown
-            .entry(row.provider_id.clone())
-            .or_default()
-            .add(total_tokens, is_success, row.total_latency_ms);
-    }
-
-    fn finish(self) -> AiStatisticsSummary {
-        let mut model_breakdown = self
-            .model_breakdown
-            .into_iter()
-            .map(|(model_id, values)| AiStatisticsModelBreakdown {
-                model_id,
-                request_count: values.request_count,
-                total_tokens: values.total_tokens,
-            })
-            .collect::<Vec<_>>();
-        model_breakdown.sort_by(|left, right| {
-            right
-                .total_tokens
-                .cmp(&left.total_tokens)
-                .then_with(|| right.request_count.cmp(&left.request_count))
-                .then_with(|| left.model_id.cmp(&right.model_id))
-        });
-
-        let mut provider_breakdown = self
-            .provider_breakdown
-            .into_iter()
-            .map(|(provider_id, values)| AiStatisticsProviderBreakdown {
-                average_latency_ms: average_i64(values.latency_sum, values.latency_count),
-                failed_count: values.request_count - values.success_count,
-                provider_id,
-                request_count: values.request_count,
-                success_count: values.success_count,
-                success_rate: if values.request_count == 0 {
-                    None
-                } else {
-                    Some(values.success_count as f64 / values.request_count as f64)
-                },
-                total_tokens: values.total_tokens,
-            })
-            .collect::<Vec<_>>();
-        provider_breakdown.sort_by(|left, right| {
-            right
-                .total_tokens
-                .cmp(&left.total_tokens)
-                .then_with(|| right.request_count.cmp(&left.request_count))
-                .then_with(|| left.provider_id.cmp(&right.provider_id))
-        });
-
-        AiStatisticsSummary {
-            average_latency_ms: average_i64(self.latency_sum, self.latency_count),
-            failed_requests: self.failed_requests,
-            model_breakdown,
-            provider_breakdown,
-            total_cache_read_tokens: self.total_cache_read_tokens,
-            total_cache_write_tokens: self.total_cache_write_tokens,
-            total_input_tokens: self.total_input_tokens,
-            total_output_tokens: self.total_output_tokens,
-            total_requests: self.total_requests,
-            total_tokens: self.total_tokens,
-            trend: self
-                .trend
-                .into_iter()
-                .map(|(bucket, values)| AiStatisticsTrendPoint {
-                    bucket,
-                    request_count: values.request_count,
-                    total_tokens: values.total_tokens,
-                })
-                .collect(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct AiStatisticsBreakdownAccumulator {
-    request_count: i64,
-    success_count: i64,
-    total_tokens: i64,
-    latency_count: i64,
-    latency_sum: i64,
-}
-
-impl AiStatisticsBreakdownAccumulator {
-    fn add(&mut self, total_tokens: i64, is_success: bool, latency_ms: Option<i64>) {
-        self.request_count += 1;
-        self.total_tokens += total_tokens;
-        if is_success {
-            self.success_count += 1;
-        }
-        if let Some(latency) = latency_ms {
-            self.latency_sum += latency;
-            self.latency_count += 1;
-        }
-    }
-}
-
-type AiStatisticsProviderAccumulator = AiStatisticsBreakdownAccumulator;
-
-fn ai_request_succeeded(final_state: &str) -> bool {
-    matches!(final_state, "succeeded" | "completed")
-}
-
-fn ai_statistics_trend_bucket(request_started_at: &str) -> String {
-    request_started_at.chars().take(10).collect()
 }
 
 fn average_i64(sum: i64, count: i64) -> Option<i64> {
@@ -18622,6 +18594,145 @@ fn average_i64(sum: i64, count: i64) -> Option<i64> {
         None
     } else {
         Some((sum as f64 / count as f64).round() as i64)
+    }
+}
+
+fn llm_request_rows_summary(rows: &[LlmRequestAuditRow]) -> AiStatisticsSummary {
+    #[derive(Default)]
+    struct ProviderAccum {
+        request_count: i64,
+        success_count: i64,
+        total_tokens: i64,
+        latency_count: i64,
+        latency_sum: i64,
+    }
+
+    let mut total_requests = 0_i64;
+    let mut failed_requests = 0_i64;
+    let mut total_input_tokens = 0_i64;
+    let mut total_output_tokens = 0_i64;
+    let mut total_cache_read_tokens = 0_i64;
+    let mut total_cache_write_tokens = 0_i64;
+    let mut total_tokens = 0_i64;
+    let mut latency_count = 0_i64;
+    let mut latency_sum = 0_i64;
+    let mut model_acc: BTreeMap<String, (i64, i64)> = BTreeMap::new(); // (request_count, total_tokens)
+    let mut provider_acc: BTreeMap<String, ProviderAccum> = BTreeMap::new();
+    let mut trend_acc: BTreeMap<String, (i64, i64)> = BTreeMap::new(); // (request_count, total_tokens)
+
+    for row in rows {
+        let input = row.input_tokens.unwrap_or(0);
+        let output = row.output_tokens.unwrap_or(0);
+        let cache_read = row.cache_read_tokens.unwrap_or(0);
+        let cache_write = row.cache_write_tokens.unwrap_or(0);
+        let row_tokens = input + output;
+        let is_success = row.final_state == "succeeded" || row.final_state == "completed";
+
+        total_requests += 1;
+        total_input_tokens += input;
+        total_output_tokens += output;
+        total_cache_read_tokens += cache_read;
+        total_cache_write_tokens += cache_write;
+        total_tokens += row_tokens;
+        if !is_success {
+            failed_requests += 1;
+        }
+        if let Some(latency) = row.total_latency_ms {
+            latency_sum += latency;
+            latency_count += 1;
+        }
+
+        let bucket: String = row.request_started_at.chars().take(10).collect();
+        trend_acc
+            .entry(bucket)
+            .and_modify(|entry| {
+                entry.0 += 1;
+                entry.1 += row_tokens;
+            })
+            .or_insert((1, row_tokens));
+
+        model_acc
+            .entry(row.model_id.clone())
+            .and_modify(|entry| {
+                entry.0 += 1;
+                entry.1 += row_tokens;
+            })
+            .or_insert((1, row_tokens));
+
+        let provider = provider_acc.entry(row.provider_id.clone()).or_default();
+        provider.request_count += 1;
+        provider.total_tokens += row_tokens;
+        if is_success {
+            provider.success_count += 1;
+        }
+        if let Some(latency) = row.total_latency_ms {
+            provider.latency_count += 1;
+            provider.latency_sum += latency;
+        }
+    }
+
+    let mut model_list: Vec<AiStatisticsModelBreakdown> = model_acc
+        .into_iter()
+        .map(|(model_id, (request_count, total_tokens))| AiStatisticsModelBreakdown {
+            model_id,
+            request_count,
+            total_tokens,
+        })
+        .collect();
+    model_list.sort_by(|left, right| {
+        right
+            .total_tokens
+            .cmp(&left.total_tokens)
+            .then_with(|| right.request_count.cmp(&left.request_count))
+            .then_with(|| left.model_id.cmp(&right.model_id))
+    });
+
+    let mut provider_list: Vec<AiStatisticsProviderBreakdown> = provider_acc
+        .into_iter()
+        .map(|(provider_id, acc)| AiStatisticsProviderBreakdown {
+            average_latency_ms: average_i64(acc.latency_sum, acc.latency_count),
+            failed_count: acc.request_count - acc.success_count,
+            provider_id,
+            request_count: acc.request_count,
+            success_count: acc.success_count,
+            success_rate: if acc.request_count == 0 {
+                None
+            } else {
+                Some(acc.success_count as f64 / acc.request_count as f64)
+            },
+            total_tokens: acc.total_tokens,
+        })
+        .collect();
+    provider_list.sort_by(|left, right| {
+        right
+            .total_tokens
+            .cmp(&left.total_tokens)
+            .then_with(|| right.request_count.cmp(&left.request_count))
+            .then_with(|| left.provider_id.cmp(&right.provider_id))
+    });
+
+    let mut trend_list: Vec<AiStatisticsTrendPoint> = trend_acc
+        .into_iter()
+        .map(|(bucket, (request_count, total_tokens))| AiStatisticsTrendPoint {
+            bucket,
+            request_count,
+            total_tokens,
+        })
+        .collect();
+    trend_list.sort_by(|left, right| right.bucket.cmp(&left.bucket));
+
+    AiStatisticsSummary {
+        average_latency_ms: average_i64(latency_sum, latency_count),
+        failed_requests,
+        model_breakdown: model_list,
+        provider_breakdown: provider_list,
+        total_cache_read_tokens,
+        total_cache_write_tokens,
+        total_input_tokens,
+        total_output_tokens,
+        total_requests,
+        total_tokens,
+        trend: trend_list,
     }
 }
 
@@ -18744,9 +18855,7 @@ fn chat_statistics_response(
     tool_breakdown: Vec<ChatToolBreakdown>,
     created_memories: i64,
 ) -> Result<ChatStatisticsResponse, ApiError> {
-    let mut ai_summary = AiStatisticsSummaryAccumulator::default();
-    ai_summary.add_rows(&llm_rows);
-    let ai_summary = ai_summary.finish();
+    let ai_summary = llm_request_rows_summary(&llm_rows);
     let total_latency_ms = llm_rows
         .iter()
         .filter_map(|row| row.total_latency_ms)
