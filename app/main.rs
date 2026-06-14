@@ -796,6 +796,7 @@ struct ToolResourceLockRegistryInner {
 #[derive(Clone)]
 struct ActiveToolResourceLock {
     lease_id: u64,
+    workspace_id: String,
     lock: ToolResourceLock,
 }
 
@@ -815,8 +816,9 @@ impl Default for ToolResourceLockRegistryInner {
 }
 
 impl ToolResourceLockRegistry {
-    async fn acquire(&self, locks: Vec<ToolResourceLock>) -> ToolResourceLease {
+    async fn acquire(&self, workspace_id: &str, locks: Vec<ToolResourceLock>) -> ToolResourceLease {
         let locks = normalize_tool_resource_locks(locks);
+        let workspace_id = workspace_id.to_string();
         let lease_id = self.inner.next_lease_id.fetch_add(1, Ordering::Relaxed);
 
         loop {
@@ -826,13 +828,12 @@ impl ToolResourceLockRegistry {
                     .active
                     .lock()
                     .expect("tool resource lock registry mutex poisoned");
-                if !tool_locks_conflict_with_active(&locks, &active) {
-                    active.extend(
-                        locks
-                            .iter()
-                            .cloned()
-                            .map(|lock| ActiveToolResourceLock { lease_id, lock }),
-                    );
+                if !tool_locks_conflict_with_active(&workspace_id, &locks, &active) {
+                    active.extend(locks.iter().cloned().map(|lock| ActiveToolResourceLock {
+                        lease_id,
+                        workspace_id: workspace_id.clone(),
+                        lock,
+                    }));
                     return ToolResourceLease {
                         registry: self.clone(),
                         lease_id,
@@ -909,14 +910,27 @@ fn strongest_tool_resource_access(
 }
 
 fn tool_locks_conflict_with_active(
+    workspace_id: &str,
     pending: &[ToolResourceLock],
     active: &[ActiveToolResourceLock],
 ) -> bool {
     pending.iter().any(|pending_lock| {
-        active
-            .iter()
-            .any(|active_lock| tool_resource_locks_conflict(pending_lock, &active_lock.lock))
+        active.iter().any(|active_lock| {
+            tool_locks_share_scope(workspace_id, pending_lock, active_lock)
+                && tool_resource_locks_conflict(pending_lock, &active_lock.lock)
+        })
     })
+}
+
+fn tool_locks_share_scope(
+    workspace_id: &str,
+    pending: &ToolResourceLock,
+    active: &ActiveToolResourceLock,
+) -> bool {
+    matches!(
+        (&pending.resource, &active.lock.resource),
+        (ToolResource::Memory(_), ToolResource::Memory(_))
+    ) || active.workspace_id == workspace_id
 }
 
 fn tool_resource_sort_key(resource: &ToolResource) -> String {
@@ -12938,6 +12952,20 @@ async fn execute_tool(
         }
     }
 
+    let tool_timeout_ms = match execution_tool_timeout_ms(tool_name, &arguments) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(error) => {
+            return ToolExecutionWithHooks {
+                execution: ToolExecution {
+                    output: json!({ "error": error }),
+                    is_error: true,
+                },
+                hook_summary,
+            };
+        }
+    };
+    let tool_deadline =
+        tool_timeout_ms.map(|timeout_ms| Instant::now() + Duration::from_millis(timeout_ms));
     let resource_lock_request = PendingToolCall {
         id: tool_call_id.to_string(),
         name: tool_name.to_string(),
@@ -12955,7 +12983,28 @@ async fn execute_tool(
             };
         }
     };
-    let _resource_lease = tool_resource_lock_registry.acquire(resource_locks).await;
+    let _resource_lease = match wait_for_tool_resource_lock(
+        &tool_resource_lock_registry,
+        workspace_id,
+        resource_locks,
+        tool_name,
+        tool_timeout_ms,
+        tool_deadline,
+        cancellation_token.clone(),
+    )
+    .await
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            return ToolExecutionWithHooks {
+                execution: ToolExecution {
+                    output: json!({ "error": error }),
+                    is_error: true,
+                },
+                hook_summary,
+            };
+        }
+    };
     if cancellation_token.is_cancelled() {
         return cancelled_tool_execution_with_hooks(hook_summary);
     }
@@ -12986,18 +13035,11 @@ async fn execute_tool(
     }
 
     if is_memory_tool_name(tool_name) {
-        let timeout_ms = match memory_tool_timeout_ms(&arguments) {
-            Ok(timeout_ms) => timeout_ms,
-            Err(error) => {
-                return ToolExecutionWithHooks {
-                    execution: ToolExecution {
-                        output: json!({ "error": error }),
-                        is_error: true,
-                    },
-                    hook_summary,
-                };
-            }
-        };
+        let timeout_ms = tool_timeout_ms.expect("memory tools must use timeoutMs");
+        let remaining_timeout = tool_deadline
+            .and_then(remaining_duration_until)
+            .unwrap_or(Duration::ZERO);
+        set_tool_timeout_ms(&mut arguments, remaining_timeout);
         let tool_name = tool_name.to_string();
         let worker_tool_name = tool_name.clone();
         let worker_cancellation_token = cancellation_token.clone();
@@ -13007,7 +13049,7 @@ async fn execute_tool(
             }
             execute_memory_tool(&memory_tool_context, &worker_tool_name, arguments)
         });
-        let execution = timeout(Duration::from_millis(timeout_ms), worker)
+        let execution = timeout(remaining_timeout, worker)
             .await
             .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
             .and_then(|result| {
@@ -13050,18 +13092,11 @@ async fn execute_tool(
             },
         }
     } else {
-        let timeout_ms = match builtin_tool_timeout_ms(tool_name, &arguments) {
-            Ok(timeout_ms) => timeout_ms,
-            Err(error) => {
-                return ToolExecutionWithHooks {
-                    execution: ToolExecution {
-                        output: json!({ "error": error }),
-                        is_error: true,
-                    },
-                    hook_summary,
-                };
-            }
-        };
+        let timeout_ms = tool_timeout_ms.expect("built-in tools must use timeoutMs");
+        let remaining_timeout = tool_deadline
+            .and_then(remaining_duration_until)
+            .unwrap_or(Duration::ZERO);
+        set_tool_timeout_ms(&mut arguments, remaining_timeout);
         let tool_name = tool_name.to_string();
         let worker = tokio::task::spawn_blocking({
             let workspace_path = workspace_path.to_path_buf();
@@ -13082,7 +13117,7 @@ async fn execute_tool(
             _ = cancellation_token_cancelled(cancellation_token.clone()) => {
                 Err("tool execution cancelled".to_string())
             }
-            execution = wait_for_builtin_tool_worker(worker, &tool_name, timeout_ms) => execution,
+            execution = wait_for_builtin_tool_worker(worker, &tool_name, timeout_ms, remaining_timeout) => execution,
         };
 
         match execution {
@@ -13097,6 +13132,64 @@ async fn execute_tool(
     ToolExecutionWithHooks {
         execution,
         hook_summary,
+    }
+}
+
+fn execution_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<Option<u64>, String> {
+    if tool_name == ASK_QUESTION_TOOL {
+        Ok(None)
+    } else if is_memory_tool_name(tool_name) {
+        memory_tool_timeout_ms(arguments).map(Some)
+    } else if is_mcp_tool_name(tool_name) {
+        Ok(None)
+    } else {
+        builtin_tool_timeout_ms(tool_name, arguments).map(Some)
+    }
+}
+
+async fn wait_for_tool_resource_lock(
+    registry: &ToolResourceLockRegistry,
+    workspace_id: &str,
+    resource_locks: Vec<ToolResourceLock>,
+    tool_name: &str,
+    timeout_ms: Option<u64>,
+    deadline: Option<Instant>,
+    cancellation_token: ToolCancellationToken,
+) -> Result<ToolResourceLease, String> {
+    let acquire = registry.acquire(workspace_id, resource_locks);
+    match (timeout_ms, deadline.and_then(remaining_duration_until)) {
+        (Some(timeout_ms), Some(remaining)) => {
+            tokio::select! {
+                _ = cancellation_token_cancelled(cancellation_token) => {
+                    Err("tool execution cancelled".to_string())
+                }
+                lease = timeout(remaining, acquire) => {
+                    lease.map_err(|_| format!("tool '{tool_name}' timed out waiting for resource lock after {timeout_ms} ms"))
+                }
+            }
+        }
+        (Some(timeout_ms), None) => Err(format!(
+            "tool '{tool_name}' timed out waiting for resource lock after {timeout_ms} ms"
+        )),
+        (None, _) => {
+            tokio::select! {
+                _ = cancellation_token_cancelled(cancellation_token) => {
+                    Err("tool execution cancelled".to_string())
+                }
+                lease = acquire => Ok(lease),
+            }
+        }
+    }
+}
+
+fn remaining_duration_until(deadline: Instant) -> Option<Duration> {
+    deadline.checked_duration_since(Instant::now())
+}
+
+fn set_tool_timeout_ms(arguments: &mut Value, timeout: Duration) {
+    if let Value::Object(map) = arguments {
+        let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        map.insert("timeoutMs".to_string(), json!(timeout_ms));
     }
 }
 
@@ -13127,13 +13220,17 @@ async fn wait_for_builtin_tool_worker(
     worker: tokio::task::JoinHandle<ToolExecution>,
     tool_name: &str,
     timeout_ms: u64,
+    remaining_timeout: Duration,
 ) -> Result<ToolExecution, String> {
     if matches!(tool_name, RUN_COMMAND_TOOL | SEARCH_TEXT_TOOL | SLEEP_TOOL) {
-        worker
+        timeout(remaining_timeout, worker)
             .await
-            .map_err(|source| format!("tool execution worker failed: {source}"))
+            .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
+            .and_then(|result| {
+                result.map_err(|source| format!("tool execution worker failed: {source}"))
+            })
     } else {
-        timeout(Duration::from_millis(timeout_ms), worker)
+        timeout(remaining_timeout, worker)
             .await
             .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
             .and_then(|result| {
@@ -19302,18 +19399,24 @@ mod tests {
     async fn tool_resource_registry_blocks_same_file_read_write() {
         let registry = ToolResourceLockRegistry::default();
         let read_lease = registry
-            .acquire(vec![test_file_resource_lock(
-                "src/main.rs",
-                ToolResourceAccess::Read,
-            )])
+            .acquire(
+                "workspace-1",
+                vec![test_file_resource_lock(
+                    "src/main.rs",
+                    ToolResourceAccess::Read,
+                )],
+            )
             .await;
         let waiting_registry = registry.clone();
         let waiter = tokio::spawn(async move {
             let _write_lease = waiting_registry
-                .acquire(vec![test_file_resource_lock(
-                    "src/main.rs",
-                    ToolResourceAccess::Write,
-                )])
+                .acquire(
+                    "workspace-1",
+                    vec![test_file_resource_lock(
+                        "src/main.rs",
+                        ToolResourceAccess::Write,
+                    )],
+                )
                 .await;
         });
 
@@ -19331,18 +19434,24 @@ mod tests {
     async fn tool_resource_registry_allows_different_file_writes() {
         let registry = ToolResourceLockRegistry::default();
         let _first_lease = registry
-            .acquire(vec![test_file_resource_lock(
-                "src/a.rs",
-                ToolResourceAccess::Write,
-            )])
+            .acquire(
+                "workspace-1",
+                vec![test_file_resource_lock(
+                    "src/a.rs",
+                    ToolResourceAccess::Write,
+                )],
+            )
             .await;
 
         let _second_lease = tokio::time::timeout(
             Duration::from_secs(1),
-            registry.acquire(vec![test_file_resource_lock(
-                "src/b.rs",
-                ToolResourceAccess::Write,
-            )]),
+            registry.acquire(
+                "workspace-1",
+                vec![test_file_resource_lock(
+                    "src/b.rs",
+                    ToolResourceAccess::Write,
+                )],
+            ),
         )
         .await
         .expect("different file writes should not block each other");
@@ -19352,18 +19461,24 @@ mod tests {
     async fn tool_resource_registry_workspace_exclusive_blocks_file_access() {
         let registry = ToolResourceLockRegistry::default();
         let workspace_lease = registry
-            .acquire(vec![ToolResourceLock {
-                resource: ToolResource::WorkspaceFiles,
-                access: ToolResourceAccess::Exclusive,
-            }])
+            .acquire(
+                "workspace-1",
+                vec![ToolResourceLock {
+                    resource: ToolResource::WorkspaceFiles,
+                    access: ToolResourceAccess::Exclusive,
+                }],
+            )
             .await;
         let waiting_registry = registry.clone();
         let waiter = tokio::spawn(async move {
             let _read_lease = waiting_registry
-                .acquire(vec![test_file_resource_lock(
-                    "src/main.rs",
-                    ToolResourceAccess::Read,
-                )])
+                .acquire(
+                    "workspace-1",
+                    vec![test_file_resource_lock(
+                        "src/main.rs",
+                        ToolResourceAccess::Read,
+                    )],
+                )
                 .await;
         });
 
@@ -19375,6 +19490,169 @@ mod tests {
             .await
             .expect("workspace exclusive lock should be released")
             .expect("file read waiter should not panic");
+    }
+
+    #[tokio::test]
+    async fn tool_resource_registry_scopes_workspace_exclusive_by_workspace() {
+        let registry = ToolResourceLockRegistry::default();
+        let _workspace_lease = registry
+            .acquire(
+                "workspace-1",
+                vec![ToolResourceLock {
+                    resource: ToolResource::WorkspaceFiles,
+                    access: ToolResourceAccess::Exclusive,
+                }],
+            )
+            .await;
+
+        let _read_lease = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.acquire(
+                "workspace-2",
+                vec![test_file_resource_lock(
+                    "src/main.rs",
+                    ToolResourceAccess::Read,
+                )],
+            ),
+        )
+        .await
+        .expect("different workspace file read should not wait on workspace-1 command");
+    }
+
+    #[tokio::test]
+    async fn tool_resource_registry_keeps_memory_locks_global() {
+        let registry = ToolResourceLockRegistry::default();
+        let memory_lease = registry
+            .acquire(
+                "workspace-1",
+                vec![ToolResourceLock {
+                    resource: ToolResource::Memory("global".to_string()),
+                    access: ToolResourceAccess::Write,
+                }],
+            )
+            .await;
+        let waiting_registry = registry.clone();
+        let waiter = tokio::spawn(async move {
+            let _read_lease = waiting_registry
+                .acquire(
+                    "workspace-2",
+                    vec![ToolResourceLock {
+                        resource: ToolResource::Memory("global".to_string()),
+                        access: ToolResourceAccess::Read,
+                    }],
+                )
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(memory_lease);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("global memory write lock should be released")
+            .expect("global memory read waiter should not panic");
+    }
+
+    #[tokio::test]
+    async fn tool_resource_lock_wait_respects_tool_timeout() {
+        let registry = ToolResourceLockRegistry::default();
+        let _workspace_lease = registry
+            .acquire(
+                "workspace-1",
+                vec![ToolResourceLock {
+                    resource: ToolResource::WorkspaceFiles,
+                    access: ToolResourceAccess::Exclusive,
+                }],
+            )
+            .await;
+        let started = Instant::now();
+        let result = wait_for_tool_resource_lock(
+            &registry,
+            "workspace-1",
+            vec![test_file_resource_lock(
+                "src/main.rs",
+                ToolResourceAccess::Read,
+            )],
+            "read_file",
+            Some(10),
+            Some(started + Duration::from_millis(10)),
+            ToolCancellationToken::new(),
+        )
+        .await;
+
+        let error = match result {
+            Ok(_) => panic!("lock wait should time out"),
+            Err(error) => error,
+        };
+        assert!(error.contains("timed out waiting for resource lock"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "hello").expect("write note");
+        let registry = ToolResourceLockRegistry::default();
+        let _workspace_lease = registry
+            .acquire(
+                "workspace-1",
+                vec![ToolResourceLock {
+                    resource: ToolResource::WorkspaceFiles,
+                    access: ToolResourceAccess::Exclusive,
+                }],
+            )
+            .await;
+        let mcp_registry = Arc::new(McpRegistry::default());
+
+        let outcome = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry),
+            &HookConfig::default(),
+            &ProviderConnectionConfig {
+                kind: foco_providers::ProviderKind::OpenAiResponses,
+                base_url: None,
+                api_key: Some("test-key".to_string()),
+                proxy_url: None,
+            },
+            QuestionRegistry::default(),
+            mpsc::unbounded_channel().0,
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: "chat-1".to_string(),
+                run_id: "run-1".to_string(),
+                tool_call_id: "call-1".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            registry,
+            ToolCancellationToken::new(),
+            "workspace-1",
+            workspace.path(),
+            "chat-1",
+            "run-1",
+            "model-1",
+            "provider-1",
+            "call-1",
+            "read_file",
+            json!({
+                "path": "note.txt",
+                "startLine": null,
+                "endLine": null,
+                "timeoutMs": 10
+            }),
+        )
+        .await;
+
+        assert!(outcome.execution.is_error);
+        assert!(
+            outcome.execution.output["error"]
+                .as_str()
+                .expect("error")
+                .contains("timed out waiting for resource lock")
+        );
     }
 
     fn captured_test_llm_request(

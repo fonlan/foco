@@ -6,6 +6,7 @@ use std::{
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -2079,6 +2080,8 @@ fn run_command_with_timeout(
     let stdout_handle = read_command_pipe(stdout);
     let stderr_handle = read_command_pipe(stderr);
     let started = Instant::now();
+    let deadline = started + timeout;
+    let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
 
     loop {
         if cancellation_token
@@ -2087,8 +2090,6 @@ fn run_command_with_timeout(
         {
             let _ = child.kill();
             let _ = child.wait();
-            drop(stdout_handle);
-            drop(stderr_handle);
 
             return Err(ToolRuntimeError::CommandCancelled {
                 command: command_label,
@@ -2103,20 +2104,33 @@ fn run_command_with_timeout(
                 source,
             })?
         {
+            let stdout = receive_command_pipe(
+                &command_label,
+                stdout_handle,
+                deadline,
+                timeout_ms,
+                pid,
+                cancellation_token,
+            )?;
+            let stderr = receive_command_pipe(
+                &command_label,
+                stderr_handle,
+                deadline,
+                timeout_ms,
+                pid,
+                cancellation_token,
+            )?;
             return Ok(CommandRunOutput {
                 pid,
                 status,
-                stdout: join_command_reader(&command_label, stdout_handle)?,
-                stderr: join_command_reader(&command_label, stderr_handle)?,
+                stdout,
+                stderr,
             });
         }
 
-        if started.elapsed() >= timeout {
+        if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            drop(stdout_handle);
-            drop(stderr_handle);
-            let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
 
             return Err(ToolRuntimeError::CommandTimedOut {
                 command: command_label,
@@ -2125,7 +2139,11 @@ fn run_command_with_timeout(
             });
         }
 
-        thread::sleep(Duration::from_millis(COMMAND_WAIT_POLL_MS));
+        thread::sleep(
+            remaining_until(deadline)
+                .unwrap_or(Duration::ZERO)
+                .min(Duration::from_millis(COMMAND_WAIT_POLL_MS)),
+        );
     }
 }
 
@@ -2136,32 +2154,66 @@ struct CommandRunOutput {
     stderr: Vec<u8>,
 }
 
-fn read_command_pipe<T>(mut pipe: T) -> thread::JoinHandle<io::Result<Vec<u8>>>
+fn read_command_pipe<T>(mut pipe: T) -> mpsc::Receiver<io::Result<Vec<u8>>>
 where
     T: Read + Send + 'static,
 {
+    let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut output = Vec::new();
-        pipe.read_to_end(&mut output)?;
-        Ok(output)
-    })
+        let result = pipe.read_to_end(&mut output).map(|_| output);
+        let _ = tx.send(result);
+    });
+    rx
 }
 
-fn join_command_reader(
+fn receive_command_pipe(
     command: &str,
-    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+    receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
+    deadline: Instant,
+    timeout_ms: u64,
+    pid: u32,
+    cancellation_token: Option<&ToolCancellationToken>,
 ) -> Result<Vec<u8>, ToolRuntimeError> {
-    match handle.join() {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(source)) => Err(ToolRuntimeError::Command {
-            command: command.to_string(),
-            source,
-        }),
-        Err(_) => Err(ToolRuntimeError::Command {
-            command: command.to_string(),
-            source: io::Error::other("output reader thread panicked"),
-        }),
+    loop {
+        if cancellation_token
+            .map(ToolCancellationToken::is_cancelled)
+            .unwrap_or(false)
+        {
+            return Err(ToolRuntimeError::CommandCancelled {
+                command: command.to_string(),
+                pid,
+            });
+        }
+
+        let Some(remaining) = remaining_until(deadline) else {
+            return Err(ToolRuntimeError::CommandTimedOut {
+                command: command.to_string(),
+                pid,
+                timeout_ms,
+            });
+        };
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(COMMAND_WAIT_POLL_MS))) {
+            Ok(Ok(output)) => return Ok(output),
+            Ok(Err(source)) => {
+                return Err(ToolRuntimeError::Command {
+                    command: command.to_string(),
+                    source,
+                });
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(ToolRuntimeError::Command {
+                    command: command.to_string(),
+                    source: io::Error::other("output reader thread exited without result"),
+                });
+            }
+        }
     }
+}
+
+fn remaining_until(deadline: Instant) -> Option<Duration> {
+    deadline.checked_duration_since(Instant::now())
 }
 
 fn command_label(command: &str, args: &[String]) -> String {
@@ -4041,8 +4093,58 @@ mod tests {
     }
 
     #[test]
+    fn run_command_times_out_when_grandchild_keeps_stdout_open() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .to_string();
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": command,
+                "args": ["--ignored", "--exact", "tests::pipe_holder_parent_process"],
+                "cwd": null,
+                "timeoutMs": 100
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result.output["pid"].as_u64().expect("timeout pid") > 0,
+            "timed out run_command should include the spawned process pid"
+        );
+        assert!(
+            result
+                .output
+                .get("error")
+                .and_then(Value::as_str)
+                .expect("error")
+                .contains("timed out")
+        );
+    }
+
+    #[test]
     #[ignore]
     fn timeout_child_process() {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    #[ignore]
+    fn pipe_holder_parent_process() {
+        let command = std::env::current_exe().expect("current test executable");
+        let _child = Command::new(command)
+            .args(["--ignored", "--exact", "tests::pipe_holder_child_process"])
+            .spawn()
+            .expect("spawn pipe holder child");
+    }
+
+    #[test]
+    #[ignore]
+    fn pipe_holder_child_process() {
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
