@@ -1509,6 +1509,52 @@ describe("App verification surfaces", () => {
       },
     });
 
+    const usageCallCountBeforeComplete = usageCallsAfterUsage.length;
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 9000,
+          providerId: "provider-1",
+          totalLatencyMs: 1000,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "Final answer.",
+        type: "complete",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 999999,
+          outputTokens: 9000,
+        },
+      });
+    });
+
+    await waitFor(() => {
+      const usageCallsAfterComplete = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/context-usage",
+      );
+      expect(usageCallsAfterComplete.length).toBeGreaterThan(
+        usageCallCountBeforeComplete,
+      );
+      const [, completeUsageInit] = usageCallsAfterComplete.at(-1)!;
+      expect(typeof completeUsageInit?.body).toBe("string");
+      expect(JSON.parse(completeUsageInit?.body as string)).toMatchObject({
+        assistantDraft: null,
+        assistantDraftReasoning: null,
+        chatId: "chat-1",
+        draftMessage: null,
+        latestResponseUsage: null,
+      });
+    });
+
     await act(async () => {
       activeChatStreamController?.close();
     });
@@ -3039,6 +3085,52 @@ describe("App verification surfaces", () => {
         inputTokens: 70000,
         outputTokens: 1000,
       },
+    });
+
+    const usageCallCountBeforeComplete = usageCalls.length;
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 9000,
+          providerId: "provider-1",
+          totalLatencyMs: 1000,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "Final answer.",
+        type: "complete",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 999999,
+          outputTokens: 9000,
+        },
+      });
+    });
+
+    await waitFor(() => {
+      const usageCallsAfterComplete = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/context-usage",
+      );
+      expect(usageCallsAfterComplete.length).toBeGreaterThan(
+        usageCallCountBeforeComplete,
+      );
+      const [, completeUsageInit] = usageCallsAfterComplete.at(-1)!;
+      expect(typeof completeUsageInit?.body).toBe("string");
+      expect(JSON.parse(completeUsageInit?.body as string)).toMatchObject({
+        assistantDraft: null,
+        assistantDraftReasoning: null,
+        chatId: "chat-1",
+        draftMessage: null,
+        latestResponseUsage: null,
+      });
     });
 
     await act(async () => {

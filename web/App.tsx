@@ -954,6 +954,13 @@ type ChatCompressionStatistics = {
   savedTokenCount: number;
 };
 
+type LiveChatStatistics = {
+  usage: ChatUsage | null;
+  modelId: string;
+  providerId: string;
+  startedAtMs: number;
+};
+
 type ChatReplyMetrics = {
   modelId: string;
   providerId: string;
@@ -2104,6 +2111,9 @@ export function App() {
   const [chatStatisticsError, setChatStatisticsError] = useState<string | null>(
     null,
   );
+  const [liveChatStatisticsByKey, setLiveChatStatisticsByKey] = useState<
+    Record<string, LiveChatStatistics>
+  >({});
   const [contextMemories, setContextMemories] = useState<ContextMemoryState>({
     global: [],
     workspace: [],
@@ -2202,6 +2212,18 @@ export function App() {
   const contextUsage = activeContextUsageKey
     ? contextUsageByChatKey[activeContextUsageKey] ?? null
     : null;
+  const liveChatStatistics = activeChatKey
+    ? liveChatStatisticsByKey[activeChatKey] ?? null
+    : null;
+  const displayedChatStatistics = liveChatStatistics
+    ? withLiveChatStatistics(
+        chatStatistics,
+        liveChatStatistics,
+        messages,
+        activeWorkspaceId,
+        activeChatId,
+      )
+    : chatStatistics;
   const isLoadingContextUsage = activeContextUsageKey
     ? contextUsageLoadingByChatKey[activeContextUsageKey] ?? false
     : false;
@@ -2619,6 +2641,9 @@ export function App() {
         );
         if (activeChatKeyRef.current === requestedChatKey) {
           setChatStatistics(data);
+          if (!runningChatKeysRef.current.has(requestedChatKey)) {
+            clearLiveChatStatistics(requestedChatKey);
+          }
         }
       } catch (requestError) {
         if (activeChatKeyRef.current === requestedChatKey) {
@@ -2718,8 +2743,12 @@ export function App() {
       return;
     }
 
+    const requestedChatKey = chatRunKey(activeWorkspace.id, activeChatId);
     setChatStatistics(null);
     setChatStatisticsError(null);
+    if (!runningChatKeysRef.current.has(requestedChatKey)) {
+      clearLiveChatStatistics(requestedChatKey);
+    }
     void loadChatStatistics(activeWorkspace.id, activeChatId);
   }, [activeChatId, activeWorkspace?.id, loadChatStatistics]);
 
@@ -3216,6 +3245,32 @@ export function App() {
       }
       return next;
     });
+  }
+
+  function clearLiveChatStatistics(chatKey: string) {
+    setLiveChatStatisticsByKey((current) => {
+      if (!(chatKey in current)) {
+        return current;
+      }
+
+      const { [chatKey]: _removed, ...next } = current;
+      return next;
+    });
+  }
+
+  function updateLiveChatStatistics(
+    chatKey: string,
+    updater: LiveChatStatistics | null,
+  ) {
+    if (updater === null) {
+      clearLiveChatStatistics(chatKey);
+      return;
+    }
+
+    setLiveChatStatisticsByKey((current) => ({
+      ...current,
+      [chatKey]: updater,
+    }));
   }
 
   function setChatRunning(chatKey: string, running: boolean) {
@@ -4541,6 +4596,7 @@ export function App() {
     let assistantDraft = "";
     let assistantDraftReasoning = "";
     let latestResponseUsage: ChatUsage | null = null;
+    let liveStartedAtMs = Date.now();
     let hasGuidanceTurns = false;
     let streamHadError = false;
     const refreshRunContextUsage = () => {
@@ -4641,6 +4697,13 @@ export function App() {
             runId: streamEvent.llmRequestId ?? activeRun.runId,
             workspaceId: activeRun.workspaceId,
           });
+          liveStartedAtMs = Date.now();
+          updateLiveChatStatistics(chatKey, {
+            modelId: selectedModelIdRef.current,
+            providerId: selectedProviderIdRef.current,
+            startedAtMs: liveStartedAtMs,
+            usage: null,
+          });
           return;
         }
 
@@ -4691,6 +4754,12 @@ export function App() {
             streamEvent.usage.outputTokens !== null
               ? streamEvent.usage
               : null;
+          updateLiveChatStatistics(chatKey, {
+            modelId: selectedModelIdRef.current,
+            providerId: selectedProviderIdRef.current,
+            startedAtMs: liveStartedAtMs,
+            usage: latestResponseUsage,
+          });
           refreshRunContextUsage();
           return;
         }
@@ -4710,8 +4779,16 @@ export function App() {
         }
 
         if (streamEvent.type === "complete") {
+          const liveStatisticsUsage = streamEvent.usage ?? latestResponseUsage;
+          updateLiveChatStatistics(chatKey, {
+            modelId: streamEvent.metrics.modelId,
+            providerId: streamEvent.metrics.providerId,
+            startedAtMs: liveStartedAtMs,
+            usage: liveStatisticsUsage,
+          });
           assistantDraft = "";
           assistantDraftReasoning = "";
+          latestResponseUsage = null;
           refreshRunContextUsage();
           void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           setChatRunFailed(chatKey, false);
@@ -4866,6 +4943,7 @@ export function App() {
       }
       setChatRunning(chatKey, false);
       setActiveRunInfoForChatKey(chatKey, null);
+      clearLiveChatStatistics(chatKey);
       if (!streamHadError) {
         setPendingQuestion(null);
         setQuestionError(null);
@@ -4901,6 +4979,7 @@ export function App() {
     let assistantDraft = "";
     let assistantDraftReasoning = "";
     let latestResponseUsage: ChatUsage | null = null;
+    let liveStartedAtMs = Date.now();
     let runSucceeded = false;
     let streamHadError = false;
     let hasGuidanceTurns = false;
@@ -5124,6 +5203,13 @@ export function App() {
             runId: streamEvent.llmRequestId ?? null,
             workspaceId: request.workspaceId,
           });
+          liveStartedAtMs = Date.now();
+          updateLiveChatStatistics(currentRunningChatKey, {
+            modelId: request.modelId,
+            providerId: request.providerId,
+            startedAtMs: liveStartedAtMs,
+            usage: null,
+          });
           const shouldActivateStartedChat =
             activeChatKeyRef.current === currentRunningChatKey ||
             activeChatKeyRef.current === request.localChatKey ||
@@ -5188,6 +5274,12 @@ export function App() {
             streamEvent.usage.outputTokens !== null
               ? streamEvent.usage
               : null;
+          updateLiveChatStatistics(runMessagesKey, {
+            modelId: request.modelId,
+            providerId: request.providerId,
+            startedAtMs: liveStartedAtMs,
+            usage: latestResponseUsage,
+          });
           refreshRunContextUsage();
           return;
         }
@@ -5207,8 +5299,16 @@ export function App() {
         }
 
         if (streamEvent.type === "complete") {
+          const liveStatisticsUsage = streamEvent.usage ?? latestResponseUsage;
+          updateLiveChatStatistics(runMessagesKey, {
+            modelId: streamEvent.metrics.modelId,
+            providerId: streamEvent.metrics.providerId,
+            startedAtMs: liveStartedAtMs,
+            usage: liveStatisticsUsage,
+          });
           assistantDraft = "";
           assistantDraftReasoning = "";
+          latestResponseUsage = null;
           refreshRunContextUsage();
           if (requestChatId) {
             void loadChatStatistics(request.workspaceId, requestChatId);
@@ -5392,6 +5492,7 @@ export function App() {
       }
       setChatRunning(currentRunningChatKey, false);
       setActiveRunInfoForChatKey(currentRunningChatKey, null);
+      clearLiveChatStatistics(currentRunningChatKey);
     }
 
     if (runSucceeded) {
@@ -6120,7 +6221,7 @@ export function App() {
             />
             <ContextPanel
               activeTab={contextPanelTab}
-              chatStatistics={chatStatistics}
+              chatStatistics={displayedChatStatistics}
               chatStatisticsError={chatStatisticsError}
               contextMemories={contextMemories}
               deletingContextMemoryId={deletingContextMemoryId}
@@ -20115,6 +20216,227 @@ function emptyAiStatisticsSummary(): AiStatisticsSummary {
     totalTokens: 0,
     trend: [],
   };
+}
+
+function withLiveChatStatistics(
+  statistics: ChatStatisticsResponse | null,
+  live: LiveChatStatistics,
+  messages: ShellMessage[],
+  workspaceId: string,
+  chatId: string | null,
+): ChatStatisticsResponse | null {
+  if (!chatId) {
+    return statistics;
+  }
+
+  const inputTokens = live.usage?.inputTokens ?? 0;
+  const outputTokens = live.usage?.outputTokens ?? 0;
+  const cacheReadTokens = live.usage?.cacheReadTokens ?? 0;
+  const cacheWriteTokens = live.usage?.cacheWriteTokens ?? 0;
+  const totalTokens = inputTokens + outputTokens;
+  const liveLatencyMs = Math.max(0, Date.now() - live.startedAtMs);
+  const base =
+    statistics ?? emptyChatStatistics(workspaceId, chatId, emptyAiStatisticsSummary());
+  const totalRequests = base.totalRequests + 1;
+  const totalLatencyMs = base.totalLatencyMs + liveLatencyMs;
+  const messageCount = messages.length || base.messageCount;
+  const userMessageCount = countMessagesByRole(messages, "user") || base.userMessageCount;
+  const assistantMessageCount =
+    countMessagesByRole(messages, "assistant") || base.assistantMessageCount;
+  const toolMessageCount = countMessagesByRole(messages, "tool") || base.toolMessageCount;
+
+  return {
+    ...base,
+    assistantMessageCount,
+    averageLatencyMs: Math.round(totalLatencyMs / totalRequests),
+    messageCount,
+    modelBreakdown: addLiveModelBreakdown(
+      base.modelBreakdown,
+      live.modelId,
+      totalTokens,
+    ),
+    providerBreakdown: addLiveProviderBreakdown(
+      base.providerBreakdown,
+      live.providerId,
+      totalTokens,
+      liveLatencyMs,
+    ),
+    toolBreakdown: liveToolBreakdown(messages) ?? base.toolBreakdown,
+    toolMessageCount,
+    totalCacheReadTokens: base.totalCacheReadTokens + cacheReadTokens,
+    totalCacheWriteTokens: base.totalCacheWriteTokens + cacheWriteTokens,
+    totalInputTokens: base.totalInputTokens + inputTokens,
+    totalLatencyMs,
+    totalOutputTokens: base.totalOutputTokens + outputTokens,
+    totalRequests,
+    totalTokens: base.totalTokens + totalTokens,
+    userMessageCount,
+  };
+}
+
+function emptyChatStatistics(
+  workspaceId: string,
+  chatId: string,
+  summary: AiStatisticsSummary,
+): ChatStatisticsResponse {
+  return {
+    workspaceId,
+    chatId,
+    messageCount: 0,
+    userMessageCount: 0,
+    assistantMessageCount: 0,
+    toolMessageCount: 0,
+    totalRequests: summary.totalRequests,
+    failedRequests: summary.failedRequests,
+    totalInputTokens: summary.totalInputTokens,
+    totalOutputTokens: summary.totalOutputTokens,
+    totalCacheReadTokens: summary.totalCacheReadTokens,
+    totalCacheWriteTokens: summary.totalCacheWriteTokens,
+    totalTokens: summary.totalTokens,
+    totalLatencyMs: 0,
+    averageLatencyMs: summary.averageLatencyMs,
+    memoryReferences: 0,
+    createdMemories: 0,
+    codeChangeStats: { additions: 0, deletions: 0 },
+    modelBreakdown: summary.modelBreakdown,
+    providerBreakdown: summary.providerBreakdown,
+    toolBreakdown: [],
+    compression: {
+      snapshotCount: 0,
+      originalTokenCount: 0,
+      summaryTokenCount: 0,
+      savedTokenCount: 0,
+    },
+  };
+}
+
+function countMessagesByRole(messages: ShellMessage[], role: string) {
+  return messages.filter((message) => message.role === role).length;
+}
+
+function addLiveModelBreakdown(
+  breakdown: AiStatisticsModelBreakdown[],
+  modelId: string,
+  totalTokens: number,
+) {
+  return sortedModelBreakdown(
+    upsertBreakdown(
+      breakdown,
+      modelId,
+      (item) => item.modelId,
+      (item) => ({
+        ...item,
+        requestCount: item.requestCount + 1,
+        totalTokens: item.totalTokens + totalTokens,
+      }),
+      (id) => ({ modelId: id, requestCount: 1, totalTokens }),
+    ),
+  );
+}
+
+function addLiveProviderBreakdown(
+  breakdown: AiStatisticsProviderBreakdown[],
+  providerId: string,
+  totalTokens: number,
+  latencyMs: number,
+) {
+  return sortedProviderBreakdown(
+    upsertBreakdown(
+      breakdown,
+      providerId,
+      (item) => item.providerId,
+      (item) => {
+        const requestCount = item.requestCount + 1;
+        const successCount = item.successCount + 1;
+        const previousLatencyTotal =
+          item.averageLatencyMs === null
+            ? 0
+            : item.averageLatencyMs * item.requestCount;
+
+        return {
+          ...item,
+          averageLatencyMs: Math.round(
+            (previousLatencyTotal + latencyMs) / requestCount,
+          ),
+          requestCount,
+          successCount,
+          successRate: successCount / requestCount,
+          totalTokens: item.totalTokens + totalTokens,
+        };
+      },
+      (id) => ({
+        averageLatencyMs: latencyMs,
+        failedCount: 0,
+        providerId: id,
+        requestCount: 1,
+        successCount: 1,
+        successRate: 1,
+        totalTokens,
+      }),
+    ),
+  );
+}
+
+function upsertBreakdown<T>(
+  breakdown: T[],
+  id: string,
+  getId: (item: T) => string,
+  update: (item: T) => T,
+  create: (id: string) => T,
+) {
+  if (!id) {
+    return breakdown;
+  }
+
+  let found = false;
+  const next = breakdown.map((item) => {
+    if (getId(item) !== id) {
+      return item;
+    }
+
+    found = true;
+    return update(item);
+  });
+
+  return found ? next : [...next, create(id)];
+}
+
+function sortedModelBreakdown(breakdown: AiStatisticsModelBreakdown[]) {
+  return [...breakdown].sort(
+    (left, right) =>
+      right.totalTokens - left.totalTokens ||
+      right.requestCount - left.requestCount ||
+      left.modelId.localeCompare(right.modelId),
+  );
+}
+
+function sortedProviderBreakdown(breakdown: AiStatisticsProviderBreakdown[]) {
+  return [...breakdown].sort(
+    (left, right) =>
+      right.totalTokens - left.totalTokens ||
+      right.requestCount - left.requestCount ||
+      left.providerId.localeCompare(right.providerId),
+  );
+}
+
+function liveToolBreakdown(messages: ShellMessage[]) {
+  const counts = new Map<string, number>();
+  for (const message of messages) {
+    for (const toolCall of message.toolCalls) {
+      counts.set(toolCall.name, (counts.get(toolCall.name) ?? 0) + 1);
+    }
+  }
+
+  if (counts.size === 0) {
+    return null;
+  }
+
+  return [...counts]
+    .map(([toolName, callCount]) => ({ toolName, callCount }))
+    .sort(
+      (left, right) =>
+        right.callCount - left.callCount || left.toolName.localeCompare(right.toolName),
+    );
 }
 
 function aiOverviewQuery(filters: {
