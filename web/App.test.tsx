@@ -1467,12 +1467,14 @@ describe("App verification surfaces", () => {
     const [, init] = usageCalls.at(-1)!;
     expect(typeof init?.body).toBe("string");
     expect(JSON.parse(init?.body as string)).toMatchObject({
-      assistantDraft: "Partial answer.",
       assistantDraftReasoning: null,
       chatId: "chat-1",
       draftMessage: null,
       latestResponseUsage: null,
     });
+    expect(JSON.parse(init?.body as string).assistantDraft).not.toBe(
+      "Partial answer.",
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -1554,6 +1556,121 @@ describe("App verification surfaces", () => {
         latestResponseUsage: null,
       });
     });
+
+    await act(async () => {
+      activeChatStreamController?.close();
+    });
+  });
+
+  it("coalesces streaming draft context usage refreshes", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(
+      await screen.findByRole("status", { name: "Context usage 47%" }),
+    ).toHaveTextContent("47%");
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    const usageCallCountBeforeDeltas = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    ).length;
+
+    const originalSetTimeout = window.setTimeout.bind(window);
+    const originalClearTimeout = window.clearTimeout.bind(window);
+    let scheduledRefresh: (() => void) | null = null;
+    type WindowSetTimeout = typeof window.setTimeout;
+    type WindowSetTimeoutReturn = ReturnType<WindowSetTimeout>;
+    const scheduledRefreshTimeoutHandle =
+      Symbol("context-usage-refresh") as unknown as WindowSetTimeoutReturn;
+    let scheduledRefreshTimeout: WindowSetTimeoutReturn | null = null;
+    let scheduledRefreshCount = 0;
+    let cancelledScheduledRefreshCount = 0;
+    const setTimeoutSpy = vi
+      .spyOn(window, "setTimeout")
+      .mockImplementation((
+        handler: Parameters<WindowSetTimeout>[0],
+        timeout?: Parameters<WindowSetTimeout>[1],
+        ...args: unknown[]
+      ): WindowSetTimeoutReturn => {
+        if (timeout === 1200 && typeof handler === "function") {
+          scheduledRefreshCount += 1;
+          scheduledRefresh = () => handler(...args);
+          scheduledRefreshTimeout = scheduledRefreshTimeoutHandle;
+          return scheduledRefreshTimeoutHandle;
+        }
+
+        return originalSetTimeout(
+          handler as (...handlerArgs: unknown[]) => void,
+          timeout,
+          ...args,
+        ) as unknown as WindowSetTimeoutReturn;
+      });
+    const clearTimeoutSpy = vi
+      .spyOn(window, "clearTimeout")
+      .mockImplementation((timeoutId) => {
+        if (timeoutId === scheduledRefreshTimeout) {
+          cancelledScheduledRefreshCount += 1;
+        } else {
+          originalClearTimeout(timeoutId);
+        }
+      });
+    try {
+      await act(async () => {
+        enqueueChatStreamEvent({
+          assistantMessageId: "message-assistant-stream",
+          delta: "Part one. ",
+          type: "textDelta",
+        });
+        enqueueChatStreamEvent({
+          assistantMessageId: "message-assistant-stream",
+          delta: "Part two.",
+          type: "textDelta",
+        });
+      });
+      expect(setTimeoutSpy).toHaveBeenCalled();
+      expect(scheduledRefreshCount).toBe(1);
+      expect(cancelledScheduledRefreshCount).toBe(0);
+      expect(scheduledRefresh).not.toBeNull();
+
+      expect(
+        fetchMock.mock.calls.filter(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-1/context-usage",
+        ),
+      ).toHaveLength(usageCallCountBeforeDeltas);
+
+      await act(async () => {
+        scheduledRefresh?.();
+        await Promise.resolve();
+      });
+
+      const usageCalls = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/context-usage",
+      );
+      expect(usageCalls).toHaveLength(usageCallCountBeforeDeltas + 1);
+      const [, init] = usageCalls.at(-1)!;
+      expect(typeof init?.body).toBe("string");
+      expect(JSON.parse(init?.body as string)).toMatchObject({
+        assistantDraft: "Part one. Part two.",
+        assistantDraftReasoning: null,
+        chatId: "chat-1",
+        draftMessage: null,
+        latestResponseUsage: null,
+      });
+    } finally {
+      setTimeoutSpy.mockRestore();
+      clearTimeoutSpy.mockRestore();
+    }
 
     await act(async () => {
       activeChatStreamController?.close();
