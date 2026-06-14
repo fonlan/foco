@@ -103,6 +103,7 @@ type ChatSummary = {
   createdAt: string;
   updatedAt: string;
   codeChangeStats: GitDiffLineStats;
+  activeRun: ActiveChatRunSummary | null;
 };
 
 type WorkspaceChatListItem = ChatSummary & {
@@ -6018,6 +6019,7 @@ export function App() {
                     workspace.id,
                   ).map(
                     (run): WorkspaceChatListItem => ({
+                      activeRun: null,
                       codeChangeStats: { additions: 0, deletions: 0 },
                       createdAt: run.createdAt,
                       id: run.chatId,
@@ -6102,6 +6104,7 @@ export function App() {
                                   chat.scheduledChatKey ?? null;
                                 const isChatRunning =
                                   runningChatKeys.has(chatKey) ||
+                                  Boolean(chat.activeRun) ||
                                   Boolean(
                                     scheduledChatKey &&
                                       runningChatKeys.has(scheduledChatKey),

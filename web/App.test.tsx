@@ -26,8 +26,15 @@ function chatSummary(
   createdAt: string,
   updatedAt: string,
   codeChangeStats = { additions: 0, deletions: 0 },
+  activeRun: {
+    chatId: string;
+    lastSequence: number | null;
+    runId: string;
+    workspaceId: string;
+  } | null = null,
 ) {
   return {
+    activeRun,
     codeChangeStats,
     createdAt,
     id,
@@ -51,6 +58,7 @@ const workspace = {
       "2026-06-05T11:05:00Z",
     ),
     ...Array.from({ length: 10 }, (_, index) => ({
+      activeRun: null,
       codeChangeStats: { additions: 0, deletions: 0 },
       createdAt: `2026-06-04T${String(10 - index).padStart(2, "0")}:00:00Z`,
       id: `older-chat-${index + 1}`,
@@ -2951,6 +2959,42 @@ describe("App verification surfaces", () => {
     );
 
     expect(statusDot()).toHaveClass("session-status-dot-idle");
+  });
+
+  it("keeps workspace chat dot running from workspace active run summary", async () => {
+    workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            ...workspace.chats[0],
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+          },
+          ...workspace.chats.slice(1),
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    render(<App />);
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyTitle = await within(workspaceList).findByText("Tool run");
+    const historyButton = historyTitle.closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+
+    expect(historyButton.querySelector(".session-status-dot")).toHaveClass(
+      "session-status-dot-running",
+    );
   });
 
   it("marks workspace chat dots red after an interrupted stream", async () => {

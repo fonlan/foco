@@ -1828,7 +1828,7 @@ struct AuthStatusResponse {
 async fn workspaces(State(state): State<AppState>) -> Result<Json<WorkspacesResponse>, ApiError> {
     let config = config_snapshot(&state)?;
 
-    workspace_response_from_config(&config)
+    workspace_response_from_config(&config, &state.active_chat_runs)
 }
 
 async fn add_workspace(
@@ -1874,7 +1874,7 @@ async fn add_workspace(
         .await
         .map_err(ApiError::from_mcp_error)?;
 
-    workspace_response_from_config(&config)
+    workspace_response_from_config(&config, &state.active_chat_runs)
 }
 
 async fn save_workspace_settings(
@@ -4204,7 +4204,7 @@ async fn delete_chat(
         )));
     }
 
-    workspace_response_from_config(&config)
+    workspace_response_from_config(&config, &state.active_chat_runs)
 }
 
 async fn git_status(
@@ -5163,6 +5163,7 @@ struct ChatSummary {
     created_at: String,
     updated_at: String,
     code_change_stats: CodeChangeStats,
+    active_run: Option<ActiveChatRunSummary>,
 }
 
 #[derive(Serialize)]
@@ -17235,6 +17236,7 @@ fn configured_model_summary_for_config(
 
 fn workspace_response_from_config(
     config: &GlobalConfig,
+    active_chat_runs: &ActiveChatRunRegistry,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
     let mut workspaces = Vec::with_capacity(config.workspaces.len());
 
@@ -17249,13 +17251,14 @@ fn workspace_response_from_config(
             .map_err(ApiError::from_workspace_error)?
             .into_iter()
             .map(|chat| {
+                let active_run = active_chat_runs.active_run_for_chat(&workspace.id, &chat.id)?;
                 let code_change_stats = code_change_stats_by_chat
                     .get(&chat.id)
                     .cloned()
                     .unwrap_or_default();
-                chat_summary(chat, code_change_stats)
+                Ok(chat_summary(chat, code_change_stats, active_run))
             })
-            .collect();
+            .collect::<Result<Vec<_>, ApiError>>()?;
 
         workspaces.push(WorkspaceSummary {
             id: workspace.id.clone(),
@@ -18056,13 +18059,18 @@ fn utc_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-fn chat_summary(chat: ChatRecord, code_change_stats: CodeChangeStats) -> ChatSummary {
+fn chat_summary(
+    chat: ChatRecord,
+    code_change_stats: CodeChangeStats,
+    active_run: Option<ActiveChatRunSummary>,
+) -> ChatSummary {
     ChatSummary {
         id: chat.id,
         title: chat.title,
         created_at: chat.created_at,
         updated_at: chat.updated_at,
         code_change_stats,
+        active_run,
     }
 }
 

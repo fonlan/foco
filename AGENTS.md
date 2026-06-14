@@ -37,7 +37,7 @@
 - prompt memory retrieval 只检索 active/latest facts，默认排除 superseded、expired 和 rejected；设置页 Memory tab 可选择 SQLite FTS 或大模型匹配。FTS 是默认当前方式，排名结合文本相关性、scope、pinned、recency、confidence、is_latest；大模型匹配会把当前 global/workspace/chat active/latest 记忆和用户请求发给 `memory.retrieval_model_id` 指定模型，未指定时继承当前会话模型，并要求模型返回相关 fact key。两种方式都会在小深度内扩展 graph 相关事实；active 记忆超过模型匹配硬上限时必须明确报错，不得静默截断。
 - 删除 chat 会级联删除未提升的 chat memory；forget memory 使用 hard delete，并必须从 search、prompt 注入和 profile 生成中消失。profile 会在审批、编辑、提升、抽取落库、agent memory write 和 retention 过期处理后同步刷新。
 - agent memory 工具只在 memory 启用时暴露：`memory_search` 支持 `global`、`workspace`、`chat` 和 `auto` scope；`memory_write` 会创建 `ManualNote` source 并按当前用户 prompt 的 remember 规则决定 pending/active。当前不提供 `memory_update` agent tool，edit/promote/forget 仍由设置页和 HTTP API 用户操作负责。
-- 浏览器 UI 的 workspace 侧边栏通过 `GET /api/workspaces` 读取全局配置和各 workspace 数据库里的 chat 历史。
+- 浏览器 UI 的 workspace 侧边栏通过 `GET /api/workspaces` 读取全局配置和各 workspace 数据库里的 chat 历史；`ChatSummary.activeRun` 可直接驱动左侧会话运行点在页面刷新和标签关闭后保持绿色呼吸闪烁，不能只依赖当前已打开标签页或运行中的订阅状态。
 - 设置页 Workspaces tab 展示所有已注册 workspace（包含 Default），workspace 在全局配置 `workspaces` 数组中的顺序就是侧边栏显示顺序；`POST /api/workspaces/order` 必须收到完整、唯一且全部已存在的 workspace id 顺序，置顶 workspace 通过 `WorkspaceConfig.pinned` 标记并显示在普通 workspace 前。
 - 浏览器 UI 的 workspace 侧边栏中，workspace 名称行点击负责展开/收起该 workspace 的 chat list；右侧 `+` 按钮只负责在该 workspace 新建 chat，若该 workspace 已收起则必须同时自动展开，hover/active 高亮应覆盖整行菜单区域。workspace 行和会话行必须有明确视觉层级区分；同一时间只能展开一个 workspace，点击历史会话或切换会话标签时必须自动收起其他 workspace 并展开该会话所属 workspace，但之后用户仍可手动收起或展开任意 workspace；新建聊天占位行必须保持与普通会话一致的行高和可点击宽度。
 - 浏览器 UI 的 workspace chat list 会在标题下方显示 chat 创建时间，当前正在等待模型返回的 chat 会把左侧气泡图标替换为旋转加载图标直到流结束。
