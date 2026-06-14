@@ -812,7 +812,7 @@ summary:focus-visible {
   }
 
   .app-main-panel > header {
-    padding-inline: 0.5rem;
+    padding-inline: 0;
   }
 
   .app-main-panel > header > div {
@@ -2168,11 +2168,16 @@ body,
   }
 
   .message-list {
-    padding: 0.75rem;
+    padding: 0.25rem;
   }
 
   .message-bubble {
     max-width: 100%;
+    gap: 0;
+  }
+
+  .message-bubble .message-avatar {
+    display: none;
   }
 
   .composer-shell {
