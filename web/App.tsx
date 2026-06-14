@@ -2831,7 +2831,7 @@ export function App() {
 
   useEffect(() => {
     setOpenChatTabs((current) => {
-      const next = current.filter((tab) => workspaceHasChat(workspaces, tab));
+      const next = current.filter((tab) => workspaceHasChatTab(workspaces, tab));
       return next.length === current.length ? current : next;
     });
 
@@ -3452,8 +3452,7 @@ export function App() {
   function setActiveWorkspaceChatRefs(workspaceId: string, chatId: string | null) {
     activeWorkspaceIdRef.current = workspaceId;
     activeChatIdRef.current = chatId;
-    activeChatKeyRef.current =
-      chatId && !isPendingChatId(chatId) ? chatRunKey(workspaceId, chatId) : null;
+    activeChatKeyRef.current = chatId ? chatRunKey(workspaceId, chatId) : null;
   }
 
   function workspaceHasRunningOrStartingRun(workspaceId: string) {
@@ -3535,6 +3534,20 @@ export function App() {
       );
       if (scheduledRun) {
         selectScheduledWorkspaceRun(scheduledRun);
+        return;
+      }
+      const chatKey = chatRunKey(workspaceId, chatId);
+      const cachedMessages = chatMessagesByKey[chatKey] ?? [];
+      setActiveWorkspaceId(workspaceId);
+      setActiveChatId(chatId);
+      setExpandedWorkspaceId(workspaceId);
+      setActiveWorkspaceChatRefs(workspaceId, chatId);
+      setMessages(cachedMessages);
+      setSelectedDiffPath(null);
+      setViewMode("chat");
+      setIsMobileWorkspaceOpen(false);
+      if (options.updateUrl !== false) {
+        updateBrowserRoute({ chatId: null, viewMode: "chat", workspaceId });
       }
       return;
     }
@@ -3589,6 +3602,64 @@ export function App() {
         fallbackWorkspaceName: workspace?.name ?? t("Workspace"),
       }),
     );
+  }
+
+  function openPendingChatTab(
+    workspaceId: string,
+    chatId: string,
+    fallbackTitle: string,
+  ) {
+    const workspace = workspaces.find((workspace) => workspace.id === workspaceId);
+
+    setOpenChatTabs((current) =>
+      upsertOpenChatTab(current, {
+        workspaceId,
+        chatId,
+        fallbackTitle,
+        fallbackWorkspaceName: workspace?.name ?? t("Workspace"),
+      }),
+    );
+  }
+
+  function replacePendingChatTab(
+    workspaceId: string,
+    pendingChatId: string,
+    chatId: string,
+  ) {
+    const workspace = workspaces.find((workspace) => workspace.id === workspaceId);
+    const chat = workspace?.chats.find((chat) => chat.id === chatId);
+
+    setOpenChatTabs((current) => {
+      const pendingTab = current.find(
+        (tab) => tab.workspaceId === workspaceId && tab.chatId === pendingChatId,
+      );
+      const nextTab: OpenChatTab = {
+        workspaceId,
+        chatId,
+        fallbackTitle: chat?.title ?? pendingTab?.fallbackTitle ?? t("Chat"),
+        fallbackWorkspaceName:
+          workspace?.name ?? pendingTab?.fallbackWorkspaceName ?? t("Workspace"),
+      };
+      const withoutOldTabs = current.filter(
+        (tab) =>
+          tab.workspaceId !== workspaceId ||
+          (tab.chatId !== pendingChatId && tab.chatId !== chatId),
+      );
+      const pendingIndex = current.findIndex(
+        (tab) => tab.workspaceId === workspaceId && tab.chatId === pendingChatId,
+      );
+
+      if (pendingIndex < 0) {
+        return upsertOpenChatTab(withoutOldTabs, nextTab);
+      }
+
+      const insertIndex = Math.min(pendingIndex, withoutOldTabs.length);
+      return [
+        ...withoutOldTabs.slice(0, insertIndex),
+        nextTab,
+        ...withoutOldTabs.slice(insertIndex),
+      ];
+    });
   }
 
   function closeChatTab(workspaceId: string, chatId: string) {
@@ -5050,6 +5121,8 @@ export function App() {
     let assistantMessageId = localAssistantId;
     let currentAssistantMessageId = localAssistantId;
     let requestChatId = request.chatId;
+    const pendingChatId =
+      request.chatId || request.localChatKey ? null : `pending:${runKey}`;
     let runMessagesKey = request.localChatKey ?? (requestChatId
       ? chatRunKey(request.workspaceId, requestChatId)
       : pendingChatRunKey(request.workspaceId, runKey));
@@ -5090,6 +5163,26 @@ export function App() {
     };
 
     activeChatKeyRef.current = runMessagesKey;
+    if (pendingChatId) {
+      setActiveWorkspaceId(request.workspaceId);
+      setActiveChatId(pendingChatId);
+      setExpandedWorkspaceId(request.workspaceId);
+      activeWorkspaceIdRef.current = request.workspaceId;
+      activeChatIdRef.current = pendingChatId;
+      openPendingChatTab(
+        request.workspaceId,
+        pendingChatId,
+        chatTitleForDraft(request.content, request.attachments),
+      );
+      setSelectedDiffPath(null);
+      setViewMode("chat");
+      setIsMobileWorkspaceOpen(false);
+      updateBrowserRoute({
+        chatId: null,
+        viewMode: "chat",
+        workspaceId: request.workspaceId,
+      });
+    }
     setChatRunFailed(runMessagesKey, false);
     setMessagesForChatKey(runMessagesKey, (current) => {
       const assistantMessage: ShellMessage = {
@@ -5209,7 +5302,15 @@ export function App() {
             streamEvent.chatId,
           );
           setChatRunFailed(currentRunningChatKey, false);
-          openChatTab(request.workspaceId, streamEvent.chatId);
+          if (pendingChatId) {
+            replacePendingChatTab(
+              request.workspaceId,
+              pendingChatId,
+              streamEvent.chatId,
+            );
+          } else {
+            openChatTab(request.workspaceId, streamEvent.chatId);
+          }
           if (runMessagesKey !== currentRunningChatKey) {
             setChatRunning(runMessagesKey, false);
             setActiveRunInfoForChatKey(runMessagesKey, null);
@@ -18369,6 +18470,18 @@ function workspaceHasChat(
     (workspace) =>
       workspace.id === tab.workspaceId &&
       workspace.chats.some((chat) => chat.id === tab.chatId),
+  );
+}
+
+function workspaceHasChatTab(
+  workspaces: WorkspaceSummary[],
+  tab: { workspaceId: string; chatId: string },
+) {
+  return workspaces.some(
+    (workspace) =>
+      workspace.id === tab.workspaceId &&
+      (isPendingChatId(tab.chatId) ||
+        workspace.chats.some((chat) => chat.id === tab.chatId)),
   );
 }
 

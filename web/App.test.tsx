@@ -2267,6 +2267,66 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("opens a new chat tab before the stream start event arrives", async () => {
+    const fetchMock = vi.mocked(fetch);
+    let delayedStreamController: ReadableStreamDefaultController<Uint8Array> | null =
+      null;
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chat/stream") {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            delayedStreamController = controller;
+          },
+        });
+
+        return Promise.resolve(
+          new Response(stream, {
+            headers: { "Content-Type": "text/event-stream" },
+            status: 200,
+          }),
+        );
+      }
+
+      return mockFetch(input, init);
+    });
+    render(<App />);
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "New chat in Default" }),
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "memory-gated chat",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(
+      await within(tabList).findByRole("tab", { name: /memory-gated chat/ }),
+    ).toHaveAttribute("aria-selected", "true");
+    expect(
+      within(tabList).getByRole("status", { name: "Chat is running" }),
+    ).toBeInTheDocument();
+    const streamCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    expect(JSON.parse(String(streamCall?.[1]?.body))).toMatchObject({
+      chatId: null,
+      message: "memory-gated chat",
+    });
+
+    await act(async () => {
+      delayedStreamController?.close();
+    });
+  });
+
   it("schedules a new workspace chat until the current workspace run finishes", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
