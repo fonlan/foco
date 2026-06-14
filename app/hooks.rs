@@ -205,6 +205,7 @@ pub struct HookRunRequest<'a> {
     pub model_id: Option<&'a str>,
     pub provider_id: Option<&'a str>,
     pub provider_config: Option<&'a ProviderConnectionConfig>,
+    pub llm_request_retry_count: u32,
     pub permission_mode: Option<&'a str>,
     pub payload: Value,
 }
@@ -222,6 +223,7 @@ struct OwnedHookRunRequest {
     model_id: Option<String>,
     provider_id: Option<String>,
     provider_config: Option<ProviderConnectionConfig>,
+    llm_request_retry_count: u32,
     permission_mode: Option<String>,
     payload: Value,
 }
@@ -241,6 +243,7 @@ impl<'a> HookRunRequest<'a> {
             model_id: self.model_id.map(str::to_string),
             provider_id: self.provider_id.map(str::to_string),
             provider_config: self.provider_config.cloned(),
+            llm_request_retry_count: self.llm_request_retry_count,
             permission_mode: self.permission_mode.map(str::to_string),
             payload: self.payload.clone(),
         }
@@ -262,6 +265,7 @@ impl OwnedHookRunRequest {
             model_id: self.model_id.as_deref(),
             provider_id: self.provider_id.as_deref(),
             provider_config: self.provider_config.as_ref(),
+            llm_request_retry_count: self.llm_request_retry_count,
             permission_mode: self.permission_mode.as_deref(),
             payload: self.payload.clone(),
         }
@@ -669,6 +673,26 @@ async fn run_prompt_hook(
         prompt_cache_key: None,
         prompt_cache_retention: None,
     };
+
+    for attempt_index in 0..=request.llm_request_retry_count {
+        match run_prompt_hook_attempt(provider_config, hook_request.clone(), request, timeout_ms)
+            .await
+        {
+            Ok(execution) => return Ok(execution),
+            Err(error) if attempt_index >= request.llm_request_retry_count => return Err(error),
+            Err(_) => {}
+        }
+    }
+
+    Err("prompt hook failed without an attempt result".to_string())
+}
+
+async fn run_prompt_hook_attempt(
+    provider_config: &ProviderConnectionConfig,
+    hook_request: NeutralChatRequest,
+    request: &HookRunRequest<'_>,
+    timeout_ms: u64,
+) -> Result<HookExecution, String> {
     let mut audited_stream =
         audited_prompt_hook_stream(provider_config, hook_request, request, timeout_ms).await?;
     let mut first_token_at = None;
@@ -1345,6 +1369,7 @@ mod tests {
             model_id: Some("model-1"),
             provider_id: Some("provider-1"),
             provider_config: None,
+            llm_request_retry_count: 2,
             permission_mode: None,
             payload,
         }

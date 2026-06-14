@@ -26,6 +26,8 @@ pub const DEFAULT_APP_LANGUAGE: &str = "en";
 pub const SUPPORTED_APP_LANGUAGES: &[&str] = &["zh-CN", "en"];
 pub const DEFAULT_APP_THEME: &str = "light";
 pub const SUPPORTED_APP_THEMES: &[&str] = &["light", "dark"];
+pub const DEFAULT_LLM_REQUEST_RETRY_COUNT: u32 = 3;
+pub const MAX_LLM_REQUEST_RETRY_COUNT: u32 = 10;
 pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
 pub const SUPPORTED_API_PROXY_TYPES: &[&str] = &[HTTP_PROXY_KIND, SOCKS_PROXY_KIND];
@@ -299,6 +301,7 @@ impl GlobalConfig {
                 active_workspace_id: DEFAULT_WORKSPACE_ID.to_string(),
                 language: DEFAULT_APP_LANGUAGE.to_string(),
                 theme: DEFAULT_APP_THEME.to_string(),
+                llm_request_retry_count: DEFAULT_LLM_REQUEST_RETRY_COUNT,
                 web_server: WebServerSettings::default(),
             },
             hooks: HookConfig::default(),
@@ -342,6 +345,7 @@ impl GlobalConfig {
             "app.active_workspace_id",
             &self.app.active_workspace_id,
         )?;
+        validate_llm_request_retry_count(config_path, self.app.llm_request_retry_count)?;
         validate_app_language(config_path, &self.app.language)?;
         validate_app_theme(config_path, &self.app.theme)?;
         validate_web_server_settings(config_path, &self.app.web_server)?;
@@ -630,6 +634,8 @@ pub struct AppSettings {
     pub language: String,
     #[serde(default = "default_app_theme")]
     pub theme: String,
+    #[serde(default = "default_llm_request_retry_count")]
+    pub llm_request_retry_count: u32,
     #[serde(default)]
     pub web_server: WebServerSettings,
 }
@@ -640,6 +646,10 @@ fn default_app_language() -> String {
 
 fn default_app_theme() -> String {
     DEFAULT_APP_THEME.to_string()
+}
+
+fn default_llm_request_retry_count() -> u32 {
+    DEFAULT_LLM_REQUEST_RETRY_COUNT
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1526,6 +1536,22 @@ fn is_tool_hook_event(event: &str) -> bool {
             | "PostToolUse"
             | "PostToolUseFailure"
             | "PostToolBatch"
+    )
+}
+
+fn validate_llm_request_retry_count(
+    config_path: Option<&Path>,
+    retry_count: u32,
+) -> Result<(), ConfigError> {
+    if retry_count <= MAX_LLM_REQUEST_RETRY_COUNT {
+        return Ok(());
+    }
+
+    invalid_config(
+        config_path,
+        format!(
+            "app.llm_request_retry_count must be no greater than {MAX_LLM_REQUEST_RETRY_COUNT}"
+        ),
     )
 }
 

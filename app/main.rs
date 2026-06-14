@@ -52,13 +52,13 @@ use foco_providers::{
 use foco_store::{
     config::{
         ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL, GlobalConfig,
-        HookConfig, HookEventMap, McpServerConfig, MemorySettings, ModelLimits, ModelSettings,
-        PromptSettings, ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE,
-        SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
-        SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings, SystemPromptSettings,
-        UNSUPPORTED_HOOK_EVENTS, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
-        load_or_create_global_config, load_workspace_hook_config, save_global_config,
-        save_workspace_hook_config, workspace_hook_config_path,
+        HookConfig, HookEventMap, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig, MemorySettings,
+        ModelLimits, ModelSettings, PromptSettings, ProviderSettings, SKILL_SCOPE_GLOBAL,
+        SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
+        SUPPORTED_APP_THEMES, SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings,
+        SystemPromptSettings, UNSUPPORTED_HOOK_EVENTS, WebServerSettings, WorkspaceCommonCommand,
+        WorkspaceConfig, load_or_create_global_config, load_workspace_hook_config,
+        save_global_config, save_workspace_hook_config, workspace_hook_config_path,
     },
     memory::{
         MemoryDatabase, MemoryDatabaseError, MemoryExtractionJobStatus, MemoryFactRecord,
@@ -2444,6 +2444,7 @@ async fn test_hooks(
             model_id: provider.as_ref().map(|provider| provider.0.as_str()),
             provider_id: provider.as_ref().map(|provider| provider.1.as_str()),
             provider_config: provider.as_ref().map(|provider| &provider.2),
+            llm_request_retry_count: config.app.llm_request_retry_count,
             permission_mode: None,
             payload: request.payload.unwrap_or_else(|| json!({})),
         })
@@ -2515,6 +2516,9 @@ async fn save_general_settings(
     let should_clear_auth_cookie = request.clear_password.unwrap_or(false);
 
     config.app.web_server = normalize_web_server_settings(&config.app.web_server, &request)?;
+    if let Some(retry_count) = request.llm_request_retry_count {
+        config.app.llm_request_retry_count = retry_count;
+    }
     config.app.language = normalize_app_language(&request.language)?;
     config.app.theme = normalize_app_theme(&request.theme)?;
     if let Some(hook_audit_enabled) = request.hook_audit_enabled {
@@ -4430,6 +4434,7 @@ struct WorkspaceLogoFile {
 struct ManualGeneralSettingsRequest {
     listen_host: String,
     listen_port: u32,
+    llm_request_retry_count: Option<u32>,
     language: String,
     theme: String,
     hook_audit_enabled: Option<bool>,
@@ -4820,6 +4825,8 @@ struct GithubReleaseAsset {
 #[serde(rename_all = "camelCase")]
 struct GeneralSettingsSummary {
     web_server: WebServerSettingsSummary,
+    llm_request_retry_count: u32,
+    max_llm_request_retry_count: u32,
     language: String,
     theme: String,
     hook_audit_enabled: bool,
@@ -5485,6 +5492,17 @@ enum ChatSseEvent {
     ReasoningDelta {
         assistant_message_id: String,
         delta: String,
+    },
+    StreamAttemptStart {
+        assistant_message_id: String,
+        llm_request_id: String,
+    },
+    StreamReset {
+        assistant_message_id: String,
+        reason: String,
+        text: String,
+        reasoning: Option<String>,
+        tool_calls: Vec<ChatToolCallSummary>,
     },
     ToolCall {
         assistant_message_id: String,
@@ -6189,6 +6207,25 @@ impl PreparedChatContext {
             ));
     }
 
+    fn capture_failed_llm_request(
+        &mut self,
+        request_id: String,
+        request_started_at: String,
+        request_body_json: String,
+        events: Vec<CapturedAuditEvent>,
+        started_at: Instant,
+        message: &str,
+        status_code: Option<i64>,
+    ) {
+        self.captured_llm_requests.push(CapturedLlmRequest {
+            id: request_id,
+            request_started_at,
+            request_body_json,
+            events,
+            outcome: failed_provider_audit_outcome(started_at, message, status_code),
+        });
+    }
+
     fn into_sse_stream(
         mut self,
         cancellation: ChatRunCancellation,
@@ -6244,6 +6281,7 @@ impl PreparedChatContext {
 
             let mut turn_index = 0usize;
             let mut tool_rounds_since_last_compression = 0usize;
+            let mut turn_retry_count = 0u32;
 
             'agent_turns: loop {
                 if chat_run_was_cancelled(&app_shutdown_rx, &run_cancellation_rx) {
@@ -6349,6 +6387,13 @@ impl PreparedChatContext {
                         return;
                     }
                 };
+                let attempt_assistant_text = assistant_text.clone();
+                let attempt_assistant_reasoning = assistant_reasoning.clone();
+                let attempt_first_token_at = first_token_at.clone();
+                let attempt_first_token_latency_ms = first_token_latency_ms;
+                let attempt_seen_tool_call_ids = seen_tool_call_ids.clone();
+                let attempt_total_usage = total_usage.clone();
+                let attempt_final_usage = final_usage.clone();
                 let mut turn_request = self.provider_request.clone();
                 turn_request.messages = packed_messages;
                 let turn_llm_request_id = unique_id("llm");
@@ -6401,6 +6446,12 @@ impl PreparedChatContext {
                         return;
                     }
                 }
+                let attempt_start_event = ChatSseEvent::StreamAttemptStart {
+                    assistant_message_id: self.assistant_message_id.clone(),
+                    llm_request_id: turn_llm_request_id.clone(),
+                };
+                events.push(captured_event(&attempt_start_event));
+                yield attempt_start_event;
                 let mut provider_stream = match tokio::select! {
                     changed = app_shutdown_rx.changed() => {
                         if changed.is_err() || *app_shutdown_rx.borrow() {
@@ -6466,6 +6517,38 @@ impl PreparedChatContext {
                     Err(error) => {
                         let status_code = provider_status_code(&error);
                         let message = error.to_string();
+                        if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                            self.capture_failed_llm_request(
+                                turn_llm_request_id,
+                                turn_request_started_at,
+                                turn_request_body_json,
+                                turn_events,
+                                turn_started_at,
+                                &message,
+                                status_code,
+                            );
+                            turn_retry_count = turn_retry_count.saturating_add(1);
+                            assistant_text = attempt_assistant_text;
+                            assistant_reasoning = attempt_assistant_reasoning;
+                            first_token_at = attempt_first_token_at;
+                            first_token_latency_ms = attempt_first_token_latency_ms;
+                            seen_tool_call_ids = attempt_seen_tool_call_ids;
+                            total_usage = attempt_total_usage;
+                            final_usage = attempt_final_usage;
+                            let event = ChatSseEvent::StreamReset {
+                                assistant_message_id: self.assistant_message_id.clone(),
+                                reason: message,
+                                text: assistant_text.clone(),
+                                reasoning: non_empty_string(&assistant_reasoning),
+                                tool_calls: executed_tool_calls
+                                    .iter()
+                                    .map(executed_tool_call_summary)
+                                    .collect(),
+                            };
+                            events.push(captured_event(&event));
+                            yield event;
+                            continue 'agent_turns;
+                        }
                         let event = ChatSseEvent::Error {
                             message: message.clone(),
                         };
@@ -6573,6 +6656,38 @@ impl PreparedChatContext {
                         Err(error) => {
                             let status_code = provider_status_code(&error);
                             let message = error.to_string();
+                            if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                                self.capture_failed_llm_request(
+                                    turn_llm_request_id,
+                                    turn_request_started_at,
+                                    turn_request_body_json,
+                                    turn_events,
+                                    turn_started_at,
+                                    &message,
+                                    status_code,
+                                );
+                                turn_retry_count = turn_retry_count.saturating_add(1);
+                                assistant_text = attempt_assistant_text;
+                                assistant_reasoning = attempt_assistant_reasoning;
+                                first_token_at = attempt_first_token_at;
+                                first_token_latency_ms = attempt_first_token_latency_ms;
+                                seen_tool_call_ids = attempt_seen_tool_call_ids;
+                                total_usage = attempt_total_usage;
+                                final_usage = attempt_final_usage;
+                                let event = ChatSseEvent::StreamReset {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    reason: message,
+                                    text: assistant_text.clone(),
+                                    reasoning: non_empty_string(&assistant_reasoning),
+                                    tool_calls: executed_tool_calls
+                                        .iter()
+                                        .map(executed_tool_call_summary)
+                                        .collect(),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                                continue 'agent_turns;
+                            }
                             let event = ChatSseEvent::Error {
                                 message: message.clone(),
                             };
@@ -6665,6 +6780,38 @@ impl PreparedChatContext {
 
                             if turn_text.is_empty() && !text.is_empty() {
                                 let message = "provider completed without streaming assistant text deltas".to_string();
+                                if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                                    self.capture_failed_llm_request(
+                                        turn_llm_request_id,
+                                        turn_request_started_at,
+                                        turn_request_body_json,
+                                        turn_events,
+                                        turn_started_at,
+                                        &message,
+                                        None,
+                                    );
+                                    turn_retry_count = turn_retry_count.saturating_add(1);
+                                    assistant_text = attempt_assistant_text;
+                                    assistant_reasoning = attempt_assistant_reasoning;
+                                    first_token_at = attempt_first_token_at;
+                                    first_token_latency_ms = attempt_first_token_latency_ms;
+                                    seen_tool_call_ids = attempt_seen_tool_call_ids;
+                                    total_usage = attempt_total_usage;
+                                    final_usage = attempt_final_usage;
+                                    let event = ChatSseEvent::StreamReset {
+                                        assistant_message_id: self.assistant_message_id.clone(),
+                                        reason: message,
+                                        text: assistant_text.clone(),
+                                        reasoning: non_empty_string(&assistant_reasoning),
+                                        tool_calls: executed_tool_calls
+                                            .iter()
+                                            .map(executed_tool_call_summary)
+                                            .collect(),
+                                    };
+                                    events.push(captured_event(&event));
+                                    yield event;
+                                    continue 'agent_turns;
+                                }
                                 let event = ChatSseEvent::Error {
                                     message: message.clone(),
                                 };
@@ -6677,6 +6824,13 @@ impl PreparedChatContext {
                             None,
                         )
                         .await;
+                                self.captured_llm_requests.push(CapturedLlmRequest {
+                                    id: turn_llm_request_id,
+                                    request_started_at: turn_request_started_at,
+                                    request_body_json: turn_request_body_json,
+                                    events: turn_events,
+                                    outcome: outcome.clone(),
+                                });
 
                                 if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                     let event = ChatSseEvent::Error {
@@ -6692,6 +6846,38 @@ impl PreparedChatContext {
 
                             if turn_text.is_empty() && tool_calls.is_empty() {
                                 let message = "provider completed without assistant text or tool calls".to_string();
+                                if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                                    self.capture_failed_llm_request(
+                                        turn_llm_request_id,
+                                        turn_request_started_at,
+                                        turn_request_body_json,
+                                        turn_events,
+                                        turn_started_at,
+                                        &message,
+                                        None,
+                                    );
+                                    turn_retry_count = turn_retry_count.saturating_add(1);
+                                    assistant_text = attempt_assistant_text;
+                                    assistant_reasoning = attempt_assistant_reasoning;
+                                    first_token_at = attempt_first_token_at;
+                                    first_token_latency_ms = attempt_first_token_latency_ms;
+                                    seen_tool_call_ids = attempt_seen_tool_call_ids;
+                                    total_usage = attempt_total_usage;
+                                    final_usage = attempt_final_usage;
+                                    let event = ChatSseEvent::StreamReset {
+                                        assistant_message_id: self.assistant_message_id.clone(),
+                                        reason: message,
+                                        text: assistant_text.clone(),
+                                        reasoning: non_empty_string(&assistant_reasoning),
+                                        tool_calls: executed_tool_calls
+                                            .iter()
+                                            .map(executed_tool_call_summary)
+                                            .collect(),
+                                    };
+                                    events.push(captured_event(&event));
+                                    yield event;
+                                    continue 'agent_turns;
+                                }
                                 let event = ChatSseEvent::Error {
                                     message: message.clone(),
                                 };
@@ -6704,6 +6890,13 @@ impl PreparedChatContext {
                             None,
                         )
                         .await;
+                                self.captured_llm_requests.push(CapturedLlmRequest {
+                                    id: turn_llm_request_id,
+                                    request_started_at: turn_request_started_at,
+                                    request_body_json: turn_request_body_json,
+                                    events: turn_events,
+                                    outcome: outcome.clone(),
+                                });
 
                                 if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
                                     let event = ChatSseEvent::Error {
@@ -6810,6 +7003,7 @@ impl PreparedChatContext {
                                     ) {
                                         yield event;
                                     }
+                                    turn_retry_count = 0;
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
@@ -6829,6 +7023,7 @@ impl PreparedChatContext {
                                     model_id: Some(&self.model_id),
                                     provider_id: Some(&self.provider_id),
                                     provider_config: Some(&self.provider_config),
+                                    llm_request_retry_count: self.global_config.app.llm_request_retry_count,
                                     permission_mode: None,
                                     payload: json!({
                                         "text": stop_text,
@@ -6851,6 +7046,7 @@ impl PreparedChatContext {
                                             stop_summary.additional_context.join("\n"),
                                         ],
                                     );
+                                    turn_retry_count = 0;
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
@@ -6988,6 +7184,7 @@ impl PreparedChatContext {
                                 };
                                 if recovered {
                                     tool_rounds_since_last_compression = 0;
+                                    turn_retry_count = 0;
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
@@ -7113,6 +7310,7 @@ impl PreparedChatContext {
                                     &self.llm_request_id,
                                     &self.model_id,
                                     &self.provider_id,
+                                    self.global_config.app.llm_request_retry_count,
                                     tool_calls.clone(),
                                     execution_plan,
                                     self.tool_resource_locks.clone(),
@@ -7238,6 +7436,7 @@ impl PreparedChatContext {
                                 model_id: Some(&self.model_id),
                                 provider_id: Some(&self.provider_id),
                                 provider_config: Some(&self.provider_config),
+                                llm_request_retry_count: self.global_config.app.llm_request_retry_count,
                                 permission_mode: None,
                                 payload: json!({
                                     "toolResults": next_executed_tool_calls.clone(),
@@ -7323,6 +7522,38 @@ impl PreparedChatContext {
                             break;
                         }
                         NeutralChatStreamEvent::Error { message } => {
+                            if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                                self.capture_failed_llm_request(
+                                    turn_llm_request_id,
+                                    turn_request_started_at,
+                                    turn_request_body_json,
+                                    turn_events,
+                                    turn_started_at,
+                                    &message,
+                                    None,
+                                );
+                                turn_retry_count = turn_retry_count.saturating_add(1);
+                                assistant_text = attempt_assistant_text;
+                                assistant_reasoning = attempt_assistant_reasoning;
+                                first_token_at = attempt_first_token_at;
+                                first_token_latency_ms = attempt_first_token_latency_ms;
+                                seen_tool_call_ids = attempt_seen_tool_call_ids;
+                                total_usage = attempt_total_usage;
+                                final_usage = attempt_final_usage;
+                                let event = ChatSseEvent::StreamReset {
+                                    assistant_message_id: self.assistant_message_id.clone(),
+                                    reason: message,
+                                    text: assistant_text.clone(),
+                                    reasoning: non_empty_string(&assistant_reasoning),
+                                    tool_calls: executed_tool_calls
+                                        .iter()
+                                        .map(executed_tool_call_summary)
+                                        .collect(),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                                continue 'agent_turns;
+                            }
                             let event = ChatSseEvent::Error {
                                 message: message.clone(),
                             };
@@ -7335,6 +7566,13 @@ impl PreparedChatContext {
                             None,
                         )
                         .await;
+                            self.captured_llm_requests.push(CapturedLlmRequest {
+                                id: turn_llm_request_id,
+                                request_started_at: turn_request_started_at,
+                                request_body_json: turn_request_body_json,
+                                events: turn_events,
+                                outcome: outcome.clone(),
+                            });
 
                             if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                 let event = ChatSseEvent::Error {
@@ -7351,11 +7589,44 @@ impl PreparedChatContext {
                 }
 
                 if completed_turn {
+                    turn_retry_count = 0;
                     turn_index = turn_index.saturating_add(1);
                     continue;
                 }
 
                 let message = "provider stream ended without a completion event".to_string();
+                if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                    self.capture_failed_llm_request(
+                        turn_llm_request_id,
+                        turn_request_started_at,
+                        turn_request_body_json,
+                        turn_events,
+                        turn_started_at,
+                        &message,
+                        None,
+                    );
+                    turn_retry_count = turn_retry_count.saturating_add(1);
+                    assistant_text = attempt_assistant_text;
+                    assistant_reasoning = attempt_assistant_reasoning;
+                    first_token_at = attempt_first_token_at;
+                    first_token_latency_ms = attempt_first_token_latency_ms;
+                    seen_tool_call_ids = attempt_seen_tool_call_ids;
+                    total_usage = attempt_total_usage;
+                    final_usage = attempt_final_usage;
+                    let event = ChatSseEvent::StreamReset {
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        reason: message,
+                        text: assistant_text.clone(),
+                        reasoning: non_empty_string(&assistant_reasoning),
+                        tool_calls: executed_tool_calls
+                            .iter()
+                            .map(executed_tool_call_summary)
+                            .collect(),
+                    };
+                    events.push(captured_event(&event));
+                    yield event;
+                    continue 'agent_turns;
+                }
                 let event = ChatSseEvent::Error {
                     message: message.clone(),
                 };
@@ -7368,6 +7639,13 @@ impl PreparedChatContext {
                             None,
                         )
                         .await;
+                self.captured_llm_requests.push(CapturedLlmRequest {
+                    id: turn_llm_request_id,
+                    request_started_at: turn_request_started_at,
+                    request_body_json: turn_request_body_json,
+                    events: turn_events,
+                    outcome: outcome.clone(),
+                });
 
                 if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                     let event = ChatSseEvent::Error {
@@ -7824,6 +8102,7 @@ async fn prepare_chat_context(
             model_id: Some(&prompt_context.model_id),
             provider_id: Some(&prompt_context.provider_id),
             provider_config: Some(&prompt_context.provider_config),
+            llm_request_retry_count: config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "prompt": raw_message,
@@ -7867,6 +8146,7 @@ async fn prepare_chat_context(
             model_id: Some(&prompt_context.model_id),
             provider_id: Some(&prompt_context.provider_id),
             provider_config: Some(&prompt_context.provider_config),
+            llm_request_retry_count: config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "chatCreated": chat_created,
@@ -8172,6 +8452,7 @@ async fn relevant_memory_facts_llm(
         &provider_id,
         &provider_config,
         request,
+        config.app.llm_request_retry_count,
     )
     .await?;
     let selected = parse_memory_retrieval_output(output)?;
@@ -9500,6 +9781,7 @@ async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result
             model_id: Some(&context.model_id),
             provider_id: Some(&context.provider_id),
             provider_config: Some(&context.provider_config),
+            llm_request_retry_count: context.global_config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "coveredSequences": covered_sequences,
@@ -9607,6 +9889,7 @@ async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result
             model_id: Some(&context.model_id),
             provider_id: Some(&context.provider_id),
             provider_config: Some(&context.provider_config),
+            llm_request_retry_count: context.global_config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "snapshotId": context.compression_snapshots.last().map(|snapshot| snapshot.id.clone()),
@@ -10628,6 +10911,7 @@ async fn run_memory_extraction_job_inner(
         &provider_id,
         &provider_config,
         request,
+        task.config.app.llm_request_retry_count,
     )
     .await?;
     let output = parse_memory_extraction_output(tool_arguments)?;
@@ -11511,122 +11795,138 @@ async fn audited_provider_tool_request(
     expected_tool_name: &str,
     tool_label: &str,
     timeout_ms: u64,
+    retry_count: u32,
 ) -> Result<Value, ApiError> {
-    let request_id = unique_id("llm");
-    let request_started_at = utc_timestamp();
-    let started_at = Instant::now();
     let request_body_json = serialize_provider_request(&request)?;
-    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
-    database
-        .insert_llm_request(NewLlmRequest {
-            id: &request_id,
-            workspace_id,
-            chat_id,
-            provider_id,
-            model_id: &request.model_id,
-            request_started_at: &request_started_at,
-            first_token_at: None,
-            completed_at: None,
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            first_token_latency_ms: None,
-            total_latency_ms: None,
-            status_code: None,
-            final_state: "running",
-            request_body_json: Some(&request_body_json),
-            response_body_json: None,
-        })
-        .map_err(ApiError::from_workspace_error)?;
-    database
-        .insert_llm_request_event(NewLlmRequestEvent {
-            id: &format!("{request_id}-event-0"),
-            llm_request_id: &request_id,
-            sequence: 0,
-            event_at: &request_started_at,
-            event_type: "start",
-            raw_chunk_json: None,
-            normalized_event_json: &json!({
-                "type": "start",
-                "requestKind": request_kind,
-                "llmRequestId": &request_id,
-                "workspaceId": workspace_id,
-                "chatId": chat_id,
+
+    for attempt_index in 0..=retry_count {
+        let request_id = unique_id("llm");
+        let request_started_at = utc_timestamp();
+        let started_at = Instant::now();
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: &request_id,
+                workspace_id,
+                chat_id,
+                provider_id,
+                model_id: &request.model_id,
+                request_started_at: &request_started_at,
+                first_token_at: None,
+                completed_at: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: None,
+                status_code: None,
+                final_state: "running",
+                request_body_json: Some(&request_body_json),
+                response_body_json: None,
             })
-            .to_string(),
-        })
-        .map_err(ApiError::from_workspace_error)?;
-    drop(database);
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: &format!("{request_id}-event-0"),
+                llm_request_id: &request_id,
+                sequence: 0,
+                event_at: &request_started_at,
+                event_type: "start",
+                raw_chunk_json: None,
+                normalized_event_json: &json!({
+                    "type": "start",
+                    "requestKind": request_kind,
+                    "llmRequestId": &request_id,
+                    "workspaceId": workspace_id,
+                    "chatId": chat_id,
+                    "attempt": attempt_index + 1,
+                    "maxAttempts": retry_count + 1,
+                })
+                .to_string(),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        drop(database);
 
-    let result = run_provider_stream_for_tool(
-        provider_config,
-        request,
-        request_kind,
-        expected_tool_name,
-        tool_label,
-        timeout_ms,
-    )
-    .await;
-    let completed_at = utc_timestamp();
-    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
+        let result = run_provider_stream_for_tool(
+            provider_config,
+            request.clone(),
+            request_kind,
+            expected_tool_name,
+            tool_label,
+            timeout_ms,
+        )
+        .await;
+        let completed_at = utc_timestamp();
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
 
-    match result {
-        Ok(AuditedToolStreamOutcome {
-            tool_arguments,
-            events,
-            usage,
-            first_token_at,
-            first_token_latency_ms,
-            response_body_json,
-        }) => {
-            database
-                .update_llm_request_outcome(
-                    &request_id,
-                    UpdateLlmRequestOutcome {
-                        first_token_at: first_token_at.as_deref(),
-                        completed_at: Some(&completed_at),
-                        input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
-                        output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
-                        cache_read_tokens: usage.as_ref().and_then(|usage| usage.cache_read_tokens),
-                        cache_write_tokens: usage
-                            .as_ref()
-                            .and_then(|usage| usage.cache_write_tokens),
-                        first_token_latency_ms,
-                        total_latency_ms: Some(elapsed_millis(started_at)),
-                        status_code: Some(200),
-                        final_state: "succeeded",
-                        response_body_json: Some(&response_body_json),
-                    },
-                )
-                .map_err(ApiError::from_workspace_error)?;
-            persist_audited_provider_events(&mut database, &request_id, &events, 1)?;
-            Ok(tool_arguments)
-        }
-        Err(error) => {
-            database
-                .update_llm_request_outcome(
-                    &request_id,
-                    UpdateLlmRequestOutcome {
-                        first_token_at: None,
-                        completed_at: Some(&completed_at),
-                        input_tokens: None,
-                        output_tokens: None,
-                        cache_read_tokens: None,
-                        cache_write_tokens: None,
-                        first_token_latency_ms: None,
-                        total_latency_ms: Some(elapsed_millis(started_at)),
-                        status_code: error.status_code,
-                        final_state: "failed",
-                        response_body_json: Some(&json!({ "error": &error.message }).to_string()),
-                    },
-                )
-                .map_err(ApiError::from_workspace_error)?;
-            Err(ApiError::internal(error.message))
+        match result {
+            Ok(AuditedToolStreamOutcome {
+                tool_arguments,
+                events,
+                usage,
+                first_token_at,
+                first_token_latency_ms,
+                response_body_json,
+            }) => {
+                database
+                    .update_llm_request_outcome(
+                        &request_id,
+                        UpdateLlmRequestOutcome {
+                            first_token_at: first_token_at.as_deref(),
+                            completed_at: Some(&completed_at),
+                            input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
+                            output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
+                            cache_read_tokens: usage
+                                .as_ref()
+                                .and_then(|usage| usage.cache_read_tokens),
+                            cache_write_tokens: usage
+                                .as_ref()
+                                .and_then(|usage| usage.cache_write_tokens),
+                            first_token_latency_ms,
+                            total_latency_ms: Some(elapsed_millis(started_at)),
+                            status_code: Some(200),
+                            final_state: "succeeded",
+                            response_body_json: Some(&response_body_json),
+                        },
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
+                persist_audited_provider_events(&mut database, &request_id, &events, 1)?;
+                return Ok(tool_arguments);
+            }
+            Err(error) => {
+                database
+                    .update_llm_request_outcome(
+                        &request_id,
+                        UpdateLlmRequestOutcome {
+                            first_token_at: None,
+                            completed_at: Some(&completed_at),
+                            input_tokens: None,
+                            output_tokens: None,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
+                            first_token_latency_ms: None,
+                            total_latency_ms: Some(elapsed_millis(started_at)),
+                            status_code: error.status_code,
+                            final_state: "failed",
+                            response_body_json: Some(
+                                &json!({ "error": &error.message }).to_string(),
+                            ),
+                        },
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
+                if attempt_index >= retry_count {
+                    return Err(ApiError::internal(error.message));
+                }
+            }
         }
     }
+
+    Err(ApiError::internal(format!(
+        "{request_kind} failed without an attempt result"
+    )))
 }
 
 struct AuditedToolStreamOutcome {
@@ -11839,6 +12139,7 @@ async fn call_memory_extraction_provider(
     provider_id: &str,
     provider_config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
+    retry_count: u32,
 ) -> Result<Value, ApiError> {
     audited_provider_tool_request(
         workspace_path,
@@ -11851,6 +12152,7 @@ async fn call_memory_extraction_provider(
         MEMORY_EXTRACTION_TOOL_NAME,
         "submit tool",
         MEMORY_EXTRACTION_TIMEOUT_MS,
+        retry_count,
     )
     .await
 }
@@ -11862,6 +12164,7 @@ async fn call_memory_retrieval_provider(
     provider_id: &str,
     provider_config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
+    retry_count: u32,
 ) -> Result<Value, ApiError> {
     audited_provider_tool_request(
         workspace_path,
@@ -11874,6 +12177,7 @@ async fn call_memory_retrieval_provider(
         MEMORY_RETRIEVAL_TOOL_NAME,
         "select tool",
         MEMORY_RETRIEVAL_TIMEOUT_MS,
+        retry_count,
     )
     .await
 }
@@ -12709,6 +13013,7 @@ async fn execute_tool_calls_parallel(
     run_id: &str,
     model_id: &str,
     provider_id: &str,
+    llm_request_retry_count: u32,
     tool_calls: Vec<NeutralToolCall>,
     execution_plan: ToolExecutionPlan,
     tool_resource_lock_registry: ToolResourceLockRegistry,
@@ -12741,6 +13046,7 @@ async fn execute_tool_calls_parallel(
                         run_id,
                         model_id,
                         provider_id,
+                        llm_request_retry_count,
                         tool_call,
                     )
                     .await;
@@ -12755,6 +13061,7 @@ async fn execute_tool_calls_parallel(
                     let run_id = run_id.to_string();
                     let model_id = model_id.to_string();
                     let provider_id = provider_id.to_string();
+                    let llm_request_retry_count = llm_request_retry_count;
                     let mcp_registry = mcp_registry.clone();
                     let hook_runtime = hook_runtime.clone();
                     let global_hooks = global_hooks.clone();
@@ -12790,6 +13097,7 @@ async fn execute_tool_calls_parallel(
                                 &run_id,
                                 &model_id,
                                 &provider_id,
+                                llm_request_retry_count,
                                 tool_call,
                             )
                             .await,
@@ -12834,6 +13142,7 @@ async fn execute_tool_call(
     run_id: &str,
     model_id: &str,
     provider_id: &str,
+    llm_request_retry_count: u32,
     tool_call: NeutralToolCall,
 ) -> ToolHookOutcome {
     let started_at_text = utc_timestamp();
@@ -12854,6 +13163,7 @@ async fn execute_tool_call(
         run_id,
         model_id,
         provider_id,
+        llm_request_retry_count,
         &tool_call.call_id,
         &tool_call.name,
         tool_call.arguments.clone(),
@@ -12887,6 +13197,7 @@ async fn execute_tool_call(
             model_id: Some(model_id),
             provider_id: Some(provider_id),
             provider_config: Some(&provider_config),
+            llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "toolName": executed.name.clone(),
@@ -12920,6 +13231,7 @@ async fn execute_tool(
     run_id: &str,
     model_id: &str,
     provider_id: &str,
+    llm_request_retry_count: u32,
     tool_call_id: &str,
     tool_name: &str,
     mut arguments: Value,
@@ -12942,6 +13254,7 @@ async fn execute_tool(
             model_id: Some(model_id),
             provider_id: Some(provider_id),
             provider_config: Some(provider_config),
+            llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "toolName": tool_name,
@@ -12990,6 +13303,7 @@ async fn execute_tool(
                         model_id: Some(model_id),
                         provider_id: Some(provider_id),
                         provider_config: Some(provider_config),
+                        llm_request_retry_count,
                         permission_mode: Some("ask"),
                         payload: json!({
                             "toolName": tool_name,
@@ -13034,6 +13348,7 @@ async fn execute_tool(
                                 model_id: Some(model_id),
                                 provider_id: Some(provider_id),
                                 provider_config: Some(provider_config),
+                                llm_request_retry_count,
                                 permission_mode: Some("deny"),
                                 payload: json!({
                                     "toolName": tool_name,
@@ -13085,6 +13400,7 @@ async fn execute_tool(
                                 model_id: Some(model_id),
                                 provider_id: Some(provider_id),
                                 provider_config: Some(provider_config),
+                                llm_request_retry_count,
                                 permission_mode: Some("deny"),
                                 payload: json!({
                                     "toolName": tool_name,
@@ -13181,6 +13497,7 @@ async fn execute_tool(
             run_id,
             model_id,
             provider_id,
+            llm_request_retry_count,
             tool_call_id,
             arguments,
             cancellation_token.clone(),
@@ -13410,6 +13727,7 @@ async fn execute_ask_question(
     run_id: &str,
     model_id: &str,
     provider_id: &str,
+    llm_request_retry_count: u32,
     tool_call_id: &str,
     arguments: Value,
     cancellation_token: ToolCancellationToken,
@@ -13455,6 +13773,7 @@ async fn execute_ask_question(
             model_id: Some(model_id),
             provider_id: Some(provider_id),
             provider_config: Some(provider_config),
+            llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "questionRequest": request.clone(),
@@ -13494,6 +13813,7 @@ async fn execute_ask_question(
                         model_id: Some(model_id),
                         provider_id: Some(provider_id),
                         provider_config: Some(provider_config),
+                        llm_request_retry_count,
                         permission_mode: None,
                         payload: json!({
                             "questionRequest": request,
@@ -13585,6 +13905,7 @@ async fn execute_ask_question(
             model_id: Some(model_id),
             provider_id: Some(provider_id),
             provider_config: Some(provider_config),
+            llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "questionRequest": request,
@@ -14239,6 +14560,7 @@ async fn failed_chat_audit_outcome(
             model_id: Some(&context.model_id),
             provider_id: Some(&context.provider_id),
             provider_config: Some(&context.provider_config),
+            llm_request_retry_count: context.global_config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "message": message,
@@ -14376,6 +14698,7 @@ async fn session_end_hook(
             model_id: Some(&context.model_id),
             provider_id: Some(&context.provider_id),
             provider_config: Some(&context.provider_config),
+            llm_request_retry_count: context.global_config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
                 "finalState": final_state,
@@ -14410,6 +14733,8 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::Start { .. } => "start",
         ChatSseEvent::TextDelta { .. } => "text_delta",
         ChatSseEvent::ReasoningDelta { .. } => "reasoning_delta",
+        ChatSseEvent::StreamAttemptStart { .. } => "stream_attempt_start",
+        ChatSseEvent::StreamReset { .. } => "stream_reset",
         ChatSseEvent::ToolCall { .. } => "tool_call",
         ChatSseEvent::ToolResult { .. } => "tool_result",
         ChatSseEvent::QuestionRequest { .. } => "question_request",
@@ -15933,6 +16258,8 @@ async fn settings_response(
                 listen_port: config.app.web_server.listen_port,
                 password_enabled: web_auth_enabled(config),
             },
+            llm_request_retry_count: config.app.llm_request_retry_count,
+            max_llm_request_retry_count: MAX_LLM_REQUEST_RETRY_COUNT,
             language: config.app.language.clone(),
             theme: config.app.theme.clone(),
             hook_audit_enabled: config.hooks.audit_enabled,
@@ -18215,6 +18542,22 @@ fn pending_tool_call_summary(tool_call: &NeutralToolCall) -> ChatToolCallSummary
     }
 }
 
+fn executed_tool_call_summary(tool_call: &ExecutedToolCall) -> ChatToolCallSummary {
+    ChatToolCallSummary {
+        id: tool_call.id.clone(),
+        name: tool_call.name.clone(),
+        status: if tool_call.is_error {
+            "error"
+        } else {
+            "completed"
+        }
+        .to_string(),
+        input: tool_call.input.clone(),
+        output: Some(tool_call.output.clone()),
+        is_error: tool_call.is_error,
+    }
+}
+
 fn executed_tool_call(
     tool_call: NeutralToolCall,
     execution: ToolExecution,
@@ -18957,9 +19300,15 @@ fn chat_message_parts(
         .iter()
         .map(|tool_call| (tool_call.id.as_str(), tool_call))
         .collect::<HashMap<_, _>>();
+    let completed_request_ids = llm_request_events
+        .iter()
+        .filter(|event| event.event_type == "completion")
+        .map(|event| event.llm_request_id.as_str())
+        .collect::<HashSet<_>>();
     let request_ids = request_ids
         .iter()
         .map(String::as_str)
+        .filter(|request_id| completed_request_ids.contains(request_id))
         .collect::<HashSet<_>>();
     let mut seen_tool_call_ids = HashSet::new();
     let mut parts = Vec::new();
@@ -19805,6 +20154,7 @@ mod tests {
             "run-1",
             "model-1",
             "provider-1",
+            2,
             "call-1",
             "read_file",
             json!({
@@ -20041,6 +20391,7 @@ mod tests {
                 clear_password: None,
                 hook_audit_enabled: None,
                 language: "en".to_string(),
+                llm_request_retry_count: None,
                 theme: "light".to_string(),
                 listen_host: "0.0.0.0".to_string(),
                 listen_port: 3211,
@@ -20056,6 +20407,7 @@ mod tests {
                 clear_password: None,
                 hook_audit_enabled: None,
                 language: "en".to_string(),
+                llm_request_retry_count: None,
                 theme: "light".to_string(),
                 listen_host: "127.0.0.1".to_string(),
                 listen_port: 3210,
@@ -20077,6 +20429,7 @@ mod tests {
                 clear_password: Some(true),
                 hook_audit_enabled: None,
                 language: "en".to_string(),
+                llm_request_retry_count: None,
                 theme: "light".to_string(),
                 listen_host: "127.0.0.1".to_string(),
                 listen_port: 3210,

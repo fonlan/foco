@@ -268,6 +268,8 @@ type AppThemeSummary = {
 type GeneralSettingsSummary = {
   hookAuditEnabled: boolean;
   language: AppLanguageId;
+  llmRequestRetryCount: number;
+  maxLlmRequestRetryCount: number;
   supportedLanguages: AppLanguageSummary[];
   supportedThemes: AppThemeSummary[];
   theme: AppThemeId;
@@ -462,6 +464,7 @@ type GeneralFormState = {
   language: string;
   listenHost: string;
   listenPort: string;
+  llmRequestRetryCount: string;
   password: string;
   theme: AppThemeId;
 };
@@ -1033,6 +1036,19 @@ type ChatStreamEvent =
     }
   | { type: "textDelta"; assistantMessageId?: string; delta: string }
   | { type: "reasoningDelta"; assistantMessageId?: string; delta: string }
+  | {
+      type: "streamAttemptStart";
+      assistantMessageId: string;
+      llmRequestId: string;
+    }
+  | {
+      type: "streamReset";
+      assistantMessageId: string;
+      reason: string;
+      text: string;
+      reasoning: string | null;
+      toolCalls: ChatToolCallSummary[];
+    }
   | { type: "usage"; usage?: ChatUsage }
   | {
       type: "complete";
@@ -1667,6 +1683,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Set a password to require browser login.":
       "设置密码后，浏览器访问需要先登录。",
     "Clear browser password": "清除浏览器密码",
+    "LLM request retries": "大模型请求重试次数",
     Language: "语言",
     Theme: "主题",
     Light: "浅色",
@@ -4917,6 +4934,40 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "streamAttemptStart") {
+          currentAssistantMessageId = streamEvent.assistantMessageId;
+          ensureStreamingAssistantMessage(streamEvent.assistantMessageId);
+          setActiveRunInfoForChatKey(chatKey, {
+            chatId: activeRun.chatId,
+            chatKey,
+            lastSequence: activeRun.lastSequence,
+            runId: streamEvent.llmRequestId,
+            workspaceId: activeRun.workspaceId,
+          });
+          return;
+        }
+
+        if (streamEvent.type === "streamReset") {
+          assistantDraft = streamEvent.text;
+          assistantDraftReasoning = streamEvent.reasoning ?? "";
+          latestResponseUsage = null;
+          cancelScheduledContextUsageForChatKey(chatKey);
+          updateLiveChatStatistics(chatKey, {
+            modelId: selectedModelIdRef.current,
+            providerId: selectedProviderIdRef.current,
+            startedAtMs: liveStartedAtMs,
+            usage: null,
+          });
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? resetStreamingAssistantMessage(message, streamEvent)
+                : message,
+            ),
+          );
+          return;
+        }
+
         if (streamEvent.type === "usage") {
           latestResponseUsage =
             streamEvent.usage &&
@@ -5486,6 +5537,38 @@ export function App() {
                     }
                   : message,
               ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "streamAttemptStart") {
+          currentAssistantMessageId = streamEvent.assistantMessageId;
+          setActiveRunInfoForChatKey(runMessagesKey, {
+            chatId: requestChatId,
+            chatKey: runMessagesKey,
+            runId: streamEvent.llmRequestId,
+            workspaceId: request.workspaceId,
+          });
+          return;
+        }
+
+        if (streamEvent.type === "streamReset") {
+          assistantDraft = streamEvent.text;
+          assistantDraftReasoning = streamEvent.reasoning ?? "";
+          latestResponseUsage = null;
+          cancelScheduledContextUsageForChatKey(runMessagesKey);
+          updateLiveChatStatistics(runMessagesKey, {
+            modelId: request.modelId,
+            providerId: request.providerId,
+            startedAtMs: liveStartedAtMs,
+            usage: null,
+          });
+          setMessagesForChatKey(runMessagesKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? resetStreamingAssistantMessage(message, streamEvent)
+                : message,
+            ),
           );
           return;
         }
@@ -12389,6 +12472,7 @@ function SettingsPanel({
       language: data.general.language,
       listenHost: data.general.webServer.listenHost,
       listenPort: String(data.general.webServer.listenPort),
+      llmRequestRetryCount: String(data.general.llmRequestRetryCount),
       password: "",
       theme: data.general.theme,
     });
@@ -12821,6 +12905,10 @@ function SettingsPanel({
           listenPort: optionalPositiveInteger(
             generalForm.listenPort,
             t("Listen port"),
+          ),
+          llmRequestRetryCount: optionalPositiveInteger(
+            generalForm.llmRequestRetryCount,
+            t("LLM request retries"),
           ),
           hookAuditEnabled: generalForm.hookAuditEnabled,
           language: generalForm.language,
@@ -14520,6 +14608,27 @@ function SettingsPanel({
                 placeholder="3210"
                 value={generalForm.listenPort}
               />
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  {t("LLM request retries")}
+                </span>
+                <input
+                  autoComplete="off"
+                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  inputMode="numeric"
+                  min={1}
+                  onChange={(event) =>
+                    setGeneralForm((current) => ({
+                      ...current,
+                      llmRequestRetryCount: event.target.value,
+                    }))
+                  }
+                  placeholder={String(settings?.general.llmRequestRetryCount ?? 3)}
+                  step={1}
+                  type="number"
+                  value={generalForm.llmRequestRetryCount}
+                />
+              </label>
             </div>
             <div className="mt-4 border-t border-stone-200 pt-4">
               <div className="flex items-center justify-between gap-3">
@@ -19154,6 +19263,7 @@ function emptyGeneralForm(): GeneralFormState {
     language: "en",
     listenHost: "127.0.0.1",
     listenPort: "3210",
+    llmRequestRetryCount: "3",
     password: "",
     theme: "light",
   };
@@ -20173,6 +20283,25 @@ function applyToolResult(
         }
     : toolCall,
   );
+}
+
+function resetStreamingAssistantMessage(
+  message: ShellMessage,
+  streamEvent: Extract<ChatStreamEvent, { type: "streamReset" }>,
+): ShellMessage {
+  const toolCalls = streamEvent.toolCalls.map(normalizedToolCallSummary);
+  return {
+    ...message,
+    content: streamEvent.text,
+    reasoning: streamEvent.reasoning,
+    toolCalls,
+    parts: fallbackMessageParts({
+      ...message,
+      content: streamEvent.text,
+      reasoning: streamEvent.reasoning,
+      toolCalls,
+    }),
+  };
 }
 
 function completedAssistantMessage(
@@ -22041,6 +22170,60 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     }
 
     return { type: "reasoningDelta", assistantMessageId, delta };
+  }
+
+  if (
+    value.type === "streamAttemptStart" ||
+    value.type === "stream_attempt_start"
+  ) {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const llmRequestId = stringField(value, "llmRequestId", "llm_request_id");
+
+    if (!assistantMessageId || !llmRequestId) {
+      return null;
+    }
+
+    return { type: "streamAttemptStart", assistantMessageId, llmRequestId };
+  }
+
+  if (value.type === "streamReset" || value.type === "stream_reset") {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const reason = stringField(value, "reason");
+    const text = stringField(value, "text");
+    const reasoning = optionalNullableStringField(value, "reasoning");
+    const toolCallsValue = fieldValue(value, "toolCalls", "tool_calls");
+
+    if (
+      !assistantMessageId ||
+      !reason ||
+      text === null ||
+      reasoning === false ||
+      !Array.isArray(toolCallsValue)
+    ) {
+      return null;
+    }
+
+    const toolCalls = toolCallsValue.map(parseChatToolCallSummary);
+    if (toolCalls.some((toolCall) => toolCall === null)) {
+      return null;
+    }
+
+    return {
+      type: "streamReset",
+      assistantMessageId,
+      reason,
+      text,
+      reasoning: reasoning ?? null,
+      toolCalls: toolCalls as ChatToolCallSummary[],
+    };
   }
 
   if (value.type === "usage") {

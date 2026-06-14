@@ -117,6 +117,8 @@ const settings = {
   general: {
     hookAuditEnabled: false,
     language: "en",
+    llmRequestRetryCount: 3,
+    maxLlmRequestRetryCount: 10,
     supportedLanguages: [
       { id: "en", name: "English" },
       { id: "zh-CN", name: "简体中文" },
@@ -992,6 +994,10 @@ function savedGeneralSettings(init?: RequestInit) {
         body.language === "zh-CN" || body.language === "en"
           ? body.language
           : settings.general.language,
+      llmRequestRetryCount:
+        typeof body.llmRequestRetryCount === "number"
+          ? body.llmRequestRetryCount
+          : settings.general.llmRequestRetryCount,
       theme:
         body.theme === "dark" || body.theme === "light"
           ? body.theme
