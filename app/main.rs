@@ -1828,7 +1828,7 @@ struct AuthStatusResponse {
 async fn workspaces(State(state): State<AppState>) -> Result<Json<WorkspacesResponse>, ApiError> {
     let config = config_snapshot(&state)?;
 
-    workspace_response_from_config(&config, &state.active_chat_runs)
+    workspace_response_from_config(&config)
 }
 
 async fn add_workspace(

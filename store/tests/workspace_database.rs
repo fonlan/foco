@@ -1079,6 +1079,105 @@ fn code_graph_query_helpers_return_compact_relationships() {
 }
 
 #[test]
+fn replacing_code_graph_file_index_clears_old_fts_entries() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let old_symbols = [
+        NewCodeGraphSymbol {
+            name: "kept_helper",
+            kind: "function",
+            start_line: Some(1),
+            start_column: Some(1),
+            end_line: Some(3),
+            end_column: Some(1),
+            signature: Some("fn kept_helper()"),
+            documentation: None,
+        },
+        NewCodeGraphSymbol {
+            name: "removed_helper",
+            kind: "function",
+            start_line: Some(5),
+            start_column: Some(1),
+            end_line: Some(7),
+            end_column: Some(1),
+            signature: Some("fn removed_helper()"),
+            documentation: None,
+        },
+    ];
+    database
+        .replace_code_graph_file_index(NewCodeGraphFileIndex {
+            path: "lib.rs",
+            language: Some("rust"),
+            size_bytes: Some(64),
+            modified_at: Some("2026-06-04T00:00:00.000Z"),
+            content_hash: "old-hash",
+            parse_status: "parsed",
+            parse_error_message: None,
+            symbols: &old_symbols,
+            imports: &[],
+            references: &[],
+            edges: &[],
+            fts_body: "fn kept_helper() {} fn removed_helper() {}",
+        })
+        .expect("old graph index");
+
+    let new_symbols = [NewCodeGraphSymbol {
+        name: "kept_helper",
+        kind: "function",
+        start_line: Some(1),
+        start_column: Some(1),
+        end_line: Some(3),
+        end_column: Some(1),
+        signature: Some("fn kept_helper()"),
+        documentation: None,
+    }];
+    database
+        .replace_code_graph_file_index(NewCodeGraphFileIndex {
+            path: "lib.rs",
+            language: Some("rust"),
+            size_bytes: Some(32),
+            modified_at: Some("2026-06-04T00:01:00.000Z"),
+            content_hash: "new-hash",
+            parse_status: "parsed",
+            parse_error_message: None,
+            symbols: &new_symbols,
+            imports: &[],
+            references: &[],
+            edges: &[],
+            fts_body: "fn kept_helper() {}",
+        })
+        .expect("new graph index");
+
+    let removed_symbols = database
+        .find_code_graph_symbols("removed_helper", None, None, 10)
+        .expect("removed symbol lookup");
+    assert!(removed_symbols.is_empty());
+
+    let connection = Connection::open(database.database_path()).expect("open database");
+    let removed_fts_data_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM code_graph_fts_data
+             WHERE entity_kind = 'symbol' AND title = ?1",
+            params!["removed_helper"],
+            |row| row.get(0),
+        )
+        .expect("removed fts data count");
+    let removed_fts_index_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM code_graph_fts_index
+             WHERE entity_kind = 'symbol' AND title = ?1",
+            params!["removed_helper"],
+            |row| row.get(0),
+        )
+        .expect("removed fts index count");
+    assert_eq!(removed_fts_data_rows, 0);
+    assert_eq!(removed_fts_index_rows, 0);
+}
+
+#[test]
 fn audits_mocked_llm_request_response_and_stream_events() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

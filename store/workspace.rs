@@ -1175,16 +1175,34 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
 
         let mut symbol_ids = Vec::with_capacity(index.symbols.len());
-        for symbol in index.symbols {
-            transaction
-                .execute(
+        {
+            let mut insert_symbol = transaction
+                .prepare(
                     "INSERT INTO code_graph_symbols
                         (
                             file_id, name, kind, start_line, start_column,
                             end_line, end_column, signature, documentation
                         )
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let mut insert_fts_data = transaction
+                .prepare(
+                    "INSERT INTO code_graph_fts_data
+                        (entity_kind, entity_id, title, body, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let mut insert_fts_index = transaction
+                .prepare(
+                    "INSERT INTO code_graph_fts_index (entity_kind, entity_id, title, body)
+                     VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+
+            for symbol in index.symbols {
+                insert_symbol
+                    .execute(params![
                         file_id,
                         symbol.name,
                         symbol.kind,
@@ -1194,64 +1212,87 @@ impl WorkspaceDatabase {
                         symbol.end_column,
                         symbol.signature,
                         symbol.documentation
-                    ],
-                )
-                .map_err(|source| sqlite_error(&database_path, source))?;
-            let symbol_id = transaction.last_insert_rowid();
-            symbol_ids.push(symbol_id);
-            upsert_code_graph_fts_entry(
-                &transaction,
+                    ])
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                let symbol_id = transaction.last_insert_rowid();
+                let symbol_entity_id = symbol_id.to_string();
+                symbol_ids.push(symbol_id);
+                insert_code_graph_fts_entry(
+                    &mut insert_fts_data,
+                    &mut insert_fts_index,
+                    &database_path,
+                    "symbol",
+                    &symbol_entity_id,
+                    symbol.name,
+                    symbol
+                        .documentation
+                        .or(symbol.signature)
+                        .unwrap_or(symbol.name),
+                    &now,
+                )?;
+            }
+
+            insert_code_graph_fts_entry(
+                &mut insert_fts_data,
+                &mut insert_fts_index,
                 &database_path,
-                "symbol",
-                &symbol_id.to_string(),
-                symbol.name,
-                symbol
-                    .documentation
-                    .or(symbol.signature)
-                    .unwrap_or(symbol.name),
+                "file",
+                index.path,
+                index.path,
+                index.fts_body,
                 &now,
             )?;
         }
 
-        for import in index.imports {
-            transaction
-                .execute(
+        {
+            let mut insert_import = transaction
+                .prepare(
                     "INSERT INTO code_graph_imports
                         (
                             file_id, module, imported_symbol, alias,
                             start_line, start_column
                         )
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            for import in index.imports {
+                insert_import
+                    .execute(params![
                         file_id,
                         import.module,
                         import.imported_symbol,
                         import.alias,
                         import.start_line,
                         import.start_column
-                    ],
-                )
-                .map_err(|source| sqlite_error(&database_path, source))?;
+                    ])
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
         }
 
-        for reference in index.references {
-            let symbol_id = match reference.symbol_index {
-                Some(symbol_index) => Some(*symbol_ids.get(symbol_index).ok_or_else(|| {
-                    WorkspaceDatabaseError::InvalidCodeGraphInput {
-                        message: format!("reference points to missing symbol index {symbol_index}"),
-                    }
-                })?),
-                None => None,
-            };
-            transaction
-                .execute(
+        {
+            let mut insert_reference = transaction
+                .prepare(
                     "INSERT INTO code_graph_references
                         (
                             file_id, symbol_id, name, start_line, start_column,
                             end_line, end_column
                         )
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            for reference in index.references {
+                let symbol_id = match reference.symbol_index {
+                    Some(symbol_index) => Some(*symbol_ids.get(symbol_index).ok_or_else(|| {
+                        WorkspaceDatabaseError::InvalidCodeGraphInput {
+                            message: format!(
+                                "reference points to missing symbol index {symbol_index}"
+                            ),
+                        }
+                    })?),
+                    None => None,
+                };
+                insert_reference
+                    .execute(params![
                         file_id,
                         symbol_id,
                         reference.name,
@@ -1259,55 +1300,51 @@ impl WorkspaceDatabase {
                         reference.start_column,
                         reference.end_line,
                         reference.end_column
-                    ],
-                )
-                .map_err(|source| sqlite_error(&database_path, source))?;
+                    ])
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
         }
 
-        for edge in index.edges {
-            let source_symbol_id = *symbol_ids.get(edge.source_symbol_index).ok_or_else(|| {
-                WorkspaceDatabaseError::InvalidCodeGraphInput {
-                    message: format!(
-                        "edge source points to missing symbol index {}",
-                        edge.source_symbol_index
-                    ),
-                }
-            })?;
-            let target_symbol_id = *symbol_ids.get(edge.target_symbol_index).ok_or_else(|| {
-                WorkspaceDatabaseError::InvalidCodeGraphInput {
-                    message: format!(
-                        "edge target points to missing symbol index {}",
-                        edge.target_symbol_index
-                    ),
-                }
-            })?;
-            transaction
-                .execute(
+        {
+            let mut insert_edge = transaction
+                .prepare(
                     "INSERT INTO code_graph_edges
                         (
                             source_symbol_id, target_symbol_id,
                             edge_kind, metadata_json
                         )
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            for edge in index.edges {
+                let source_symbol_id =
+                    *symbol_ids.get(edge.source_symbol_index).ok_or_else(|| {
+                        WorkspaceDatabaseError::InvalidCodeGraphInput {
+                            message: format!(
+                                "edge source points to missing symbol index {}",
+                                edge.source_symbol_index
+                            ),
+                        }
+                    })?;
+                let target_symbol_id =
+                    *symbol_ids.get(edge.target_symbol_index).ok_or_else(|| {
+                        WorkspaceDatabaseError::InvalidCodeGraphInput {
+                            message: format!(
+                                "edge target points to missing symbol index {}",
+                                edge.target_symbol_index
+                            ),
+                        }
+                    })?;
+                insert_edge
+                    .execute(params![
                         source_symbol_id,
                         target_symbol_id,
                         edge.edge_kind,
                         edge.metadata_json.unwrap_or("{}")
-                    ],
-                )
-                .map_err(|source| sqlite_error(&database_path, source))?;
+                    ])
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
         }
-
-        upsert_code_graph_fts_entry(
-            &transaction,
-            &database_path,
-            "file",
-            index.path,
-            index.path,
-            index.fts_body,
-            &now,
-        )?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(&database_path, source))?;
@@ -2817,22 +2854,7 @@ fn clear_code_graph_file_index(
     file_id: i64,
     path: &str,
 ) -> Result<(), WorkspaceDatabaseError> {
-    let symbol_ids = {
-        let mut statement = transaction
-            .prepare("SELECT id FROM code_graph_symbols WHERE file_id = ?1")
-            .map_err(|source| sqlite_error(database_path, source))?;
-        let rows = statement
-            .query_map(params![file_id], |row| row.get::<_, i64>(0))
-            .map_err(|source| sqlite_error(database_path, source))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|source| sqlite_error(database_path, source))?
-    };
-
-    for symbol_id in symbol_ids {
-        delete_code_graph_fts_entry(transaction, database_path, "symbol", &symbol_id.to_string())?;
-    }
-    delete_code_graph_fts_entry(transaction, database_path, "file", path)?;
+    delete_code_graph_file_fts_entries(transaction, database_path, file_id, path)?;
     transaction
         .execute(
             "DELETE FROM code_graph_references WHERE file_id = ?1",
@@ -2855,8 +2877,9 @@ fn clear_code_graph_file_index(
     Ok(())
 }
 
-fn upsert_code_graph_fts_entry(
-    transaction: &Transaction<'_>,
+fn insert_code_graph_fts_entry(
+    insert_fts_data: &mut rusqlite::Statement<'_>,
+    insert_fts_index: &mut rusqlite::Statement<'_>,
     database_path: &Path,
     entity_kind: &str,
     entity_id: &str,
@@ -2864,48 +2887,52 @@ fn upsert_code_graph_fts_entry(
     body: &str,
     updated_at: &str,
 ) -> Result<(), WorkspaceDatabaseError> {
-    delete_code_graph_fts_entry(transaction, database_path, entity_kind, entity_id)?;
-    transaction
-        .execute(
-            "INSERT INTO code_graph_fts_data
-                (entity_kind, entity_id, title, body, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(entity_kind, entity_id) DO UPDATE SET
-                title = excluded.title,
-                body = excluded.body,
-                updated_at = excluded.updated_at",
-            params![entity_kind, entity_id, title, body, updated_at],
-        )
+    insert_fts_data
+        .execute(params![entity_kind, entity_id, title, body, updated_at])
         .map_err(|source| sqlite_error(database_path, source))?;
-    transaction
-        .execute(
-            "INSERT INTO code_graph_fts_index (entity_kind, entity_id, title, body)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![entity_kind, entity_id, title, body],
-        )
+    insert_fts_index
+        .execute(params![entity_kind, entity_id, title, body])
         .map_err(|source| sqlite_error(database_path, source))?;
 
     Ok(())
 }
 
-fn delete_code_graph_fts_entry(
+fn delete_code_graph_file_fts_entries(
     transaction: &Transaction<'_>,
     database_path: &Path,
-    entity_kind: &str,
-    entity_id: &str,
+    file_id: i64,
+    path: &str,
 ) -> Result<(), WorkspaceDatabaseError> {
     transaction
         .execute(
             "DELETE FROM code_graph_fts_index
-             WHERE entity_kind = ?1 AND entity_id = ?2",
-            params![entity_kind, entity_id],
+             WHERE
+                (entity_kind = 'file' AND entity_id = ?1)
+                OR (
+                    entity_kind = 'symbol'
+                    AND entity_id IN (
+                        SELECT CAST(id AS TEXT)
+                        FROM code_graph_symbols
+                        WHERE file_id = ?2
+                    )
+                )",
+            params![path, file_id],
         )
         .map_err(|source| sqlite_error(database_path, source))?;
     transaction
         .execute(
             "DELETE FROM code_graph_fts_data
-             WHERE entity_kind = ?1 AND entity_id = ?2",
-            params![entity_kind, entity_id],
+             WHERE
+                (entity_kind = 'file' AND entity_id = ?1)
+                OR (
+                    entity_kind = 'symbol'
+                    AND entity_id IN (
+                        SELECT CAST(id AS TEXT)
+                        FROM code_graph_symbols
+                        WHERE file_id = ?2
+                    )
+                )",
+            params![path, file_id],
         )
         .map_err(|source| sqlite_error(database_path, source))?;
 
