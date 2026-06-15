@@ -3,7 +3,7 @@ setlocal
 
 set "FOCO_DEV_BACKEND_PORT=33210"
 set "FOCO_DEV_CONFIG_DIR=%USERPROFILE%\.foco-dev"
-set "FOCO_DEV_FRONTEND_PORT=5174"
+set "FOCO_DEV_FRONTEND_PORT=16000"
 
 pushd "%~dp0" || exit /b 1
 
