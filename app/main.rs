@@ -21505,7 +21505,7 @@ description:
         let tool_calls = vec![
             NeutralToolCall {
                 call_id: "call-1".to_string(),
-                name: "list_files".to_string(),
+                name: "find_files".to_string(),
                 arguments: json!({ "path": "." }),
                 thought_signatures: None,
             },
@@ -21519,7 +21519,7 @@ description:
         let tool_results = vec![
             ExecutedToolCall {
                 id: "call-1".to_string(),
-                name: "list_files".to_string(),
+                name: "find_files".to_string(),
                 input: json!({ "path": "." }),
                 output: json!({ "entries": [] }),
                 is_error: false,
@@ -21916,7 +21916,7 @@ description:
         for (id, name, input, output, started_at) in [
             (
                 "call-1",
-                "list_files",
+                "find_files",
                 r#"{"path":"."}"#,
                 r#"{"entries":[]}"#,
                 "2026-06-05T07:00:00Z",

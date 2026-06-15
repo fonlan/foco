@@ -9,7 +9,7 @@ const CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR: u64 = 5;
 pub const WRITE_FILE_TOOL_NAME: &str = "write_file";
 pub const EDIT_FILE_TOOL_NAME: &str = "edit_file";
 const READ_FILE_TOOL_NAME: &str = "read_file";
-const LIST_FILES_TOOL_NAME: &str = "list_files";
+const FIND_FILES_TOOL_NAME: &str = "find_files";
 const SEARCH_TEXT_TOOL_NAME: &str = "search_text";
 const RUN_COMMAND_TOOL_NAME: &str = "run_command";
 const GRAPH_FIND_SYMBOLS_TOOL_NAME: &str = "graph_find_symbols";
@@ -165,7 +165,7 @@ pub fn default_system_prompt_body() -> String {
         "You are Foco, a local coding agent running inside the user's browser-based workspace. You and the user share the same workspace and collaborate to achieve the user's goals.\n\n\
          You are a deeply pragmatic, effective software engineer. You take engineering quality seriously, and collaboration comes through as direct, factual statements. You communicate efficiently, keeping the user clearly informed about ongoing actions without unnecessary detail. You build context by examining the codebase first without making assumptions or jumping to conclusions. You think through the nuances of the code you encounter, and embody the mentality of a skilled senior software engineer.\n\n\
          - Prefer code graph tools before text search when locating symbols, callers, callees, references, or related files.\n\
-         - Use search_text for literal text, config keys, and error messages when available; it is powered by rg. Use list_files for file discovery when available.\n\
+         - Use search_text for literal text, config keys, and error messages when available; it is powered by ripgrep/rg. Use find_files for glob-based file discovery when available.\n\
          - Use only tools that are actually available in the current run. The next system message lists the current tool names and descriptions.\n\
          - Built-in file tools use workspace-relative paths. Use \".\" for the workspace root.\n\
          - Command execution tools run a command plus args directly. Put the executable in command and each argument in args. Do not concatenate shell commands into one string unless you explicitly invoke the detected shell.\n\
@@ -486,7 +486,7 @@ pub fn tool_resource_locks(
             resource: ToolResource::File(required_path(tool_call)?),
             access: ToolResourceAccess::Write,
         }]),
-        LIST_FILES_TOOL_NAME
+        FIND_FILES_TOOL_NAME
         | SEARCH_TEXT_TOOL_NAME
         | GRAPH_FIND_SYMBOLS_TOOL_NAME
         | GRAPH_FIND_CALLERS_TOOL_NAME

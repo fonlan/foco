@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const READ_FILE_TOOL: &str = "read_file";
-pub const LIST_FILES_TOOL: &str = "list_files";
+pub const FIND_FILES_TOOL: &str = "find_files";
 pub const SEARCH_TEXT_TOOL: &str = "search_text";
 pub const WRITE_FILE_TOOL: &str = "write_file";
 pub const EDIT_FILE_TOOL: &str = "edit_file";
@@ -44,7 +44,7 @@ pub const ASK_QUESTION_TOOL: &str = "ask_question";
 const MAX_FULL_READ_BYTES: u64 = 1024 * 1024;
 const MAX_RANGED_READ_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RANGED_READ_OUTPUT_BYTES: usize = 512 * 1024;
-const MAX_LIST_ENTRIES: usize = 200;
+const MAX_FIND_ENTRIES: usize = 200;
 const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_GRAPH_RESULT_LIMIT: usize = 20;
@@ -100,7 +100,7 @@ impl ToolCancellationToken {
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         read_file_definition(),
-        list_files_definition(),
+        find_files_definition(),
         graph_find_symbols_definition(),
         graph_find_callers_definition(),
         graph_find_callees_definition(),
@@ -197,7 +197,7 @@ fn tool_error_output(error: &ToolRuntimeError) -> Value {
 
 pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64, String> {
     let default_timeout_ms = match tool_name {
-        READ_FILE_TOOL | LIST_FILES_TOOL => DEFAULT_FILE_TOOL_TIMEOUT_MS,
+        READ_FILE_TOOL | FIND_FILES_TOOL => DEFAULT_FILE_TOOL_TIMEOUT_MS,
         GRAPH_FIND_SYMBOLS_TOOL
         | GRAPH_FIND_CALLERS_TOOL
         | GRAPH_FIND_CALLEES_TOOL
@@ -230,7 +230,7 @@ fn execute_builtin_tool_inner(
 ) -> Result<Value, ToolRuntimeError> {
     match tool_name {
         READ_FILE_TOOL => read_file(workspace_path, arguments),
-        LIST_FILES_TOOL => list_files(workspace_path, arguments),
+        FIND_FILES_TOOL => find_files(workspace_path, arguments),
         GRAPH_FIND_SYMBOLS_TOOL => graph_find_symbols(workspace_path, arguments),
         GRAPH_FIND_CALLERS_TOOL => graph_find_callers(workspace_path, arguments),
         GRAPH_FIND_CALLEES_TOOL => graph_find_callees(workspace_path, arguments),
@@ -316,8 +316,8 @@ fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunti
     }))
 }
 
-fn list_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: ListFilesInput = parse_arguments(arguments)?;
+fn find_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+    let request: FindFilesInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
     let input_path = request.path;
     let path = resolve_workspace_path(workspace_path, &input_path)?;
@@ -331,51 +331,16 @@ fn list_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
         return Err(ToolRuntimeError::NotDirectory(path));
     }
 
-    let mut entries = fs::read_dir(&path)
-        .map_err(|source| ToolRuntimeError::Io {
-            path: path.clone(),
-            source,
-        })?
-        .map(|entry| {
-            let entry = entry.map_err(|source| ToolRuntimeError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            let entry_path = entry.path();
-            let metadata = entry.metadata().map_err(|source| ToolRuntimeError::Io {
-                path: entry_path.clone(),
-                source,
-            })?;
-            let kind = if metadata.is_dir() {
-                "directory"
-            } else if metadata.is_file() {
-                "file"
-            } else {
-                "other"
-            };
-            let relative_path = relative_workspace_path(workspace_path, &entry_path)?;
-            if !filter.matches(&relative_path) {
-                return Ok(None);
-            }
-
-            Ok(Some(json!({
-                "path": relative_path,
-                "kind": kind,
-                "bytes": if metadata.is_file() { Some(metadata.len()) } else { None }
-            })))
-        })
-        .collect::<Result<Vec<_>, ToolRuntimeError>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    find_files_in_directory(workspace_path, &path, &filter, &mut entries)?;
 
     entries.sort_by(|left, right| {
         left.get("path")
             .and_then(Value::as_str)
             .cmp(&right.get("path").and_then(Value::as_str))
     });
-    let truncated = entries.len() > MAX_LIST_ENTRIES;
-    entries.truncate(MAX_LIST_ENTRIES);
+    let truncated = entries.len() > MAX_FIND_ENTRIES;
+    entries.truncate(MAX_FIND_ENTRIES);
 
     Ok(json!({
         "path": input_path,
@@ -385,6 +350,62 @@ fn list_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
         "truncated": truncated,
         "timeoutMs": timeout_ms
     }))
+}
+
+fn find_files_in_directory(
+    workspace_path: &Path,
+    directory_path: &Path,
+    filter: &GlobFilter,
+    entries: &mut Vec<Value>,
+) -> Result<(), ToolRuntimeError> {
+    let mut directory_entries = fs::read_dir(directory_path)
+        .map_err(|source| ToolRuntimeError::Io {
+            path: directory_path.to_path_buf(),
+            source,
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| ToolRuntimeError::Io {
+            path: directory_path.to_path_buf(),
+            source,
+        })?;
+    directory_entries.sort_by_key(|entry| entry.path());
+
+    for entry in directory_entries {
+        if entries.len() > MAX_FIND_ENTRIES {
+            return Ok(());
+        }
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|source| ToolRuntimeError::Io {
+            path: entry_path.clone(),
+            source,
+        })?;
+        let metadata = entry.metadata().map_err(|source| ToolRuntimeError::Io {
+            path: entry_path.clone(),
+            source,
+        })?;
+        let kind = if file_type.is_dir() {
+            "directory"
+        } else if file_type.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        let relative_path = relative_workspace_path(workspace_path, &entry_path)?;
+
+        if filter.matches(&relative_path) {
+            entries.push(json!({
+                "path": relative_path,
+                "kind": kind,
+                "bytes": if file_type.is_file() { Some(metadata.len()) } else { None }
+            }));
+        }
+
+        if file_type.is_dir() {
+            find_files_in_directory(workspace_path, &entry_path, filter, entries)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn graph_find_symbols(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
@@ -1822,17 +1843,17 @@ fn read_file_definition() -> ToolDefinition {
     }
 }
 
-fn list_files_definition() -> ToolDefinition {
+fn find_files_definition() -> ToolDefinition {
     ToolDefinition {
-        name: LIST_FILES_TOOL,
-        description: "List files and directories in a workspace-relative directory, optionally filtered by glob patterns.",
+        name: FIND_FILES_TOOL,
+        description: "Find files and directories under a workspace-relative directory using optional glob include/exclude patterns.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative directory path. Use . for the workspace root."
+                    "description": "Workspace-relative directory path to search recursively. Use . for the workspace root."
                 },
                 "include": {
                     "type": ["array", "null"],
@@ -2025,7 +2046,7 @@ fn graph_related_files_definition() -> ToolDefinition {
 fn search_text_definition() -> ToolDefinition {
     ToolDefinition {
         name: SEARCH_TEXT_TOOL,
-        description: "Search workspace text with ripgrep and return matching lines.",
+        description: "Search workspace text and return matching lines. Powered by ripgrep/rg; the query uses rg pattern syntax.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2425,7 +2446,7 @@ struct ReadFileInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ListFilesInput {
+struct FindFilesInput {
     path: String,
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
@@ -2891,32 +2912,37 @@ mod tests {
     }
 
     #[test]
-    fn lists_workspace_files() {
+    fn finds_workspace_files() {
         let workspace = tempfile::tempdir().expect("workspace");
         fs::write(workspace.path().join("a.txt"), "a").expect("write a");
+        fs::create_dir(workspace.path().join("nested")).expect("create nested");
+        fs::write(workspace.path().join("nested").join("b.txt"), "b").expect("write b");
 
         let result =
-            execute_builtin_tool(workspace.path(), LIST_FILES_TOOL, json!({ "path": "." }));
+            execute_builtin_tool(workspace.path(), FIND_FILES_TOOL, json!({ "path": "." }));
 
         assert!(!result.is_error);
         let entries = result.output["entries"].as_array().expect("entries");
         assert_eq!(entries[0]["path"], "a.txt");
+        assert_eq!(entries[1]["path"], "nested");
+        assert_eq!(entries[2]["path"], "nested/b.txt");
     }
 
     #[test]
-    fn lists_workspace_files_with_glob_filters() {
+    fn finds_workspace_files_with_glob_filters() {
         let workspace = tempfile::tempdir().expect("workspace");
-        fs::write(workspace.path().join("a.rs"), "a").expect("write a");
+        fs::create_dir(workspace.path().join("src")).expect("create src");
+        fs::write(workspace.path().join("src").join("lib.rs"), "a").expect("write lib");
         fs::write(workspace.path().join("b.txt"), "b").expect("write b");
-        fs::write(workspace.path().join("test.rs"), "test").expect("write test");
+        fs::write(workspace.path().join("src").join("test.rs"), "test").expect("write test");
 
         let result = execute_builtin_tool(
             workspace.path(),
-            LIST_FILES_TOOL,
+            FIND_FILES_TOOL,
             json!({
                 "path": ".",
-                "include": ["*.rs"],
-                "exclude": ["test.rs"],
+                "include": ["**/*.rs"],
+                "exclude": ["**/test.rs"],
                 "timeoutMs": null
             }),
         );
@@ -2924,14 +2950,14 @@ mod tests {
         assert!(!result.is_error);
         let entries = result.output["entries"].as_array().expect("entries");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["path"], "a.rs");
+        assert_eq!(entries[0]["path"], "src/lib.rs");
     }
 
     #[test]
     fn rejects_missing_required_tool_arguments() {
         let workspace = tempfile::tempdir().expect("workspace");
 
-        let result = execute_builtin_tool(workspace.path(), LIST_FILES_TOOL, json!({}));
+        let result = execute_builtin_tool(workspace.path(), FIND_FILES_TOOL, json!({}));
 
         assert!(result.is_error);
         assert!(

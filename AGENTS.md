@@ -97,7 +97,7 @@
 - assistant 气泡完成后必须在底部小字显示该次回复的模型、provider 渠道、总耗时、输出 token/s 和首 token 延迟；这些指标来自同一条 `llm_requests` 审计记录，历史回读不得从消息文本或 UI 状态推断。
 - 浏览器工具调用折叠摘要必须直接显示关键输入细节，例如 `read_file` 的文件路径和 `run_command` 的完整命令；展开后继续显示完整 Input/Output JSON。
 - 浏览器聊天消息列表在用户未主动向上滚动时会随消息追加、流式更新和内容尺寸变化锁定到底部；用户滚离底部后停止自动滚动，切换 chat 时重新默认锁定底部。
-- 内置工具运行时位于 `tools/lib.rs`，当前提供 `read_file`、`list_files`、`graph_find_symbols`、`graph_find_callers`、`graph_find_callees`、`graph_find_references`、`graph_related_files`、`search_text`、`write_file`、`edit_file`、`create_todo_graph`、`update_todo_graph`、`get_todo_graph`、`ask_question`、`run_command` 和 `sleep`。
+- 内置工具运行时位于 `tools/lib.rs`，当前提供 `read_file`、`find_files`、`graph_find_symbols`、`graph_find_callers`、`graph_find_callees`、`graph_find_references`、`graph_related_files`、`search_text`、`write_file`、`edit_file`、`create_todo_graph`、`update_todo_graph`、`get_todo_graph`、`ask_question`、`run_command` 和 `sleep`。
 - todo graph 工具绑定当前 chat：`create_todo_graph` 创建或替换当前 chat 的 ToDo 图，task 必须包含 `id`、`title`、`status`、`dependsOn`、`acceptance`、`summary`、`createdAt`、`updatedAt` 和 `subtasks`，其中时间戳由后端生成并覆盖输入值。
 - todo graph 状态只允许 `pending`、`ready`、`running`、`blocked`、`completed`、`failed` 和 `cancelled`；task id 必须全图唯一，`dependsOn` 必须指向已存在 task，不能自依赖或形成环。
 - `update_todo_graph` 只接受某个 task 的 patch，不接受整图替换；patch 至少修改一个字段，替换 subtasks 时会重新生成这些 subtask 的时间戳。
@@ -106,7 +106,7 @@
 - 内置工具 schema 必须包含 `timeoutMs`；传 `null` 时使用工具默认值，执行命令类工具必须在超时后终止进程并明确报错。`ask_question` 是唯一例外：它不接受 `timeoutMs`，必须通过聊天 UI 弹窗等待用户回答或等待 run 取消。
 - 文件工具只接受 workspace-relative 路径，必须 canonicalize 后仍位于当前 workspace 内；绝对路径、父目录逃逸和 Windows prefix/root 组件都应明确报错。
 - `read_file` 支持可选的 1-based 闭区间 `startLine`/`endLine` 行过滤；两者必须同时为整数或同时为 `null`，越界时明确报错。
-- `list_files` 支持可选 `include` 和 `exclude` glob 数组，规则匹配返回的 workspace-relative path；无效或空 glob 必须明确报错。
+- `find_files` 递归查找指定 workspace-relative 目录下的文件和目录，支持可选 `include` 和 `exclude` glob 数组，规则匹配返回的 workspace-relative path；无效或空 glob 必须明确报错。
 - `search_text` 通过 `rg --json` 执行，并返回 workspace-relative path、line、text 和 truncated 状态。
 - `write_file` 支持完整文件写入，也支持用 1-based 闭区间 `startLine`/`endLine` 替换已有文件指定行；已有文件按原编码写回，支持 UTF-8、UTF-8 BOM、UTF-16 LE BOM 和 UTF-16 BE BOM，不支持的编码必须明确报错；新建文件默认写 UTF-8；目标父目录必须已存在，文件可新建或覆盖，不创建缺失目录。
 - `edit_file` 支持对已有文本文件做精确字符串替换；调用前必须先用 `read_file` 获取最新文件内容，`oldStr` 必须来自当前文件内容；`replaceAll` 为 `false` 或 `null` 时必须只匹配一次，匹配 0 次或多次都明确报错，只有 `replaceAll=true` 时允许批量替换；成功后按原文件编码写回，不支持的编码必须明确报错。
