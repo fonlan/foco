@@ -12385,15 +12385,34 @@ function TodoGraphTaskItem({
   task: TodoGraphTask;
 }) {
   const { t } = useI18n();
+  const [isExpanded, setIsExpanded] = useState(false);
+  const bodyId = `todo-graph-task-${task.id}-body`;
 
   return (
     <div>
       <div
-        className="rounded-lg border border-stone-200 bg-white px-3 py-2 shadow-sm"
+        className="rounded-lg border border-stone-200 bg-white shadow-sm transition hover:border-stone-300 hover:bg-stone-50"
         style={{ marginLeft: level ? Math.min(level * 14, 42) : 0 }}
       >
-        <div className="flex min-w-0 items-start justify-between gap-2">
-          <div className="min-w-0">
+        <button
+          aria-controls={bodyId}
+          aria-expanded={isExpanded}
+          className="flex w-full min-w-0 items-start gap-2 px-3 py-2 text-left focus:outline-none focus:ring-2 focus:ring-inset focus:ring-stone-300"
+          onClick={() => setIsExpanded((current) => !current)}
+          type="button"
+        >
+          {isExpanded ? (
+            <ChevronDown
+              aria-hidden="true"
+              className="mt-0.5 size-3.5 shrink-0 text-stone-500"
+            />
+          ) : (
+            <ChevronRight
+              aria-hidden="true"
+              className="mt-0.5 size-3.5 shrink-0 text-stone-500"
+            />
+          )}
+          <div className="min-w-0 flex-1">
             <div className="flex min-w-0 flex-wrap items-center gap-2">
               <span className="font-mono text-[11px] font-semibold text-stone-500">
                 {task.id}
@@ -12402,40 +12421,52 @@ function TodoGraphTaskItem({
                 {t(task.status)}
               </span>
             </div>
-            <h3 className="mt-1 break-words text-sm font-semibold leading-snug text-stone-950">
+            <h3
+              className={`mt-1 break-words text-sm font-semibold leading-snug text-stone-950 ${
+                isExpanded ? "" : "line-clamp-2"
+              }`}
+            >
               {task.title}
             </h3>
-          </div>
-        </div>
-        {task.summary ? (
-          <p className="mt-2 break-words text-xs leading-5 text-stone-600">
-            {task.summary}
-          </p>
-        ) : null}
-        {task.dependsOn.length ? (
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {task.dependsOn.map((dependencyId) => (
-              <span
-                className="rounded-md bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600"
-                key={dependencyId}
+            {task.summary ? (
+              <p
+                className={`mt-1 break-words text-xs leading-5 text-stone-600 ${
+                  isExpanded ? "" : "line-clamp-2"
+                }`}
               >
-                {dependencyId}
-              </span>
-            ))}
+                {task.summary}
+              </p>
+            ) : null}
           </div>
-        ) : null}
-        {task.acceptance.length ? (
-          <ul className="mt-2 space-y-1 text-xs leading-5 text-stone-600">
-            {task.acceptance.map((item, index) => (
-              <li className="flex gap-2" key={`${task.id}-acceptance-${index}`}>
-                <CheckCircle2
-                  aria-hidden="true"
-                  className="mt-0.5 size-3.5 shrink-0 text-teal-700"
-                />
-                <span className="min-w-0 break-words">{item}</span>
-              </li>
-            ))}
-          </ul>
+        </button>
+        {isExpanded ? (
+          <div className="px-3 pb-2 pl-8" id={bodyId}>
+            {task.dependsOn.length ? (
+              <div className="mt-1 flex flex-wrap gap-1.5">
+                {task.dependsOn.map((dependencyId) => (
+                  <span
+                    className="rounded-md bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600"
+                    key={dependencyId}
+                  >
+                    {dependencyId}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+            {task.acceptance.length ? (
+              <ul className="mt-2 space-y-1 text-xs leading-5 text-stone-600">
+                {task.acceptance.map((item, index) => (
+                  <li className="flex gap-2" key={`${task.id}-acceptance-${index}`}>
+                    <CheckCircle2
+                      aria-hidden="true"
+                      className="mt-0.5 size-3.5 shrink-0 text-teal-700"
+                    />
+                    <span className="min-w-0 break-words">{item}</span>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
         ) : null}
       </div>
       {task.subtasks.length ? (
