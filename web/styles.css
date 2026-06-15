@@ -2453,6 +2453,41 @@ body,
   flex: 1 1 auto;
 }
 
+.composer-send-button-shell {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.composer-send-tooltip {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 0.5rem);
+  z-index: 40;
+  width: max-content;
+  max-width: 12rem;
+  border-radius: 0.5rem;
+  background: var(--foco-primary);
+  padding: 0.3125rem 0.5rem;
+  color: #ffffff;
+  font-size: var(--foco-font-micro);
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+  box-shadow: 0 12px 28px rgba(28, 25, 23, 0.18);
+}
+
+.composer-send-tooltip::after {
+  content: "";
+  position: absolute;
+  right: 0.625rem;
+  bottom: -0.25rem;
+  width: 0.5rem;
+  height: 0.5rem;
+  transform: rotate(45deg);
+  background: var(--foco-primary);
+}
+
 .message-composer-control-row .composer-tool-button,
 .message-composer-control-row .composer-run-button,
 .message-composer-control-row .context-usage-circle {

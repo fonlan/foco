@@ -1425,7 +1425,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Send guidance. Ctrl+click queues.": "发送引导。Ctrl+点击进入队列。",
     "Send guidance. Ctrl+click queues. {count} queued.":
       "发送引导。Ctrl+点击进入队列。已排队 {count} 条。",
-    "Send to queue": "发送到队列",
+    "Send to queue": "发送至队列",
     "No active run is available for guidance.":
       "当前没有可引导的运行。",
     "Guidance pending": "引导待生效",
@@ -7914,6 +7914,7 @@ function ChatPanel({
   const shouldLockMessageScrollRef = useRef(true);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
+  const [isSendButtonTooltipOpen, setIsSendButtonTooltipOpen] = useState(false);
   const skillQuery = activeSkillQuery(draftMessage);
   const selectedSkillSet = new Set(selectedSkillIds);
   const selectedSkills = selectedSkillIds
@@ -7973,6 +7974,7 @@ function ChatPanel({
       : t("Send guidance. Ctrl+click queues.")
     : t("Cancel run");
   const sendButtonTitle = isCtrlKeyPressed ? t("Send to queue") : t("Send");
+  const showSendButtonTooltip = isSendButtonTooltipOpen && !isSendingMessage;
 
   function scrollMessageListToBottom() {
     messageScrollEndRef.current?.scrollIntoView({
@@ -8086,6 +8088,10 @@ function ChatPanel({
     window.requestAnimationFrame(() => messageTextareaRef.current?.focus());
   }
 
+  function isQueueModifierActive(event: { ctrlKey: boolean }) {
+    return event.ctrlKey || isCtrlKeyPressed;
+  }
+
   function handleRunningRunButtonClick(
     event: ReactMouseEvent<HTMLButtonElement>,
   ) {
@@ -8095,7 +8101,7 @@ function ChatPanel({
       return;
     }
 
-    if (event.ctrlKey) {
+    if (isQueueModifierActive(event)) {
       onQueueActiveRun();
       return;
     }
@@ -8384,7 +8390,7 @@ function ChatPanel({
                 }
 
                 event.preventDefault();
-                if (event.ctrlKey) {
+                if (isQueueModifierActive(event)) {
                   onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
                     schedule: true,
                   });
@@ -8541,31 +8547,51 @@ function ChatPanel({
                   )}
                 </button>
               ) : (
-                <button
-                  aria-label={t("Send message")}
-                  className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-                  disabled={
-                    (!draftMessage.trim() && !draftAttachments.length) ||
-                    !selectedModelId
-                  }
-                  onClick={(event) => {
-                    if (event.ctrlKey) {
-                      event.preventDefault();
-                      const form = event.currentTarget.form;
-                      if (!form) {
-                        return;
-                      }
-
-                      onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
-                        schedule: true,
-                      });
-                    }
-                  }}
-                  title={sendButtonTitle}
-                  type="submit"
+                <span
+                  className="composer-send-button-shell"
+                  onBlur={() => setIsSendButtonTooltipOpen(false)}
+                  onFocus={() => setIsSendButtonTooltipOpen(true)}
+                  onMouseEnter={() => setIsSendButtonTooltipOpen(true)}
+                  onMouseLeave={() => setIsSendButtonTooltipOpen(false)}
                 >
-                  <Send aria-hidden="true" className="size-4" />
-                </button>
+                  <button
+                    aria-describedby={
+                      showSendButtonTooltip ? "composer-send-button-tooltip" : undefined
+                    }
+                    aria-label={t("Send message")}
+                    className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                    disabled={
+                      (!draftMessage.trim() && !draftAttachments.length) ||
+                      !selectedModelId
+                    }
+                    onClick={(event) => {
+                      if (isQueueModifierActive(event)) {
+                        event.preventDefault();
+                        const form = event.currentTarget.form;
+                        if (!form) {
+                          return;
+                        }
+
+                        onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
+                          schedule: true,
+                        });
+                      }
+                    }}
+                    title={sendButtonTitle}
+                    type="submit"
+                  >
+                    <Send aria-hidden="true" className="size-4" />
+                  </button>
+                  {showSendButtonTooltip ? (
+                    <span
+                      className="composer-send-tooltip"
+                      id="composer-send-button-tooltip"
+                      role="tooltip"
+                    >
+                      {sendButtonTitle}
+                    </span>
+                  ) : null}
+                </span>
               )}
             </div>
           </div>
