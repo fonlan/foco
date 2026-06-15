@@ -30,7 +30,27 @@ pub fn init(log_dir: &Path) -> Result<(), LoggingError> {
         .try_init()
         .map_err(LoggingError::Subscriber)?;
 
+    install_panic_hook();
+
     Ok(())
+}
+
+// Routes panics from every thread through the daily log file via tracing. The
+// previous hook is chained so the default stderr output is preserved.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::capture();
+        let thread = std::thread::current();
+        tracing::error!(
+            target: "panic",
+            thread = thread.name().unwrap_or("<unnamed>"),
+            message = %info,
+            backtrace = %backtrace,
+            "process panic captured",
+        );
+        default_hook(info);
+    }));
 }
 
 #[derive(Debug)]
