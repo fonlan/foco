@@ -1131,6 +1131,11 @@ type ChatStreamEvent =
       assistantMessageId: string;
       extractedMemories: ChatExtractedMemorySummary[];
     }
+  | {
+      type: "memoryResolved";
+      assistantMessageId: string;
+      memoriesUsed: ChatMemoryUsedSummary[];
+    }
   | { type: "error"; message: string };
 
 type HookNotificationSummary = {
@@ -5327,6 +5332,20 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "memoryResolved") {
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? assistantMessageWithMemoriesUsed(
+                    message,
+                    streamEvent.memoriesUsed,
+                  )
+                : message,
+            ),
+          );
+          return;
+        }
+
         if (streamEvent.type === "error") {
           streamHadError = true;
           setChatRunFailed(chatKey, true);
@@ -5947,6 +5966,20 @@ export function App() {
                 ? assistantMessageWithExtractedMemories(
                     message,
                     streamEvent.extractedMemories,
+                  )
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "memoryResolved") {
+          setMessagesForChatKey(runMessagesKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? assistantMessageWithMemoriesUsed(
+                    message,
+                    streamEvent.memoriesUsed,
                   )
                 : message,
             ),
@@ -21038,6 +21071,16 @@ function assistantMessageWithExtractedMemories(
   };
 }
 
+function assistantMessageWithMemoriesUsed(
+  message: ShellMessage,
+  memoriesUsed: ChatMemoryUsedSummary[],
+): ShellMessage {
+  return {
+    ...message,
+    memoriesUsed,
+  };
+}
+
 function assistantMessageWithAppendedError(
   message: ShellMessage,
   errorText: string,
@@ -23118,6 +23161,27 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       type: "memoryExtractionComplete",
       assistantMessageId,
       extractedMemories,
+    };
+  }
+
+  if (value.type === "memoryResolved" || value.type === "memory_resolved") {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const memoriesUsed = parseChatMemoriesUsed(
+      fieldValue(value, "memoriesUsed", "memories_used"),
+    );
+
+    if (!assistantMessageId || memoriesUsed === false) {
+      return null;
+    }
+
+    return {
+      type: "memoryResolved",
+      assistantMessageId,
+      memoriesUsed,
     };
   }
 

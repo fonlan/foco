@@ -4271,8 +4271,7 @@ async fn ai_statistics(
     let mut merged_summary: Option<LlmRequestAuditSummaryRow> = None;
     let mut merged_trend: BTreeMap<String, LlmRequestAuditTrendPoint> = BTreeMap::new();
     let mut merged_models: BTreeMap<String, LlmRequestAuditModelBreakdown> = BTreeMap::new();
-    let mut merged_providers: BTreeMap<String, LlmRequestAuditProviderBreakdown> =
-        BTreeMap::new();
+    let mut merged_providers: BTreeMap<String, LlmRequestAuditProviderBreakdown> = BTreeMap::new();
     let mut total_count = 0_i64;
     let page_limit = filters
         .offset
@@ -5994,6 +5993,10 @@ enum ChatSseEvent {
         assistant_message_id: String,
         extracted_memories: Vec<ChatExtractedMemorySummary>,
     },
+    MemoryResolved {
+        assistant_message_id: String,
+        memories_used: Vec<ChatMemoryUsedSummary>,
+    },
     Usage {
         usage: NeutralUsage,
     },
@@ -6048,6 +6051,7 @@ struct PreparedChatContext {
     hook_notifications: Vec<HookNotification>,
     initial_git_diff_stats: Option<GitDiffStatsByFile>,
     code_change_stats: CodeChangeStats,
+    pending_memory_retrieval: Option<PendingMemoryRetrieval>,
 }
 
 struct PreparedPromptContext {
@@ -6071,6 +6075,22 @@ struct PreparedPromptContext {
     attachments: Vec<NeutralChatAttachment>,
     next_message_sequence: i64,
     pending_context_injections: Vec<PendingPromptContextInjection>,
+    pending_memory_retrieval: Option<PendingMemoryRetrieval>,
+}
+
+#[derive(Clone)]
+struct PendingMemoryRetrieval {
+    workspace: WorkspaceConfig,
+    chat_id_for_retrieval: Option<String>,
+    query_text: Option<String>,
+    chat_model: ModelSettings,
+    chat_provider: ProviderSettings,
+    purpose: PromptAssemblyPurpose,
+    excluded_memory_keys: HashSet<String>,
+    split_stable_memory: bool,
+    stable_insert_index: usize,
+    turn_insert_index: usize,
+    user_sequence: i64,
 }
 
 struct PendingPromptContextInjection {
@@ -6815,6 +6835,66 @@ impl PreparedChatContext {
                 &self.hook_context_messages,
             );
             self.hook_context_messages.clear();
+
+            // Resolve deferred memory retrieval now that the `start` event has
+            // been emitted and the chat record is visible in the workspace.
+            // Retrieval is advisory: a failure leaves the run without memory
+            // context, but it must not block the newly created chat.
+            if self.pending_memory_retrieval.is_some() {
+                let global_config = self.global_config.clone();
+                match self.resolve_pending_memory(&global_config).await {
+                    Ok(()) => {
+                        let memories_used = self.memories_used.clone();
+                        let assistant_message_id = self.assistant_message_id.clone();
+                        let event = ChatSseEvent::MemoryResolved {
+                            assistant_message_id,
+                            memories_used,
+                        };
+                        events.push(captured_event(&event));
+                        yield event;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error.message,
+                            chat_id = %self.chat_id,
+                            "deferred memory retrieval failed; continuing without memory"
+                        );
+                        if let Err(error) = self.finalize_prompt_without_memory() {
+                            let message = error.message;
+                            let event = ChatSseEvent::Error {
+                                message: message.clone(),
+                            };
+                            events.push(captured_event(&event));
+                            let outcome = failed_chat_audit_outcome(
+                                &self,
+                                started_at,
+                                &mut events,
+                                &message,
+                                None,
+                            )
+                            .await;
+
+                            if let Err(persist_error) = persist_chat_result(
+                                &self,
+                                &request_started_at,
+                                outcome,
+                                &events,
+                                None,
+                                None,
+                                &[],
+                            ) {
+                                yield ChatSseEvent::Error {
+                                    message: persist_error.message,
+                                };
+                            } else {
+                                yield event;
+                            }
+
+                            return;
+                        }
+                    }
+                }
+            }
 
             let mut turn_index = 0usize;
             let mut tool_rounds_since_last_compression = 0usize;
@@ -8481,23 +8561,39 @@ async fn prepare_prompt_context(
         &prompt_context_injections,
         &active_stored_memory_keys,
     )?;
-    let memory_context = memory_prompt_context(
-        state,
-        config,
-        workspace,
-        chat_id.as_deref(),
-        raw_message.as_deref(),
-        model,
-        provider,
-        &context_budget,
-        purpose,
-        &active_stored_memory_keys,
-        is_new_chat,
-    )
-    .await?;
+    // For chat runs, memory retrieval is deferred to a later phase so that chat
+    // record creation and the stream's `start` event are not blocked by
+    // potentially slow memory lookups (e.g. LLM-based retrieval). The retrieval
+    // inputs are captured here and applied after the chat has been persisted.
+    // Context preview builds must keep memory inline so the usage estimate stays
+    // accurate.
+    let defer_memory = config.memory.enabled && matches!(purpose, PromptAssemblyPurpose::ChatRun);
+    let memory_context = if defer_memory {
+        None
+    } else {
+        Some(
+            memory_prompt_context(
+                &state.memory_database_file,
+                config,
+                workspace,
+                chat_id.as_deref(),
+                raw_message.as_deref(),
+                model,
+                provider,
+                &context_budget,
+                purpose,
+                &active_stored_memory_keys,
+                is_new_chat,
+            )
+            .await?,
+        )
+    };
     let mut stable_context_messages = if is_new_chat {
         let mut messages = Vec::new();
-        if let Some(message) = memory_context.stable_message.clone() {
+        if let Some(message) = memory_context
+            .as_ref()
+            .and_then(|context| context.stable_message.clone())
+        {
             messages.push(message);
         }
         messages.extend(agents_messages);
@@ -8509,25 +8605,31 @@ async fn prepare_prompt_context(
         existing_stable_context_messages
     };
     let current_turn_memory_messages = memory_context
-        .turn_message
-        .clone()
+        .as_ref()
+        .and_then(|context| context.turn_message.clone())
         .into_iter()
         .collect::<Vec<_>>();
     let mut pending_context_injections = Vec::new();
-    if is_new_chat && !stable_context_messages.is_empty() {
+    if !defer_memory && is_new_chat && !stable_context_messages.is_empty() {
         pending_context_injections.push(PendingPromptContextInjection {
             kind: "stable",
             sequence: None,
             messages: stable_context_messages.clone(),
-            memory_keys: memory_context.stable_memory_keys.clone(),
+            memory_keys: memory_context
+                .as_ref()
+                .map(|context| context.stable_memory_keys.clone())
+                .unwrap_or_default(),
         });
     }
-    if !current_turn_memory_messages.is_empty() {
+    if !defer_memory && !current_turn_memory_messages.is_empty() {
         pending_context_injections.push(PendingPromptContextInjection {
             kind: "turn_memory",
             sequence: Some(user_sequence),
             messages: current_turn_memory_messages.clone(),
-            memory_keys: memory_context.turn_memory_keys.clone(),
+            memory_keys: memory_context
+                .as_ref()
+                .map(|context| context.turn_memory_keys.clone())
+                .unwrap_or_default(),
         });
     }
     let mut neutral_messages = Vec::with_capacity(
@@ -8553,6 +8655,7 @@ async fn prepare_prompt_context(
         message_source_sequences.push(None);
         message_context_sources.push(PromptContextSource::ReservedPrompt);
     }
+    let stable_insert_index = neutral_messages.len();
     for stable_context_message in stable_context_messages.drain(..) {
         neutral_messages.push(stable_context_message);
         message_source_sequences.push(None);
@@ -8607,6 +8710,7 @@ async fn prepare_prompt_context(
             sequence: user_sequence,
         });
     }
+    let turn_insert_index = neutral_messages.len();
     for turn_memory_message in current_turn_memory_messages {
         neutral_messages.push(turn_memory_message);
         message_source_sequences.push(Some(user_sequence));
@@ -8615,6 +8719,24 @@ async fn prepare_prompt_context(
         });
     }
     let active_tool_start_index = neutral_messages.len();
+
+    let pending_memory_retrieval = if defer_memory {
+        Some(PendingMemoryRetrieval {
+            workspace: workspace.clone(),
+            chat_id_for_retrieval: chat_id.clone(),
+            query_text: raw_message.clone(),
+            chat_model: model.clone(),
+            chat_provider: provider.clone(),
+            purpose,
+            excluded_memory_keys: active_stored_memory_keys,
+            split_stable_memory: is_new_chat,
+            stable_insert_index,
+            turn_insert_index,
+            user_sequence,
+        })
+    } else {
+        None
+    };
 
     let provider_request = NeutralChatRequest {
         model_id: model.id.clone(),
@@ -8634,9 +8756,17 @@ async fn prepare_prompt_context(
         provider_config,
         provider_request,
         context_budget,
-        memory_context_tokens: memory_context.context_tokens,
-        memory_budget_tokens: memory_context.budget_tokens,
-        memories_used: memory_context.memories_used,
+        memory_context_tokens: memory_context
+            .as_ref()
+            .map(|context| context.context_tokens)
+            .unwrap_or(0),
+        memory_budget_tokens: memory_context
+            .as_ref()
+            .map(|context| context.budget_tokens)
+            .unwrap_or(0),
+        memories_used: memory_context
+            .map(|context| context.memories_used)
+            .unwrap_or_default(),
         compression_snapshots,
         message_source_sequences,
         message_context_sources,
@@ -8646,6 +8776,7 @@ async fn prepare_prompt_context(
         attachments,
         next_message_sequence: user_sequence,
         pending_context_injections,
+        pending_memory_retrieval,
     })
 }
 
@@ -8764,18 +8895,29 @@ async fn prepare_chat_context(
         &prompt_context.pending_context_injections,
     )?;
 
+    let pending_memory_retrieval = prompt_context.pending_memory_retrieval;
+    let memory_resolution_deferred = pending_memory_retrieval.is_some();
     let mut provider_request = prompt_context.provider_request;
-    provider_request.prompt_cache_key = Some(prompt_cache_key(
-        &prompt_context.workspace_id,
-        &chat_id,
-        &prompt_context.provider_id,
-        &prompt_context.model_id,
-        &provider_request,
-        &prompt_context.message_source_sequences,
-        &prompt_context.message_context_sources,
-    )?);
-    provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
-    let request_body_json = serialize_provider_request(&provider_request)?;
+    // When memory retrieval is deferred, the prompt cache key is finalized
+    // after the memory messages have been spliced into the prompt (in the
+    // background stream, after the `start` event). The initial request body is
+    // still serialized without a cache key so cancellation or memory-resolution
+    // failures never write invalid JSON into the LLM audit table.
+    let request_body_json = if memory_resolution_deferred {
+        serialize_provider_request(&provider_request)?
+    } else {
+        provider_request.prompt_cache_key = Some(prompt_cache_key(
+            &prompt_context.workspace_id,
+            &chat_id,
+            &prompt_context.provider_id,
+            &prompt_context.model_id,
+            &provider_request,
+            &prompt_context.message_source_sequences,
+            &prompt_context.message_context_sources,
+        )?);
+        provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
+        serialize_provider_request(&provider_request)?
+    };
     let initial_git_diff_stats = git_diff_stats_for_workspace(&prompt_context.workspace_path);
 
     Ok(PreparedChatContext {
@@ -8813,11 +8955,263 @@ async fn prepare_chat_context(
         hook_notifications,
         initial_git_diff_stats,
         code_change_stats: CodeChangeStats::default(),
+        pending_memory_retrieval,
     })
 }
 
+impl PreparedChatContext {
+    /// Resolves deferred memory retrieval and splices the resulting memory
+    /// messages into the assembled prompt. Runs after the `start` event so that
+    /// chat creation and stream start are never blocked by memory lookups.
+    async fn resolve_pending_memory(&mut self, config: &GlobalConfig) -> Result<(), ApiError> {
+        let pending = match self.pending_memory_retrieval.take() {
+            Some(pending) => pending,
+            None => return Ok(()),
+        };
+
+        let memory_context = match memory_prompt_context(
+            &self.memory_database_file,
+            config,
+            &pending.workspace,
+            pending.chat_id_for_retrieval.as_deref(),
+            pending.query_text.as_deref(),
+            &pending.chat_model,
+            &pending.chat_provider,
+            &self.context_budget,
+            pending.purpose,
+            &pending.excluded_memory_keys,
+            pending.split_stable_memory,
+        )
+        .await
+        {
+            Ok(memory_context) => memory_context,
+            Err(error) => {
+                if pending.split_stable_memory {
+                    self.persist_deferred_stable_prompt_context(Vec::new())?;
+                }
+                return Err(error);
+            }
+        };
+
+        splice_resolved_memory(
+            &mut self.provider_request.messages,
+            &mut self.message_source_sequences,
+            &mut self.message_context_sources,
+            &mut self.active_tool_start_index,
+            &pending,
+            &memory_context,
+        );
+        self.memories_used = memory_context.memories_used;
+
+        // Persist the prompt context injections now that memory has been
+        // resolved, mirroring what prepare_prompt_context would have recorded
+        // synchronously for the context-preview path.
+        let mut pending_injections = Vec::new();
+        if pending.split_stable_memory {
+            if let Some(injection) = self
+                .deferred_stable_prompt_context_injection(memory_context.stable_memory_keys.clone())
+            {
+                pending_injections.push(injection);
+            }
+        }
+        if !memory_context.turn_memory_keys.is_empty() {
+            pending_injections.push(PendingPromptContextInjection {
+                kind: "turn_memory",
+                sequence: Some(pending.user_sequence),
+                messages: self
+                    .provider_request
+                    .messages
+                    .iter()
+                    .zip(self.message_context_sources.iter())
+                    .filter_map(|(message, source)| {
+                        matches!(
+                            source,
+                            PromptContextSource::TurnMemory {
+                                sequence
+                            } if *sequence == pending.user_sequence
+                        )
+                        .then(|| message.clone())
+                    })
+                    .collect(),
+                memory_keys: memory_context.turn_memory_keys.clone(),
+            });
+        }
+        if !pending_injections.is_empty() {
+            let mut database = WorkspaceDatabase::open_or_create(&self.workspace_path)
+                .map_err(ApiError::from_workspace_error)?;
+            persist_pending_prompt_context_injections(
+                &mut database,
+                &self.chat_id,
+                &pending_injections,
+            )?;
+        }
+
+        // Recompute the prompt cache key and request body now that the final
+        // prompt (with memory) is assembled.
+        self.provider_request.prompt_cache_key = Some(prompt_cache_key(
+            &self.workspace_id,
+            &self.chat_id,
+            &self.provider_id,
+            &self.model_id,
+            &self.provider_request,
+            &self.message_source_sequences,
+            &self.message_context_sources,
+        )?);
+        self.provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
+        self.request_body_json = serialize_provider_request(&self.provider_request)?;
+
+        Ok(())
+    }
+
+    fn deferred_stable_prompt_context_injection(
+        &self,
+        memory_keys: Vec<String>,
+    ) -> Option<PendingPromptContextInjection> {
+        let stable_messages = self
+            .provider_request
+            .messages
+            .iter()
+            .zip(self.message_context_sources.iter())
+            .filter_map(|(message, source)| {
+                matches!(source, PromptContextSource::StableInjection).then(|| message.clone())
+            })
+            .collect::<Vec<_>>();
+
+        if stable_messages.is_empty() {
+            return None;
+        }
+
+        Some(PendingPromptContextInjection {
+            kind: "stable",
+            sequence: None,
+            messages: stable_messages,
+            memory_keys,
+        })
+    }
+
+    fn persist_deferred_stable_prompt_context(
+        &self,
+        memory_keys: Vec<String>,
+    ) -> Result<(), ApiError> {
+        let Some(injection) = self.deferred_stable_prompt_context_injection(memory_keys) else {
+            return Ok(());
+        };
+        let mut database = WorkspaceDatabase::open_or_create(&self.workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+        persist_pending_prompt_context_injections(&mut database, &self.chat_id, &[injection])
+    }
+
+    fn finalize_prompt_without_memory(&mut self) -> Result<(), ApiError> {
+        self.provider_request.prompt_cache_key = Some(prompt_cache_key(
+            &self.workspace_id,
+            &self.chat_id,
+            &self.provider_id,
+            &self.model_id,
+            &self.provider_request,
+            &self.message_source_sequences,
+            &self.message_context_sources,
+        )?);
+        self.provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
+        self.request_body_json = serialize_provider_request(&self.provider_request)?;
+
+        Ok(())
+    }
+}
+
+/// Splices resolved memory messages into the assembled prompt at the indices
+/// captured during prompt assembly. Updates the parallel source vectors so they
+/// stay aligned with the message list and shifts the active-tool start index.
+fn splice_resolved_memory(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
+    active_tool_start_index: &mut usize,
+    pending: &PendingMemoryRetrieval,
+    memory_context: &MemoryPromptContext,
+) {
+    let mut inserted = 0usize;
+
+    if pending.split_stable_memory {
+        if let Some(stable_message) = memory_context.stable_message.clone() {
+            let index = pending.stable_insert_index;
+            messages.insert(index, stable_message);
+            message_source_sequences.insert(index, None);
+            message_context_sources.insert(index, PromptContextSource::StableInjection);
+            inserted += 1;
+        }
+    }
+
+    let turn_messages = memory_context
+        .turn_message
+        .clone()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let turn_insert_count = turn_messages.len();
+    if turn_insert_count > 0 {
+        let mut index = pending.turn_insert_index + inserted;
+        for turn_message in turn_messages {
+            messages.insert(index, turn_message);
+            message_source_sequences.insert(index, Some(pending.user_sequence));
+            message_context_sources.insert(
+                index,
+                PromptContextSource::TurnMemory {
+                    sequence: pending.user_sequence,
+                },
+            );
+            index += 1;
+        }
+        inserted += turn_insert_count;
+    }
+
+    *active_tool_start_index += inserted;
+}
+
+/// Resolves deferred memory retrieval for a `PreparedPromptContext` in place.
+/// Used by tests that exercise the deferred-retrieval path without going
+/// through the full chat context (which owns persistence and cache-key steps).
+#[cfg(test)]
+async fn resolve_prompt_context_memory(
+    context: &mut PreparedPromptContext,
+    memory_database_file: &Path,
+    config: &GlobalConfig,
+) -> Result<(), ApiError> {
+    let pending = match context.pending_memory_retrieval.take() {
+        Some(pending) => pending,
+        None => return Ok(()),
+    };
+
+    let memory_context = memory_prompt_context(
+        memory_database_file,
+        config,
+        &pending.workspace,
+        pending.chat_id_for_retrieval.as_deref(),
+        pending.query_text.as_deref(),
+        &pending.chat_model,
+        &pending.chat_provider,
+        &context.context_budget,
+        pending.purpose,
+        &pending.excluded_memory_keys,
+        pending.split_stable_memory,
+    )
+    .await?;
+
+    splice_resolved_memory(
+        &mut context.provider_request.messages,
+        &mut context.message_source_sequences,
+        &mut context.message_context_sources,
+        &mut context.active_tool_start_index,
+        &pending,
+        &memory_context,
+    );
+    context.memory_context_tokens = memory_context.context_tokens;
+    context.memory_budget_tokens = memory_context.budget_tokens;
+    context.memories_used = memory_context.memories_used;
+
+    Ok(())
+}
+
 async fn memory_prompt_context(
-    state: &AppState,
+    memory_database_file: &Path,
     config: &GlobalConfig,
     workspace: &WorkspaceConfig,
     chat_id: Option<&str>,
@@ -8850,9 +9244,12 @@ async fn memory_prompt_context(
         });
     }
 
+    WorkspaceDatabase::open_or_create(&workspace.path).map_err(ApiError::from_workspace_error)?;
     let mut workspace_memory =
-        open_memory_database(state, config, MemoryScope::Workspace, Some(&workspace.id))?;
-    let mut global_memory = open_memory_database(state, config, MemoryScope::Global, None)?;
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
+            .map_err(ApiError::from_memory_error)?;
+    let mut global_memory = MemoryDatabase::open_or_create_global_at(memory_database_file)
+        .map_err(ApiError::from_memory_error)?;
 
     if purpose.allows_memory_mutation() {
         expire_due_memories(&mut workspace_memory)?;
@@ -8888,7 +9285,7 @@ async fn memory_prompt_context(
                     config,
                     &workspace.id,
                     &workspace.path,
-                    &state.memory_database_file,
+                    memory_database_file,
                     candidates,
                     query_text,
                     chat_model,
@@ -15756,6 +16153,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
         ChatSseEvent::TodoGraphRefresh { .. } => "todo_graph_refresh",
         ChatSseEvent::MemoryExtractionComplete { .. } => "memory_extraction_complete",
+        ChatSseEvent::MemoryResolved { .. } => "memory_resolved",
         ChatSseEvent::Usage { .. } => "usage",
         ChatSseEvent::Complete { .. } => "completion",
         ChatSseEvent::Error { .. } => "error",
@@ -19346,11 +19744,13 @@ fn llm_request_rows_summary(rows: &[LlmRequestAuditRow]) -> AiStatisticsSummary 
 
     let mut model_list: Vec<AiStatisticsModelBreakdown> = model_acc
         .into_iter()
-        .map(|(model_id, (request_count, total_tokens))| AiStatisticsModelBreakdown {
-            model_id,
-            request_count,
-            total_tokens,
-        })
+        .map(
+            |(model_id, (request_count, total_tokens))| AiStatisticsModelBreakdown {
+                model_id,
+                request_count,
+                total_tokens,
+            },
+        )
         .collect();
     model_list.sort_by(|left, right| {
         right
@@ -19386,11 +19786,13 @@ fn llm_request_rows_summary(rows: &[LlmRequestAuditRow]) -> AiStatisticsSummary 
 
     let mut trend_list: Vec<AiStatisticsTrendPoint> = trend_acc
         .into_iter()
-        .map(|(bucket, (request_count, total_tokens))| AiStatisticsTrendPoint {
-            bucket,
-            request_count,
-            total_tokens,
-        })
+        .map(
+            |(bucket, (request_count, total_tokens))| AiStatisticsTrendPoint {
+                bucket,
+                request_count,
+                total_tokens,
+            },
+        )
         .collect();
     trend_list.sort_by(|left, right| right.bucket.cmp(&left.bucket));
 
@@ -21016,6 +21418,7 @@ mod tests {
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
             code_change_stats: CodeChangeStats::default(),
+            pending_memory_retrieval: None,
         }
     }
 
@@ -22402,9 +22805,7 @@ description:
                 .by_source
                 .iter()
                 .find(|entry| entry.source == bucket)
-                .unwrap_or_else(|| {
-                    panic!("source bucket {:?} missing from breakdown", bucket)
-                });
+                .unwrap_or_else(|| panic!("source bucket {:?} missing from breakdown", bucket));
             assert_eq!(entry.tokens, 10);
             assert_eq!(entry.required_tokens, 10);
         }
@@ -23299,6 +23700,7 @@ description:
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
             code_change_stats: CodeChangeStats::default(),
+            pending_memory_retrieval: None,
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -23462,6 +23864,7 @@ description:
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
             code_change_stats: CodeChangeStats::default(),
+            pending_memory_retrieval: None,
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -23701,6 +24104,7 @@ description:
             hook_notifications: Vec::new(),
             initial_git_diff_stats: None,
             code_change_stats: CodeChangeStats::default(),
+            pending_memory_retrieval: None,
         };
         let outcome = ChatAuditOutcome {
             first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -25331,6 +25735,188 @@ Search memory before repo work.
     }
 
     #[tokio::test]
+    async fn prepare_chat_context_continues_without_deferred_memory() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-memory-failure-workspace-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-memory-failure-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.memory.enabled = true;
+        config.memory.retrieval_mode = "unsupported".to_string();
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 100_000,
+                max_output_tokens: 1_024,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+
+        let mut context = prepare_chat_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            ChatStreamRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: "Hello after creation".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("chat context");
+
+        assert!(context.pending_memory_retrieval.is_some());
+        serde_json::from_str::<Value>(&context.request_body_json)
+            .expect("deferred request body is valid JSON");
+        let error = context
+            .resolve_pending_memory(&config)
+            .await
+            .err()
+            .expect("unsupported memory retrieval should fail");
+        assert!(
+            error
+                .message
+                .contains("memory retrieval mode 'unsupported' is unsupported")
+        );
+        assert!(context.pending_memory_retrieval.is_none());
+        context
+            .finalize_prompt_without_memory()
+            .expect("finalize without memory");
+        assert!(context.provider_request.prompt_cache_key.is_some());
+        assert_eq!(
+            context.provider_request.prompt_cache_retention.as_deref(),
+            Some(PROMPT_CACHE_RETENTION_24H)
+        );
+        let final_request_json: Value = serde_json::from_str(&context.request_body_json)
+            .expect("final request body is valid JSON");
+        assert!(
+            !final_request_json
+                .to_string()
+                .contains(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX)
+        );
+
+        {
+            let database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            let stored_messages = database
+                .messages_for_chat(&context.chat_id)
+                .expect("stored messages");
+            assert_eq!(stored_messages.len(), 1);
+            assert_eq!(stored_messages[0].content, "Hello after creation");
+
+            let injections = database
+                .prompt_context_injections_for_chat(&context.chat_id)
+                .expect("context injections");
+            assert_eq!(injections.len(), 1);
+            assert_eq!(injections[0].kind, "stable");
+            assert_eq!(injections[0].memory_keys_json, "[]");
+            assert!(
+                injections[0]
+                    .messages_json
+                    .contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX)
+            );
+        }
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_starts_when_deferred_memory_fails() {
+        let workspace_dir =
+            env::temp_dir().join(unique_id("foco-memory-stream-failure-workspace-test"));
+        let profile_dir =
+            env::temp_dir().join(unique_id("foco-memory-stream-failure-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.memory.enabled = true;
+        config.memory.retrieval_mode = "unsupported".to_string();
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 100_000,
+                max_output_tokens: 1_024,
+            }),
+        });
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        let context = prepare_chat_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            ChatStreamRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: "Hello after creation".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .await
+        .expect("chat context");
+        let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+        drop(guidance_tx);
+        let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+        tokio::pin!(stream);
+
+        let first = stream.next().await.expect("start event");
+        assert!(matches!(first, ChatSseEvent::Start { .. }));
+
+        let second = stream.next().await.expect("attempt start event");
+        assert!(
+            matches!(second, ChatSseEvent::StreamAttemptStart { .. }),
+            "memory retrieval failure must not emit an error before provider start"
+        );
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
     async fn prepare_chat_context_prefixes_selected_skills_in_user_message() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-selected-skill-workspace-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-selected-skill-profile-test"));
@@ -26016,7 +26602,7 @@ Use the existing product UI conventions.
             );
         }
 
-        let context = prepare_prompt_context(
+        let mut context = prepare_prompt_context(
             &state,
             &config,
             &config.workspaces[0].id,
@@ -26035,6 +26621,9 @@ Use the existing product UI conventions.
         )
         .await
         .expect("prompt context");
+        resolve_prompt_context_memory(&mut context, &state.memory_database_file, &config)
+            .await
+            .expect("resolve memory");
         let messages = &context.provider_request.messages;
 
         assert!(messages[0].content.contains("You are Foco"));
@@ -26290,7 +26879,7 @@ Use the existing product UI conventions.
             );
         }
 
-        let first_context = prepare_chat_context(
+        let mut first_context = prepare_chat_context(
             &state,
             &config,
             &config.workspaces[0].id,
@@ -26306,6 +26895,10 @@ Use the existing product UI conventions.
         )
         .await
         .expect("first chat context");
+        first_context
+            .resolve_pending_memory(&config)
+            .await
+            .expect("resolve first context memory");
         let stable_memory_index = first_context
             .provider_request
             .messages
@@ -26367,7 +26960,7 @@ Use the existing product UI conventions.
             );
         }
 
-        let second_context = prepare_chat_context(
+        let mut second_context = prepare_chat_context(
             &state,
             &config,
             &config.workspaces[0].id,
@@ -26383,6 +26976,10 @@ Use the existing product UI conventions.
         )
         .await
         .expect("second chat context");
+        second_context
+            .resolve_pending_memory(&config)
+            .await
+            .expect("resolve second context memory");
         let second_text = second_context
             .provider_request
             .messages
@@ -26497,7 +27094,7 @@ Use the existing product UI conventions.
             );
         }
 
-        let context = prepare_prompt_context(
+        let mut context = prepare_prompt_context(
             &state,
             &config,
             &config.workspaces[0].id,
@@ -26516,6 +27113,9 @@ Use the existing product UI conventions.
         )
         .await
         .expect("prompt context");
+        resolve_prompt_context_memory(&mut context, &state.memory_database_file, &config)
+            .await
+            .expect("resolve memory");
         let request_json: Value =
             serde_json::from_str(&serialize_provider_request(&context.provider_request).unwrap())
                 .expect("request json");
