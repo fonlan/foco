@@ -3581,19 +3581,29 @@ describe("App verification surfaces", () => {
       expect(nameInput).toHaveValue("NewWorkspace");
     });
 
+    await userEvent.upload(
+      within(dialog).getByLabelText("Workspace icon file"),
+      new File([new Uint8Array([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])], "workspace-logo.png", {
+        type: "image/png",
+      }),
+    );
+
+    await waitFor(() => {
+      expect(within(dialog).getByText("workspace-logo.png")).toBeInTheDocument();
+    });
+
     await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/workspaces/add",
-        expect.objectContaining({
-          body: JSON.stringify({
-            name: "NewWorkspace",
-            path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
-          }),
-          method: "POST",
-        }),
+      const addWorkspaceCall = fetchMock.mock.calls.find(
+        ([url, init]) => url === "/api/workspaces/add" && init?.method === "POST",
       );
+      expect(addWorkspaceCall).toBeDefined();
+      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual({
+        contentBase64: expect.any(String),
+        name: "NewWorkspace",
+        path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+      });
     });
 
     expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
@@ -4832,18 +4842,18 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
     return jsonResponse({
       activeWorkspaceId: "new-workspace",
       workspaces: [
-        workspace,
-        secondaryWorkspace,
         {
           chats: [],
           id: "new-workspace",
-          logoUrl: null,
+          logoUrl: "/api/workspaces/new-workspace/logo?v=1",
           name: "New Workspace",
           path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
           pinned: false,
           terminalShell: "powershell",
           commonCommands: [],
         },
+        workspace,
+        secondaryWorkspace,
       ],
     });
   }

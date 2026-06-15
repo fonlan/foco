@@ -870,6 +870,12 @@ type NativeSelectedFile = {
   contentBase64?: string | null;
 };
 
+type WorkspaceIconDraft = {
+  contentBase64: string;
+  name: string;
+  previewUrl: string;
+};
+
 type ChatMessageSummary = {
   id: string;
   role: "assistant" | "user";
@@ -2167,6 +2173,9 @@ export function App() {
   const [workspaceDialogRevision, setWorkspaceDialogRevision] = useState(0);
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
+  const [workspaceIconDraft, setWorkspaceIconDraft] =
+    useState<WorkspaceIconDraft | null>(null);
+  const workspaceIconInputRef = useRef<HTMLInputElement | null>(null);
   const [draftMessage, setDraftMessage] = useState("");
   const [draftAttachments, setDraftAttachments] = useState<ComposerAttachment[]>(
     [],
@@ -3201,11 +3210,15 @@ export function App() {
         body: JSON.stringify({
           name: workspaceName,
           path: workspacePath,
+          contentBase64: workspaceIconDraft?.contentBase64 ?? null,
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
-      const createdWorkspace = data.workspaces[data.workspaces.length - 1];
+      const createdWorkspace =
+        data.workspaces.find(
+          (workspace) => workspace.id === data.activeWorkspaceId,
+        ) ?? data.workspaces[0];
 
       setWorkspaces(data.workspaces);
       setActiveWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
@@ -3217,11 +3230,38 @@ export function App() {
       });
       setWorkspaceName("");
       setWorkspacePath("");
-      setIsWorkspaceDialogOpen(false);
+      closeWorkspaceDialog();
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
       setIsSavingWorkspace(false);
+    }
+  }
+
+  function clearWorkspaceIconDraft() {
+    setWorkspaceIconDraft(null);
+  }
+
+  async function handleWorkspaceIconFileChange(
+    event: ReactChangeEvent<HTMLInputElement>,
+  ) {
+    const file = event.target.files?.[0] ?? null;
+    event.target.value = "";
+    if (!file) {
+      return;
+    }
+
+    try {
+      const contentBase64 = await fileToBase64(file);
+      setWorkspaceIconDraft({
+        contentBase64,
+        name: file.name,
+        previewUrl: file.type
+          ? `data:${file.type};base64,${contentBase64}`
+          : "",
+      });
+    } catch (readError) {
+      setError(errorMessage(readError));
     }
   }
 
@@ -6078,9 +6118,15 @@ export function App() {
   function openWorkspaceDialog() {
     setWorkspaceName("");
     setWorkspacePath("");
+    setWorkspaceIconDraft(null);
     setError(null);
     setWorkspaceDialogRevision((current) => current + 1);
     setIsWorkspaceDialogOpen(true);
+  }
+
+  function closeWorkspaceDialog() {
+    setWorkspaceIconDraft(null);
+    setIsWorkspaceDialogOpen(false);
   }
 
   async function saveAppTheme(nextTheme: AppThemeId) {
@@ -6816,10 +6862,14 @@ export function App() {
       {isWorkspaceDialogOpen ? (
         <WorkspaceDialog
           canUseNativePicker={canUseNativePicker}
+          iconDraft={workspaceIconDraft}
+          iconInputRef={workspaceIconInputRef}
           isSelectingPath={isSelectingWorkspacePath}
           isSaving={isSavingWorkspace}
           name={workspaceName}
-          onClose={() => setIsWorkspaceDialogOpen(false)}
+          onClearIcon={clearWorkspaceIconDraft}
+          onClose={closeWorkspaceDialog}
+          onIconFileChange={handleWorkspaceIconFileChange}
           onNameChange={setWorkspaceName}
           onPathChange={setWorkspacePath}
           onSelectPath={handleSelectWorkspacePath}
@@ -6970,10 +7020,14 @@ function RipgrepMissingDialog({
 
 function WorkspaceDialog({
   canUseNativePicker,
+  iconDraft,
+  iconInputRef,
   isSelectingPath,
   isSaving,
   name,
+  onClearIcon,
   onClose,
+  onIconFileChange,
   onNameChange,
   onPathChange,
   onSelectPath,
@@ -6981,10 +7035,14 @@ function WorkspaceDialog({
   path,
 }: {
   canUseNativePicker: boolean;
+  iconDraft: WorkspaceIconDraft | null;
+  iconInputRef: { current: HTMLInputElement | null };
   isSelectingPath: boolean;
   isSaving: boolean;
   name: string;
+  onClearIcon: () => void;
   onClose: () => void;
+  onIconFileChange: (event: ReactChangeEvent<HTMLInputElement>) => void;
   onNameChange: (value: string) => void;
   onPathChange: (value: string) => void;
   onSelectPath: () => void;
@@ -7081,6 +7139,55 @@ function WorkspaceDialog({
               </button>
             </div>
           </label>
+          <div className="rounded-lg border border-stone-200 bg-stone-50/80 p-3">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="flex min-w-0 items-center gap-2">
+                <WorkspaceIcon
+                  className="size-10 rounded-lg border border-stone-200 bg-white object-cover p-1"
+                  fallbackClassName="size-10 rounded-lg border border-stone-200 bg-white p-2 text-teal-700"
+                  logoUrl={iconDraft?.previewUrl || null}
+                />
+                <div className="min-w-0">
+                  <span className="block text-sm font-semibold text-stone-800">
+                    {t("Workspace icon")}
+                  </span>
+                  <span className="block truncate text-xs text-stone-500">
+                    {iconDraft?.name ?? t("Folder icon")}
+                  </span>
+                </div>
+              </div>
+              <button
+                aria-label={t("Clear workspace icon")}
+                className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:text-stone-300"
+                disabled={isSaving || !iconDraft}
+                onClick={onClearIcon}
+                title={t("Clear workspace icon")}
+                type="button"
+              >
+                <Trash2 aria-hidden="true" className="size-4" />
+              </button>
+            </div>
+            <input
+              aria-label={t("Workspace icon file")}
+              accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"
+              className="sr-only"
+              disabled={isSaving}
+              onChange={onIconFileChange}
+              ref={iconInputRef}
+              type="file"
+            />
+            <button
+              aria-label={t("Upload icon")}
+              className="mt-2 inline-flex h-9 items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+              disabled={isSaving}
+              onClick={() => iconInputRef.current?.click()}
+              title={t("Upload icon")}
+              type="button"
+            >
+              <Upload aria-hidden="true" className="size-3.5" />
+              {t("Upload icon")}
+            </button>
+          </div>
           <div className="flex justify-end gap-2">
             <button
               aria-label={t("Cancel workspace dialog")}

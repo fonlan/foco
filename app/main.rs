@@ -1911,6 +1911,16 @@ async fn add_workspace(
     State(state): State<AppState>,
     Json(request): Json<WorkspacePathRequest>,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
+    let logo_content_base64 = request.content_base64.clone();
+    let logo = if logo_content_base64.is_some() {
+        let bytes = workspace_logo_request_bytes(&WorkspaceLogoRequest {
+            content_base64: logo_content_base64,
+        })?;
+        let kind = workspace_logo_kind(&bytes)?;
+        Some((bytes, kind))
+    } else {
+        None
+    };
     let (name, requested_path) = validate_workspace_request(request)?;
 
     if requested_path.exists() && !requested_path.is_dir() {
@@ -1936,15 +1946,22 @@ async fn add_workspace(
     reject_registered_workspace_path(&config, &path, None)?;
     WorkspaceDatabase::open_or_create(&path).map_err(ApiError::from_workspace_error)?;
 
+    if let Some((bytes, kind)) = logo {
+        save_workspace_logo_file(&path, &bytes, kind)?;
+    }
+
     let id = unique_workspace_id(&config, &name);
-    config.workspaces.push(WorkspaceConfig {
-        id,
-        name,
-        path,
-        pinned: false,
-        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
-        common_commands: Vec::new(),
-    });
+    config.workspaces.insert(
+        0,
+        WorkspaceConfig {
+            id,
+            name,
+            path,
+            pinned: false,
+            terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
+        },
+    );
     save_config(&state, config.clone())?;
     sync_all_mcp_workspaces(&state.mcp_registry, &config)
         .await
@@ -4770,6 +4787,8 @@ async fn terminal_socket(
 struct WorkspacePathRequest {
     name: String,
     path: String,
+    #[serde(default)]
+    content_base64: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -25342,11 +25361,15 @@ description:
         let config = GlobalConfig::first_run(existing_workspace_dir.clone());
         let state = test_app_state(config, profile_dir.clone());
 
-        let _response = add_workspace(
+        let response = add_workspace(
             State(state.clone()),
             Json(WorkspacePathRequest {
                 name: "New Workspace".to_string(),
                 path: new_workspace_dir.display().to_string(),
+                content_base64: Some(
+                    general_purpose::STANDARD
+                        .encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+                ),
             }),
         )
         .await
@@ -25363,10 +25386,25 @@ description:
         let registered_path = normalize_windows_verbatim_path(
             fs::canonicalize(&new_workspace_dir).expect("new workspace canonical path"),
         );
+        let response = response.0;
+        let response_workspace = response
+            .workspaces
+            .first()
+            .expect("response workspace first");
+        assert_eq!(response_workspace.name, "New Workspace");
+        assert!(
+            response_workspace.logo_url.as_deref().is_some_and(
+                |logo_url| logo_url.starts_with("/api/workspaces/new-workspace/logo?v=")
+            )
+        );
+        let logo = workspace_logo_file(&new_workspace_dir)
+            .expect("workspace logo lookup")
+            .expect("workspace logo file");
+        assert_eq!(logo.kind.extension, "png");
         let config = state.config.lock().expect("config lock");
-        assert!(config.workspaces.iter().any(
-            |workspace| workspace.name == "New Workspace" && workspace.path == registered_path
-        ));
+        let registered_workspace = config.workspaces.first().expect("new workspace first");
+        assert_eq!(registered_workspace.name, "New Workspace");
+        assert_eq!(registered_workspace.path, registered_path);
         drop(config);
 
         fs::remove_dir_all(existing_workspace_dir).expect("remove existing workspace directory");
