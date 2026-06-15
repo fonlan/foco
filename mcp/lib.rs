@@ -112,7 +112,6 @@ pub struct McpRegistry {
 }
 
 struct McpServerRuntime {
-    workspace_id: String,
     definition: McpServerDefinition,
     service: Option<RunningService<RoleClient, ClientInfo>>,
     tools: Vec<McpToolDefinition>,
@@ -134,17 +133,14 @@ impl McpRegistry {
         let stale_ids = {
             let servers = self.servers.lock().await;
             servers
-                .values()
-                .filter(|runtime| {
-                    runtime.workspace_id == workspace_id
-                        && !desired_ids.contains(runtime.definition.id.as_str())
-                })
-                .map(|runtime| runtime.definition.id.clone())
+                .keys()
+                .filter(|server_id| !desired_ids.contains(server_id.as_str()))
+                .cloned()
                 .collect::<Vec<_>>()
         };
 
         for server_id in stale_ids {
-            self.stop_server(workspace_id, &server_id).await?;
+            self.stop_server(&server_id).await?;
         }
 
         for definition in definitions {
@@ -155,27 +151,25 @@ impl McpRegistry {
         Ok(())
     }
 
-    pub async fn tool_definitions(&self, workspace_id: &str) -> Vec<McpToolDefinition> {
+    pub async fn tool_definitions(&self, _workspace_id: &str) -> Vec<McpToolDefinition> {
         let servers = self.servers.lock().await;
         servers
             .values()
-            .filter(|server| server.workspace_id == workspace_id)
             .flat_map(|server| server.tools.clone())
             .collect()
     }
 
     pub async fn execute_tool(
         &self,
-        workspace_id: &str,
+        _workspace_id: &str,
         tool_name: &str,
         arguments: Value,
     ) -> Result<McpToolExecution, McpError> {
         let (server_id, original_name) = decode_mcp_tool_name(tool_name)?;
         let peer = {
             let servers = self.servers.lock().await;
-            let runtime_key = runtime_key(workspace_id, &server_id);
             let server = servers
-                .get(&runtime_key)
+                .get(&server_id)
                 .ok_or_else(|| McpError::ServerNotFound(server_id.clone()))?;
             let service = server
                 .service
@@ -201,11 +195,10 @@ impl McpRegistry {
         Ok(McpToolExecution { output, is_error })
     }
 
-    pub async fn statuses(&self, workspace_id: &str) -> Vec<McpServerStatus> {
+    pub async fn statuses(&self, _workspace_id: &str) -> Vec<McpServerStatus> {
         let servers = self.servers.lock().await;
         servers
             .values()
-            .filter(|server| server.workspace_id == workspace_id)
             .map(|server| {
                 let state = if !server.definition.enabled {
                     McpServerState::Disabled
@@ -242,26 +235,23 @@ impl McpRegistry {
 
         Ok(())
     }
-
     async fn sync_server(
         &self,
-        workspace_id: &str,
+        _workspace_id: &str,
         workspace_path: &Path,
         definition: McpServerDefinition,
     ) -> Result<(), McpError> {
-        let key = runtime_key(workspace_id, &definition.id);
+        let key = definition.id.clone();
         let should_restart = {
             let servers = self.servers.lock().await;
             servers
                 .get(&key)
-                .map(|runtime| {
-                    runtime.definition != definition || runtime.workspace_id != workspace_id
-                })
+                .map(|runtime| runtime.definition != definition)
                 .unwrap_or(true)
         };
 
         if should_restart {
-            self.stop_server(workspace_id, &definition.id).await?;
+            self.stop_server(&definition.id).await?;
         }
 
         if !definition.enabled {
@@ -269,7 +259,6 @@ impl McpRegistry {
             servers.insert(
                 key,
                 McpServerRuntime {
-                    workspace_id: workspace_id.to_string(),
                     definition,
                     service: None,
                     tools: Vec::new(),
@@ -299,7 +288,6 @@ impl McpRegistry {
                 servers.insert(
                     key,
                     McpServerRuntime {
-                        workspace_id: workspace_id.to_string(),
                         definition,
                         service: Some(service),
                         tools,
@@ -313,7 +301,6 @@ impl McpRegistry {
                 servers.insert(
                     key,
                     McpServerRuntime {
-                        workspace_id: workspace_id.to_string(),
                         definition,
                         service: None,
                         tools: Vec::new(),
@@ -322,7 +309,7 @@ impl McpRegistry {
                 );
             }
         }
-        validate_unique_tools(&self.tool_definitions(workspace_id).await).map_err(|error| {
+        validate_unique_tools(&self.tool_definitions("").await).map_err(|error| {
             McpError::InvalidConfig(format!(
                 "MCP server '{}' produced conflicting tools: {error}",
                 server_name
@@ -330,9 +317,8 @@ impl McpRegistry {
         })
     }
 
-    async fn stop_server(&self, workspace_id: &str, server_id: &str) -> Result<(), McpError> {
-        let key = runtime_key(workspace_id, server_id);
-        self.stop_runtime_key(&key).await
+    async fn stop_server(&self, server_id: &str) -> Result<(), McpError> {
+        self.stop_runtime_key(server_id).await
     }
 
     async fn stop_runtime_key(&self, key: &str) -> Result<(), McpError> {
@@ -537,10 +523,6 @@ async fn start_runtime(
     Ok((service, tools))
 }
 
-fn runtime_key(workspace_id: &str, server_id: &str) -> String {
-    format!("{workspace_id}{MCP_TOOL_SEPARATOR}{server_id}")
-}
-
 fn validate_unique_tools(tools: &[McpToolDefinition]) -> Result<(), McpError> {
     let mut seen_names = HashSet::new();
 
@@ -711,4 +693,42 @@ pub fn crate_name() -> &'static str {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn disabled_stdio_server(id: &str) -> McpServerDefinition {
+        McpServerDefinition {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: false,
+            transport: McpTransportKind::Stdio,
+            command: Some("foco-test-mcp".to_string()),
+            args: Vec::new(),
+            url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_workspace_servers_reuses_global_server_runtime() {
+        let registry = McpRegistry::default();
+        let definitions = vec![disabled_stdio_server("context7")];
+
+        registry
+            .sync_workspace_servers("workspace-a", Path::new("."), &definitions)
+            .await
+            .expect("first workspace sync should succeed");
+        registry
+            .sync_workspace_servers("workspace-b", Path::new("."), &definitions)
+            .await
+            .expect("second workspace sync should succeed");
+
+        let servers = registry.servers.lock().await;
+
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("context7"));
+    }
 }
