@@ -1917,6 +1917,7 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Edit model": "编辑模型",
     "Delete model": "删除模型",
     "Close model configuration": "关闭模型配置",
+    "Close model configuration backdrop": "关闭模型配置背景",
     "Model configuration": "模型配置",
     "Model id": "模型 ID",
     "Display name": "显示名称",
@@ -19035,7 +19036,12 @@ function SettingsPanel({
 
           {isModelDialogOpen ? (
             <>
-              <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+              <button
+                aria-label={t("Close model configuration backdrop")}
+                className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                onClick={() => setIsModelDialogOpen(false)}
+                type="button"
+              />
               <form
                 aria-label={t("Model configuration")}
                 className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,38rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"

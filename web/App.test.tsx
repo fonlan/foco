@@ -4184,6 +4184,31 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("closes the model dialog from the backdrop without saving", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add model" }));
+
+    expect(
+      await screen.findByRole("form", { name: "Model configuration" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Close model configuration backdrop" }),
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("form", { name: "Model configuration" }),
+      ).not.toBeInTheDocument();
+    });
+    expect(fetchMock.mock.calls.some(([url]) => url === "/api/models/manual")).toBe(
+      false,
+    );
+  });
   it("saves provider, model, MCP server, and skill settings", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
