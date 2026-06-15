@@ -5494,7 +5494,12 @@ export function App() {
       });
     };
 
-    activeChatKeyRef.current = runMessagesKey;
+    const shouldActivateRun =
+      !request.localChatKey || activeChatKeyRef.current === request.localChatKey;
+
+    if (shouldActivateRun) {
+      activeChatKeyRef.current = runMessagesKey;
+    }
     if (pendingChatId) {
       setActiveWorkspaceId(request.workspaceId);
       setActiveChatId(pendingChatId);
@@ -5736,6 +5741,7 @@ export function App() {
             usage: null,
           });
           const shouldActivateStartedChat =
+            shouldActivateRun ||
             activeChatKeyRef.current === currentRunningChatKey ||
             activeChatKeyRef.current === request.localChatKey ||
             activeChatKeyRef.current === null ||

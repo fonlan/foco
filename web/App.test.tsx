@@ -2457,6 +2457,39 @@ describe("App verification surfaces", () => {
 
   it("schedules a new workspace chat until the current workspace run finishes", async () => {
     const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chat/stream") {
+        const body =
+          typeof init?.body === "string"
+            ? (JSON.parse(init.body) as { chatId?: string | null; message?: string })
+            : {};
+        if (body.chatId === null && body.message === "Scheduled task") {
+          workspaceResponseWorkspaces = [
+            {
+              ...workspace,
+              chats: [
+                ...workspace.chats,
+                chatSummary(
+                  "chat-scheduled",
+                  "Scheduled task",
+                  "2026-06-05T12:00:00Z",
+                  "2026-06-05T12:00:00Z",
+                ),
+              ],
+            },
+            secondaryWorkspace,
+          ];
+          return chatStreamResponse("chat-scheduled");
+        }
+      }
+
+      return mockFetch(input, init);
+    });
     render(<App />);
 
     await userEvent.click(await screen.findByText("Tool run"));
@@ -2502,6 +2535,12 @@ describe("App verification surfaces", () => {
       within(scheduledMessageRow as HTMLElement).getByText("Queued"),
     ).toBeInTheDocument();
 
+    const tabListBeforeComplete = await screen.findByRole("tablist", { name: "Chat" });
+    await userEvent.click(
+      within(tabListBeforeComplete).getByRole("tab", { name: /Tool run/ }),
+    );
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
     const streamCallsBeforeComplete = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
@@ -2510,6 +2549,23 @@ describe("App verification surfaces", () => {
     expect(streamCallsBeforeComplete).toHaveLength(1);
 
     await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 10,
+        },
+        reasoning: null,
+        stopReason: null,
+        text: "Done.",
+        type: "complete",
+        usage: null,
+      });
       chatStreamControllers.get("request-stream")?.close();
     });
 
@@ -2531,6 +2587,35 @@ describe("App verification surfaces", () => {
       chatId: null,
       message: "Scheduled task",
     });
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream-2", {
+        assistantMessageId: "message-assistant-stream-2",
+        delta: "Scheduled answer.",
+        type: "textDelta",
+      });
+    });
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    const activeMessageList = document.querySelector(".message-list");
+    if (!(activeMessageList instanceof HTMLElement)) {
+      throw new Error("Expected message list");
+    }
+    expect(within(activeMessageList).getByText("Please inspect README.")).toBeInTheDocument();
+    expect(within(activeMessageList).queryByText("Scheduled task")).not.toBeInTheDocument();
+    expect(within(activeMessageList).queryByText("Scheduled answer.")).not.toBeInTheDocument();
+
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Scheduled task/ }));
+    const scheduledMessageList = document.querySelector(".message-list");
+    if (!(scheduledMessageList instanceof HTMLElement)) {
+      throw new Error("Expected scheduled message list");
+    }
+    expect(await within(scheduledMessageList).findByText("Scheduled task")).toBeInTheDocument();
+    expect(await within(scheduledMessageList).findByText("Scheduled answer.")).toBeInTheDocument();
 
     await act(async () => {
       chatStreamControllers.get("request-stream-2")?.close();
