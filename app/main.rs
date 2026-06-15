@@ -13613,6 +13613,7 @@ fn context_token_breakdown(groups: &[ContextMessageGroup]) -> ContextTokenBreakd
         PromptContextSourceBucket::AssistantDraft,
         PromptContextSourceBucket::HookContext,
         PromptContextSourceBucket::Guidance,
+        PromptContextSourceBucket::RuntimeGuard,
         PromptContextSourceBucket::RuntimeAssistant,
         PromptContextSourceBucket::RuntimeToolState,
         PromptContextSourceBucket::RuntimeToolStateSnapshot,
@@ -22367,6 +22368,46 @@ description:
                 .required_tokens,
             0
         );
+    }
+
+    #[test]
+    fn context_token_breakdown_handles_every_source_bucket() {
+        // Guards against a repeat of the panic where a source bucket existed on the
+        // enum but was missing from the SOURCES list inside context_token_breakdown.
+        for bucket in [
+            PromptContextSourceBucket::ReservedPrompt,
+            PromptContextSourceBucket::StableInjection,
+            PromptContextSourceBucket::TodoGraph,
+            PromptContextSourceBucket::CompressionSnapshot,
+            PromptContextSourceBucket::PersistedHistory,
+            PromptContextSourceBucket::TurnMemory,
+            PromptContextSourceBucket::CurrentUser,
+            PromptContextSourceBucket::AssistantDraft,
+            PromptContextSourceBucket::HookContext,
+            PromptContextSourceBucket::Guidance,
+            PromptContextSourceBucket::RuntimeGuard,
+            PromptContextSourceBucket::RuntimeAssistant,
+            PromptContextSourceBucket::RuntimeToolState,
+            PromptContextSourceBucket::RuntimeToolStateSnapshot,
+        ] {
+            let groups = vec![ContextMessageGroup {
+                message_indices: vec![0],
+                estimated_tokens: 10,
+                must_keep: true,
+                source_bucket: bucket,
+                runtime_tool_batch_index: None,
+            }];
+            let breakdown = context_token_breakdown(&groups);
+            let entry = breakdown
+                .by_source
+                .iter()
+                .find(|entry| entry.source == bucket)
+                .unwrap_or_else(|| {
+                    panic!("source bucket {:?} missing from breakdown", bucket)
+                });
+            assert_eq!(entry.tokens, 10);
+            assert_eq!(entry.required_tokens, 10);
+        }
     }
 
     #[test]

@@ -4904,6 +4904,12 @@ export function App() {
     const abortController = new AbortController();
     let assistantMessageId = `active-assistant-${activeRun.runId}`;
     let currentAssistantMessageId = assistantMessageId;
+    // Once a guidance message is applied, the backend keeps emitting subsequent
+    // stream events under the original (now-interrupted) assistant message id,
+    // but they belong to the new post-guidance bubble. Tracking the interrupted
+    // id lets us route those events to `currentAssistantMessageId` instead of
+    // the stale bubble that the event id would otherwise match.
+    let interruptedAssistantMessageId: string | null = null;
     let assistantDraft = "";
     let assistantDraftReasoning = "";
     let latestResponseUsage: ChatUsage | null = null;
@@ -4978,12 +4984,40 @@ export function App() {
     const isCurrentAssistantMessage = (
       message: ShellMessage,
       eventAssistantMessageId?: string,
-    ) =>
-      message.role === "assistant" &&
-      (message.id === currentAssistantMessageId ||
-        (eventAssistantMessageId !== undefined &&
-          message.id === eventAssistantMessageId) ||
-        message.id === assistantMessageId);
+    ) => {
+      // After a guidance boundary the backend keeps emitting events under the
+      // interrupted assistant message id, but they must land in the new bubble.
+      // Ignore the event-carried id (and the original `assistantMessageId`,
+      // which equals the interrupted id) in that case and match only the current
+      // bubble.
+      const ignoreInterruptedId =
+        interruptedAssistantMessageId !== null &&
+        (eventAssistantMessageId === undefined ||
+          eventAssistantMessageId === interruptedAssistantMessageId);
+      return (
+        message.role === "assistant" &&
+        (message.id === currentAssistantMessageId ||
+          (!ignoreInterruptedId &&
+            eventAssistantMessageId !== undefined &&
+            message.id === eventAssistantMessageId) ||
+          (!ignoreInterruptedId && message.id === assistantMessageId))
+      );
+    };
+    // Resolve which assistant bubble a post-guidance event targets: once a
+    // guidance boundary is crossed, events keep carrying the interrupted id but
+    // must target the new bubble (`currentAssistantMessageId`).
+    const resolvedAssistantMessageId = (
+      eventAssistantMessageId?: string,
+    ): string => {
+      if (
+        interruptedAssistantMessageId !== null &&
+        (eventAssistantMessageId === undefined ||
+          eventAssistantMessageId === interruptedAssistantMessageId)
+      ) {
+        return currentAssistantMessageId;
+      }
+      return eventAssistantMessageId ?? currentAssistantMessageId;
+    };
 
     setChatRunning(chatKey, true);
     setChatRunFailed(chatKey, false);
@@ -5041,7 +5075,7 @@ export function App() {
           assistantDraft += streamEvent.delta;
           scheduleRunContextUsageRefresh();
           ensureStreamingAssistantMessage(
-            streamEvent.assistantMessageId ?? currentAssistantMessageId,
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
           setMessagesForChatKey(chatKey, (current) =>
             current.map((message) =>
@@ -5061,7 +5095,7 @@ export function App() {
           assistantDraftReasoning += streamEvent.delta;
           scheduleRunContextUsageRefresh();
           ensureStreamingAssistantMessage(
-            streamEvent.assistantMessageId ?? currentAssistantMessageId,
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
           setMessagesForChatKey(chatKey, (current) =>
             current.map((message) =>
@@ -5078,8 +5112,14 @@ export function App() {
         }
 
         if (streamEvent.type === "streamAttemptStart") {
-          currentAssistantMessageId = streamEvent.assistantMessageId;
-          ensureStreamingAssistantMessage(streamEvent.assistantMessageId);
+          // A post-guidance turn still emits streamAttemptStart under the
+          // interrupted id; keep targeting the new bubble in that case.
+          if (interruptedAssistantMessageId === null) {
+            currentAssistantMessageId = streamEvent.assistantMessageId;
+          }
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
           setActiveRunInfoForChatKey(chatKey, {
             chatId: activeRun.chatId,
             chatKey,
@@ -5133,6 +5173,7 @@ export function App() {
           const previousAssistantId = currentAssistantMessageId;
           const guidanceAssistantId = `${streamEvent.id}-assistant`;
           currentAssistantMessageId = guidanceAssistantId;
+          interruptedAssistantMessageId = previousAssistantId;
           hasGuidanceTurns = true;
           appendGuidanceMessage(
             chatKey,
@@ -5175,7 +5216,9 @@ export function App() {
         }
 
         if (streamEvent.type === "toolCall") {
-          ensureStreamingAssistantMessage(streamEvent.assistantMessageId);
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
           setMessagesForChatKey(chatKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5345,6 +5388,9 @@ export function App() {
     );
     let assistantMessageId = localAssistantId;
     let currentAssistantMessageId = localAssistantId;
+    // See subscribeActiveChatRun: post-guidance events keep carrying the
+    // interrupted assistant message id but must target the new bubble.
+    let interruptedAssistantMessageId: string | null = null;
     let requestChatId = request.chatId;
     const pendingChatId =
       request.chatId || request.localChatKey ? null : `pending:${runKey}`;
@@ -5687,7 +5733,11 @@ export function App() {
         }
 
         if (streamEvent.type === "streamAttemptStart") {
-          currentAssistantMessageId = streamEvent.assistantMessageId;
+          // A post-guidance turn still emits streamAttemptStart under the
+          // interrupted id; keep targeting the new bubble in that case.
+          if (interruptedAssistantMessageId === null) {
+            currentAssistantMessageId = streamEvent.assistantMessageId;
+          }
           setActiveRunInfoForChatKey(runMessagesKey, {
             chatId: requestChatId,
             chatKey: runMessagesKey,
@@ -5740,6 +5790,7 @@ export function App() {
           const previousAssistantId = currentAssistantMessageId;
           const guidanceAssistantId = `${streamEvent.id}-assistant`;
           currentAssistantMessageId = guidanceAssistantId;
+          interruptedAssistantMessageId = previousAssistantId;
           hasGuidanceTurns = true;
           appendGuidanceMessage(
             runMessagesKey,

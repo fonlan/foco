@@ -1936,6 +1936,53 @@ describe("App verification surfaces", () => {
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
 
+    // The interrupted bubble keeps its original content and does not absorb the
+    // post-guidance response text, even though the backend emits that text under
+    // the original assistant message id.
+    const guidedAnswerRow = guidedAnswer.closest(".message-row");
+    expect(guidedAnswerRow).not.toBeNull();
+    const initialAnswerRow = initialAnswer.closest(".message-row");
+    expect(initialAnswerRow).not.toBeNull();
+    expect(
+      within(initialAnswerRow as HTMLElement).queryByText("Adjusted answer."),
+    ).not.toBeInTheDocument();
+    expect(
+      within(guidedAnswerRow as HTMLElement).queryByText("Initial answer."),
+    ).not.toBeInTheDocument();
+
+    // Tool calls emitted after the guidance boundary must attach to the new
+    // bubble and resolve to a terminal status, never getting stuck "running".
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-guided",
+          input: {},
+          isError: false,
+          name: "noop",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        isError: false,
+        output: "ok",
+        toolCallId: "call-guided",
+        type: "toolResult",
+      });
+    });
+    expect(
+      within(guidedAnswerRow as HTMLElement).getByText(/noop/),
+    ).toBeInTheDocument();
+    expect(
+      within(guidedAnswerRow as HTMLElement).queryByText(/running/i),
+    ).not.toBeInTheDocument();
+    expect(
+      within(initialAnswerRow as HTMLElement).queryByText(/noop/),
+    ).not.toBeInTheDocument();
+
     await act(async () => {
       activeChatStreamController?.close();
     });
