@@ -677,6 +677,44 @@ fn ripgrep_command() -> String {
         .unwrap_or_else(|| "rg".to_string())
 }
 
+struct TextChangeStats {
+    lines_added: usize,
+    lines_removed: usize,
+}
+
+fn text_change_stats(old: &str, new: &str) -> Result<TextChangeStats, ToolRuntimeError> {
+    let input = gix::diff::blob::InternedInput::new(old.as_bytes(), new.as_bytes());
+    let diff =
+        gix::diff::blob::diff_with_slider_heuristics(gix::diff::blob::Algorithm::Histogram, &input);
+    let hunks = gix::diff::blob::UnifiedDiff::new(
+        &diff,
+        &input,
+        gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(Vec::new(), "\n"),
+        gix::diff::blob::unified_diff::ContextSize::default(),
+    )
+    .consume()
+    .map_err(|source| {
+        ToolRuntimeError::InvalidArguments(format!("failed to compute file change stats: {source}"))
+    })?;
+    let mut stats = TextChangeStats {
+        lines_added: 0,
+        lines_removed: 0,
+    };
+
+    for line in String::from_utf8_lossy(&hunks).lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            stats.lines_added += 1;
+        } else if line.starts_with('-') {
+            stats.lines_removed += 1;
+        }
+    }
+
+    Ok(stats)
+}
+
 fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
     let request: WriteFileInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_WRITE_FILE_TIMEOUT_MS)?;
@@ -691,7 +729,7 @@ fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
         }
     };
 
-    let (content, encoding) = match fs::metadata(&path) {
+    let (content, encoding, change_stats) = match fs::metadata(&path) {
         Ok(metadata) => {
             if !metadata.is_file() {
                 return Err(ToolRuntimeError::NotFile(path));
@@ -707,8 +745,9 @@ fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
             } else {
                 request.content
             };
+            let change_stats = text_change_stats(&existing_content, &content)?;
 
-            (content, encoding)
+            (content, encoding, change_stats)
         }
         Err(source) if source.kind() == io::ErrorKind::NotFound => {
             if line_range.is_some() {
@@ -717,7 +756,9 @@ fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
                 ));
             }
 
-            (request.content, TextEncoding::Utf8)
+            let change_stats = text_change_stats("", &request.content)?;
+
+            (request.content, TextEncoding::Utf8, change_stats)
         }
         Err(source) => {
             return Err(ToolRuntimeError::Io {
@@ -736,6 +777,8 @@ fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunt
     Ok(json!({
         "path": normalize_workspace_path_text(&request.path)?,
         "bytes": encoded.len(),
+        "linesAdded": change_stats.lines_added,
+        "linesRemoved": change_stats.lines_removed,
         "timeoutMs": timeout_ms
     }))
 }
@@ -775,6 +818,7 @@ fn edit_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunti
     } else {
         existing_content.replacen(&request.old_str, &request.new_str, 1)
     };
+    let change_stats = text_change_stats(&existing_content, &content)?;
     let encoded = encode_text_file(&content, encoding);
 
     fs::write(&path, &encoded).map_err(|source| ToolRuntimeError::Io {
@@ -787,6 +831,8 @@ fn edit_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRunti
         "bytes": encoded.len(),
         "replacements": match_count,
         "replaceAll": replace_all,
+        "linesAdded": change_stats.lines_added,
+        "linesRemoved": change_stats.lines_removed,
         "timeoutMs": timeout_ms
     }))
 }
@@ -3705,7 +3751,32 @@ mod tests {
         );
 
         assert!(!result.is_error);
+        assert_eq!(result.output["linesAdded"], 1);
+        assert_eq!(result.output["linesRemoved"], 0);
         assert_eq!(fs::read(&path).expect("read note bytes"), "你好".as_bytes());
+    }
+
+    #[test]
+    fn reports_write_file_line_change_stats() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let path = workspace.path().join("note.txt");
+        fs::write(&path, "one\ntwo\nthree\n").expect("write note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            WRITE_FILE_TOOL,
+            json!({
+                "path": "note.txt",
+                "content": "two\nfour\nfive",
+                "startLine": 2,
+                "endLine": 3,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(result.output["linesAdded"], 2);
+        assert_eq!(result.output["linesRemoved"], 1);
     }
 
     #[test]
@@ -3728,6 +3799,8 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(result.output["replacements"], 1);
         assert_eq!(result.output["replaceAll"], false);
+        assert_eq!(result.output["linesAdded"], 1);
+        assert_eq!(result.output["linesRemoved"], 1);
         assert_eq!(
             fs::read_to_string(workspace.path().join("note.txt")).expect("read note"),
             "one\nTWO\nthree\n"

@@ -681,10 +681,10 @@ const chatMessages = {
         {
           toolCall: {
             id: "tool-1",
-            input: { path: "README.md" },
+            input: { path: "README.md", oldStr: "hello", newStr: "hello world" },
             isError: false,
-            name: "read_file",
-            output: { content: "hello" },
+            name: "edit_file",
+            output: { bytes: 11, linesAdded: 1, linesRemoved: 1, path: "README.md" },
             status: "completed",
           },
           type: "toolCall",
@@ -699,10 +699,10 @@ const chatMessages = {
       toolCalls: [
         {
           id: "tool-1",
-          input: { path: "README.md" },
+          input: { path: "README.md", oldStr: "hello", newStr: "hello world" },
           isError: false,
-          name: "read_file",
-          output: { content: "hello" },
+          name: "edit_file",
+          output: { bytes: 11, linesAdded: 1, linesRemoved: 1, path: "README.md" },
           status: "completed",
         },
       ],
@@ -1151,12 +1151,14 @@ describe("App verification surfaces", () => {
     expect(within(reasoningToggle).getByText("2 s")).toBeInTheDocument();
     expect(screen.getByText("Need file context.")).toBeInTheDocument();
     expect(screen.getByText("Then answer.")).toBeInTheDocument();
-    expect(screen.getByText("read_file")).toBeInTheDocument();
+    expect(screen.getByText("edit_file")).toBeInTheDocument();
+    expect(screen.getByText("+1")).toHaveClass("text-emerald-700");
+    expect(screen.getByText("-1")).toHaveClass("text-rose-700");
     expect(screen.getByText("README.md")).toBeInTheDocument();
     expect(
       screen.getByText((_content, element) =>
         element?.tagName === "PRE" &&
-        Boolean(element.textContent?.includes('"path": "README.md')),
+        Boolean(element.textContent?.includes('"oldStr": "hello"')),
       ),
     ).toBeInTheDocument();
     expect(screen.getByText("Done.")).toBeInTheDocument();

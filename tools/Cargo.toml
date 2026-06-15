@@ -9,6 +9,7 @@ path = "lib.rs"
 
 [dependencies]
 foco-store.workspace = true
+gix.workspace = true
 globset.workspace = true
 serde.workspace = true
 serde_json.workspace = true

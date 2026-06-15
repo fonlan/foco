@@ -875,6 +875,7 @@ name = "foco-tools"
 version = "0.1.0"
 dependencies = [
  "foco-store",
+ "gix",
  "globset",
  "serde",
  "serde_json",

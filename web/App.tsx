@@ -9591,12 +9591,19 @@ function ToolCallBlock({ toolCall }: { toolCall: ChatToolCallSummary }) {
   const { t } = useI18n();
   const input = normalizedToolInput(toolCall.input);
   const detailText = toolCallDetailText(toolCall);
+  const changeStats = toolCallChangeStats(toolCall);
 
   return (
     <details className="tool-call-block group min-w-0">
       <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
         <Wrench aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
         <span className="min-w-0 shrink-0 truncate">{toolCall.name}</span>
+        {changeStats ? (
+          <span className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-stone-600">
+            <span className="text-emerald-700">+{changeStats.linesAdded}</span>{" "}
+            <span className="text-rose-700">-{changeStats.linesRemoved}</span>
+          </span>
+        ) : null}
         {detailText ? (
           <span className="shrink-0 text-stone-300">·</span>
         ) : null}
@@ -21488,6 +21495,28 @@ function toolStatusText(toolCall: ChatToolCallSummary, t: Translate) {
   return toolCall.status;
 }
 
+type ToolCallChangeStats = {
+  linesAdded: number;
+  linesRemoved: number;
+};
+
+function toolCallChangeStats(toolCall: ChatToolCallSummary): ToolCallChangeStats | null {
+  if (toolCall.name !== "edit_file" && toolCall.name !== "write_file") {
+    return null;
+  }
+  if (toolCall.output === null || !isObjectRecord(toolCall.output)) {
+    return null;
+  }
+
+  const linesAdded = numericField(toolCall.output, "linesAdded", "lines_added");
+  const linesRemoved = numericField(toolCall.output, "linesRemoved", "lines_removed");
+  if (linesAdded === null || linesRemoved === null) {
+    return null;
+  }
+
+  return { linesAdded, linesRemoved };
+}
+
 function toolCallDetailText(toolCall: ChatToolCallSummary) {
   const input = normalizedToolInput(toolCall.input);
 
@@ -21566,6 +21595,11 @@ function textField(value: Record<string, unknown>, camelName: string, snakeName?
 function numberTextField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
   const field = fieldValue(value, camelName, snakeName);
   return typeof field === "number" ? String(field) : null;
+}
+
+function numericField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
+  const field = fieldValue(value, camelName, snakeName);
+  return typeof field === "number" && Number.isFinite(field) ? field : null;
 }
 
 function stringArrayField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
