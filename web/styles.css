@@ -1626,6 +1626,17 @@ body,
   white-space: nowrap;
 }
 
+.message-model-id {
+  min-width: 0;
+  max-width: 16rem;
+  overflow: hidden;
+  color: var(--foco-text-muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .message-pending-badge {
   display: inline-flex;
   align-items: center;

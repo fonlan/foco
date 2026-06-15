@@ -8442,6 +8442,14 @@ function ChatPanel({
                             >
                               {createdAtLabel}
                             </time>
+                            {!isUser && message.metrics ? (
+                              <span
+                                className="message-model-id"
+                                title={`${t("Model")}: ${message.metrics.modelId}`}
+                              >
+                                {message.metrics.modelId}
+                              </span>
+                            ) : null}
                           </span>
                           <span className="message-action-group">
                             {canManageQueuedMessage ? (

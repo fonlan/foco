@@ -1099,10 +1099,14 @@ describe("App verification surfaces", () => {
       "dateTime",
       "2026-06-10T08:00:00.000Z",
     );
+    expect(userBubble?.querySelector(".message-model-id")).toBeNull();
     expect(assistantBubble?.querySelector("time")).toHaveAttribute(
       "dateTime",
       "2026-06-10T08:00:02.000Z",
     );
+    expect(
+      assistantBubble?.querySelector(".message-model-id"),
+    ).toHaveTextContent("gpt-test");
     const userRow = userBubble?.closest(".message-row") as HTMLElement | null;
     const assistantRow = assistantBubble?.closest(
       ".message-row",
@@ -4656,7 +4660,9 @@ describe("App verification surfaces", () => {
         .getByText("2"),
     ).toBeInTheDocument();
     expect(screen.getByText("+12 / -3")).toBeInTheDocument();
-    expect(screen.getByText("gpt-test")).toBeInTheDocument();
+    expect(
+      within(screen.getByText("Model calls").parentElement!).getByText("gpt-test"),
+    ).toBeInTheDocument();
     expect(
       within(screen.getByText("Tools and compression").parentElement!)
         .getByText("read_file"),
