@@ -836,12 +836,14 @@ dependencies = [
 name = "foco-mcp"
 version = "0.1.0"
 dependencies = [
+ "process-wrap",
  "reqwest",
  "rmcp",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
+ "windows",
 ]
 
 [[package]]

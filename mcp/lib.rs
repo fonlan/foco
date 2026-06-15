@@ -9,8 +9,14 @@ use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, ClientInfo, JsonObject},
     service::{RoleClient, RunningService},
-    transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess},
+    transport::{StreamableHttpClientTransport, TokioChildProcess},
 };
+#[cfg(not(windows))]
+use rmcp::transport::ConfigureCommandExt;
+#[cfg(windows)]
+use process_wrap::tokio::{CommandWrap, CreationFlags, JobObject, KillOnDrop};
+#[cfg(windows)]
+use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -18,7 +24,7 @@ use tokio::time::timeout;
 
 const MCP_TOOL_PREFIX: &str = "mcp__";
 const MCP_TOOL_SEPARATOR: &str = "__";
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(7);
 const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -434,6 +440,35 @@ pub fn validate_server_definitions(definitions: &[McpServerDefinition]) -> Resul
     Ok(())
 }
 
+#[cfg(windows)]
+fn start_stdio_transport(
+    command: &str,
+    args: Vec<String>,
+    workspace_path: &Path,
+) -> std::io::Result<TokioChildProcess> {
+    let command = rmcp::transport::which_command(command)?;
+    let mut command = CommandWrap::from(command);
+    command
+        .wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW)))
+        .wrap(KillOnDrop)
+        .wrap(JobObject);
+    command.command_mut().args(args).current_dir(workspace_path);
+
+    TokioChildProcess::new(command)
+}
+
+#[cfg(not(windows))]
+fn start_stdio_transport(
+    command: &str,
+    args: Vec<String>,
+    workspace_path: &Path,
+) -> std::io::Result<TokioChildProcess> {
+    TokioChildProcess::new(rmcp::transport::which_command(command)?.configure(move |cmd| {
+        cmd.args(args);
+        cmd.current_dir(workspace_path);
+    }))
+}
+
 async fn start_runtime(
     definition: &McpServerDefinition,
     workspace_path: &Path,
@@ -453,16 +488,7 @@ async fn start_runtime(
                     definition.id
                 ))
             })?;
-            let args = definition.args.clone();
-            let workspace_path = workspace_path.to_path_buf();
-            let transport = TokioChildProcess::new(
-                rmcp::transport::which_command(command)?.configure(move |cmd| {
-                    cmd.args(args);
-                    cmd.current_dir(workspace_path);
-                    #[cfg(windows)]
-                    cmd.creation_flags(CREATE_NO_WINDOW);
-                }),
-            )?;
+            let transport = start_stdio_transport(command, definition.args.clone(), workspace_path)?;
 
             client_info.clone().serve(transport).await
         }
