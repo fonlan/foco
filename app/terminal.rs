@@ -4,17 +4,26 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
+    time::Duration,
 };
 
-use axum::extract::ws::{Message, WebSocket};
+use axum::{
+    body::Bytes,
+    extract::ws::{Message, WebSocket},
+};
 use foco_store::workspace::{TerminalSessionRecord, WorkspaceDatabase};
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc};
+use tokio::{
+    sync::{broadcast, mpsc},
+    time,
+};
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+const TERMINAL_WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(10);
+const TERMINAL_WEBSOCKET_PING_PAYLOAD: &[u8] = b"foco-terminal-keepalive";
 const OSC7_PREFIX: &str = "\x1b]7;file://foco/";
 const OSC_BEL: char = '\x07';
 const OSC_ST: &str = "\x1b\\";
@@ -169,6 +178,8 @@ pub(crate) async fn handle_terminal_socket(
     let mut cwd_tracker = CwdTracker::default();
     let mut exit_status = None;
     let mut child_exited = false;
+    let mut heartbeat = time::interval(TERMINAL_WEBSOCKET_PING_INTERVAL);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -261,6 +272,16 @@ pub(crate) async fn handle_terminal_socket(
                         exit_status = Some("terminal output stream closed".to_string());
                         break;
                     }
+                }
+            }
+            _ = heartbeat.tick() => {
+                if sender
+                    .send(Message::Ping(Bytes::from_static(TERMINAL_WEBSOCKET_PING_PAYLOAD)))
+                    .await
+                    .is_err()
+                {
+                    exit_status = Some("terminal websocket heartbeat failed".to_string());
+                    break;
                 }
             }
             shutdown = shutdown_rx.recv() => {
