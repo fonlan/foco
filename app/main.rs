@@ -140,8 +140,6 @@ const MAX_AGENT_TOOL_ROUNDS: usize = 128;
 const MAX_REPEATED_TOOL_CALL_BATCHES: usize = 3;
 // Consecutive read-only exploration batches before telling the model to edit, ask, or finish.
 const READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD: usize = 16;
-// Consecutive read-only exploration batches allowed before failing the run as not making progress.
-const MAX_READ_ONLY_TOOL_BATCHES: usize = 20;
 // Number of newest chat messages kept verbatim when older history is compressed.
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 // Number of newest in-progress tool batches kept verbatim inside a long agent run.
@@ -6500,7 +6498,6 @@ fn tool_call_loop_signatures(tool_calls: &[NeutralToolCall]) -> Vec<ToolCallLoop
 enum ReadOnlyToolProgressAction {
     Continue,
     Warn(String),
-    Stop(String),
 }
 
 #[derive(Default)]
@@ -6522,13 +6519,6 @@ impl ReadOnlyToolProgressDetector {
         }
 
         self.consecutive_read_only_batches = self.consecutive_read_only_batches.saturating_add(1);
-
-        if self.consecutive_read_only_batches >= MAX_READ_ONLY_TOOL_BATCHES {
-            return ReadOnlyToolProgressAction::Stop(format!(
-                "agent run made {} consecutive read-only exploration tool batches without editing, asking a question, or finishing; stopping to avoid an unbounded tool loop",
-                self.consecutive_read_only_batches
-            ));
-        }
 
         if !self.warned
             && self.consecutive_read_only_batches >= READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD
@@ -8137,39 +8127,6 @@ impl PreparedChatContext {
                                         &mut self.message_context_sources,
                                         message,
                                     );
-                                }
-                                ReadOnlyToolProgressAction::Stop(message) => {
-                                    let event = ChatSseEvent::Error {
-                                        message: message.clone(),
-                                    };
-                                    events.push(captured_event(&event));
-                                    let outcome = failed_chat_audit_outcome(
-                                        &self,
-                                        started_at,
-                                        &mut events,
-                                        &message,
-                                        None,
-                                    )
-                                    .await;
-
-                                    if let Err(persist_error) = persist_chat_result(
-                                        &self,
-                                        &request_started_at,
-                                        outcome,
-                                        &events,
-                                        None,
-                                        None,
-                                        &executed_tool_calls,
-                                    ) {
-                                        let event = ChatSseEvent::Error {
-                                            message: persist_error.message,
-                                        };
-                                        yield event;
-                                    } else {
-                                        yield event;
-                                    }
-
-                                    return;
                                 }
                             }
                             for event in append_guidance_events(
@@ -21887,7 +21844,7 @@ mod tests {
     }
 
     #[test]
-    fn read_only_tool_progress_detector_warns_then_stops_varied_exploration() {
+    fn read_only_tool_progress_detector_warns_once_and_continues_varied_exploration() {
         let mut detector = ReadOnlyToolProgressDetector::default();
 
         for index in 1..READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD {
@@ -21908,7 +21865,9 @@ mod tests {
         )]);
         assert!(matches!(warning, ReadOnlyToolProgressAction::Warn(_)));
 
-        for index in (READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD + 1)..MAX_READ_ONLY_TOOL_BATCHES {
+        for index in (READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD + 1)
+            ..(READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD + 8)
+        {
             assert_eq!(
                 detector.check(&[test_neutral_tool_call(
                     &format!("call-after-warning-{index}"),
@@ -21919,12 +21878,14 @@ mod tests {
             );
         }
 
-        let stop = detector.check(&[test_neutral_tool_call(
-            "call-stop",
-            GRAPH_FIND_SYMBOLS_TOOL,
-            json!({ "query": "still_searching" }),
-        )]);
-        assert!(matches!(stop, ReadOnlyToolProgressAction::Stop(_)));
+        assert_eq!(
+            detector.check(&[test_neutral_tool_call(
+                "call-after-limit-removed",
+                GRAPH_FIND_SYMBOLS_TOOL,
+                json!({ "query": "still_searching" }),
+            )]),
+            ReadOnlyToolProgressAction::Continue
+        );
     }
 
     #[test]
