@@ -27,6 +27,8 @@ use serde_json::{Value, json};
 pub const READ_FILE_TOOL: &str = "read_file";
 pub const FIND_FILES_TOOL: &str = "find_files";
 pub const SEARCH_TEXT_TOOL: &str = "search_text";
+pub const WEB_SEARCH_TOOL: &str = "web_search";
+pub const WEB_FETCH_TOOL: &str = "web_fetch";
 pub const WRITE_FILE_TOOL: &str = "write_file";
 pub const EDIT_FILE_TOOL: &str = "edit_file";
 pub const RUN_COMMAND_TOOL: &str = "run_command";
@@ -52,6 +54,7 @@ const MAX_GRAPH_RESULT_LIMIT: usize = 50;
 const DEFAULT_FILE_TOOL_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_GRAPH_TOOL_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SEARCH_TEXT_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_WEB_TOOL_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
@@ -107,6 +110,8 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         graph_find_references_definition(),
         graph_related_files_definition(),
         search_text_definition(),
+        web_search_definition(),
+        web_fetch_definition(),
         write_file_definition(),
         edit_file_definition(),
         create_todo_graph_definition(),
@@ -204,6 +209,7 @@ pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64
         | GRAPH_FIND_REFERENCES_TOOL
         | GRAPH_RELATED_FILES_TOOL => DEFAULT_GRAPH_TOOL_TIMEOUT_MS,
         SEARCH_TEXT_TOOL => DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
+        WEB_SEARCH_TOOL | WEB_FETCH_TOOL => DEFAULT_WEB_TOOL_TIMEOUT_MS,
         WRITE_FILE_TOOL | EDIT_FILE_TOOL => DEFAULT_WRITE_FILE_TIMEOUT_MS,
         CREATE_TODO_GRAPH_TOOL | UPDATE_TODO_GRAPH_TOOL | GET_TODO_GRAPH_TOOL => {
             DEFAULT_TODO_GRAPH_TIMEOUT_MS
@@ -237,6 +243,9 @@ fn execute_builtin_tool_inner(
         GRAPH_FIND_REFERENCES_TOOL => graph_find_references(workspace_path, arguments),
         GRAPH_RELATED_FILES_TOOL => graph_related_files(workspace_path, arguments),
         SEARCH_TEXT_TOOL => search_text(workspace_path, arguments, cancellation_token),
+        WEB_SEARCH_TOOL | WEB_FETCH_TOOL => Err(ToolRuntimeError::InvalidArguments(format!(
+            "{tool_name} requires app web runtime configuration"
+        ))),
         WRITE_FILE_TOOL => write_file(workspace_path, arguments),
         EDIT_FILE_TOOL => edit_file(workspace_path, arguments),
         CREATE_TODO_GRAPH_TOOL => create_todo_graph(workspace_path, chat_id, arguments),
@@ -2065,6 +2074,56 @@ fn search_text_definition() -> ToolDefinition {
                 }
             },
             "required": ["query", "path", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn web_search_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: WEB_SEARCH_TOOL,
+        description: "Search the web for current or external information using the search API configured in Foco settings. Use web_fetch on result URLs when page details or direct source text are needed.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query."
+                },
+                "maxResults": {
+                    "type": ["integer", "null"],
+                    "description": "Optional number of results from 1 to 10. Defaults to 5."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 15000."
+                }
+            },
+            "required": ["query", "maxResults", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn web_fetch_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: WEB_FETCH_TOOL,
+        description: "Fetch an HTTP or HTTPS URL and return its readable text content with basic page metadata. Use this when the user provides a URL or when page details are needed from a known URL.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "HTTP or HTTPS URL to fetch."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 15000."
+                }
+            },
+            "required": ["url", "timeoutMs"]
         }),
         strict: true,
     }

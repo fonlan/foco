@@ -66,10 +66,12 @@ use foco_store::{
         HookConfig, HookEventMap, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig, MemorySettings,
         ModelLimits, ModelSettings, PromptSettings, ProviderSettings, SKILL_SCOPE_GLOBAL,
         SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
-        SUPPORTED_APP_THEMES, SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SkillSettings,
-        SystemPromptSettings, UNSUPPORTED_HOOK_EVENTS, WebServerSettings, WorkspaceCommonCommand,
-        WorkspaceConfig, load_or_create_global_config, load_workspace_hook_config,
-        save_global_config, save_workspace_hook_config, workspace_hook_config_path,
+        SUPPORTED_APP_THEMES, SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS,
+        SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings, SystemPromptSettings,
+        UNSUPPORTED_HOOK_EVENTS, WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY,
+        WebSearchSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
+        load_or_create_global_config, load_workspace_hook_config, save_global_config,
+        save_workspace_hook_config, workspace_hook_config_path,
     },
     memory::{
         MemoryDatabase, MemoryDatabaseError, MemoryExtractionJobStatus, MemoryFactRecord,
@@ -95,8 +97,8 @@ use foco_store::{
 };
 use foco_tools::{
     ASK_QUESTION_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
-    SLEEP_TOOL, ToolCancellationToken, ToolExecution, UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL,
-    builtin_tool_definitions, builtin_tool_timeout_ms,
+    SLEEP_TOOL, ToolCancellationToken, ToolExecution, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL,
+    WEB_SEARCH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions, builtin_tool_timeout_ms,
     execute_builtin_tool_for_chat_with_cancellation, set_ripgrep_path,
 };
 use futures_util::{StreamExt, future::join_all};
@@ -179,6 +181,13 @@ const MEMORY_RETRIEVAL_TOOL_NAME: &str = "select_relevant_memory";
 const MEMORY_EXTRACTION_TIMEOUT_MS: u64 = 60_000;
 // One retry is enough for malformed model tool output; repeated failures are ignored.
 const MEMORY_EXTRACTION_MAX_ATTEMPTS: usize = 2;
+const DEFAULT_WEB_TOOL_TIMEOUT_MS: u64 = 15_000;
+const MAX_WEB_TOOL_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_WEB_SEARCH_RESULT_LIMIT: usize = 5;
+const MAX_WEB_SEARCH_RESULT_LIMIT: usize = 10;
+const MAX_WEB_FETCH_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WEB_FETCH_TEXT_CHARS: usize = 40_000;
+const FOCO_WEB_USER_AGENT: &str = "Foco/0.1";
 // Timeout for model-based memory retrieval during prompt assembly.
 const MEMORY_RETRIEVAL_TIMEOUT_MS: u64 = 30_000;
 // Maximum output tokens allowed for the memory extraction model request.
@@ -1385,6 +1394,7 @@ fn app_router(state: AppState) -> Router {
         .route("/api/native/install-ripgrep", post(install_ripgrep))
         .route("/api/settings", get(settings))
         .route("/api/settings/general", post(save_general_settings))
+        .route("/api/settings/web-search", post(save_web_search_settings))
         .route("/api/settings/memory", post(save_memory_settings))
         .route("/api/settings/prompts", post(save_prompt_settings))
         .route("/api/memory", get(memory_list))
@@ -2848,6 +2858,51 @@ async fn save_general_settings(
     }
 
     Ok(response.into_response())
+}
+
+async fn save_web_search_settings(
+    State(state): State<AppState>,
+    Json(request): Json<ManualWebSearchSettingsRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let active_provider = request.active_provider.trim();
+
+    if !SUPPORTED_WEB_SEARCH_PROVIDERS.contains(&active_provider) {
+        return Err(ApiError::bad_request(format!(
+            "web search provider '{active_provider}' is unsupported"
+        )));
+    }
+
+    config.web_search.enabled = request.enabled;
+    config.web_search.active_provider = active_provider.to_string();
+    apply_web_search_api_key_update(
+        &mut config.web_search.tavily_api_key,
+        request.tavily_api_key,
+        request.clear_tavily_api_key.unwrap_or(false),
+    );
+    apply_web_search_api_key_update(
+        &mut config.web_search.brave_api_key,
+        request.brave_api_key,
+        request.clear_brave_api_key.unwrap_or(false),
+    );
+    config
+        .validate(Some(&state.config_file))
+        .map_err(ApiError::from_config_error)?;
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
+fn apply_web_search_api_key_update(
+    current: &mut Option<String>,
+    next: Option<String>,
+    clear: bool,
+) {
+    match optional_trimmed_string(next) {
+        Some(value) => *current = Some(value),
+        None if clear => *current = None,
+        None => {}
+    }
 }
 
 async fn save_memory_settings(
@@ -4806,6 +4861,17 @@ struct ManualGeneralSettingsRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ManualWebSearchSettingsRequest {
+    enabled: bool,
+    active_provider: String,
+    tavily_api_key: Option<String>,
+    brave_api_key: Option<String>,
+    clear_tavily_api_key: Option<bool>,
+    clear_brave_api_key: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ManualMemorySettingsRequest {
     enabled: bool,
     extraction_mode: String,
@@ -5139,6 +5205,7 @@ struct TerminalSocketQuery {
 struct SettingsResponse {
     general: GeneralSettingsSummary,
     native_tools: NativeToolsSummary,
+    web_search: WebSearchSettingsSummary,
     memory: MemorySettingsSummary,
     prompts: PromptSettingsSummary,
     workspaces: Vec<ConfiguredWorkspaceSummary>,
@@ -5196,6 +5263,22 @@ struct GeneralSettingsSummary {
     hook_audit_enabled: bool,
     supported_languages: Vec<AppLanguageSummary>,
     supported_themes: Vec<AppThemeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSearchSettingsSummary {
+    enabled: bool,
+    active_provider: String,
+    providers: Vec<WebSearchProviderSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebSearchProviderSummary {
+    provider: &'static str,
+    label: &'static str,
+    has_api_key: bool,
 }
 
 #[derive(Serialize)]
@@ -6128,6 +6211,21 @@ struct MemoryWriteToolInput {
     confidence: Option<f64>,
     pinned: Option<bool>,
     reason: Option<String>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebSearchToolInput {
+    query: String,
+    max_results: Option<usize>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WebFetchToolInput {
+    url: String,
     timeout_ms: Option<u64>,
 }
 
@@ -7656,6 +7754,7 @@ impl PreparedChatContext {
                                     self.hook_runtime.clone(),
                                     self.global_hooks.clone(),
                                     self.provider_config.clone(),
+                                    self.global_config.web_search.clone(),
                                     self.question_registry.clone(),
                                     question_event_tx,
                                     MemoryToolContext {
@@ -8190,7 +8289,9 @@ async fn prepare_prompt_context(
             .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
         status.available
     };
-    let builtin_tool_definitions = builtin_tool_definitions_for_runtime(ripgrep_available);
+    let web_search_available = web_search_enabled(&config.web_search);
+    let builtin_tool_definitions =
+        builtin_tool_definitions_for_runtime(ripgrep_available, web_search_available);
     let memory_tool_definitions = if config.memory.enabled {
         memory_tool_definitions()
     } else {
@@ -9876,10 +9977,12 @@ fn system_prompt_summaries(
 
 fn builtin_tool_definitions_for_runtime(
     ripgrep_available: bool,
+    web_search_available: bool,
 ) -> Vec<foco_tools::ToolDefinition> {
     builtin_tool_definitions()
         .into_iter()
         .filter(|tool| ripgrep_available || tool.name != SEARCH_TEXT_TOOL)
+        .filter(|tool| web_search_available || tool.name != WEB_SEARCH_TOOL)
         .collect()
 }
 
@@ -11660,6 +11763,10 @@ fn is_memory_tool_name(tool_name: &str) -> bool {
     matches!(tool_name, MEMORY_SEARCH_TOOL_NAME | MEMORY_WRITE_TOOL_NAME)
 }
 
+fn is_web_tool_name(tool_name: &str) -> bool {
+    matches!(tool_name, WEB_SEARCH_TOOL | WEB_FETCH_TOOL)
+}
+
 fn memory_tool_timeout_ms(arguments: &Value) -> Result<u64, String> {
     match arguments.get("timeoutMs") {
         Some(Value::Null) | None => Ok(DEFAULT_MEMORY_TOOL_TIMEOUT_MS),
@@ -11670,6 +11777,25 @@ fn memory_tool_timeout_ms(arguments: &Value) -> Result<u64, String> {
             if timeout_ms == 0 || timeout_ms > MAX_MEMORY_TOOL_TIMEOUT_MS {
                 Err(format!(
                     "timeoutMs must be between 1 and {MAX_MEMORY_TOOL_TIMEOUT_MS} milliseconds"
+                ))
+            } else {
+                Ok(timeout_ms)
+            }
+        }
+        Some(_) => Err("timeoutMs must be an integer or null".to_string()),
+    }
+}
+
+fn web_tool_timeout_ms(arguments: &Value) -> Result<u64, String> {
+    match arguments.get("timeoutMs") {
+        Some(Value::Null) | None => Ok(DEFAULT_WEB_TOOL_TIMEOUT_MS),
+        Some(Value::Number(timeout_ms)) => {
+            let timeout_ms = timeout_ms
+                .as_u64()
+                .ok_or_else(|| "timeoutMs must be an integer or null".to_string())?;
+            if timeout_ms == 0 || timeout_ms > MAX_WEB_TOOL_TIMEOUT_MS {
+                Err(format!(
+                    "timeoutMs must be between 1 and {MAX_WEB_TOOL_TIMEOUT_MS} milliseconds"
                 ))
             } else {
                 Ok(timeout_ms)
@@ -11705,6 +11831,350 @@ fn execute_memory_tool(
         }
         other => Err(format!("unknown memory tool: {other}")),
     }
+}
+
+async fn execute_web_tool(
+    settings: &WebSearchSettings,
+    tool_name: &str,
+    arguments: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    match tool_name {
+        WEB_SEARCH_TOOL => {
+            let input = serde_json::from_value::<WebSearchToolInput>(arguments)
+                .map_err(|source| format!("web_search arguments do not match schema: {source}"))?;
+            execute_web_search(settings, input, timeout).await
+        }
+        WEB_FETCH_TOOL => {
+            let input = serde_json::from_value::<WebFetchToolInput>(arguments)
+                .map_err(|source| format!("web_fetch arguments do not match schema: {source}"))?;
+            execute_web_fetch(input, timeout).await
+        }
+        _ => Err(format!("unknown web tool '{tool_name}'")),
+    }
+}
+
+async fn execute_web_search(
+    settings: &WebSearchSettings,
+    input: WebSearchToolInput,
+    timeout: Duration,
+) -> Result<Value, String> {
+    web_tool_timeout_ms_from_input(input.timeout_ms)?;
+    if !web_search_enabled(settings) {
+        return Err("web_search is disabled or missing an API key in settings".to_string());
+    }
+    let query = input.query.trim();
+    if query.is_empty() {
+        return Err("query must not be empty".to_string());
+    }
+    let max_results = normalize_web_search_limit(input.max_results)?;
+    let provider = settings.active_provider.trim();
+    let api_key = settings
+        .api_key_for_provider(provider)
+        .ok_or_else(|| format!("web_search provider '{provider}' is missing an API key"))?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(FOCO_WEB_USER_AGENT)
+        .build()
+        .map_err(|source| format!("failed to create web_search HTTP client: {source}"))?;
+    let output = match provider {
+        WEB_SEARCH_PROVIDER_TAVILY => tavily_search(&client, api_key, query, max_results).await?,
+        WEB_SEARCH_PROVIDER_BRAVE => brave_search(&client, api_key, query, max_results).await?,
+        other => return Err(format!("web_search provider '{other}' is unsupported")),
+    };
+
+    Ok(json!({
+        "provider": provider,
+        "query": query,
+        "results": output,
+        "timeoutMs": timeout.as_millis().min(u128::from(u64::MAX)) as u64
+    }))
+}
+
+async fn tavily_search(
+    client: &reqwest::Client,
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<Value>, String> {
+    let response = client
+        .post("https://api.tavily.com/search")
+        .bearer_auth(api_key)
+        .json(&json!({
+            "query": query,
+            "max_results": max_results,
+            "search_depth": "basic"
+        }))
+        .send()
+        .await
+        .map_err(|source| format!("Tavily search request failed: {source}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|source| format!("failed to read Tavily response: {source}"))?;
+    if !status.is_success() {
+        return Err(format_web_status_error("Tavily search", status, &body));
+    }
+    let value = serde_json::from_str::<Value>(&body)
+        .map_err(|source| format!("failed to parse Tavily response JSON: {source}"))?;
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Tavily response is missing results array".to_string())?;
+
+    Ok(results
+        .iter()
+        .take(max_results)
+        .map(|item| {
+            json!({
+                "title": item.get("title").and_then(Value::as_str).unwrap_or_default(),
+                "url": item.get("url").and_then(Value::as_str).unwrap_or_default(),
+                "snippet": item
+                    .get("content")
+                    .or_else(|| item.get("snippet"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "publishedAt": item
+                    .get("published_date")
+                    .or_else(|| item.get("publishedAt"))
+                    .and_then(Value::as_str),
+                "score": item.get("score").and_then(Value::as_f64)
+            })
+        })
+        .collect())
+}
+
+async fn brave_search(
+    client: &reqwest::Client,
+    api_key: &str,
+    query: &str,
+    max_results: usize,
+) -> Result<Vec<Value>, String> {
+    let mut url = reqwest::Url::parse("https://api.search.brave.com/res/v1/web/search")
+        .map_err(|source| format!("invalid Brave search URL: {source}"))?;
+    url.query_pairs_mut()
+        .append_pair("q", query)
+        .append_pair("count", &max_results.to_string())
+        .append_pair("text_decorations", "false");
+    let response = client
+        .get(url)
+        .header("X-Subscription-Token", api_key)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|source| format!("Brave search request failed: {source}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|source| format!("failed to read Brave response: {source}"))?;
+    if !status.is_success() {
+        return Err(format_web_status_error("Brave search", status, &body));
+    }
+    let value = serde_json::from_str::<Value>(&body)
+        .map_err(|source| format!("failed to parse Brave response JSON: {source}"))?;
+    let results = value
+        .get("web")
+        .and_then(|web| web.get("results"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Brave response is missing web.results array".to_string())?;
+
+    Ok(results
+        .iter()
+        .take(max_results)
+        .map(|item| {
+            json!({
+                "title": item.get("title").and_then(Value::as_str).unwrap_or_default(),
+                "url": item.get("url").and_then(Value::as_str).unwrap_or_default(),
+                "snippet": item
+                    .get("description")
+                    .or_else(|| item.get("snippet"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "publishedAt": item
+                    .get("age")
+                    .or_else(|| item.get("page_age"))
+                    .and_then(Value::as_str),
+                "score": null
+            })
+        })
+        .collect())
+}
+
+async fn execute_web_fetch(input: WebFetchToolInput, timeout: Duration) -> Result<Value, String> {
+    web_tool_timeout_ms_from_input(input.timeout_ms)?;
+    let url = parse_fetch_url(&input.url)?;
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent(FOCO_WEB_USER_AGENT)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|source| format!("failed to create web_fetch HTTP client: {source}"))?;
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(|source| format!("web_fetch request failed: {source}"))?;
+    let final_url = response.url().to_string();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_else(|_| String::new());
+        return Err(format_web_status_error("web_fetch", status, &body));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_WEB_FETCH_BYTES as u64)
+    {
+        return Err(format!(
+            "web_fetch response is too large to read (max {MAX_WEB_FETCH_BYTES} bytes)"
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|source| format!("failed to read web_fetch response: {source}"))?;
+    if bytes.len() > MAX_WEB_FETCH_BYTES {
+        return Err(format!(
+            "web_fetch response is too large to read ({} bytes; max {MAX_WEB_FETCH_BYTES})",
+            bytes.len()
+        ));
+    }
+    let raw_text = String::from_utf8_lossy(&bytes).to_string();
+    let (title, text) = if content_type
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("html")
+    {
+        (html_title(&raw_text), html_to_text(&raw_text))
+    } else {
+        (None, raw_text)
+    };
+    let (text, truncated) = truncate_chars(text.trim().to_string(), MAX_WEB_FETCH_TEXT_CHARS);
+
+    Ok(json!({
+        "url": input.url,
+        "finalUrl": final_url,
+        "status": status.as_u16(),
+        "contentType": content_type,
+        "title": title,
+        "text": text,
+        "truncated": truncated,
+        "bytes": bytes.len(),
+        "timeoutMs": timeout.as_millis().min(u128::from(u64::MAX)) as u64
+    }))
+}
+
+fn web_search_enabled(settings: &WebSearchSettings) -> bool {
+    settings.enabled
+        && settings
+            .api_key_for_provider(settings.active_provider.trim())
+            .is_some()
+}
+
+fn normalize_web_search_limit(limit: Option<usize>) -> Result<usize, String> {
+    let limit = limit.unwrap_or(DEFAULT_WEB_SEARCH_RESULT_LIMIT);
+    if !(1..=MAX_WEB_SEARCH_RESULT_LIMIT).contains(&limit) {
+        return Err(format!(
+            "maxResults must be between 1 and {MAX_WEB_SEARCH_RESULT_LIMIT}"
+        ));
+    }
+
+    Ok(limit)
+}
+
+fn web_tool_timeout_ms_from_input(timeout_ms: Option<u64>) -> Result<u64, String> {
+    match timeout_ms {
+        None => Ok(DEFAULT_WEB_TOOL_TIMEOUT_MS),
+        Some(timeout_ms) if timeout_ms > 0 && timeout_ms <= MAX_WEB_TOOL_TIMEOUT_MS => {
+            Ok(timeout_ms)
+        }
+        Some(_) => Err(format!(
+            "timeoutMs must be between 1 and {MAX_WEB_TOOL_TIMEOUT_MS} milliseconds"
+        )),
+    }
+}
+
+fn parse_fetch_url(value: &str) -> Result<reqwest::Url, String> {
+    let url =
+        reqwest::Url::parse(value.trim()).map_err(|source| format!("invalid URL: {source}"))?;
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        scheme => Err(format!(
+            "web_fetch only supports http and https URLs, got '{scheme}'"
+        )),
+    }
+}
+
+fn format_web_status_error(context: &str, status: reqwest::StatusCode, body: &str) -> String {
+    let preview = body.trim();
+    if preview.is_empty() {
+        format!("{context} returned HTTP {status}")
+    } else {
+        let (preview, _) = truncate_chars(preview.to_string(), 800);
+        format!("{context} returned HTTP {status}: {preview}")
+    }
+}
+
+fn html_title(html: &str) -> Option<String> {
+    let lower = html.to_ascii_lowercase();
+    let start = lower.find("<title")?;
+    let start = lower[start..].find('>').map(|offset| start + offset + 1)?;
+    let end = lower[start..]
+        .find("</title>")
+        .map(|offset| start + offset)?;
+    let title = html[start..end].trim();
+    (!title.is_empty()).then(|| decode_basic_html_entities(title))
+}
+
+fn html_to_text(html: &str) -> String {
+    let without_scripts = regex::Regex::new("(?is)<script\\b[^>]*>.*?</script>")
+        .expect("valid script regex")
+        .replace_all(html, " ");
+    let without_styles = regex::Regex::new("(?is)<style\\b[^>]*>.*?</style>")
+        .expect("valid style regex")
+        .replace_all(&without_scripts, " ");
+    let with_breaks = regex::Regex::new("(?i)<\\s*(br|p|div|li|h[1-6]|tr)\\b[^>]*>")
+        .expect("valid block regex")
+        .replace_all(&without_styles, "\n");
+    let without_tags = regex::Regex::new("(?is)<[^>]+>")
+        .expect("valid tag regex")
+        .replace_all(&with_breaks, " ");
+    normalize_web_text(&decode_basic_html_entities(&without_tags))
+}
+
+fn decode_basic_html_entities(value: &str) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+fn normalize_web_text(value: &str) -> String {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
+    if value.chars().count() <= max_chars {
+        return (value, false);
+    }
+
+    (value.chars().take(max_chars).collect(), true)
 }
 
 fn execute_memory_search_tool(
@@ -13368,6 +13838,7 @@ async fn execute_tool_calls_parallel(
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
     provider_config: ProviderConnectionConfig,
+    web_search_settings: WebSearchSettings,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     memory_tool_context: MemoryToolContext,
@@ -13399,6 +13870,7 @@ async fn execute_tool_calls_parallel(
                         hook_runtime.clone(),
                         global_hooks.clone(),
                         provider_config.clone(),
+                        web_search_settings.clone(),
                         question_registry.clone(),
                         question_event_tx.clone(),
                         memory_tool_context.clone(),
@@ -13430,6 +13902,7 @@ async fn execute_tool_calls_parallel(
                     let hook_runtime = hook_runtime.clone();
                     let global_hooks = global_hooks.clone();
                     let provider_config = provider_config.clone();
+                    let web_search_settings = web_search_settings.clone();
                     let question_registry = question_registry.clone();
                     let question_event_tx = question_event_tx.clone();
                     let memory_tool_context = memory_tool_context.clone();
@@ -13450,6 +13923,7 @@ async fn execute_tool_calls_parallel(
                                 hook_runtime,
                                 global_hooks,
                                 provider_config,
+                                web_search_settings,
                                 question_registry,
                                 question_event_tx,
                                 memory_tool_context,
@@ -13495,6 +13969,7 @@ async fn execute_tool_call(
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
     provider_config: ProviderConnectionConfig,
+    web_search_settings: WebSearchSettings,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     mut memory_tool_context: MemoryToolContext,
@@ -13516,6 +13991,7 @@ async fn execute_tool_call(
         hook_runtime.clone(),
         &global_hooks,
         &provider_config,
+        &web_search_settings,
         question_registry,
         question_event_tx,
         memory_tool_context,
@@ -13584,6 +14060,7 @@ async fn execute_tool(
     hook_runtime: HookRuntime,
     global_hooks: &HookConfig,
     provider_config: &ProviderConnectionConfig,
+    web_search_settings: &WebSearchSettings,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     memory_tool_context: MemoryToolContext,
@@ -13912,6 +14389,34 @@ async fn execute_tool(
         };
     }
 
+    if is_web_tool_name(tool_name) {
+        let remaining_timeout = tool_deadline
+            .and_then(remaining_duration_until)
+            .unwrap_or(Duration::ZERO);
+        set_tool_timeout_ms(&mut arguments, remaining_timeout);
+        let execution = tokio::select! {
+            _ = cancellation_token_cancelled(cancellation_token.clone()) => {
+                Err("tool execution cancelled".to_string())
+            }
+            execution = execute_web_tool(web_search_settings, tool_name, arguments, remaining_timeout) => execution,
+        };
+        let execution = match execution {
+            Ok(output) => ToolExecution {
+                output,
+                is_error: false,
+            },
+            Err(error) => ToolExecution {
+                output: json!({ "error": error }),
+                is_error: true,
+            },
+        };
+
+        return ToolExecutionWithHooks {
+            execution,
+            hook_summary,
+        };
+    }
+
     let execution = if is_mcp_tool_name(tool_name) {
         let tool_future = mcp_registry.execute_tool(workspace_id, tool_name, arguments);
         match tokio::select! {
@@ -13980,6 +14485,8 @@ fn execution_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<Optio
         Ok(None)
     } else if is_memory_tool_name(tool_name) {
         memory_tool_timeout_ms(arguments).map(Some)
+    } else if is_web_tool_name(tool_name) {
+        web_tool_timeout_ms(arguments).map(Some)
     } else if is_mcp_tool_name(tool_name) {
         Ok(None)
     } else {
@@ -16660,6 +17167,7 @@ async fn settings_response(
                 ripgrep_tool_summary(&status)
             },
         },
+        web_search: web_search_settings_summary(&config.web_search),
         memory: MemorySettingsSummary {
             enabled: config.memory.enabled,
             extraction_mode: config.memory.extraction_mode.clone(),
@@ -17067,6 +17575,29 @@ fn configured_provider_summary(provider: &ProviderSettings) -> ConfiguredProvide
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false),
         warnings: provider_warnings(provider),
+    }
+}
+
+fn web_search_settings_summary(settings: &WebSearchSettings) -> WebSearchSettingsSummary {
+    WebSearchSettingsSummary {
+        enabled: settings.enabled,
+        active_provider: settings.active_provider.clone(),
+        providers: vec![
+            WebSearchProviderSummary {
+                provider: WEB_SEARCH_PROVIDER_TAVILY,
+                label: "Tavily",
+                has_api_key: settings
+                    .api_key_for_provider(WEB_SEARCH_PROVIDER_TAVILY)
+                    .is_some(),
+            },
+            WebSearchProviderSummary {
+                provider: WEB_SEARCH_PROVIDER_BRAVE,
+                label: "Brave Search",
+                has_api_key: settings
+                    .api_key_for_provider(WEB_SEARCH_PROVIDER_BRAVE)
+                    .is_some(),
+            },
+        ],
     }
 }
 
@@ -20568,6 +21099,7 @@ mod tests {
                 api_key: Some("test-key".to_string()),
                 proxy_url: None,
             },
+            &WebSearchSettings::default(),
             QuestionRegistry::default(),
             mpsc::unbounded_channel().0,
             MemoryToolContext {
@@ -24737,6 +25269,106 @@ Use the existing product UI conventions.
     }
 
     #[tokio::test]
+    async fn prepare_prompt_context_hides_web_search_without_enabled_search_api() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-web-search-disabled-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-web-search-disabled-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let config = prompt_test_config(workspace_dir.clone());
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        let context = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: Some("hello".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+                attachments: Vec::new(),
+            },
+            PromptAssemblyPurpose::ChatRun,
+        )
+        .await
+        .expect("prompt context");
+        let tool_names = context
+            .provider_request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(!tool_names.contains(WEB_SEARCH_TOOL));
+        assert!(tool_names.contains(WEB_FETCH_TOOL));
+        let available_tools_message = context
+            .provider_request
+            .messages
+            .get(1)
+            .expect("available tools message");
+        assert!(!available_tools_message.content.contains(WEB_SEARCH_TOOL));
+        assert!(available_tools_message.content.contains(WEB_FETCH_TOOL));
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
+    async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
+        let workspace_dir = env::temp_dir().join(unique_id("foco-web-search-enabled-test"));
+        let profile_dir = env::temp_dir().join(unique_id("foco-web-search-enabled-profile-test"));
+
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = prompt_test_config(workspace_dir.clone());
+        config.web_search.enabled = true;
+        config.web_search.tavily_api_key = Some("tavily-token".to_string());
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        let context = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                chat_id: None,
+                model_id: "model".to_string(),
+                provider_id: None,
+                thinking_level: None,
+                skill_ids: None,
+                message: Some("hello".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+                attachments: Vec::new(),
+            },
+            PromptAssemblyPurpose::ChatRun,
+        )
+        .await
+        .expect("prompt context");
+        let tool_names = context
+            .provider_request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(tool_names.contains(WEB_SEARCH_TOOL));
+        assert!(tool_names.contains(WEB_FETCH_TOOL));
+        let available_tools_message = context
+            .provider_request
+            .messages
+            .get(1)
+            .expect("available tools message");
+        assert!(available_tools_message.content.contains(WEB_SEARCH_TOOL));
+        assert!(available_tools_message.content.contains(WEB_FETCH_TOOL));
+
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+
+    #[tokio::test]
     async fn prepare_prompt_context_uses_model_system_prompt() {
         let workspace_dir = env::temp_dir().join(unique_id("foco-custom-system-prompt-test"));
         let profile_dir = env::temp_dir().join(unique_id("foco-custom-system-prompt-profile-test"));
@@ -26195,6 +26827,36 @@ description: Project memory.
                 metadata_json: "{}",
             })
             .expect("memory fact insert");
+    }
+
+    fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
+        let mut config = GlobalConfig::first_run(workspace_dir);
+        config.providers.push(ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 20_000,
+                max_output_tokens: 1_000,
+            }),
+        });
+        config
     }
 
     fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {

@@ -31,6 +31,10 @@ pub const MAX_LLM_REQUEST_RETRY_COUNT: u32 = 10;
 pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
 pub const SUPPORTED_API_PROXY_TYPES: &[&str] = &[HTTP_PROXY_KIND, SOCKS_PROXY_KIND];
+pub const WEB_SEARCH_PROVIDER_TAVILY: &str = "tavily";
+pub const WEB_SEARCH_PROVIDER_BRAVE: &str = "brave";
+pub const SUPPORTED_WEB_SEARCH_PROVIDERS: &[&str] =
+    &[WEB_SEARCH_PROVIDER_TAVILY, WEB_SEARCH_PROVIDER_BRAVE];
 pub const DEFAULT_SYSTEM_PROMPT_NAME: &str = "Default";
 pub const FOCO_CONFIG_DIR_ENV: &str = "FOCO_CONFIG_DIR";
 pub const WORKSPACE_HOOK_CONFIG_FILE: &str = "hooks.json";
@@ -286,6 +290,8 @@ pub struct GlobalConfig {
     pub memory: MemorySettings,
     #[serde(default)]
     pub prompts: PromptSettings,
+    #[serde(default)]
+    pub web_search: WebSearchSettings,
     pub providers: Vec<ProviderSettings>,
     pub models: Vec<ModelSettings>,
     pub mcp: McpConfig,
@@ -308,6 +314,7 @@ impl GlobalConfig {
             hooks: HookConfig::default(),
             memory: MemorySettings::default(),
             prompts: PromptSettings::default(),
+            web_search: WebSearchSettings::default(),
             providers: Vec::new(),
             models: Vec::new(),
             mcp: McpConfig {
@@ -353,6 +360,7 @@ impl GlobalConfig {
         validate_hook_config(config_path, "hooks", &self.hooks)?;
         validate_memory_settings(config_path, &self.memory, &self.models)?;
         validate_prompt_settings(config_path, &self.prompts)?;
+        validate_web_search_settings(config_path, &self.web_search)?;
         require_non_empty_list(config_path, "workspaces", self.workspaces.len())?;
 
         let mut workspace_ids = HashSet::new();
@@ -622,6 +630,7 @@ impl GlobalConfig {
         if redacted.app.web_server.password_hash.is_some() {
             redacted.app.web_server.password_hash = Some(REDACTED_SECRET.to_string());
         }
+        redacted.web_search.redact_secrets();
 
         serde_json::to_string(&redacted)
     }
@@ -678,6 +687,55 @@ impl Default for ApiProxySettings {
 
 fn default_api_proxy_type() -> String {
     HTTP_PROXY_KIND.to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebSearchSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_web_search_provider")]
+    pub active_provider: String,
+    #[serde(default)]
+    pub tavily_api_key: Option<String>,
+    #[serde(default)]
+    pub brave_api_key: Option<String>,
+}
+
+impl WebSearchSettings {
+    pub fn api_key_for_provider(&self, provider: &str) -> Option<&str> {
+        match provider {
+            WEB_SEARCH_PROVIDER_TAVILY => self.tavily_api_key.as_deref(),
+            WEB_SEARCH_PROVIDER_BRAVE => self.brave_api_key.as_deref(),
+            _ => None,
+        }
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    }
+
+    fn redact_secrets(&mut self) {
+        if self.tavily_api_key.is_some() {
+            self.tavily_api_key = Some(REDACTED_SECRET.to_string());
+        }
+        if self.brave_api_key.is_some() {
+            self.brave_api_key = Some(REDACTED_SECRET.to_string());
+        }
+    }
+}
+
+impl Default for WebSearchSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            active_provider: default_web_search_provider(),
+            tavily_api_key: None,
+            brave_api_key: None,
+        }
+    }
+}
+
+fn default_web_search_provider() -> String {
+    WEB_SEARCH_PROVIDER_TAVILY.to_string()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1166,6 +1224,56 @@ fn validate_api_proxy_settings(
             path: config_path.map(Path::to_path_buf),
             message: source.to_string(),
         })?;
+    }
+
+    Ok(())
+}
+
+fn validate_web_search_settings(
+    config_path: Option<&Path>,
+    settings: &WebSearchSettings,
+) -> Result<(), ConfigError> {
+    let active_provider = settings.active_provider.trim();
+    if !SUPPORTED_WEB_SEARCH_PROVIDERS.contains(&active_provider) {
+        return invalid_config(
+            config_path,
+            format!(
+                "web_search.active_provider '{active_provider}' is unsupported; expected one of {}",
+                SUPPORTED_WEB_SEARCH_PROVIDERS.join(", ")
+            ),
+        );
+    }
+
+    validate_optional_secret(
+        config_path,
+        "web_search.tavily_api_key",
+        &settings.tavily_api_key,
+    )?;
+    validate_optional_secret(
+        config_path,
+        "web_search.brave_api_key",
+        &settings.brave_api_key,
+    )?;
+    if settings.enabled && settings.api_key_for_provider(active_provider).is_none() {
+        return invalid_config(
+            config_path,
+            format!("web_search.{active_provider} api key must be set when web search is enabled"),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_optional_secret(
+    config_path: Option<&Path>,
+    field: &str,
+    value: &Option<String>,
+) -> Result<(), ConfigError> {
+    if value
+        .as_deref()
+        .is_some_and(|secret| secret.trim().is_empty())
+    {
+        return invalid_config(config_path, format!("{field} must not be empty when set"));
     }
 
     Ok(())
@@ -1995,6 +2103,30 @@ mod tests {
         let error = save_global_config(&paths.config_file, &config)
             .expect_err("proxy URL type mismatch should fail");
         assert!(error.to_string().contains("does not match proxy type"));
+    }
+
+    #[test]
+    fn load_rejects_enabled_web_search_without_active_provider_key() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.web_search.enabled = true;
+        config.web_search.active_provider = WEB_SEARCH_PROVIDER_TAVILY.to_string();
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("enabled web search without token should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("web_search.tavily api key must be set")
+        );
+
+        config.web_search.tavily_api_key = Some("token".to_string());
+        save_global_config(&paths.config_file, &config)
+            .expect("enabled web search with active token should save");
     }
 
     #[test]

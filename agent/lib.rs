@@ -24,6 +24,8 @@ const ASK_QUESTION_TOOL_NAME: &str = "ask_question";
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 const MEMORY_WRITE_TOOL_NAME: &str = "memory_write";
 const MCP_TOOL_NAME_PREFIX: &str = "mcp__";
+const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+const WEB_FETCH_TOOL_NAME: &str = "web_fetch";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolPromptInfo {
@@ -515,6 +517,10 @@ pub fn tool_resource_locks(
         MEMORY_WRITE_TOOL_NAME => Ok(vec![ToolResourceLock {
             resource: ToolResource::Memory(memory_scope_key(tool_call)?),
             access: ToolResourceAccess::Write,
+        }]),
+        WEB_SEARCH_TOOL_NAME | WEB_FETCH_TOOL_NAME => Ok(vec![ToolResourceLock {
+            resource: ToolResource::ExternalTool(tool_call.name.clone()),
+            access: ToolResourceAccess::Exclusive,
         }]),
         ASK_QUESTION_TOOL_NAME | "sleep" => Ok(Vec::new()),
         name if name.starts_with(MCP_TOOL_NAME_PREFIX) => Ok(vec![

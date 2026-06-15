@@ -36,6 +36,7 @@ import {
   PlugZap,
   Plus,
   RefreshCw,
+  Search,
   Send,
   Server,
   Settings,
@@ -278,6 +279,18 @@ type GeneralSettingsSummary = {
   webServer: WebServerSettingsSummary;
 };
 
+type WebSearchProviderSummary = {
+  provider: string;
+  label: string;
+  hasApiKey: boolean;
+};
+
+type WebSearchSettingsSummary = {
+  enabled: boolean;
+  activeProvider: string;
+  providers: WebSearchProviderSummary[];
+};
+
 type MemoryExtractionModeSummary = {
   value: string;
   label: string;
@@ -326,6 +339,7 @@ type TerminalShellSummary = {
 type SettingsResponse = {
   general: GeneralSettingsSummary;
   nativeTools: NativeToolsSummary;
+  webSearch: WebSearchSettingsSummary;
   memory: MemorySettingsSummary;
   prompts: PromptSettingsSummary;
   workspaces: ConfiguredWorkspaceSummary[];
@@ -470,6 +484,15 @@ type GeneralFormState = {
   llmRequestRetryCount: string;
   password: string;
   theme: AppThemeId;
+};
+
+type WebSearchFormState = {
+  activeProvider: string;
+  braveApiKey: string;
+  clearBraveApiKey: boolean;
+  clearTavilyApiKey: boolean;
+  enabled: boolean;
+  tavilyApiKey: string;
 };
 
 type PromptSettingsFormState = {
@@ -1119,6 +1142,7 @@ type HookNotificationSummary = {
 type SettingsSection =
   | "general"
   | "prompts"
+  | "web-search"
   | "hooks"
   | "memory"
   | "mcp"
@@ -1148,6 +1172,7 @@ const SAVED_PASSWORD_MASK = "********";
 const SETTINGS_SECTION_IDS: SettingsSection[] = [
   "general",
   "prompts",
+  "web-search",
   "workspaces",
   "hooks",
   "memory",
@@ -1563,8 +1588,10 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Models: "模型",
     Skills: "技能",
     Memory: "记忆",
+    "Web Search": "Web 搜索",
     "General settings": "常规设置",
     "Prompt settings": "提示词设置",
+    "Web search settings": "Web 搜索设置",
     "Provider settings": "供应商设置",
     "Model settings": "模型设置",
     "MCP settings": "MCP 设置",
@@ -1662,6 +1689,8 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Web service listen address": "Web 服务监听地址",
     "System prompt, prompt files, and extra instructions":
       "系统提示词、提示词文件与额外指令",
+    "Search API credentials and runtime web tools":
+      "搜索 API 凭据与运行时 Web 工具",
     "Provider credentials and connection checks": "供应商凭据与连接检查",
     "Workspace-scoped MCP server runtimes": "工作区级 MCP 服务运行时",
     "Skill discovery and enablement": "技能发现与启用",
@@ -1701,6 +1730,20 @@ const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Save general settings": "保存常规设置",
     Save: "保存",
     "Reload general settings": "重新加载常规设置",
+    "Web search": "Web 搜索",
+    "Runtime tool": "运行时工具",
+    "Expose web_search to chat runs": "向聊天运行暴露 web_search",
+    "web_fetch is available for known URLs; web_search requires an enabled search API.":
+      "web_fetch 可用于已知 URL；web_search 需要启用搜索 API。",
+    "Search API": "搜索 API",
+    "API token": "API token",
+    saved: "已保存",
+    missing: "缺失",
+    "Paste API token": "粘贴 API token",
+    "Saved token is kept unless changed.": "不填写则保留已保存 token。",
+    "Clear saved token": "清除已保存 token",
+    "Save web search settings": "保存 Web 搜索设置",
+    "Reload web search settings": "重新加载 Web 搜索设置",
     "System prompt": "系统提示词",
     Custom: "自定义",
     "Prompt name": "提示词名称",
@@ -12408,6 +12451,9 @@ function SettingsPanel({
   const [generalForm, setGeneralForm] = useState<GeneralFormState>(() =>
     emptyGeneralForm(),
   );
+  const [webSearchForm, setWebSearchForm] = useState<WebSearchFormState>(() =>
+    emptyWebSearchForm(),
+  );
   const [promptSettingsForm, setPromptSettingsForm] =
     useState<PromptSettingsFormState>(() => emptyPromptSettingsForm());
   const [memorySettingsForm, setMemorySettingsForm] =
@@ -12477,6 +12523,7 @@ function SettingsPanel({
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isSavingGeneral, setIsSavingGeneral] = useState(false);
+  const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
   const [isSavingPromptSettings, setIsSavingPromptSettings] = useState(false);
   const [isSelectingPromptFile, setIsSelectingPromptFile] = useState(false);
   const [isSavingMemorySettings, setIsSavingMemorySettings] = useState(false);
@@ -12690,6 +12737,20 @@ function SettingsPanel({
     });
   }
 
+  function syncWebSearchForm(data: SettingsResponse) {
+    setWebSearchForm({
+      activeProvider:
+        data.webSearch.activeProvider ||
+        data.webSearch.providers[0]?.provider ||
+        "tavily",
+      braveApiKey: "",
+      clearBraveApiKey: false,
+      clearTavilyApiKey: false,
+      enabled: data.webSearch.enabled,
+      tavilyApiKey: "",
+    });
+  }
+
   function syncPromptSettingsForm(data: SettingsResponse) {
     const systemPrompts = normalizedSystemPromptSummaries(data.prompts);
     setPromptSettingsForm({
@@ -12752,6 +12813,7 @@ function SettingsPanel({
       setDraggedModelId(null);
       setModelOrderPreview(null);
       syncGeneralForm(data);
+      syncWebSearchForm(data);
       syncPromptSettingsForm(data);
       syncMemorySettingsForm(data);
       setProviderForm((current) => ({
@@ -13146,6 +13208,34 @@ function SettingsPanel({
       setError(errorMessage(requestError));
     } finally {
       setIsSavingGeneral(false);
+    }
+  }
+
+  async function saveWebSearchSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSavingWebSearch(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings/web-search", {
+        body: JSON.stringify({
+          activeProvider: webSearchForm.activeProvider,
+          braveApiKey: webSearchForm.braveApiKey.trim() || null,
+          clearBraveApiKey: webSearchForm.clearBraveApiKey,
+          clearTavilyApiKey: webSearchForm.clearTavilyApiKey,
+          enabled: webSearchForm.enabled,
+          tavilyApiKey: webSearchForm.tavilyApiKey.trim() || null,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncWebSearchForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingWebSearch(false);
     }
   }
 
@@ -14724,6 +14814,12 @@ function SettingsPanel({
             onClick={() => onActiveSectionChange("prompts")}
           />
           <SettingsNavButton
+            active={activeSection === "web-search"}
+            icon={Search}
+            label={t("Web Search")}
+            onClick={() => onActiveSectionChange("web-search")}
+          />
+          <SettingsNavButton
             active={activeSection === "workspaces"}
             icon={Folder}
             label={t("Workspaces")}
@@ -15124,6 +15220,182 @@ function SettingsPanel({
               </div>
             </div>
           </section>
+        </section>
+        ) : null}
+
+        {activeSection === "web-search" ? (
+        <section className="grid gap-4">
+          <form
+            className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+            onSubmit={(event) => void saveWebSearchSettings(event)}
+          >
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Search aria-hidden="true" className="size-5 text-teal-700" />
+                <h3 className="text-sm font-semibold text-stone-950">
+                  {t("Web search")}
+                </h3>
+              </div>
+              <CapabilityPill
+                label={webSearchForm.enabled ? t("enabled") : t("disabled")}
+                ok={webSearchForm.enabled}
+              />
+            </div>
+            <div className="mt-4 grid gap-4">
+              <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                <legend className="px-1 text-xs font-semibold text-stone-600">
+                  {t("Runtime tool")}
+                </legend>
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-stone-800">
+                      {t("Expose web_search to chat runs")}
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-stone-500">
+                      {t(
+                        "web_fetch is available for known URLs; web_search requires an enabled search API.",
+                      )}
+                    </p>
+                  </div>
+                  <label
+                    aria-label={t("Expose web_search to chat runs")}
+                    className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                  >
+                    <input
+                      checked={webSearchForm.enabled}
+                      className="size-4 accent-teal-700"
+                      onChange={(event) =>
+                        setWebSearchForm((current) => ({
+                          ...current,
+                          enabled: event.target.checked,
+                        }))
+                      }
+                      type="checkbox"
+                    />
+                  </label>
+                </div>
+              </fieldset>
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  {t("Search API")}
+                </span>
+                <select
+                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) =>
+                    setWebSearchForm((current) => ({
+                      ...current,
+                      activeProvider: event.target.value,
+                    }))
+                  }
+                  value={webSearchForm.activeProvider}
+                >
+                  {(settings?.webSearch.providers ?? []).map((provider) => (
+                    <option key={provider.provider} value={provider.provider}>
+                      {provider.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="grid gap-3 lg:grid-cols-2">
+                {(settings?.webSearch.providers ?? []).map((provider) => {
+                  const keyField =
+                    provider.provider === "brave"
+                      ? "braveApiKey"
+                      : "tavilyApiKey";
+                  const clearField =
+                    provider.provider === "brave"
+                      ? "clearBraveApiKey"
+                      : "clearTavilyApiKey";
+
+                  return (
+                    <div
+                      className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3"
+                      key={provider.provider}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-sm font-semibold text-stone-900">
+                          {provider.label}
+                        </span>
+                        <CapabilityPill
+                          label={provider.hasApiKey ? t("saved") : t("missing")}
+                          ok={provider.hasApiKey}
+                        />
+                      </div>
+                      <label className="mt-3 block">
+                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          {t("API token")}
+                        </span>
+                        <input
+                          autoComplete="off"
+                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          onChange={(event) =>
+                            setWebSearchForm((current) => ({
+                              ...current,
+                              [keyField]: event.target.value,
+                            }))
+                          }
+                          placeholder={
+                            provider.hasApiKey
+                              ? t("Saved token is kept unless changed.")
+                              : t("Paste API token")
+                          }
+                          type="password"
+                          value={String(webSearchForm[keyField])}
+                        />
+                      </label>
+                      {provider.hasApiKey ? (
+                        <label className="mt-3 flex items-center gap-2 text-xs font-semibold text-stone-600">
+                          <input
+                            checked={Boolean(webSearchForm[clearField])}
+                            className="size-4 accent-teal-700"
+                            onChange={(event) =>
+                              setWebSearchForm((current) => ({
+                                ...current,
+                                [clearField]: event.target.checked,
+                              }))
+                            }
+                            type="checkbox"
+                          />
+                          {t("Clear saved token")}
+                        </label>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                aria-label={t("Save web search settings")}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                disabled={isSavingWebSearch || !webSearchForm.activeProvider}
+                title={t("Save web search settings")}
+                type="submit"
+              >
+                {isSavingWebSearch ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <CheckCircle2 aria-hidden="true" className="size-4" />
+                )}
+                {t("Save")}
+              </button>
+              <button
+                aria-label={t("Reload web search settings")}
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                disabled={isLoadingSettings}
+                onClick={() => void loadSettings()}
+                title={t("Reload settings")}
+                type="button"
+              >
+                {isLoadingSettings ? (
+                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                ) : (
+                  <RefreshCw aria-hidden="true" className="size-4" />
+                )}
+                {t("Reload")}
+              </button>
+            </div>
+          </form>
         </section>
         ) : null}
 
@@ -19123,6 +19395,10 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
     return t("Prompt settings");
   }
 
+  if (section === "web-search") {
+    return t("Web search settings");
+  }
+
   if (section === "hooks") {
     return t("Hook settings");
   }
@@ -19157,6 +19433,10 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
 
   if (section === "prompts") {
     return t("System prompt, prompt files, and extra instructions");
+  }
+
+  if (section === "web-search") {
+    return t("Search API credentials and runtime web tools");
   }
 
   if (section === "hooks") {
@@ -19554,6 +19834,17 @@ function emptyGeneralForm(): GeneralFormState {
     llmRequestRetryCount: "3",
     password: "",
     theme: "light",
+  };
+}
+
+function emptyWebSearchForm(): WebSearchFormState {
+  return {
+    activeProvider: "tavily",
+    braveApiKey: "",
+    clearBraveApiKey: false,
+    clearTavilyApiKey: false,
+    enabled: false,
+    tavilyApiKey: "",
   };
 }
 
