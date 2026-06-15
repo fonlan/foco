@@ -3666,6 +3666,13 @@ export function App() {
     );
   }
 
+  function compareWorkspaceChatListItemsByCreatedAtDesc(
+    left: WorkspaceChatListItem,
+    right: WorkspaceChatListItem,
+  ) {
+    return Date.parse(right.createdAt) - Date.parse(left.createdAt);
+  }
+
   function scheduledWorkspaceRunsFor(workspaceId: string) {
     return scheduledWorkspaceRuns.filter((run) => run.workspaceId === workspaceId);
   }
@@ -6402,19 +6409,21 @@ export function App() {
                     WORKSPACE_CHAT_HISTORY_PAGE_SIZE;
                   const scheduledChats = scheduledWorkspaceRunsFor(
                     workspace.id,
-                  ).map(
-                    (run): WorkspaceChatListItem => ({
-                      activeRun: null,
-                      codeChangeStats: { additions: 0, deletions: 0 },
-                      createdAt: run.createdAt,
-                      id: run.chatId,
-                      scheduledChatKey: run.chatKey,
-                      scheduledRunId: run.id,
-                      scheduledStatus: run.status,
-                      title: run.title,
-                      updatedAt: run.createdAt,
-                    }),
-                  );
+                  )
+                    .map(
+                      (run): WorkspaceChatListItem => ({
+                        activeRun: null,
+                        codeChangeStats: { additions: 0, deletions: 0 },
+                        createdAt: run.createdAt,
+                        id: run.chatId,
+                        scheduledChatKey: run.chatKey,
+                        scheduledRunId: run.id,
+                        scheduledStatus: run.status,
+                        title: run.title,
+                        updatedAt: run.createdAt,
+                      }),
+                    )
+                    .sort(compareWorkspaceChatListItemsByCreatedAtDesc);
                   const workspaceChats: WorkspaceChatListItem[] = [
                     ...scheduledChats,
                     ...workspace.chats,

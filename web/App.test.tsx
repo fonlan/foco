@@ -2733,6 +2733,41 @@ describe("App verification surfaces", () => {
       within(scheduledMessageRow as HTMLElement).getByText("Queued"),
     ).toBeInTheDocument();
 
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const firstScheduledHistoryButton = within(workspaceList)
+      .getByText("Keyboard scheduled task")
+      .closest("button");
+    if (!firstScheduledHistoryButton) {
+      throw new Error("Expected first scheduled chat history button");
+    }
+    expect(
+      firstScheduledHistoryButton.querySelector(".session-status-dot"),
+    ).toHaveClass("session-status-dot-scheduled");
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "New chat in Default" }),
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "Click scheduled task",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }), {
+      ctrlKey: true,
+    });
+
+    const secondScheduledHistoryButton = within(workspaceList)
+      .getByText("Click scheduled task")
+      .closest("button");
+    if (!secondScheduledHistoryButton) {
+      throw new Error("Expected second scheduled chat history button");
+    }
+    expect(
+      secondScheduledHistoryButton.compareDocumentPosition(firstScheduledHistoryButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
     await act(async () => {
       chatStreamControllers.get("request-stream")?.close();
     });
@@ -2748,6 +2783,19 @@ describe("App verification surfaces", () => {
 
     await act(async () => {
       chatStreamControllers.get("request-stream-2")?.close();
+    });
+
+    await waitFor(() => {
+      const streamCalls = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/chat/stream",
+      );
+      expect(streamCalls).toHaveLength(3);
+    });
+
+    await act(async () => {
+      chatStreamControllers.get("request-stream-3")?.close();
     });
   });
 
