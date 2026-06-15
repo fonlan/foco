@@ -96,9 +96,12 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    ASK_QUESTION_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
-    SLEEP_TOOL, ToolCancellationToken, ToolExecution, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL,
-    WEB_SEARCH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions, builtin_tool_timeout_ms,
+    ASK_QUESTION_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
+    GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
+    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL,
+    RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolCancellationToken, ToolExecution,
+    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    builtin_tool_definitions, builtin_tool_timeout_ms,
     execute_builtin_tool_for_chat_with_cancellation, set_ripgrep_path,
 };
 use futures_util::{StreamExt, future::join_all};
@@ -135,6 +138,10 @@ const HOST_ENV: &str = "FOCO_HOST";
 const MAX_AGENT_TOOL_ROUNDS: usize = 128;
 // Maximum identical tool-call batches allowed before treating the run as a loop.
 const MAX_REPEATED_TOOL_CALL_BATCHES: usize = 3;
+// Consecutive read-only exploration batches before telling the model to edit, ask, or finish.
+const READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD: usize = 16;
+// Consecutive read-only exploration batches allowed before failing the run as not making progress.
+const MAX_READ_ONLY_TOOL_BATCHES: usize = 20;
 // Number of newest chat messages kept verbatim when older history is compressed.
 const CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES: usize = 4;
 // Number of newest in-progress tool batches kept verbatim inside a long agent run.
@@ -6340,6 +6347,7 @@ enum PromptContextSource {
     AssistantDraft,
     HookContext,
     Guidance,
+    RuntimeGuard,
     RuntimeAssistant,
     RuntimeToolState { batch_index: usize },
     RuntimeToolStateSnapshot,
@@ -6364,6 +6372,7 @@ enum PromptContextSourceBucket {
     AssistantDraft,
     HookContext,
     Guidance,
+    RuntimeGuard,
     RuntimeAssistant,
     RuntimeToolState,
     RuntimeToolStateSnapshot,
@@ -6465,6 +6474,71 @@ fn tool_call_loop_signatures(tool_calls: &[NeutralToolCall]) -> Vec<ToolCallLoop
             arguments: tool_call.arguments.clone(),
         })
         .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReadOnlyToolProgressAction {
+    Continue,
+    Warn(String),
+    Stop(String),
+}
+
+#[derive(Default)]
+struct ReadOnlyToolProgressDetector {
+    consecutive_read_only_batches: usize,
+    warned: bool,
+}
+
+impl ReadOnlyToolProgressDetector {
+    fn check(&mut self, tool_calls: &[NeutralToolCall]) -> ReadOnlyToolProgressAction {
+        if tool_calls.is_empty()
+            || !tool_calls
+                .iter()
+                .all(|tool_call| is_read_only_tool(&tool_call.name))
+        {
+            self.consecutive_read_only_batches = 0;
+            self.warned = false;
+            return ReadOnlyToolProgressAction::Continue;
+        }
+
+        self.consecutive_read_only_batches = self.consecutive_read_only_batches.saturating_add(1);
+
+        if self.consecutive_read_only_batches >= MAX_READ_ONLY_TOOL_BATCHES {
+            return ReadOnlyToolProgressAction::Stop(format!(
+                "agent run made {} consecutive read-only exploration tool batches without editing, asking a question, or finishing; stopping to avoid an unbounded tool loop",
+                self.consecutive_read_only_batches
+            ));
+        }
+
+        if !self.warned
+            && self.consecutive_read_only_batches >= READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD
+        {
+            self.warned = true;
+            return ReadOnlyToolProgressAction::Warn(format!(
+                "Runtime progress guard: you have made {} consecutive read-only exploration tool batches without editing, asking a question, or finishing. Do not call more read-only exploration tools now. Either make the needed edit, ask one blocking question, or provide the final diagnosis/answer using the evidence already gathered.",
+                self.consecutive_read_only_batches
+            ));
+        }
+
+        ReadOnlyToolProgressAction::Continue
+    }
+}
+
+fn is_read_only_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        READ_FILE_TOOL
+            | FIND_FILES_TOOL
+            | SEARCH_TEXT_TOOL
+            | GRAPH_FIND_SYMBOLS_TOOL
+            | GRAPH_FIND_CALLERS_TOOL
+            | GRAPH_FIND_CALLEES_TOOL
+            | GRAPH_FIND_REFERENCES_TOOL
+            | GRAPH_RELATED_FILES_TOOL
+            | GRAPH_EXPLORE_TOOL
+            | GET_TODO_GRAPH_TOOL
+            | MEMORY_SEARCH_TOOL_NAME
+    )
 }
 
 struct ToolExecutionWithHooks {
@@ -6712,6 +6786,7 @@ impl PreparedChatContext {
             let mut first_token_latency_ms = None;
             let mut seen_tool_call_ids = HashSet::new();
             let mut repeated_tool_call_detector = RepeatedToolCallDetector::default();
+            let mut read_only_tool_progress_detector = ReadOnlyToolProgressDetector::default();
             let mut executed_tool_calls = Vec::new();
             let mut provider_completions = Vec::new();
             let mut total_usage = NeutralUsage::default();
@@ -7958,6 +8033,8 @@ impl PreparedChatContext {
                                 yield event;
                             }
 
+                            let read_only_progress_action =
+                                read_only_tool_progress_detector.check(&tool_calls);
                             append_tool_state_messages(
                                 &mut self.provider_request.messages,
                                 &mut self.message_source_sequences,
@@ -7971,6 +8048,50 @@ impl PreparedChatContext {
                             executed_tool_calls.extend(next_executed_tool_calls);
                             tool_rounds_since_last_compression =
                                 tool_rounds_since_last_compression.saturating_add(1);
+                            match read_only_progress_action {
+                                ReadOnlyToolProgressAction::Continue => {}
+                                ReadOnlyToolProgressAction::Warn(message) => {
+                                    append_runtime_guard_message(
+                                        &mut self.provider_request.messages,
+                                        &mut self.message_source_sequences,
+                                        &mut self.message_context_sources,
+                                        message,
+                                    );
+                                }
+                                ReadOnlyToolProgressAction::Stop(message) => {
+                                    let event = ChatSseEvent::Error {
+                                        message: message.clone(),
+                                    };
+                                    events.push(captured_event(&event));
+                                    let outcome = failed_chat_audit_outcome(
+                                        &self,
+                                        started_at,
+                                        &mut events,
+                                        &message,
+                                        None,
+                                    )
+                                    .await;
+
+                                    if let Err(persist_error) = persist_chat_result(
+                                        &self,
+                                        &request_started_at,
+                                        outcome,
+                                        &events,
+                                        None,
+                                        None,
+                                        &executed_tool_calls,
+                                    ) {
+                                        let event = ChatSseEvent::Error {
+                                            message: persist_error.message,
+                                        };
+                                        yield event;
+                                    } else {
+                                        yield event;
+                                    }
+
+                                    return;
+                                }
+                            }
                             for event in append_guidance_events(
                                 &mut self.provider_request.messages,
                                 &mut self.message_source_sequences,
@@ -13450,6 +13571,7 @@ fn prompt_context_source_bucket(source: &PromptContextSource) -> PromptContextSo
         PromptContextSource::AssistantDraft => PromptContextSourceBucket::AssistantDraft,
         PromptContextSource::HookContext => PromptContextSourceBucket::HookContext,
         PromptContextSource::Guidance => PromptContextSourceBucket::Guidance,
+        PromptContextSource::RuntimeGuard => PromptContextSourceBucket::RuntimeGuard,
         PromptContextSource::RuntimeAssistant => PromptContextSourceBucket::RuntimeAssistant,
         PromptContextSource::RuntimeToolState { .. } => PromptContextSourceBucket::RuntimeToolState,
         PromptContextSource::RuntimeToolStateSnapshot => {
@@ -13603,6 +13725,7 @@ fn prompt_context_source_bucket_label(source: PromptContextSourceBucket) -> &'st
         PromptContextSourceBucket::AssistantDraft => "assistantDraft",
         PromptContextSourceBucket::HookContext => "hookContext",
         PromptContextSourceBucket::Guidance => "guidance",
+        PromptContextSourceBucket::RuntimeGuard => "runtimeGuard",
         PromptContextSourceBucket::RuntimeAssistant => "runtimeAssistant",
         PromptContextSourceBucket::RuntimeToolState => "runtimeToolState",
         PromptContextSourceBucket::RuntimeToolStateSnapshot => "runtimeToolStateSnapshot",
@@ -15205,6 +15328,24 @@ fn append_hook_context_messages(
         message_source_sequences.push(None);
         message_context_sources.push(PromptContextSource::HookContext);
     }
+}
+
+fn append_runtime_guard_message(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
+    message: String,
+) {
+    if message.trim().is_empty() {
+        return;
+    }
+
+    messages.push(neutral_text_message(
+        NeutralChatRole::System,
+        message.trim().to_string(),
+    ));
+    message_source_sequences.push(None);
+    message_context_sources.push(PromptContextSource::RuntimeGuard);
 }
 
 fn append_guidance_message(
@@ -21338,6 +21479,81 @@ mod tests {
                     json!({ "path": "CHANGELOG.md" }),
                 )])
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn read_only_tool_progress_detector_warns_then_stops_varied_exploration() {
+        let mut detector = ReadOnlyToolProgressDetector::default();
+
+        for index in 1..READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD {
+            assert_eq!(
+                detector.check(&[test_neutral_tool_call(
+                    &format!("call-{index}"),
+                    READ_FILE_TOOL,
+                    json!({ "path": format!("file-{index}.rs") }),
+                )]),
+                ReadOnlyToolProgressAction::Continue
+            );
+        }
+
+        let warning = detector.check(&[test_neutral_tool_call(
+            "call-warning",
+            SEARCH_TEXT_TOOL,
+            json!({ "query": "needle", "path": "." }),
+        )]);
+        assert!(matches!(warning, ReadOnlyToolProgressAction::Warn(_)));
+
+        for index in (READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD + 1)..MAX_READ_ONLY_TOOL_BATCHES {
+            assert_eq!(
+                detector.check(&[test_neutral_tool_call(
+                    &format!("call-after-warning-{index}"),
+                    GRAPH_EXPLORE_TOOL,
+                    json!({ "query": format!("symbol_{index}") }),
+                )]),
+                ReadOnlyToolProgressAction::Continue
+            );
+        }
+
+        let stop = detector.check(&[test_neutral_tool_call(
+            "call-stop",
+            GRAPH_FIND_SYMBOLS_TOOL,
+            json!({ "query": "still_searching" }),
+        )]);
+        assert!(matches!(stop, ReadOnlyToolProgressAction::Stop(_)));
+    }
+
+    #[test]
+    fn read_only_tool_progress_detector_resets_on_non_read_only_tool() {
+        let mut detector = ReadOnlyToolProgressDetector::default();
+
+        for index in 1..READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD {
+            assert_eq!(
+                detector.check(&[test_neutral_tool_call(
+                    &format!("call-{index}"),
+                    READ_FILE_TOOL,
+                    json!({ "path": format!("file-{index}.rs") }),
+                )]),
+                ReadOnlyToolProgressAction::Continue
+            );
+        }
+
+        assert_eq!(
+            detector.check(&[test_neutral_tool_call(
+                "call-edit",
+                EDIT_FILE_TOOL,
+                json!({ "path": "file.rs" }),
+            )]),
+            ReadOnlyToolProgressAction::Continue
+        );
+
+        assert_eq!(
+            detector.check(&[test_neutral_tool_call(
+                "call-read-again",
+                READ_FILE_TOOL,
+                json!({ "path": "file.rs" }),
+            )]),
+            ReadOnlyToolProgressAction::Continue
         );
     }
 

@@ -38,6 +38,7 @@ pub const GRAPH_FIND_CALLERS_TOOL: &str = "graph_find_callers";
 pub const GRAPH_FIND_CALLEES_TOOL: &str = "graph_find_callees";
 pub const GRAPH_FIND_REFERENCES_TOOL: &str = "graph_find_references";
 pub const GRAPH_RELATED_FILES_TOOL: &str = "graph_related_files";
+pub const GRAPH_EXPLORE_TOOL: &str = "graph_explore";
 pub const CREATE_TODO_GRAPH_TOOL: &str = "create_todo_graph";
 pub const UPDATE_TODO_GRAPH_TOOL: &str = "update_todo_graph";
 pub const GET_TODO_GRAPH_TOOL: &str = "get_todo_graph";
@@ -51,6 +52,12 @@ const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_GRAPH_RESULT_LIMIT: usize = 20;
 const MAX_GRAPH_RESULT_LIMIT: usize = 50;
+const DEFAULT_GRAPH_EXPLORE_RESULT_LIMIT: usize = 5;
+const MAX_GRAPH_EXPLORE_RESULT_LIMIT: usize = 20;
+const DEFAULT_GRAPH_EXPLORE_CONTEXT_LINES: usize = 2;
+const MAX_GRAPH_EXPLORE_CONTEXT_LINES: usize = 20;
+const MAX_GRAPH_EXPLORE_SYMBOL_LINES: usize = 240;
+const MAX_GRAPH_EXPLORE_OUTPUT_BYTES: usize = 512 * 1024;
 const DEFAULT_FILE_TOOL_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_GRAPH_TOOL_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SEARCH_TEXT_TIMEOUT_MS: u64 = 10_000;
@@ -109,6 +116,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         graph_find_callees_definition(),
         graph_find_references_definition(),
         graph_related_files_definition(),
+        graph_explore_definition(),
         search_text_definition(),
         web_search_definition(),
         web_fetch_definition(),
@@ -207,7 +215,8 @@ pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64
         | GRAPH_FIND_CALLERS_TOOL
         | GRAPH_FIND_CALLEES_TOOL
         | GRAPH_FIND_REFERENCES_TOOL
-        | GRAPH_RELATED_FILES_TOOL => DEFAULT_GRAPH_TOOL_TIMEOUT_MS,
+        | GRAPH_RELATED_FILES_TOOL
+        | GRAPH_EXPLORE_TOOL => DEFAULT_GRAPH_TOOL_TIMEOUT_MS,
         SEARCH_TEXT_TOOL => DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
         WEB_SEARCH_TOOL | WEB_FETCH_TOOL => DEFAULT_WEB_TOOL_TIMEOUT_MS,
         WRITE_FILE_TOOL | EDIT_FILE_TOOL => DEFAULT_WRITE_FILE_TIMEOUT_MS,
@@ -242,6 +251,7 @@ fn execute_builtin_tool_inner(
         GRAPH_FIND_CALLEES_TOOL => graph_find_callees(workspace_path, arguments),
         GRAPH_FIND_REFERENCES_TOOL => graph_find_references(workspace_path, arguments),
         GRAPH_RELATED_FILES_TOOL => graph_related_files(workspace_path, arguments),
+        GRAPH_EXPLORE_TOOL => graph_explore(workspace_path, arguments),
         SEARCH_TEXT_TOOL => search_text(workspace_path, arguments, cancellation_token),
         WEB_SEARCH_TOOL | WEB_FETCH_TOOL => Err(ToolRuntimeError::InvalidArguments(format!(
             "{tool_name} requires app web runtime configuration"
@@ -513,6 +523,42 @@ fn graph_related_files(workspace_path: &Path, arguments: Value) -> Result<Value,
         "path": path,
         "files": files.into_iter().map(related_file_json).collect::<Vec<_>>(),
         "truncated": truncated,
+        "timeoutMs": timeout_ms
+    }))
+}
+
+fn graph_explore(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
+    let request: GraphExploreInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
+    let context_lines = graph_explore_context_lines(request.context_lines)?;
+    let database = open_code_graph_database(workspace_path)?;
+    let (symbols, query, path, truncated_matches) =
+        resolve_graph_explore_symbols(&database, &request)?;
+    let mut snippets = Vec::new();
+    let mut output_bytes = 0usize;
+    let mut output_truncated = false;
+
+    for symbol in symbols {
+        let snippet = graph_symbol_source_snippet(workspace_path, symbol, context_lines)?;
+        let content_bytes = snippet["content"]
+            .as_str()
+            .map(str::len)
+            .unwrap_or_default();
+        if output_bytes.saturating_add(content_bytes) > MAX_GRAPH_EXPLORE_OUTPUT_BYTES {
+            output_truncated = true;
+            break;
+        }
+        output_bytes = output_bytes.saturating_add(content_bytes);
+        snippets.push(snippet);
+    }
+
+    Ok(json!({
+        "query": query,
+        "path": path,
+        "contextLines": context_lines,
+        "snippets": snippets,
+        "truncated": truncated_matches || output_truncated,
+        "outputTruncated": output_truncated,
         "timeoutMs": timeout_ms
     }))
 }
@@ -1011,6 +1057,64 @@ fn resolve_graph_symbol(
     }
 }
 
+fn resolve_graph_explore_symbols(
+    database: &WorkspaceDatabase,
+    request: &GraphExploreInput,
+) -> Result<
+    (
+        Vec<CodeGraphSymbolRecord>,
+        Option<String>,
+        Option<String>,
+        bool,
+    ),
+    ToolRuntimeError,
+> {
+    let query = request
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (request.symbol_id, query) {
+        (Some(_), Some(_)) => Err(ToolRuntimeError::InvalidArguments(
+            "provide exactly one of symbolId or query".to_string(),
+        )),
+        (None, None) => Err(ToolRuntimeError::InvalidArguments(
+            "provide exactly one of symbolId or query".to_string(),
+        )),
+        (Some(symbol_id), None) => {
+            if request.path.is_some() || request.kind.is_some() {
+                return Err(ToolRuntimeError::InvalidArguments(
+                    "path and kind can only be used when resolving by query".to_string(),
+                ));
+            }
+
+            let symbol = database.code_graph_symbol(symbol_id)?.ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(format!(
+                    "code graph symbol was not found: {symbol_id}"
+                ))
+            })?;
+            Ok((vec![symbol], None, None, false))
+        }
+        (None, Some(query)) => {
+            let limit = graph_explore_limit(request.limit)?;
+            let path = request
+                .path
+                .as_deref()
+                .map(normalize_workspace_path_text)
+                .transpose()?;
+            let mut symbols = database.find_code_graph_symbols(
+                query,
+                request.kind.as_deref(),
+                path.as_deref(),
+                graph_query_limit(limit)?,
+            )?;
+            let truncated = truncate_records(&mut symbols, limit);
+            Ok((symbols, Some(query.to_string()), path, truncated))
+        }
+    }
+}
+
 fn non_empty_argument<'a>(name: &str, value: &'a str) -> Result<&'a str, ToolRuntimeError> {
     let trimmed = value.trim();
 
@@ -1033,6 +1137,30 @@ fn graph_limit(limit: Option<usize>) -> Result<usize, ToolRuntimeError> {
     }
 
     Ok(limit)
+}
+
+fn graph_explore_limit(limit: Option<usize>) -> Result<usize, ToolRuntimeError> {
+    let limit = limit.unwrap_or(DEFAULT_GRAPH_EXPLORE_RESULT_LIMIT);
+
+    if limit == 0 || limit > MAX_GRAPH_EXPLORE_RESULT_LIMIT {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "limit must be between 1 and {MAX_GRAPH_EXPLORE_RESULT_LIMIT}"
+        )));
+    }
+
+    Ok(limit)
+}
+
+fn graph_explore_context_lines(context_lines: Option<usize>) -> Result<usize, ToolRuntimeError> {
+    let context_lines = context_lines.unwrap_or(DEFAULT_GRAPH_EXPLORE_CONTEXT_LINES);
+
+    if context_lines > MAX_GRAPH_EXPLORE_CONTEXT_LINES {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "contextLines must be between 0 and {MAX_GRAPH_EXPLORE_CONTEXT_LINES}"
+        )));
+    }
+
+    Ok(context_lines)
 }
 
 fn graph_query_limit(limit: usize) -> Result<i64, ToolRuntimeError> {
@@ -1156,6 +1284,86 @@ fn symbol_json(symbol: CodeGraphSymbolRecord) -> Value {
         "signature": symbol.signature,
         "documentation": symbol.documentation
     })
+}
+
+fn graph_symbol_source_snippet(
+    workspace_path: &Path,
+    symbol: CodeGraphSymbolRecord,
+    context_lines: usize,
+) -> Result<Value, ToolRuntimeError> {
+    let start_line = symbol
+        .start_line
+        .and_then(positive_i64_to_usize)
+        .ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments(format!(
+                "code graph symbol {}:{} has no startLine",
+                symbol.path, symbol.name
+            ))
+        })?;
+    let end_line = symbol
+        .end_line
+        .and_then(positive_i64_to_usize)
+        .ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments(format!(
+                "code graph symbol {}:{} has no endLine",
+                symbol.path, symbol.name
+            ))
+        })?;
+    if end_line < start_line {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "code graph symbol {}:{} has invalid line range {start_line}-{end_line}",
+            symbol.path, symbol.name
+        )));
+    }
+
+    let symbol_line_count = end_line - start_line + 1;
+    if symbol_line_count > MAX_GRAPH_EXPLORE_SYMBOL_LINES {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "code graph symbol {}:{} spans {symbol_line_count} lines; max {MAX_GRAPH_EXPLORE_SYMBOL_LINES}",
+            symbol.path, symbol.name
+        )));
+    }
+
+    let path = resolve_workspace_file(workspace_path, &symbol.path)?;
+    let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if metadata.len() > MAX_RANGED_READ_SOURCE_BYTES {
+        return Err(ToolRuntimeError::FileTooLarge {
+            path,
+            bytes: metadata.len(),
+            max_bytes: MAX_RANGED_READ_SOURCE_BYTES,
+        });
+    }
+    let bytes = fs::read(&path).map_err(|source| ToolRuntimeError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let (content, _) = decode_text_file(&path, &bytes)?;
+    let line_count = count_text_lines(&content);
+    let range = normalize_read_line_range(
+        LineRange::new(
+            start_line.saturating_sub(context_lines).max(1),
+            end_line + context_lines,
+        )?,
+        line_count,
+    )?;
+    let snippet = numbered_content(&read_line_range(&content, &range), range.start);
+
+    let symbol_path = symbol.path.clone();
+
+    Ok(json!({
+        "symbol": symbol_json(symbol),
+        "path": symbol_path,
+        "startLine": range.start,
+        "endLine": range.end,
+        "content": snippet
+    }))
+}
+
+fn positive_i64_to_usize(value: i64) -> Option<usize> {
+    usize::try_from(value).ok().filter(|value| *value > 0)
 }
 
 fn relation_json(relation: CodeGraphSymbolRelationRecord) -> Value {
@@ -1888,7 +2096,7 @@ fn find_files_definition() -> ToolDefinition {
 fn graph_find_symbols_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_FIND_SYMBOLS_TOOL,
-        description: "Find indexed code graph symbols by name, signature, or documentation. Prefer this before full-text search when locating code.",
+        description: "Find indexed code graph symbol candidates and symbolIds by name, signature, or documentation. Use this for disambiguation or candidate lists; use graph_explore instead when you need source code snippets.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1923,7 +2131,7 @@ fn graph_find_symbols_definition() -> ToolDefinition {
 fn graph_find_callers_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_FIND_CALLERS_TOOL,
-        description: "Find code graph symbols that reference the requested symbol. Use symbolId from graph_find_symbols when names are ambiguous.",
+        description: "Find code graph caller relationships for the requested symbol. This returns relationship metadata, not source snippets; use graph_explore for source context. Use symbolId from graph_find_symbols when names are ambiguous.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1958,7 +2166,7 @@ fn graph_find_callers_definition() -> ToolDefinition {
 fn graph_find_callees_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_FIND_CALLEES_TOOL,
-        description: "Find code graph symbols referenced by the requested symbol. Use symbolId from graph_find_symbols when names are ambiguous.",
+        description: "Find code graph callee relationships from the requested symbol. This returns relationship metadata, not source snippets; use graph_explore for source context. Use symbolId from graph_find_symbols when names are ambiguous.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1993,7 +2201,7 @@ fn graph_find_callees_definition() -> ToolDefinition {
 fn graph_find_references_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_FIND_REFERENCES_TOOL,
-        description: "Find indexed reference locations for the requested symbol. Use symbolId from graph_find_symbols when names are ambiguous.",
+        description: "Find indexed reference locations for the requested symbol. This returns locations, not source snippets; use graph_explore for source context around symbols. Use symbolId from graph_find_symbols when names are ambiguous.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2028,7 +2236,7 @@ fn graph_find_references_definition() -> ToolDefinition {
 fn graph_related_files_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_RELATED_FILES_TOOL,
-        description: "Find files related to an indexed workspace file through code graph edges or shared imports.",
+        description: "Find files related to an indexed workspace file through code graph edges or shared imports. Use this to discover adjacent files, not to read source snippets.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2047,6 +2255,49 @@ fn graph_related_files_definition() -> ToolDefinition {
                 }
             },
             "required": ["path", "limit", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn graph_explore_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GRAPH_EXPLORE_TOOL,
+        description: "Default code graph tool for source context: find indexed code graph symbols and return matching source snippets with real 1-based line numbers. Use this instead of graph_find_symbols plus read_file when you need code for a symbol or likely target.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbolId": {
+                    "type": ["integer", "null"],
+                    "description": "Exact code graph symbol id returned by graph_find_symbols. Provide exactly one of symbolId or query."
+                },
+                "query": {
+                    "type": ["string", "null"],
+                    "description": "Symbol name or partial text to find and read. Provide exactly one of query or symbolId."
+                },
+                "kind": {
+                    "type": ["string", "null"],
+                    "description": "Optional symbol kind used only with query, such as function, method, struct, class, enum, trait, variable, or constant."
+                },
+                "path": {
+                    "type": ["string", "null"],
+                    "description": "Optional workspace-relative file or directory path used only with query."
+                },
+                "limit": {
+                    "type": ["integer", "null"],
+                    "description": "Optional result limit from 1 to 20 when using query. Defaults to 5."
+                },
+                "contextLines": {
+                    "type": ["integer", "null"],
+                    "description": "Optional number of context lines before and after each symbol, from 0 to 20. Defaults to 2."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["symbolId", "query", "kind", "path", "limit", "contextLines", "timeoutMs"]
         }),
         strict: true,
     }
@@ -2537,6 +2788,18 @@ struct GraphSymbolLookupInput {
     symbol: Option<String>,
     path: Option<String>,
     limit: Option<usize>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphExploreInput {
+    symbol_id: Option<i64>,
+    query: Option<String>,
+    kind: Option<String>,
+    path: Option<String>,
+    limit: Option<usize>,
+    context_lines: Option<usize>,
     timeout_ms: Option<u64>,
 }
 
@@ -3328,6 +3591,44 @@ mod tests {
         assert_eq!(
             related_files.output["files"][0]["relation"],
             "shared_import"
+        );
+    }
+
+    #[test]
+    fn graph_explore_returns_symbol_source_snippets() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(
+            workspace.path().join("lib.rs"),
+            "fn public_api() {\n    helper();\n}\n\n// gap\n\nfn helper() {\n    println!(\"helper\");\n}\n",
+        )
+        .expect("write lib");
+        insert_graph_fixture(workspace.path());
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_EXPLORE_TOOL,
+            json!({
+                "query": "helper",
+                "kind": "function",
+                "path": "lib.rs",
+                "limit": 5,
+                "contextLines": 1,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!result.is_error);
+        let snippets = result.output["snippets"].as_array().expect("snippets");
+        assert_eq!(snippets.len(), 1);
+        assert_eq!(snippets[0]["symbol"]["name"], "helper");
+        assert_eq!(snippets[0]["path"], "lib.rs");
+        assert_eq!(snippets[0]["startLine"], 6);
+        assert_eq!(snippets[0]["endLine"], 9);
+        assert!(
+            snippets[0]["content"]
+                .as_str()
+                .expect("content")
+                .contains("7\tfn helper()")
         );
     }
 

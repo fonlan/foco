@@ -17,6 +17,7 @@ const GRAPH_FIND_CALLERS_TOOL_NAME: &str = "graph_find_callers";
 const GRAPH_FIND_CALLEES_TOOL_NAME: &str = "graph_find_callees";
 const GRAPH_FIND_REFERENCES_TOOL_NAME: &str = "graph_find_references";
 const GRAPH_RELATED_FILES_TOOL_NAME: &str = "graph_related_files";
+const GRAPH_EXPLORE_TOOL_NAME: &str = "graph_explore";
 const CREATE_TODO_GRAPH_TOOL_NAME: &str = "create_todo_graph";
 const UPDATE_TODO_GRAPH_TOOL_NAME: &str = "update_todo_graph";
 const GET_TODO_GRAPH_TOOL_NAME: &str = "get_todo_graph";
@@ -237,7 +238,12 @@ pub fn build_available_tools_prompt(tools: Vec<ToolPromptInfo>) -> Option<String
         return None;
     }
 
+    let graph_guidance = available_graph_tool_guidance(&tools);
     let mut prompt = String::from("Available tools:");
+    if let Some(graph_guidance) = graph_guidance {
+        prompt.push('\n');
+        prompt.push_str(graph_guidance);
+    }
     for tool in tools {
         prompt.push_str("\n- ");
         prompt.push_str(&tool.name);
@@ -246,6 +252,23 @@ pub fn build_available_tools_prompt(tools: Vec<ToolPromptInfo>) -> Option<String
     }
 
     Some(prompt)
+}
+
+fn available_graph_tool_guidance(tools: &[ToolPromptInfo]) -> Option<&'static str> {
+    if !tools
+        .iter()
+        .any(|tool| tool.name == GRAPH_EXPLORE_TOOL_NAME)
+    {
+        return None;
+    }
+
+    Some(
+        "Code graph tool routing:\n\
+         - Need source context for a symbol or likely code target: use graph_explore first; do not follow it with read_file for the same returned snippet.\n\
+         - Need a candidate list or a symbolId for an ambiguous name: use graph_find_symbols.\n\
+         - Need relationships: use graph_find_callers, graph_find_callees, or graph_find_references.\n\
+         - Need adjacent files: use graph_related_files.",
+    )
 }
 
 pub fn estimate_text_tokens(text: &str) -> u64 {
@@ -808,6 +831,43 @@ mod tests {
             prompt,
             "Available tools:\n- read_file: Read a file.\n- run_command: Run a command."
         );
+    }
+
+    #[test]
+    fn available_tools_prompt_routes_graph_tools_when_graph_explore_is_available() {
+        let prompt = build_available_tools_prompt(vec![
+            ToolPromptInfo {
+                name: GRAPH_EXPLORE_TOOL_NAME.to_string(),
+                description: "Read symbol source.".to_string(),
+            },
+            ToolPromptInfo {
+                name: GRAPH_FIND_SYMBOLS_TOOL_NAME.to_string(),
+                description: "Find symbols.".to_string(),
+            },
+            ToolPromptInfo {
+                name: GRAPH_FIND_CALLERS_TOOL_NAME.to_string(),
+                description: "Find callers.".to_string(),
+            },
+            ToolPromptInfo {
+                name: GRAPH_FIND_CALLEES_TOOL_NAME.to_string(),
+                description: "Find callees.".to_string(),
+            },
+            ToolPromptInfo {
+                name: GRAPH_FIND_REFERENCES_TOOL_NAME.to_string(),
+                description: "Find references.".to_string(),
+            },
+            ToolPromptInfo {
+                name: GRAPH_RELATED_FILES_TOOL_NAME.to_string(),
+                description: "Find related files.".to_string(),
+            },
+        ])
+        .expect("available tools prompt");
+
+        assert!(prompt.contains("Code graph tool routing:"));
+        assert!(prompt.contains("use graph_explore first"));
+        assert!(prompt.contains("do not follow it with read_file"));
+        assert!(prompt.contains("Need relationships"));
+        assert!(prompt.contains("- graph_explore: Read symbol source."));
     }
 
     #[test]
