@@ -6187,6 +6187,25 @@ export function App() {
   return (
     <I18nContext.Provider value={{ language, t }}>
     <main className="app-root foco-workbench text-stone-950">
+      {error ? (
+        <section
+          aria-live="assertive"
+          className="app-error-toast"
+          role="alert"
+        >
+          <CircleAlert aria-hidden="true" className="app-error-toast-icon" />
+          <div className="app-error-toast-message">{error}</div>
+          <button
+            aria-label={t("Close error message")}
+            className="app-error-toast-close"
+            onClick={() => setError(null)}
+            title={t("Close error message")}
+            type="button"
+          >
+            <X aria-hidden="true" className="size-4" />
+          </button>
+        </section>
+      ) : null}
       {isGlobalView ? (
         <div className="global-shell">
           <FocoNavRail
@@ -6319,20 +6338,6 @@ export function App() {
               </div>
             </div>
 
-            {error ? (
-              <div className="flex items-start gap-2 border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
-                <div className="min-w-0 flex-1 break-words">{error}</div>
-                <button
-                  aria-label={t("Close")}
-                  className="-mr-1 inline-flex size-7 shrink-0 items-center justify-center rounded-md text-rose-700 hover:bg-rose-100 hover:text-rose-900"
-                  onClick={() => setError(null)}
-                  title={t("Close")}
-                  type="button"
-                >
-                  <X aria-hidden="true" className="size-4" />
-                </button>
-              </div>
-            ) : null}
 
             <nav
               aria-label={t("Workspace list")}
