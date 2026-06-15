@@ -136,6 +136,7 @@ const settings = {
     },
   },
   nativeTools: {
+    browserProbePort: 3210,
     ripgrep: {
       available: true,
       installDir: "C:\\Users\\fonla\\.foco\\bin",
@@ -1045,6 +1046,19 @@ describe("App verification surfaces", () => {
         writeText: vi.fn().mockResolvedValue(undefined),
       },
     });
+    vi.stubGlobal(
+      "Image",
+      class {
+        onerror: ((event: Event) => void) | null = null;
+        onload: ((event: Event) => void) | null = null;
+
+        set src(_value: string) {
+          window.setTimeout(() => {
+            this.onload?.(new Event("load"));
+          }, 0);
+        }
+      },
+    );
     vi.stubGlobal("fetch", vi.fn(mockFetch));
   });
 
@@ -2555,7 +2569,9 @@ describe("App verification surfaces", () => {
     render(<App />);
 
     await screen.findByText("Tool run");
-    await userEvent.click(screen.getByRole("button", { name: "Add attachment" }));
+    const addAttachmentButton = screen.getByRole("button", { name: "Add attachment" });
+    await waitFor(() => expect(addAttachmentButton).toBeEnabled());
+    await userEvent.click(addAttachmentButton);
     expect(await screen.findByText("note.txt")).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText("Provider"));
@@ -3429,7 +3445,11 @@ describe("App verification surfaces", () => {
     const pathInput = within(dialog).getByPlaceholderText("C:/Users/name/workspace");
     expect(pathInput).toBeInTheDocument();
 
-    await userEvent.click(within(dialog).getByRole("button", { name: "Choose workspace path" }));
+    const choosePathButton = within(dialog).getByRole("button", {
+      name: "Choose workspace path",
+    });
+    await waitFor(() => expect(choosePathButton).toBeEnabled());
+    await userEvent.click(choosePathButton);
 
     await waitFor(() => {
       expect(pathInput).toHaveValue("C:/Users/fonla/Documents/Repos/NewWorkspace");
