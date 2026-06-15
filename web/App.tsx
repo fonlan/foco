@@ -13586,11 +13586,17 @@ function SettingsPanel({
     }
 
     setPromptSettingsForm((current) => {
-      if (current.systemPrompts.some((prompt) => prompt.name === nextName)) {
+      const currentSystemPrompts = current.systemPrompts.length
+        ? current.systemPrompts
+        : settings
+          ? normalizedSystemPromptSummaries(settings.prompts)
+          : [];
+      if (currentSystemPrompts.some((prompt) => prompt.name === nextName)) {
         return {
           ...current,
           activeSystemPromptName: nextName,
           pendingSystemPromptName: "",
+          systemPrompts: currentSystemPrompts,
         };
       }
 
@@ -13599,7 +13605,7 @@ function SettingsPanel({
         activeSystemPromptName: nextName,
         pendingSystemPromptName: "",
         systemPrompts: [
-          ...current.systemPrompts,
+          ...currentSystemPrompts,
           {
             name: nextName,
             content: "",
@@ -13615,7 +13621,12 @@ function SettingsPanel({
     }
 
     setPromptSettingsForm((current) => {
-      const systemPrompts = current.systemPrompts.filter(
+      const currentSystemPrompts = current.systemPrompts.length
+        ? current.systemPrompts
+        : settings
+          ? normalizedSystemPromptSummaries(settings.prompts)
+          : [];
+      const systemPrompts = currentSystemPrompts.filter(
         (prompt) => prompt.name !== name,
       );
       return {
@@ -13630,17 +13641,24 @@ function SettingsPanel({
   }
 
   function updateActiveSystemPromptContent(content: string) {
-    setPromptSettingsForm((current) => ({
-      ...current,
-      systemPrompts: current.systemPrompts.map((prompt) =>
-        prompt.name === current.activeSystemPromptName
-          ? {
-              ...prompt,
-              content,
-            }
-          : prompt,
-      ),
-    }));
+    setPromptSettingsForm((current) => {
+      const currentSystemPrompts = current.systemPrompts.length
+        ? current.systemPrompts
+        : settings
+          ? normalizedSystemPromptSummaries(settings.prompts)
+          : [];
+      return {
+        ...current,
+        systemPrompts: currentSystemPrompts.map((prompt) =>
+          prompt.name === current.activeSystemPromptName
+            ? {
+                ...prompt,
+                content,
+              }
+            : prompt,
+        ),
+      };
+    });
   }
 
   function restoreDefaultSystemPrompt() {

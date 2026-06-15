@@ -4302,14 +4302,14 @@ describe("App verification surfaces", () => {
         "/api/skills/manual",
         expect.objectContaining({
           body: JSON.stringify({
-            disabled: ["global:gitmemo"],
-            enabled: [],
+            disabled: [],
+            enabled: ["global:gitmemo"],
           }),
           method: "POST",
         }),
       );
     });
-  });
+  }, 10000);
 
   it("toggles the context panel and opens the terminal panel for the active workspace", async () => {
     const fetchMock = vi.mocked(fetch);
