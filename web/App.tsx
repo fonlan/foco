@@ -4190,13 +4190,8 @@ export function App() {
     }
   }
 
-  async function handleSelectDraftAttachments() {
-    if (!nativeBrowserToken) {
-      setError(
-        t(
-          "Native file browsing is only available from a browser running on the Foco computer.",
-        ),
-      );
+  async function handleSelectDraftAttachments(files: File[]) {
+    if (!files.length) {
       return;
     }
 
@@ -4204,11 +4199,7 @@ export function App() {
     setError(null);
 
     try {
-      const data = await requestJson<{ files: NativeSelectedFile[] }>(
-        "/api/native/select-files",
-        nativePickerRequestInit(nativeBrowserToken),
-      );
-      const attachments = data.files.map(nativeSelectedFileToComposerAttachment);
+      const attachments = await Promise.all(files.map(fileToComposerAttachment));
       await handleAddDraftAttachments(attachments);
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -6755,7 +6746,9 @@ export function App() {
               onGuideQueuedMessage={(messageId) =>
                 void handleGuideQueuedMessage(messageId)
               }
-              onSelectAttachments={() => void handleSelectDraftAttachments()}
+              onSelectAttachments={(files) =>
+                void handleSelectDraftAttachments(files)
+              }
               onCancelRun={() => void handleCancelRun()}
               onGuideActiveRun={() => void handleGuideActiveRun()}
               onQueueActiveRun={handleQueueActiveRun}
@@ -8088,7 +8081,7 @@ function ChatPanel({
   onRemoveAttachment: (attachmentId: string) => void;
   onRemoveSkill: (skillId: string) => void;
   onRetryRun: () => void;
-  onSelectAttachments: () => void;
+  onSelectAttachments: (files: File[]) => void;
   onSubmit: (
     event: FormEvent<HTMLFormElement>,
     options?: { schedule?: boolean },
@@ -8162,6 +8155,7 @@ function ChatPanel({
               skill.description.toLowerCase().includes(query))
           );
         });
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const hasComposerDraft = Boolean(draftMessage.trim() || draftAttachments.length);
   const runningButtonSendsMessage = isSendingMessage && hasComposerDraft;
   const runningButtonLabel = runningButtonSendsMessage
@@ -8659,18 +8653,28 @@ function ChatPanel({
                 canRetryRun ? "message-composer-actions-with-retry" : ""
               }`}
             >
+              <input
+                ref={fileInputRef}
+                aria-hidden="true"
+                className="sr-only"
+                multiple
+                tabIndex={-1}
+                type="file"
+                onChange={(event) => {
+                  const files = Array.from(event.currentTarget.files ?? []);
+                  event.currentTarget.value = "";
+                  onSelectAttachments(files);
+                }}
+              />
               <button
                 aria-label={t("Add attachment")}
                 className="composer-tool-button"
-                disabled={isSelectingAttachments || !canUseNativePicker}
-                onClick={onSelectAttachments}
-                title={
-                  canUseNativePicker
-                    ? t("Add attachment")
-                    : t("Local Foco browser required")
-                }
+                disabled={isSelectingAttachments}
+                onClick={() => fileInputRef.current?.click()}
+                title={t("Add attachment")}
                 type="button"
               >
+
                 {isSelectingAttachments ? (
                   <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
                 ) : (

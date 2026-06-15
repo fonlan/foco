@@ -226,6 +226,10 @@ const MAX_CHAT_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_CHAT_ATTACHMENT_TOTAL_BYTES: u64 = 24 * 1024 * 1024;
 // HTTP request body limit for endpoints that accept chat attachments.
 const CHAT_ATTACHMENT_BODY_LIMIT_BYTES: usize = 40 * 1024 * 1024;
+const WORKSPACE_INTERNAL_DIR_NAME: &str = ".foco";
+const CHAT_SESSION_UPLOADS_DIR_NAME: &str = "sessions";
+const TEMP_ATTACHMENT_FILENAME_SEPARATOR: &str = "-";
+const TEMP_ATTACHMENT_FILENAME_REPLACEMENT: char = '_';
 // Maximum accepted workspace logo image size.
 const MAX_WORKSPACE_LOGO_BYTES: u64 = 2 * 1024 * 1024;
 // HTTP request body limit for workspace logo upload and save endpoints.
@@ -4250,6 +4254,7 @@ async fn context_usage(
         &config,
         &workspace_id,
         request.into_prompt_request(),
+        None,
         PromptAssemblyPurpose::ContextPreview,
     )
     .await?;
@@ -6087,6 +6092,7 @@ struct PreparedPromptContext {
     message_context_sources: Vec<PromptContextSource>,
     active_tool_start_index: usize,
     chat_id: Option<String>,
+    is_new_chat: bool,
     raw_message: Option<String>,
     message: Option<String>,
     attachments: Vec<NeutralChatAttachment>,
@@ -6697,6 +6703,13 @@ async fn run_chat_context_in_background(
     }
 
     active_run_registration.finish();
+    if let Err(error) = cleanup_chat_session_uploads(&workspace_path, &chat_id) {
+        tracing::warn!(
+            error = %error.message,
+            chat_id = %chat_id,
+            "failed to clean up chat session uploads"
+        );
+    }
 }
 
 fn chat_run_subscription_stream(
@@ -8307,6 +8320,7 @@ async fn prepare_prompt_context(
     config: &GlobalConfig,
     workspace_id: &str,
     request: PromptContextRequest,
+    preallocated_chat_id: Option<String>,
     purpose: PromptAssemblyPurpose,
 ) -> Result<PreparedPromptContext, ApiError> {
     let workspace_id = workspace_id.trim();
@@ -8314,6 +8328,7 @@ async fn prepare_prompt_context(
     let requested_provider_id = optional_trimmed_string(request.provider_id);
     let thinking_level = optional_trimmed_string(request.thinking_level);
     let requested_skill_ids = request.skill_ids;
+    let attachment_inputs = request.attachments;
     let raw_message = optional_trimmed_string(request.message);
     let assistant_draft = request
         .assistant_draft
@@ -8321,7 +8336,6 @@ async fn prepare_prompt_context(
     let assistant_draft_reasoning = request
         .assistant_draft_reasoning
         .filter(|value| !value.trim().is_empty());
-    let attachments = normalized_chat_attachments(request.attachments)?;
 
     if workspace_id.is_empty() {
         return Err(ApiError::bad_request("workspace id must not be empty"));
@@ -8401,21 +8415,9 @@ async fn prepare_prompt_context(
     let mcp_tools = state.mcp_registry.tool_definitions(&workspace.id).await;
     let database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
-    let has_user_turn = raw_message.is_some() || !attachments.is_empty();
-    let message = if has_user_turn {
-        Some(message_with_selected_skills(
-            &state.user_profile_dir,
-            config,
-            &workspace.id,
-            requested_skill_ids,
-            raw_message.as_deref().unwrap_or(""),
-        )?)
-    } else {
-        None
-    };
-    let chat_id = optional_trimmed_string(request.chat_id);
-    let is_new_chat = chat_id.is_none();
-    let chat_id = match chat_id {
+    let requested_chat_id = optional_trimmed_string(request.chat_id);
+    let is_new_chat = requested_chat_id.is_none();
+    let chat_id = match requested_chat_id {
         Some(chat_id) => {
             if database
                 .chat(&chat_id)
@@ -8428,33 +8430,66 @@ async fn prepare_prompt_context(
             }
             Some(chat_id)
         }
-        None => None,
+        None => preallocated_chat_id,
     };
-    let existing_messages = match chat_id.as_deref() {
-        Some(chat_id) => database
-            .messages_for_chat(chat_id)
-            .map_err(ApiError::from_workspace_error)?,
-        None => Vec::new(),
+    let attachments = normalized_chat_attachments_for_workspace(
+        Some(&workspace.path),
+        chat_id.as_deref(),
+        attachment_inputs,
+    )?;
+    let has_user_turn = raw_message.is_some() || !attachments.is_empty();
+    let message = if has_user_turn {
+        Some(message_with_selected_skills(
+            &state.user_profile_dir,
+            config,
+            &workspace.id,
+            requested_skill_ids,
+            raw_message.as_deref().unwrap_or(""),
+        )?)
+    } else {
+        None
     };
-    let compression_snapshots = match chat_id.as_deref() {
-        Some(chat_id) => database
-            .context_compression_snapshots_for_chat(chat_id)
-            .map_err(ApiError::from_workspace_error)?,
-        None => Vec::new(),
+    let existing_messages = if is_new_chat {
+        Vec::new()
+    } else {
+        match chat_id.as_deref() {
+            Some(chat_id) => database
+                .messages_for_chat(chat_id)
+                .map_err(ApiError::from_workspace_error)?,
+            None => Vec::new(),
+        }
     };
-    let prompt_context_injections = match chat_id.as_deref() {
-        Some(chat_id) => database
-            .prompt_context_injections_for_chat(chat_id)
-            .map_err(ApiError::from_workspace_error)?,
-        None => Vec::new(),
+    let compression_snapshots = if is_new_chat {
+        Vec::new()
+    } else {
+        match chat_id.as_deref() {
+            Some(chat_id) => database
+                .context_compression_snapshots_for_chat(chat_id)
+                .map_err(ApiError::from_workspace_error)?,
+            None => Vec::new(),
+        }
     };
-    let todo_graph_context_message = match chat_id.as_deref() {
-        Some(chat_id) => database
-            .todo_graph(chat_id)
-            .map_err(ApiError::from_workspace_error)?
-            .map(todo_graph_context_message)
-            .transpose()?,
-        None => None,
+    let prompt_context_injections = if is_new_chat {
+        Vec::new()
+    } else {
+        match chat_id.as_deref() {
+            Some(chat_id) => database
+                .prompt_context_injections_for_chat(chat_id)
+                .map_err(ApiError::from_workspace_error)?,
+            None => Vec::new(),
+        }
+    };
+    let todo_graph_context_message = if is_new_chat {
+        None
+    } else {
+        match chat_id.as_deref() {
+            Some(chat_id) => database
+                .todo_graph(chat_id)
+                .map_err(ApiError::from_workspace_error)?
+                .map(todo_graph_context_message)
+                .transpose()?,
+            None => None,
+        }
     };
     let user_sequence = next_message_sequence(&existing_messages);
     drop(database);
@@ -8727,6 +8762,7 @@ async fn prepare_prompt_context(
         workspace_id: workspace.id.clone(),
         workspace_path: workspace.path.clone(),
         chat_id,
+        is_new_chat,
         provider_id: provider.id.clone(),
         model_id: model.id.clone(),
         provider_config,
@@ -8762,11 +8798,23 @@ async fn prepare_chat_context(
     workspace_id: &str,
     request: ChatStreamRequest,
 ) -> Result<PreparedChatContext, ApiError> {
+    let preallocated_chat_id = if request
+        .chat_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        Some(unique_id("chat"))
+    } else {
+        None
+    };
     let prompt_context = prepare_prompt_context(
         state,
         config,
         workspace_id,
         request.into_prompt_request(),
+        preallocated_chat_id,
         PromptAssemblyPurpose::ChatRun,
     )
     .await?;
@@ -8811,18 +8859,24 @@ async fn prepare_chat_context(
     }
     let mut database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
-    let (chat_id, chat_created) = match prompt_context.chat_id.clone() {
-        Some(chat_id) => (chat_id, false),
-        None => {
-            let chat_id = unique_id("chat");
-            database
-                .insert_chat(
-                    &chat_id,
-                    &chat_title_for_prompt(raw_message, &prompt_context.attachments),
-                )
-                .map_err(ApiError::from_workspace_error)?;
-            (chat_id, true)
-        }
+    let (chat_id, chat_created) = if prompt_context.is_new_chat {
+        let chat_id = prompt_context
+            .chat_id
+            .clone()
+            .ok_or_else(|| ApiError::internal("new chat is missing preallocated id"))?;
+        database
+            .insert_chat(
+                &chat_id,
+                &chat_title_for_prompt(raw_message, &prompt_context.attachments),
+            )
+            .map_err(ApiError::from_workspace_error)?;
+        (chat_id, true)
+    } else {
+        let chat_id = prompt_context
+            .chat_id
+            .clone()
+            .ok_or_else(|| ApiError::bad_request("chat id must not be empty"))?;
+        (chat_id, false)
     };
     let session_start_summary = state
         .hook_runtime
@@ -20374,6 +20428,14 @@ fn message_attachments_from_metadata(
 fn normalized_chat_attachments(
     inputs: Vec<ChatAttachmentInput>,
 ) -> Result<Vec<NeutralChatAttachment>, ApiError> {
+    normalized_chat_attachments_for_workspace(None, None, inputs)
+}
+
+fn normalized_chat_attachments_for_workspace(
+    workspace_path: Option<&Path>,
+    chat_id: Option<&str>,
+    inputs: Vec<ChatAttachmentInput>,
+) -> Result<Vec<NeutralChatAttachment>, ApiError> {
     if inputs.len() > MAX_CHAT_ATTACHMENTS {
         return Err(ApiError::bad_request(format!(
             "at most {MAX_CHAT_ATTACHMENTS} attachments are allowed"
@@ -20443,20 +20505,41 @@ fn normalized_chat_attachments(
             )));
         }
 
-        if is_inline_binary_attachment(&content_type) {
+        if let Some(content_base64) = content_base64 {
             if path.is_some() {
                 return Err(ApiError::bad_request(format!(
-                    "attachment {name} images must use contentBase64, not path"
+                    "attachment {name} must not provide both contentBase64 and path"
                 )));
             }
 
-            let content_base64 = content_base64.ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "attachment {name} image contentBase64 must not be empty"
-                ))
-            })?;
-            validate_attachment_base64(&name, &content_base64, input.size_bytes)?;
+            if let (Some(workspace_path), Some(chat_id)) = (workspace_path, chat_id) {
+                let path = write_session_attachment_file(
+                    workspace_path,
+                    chat_id,
+                    index,
+                    &id,
+                    &name,
+                    &content_base64,
+                    input.size_bytes,
+                )?;
+                attachments.push(NeutralChatAttachment {
+                    id,
+                    name,
+                    content_type,
+                    size_bytes: input.size_bytes,
+                    content_base64: None,
+                    path: Some(path),
+                });
+                continue;
+            }
 
+            if !is_inline_binary_attachment(&content_type) {
+                return Err(ApiError::bad_request(format!(
+                    "attachment {name} must use path; contentBase64 is only accepted for image attachments"
+                )));
+            }
+
+            validate_attachment_base64(&name, &content_base64, input.size_bytes)?;
             attachments.push(NeutralChatAttachment {
                 id,
                 name,
@@ -20466,12 +20549,6 @@ fn normalized_chat_attachments(
                 path: None,
             });
             continue;
-        }
-
-        if content_base64.is_some() {
-            return Err(ApiError::bad_request(format!(
-                "attachment {name} must use path; contentBase64 is only accepted for image attachments"
-            )));
         }
 
         let path = path.ok_or_else(|| {
@@ -20490,6 +20567,116 @@ fn normalized_chat_attachments(
     }
 
     Ok(attachments)
+}
+
+fn write_session_attachment_file(
+    workspace_path: &Path,
+    chat_id: &str,
+    index: usize,
+    attachment_id: &str,
+    name: &str,
+    content_base64: &str,
+    size_bytes: u64,
+) -> Result<String, ApiError> {
+    let decoded = general_purpose::STANDARD
+        .decode(content_base64.as_bytes())
+        .map_err(|source| {
+            ApiError::bad_request(format!("attachment {name} has invalid base64: {source}"))
+        })?;
+    let decoded_len = u64::try_from(decoded.len())
+        .map_err(|_| ApiError::bad_request(format!("attachment {name} size exceeds u64")))?;
+    if decoded_len != size_bytes {
+        return Err(ApiError::bad_request(format!(
+            "attachment {name} sizeBytes does not match decoded content"
+        )));
+    }
+
+    let session_dir = chat_session_upload_dir(workspace_path, chat_id)?;
+    fs::create_dir_all(&session_dir).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to create chat session upload directory: {source}"
+        ))
+    })?;
+    let file_name = session_attachment_file_name(index, attachment_id, name)?;
+    let file_path = session_dir.join(file_name);
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file_path)
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to create temporary attachment file: {source}"
+            ))
+        })?;
+    std::io::Write::write_all(&mut file, &decoded).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to write temporary attachment file: {source}"
+        ))
+    })?;
+
+    Ok(file_path.display().to_string())
+}
+
+fn chat_session_upload_dir(workspace_path: &Path, chat_id: &str) -> Result<PathBuf, ApiError> {
+    Ok(workspace_path
+        .join(WORKSPACE_INTERNAL_DIR_NAME)
+        .join(CHAT_SESSION_UPLOADS_DIR_NAME)
+        .join(safe_path_component("chat id", chat_id)?))
+}
+
+fn session_attachment_file_name(
+    index: usize,
+    attachment_id: &str,
+    name: &str,
+) -> Result<String, ApiError> {
+    Ok(format!(
+        "{}{}{}{}{}",
+        index + 1,
+        TEMP_ATTACHMENT_FILENAME_SEPARATOR,
+        safe_path_component("attachment id", attachment_id)?,
+        TEMP_ATTACHMENT_FILENAME_SEPARATOR,
+        safe_path_component("attachment name", name)?
+    ))
+}
+
+fn safe_path_component(label: &str, value: &str) -> Result<String, ApiError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::bad_request(format!("{label} must not be empty")));
+    }
+
+    let safe = trimmed
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                TEMP_ATTACHMENT_FILENAME_REPLACEMENT
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .trim_matches(TEMP_ATTACHMENT_FILENAME_REPLACEMENT)
+        .to_string();
+
+    if safe.is_empty() || safe == "." || safe == ".." {
+        return Err(ApiError::bad_request(format!(
+            "{label} does not contain a safe path component"
+        )));
+    }
+
+    Ok(safe)
+}
+
+fn cleanup_chat_session_uploads(workspace_path: &Path, chat_id: &str) -> Result<(), ApiError> {
+    let session_dir = chat_session_upload_dir(workspace_path, chat_id)?;
+    match fs::remove_dir_all(&session_dir) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ApiError::internal(format!(
+            "failed to remove chat session upload directory: {source}"
+        ))),
+    }
 }
 
 fn validate_stored_chat_attachments(attachments: &[NeutralChatAttachment]) -> Result<(), ApiError> {

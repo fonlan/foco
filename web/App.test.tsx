@@ -2778,14 +2778,21 @@ describe("App verification surfaces", () => {
     await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
   });
 
-  it("adds native path attachments into the composer and sends them with the chat request", async () => {
+  it("adds browser file attachments into the composer and sends them with the chat request", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);
 
     await screen.findByText("Tool run");
     const addAttachmentButton = screen.getByRole("button", { name: "Add attachment" });
     await waitFor(() => expect(addAttachmentButton).toBeEnabled());
-    await userEvent.click(addAttachmentButton);
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"][multiple]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput as HTMLInputElement,
+      new File(["Hello"], "note.txt", { type: "text/plain" }),
+    );
     expect(await screen.findByText("note.txt")).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText("Provider"));
@@ -2813,9 +2820,9 @@ describe("App verification surfaces", () => {
       expect.objectContaining({
         attachments: [
           expect.objectContaining({
+            contentBase64: "SGVsbG8=",
             contentType: "text/plain",
             name: "note.txt",
-            path: "C:/Users/fonla/Desktop/note.txt",
             sizeBytes: 5,
           }),
         ],
@@ -2823,7 +2830,7 @@ describe("App verification surfaces", () => {
         providerId: "anthropic",
       }),
     );
-    expect(body.attachments[0]).not.toHaveProperty("contentBase64");
+
 
     await act(async () => {
       activeChatStreamController?.close();
