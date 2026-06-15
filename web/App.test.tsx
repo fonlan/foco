@@ -1927,6 +1927,46 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("cancels the active run id after a later provider attempt starts", async () => {
+    const fetchMock = vi.mocked(fetch);
+    render(<App />);
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "start work",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        llmRequestId: "llm-turn-2",
+        type: "streamAttemptStart",
+      });
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Cancel run" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-1/chat/runs/request-stream/cancel",
+        ),
+      ).toBe(true);
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/chat/runs/llm-turn-2/cancel",
+      ),
+    ).toBe(false);
+  });
+
   it("queues a message during an active run and sends it after the stream ends", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);

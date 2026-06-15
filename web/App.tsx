@@ -2048,6 +2048,7 @@ type ScheduledWorkspaceRun = {
 type ActiveRunInfo = {
   workspaceId: string;
   chatId: string | null;
+  // Backend active-run registry id. Do not replace it with per-provider llmRequestId attempts.
   runId: string | null;
   chatKey: string;
   lastSequence?: number | null;
@@ -4980,7 +4981,7 @@ export function App() {
             chatId: streamEvent.chatId,
             chatKey,
             lastSequence: activeRun.lastSequence,
-            runId: streamEvent.llmRequestId ?? activeRun.runId,
+            runId: activeRun.runId,
             workspaceId: activeRun.workspaceId,
           });
           liveStartedAtMs = Date.now();
@@ -5040,7 +5041,7 @@ export function App() {
             chatId: activeRun.chatId,
             chatKey,
             lastSequence: activeRun.lastSequence,
-            runId: streamEvent.llmRequestId,
+            runId: activeRun.runId,
             workspaceId: activeRun.workspaceId,
           });
           return;
@@ -5315,6 +5316,7 @@ export function App() {
     let runSucceeded = false;
     let streamHadError = false;
     let hasGuidanceTurns = false;
+    let activeRunId: string | null = null;
     const abortController = new AbortController();
     const refreshRunContextUsage = () => {
       void refreshContextUsage({
@@ -5570,10 +5572,11 @@ export function App() {
             );
           }
           setChatRunning(currentRunningChatKey, true);
+          activeRunId = streamEvent.llmRequestId ?? activeRunId;
           setActiveRunInfoForChatKey(currentRunningChatKey, {
             chatId: streamEvent.chatId,
             chatKey: currentRunningChatKey,
-            runId: streamEvent.llmRequestId ?? null,
+            runId: activeRunId,
             workspaceId: request.workspaceId,
           });
           liveStartedAtMs = Date.now();
@@ -5645,7 +5648,7 @@ export function App() {
           setActiveRunInfoForChatKey(runMessagesKey, {
             chatId: requestChatId,
             chatKey: runMessagesKey,
-            runId: streamEvent.llmRequestId,
+            runId: activeRunId,
             workspaceId: request.workspaceId,
           });
           return;
