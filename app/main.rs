@@ -20321,9 +20321,7 @@ fn chat_message_parts(
                 }
 
                 let Some(tool_call) = tool_calls_by_id.get(tool_call_id) else {
-                    return Err(ApiError::internal(format!(
-                        "tool call event referenced unknown tool call id: {tool_call_id}"
-                    )));
+                    continue;
                 };
 
                 parts.push(ChatMessagePart::ToolCall {
@@ -22789,6 +22787,78 @@ description:
 
         drop(database);
         fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+
+    #[test]
+    fn chat_message_parts_ignore_unknown_tool_call_audit_events() {
+        let message = MessageRecord {
+            id: "assistant-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            role: "assistant".to_string(),
+            content: "Done".to_string(),
+            sequence: 1,
+            created_at: "2026-06-08T10:00:01Z".to_string(),
+            metadata_json: "{}".to_string(),
+        };
+        let events = vec![
+            LlmRequestEventRecord {
+                id: "event-1".to_string(),
+                llm_request_id: "request-1".to_string(),
+                sequence: 0,
+                event_at: "2026-06-08T10:00:01Z".to_string(),
+                event_type: "start".to_string(),
+                raw_chunk_json: None,
+                normalized_event_json: json!({
+                    "assistantMessageId": "assistant-1"
+                })
+                .to_string(),
+            },
+            LlmRequestEventRecord {
+                id: "event-2".to_string(),
+                llm_request_id: "request-1".to_string(),
+                sequence: 1,
+                event_at: "2026-06-08T10:00:02Z".to_string(),
+                event_type: "completion".to_string(),
+                raw_chunk_json: None,
+                normalized_event_json: json!({}).to_string(),
+            },
+            LlmRequestEventRecord {
+                id: "event-3".to_string(),
+                llm_request_id: "request-1".to_string(),
+                sequence: 2,
+                event_at: "2026-06-08T10:00:03Z".to_string(),
+                event_type: "tool_call".to_string(),
+                raw_chunk_json: None,
+                normalized_event_json: json!({
+                    "assistantMessageId": "assistant-1",
+                    "toolCall": {
+                        "id": "missing-call",
+                        "name": "read_file"
+                    }
+                })
+                .to_string(),
+            },
+            LlmRequestEventRecord {
+                id: "event-4".to_string(),
+                llm_request_id: "request-1".to_string(),
+                sequence: 3,
+                event_at: "2026-06-08T10:00:04Z".to_string(),
+                event_type: "text_delta".to_string(),
+                raw_chunk_json: None,
+                normalized_event_json: json!({
+                    "assistantMessageId": "assistant-1",
+                    "delta": "Done"
+                })
+                .to_string(),
+            },
+        ];
+
+        let parts = chat_message_parts(&message, None, &[], &events).expect("message parts");
+        assert_eq!(parts.len(), 1);
+        match &parts[0] {
+            ChatMessagePart::Text { text } => assert_eq!(text, "Done"),
+            other => panic!("expected text part, got {other:?}"),
+        }
     }
 
     #[test]
