@@ -12700,7 +12700,11 @@ function SettingsPanel({
     ];
   const hasSavedProviderKey = editingProvider?.hasApiKey ?? false;
   const selectedProviderIds = new Set(form.providerIds);
-  const systemPrompts = promptSettingsForm.systemPrompts;
+  const systemPrompts = promptSettingsForm.systemPrompts.length
+    ? promptSettingsForm.systemPrompts
+    : settings
+      ? normalizedSystemPromptSummaries(settings.prompts)
+      : [];
   const savedSystemPrompts = settings
     ? normalizedSystemPromptSummaries(settings.prompts)
     : systemPrompts;
@@ -13417,18 +13421,34 @@ function SettingsPanel({
   }
 
   function restoreDefaultSystemPrompt() {
-    setPromptSettingsForm((current) => ({
-      ...current,
-      activeSystemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
-      systemPrompts: current.systemPrompts.map((prompt) =>
-        prompt.name === DEFAULT_SYSTEM_PROMPT_NAME
-          ? {
-              ...prompt,
-              content: settings?.prompts.defaultSystemPrompt ?? prompt.content,
-            }
-          : prompt,
-      ),
-    }));
+    setPromptSettingsForm((current) => {
+      if (!settings) {
+        return current;
+      }
+
+      const defaultContent = settings.prompts.defaultSystemPrompt;
+      const systemPrompts = current.systemPrompts.length
+        ? current.systemPrompts.map((prompt) =>
+            prompt.name === DEFAULT_SYSTEM_PROMPT_NAME
+              ? {
+                  ...prompt,
+                  content: defaultContent,
+                }
+              : prompt,
+          )
+        : [
+            {
+              content: defaultContent,
+              name: DEFAULT_SYSTEM_PROMPT_NAME,
+            },
+          ];
+
+      return {
+        ...current,
+        activeSystemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
+        systemPrompts,
+      };
+    });
   }
 
   function addPromptFilePath(path: string) {
@@ -15418,7 +15438,7 @@ function SettingsPanel({
             </div>
             <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(180px,240px)_minmax(0,1fr)]">
               <div className="grid content-start gap-2">
-                <div className="rounded-xl border border-stone-200 bg-stone-50/80">
+                <div className="overflow-hidden rounded-xl border border-stone-200 bg-stone-50/80">
                   {systemPrompts.map((prompt) => (
                     <div
                       className={`flex items-center gap-2 px-3 py-2 ${
@@ -15444,7 +15464,18 @@ function SettingsPanel({
                       >
                         {prompt.name}
                       </button>
-                      {prompt.name !== DEFAULT_SYSTEM_PROMPT_NAME ? (
+                      {prompt.name === DEFAULT_SYSTEM_PROMPT_NAME ? (
+                        <button
+                          aria-label={t("Restore default system prompt")}
+                          className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                          disabled={isLoadingSettings || !settings}
+                          onClick={restoreDefaultSystemPrompt}
+                          title={t("Restore default system prompt")}
+                          type="button"
+                        >
+                          <RefreshCw aria-hidden="true" className="size-4" />
+                        </button>
+                      ) : (
                         <button
                           aria-label={t("Remove system prompt {name}", {
                             name: prompt.name,
@@ -15456,7 +15487,7 @@ function SettingsPanel({
                         >
                           <Trash2 aria-hidden="true" className="size-4" />
                         </button>
-                      ) : null}
+                      )}
                     </div>
                   ))}
                 </div>
@@ -15500,24 +15531,6 @@ function SettingsPanel({
                 />
               </label>
             </div>
-            <div className="mt-3 flex flex-wrap gap-2">
-              <button
-                aria-label={t("Restore default system prompt")}
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-                disabled={
-                  isLoadingSettings ||
-                  !settings ||
-                  activeSystemPrompt?.name !== DEFAULT_SYSTEM_PROMPT_NAME
-                }
-                onClick={restoreDefaultSystemPrompt}
-                title={t("Restore default system prompt")}
-                type="button"
-              >
-                <RefreshCw aria-hidden="true" className="size-4" />
-                {t("Restore default")}
-              </button>
-            </div>
-
             <div className="mt-6 flex items-center gap-2 border-t border-stone-200 pt-4">
               <ScrollText aria-hidden="true" className="size-5 text-teal-700" />
               <h3 className="text-sm font-semibold text-stone-950">
