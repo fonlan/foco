@@ -3,9 +3,11 @@ use std::{
     fs,
     net::SocketAddr,
     path::PathBuf,
-    process::{Command, Stdio},
     time::{Duration, Instant},
 };
+
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
 
 use axum::{
     Json,
@@ -20,8 +22,10 @@ use crate::{
     ApiError, AppState, MAX_CHAT_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENT_TOTAL_BYTES,
     MAX_CHAT_ATTACHMENTS, NativeBrowserProbeQuery, NativePickerRequest, NativeSelectedFile,
     SelectDirectoryResponse, SelectFilesResponse, attachment_content_type_for_path,
-    is_wsl_environment,
 };
+
+#[cfg(not(windows))]
+use crate::prompt::is_wsl_environment;
 
 const NATIVE_BROWSER_AUTHORIZATION_TTL: Duration = Duration::from_secs(8 * 60 * 60);
 const NATIVE_BROWSER_PROBE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1" fill="#0f766e"/></svg>"##;

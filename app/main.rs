@@ -104,7 +104,7 @@ use crate::memory_runtime::{
 use crate::prompt::{
     active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
     configured_prompt_messages, context_usage_response, ensure_context_compression,
-    environment_context_message, interleaved_tool_state_messages, is_wsl_environment,
+    environment_context_message, interleaved_tool_state_messages,
     neutral_assistant_tool_call_message, pack_neutral_messages, persist_chat_result,
     prepare_prompt_context, recover_after_tool_round_cap, serialize_provider_request,
     system_prompt_summaries, tool_prompt_infos,
