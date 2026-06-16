@@ -16,6 +16,8 @@ use crate::memory::WORKSPACE_MEMORY_SCHEMA_SQL;
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_SCHEMA_VERSION: u32 = 9;
+const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
+const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
 const MIGRATIONS: &[Migration] = &[
@@ -176,10 +178,30 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    pub fn insert_chat_with_metadata(
+        &mut self,
+        id: &str,
+        title: &str,
+        metadata_json: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        validate_json_metadata(metadata_json, "chat metadata")?;
+        let now = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO chats (id, title, created_at, updated_at, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, title, now, now, metadata_json],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
     pub fn chat(&self, id: &str) -> Result<Option<ChatRecord>, WorkspaceDatabaseError> {
         self.connection
             .query_row(
-                "SELECT id, title, created_at, updated_at, archived_at
+                "SELECT id, title, created_at, updated_at, archived_at, metadata_json
                  FROM chats
                  WHERE id = ?1",
                 params![id],
@@ -190,6 +212,7 @@ impl WorkspaceDatabase {
                         created_at: row.get(2)?,
                         updated_at: row.get(3)?,
                         archived_at: row.get(4)?,
+                        metadata_json: row.get(5)?,
                     })
                 },
             )
@@ -210,7 +233,7 @@ impl WorkspaceDatabase {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT id, title, created_at, updated_at, archived_at
+                "SELECT id, title, created_at, updated_at, archived_at, metadata_json
                  FROM chats
                  ORDER BY updated_at DESC, created_at DESC, id DESC",
             )
@@ -223,6 +246,7 @@ impl WorkspaceDatabase {
                     created_at: row.get(2)?,
                     updated_at: row.get(3)?,
                     archived_at: row.get(4)?,
+                    metadata_json: row.get(5)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -341,6 +365,136 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
 
         Ok(())
+    }
+
+    pub fn insert_message_if_absent(
+        &mut self,
+        message: NewMessage<'_>,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let metadata_json = message.metadata_json.unwrap_or("{}");
+        let inserted = self
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO messages
+                    (id, chat_id, role, content, sequence, created_at, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    message.id,
+                    message.chat_id,
+                    message.role,
+                    message.content,
+                    message.sequence,
+                    now,
+                    metadata_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        if inserted > 0 {
+            self.connection
+                .execute(
+                    "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
+                    params![now, message.chat_id],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+        }
+
+        Ok(inserted > 0)
+    }
+
+    pub fn mark_chat_queued_run_started(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let chat =
+            self.chat(chat_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat was not found: {chat_id}"),
+                })?;
+        let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+        if let Some(queued_run) = chat_metadata.get_mut(QUEUED_CHAT_METADATA_KEY) {
+            let Some(queued_run_object) = queued_run.as_object_mut() else {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "chat metadata.queuedRun must be an object".to_string(),
+                });
+            };
+            queued_run_object.insert("status".to_string(), Value::String("running".to_string()));
+            queued_run_object.insert(
+                "assistantMessageId".to_string(),
+                Value::String(assistant_message_id.to_string()),
+            );
+        }
+        let chat_metadata_json = serde_json::to_string(&chat_metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("chat metadata is invalid JSON: {source}"),
+            }
+        })?;
+
+        let message = self.message(user_message_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("message was not found: {user_message_id}"),
+            }
+        })?;
+        let mut message_metadata =
+            parse_json_object(&message.metadata_json, "user message metadata")?;
+        if let Some(queued_run) = message_metadata.get_mut(QUEUED_MESSAGE_METADATA_KEY) {
+            let Some(queued_run_object) = queued_run.as_object_mut() else {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "message metadata.queuedRun must be an object".to_string(),
+                });
+            };
+            queued_run_object.insert("status".to_string(), Value::String("running".to_string()));
+            queued_run_object.insert(
+                "assistantMessageId".to_string(),
+                Value::String(assistant_message_id.to_string()),
+            );
+        }
+        let message_metadata_json = serde_json::to_string(&message_metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("user message metadata is invalid JSON: {source}"),
+            }
+        })?;
+
+        self.connection
+            .execute(
+                "UPDATE chats SET metadata_json = ?1 WHERE id = ?2",
+                params![chat_metadata_json, chat_id],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                params![message_metadata_json, user_message_id, chat_id],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn message(&self, id: &str) -> Result<Option<MessageRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, chat_id, role, content, sequence, created_at, metadata_json
+                 FROM messages
+                 WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(MessageRecord {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        role: row.get(2)?,
+                        content: row.get(3)?,
+                        sequence: row.get(4)?,
+                        created_at: row.get(5)?,
+                        metadata_json: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn upsert_message_content(
@@ -2297,6 +2451,7 @@ pub struct ChatRecord {
     pub created_at: String,
     pub updated_at: String,
     pub archived_at: Option<String>,
+    pub metadata_json: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3629,6 +3784,31 @@ fn create_migration_backup(
         })?;
 
     Ok(())
+}
+
+fn validate_json_metadata(
+    metadata_json: &str,
+    context: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    let _ = parse_json_object(metadata_json, context)?;
+    Ok(())
+}
+
+fn parse_json_object(
+    metadata_json: &str,
+    context: &str,
+) -> Result<serde_json::Map<String, Value>, WorkspaceDatabaseError> {
+    let value = serde_json::from_str::<Value>(metadata_json).map_err(|source| {
+        WorkspaceDatabaseError::InvalidMessageMetadata {
+            message: format!("{context} is invalid JSON: {source}"),
+        }
+    })?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+            message: format!("{context} must be a JSON object"),
+        })
 }
 
 fn create_directory(path: &Path) -> Result<(), WorkspaceDatabaseError> {

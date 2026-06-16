@@ -105,6 +105,13 @@ type ChatSummary = {
   updatedAt: string;
   codeChangeStats: GitDiffLineStats;
   activeRun: ActiveChatRunSummary | null;
+  queuedRun: QueuedRunSummary | null;
+};
+
+type QueuedRunSummary = {
+  status: "queued" | "running" | string;
+  userMessageId: string;
+  assistantMessageId: string | null;
 };
 
 type WorkspaceChatListItem = ChatSummary & {
@@ -875,19 +882,14 @@ type NativeSelectedFile = {
   sizeBytes: number;
   contentBase64?: string | null;
 };
-
-type WorkspaceIconDraft = {
-  contentBase64: string;
-  name: string;
-  previewUrl: string;
-};
-
 type ChatMessageSummary = {
   id: string;
   role: "assistant" | "user";
   content: string;
   createdAt: string;
   reasoning: string | null;
+  pendingMode?: "guidance" | "queued";
+  queuedRun?: QueuedMessageRunSummary | null;
   toolCalls: ChatToolCallSummary[];
   parts: ChatMessagePart[];
   metrics: ChatReplyMetrics | null;
@@ -895,11 +897,30 @@ type ChatMessageSummary = {
   extractedMemories: ChatExtractedMemorySummary[];
 };
 
+type QueuedMessageRunSummary = {
+  status: "queued" | "running" | string;
+  modelId: string;
+  providerId: string | null;
+  thinkingLevel: string | null;
+  skillIds: string[];
+  assistantMessageId: string | null;
+};
+
 type ActiveChatRunSummary = {
   runId: string;
   workspaceId: string;
   chatId: string;
   lastSequence: number | null;
+};
+
+type QueueChatMessageResponse = {
+  chatId: string;
+  chatTitle: string;
+  createdAt: string;
+  updatedAt: string;
+  userMessageId: string;
+  content: string;
+  parts: ChatMessagePart[];
 };
 
 type ChatMessagesResponse = {
@@ -2061,11 +2082,19 @@ type ShellMessage = {
   reasoning: string | null;
   status?: "error" | "streaming";
   pendingMode?: "guidance" | "queued";
+  queuedRun?: QueuedMessageRunSummary | null;
   toolCalls: ChatToolCallSummary[];
   parts: ChatMessagePart[];
   metrics: ChatReplyMetrics | null;
   memoriesUsed: ChatMemoryUsedSummary[];
   extractedMemories: ChatExtractedMemorySummary[];
+};
+
+type WorkspaceIconDraft = {
+  contentBase64: string;
+  dataUrl?: string;
+  name: string;
+  previewUrl: string;
 };
 
 type OpenChatTab = {
@@ -2099,6 +2128,7 @@ type RetryRunRequest = {
   skillIds: string[];
   localChatKey?: string;
   pendingUserMessageId?: string;
+  queuedUserMessageId?: string;
 };
 
 type ScheduledWorkspaceRun = {
@@ -3680,6 +3710,38 @@ export function App() {
     );
   }
 
+  function restoreQueuedRunRequestsForChatKey(
+    workspaceId: string,
+    chatId: string,
+    chatMessages: ShellMessage[],
+  ) {
+    const chatKey = chatRunKey(workspaceId, chatId);
+    const queuedRequests = chatMessages
+      .filter(
+        (message) =>
+          message.role === "user" &&
+          message.pendingMode === "queued" &&
+          message.queuedRun?.status === "queued",
+      )
+      .map((message) => ({
+        workspaceId,
+        chatId,
+        content: message.content,
+        attachments: [],
+        modelId: message.queuedRun?.modelId ?? "",
+        providerId: message.queuedRun?.providerId ?? "",
+        thinkingLevel: message.queuedRun?.thinkingLevel ?? "",
+        skillIds: message.queuedRun?.skillIds ?? [],
+        pendingUserMessageId: message.id,
+        queuedUserMessageId: message.id,
+      }))
+      .filter(
+        (request) => request.modelId.trim() && request.providerId.trim(),
+      );
+
+    updateQueuedRunRequestsForChatKey(chatKey, () => queuedRequests);
+  }
+
   function compareWorkspaceChatListItemsByCreatedAtDesc(
     left: WorkspaceChatListItem,
     right: WorkspaceChatListItem,
@@ -3749,6 +3811,7 @@ export function App() {
       activeChatKeyRef.current = chatKey;
       setMessages(nextMessages);
       setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
+      restoreQueuedRunRequestsForChatKey(workspaceId, chatId, nextMessages);
       setViewMode("chat");
       setIsMobileWorkspaceOpen(false);
       if (activeRun) {
@@ -4314,6 +4377,27 @@ export function App() {
     return runInfo;
   }
 
+  async function persistQueuedRunRequest(
+    request: RetryRunRequest,
+  ): Promise<QueueChatMessageResponse> {
+    return requestJson<QueueChatMessageResponse>(
+      `/api/workspaces/${encodeURIComponent(request.workspaceId)}/chat/queue`,
+      {
+        body: JSON.stringify({
+          chatId: request.chatId,
+          message: request.content,
+          attachments: request.attachments,
+          modelId: request.modelId,
+          providerId: request.providerId,
+          skillIds: request.skillIds.length ? request.skillIds : null,
+          thinkingLevel: request.thinkingLevel || null,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      },
+    );
+  }
+
   async function handleSendMessage(
     event: FormEvent<HTMLFormElement>,
     options: { schedule?: boolean } = {},
@@ -4328,7 +4412,7 @@ export function App() {
     const requestActiveRun = activeRunForRequest(request);
     if (requestActiveRun) {
       if (options.schedule) {
-        handleQueueActiveRunWithRequest(request, requestActiveRun);
+        await handleQueueActiveRunWithRequest(request, requestActiveRun);
         return;
       }
 
@@ -4337,7 +4421,7 @@ export function App() {
     }
 
     if (options.schedule) {
-      handleScheduleMessage(request);
+      await handleScheduleMessage(request);
       return;
     }
 
@@ -4348,61 +4432,71 @@ export function App() {
     await runChatMessage(request);
   }
 
-  function handleScheduleMessage(request: RetryRunRequest) {
-    const runKey = localUiId("scheduled-chat");
-    const chatKey = pendingChatRunKey(request.workspaceId, runKey);
-    const pendingUserMessageId = localUiId("pending-scheduled-user");
-    const createdAt = new Date().toISOString();
-    const visibleUserContent = messageWithSelectedSkills(
-      detectedSkills,
-      request.skillIds,
-      request.content,
-    );
-
+  async function handleScheduleMessage(request: RetryRunRequest) {
     setSelectedSkillIds([]);
     setDraftAttachments([]);
     setDraftMessage("");
     setError(null);
-    setActiveWorkspaceId(request.workspaceId);
-    setActiveChatId(runKey);
-    setExpandedWorkspaceId(request.workspaceId);
-    activeWorkspaceIdRef.current = request.workspaceId;
-    activeChatIdRef.current = runKey;
-    activeChatKeyRef.current = chatKey;
-    setSelectedDiffPath(null);
-    setViewMode("chat");
-    setIsMobileWorkspaceOpen(false);
-    updateBrowserRoute({
-      chatId: null,
-      viewMode: "chat",
-      workspaceId: request.workspaceId,
-    });
-    appendPendingUserMessage(
-      chatKey,
-      pendingUserMessageId,
-      visibleUserContent,
-      request.attachments,
-      "queued",
-    );
 
-    const scheduledRun: ScheduledWorkspaceRun = {
-      id: runKey,
-      workspaceId: request.workspaceId,
-      chatId: runKey,
-      chatKey,
-      title: chatTitleForDraft(request.content, request.attachments),
-      createdAt,
-      pendingUserMessageId,
-      request: {
-        ...request,
-        chatId: null,
-        localChatKey: chatKey,
-        pendingUserMessageId,
-      },
-      status: "queued",
-    };
+    try {
+      const queued = await persistQueuedRunRequest(request);
+      const chatKey = chatRunKey(request.workspaceId, queued.chatId);
+      const createdAt = queued.createdAt;
 
-    updateScheduledWorkspaceRuns((current) => [...current, scheduledRun]);
+      setActiveWorkspaceId(request.workspaceId);
+      setActiveChatId(queued.chatId);
+      setExpandedWorkspaceId(request.workspaceId);
+      activeWorkspaceIdRef.current = request.workspaceId;
+      activeChatIdRef.current = queued.chatId;
+      activeChatKeyRef.current = chatKey;
+      setSelectedDiffPath(null);
+      setViewMode("chat");
+      setIsMobileWorkspaceOpen(false);
+      updateBrowserRoute({
+        chatId: queued.chatId,
+        viewMode: "chat",
+        workspaceId: request.workspaceId,
+      });
+      setMessagesForChatKey(chatKey, (current) => [
+        ...current,
+        {
+          id: queued.userMessageId,
+          role: "user",
+          content: queued.content,
+          createdAt,
+          reasoning: null,
+          pendingMode: "queued",
+          queuedRun: null,
+          toolCalls: [],
+          parts: queued.parts,
+          metrics: null,
+          memoriesUsed: [],
+          extractedMemories: [],
+        },
+      ]);
+
+      const scheduledRun: ScheduledWorkspaceRun = {
+        id: queued.chatId,
+        workspaceId: request.workspaceId,
+        chatId: queued.chatId,
+        chatKey,
+        title: queued.chatTitle,
+        createdAt,
+        pendingUserMessageId: queued.userMessageId,
+        request: {
+          ...request,
+          chatId: queued.chatId,
+          pendingUserMessageId: queued.userMessageId,
+          queuedUserMessageId: queued.userMessageId,
+        },
+        status: "queued",
+      };
+
+      updateScheduledWorkspaceRuns((current) => [...current, scheduledRun]);
+      void refreshWorkspaces();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
   }
 
   async function handleGuideActiveRun() {
@@ -4420,7 +4514,7 @@ export function App() {
     await guideActiveRun(request, runInfo);
   }
 
-  function handleQueueActiveRun() {
+  async function handleQueueActiveRun() {
     const request = currentDraftRunRequest();
     if (!request) {
       return;
@@ -4431,10 +4525,10 @@ export function App() {
       return;
     }
 
-    handleQueueActiveRunWithRequest(request, runInfo);
+    await handleQueueActiveRunWithRequest(request, runInfo);
   }
 
-  function handleQueueActiveRunWithRequest(
+  async function handleQueueActiveRunWithRequest(
     request: RetryRunRequest,
     runInfo: ActiveRunInfo,
   ) {
@@ -4443,25 +4537,44 @@ export function App() {
     setDraftMessage("");
     setError(null);
 
-    const pendingUserMessageId = localUiId("pending-queued-user");
-    appendPendingUserMessage(
-      runInfo.chatKey,
-      pendingUserMessageId,
-      messageWithSelectedSkills(detectedSkills, request.skillIds, request.content),
-      request.attachments,
-      "queued",
-    );
+    try {
+      const queued = await persistQueuedRunRequest({
+        ...request,
+        chatId: runInfo.chatId ?? request.chatId,
+        workspaceId: runInfo.workspaceId ?? request.workspaceId,
+      });
+      setMessagesForChatKey(runInfo.chatKey, (current) => [
+        ...current,
+        {
+          id: queued.userMessageId,
+          role: "user",
+          content: queued.content,
+          createdAt: queued.createdAt,
+          reasoning: null,
+          pendingMode: "queued",
+          toolCalls: [],
+          parts: queued.parts,
+          metrics: null,
+          memoriesUsed: [],
+          extractedMemories: [],
+        },
+      ]);
 
-    const queuedRequest = {
-      ...request,
-      chatId: runInfo.chatId ?? request.chatId,
-      pendingUserMessageId,
-      workspaceId: runInfo.workspaceId ?? request.workspaceId,
-    };
-    updateQueuedRunRequestsForChatKey(runInfo.chatKey, (current) => [
-      ...current,
-      queuedRequest,
-    ]);
+      const queuedRequest = {
+        ...request,
+        chatId: runInfo.chatId ?? request.chatId,
+        pendingUserMessageId: queued.userMessageId,
+        queuedUserMessageId: queued.userMessageId,
+        workspaceId: runInfo.workspaceId ?? request.workspaceId,
+      };
+      updateQueuedRunRequestsForChatKey(runInfo.chatKey, (current) => [
+        ...current,
+        queuedRequest,
+      ]);
+      void refreshWorkspaces();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    }
   }
 
   function handleWithdrawQueuedMessage(messageId: string) {
@@ -5647,6 +5760,7 @@ export function App() {
         {
           body: JSON.stringify({
             chatId: request.chatId,
+            queuedUserMessageId: request.queuedUserMessageId ?? null,
             message: request.content,
             attachments: request.attachments,
             modelId: request.modelId,
@@ -6471,15 +6585,22 @@ export function App() {
                   const configuredVisibleChatCount =
                     workspaceChatVisibleCounts[workspace.id] ??
                     WORKSPACE_CHAT_HISTORY_PAGE_SIZE;
+                  const persistedQueuedChatIds = new Set(
+                    workspace.chats
+                      .filter((chat) => chat.queuedRun?.status === "queued")
+                      .map((chat) => chat.id),
+                  );
                   const scheduledChats = scheduledWorkspaceRunsFor(
                     workspace.id,
                   )
+                    .filter((run) => !persistedQueuedChatIds.has(run.chatId))
                     .map(
                       (run): WorkspaceChatListItem => ({
                         activeRun: null,
                         codeChangeStats: { additions: 0, deletions: 0 },
                         createdAt: run.createdAt,
                         id: run.chatId,
+                        queuedRun: null,
                         scheduledChatKey: run.chatKey,
                         scheduledRunId: run.id,
                         scheduledStatus: run.status,
@@ -6488,9 +6609,16 @@ export function App() {
                       }),
                     )
                     .sort(compareWorkspaceChatListItemsByCreatedAtDesc);
+                  const persistedWorkspaceChats: WorkspaceChatListItem[] = workspace.chats.map(
+                    (chat) => ({
+                      ...chat,
+                      scheduledStatus:
+                        chat.queuedRun?.status === "queued" ? "queued" : undefined,
+                    }),
+                  );
                   const workspaceChats: WorkspaceChatListItem[] = [
                     ...scheduledChats,
-                    ...workspace.chats,
+                    ...persistedWorkspaceChats,
                   ];
                   const visibleChatCount =
                     selectedChatIndex >= configuredVisibleChatCount
@@ -23913,11 +24041,18 @@ function normalizeChatMessageSummary(
   const parts = partsSource
     .map((part) => normalizeChatMessagePart(part))
     .filter((part): part is ChatMessagePart => part !== null);
+  const pendingMode =
+    message.pendingMode === "queued" || message.pendingMode === "guidance"
+      ? message.pendingMode
+      : undefined;
+  const queuedRun = normalizeQueuedMessageRunSummary(message.queuedRun);
   const normalizedMessage = {
     ...message,
     extractedMemories,
     metrics,
     memoriesUsed,
+    pendingMode,
+    queuedRun,
     toolCalls,
     parts,
   };
@@ -23925,6 +24060,39 @@ function normalizeChatMessageSummary(
   return {
     ...normalizedMessage,
     parts: parts.length ? parts : fallbackMessageParts(normalizedMessage),
+  };
+}
+
+function normalizeQueuedMessageRunSummary(
+  queuedRun: QueuedMessageRunSummary | null | undefined,
+): QueuedMessageRunSummary | null {
+  if (!queuedRun || typeof queuedRun !== "object") {
+    return null;
+  }
+  const modelId = fieldValue(queuedRun, "modelId", "model_id");
+  if (typeof modelId !== "string" || !modelId.trim()) {
+    return null;
+  }
+  const providerId = fieldValue(queuedRun, "providerId", "provider_id");
+  const thinkingLevel = fieldValue(queuedRun, "thinkingLevel", "thinking_level");
+  const skillIds = fieldValue(queuedRun, "skillIds", "skill_ids");
+  const assistantMessageId = fieldValue(
+    queuedRun,
+    "assistantMessageId",
+    "assistant_message_id",
+  );
+  const status = fieldValue(queuedRun, "status");
+
+  return {
+    status: typeof status === "string" ? status : "queued",
+    modelId,
+    providerId: typeof providerId === "string" ? providerId : null,
+    thinkingLevel: typeof thinkingLevel === "string" ? thinkingLevel : null,
+    skillIds: Array.isArray(skillIds)
+      ? skillIds.filter((skillId): skillId is string => typeof skillId === "string")
+      : [],
+    assistantMessageId:
+      typeof assistantMessageId === "string" ? assistantMessageId : null,
   };
 }
 

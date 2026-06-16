@@ -1438,6 +1438,10 @@ fn app_router(state: AppState) -> Router {
         .route("/api/skills/refresh", post(refresh_skills))
         .route("/api/ai-statistics", get(ai_statistics))
         .route(
+            "/api/workspaces/{workspace_id}/chat/queue",
+            post(queue_chat_message).layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/chat/stream",
             post(stream_chat_response)
                 .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
@@ -4143,9 +4147,9 @@ async fn promote_memory(
             .unwrap_or(memory)
     };
 
-    Ok(Json(MemoryMutationResponse {
-        memory: Some(memory),
-    }))
+    let memory = Some(memory);
+
+    Ok(Json(MemoryMutationResponse { memory }))
 }
 
 async fn memory_sources(
@@ -4161,6 +4165,87 @@ async fn memory_sources(
         .map_err(ApiError::from_memory_error)?;
 
     Ok(Json(MemorySourcesResponse { sources }))
+}
+
+async fn queue_chat_message(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<QueueChatMessageRequest>,
+) -> Result<Json<QueueChatMessageResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let requested_model_id = request.model_id.clone();
+    let requested_provider_id = request.provider_id.clone();
+    let requested_thinking_level = request.thinking_level.clone();
+    let requested_skill_ids = request.skill_ids.clone().unwrap_or_default();
+    let prompt_context = prepare_prompt_context(
+        &state,
+        &config,
+        &workspace_id,
+        request.into_prompt_request(),
+        None,
+        PromptAssemblyPurpose::ChatRun,
+    )
+    .await?;
+    let raw_message = prompt_context.raw_message.as_deref().unwrap_or("");
+    let message = prompt_context
+        .message
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("message must not be empty"))?;
+    let mut database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let user_message_id = unique_id("msg-user");
+    let user_metadata_json = queued_user_message_metadata_json(
+        &prompt_context.attachments,
+        &requested_model_id,
+        requested_provider_id.as_deref(),
+        requested_thinking_level.as_deref(),
+        &requested_skill_ids,
+    )?;
+
+    let (chat_id, chat_title) = if prompt_context.is_new_chat {
+        let chat_id = unique_id("chat");
+        let title = chat_title_for_prompt(raw_message, &prompt_context.attachments);
+        let chat_metadata_json = queued_chat_metadata_json(&user_message_id)?;
+        database
+            .insert_chat_with_metadata(&chat_id, &title, &chat_metadata_json)
+            .map_err(ApiError::from_workspace_error)?;
+        (chat_id, title)
+    } else {
+        let chat_id = prompt_context
+            .chat_id
+            .clone()
+            .ok_or_else(|| ApiError::bad_request("chat id must not be empty"))?;
+        let chat = database
+            .chat(&chat_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+        (chat_id, chat.title)
+    };
+
+    database
+        .insert_message(NewMessage {
+            id: &user_message_id,
+            chat_id: &chat_id,
+            role: "user",
+            content: message,
+            sequence: prompt_context.next_message_sequence,
+            metadata_json: Some(&user_metadata_json),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    let chat = database
+        .chat(&chat_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+
+    Ok(Json(QueueChatMessageResponse {
+        chat_id,
+        chat_title,
+        created_at: chat.created_at,
+        updated_at: chat.updated_at,
+        user_message_id,
+        content: message.to_string(),
+        parts: user_message_response_parts(message, &prompt_context.attachments),
+    }))
 }
 
 async fn stream_chat_response(
@@ -5050,6 +5135,7 @@ struct DeleteSettingsItemRequest {
 #[serde(rename_all = "camelCase")]
 struct ChatStreamRequest {
     chat_id: Option<String>,
+    queued_user_message_id: Option<String>,
     model_id: String,
     provider_id: Option<String>,
     thinking_level: Option<String>,
@@ -5057,6 +5143,31 @@ struct ChatStreamRequest {
     message: String,
     #[serde(default)]
     attachments: Vec<ChatAttachmentInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueChatMessageRequest {
+    chat_id: Option<String>,
+    model_id: String,
+    provider_id: Option<String>,
+    thinking_level: Option<String>,
+    skill_ids: Option<Vec<String>>,
+    message: String,
+    #[serde(default)]
+    attachments: Vec<ChatAttachmentInput>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueChatMessageResponse {
+    chat_id: String,
+    chat_title: String,
+    created_at: String,
+    updated_at: String,
+    user_message_id: String,
+    content: String,
+    parts: Vec<ChatMessagePart>,
 }
 
 #[derive(Deserialize)]
@@ -5144,6 +5255,7 @@ struct ContextUsageResponse {
 
 struct PromptContextRequest {
     chat_id: Option<String>,
+    queued_user_message_id: Option<String>,
     model_id: String,
     provider_id: Option<String>,
     thinking_level: Option<String>,
@@ -5158,6 +5270,24 @@ impl ChatStreamRequest {
     fn into_prompt_request(self) -> PromptContextRequest {
         PromptContextRequest {
             chat_id: self.chat_id,
+            queued_user_message_id: self.queued_user_message_id,
+            model_id: self.model_id,
+            provider_id: self.provider_id,
+            thinking_level: self.thinking_level,
+            skill_ids: self.skill_ids,
+            message: Some(self.message),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: self.attachments,
+        }
+    }
+}
+
+impl QueueChatMessageRequest {
+    fn into_prompt_request(self) -> PromptContextRequest {
+        PromptContextRequest {
+            chat_id: self.chat_id,
+            queued_user_message_id: None,
             model_id: self.model_id,
             provider_id: self.provider_id,
             thinking_level: self.thinking_level,
@@ -5174,6 +5304,7 @@ impl ContextUsageRequest {
     fn into_prompt_request(self) -> PromptContextRequest {
         PromptContextRequest {
             chat_id: self.chat_id,
+            queued_user_message_id: None,
             model_id: self.model_id,
             provider_id: self.provider_id,
             thinking_level: self.thinking_level,
@@ -5646,6 +5777,15 @@ struct ChatSummary {
     updated_at: String,
     code_change_stats: CodeChangeStats,
     active_run: Option<ActiveChatRunSummary>,
+    queued_run: Option<QueuedRunSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedRunSummary {
+    status: String,
+    user_message_id: String,
+    assistant_message_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -5890,11 +6030,24 @@ struct ChatMessageSummary {
     content: String,
     created_at: String,
     reasoning: Option<String>,
+    pending_mode: Option<String>,
+    queued_run: Option<QueuedMessageRunSummary>,
     tool_calls: Vec<ChatToolCallSummary>,
     parts: Vec<ChatMessagePart>,
     metrics: Option<ChatReplyMetrics>,
     memories_used: Vec<ChatMemoryUsedSummary>,
     extracted_memories: Vec<ChatExtractedMemorySummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct QueuedMessageRunSummary {
+    status: String,
+    model_id: String,
+    provider_id: Option<String>,
+    thinking_level: Option<String>,
+    skill_ids: Vec<String>,
+    assistant_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -8386,6 +8539,7 @@ async fn prepare_prompt_context(
     let requested_provider_id = optional_trimmed_string(request.provider_id);
     let thinking_level = optional_trimmed_string(request.thinking_level);
     let requested_skill_ids = request.skill_ids;
+    let queued_user_message_id = normalized_optional_text(request.queued_user_message_id);
     let attachment_inputs = request.attachments;
     let raw_message = optional_trimmed_string(request.message);
     let assistant_draft = request
@@ -8511,9 +8665,18 @@ async fn prepare_prompt_context(
         Vec::new()
     } else {
         match chat_id.as_deref() {
-            Some(chat_id) => database
-                .messages_for_chat(chat_id)
-                .map_err(ApiError::from_workspace_error)?,
+            Some(chat_id) => {
+                let messages = database
+                    .messages_for_chat(chat_id)
+                    .map_err(ApiError::from_workspace_error)?;
+                match queued_user_message_id.as_deref() {
+                    Some(queued_user_message_id) => messages
+                        .into_iter()
+                        .filter(|message| message.id != queued_user_message_id)
+                        .collect(),
+                    None => messages,
+                }
+            }
             None => Vec::new(),
         }
     };
@@ -8856,6 +9019,12 @@ async fn prepare_chat_context(
     workspace_id: &str,
     request: ChatStreamRequest,
 ) -> Result<PreparedChatContext, ApiError> {
+    let queued_user_message_id = request
+        .queued_user_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let preallocated_chat_id = if request
         .chat_id
         .as_deref()
@@ -8883,7 +9052,9 @@ async fn prepare_chat_context(
         .ok_or_else(|| ApiError::bad_request("message must not be empty"))?;
     let user_sequence = prompt_context.next_message_sequence;
     let assistant_sequence = user_sequence + 1;
-    let user_message_id = unique_id("msg-user");
+    let user_message_id = queued_user_message_id
+        .clone()
+        .unwrap_or_else(|| unique_id("msg-user"));
     let assistant_message_id = unique_id("msg-assistant");
     let llm_request_id = unique_id("llm");
     let user_prompt_summary = state
@@ -8966,16 +9137,32 @@ async fn prepare_chat_context(
     hook_context_messages.extend(session_start_summary.additional_context);
     let user_metadata_json = user_message_metadata_json(&prompt_context.attachments)?;
 
-    database
-        .insert_message(NewMessage {
-            id: &user_message_id,
-            chat_id: &chat_id,
-            role: "user",
-            content: message,
-            sequence: user_sequence,
-            metadata_json: Some(&user_metadata_json),
-        })
-        .map_err(ApiError::from_workspace_error)?;
+    if queued_user_message_id.is_some() {
+        database
+            .insert_message_if_absent(NewMessage {
+                id: &user_message_id,
+                chat_id: &chat_id,
+                role: "user",
+                content: message,
+                sequence: user_sequence,
+                metadata_json: Some(&user_metadata_json),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .mark_chat_queued_run_started(&chat_id, &user_message_id, &assistant_message_id)
+            .map_err(ApiError::from_workspace_error)?;
+    } else {
+        database
+            .insert_message(NewMessage {
+                id: &user_message_id,
+                chat_id: &chat_id,
+                role: "user",
+                content: message,
+                sequence: user_sequence,
+                metadata_json: Some(&user_metadata_json),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
 
     persist_pending_prompt_context_injections(
         &mut database,
@@ -19148,7 +19335,7 @@ fn workspace_response_from_config(
                     .get(&chat.id)
                     .cloned()
                     .unwrap_or_default();
-                Ok(chat_summary(chat, code_change_stats, active_run))
+                chat_summary(chat, code_change_stats, active_run)
             })
             .collect::<Result<Vec<_>, ApiError>>()?;
 
@@ -20022,15 +20209,16 @@ fn chat_summary(
     chat: ChatRecord,
     code_change_stats: CodeChangeStats,
     active_run: Option<ActiveChatRunSummary>,
-) -> ChatSummary {
-    ChatSummary {
+) -> Result<ChatSummary, ApiError> {
+    Ok(ChatSummary {
         id: chat.id,
         title: chat.title,
         created_at: chat.created_at,
         updated_at: chat.updated_at,
         code_change_stats,
         active_run,
-    }
+        queued_run: queued_run_summary_from_chat_metadata(&chat.metadata_json)?,
+    })
 }
 
 fn chat_statistics_response(
@@ -20366,6 +20554,68 @@ fn git_diff_changed_files(
     }
 
     changed_files.into_iter().collect()
+}
+
+fn queued_chat_metadata_json(user_message_id: &str) -> Result<String, ApiError> {
+    serde_json::to_string(&json!({
+        "queuedRun": {
+            "status": "queued",
+            "userMessageId": user_message_id,
+        }
+    }))
+    .map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize queued chat metadata: {source}"
+        ))
+    })
+}
+
+fn queued_user_message_metadata_json(
+    attachments: &[NeutralChatAttachment],
+    model_id: &str,
+    provider_id: Option<&str>,
+    thinking_level: Option<&str>,
+    skill_ids: &[String],
+) -> Result<String, ApiError> {
+    let mut metadata = serde_json::from_str::<Value>(&user_message_metadata_json(attachments)?)
+        .map_err(|source| ApiError::internal(format!("failed to parse user metadata: {source}")))?;
+    let Some(metadata_object) = metadata.as_object_mut() else {
+        return Err(ApiError::internal(
+            "user message metadata must be an object",
+        ));
+    };
+    metadata_object.insert(
+        "queuedRun".to_string(),
+        json!({
+            "status": "queued",
+            "modelId": model_id,
+            "providerId": provider_id,
+            "thinkingLevel": thinking_level,
+            "skillIds": skill_ids,
+        }),
+    );
+    serde_json::to_string(&metadata).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize queued user metadata: {source}"
+        ))
+    })
+}
+
+fn user_message_response_parts(
+    content: &str,
+    attachments: &[NeutralChatAttachment],
+) -> Vec<ChatMessagePart> {
+    let mut parts = Vec::new();
+    push_text_part(&mut parts, content);
+    parts.extend(
+        attachments
+            .iter()
+            .cloned()
+            .map(|attachment| ChatMessagePart::Attachment {
+                attachment: chat_attachment_part(attachment),
+            }),
+    );
+    parts
 }
 
 fn path_from_diff_header(line: &str) -> Option<String> {
@@ -20965,9 +21215,20 @@ fn chat_message_summary(
         None
     };
 
+    let queued_run = if message.role == "user" {
+        queued_run_summary_from_message_metadata(&message.metadata_json)?
+    } else {
+        None
+    };
+    let pending_mode = queued_run
+        .as_ref()
+        .and_then(|queued_run| (queued_run.status == "queued").then(|| "queued".to_string()));
+
     Ok(ChatMessageSummary {
         id: message.id,
         reasoning,
+        pending_mode,
+        queued_run,
         role: message.role,
         content: message.content,
         created_at: message.created_at,
@@ -21132,6 +21393,73 @@ fn chat_message_parts(
     } else {
         Ok(parts)
     }
+}
+
+fn queued_run_summary_from_chat_metadata(
+    metadata_json: &str,
+) -> Result<Option<QueuedRunSummary>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "chat metadata")?;
+    let Some(queued_run) = metadata.get("queuedRun") else {
+        return Ok(None);
+    };
+    let status = string_json_field(queued_run, "status", "status")
+        .ok_or_else(|| ApiError::bad_request("chat metadata.queuedRun.status must be a string"))?;
+    let user_message_id = string_json_field(queued_run, "userMessageId", "user_message_id")
+        .ok_or_else(|| {
+            ApiError::bad_request("chat metadata.queuedRun.userMessageId must be a string")
+        })?;
+    let assistant_message_id =
+        string_json_field(queued_run, "assistantMessageId", "assistant_message_id")
+            .map(str::to_string);
+
+    Ok(Some(QueuedRunSummary {
+        status: status.to_string(),
+        user_message_id: user_message_id.to_string(),
+        assistant_message_id,
+    }))
+}
+
+fn queued_run_summary_from_message_metadata(
+    metadata_json: &str,
+) -> Result<Option<QueuedMessageRunSummary>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "user message metadata")?;
+    let Some(queued_run) = metadata.get("queuedRun") else {
+        return Ok(None);
+    };
+    let status = string_json_field(queued_run, "status", "status").ok_or_else(|| {
+        ApiError::bad_request("message metadata.queuedRun.status must be a string")
+    })?;
+    let model_id = string_json_field(queued_run, "modelId", "model_id").ok_or_else(|| {
+        ApiError::bad_request("message metadata.queuedRun.modelId must be a string")
+    })?;
+    let provider_id =
+        string_json_field(queued_run, "providerId", "provider_id").map(str::to_string);
+    let thinking_level =
+        string_json_field(queued_run, "thinkingLevel", "thinking_level").map(str::to_string);
+    let assistant_message_id =
+        string_json_field(queued_run, "assistantMessageId", "assistant_message_id")
+            .map(str::to_string);
+    let skill_ids = queued_run
+        .get("skillIds")
+        .or_else(|| queued_run.get("skill_ids"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(QueuedMessageRunSummary {
+        status: status.to_string(),
+        model_id: model_id.to_string(),
+        provider_id,
+        thinking_level,
+        skill_ids,
+        assistant_message_id,
+    }))
 }
 
 fn assistant_message_request_ids(
