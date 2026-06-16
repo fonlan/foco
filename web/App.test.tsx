@@ -3252,6 +3252,17 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("Older chat 8")).toBeInTheDocument();
     expect(screen.queryByText("Older chat 9")).not.toBeInTheDocument();
     expect(screen.getByText("2 hidden chats")).toBeInTheDocument();
+
+    const defaultToggle = screen.getByRole("button", { name: "Default" });
+    await userEvent.click(defaultToggle);
+    expect(defaultToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Older chat 4")).not.toBeInTheDocument();
+
+    await userEvent.click(defaultToggle);
+    expect(defaultToggle).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("Older chat 3")).toBeInTheDocument();
+    expect(screen.queryByText("Older chat 4")).not.toBeInTheDocument();
+    expect(screen.getByText("7 hidden chats")).toBeInTheDocument();
   });
 
   it("opens center chat tabs and closes tabs without deleting chat history", async () => {

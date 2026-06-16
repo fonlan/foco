@@ -6323,9 +6323,15 @@ export function App() {
   }
 
   function toggleWorkspace(workspaceId: string) {
-    setExpandedWorkspaceId((current) =>
-      current === workspaceId ? null : workspaceId,
-    );
+    const isCollapsingWorkspace = expandedWorkspaceId === workspaceId;
+    setExpandedWorkspaceId(isCollapsingWorkspace ? null : workspaceId);
+    if (isCollapsingWorkspace) {
+      setWorkspaceChatVisibleCounts((current) => {
+        const next = { ...current };
+        delete next[workspaceId];
+        return next;
+      });
+    }
   }
 
   function showMoreWorkspaceChats(workspaceId: string) {
