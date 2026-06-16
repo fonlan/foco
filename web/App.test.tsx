@@ -3335,6 +3335,48 @@ describe("App verification surfaces", () => {
     );
   });
 
+  it("clears stale workspace active run summary when loaded chat has no active run", async () => {
+    workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            ...workspace.chats[0],
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "stale-run",
+              workspaceId: "workspace-1",
+            },
+          },
+          ...workspace.chats.slice(1),
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    render(<App />);
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyTitle = await within(workspaceList).findByText("Tool run");
+    const historyButton = historyTitle.closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+
+    const statusDot = () => historyButton.querySelector(".session-status-dot");
+    expect(statusDot()).toHaveClass("session-status-dot-running");
+
+    await userEvent.click(historyButton);
+    await screen.findByText("Please inspect README.");
+
+    await waitFor(() =>
+      expect(statusDot()).toHaveClass("session-status-dot-open"),
+    );
+  });
+
   it("marks workspace chat dots red after an interrupted stream", async () => {
     render(<App />);
 

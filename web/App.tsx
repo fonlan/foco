@@ -3638,6 +3638,36 @@ export function App() {
     });
   }
 
+  function clearWorkspaceChatActiveRun(workspaceId: string, chatId: string) {
+    setWorkspaces((current) => {
+      let changed = false;
+      const nextWorkspaces = current.map((workspace) => {
+        if (workspace.id !== workspaceId) {
+          return workspace;
+        }
+
+        let workspaceChanged = false;
+        const nextChats = workspace.chats.map((chat) => {
+          if (chat.id !== chatId || chat.activeRun === null) {
+            return chat;
+          }
+
+          workspaceChanged = true;
+          return { ...chat, activeRun: null };
+        });
+
+        if (!workspaceChanged) {
+          return workspace;
+        }
+
+        changed = true;
+        return { ...workspace, chats: nextChats };
+      });
+
+      return changed ? nextWorkspaces : current;
+    });
+  }
+
   function updateQueuedRunRequestsForChatKey(
     chatKey: string,
     updater: (current: RetryRunRequest[]) => RetryRunRequest[],
@@ -3819,6 +3849,7 @@ export function App() {
       } else {
         setChatRunning(chatKey, false);
         setActiveRunInfoForChatKey(chatKey, null);
+        clearWorkspaceChatActiveRun(workspaceId, chatId);
       }
       if (options.updateUrl !== false) {
         updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
