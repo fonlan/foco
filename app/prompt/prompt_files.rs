@@ -1,17 +1,20 @@
 use std::{fs, path::Path};
 
-use foco_agent::{build_default_system_prompt, ToolPromptInfo};
+use foco_agent::{ToolPromptInfo, build_default_system_prompt};
 use foco_mcp::McpToolDefinition;
 use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolDefinition};
-use foco_store::config::{PromptSettings, DEFAULT_SYSTEM_PROMPT_NAME};
-use foco_tools::{builtin_tool_definitions, SEARCH_TEXT_TOOL, WEB_SEARCH_TOOL};
+use foco_store::config::{DEFAULT_SYSTEM_PROMPT_NAME, PromptSettings};
+use foco_tools::{SEARCH_TEXT_TOOL, WEB_SEARCH_TOOL, builtin_tool_definitions};
 
 use crate::{
-    neutral_text_message, ApiError, SystemPromptSummary, AGENTS_MESSAGE_PREFIX,
-    EXTRA_PROMPT_MESSAGE_PREFIX, PROMPT_FILE_MESSAGE_PREFIX,
+    AGENTS_MESSAGE_PREFIX, ApiError, EXTRA_PROMPT_MESSAGE_PREFIX, PROMPT_FILE_MESSAGE_PREFIX,
+    SystemPromptSummary, neutral_text_message,
 };
 
-pub(crate) fn active_system_prompt(settings: &PromptSettings, name: &str) -> Result<String, ApiError> {
+pub(crate) fn active_system_prompt(
+    settings: &PromptSettings,
+    name: &str,
+) -> Result<String, ApiError> {
     if let Some(prompt) = settings
         .system_prompts
         .iter()
@@ -102,7 +105,9 @@ pub(crate) fn tool_prompt_infos(
         .collect()
 }
 
-pub(crate) fn agents_prompt_messages(workspace_path: &Path) -> Result<Vec<NeutralChatMessage>, ApiError> {
+pub(crate) fn agents_prompt_messages(
+    workspace_path: &Path,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
     let mut messages = Vec::new();
     let path = workspace_path.join("AGENTS.md");
 

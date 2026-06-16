@@ -17,10 +17,10 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 
 use crate::{
-    ApiError, AppState, MAX_CHAT_ATTACHMENTS, MAX_CHAT_ATTACHMENT_BYTES,
-    MAX_CHAT_ATTACHMENT_TOTAL_BYTES, NativeBrowserProbeQuery, NativePickerRequest,
-    NativeSelectedFile, SelectDirectoryResponse, SelectFilesResponse,
-    attachment_content_type_for_path, is_wsl_environment,
+    ApiError, AppState, MAX_CHAT_ATTACHMENT_BYTES, MAX_CHAT_ATTACHMENT_TOTAL_BYTES,
+    MAX_CHAT_ATTACHMENTS, NativeBrowserProbeQuery, NativePickerRequest, NativeSelectedFile,
+    SelectDirectoryResponse, SelectFilesResponse, attachment_content_type_for_path,
+    is_wsl_environment,
 };
 
 const NATIVE_BROWSER_AUTHORIZATION_TTL: Duration = Duration::from_secs(8 * 60 * 60);

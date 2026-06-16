@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use foco_agent::{
     ToolResource, ToolResourceAccess, ToolResourceLock, tool_resource_locks_conflict,
@@ -39,7 +42,11 @@ impl Default for ToolResourceLockRegistryInner {
 }
 
 impl ToolResourceLockRegistry {
-    pub(crate) async fn acquire(&self, workspace_id: &str, locks: Vec<ToolResourceLock>) -> ToolResourceLease {
+    pub(crate) async fn acquire(
+        &self,
+        workspace_id: &str,
+        locks: Vec<ToolResourceLock>,
+    ) -> ToolResourceLease {
         let locks = normalize_tool_resource_locks(locks);
         let workspace_id = workspace_id.to_string();
         let lease_id = self.inner.next_lease_id.fetch_add(1, Ordering::Relaxed);

@@ -1,6 +1,8 @@
-use crate::*;
-use crate::memory_runtime::{neutral_messages_from_record, stored_turn_memory_messages_by_sequence};
 use super::{compression_snapshot_message, snapshot_covered_sequences};
+use crate::memory_runtime::{
+    neutral_messages_from_record, stored_turn_memory_messages_by_sequence,
+};
+use crate::*;
 
 pub(crate) async fn prepare_prompt_context(
     state: &AppState,

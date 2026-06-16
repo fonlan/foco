@@ -21,10 +21,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{HeaderMap, StatusCode, header},
     middleware,
-    response::{
-        IntoResponse, Response,
-        sse::Event,
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
@@ -46,39 +43,36 @@ use foco_store::{
     config::{
         ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL, GlobalConfig,
         HookConfig, HookEventMap, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig, MemorySettings,
-        ModelLimits, ModelSettings, ProviderSettings, SKILL_SCOPE_GLOBAL,
-        SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
-        SUPPORTED_APP_THEMES, SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS,
-        SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings, SystemPromptSettings,
-        UNSUPPORTED_HOOK_EVENTS, WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY,
-        WebSearchSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
-        load_or_create_global_config, load_workspace_hook_config, save_global_config,
-        workspace_hook_config_path,
+        ModelLimits, ModelSettings, ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE,
+        SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
+        SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS,
+        SkillSettings, SystemPromptSettings, UNSUPPORTED_HOOK_EVENTS, WEB_SEARCH_PROVIDER_BRAVE,
+        WEB_SEARCH_PROVIDER_TAVILY, WebSearchSettings, WebServerSettings, WorkspaceCommonCommand,
+        WorkspaceConfig, load_or_create_global_config, load_workspace_hook_config,
+        save_global_config, workspace_hook_config_path,
     },
     memory::{
         MemoryDatabase, MemoryDatabaseError, MemoryExtractionJobStatus, MemoryFactRecord,
-        MemoryKind, MemoryScope, MemorySourceType, MemoryStatus,
-        NewMemoryExtractionJob, NewMemoryFact, NewMemorySource,
+        MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryExtractionJob,
+        NewMemoryFact, NewMemorySource,
     },
     model_metadata::{
         ModelMetadataCache, ModelMetadataError, ModelMetadataRecord, read_model_metadata_cache,
     },
     workspace::{
         ChatRecord, CodeChangeStats, ContextCompressionSnapshotRecord, HookRunRecord,
-        LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
-        LlmRequestAuditRow, LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint,
-        LlmRequestEventRecord, LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot,
-        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection,
-        NewToolCall, NewToolResult, PromptContextInjectionRecord, TodoGraphRecord, TodoGraphTask,
-        ToolCallCountRecord,
+        LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
+        LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
+        LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot, NewLlmRequest,
+        NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewToolCall, NewToolResult,
+        PromptContextInjectionRecord, TodoGraphRecord, TodoGraphTask, ToolCallCountRecord,
         ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
         initialize_workspace_databases, workspace_database_path,
     },
 };
 use foco_tools::{
-    CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, RUN_COMMAND_TOOL, ToolExecution,
-    ToolOutputStream, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
-    set_ripgrep_path,
+    CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, RUN_COMMAND_TOOL, ToolExecution, ToolOutputStream,
+    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL, set_ripgrep_path,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -94,35 +88,34 @@ use crate::platform::native_browser::{
     native_browser_probe, prune_native_browser_authorizations, select_directory, select_files,
 };
 
+use crate::git_backend::git_diff_response;
 use crate::hooks::{
     EffectiveHookSummary, HookDecision, HookNotification, HookRunRequest, HookRunSummary,
     HookRuntime, effective_hook_summaries,
 };
-use crate::git_backend::git_diff_response;
-use crate::http::memory::{refresh_memory_profile, EditMemorySourceRequest};
+use crate::http::memory::{EditMemorySourceRequest, refresh_memory_profile};
 use crate::memory_runtime::{
-    active_prompt_context_memory_keys, apply_memory_expiration_to_fact, chat_extracted_memory_summary,
-    expire_due_memories, memory_fact_key, memory_fact_prompt_order,
-    memory_fts_query, memory_prompt_context,
-    persist_pending_prompt_context_injections, prompt_cache_key,
-    splice_resolved_memory, stored_prompt_context_record_memory_keys,
+    active_prompt_context_memory_keys, apply_memory_expiration_to_fact,
+    chat_extracted_memory_summary, expire_due_memories, memory_fact_key, memory_fact_prompt_order,
+    memory_fts_query, memory_prompt_context, persist_pending_prompt_context_injections,
+    prompt_cache_key, splice_resolved_memory, stored_prompt_context_record_memory_keys,
     stored_stable_prompt_context_messages,
 };
 use crate::prompt::{
     active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
-    configured_prompt_messages, context_usage_response,
-    ensure_context_compression, environment_context_message, interleaved_tool_state_messages,
-    is_wsl_environment, neutral_assistant_tool_call_message, pack_neutral_messages,
-    persist_chat_result, prepare_prompt_context, recover_after_tool_round_cap,
-    serialize_provider_request, system_prompt_summaries, tool_prompt_infos,
+    configured_prompt_messages, context_usage_response, ensure_context_compression,
+    environment_context_message, interleaved_tool_state_messages, is_wsl_environment,
+    neutral_assistant_tool_call_message, pack_neutral_messages, persist_chat_result,
+    prepare_prompt_context, recover_after_tool_round_cap, serialize_provider_request,
+    system_prompt_summaries, tool_prompt_infos,
 };
 use crate::runtime::{
-    chat_run_subscription_stream, execute_tool_calls_parallel, pending_tool_calls,
-    ActiveChatRunRegistry, ActiveChatRunRegistration, ActiveChatRunSubscription,
+    ActiveChatRunRegistration, ActiveChatRunRegistry, ActiveChatRunSubscription,
     ActiveChatRunSummary, ChatRunCancellation, GuidanceMessage, QuestionAnswer,
-    QuestionAnswerResponse, QuestionRegistry,
-    QuestionRequest, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
-    RepeatedToolCallDetector, ToolOutputDeltaEvent, ToolResourceLockRegistry,
+    QuestionAnswerResponse, QuestionRegistry, QuestionRequest, ReadOnlyToolProgressAction,
+    ReadOnlyToolProgressDetector, RepeatedToolCallDetector, ToolOutputDeltaEvent,
+    ToolResourceLockRegistry, chat_run_subscription_stream, execute_tool_calls_parallel,
+    pending_tool_calls,
 };
 
 #[cfg(all(windows, not(debug_assertions)))]
@@ -130,13 +123,13 @@ use std::sync::atomic::AtomicU32;
 
 mod git_backend;
 mod hooks;
-mod logging;
-mod terminal;
 mod http;
-mod platform;
-mod runtime;
-mod prompt;
+mod logging;
 mod memory_runtime;
+mod platform;
+mod prompt;
+mod runtime;
+mod terminal;
 #[cfg(test)]
 mod tests;
 
@@ -278,7 +271,6 @@ static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
 type AppResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-
 #[cfg(all(windows, not(debug_assertions)))]
 // Stable tray menu item id for opening the browser UI from the Windows tray icon.
 const TRAY_OPEN_ITEM_ID: &str = "foco-open-ui";
@@ -380,8 +372,6 @@ impl NativeBrowserAuthorizations {
     }
 }
 
-
-
 impl MemoryExtractionHandle {
     async fn wait(self) -> Result<Vec<ChatExtractedMemorySummary>, ApiError> {
         self.task.await.map_err(|source| {
@@ -389,8 +379,6 @@ impl MemoryExtractionHandle {
         })?
     }
 }
-
-
 
 #[tokio::main]
 async fn main() {
@@ -520,9 +508,18 @@ fn app_router(state: AppState) -> Router {
         .route("/api/auth/login", post(crate::http::auth::auth_login))
         .route("/api/auth/logout", post(crate::http::auth::auth_logout))
         .route("/api/workspaces", get(crate::http::workspaces::workspaces))
-        .route("/api/workspaces/add", post(crate::http::workspaces::add_workspace))
-        .route("/api/workspaces/manual", post(crate::http::workspaces::save_workspace_settings))
-        .route("/api/workspaces/order", post(crate::http::workspaces::save_workspace_order))
+        .route(
+            "/api/workspaces/add",
+            post(crate::http::workspaces::add_workspace),
+        )
+        .route(
+            "/api/workspaces/manual",
+            post(crate::http::workspaces::save_workspace_settings),
+        )
+        .route(
+            "/api/workspaces/order",
+            post(crate::http::workspaces::save_workspace_order),
+        )
         .route(
             "/api/workspaces/{workspace_id}/logo",
             get(crate::http::workspaces::workspace_logo)
@@ -533,46 +530,128 @@ fn app_router(state: AppState) -> Router {
         .route("/api/native/browser-probe.svg", get(native_browser_probe))
         .route("/api/native/select-directory", post(select_directory))
         .route("/api/native/select-files", post(select_files))
-        .route("/api/native/install-ripgrep", post(crate::http::workspaces::install_ripgrep))
+        .route(
+            "/api/native/install-ripgrep",
+            post(crate::http::workspaces::install_ripgrep),
+        )
         .route("/api/settings", get(crate::http::settings::settings))
-        .route("/api/settings/general", post(crate::http::settings::save_general_settings))
-        .route("/api/settings/web-search", post(crate::http::settings::save_web_search_settings))
-        .route("/api/settings/memory", post(crate::http::settings::save_memory_settings))
-        .route("/api/settings/prompts", post(crate::http::settings::save_prompt_settings))
+        .route(
+            "/api/settings/general",
+            post(crate::http::settings::save_general_settings),
+        )
+        .route(
+            "/api/settings/web-search",
+            post(crate::http::settings::save_web_search_settings),
+        )
+        .route(
+            "/api/settings/memory",
+            post(crate::http::settings::save_memory_settings),
+        )
+        .route(
+            "/api/settings/prompts",
+            post(crate::http::settings::save_prompt_settings),
+        )
         .route("/api/memory", get(crate::http::memory::memory_list))
-        .route("/api/memory/manual", post(crate::http::memory::create_manual_memory))
-        .route("/api/memory/status", post(crate::http::memory::update_memory_status))
+        .route(
+            "/api/memory/manual",
+            post(crate::http::memory::create_manual_memory),
+        )
+        .route(
+            "/api/memory/status",
+            post(crate::http::memory::update_memory_status),
+        )
         .route("/api/memory/edit", post(crate::http::memory::edit_memory))
-        .route("/api/memory/forget", post(crate::http::memory::forget_memory))
-        .route("/api/memory/clear", post(crate::http::memory::clear_filtered_memories))
-        .route("/api/memory/promote", post(crate::http::memory::promote_memory))
-        .route("/api/memory/sources", get(crate::http::memory::memory_sources))
+        .route(
+            "/api/memory/forget",
+            post(crate::http::memory::forget_memory),
+        )
+        .route(
+            "/api/memory/clear",
+            post(crate::http::memory::clear_filtered_memories),
+        )
+        .route(
+            "/api/memory/promote",
+            post(crate::http::memory::promote_memory),
+        )
+        .route(
+            "/api/memory/sources",
+            get(crate::http::memory::memory_sources),
+        )
         .route("/api/hooks", get(crate::http::hooks::hooks_settings))
-        .route("/api/hooks/global", post(crate::http::hooks::save_global_hooks))
-        .route("/api/hooks/workspace", post(crate::http::hooks::save_workspace_hooks))
-        .route("/api/hooks/import-claude", post(crate::http::hooks::import_claude_hooks))
+        .route(
+            "/api/hooks/global",
+            post(crate::http::hooks::save_global_hooks),
+        )
+        .route(
+            "/api/hooks/workspace",
+            post(crate::http::hooks::save_workspace_hooks),
+        )
+        .route(
+            "/api/hooks/import-claude",
+            post(crate::http::hooks::import_claude_hooks),
+        )
         .route("/api/hooks/test", post(crate::http::hooks::test_hooks))
-        .route("/api/workspaces/{workspace_id}/hooks/runs", get(crate::http::hooks::hook_runs))
+        .route(
+            "/api/workspaces/{workspace_id}/hooks/runs",
+            get(crate::http::hooks::hook_runs),
+        )
         .route(
             "/api/workspaces/{workspace_id}/hooks/runs/{hook_run_id}",
             get(crate::http::hooks::hook_run_detail),
         )
-        .route("/api/providers/manual", post(crate::http::settings::save_manual_provider))
-        .route("/api/providers/delete", post(crate::http::settings::delete_provider))
-        .route("/api/providers/test", post(crate::http::settings::test_provider))
-        .route("/api/model-metadata", get(crate::http::settings::model_metadata))
-        .route("/api/model-metadata/refresh", post(crate::http::settings::refresh_model_metadata))
-        .route("/api/models/manual", post(crate::http::settings::save_manual_model))
-        .route("/api/models/delete", post(crate::http::settings::delete_model))
-        .route("/api/models/order", post(crate::http::settings::save_model_order))
-        .route("/api/mcp/servers/manual", post(crate::http::settings::save_mcp_server))
-        .route("/api/mcp/servers/delete", post(crate::http::settings::delete_mcp_server))
-        .route("/api/skills/manual", post(crate::http::settings::save_skills))
-        .route("/api/skills/refresh", post(crate::http::settings::refresh_skills))
+        .route(
+            "/api/providers/manual",
+            post(crate::http::settings::save_manual_provider),
+        )
+        .route(
+            "/api/providers/delete",
+            post(crate::http::settings::delete_provider),
+        )
+        .route(
+            "/api/providers/test",
+            post(crate::http::settings::test_provider),
+        )
+        .route(
+            "/api/model-metadata",
+            get(crate::http::settings::model_metadata),
+        )
+        .route(
+            "/api/model-metadata/refresh",
+            post(crate::http::settings::refresh_model_metadata),
+        )
+        .route(
+            "/api/models/manual",
+            post(crate::http::settings::save_manual_model),
+        )
+        .route(
+            "/api/models/delete",
+            post(crate::http::settings::delete_model),
+        )
+        .route(
+            "/api/models/order",
+            post(crate::http::settings::save_model_order),
+        )
+        .route(
+            "/api/mcp/servers/manual",
+            post(crate::http::settings::save_mcp_server),
+        )
+        .route(
+            "/api/mcp/servers/delete",
+            post(crate::http::settings::delete_mcp_server),
+        )
+        .route(
+            "/api/skills/manual",
+            post(crate::http::settings::save_skills),
+        )
+        .route(
+            "/api/skills/refresh",
+            post(crate::http::settings::refresh_skills),
+        )
         .route("/api/ai-statistics", get(crate::http::chat::ai_statistics))
         .route(
             "/api/workspaces/{workspace_id}/chat/queue",
-            post(crate::http::chat::queue_chat_message).layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
+            post(crate::http::chat::queue_chat_message)
+                .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/workspaces/{workspace_id}/chat/stream",
@@ -589,11 +668,13 @@ fn app_router(state: AppState) -> Router {
         )
         .route(
             "/api/workspaces/{workspace_id}/chat/guidance",
-            post(crate::http::chat::add_chat_guidance).layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
+            post(crate::http::chat::add_chat_guidance)
+                .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/workspaces/{workspace_id}/context-usage",
-            post(crate::http::chat::context_usage).layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
+            post(crate::http::chat::context_usage)
+                .layer(DefaultBodyLimit::max(CHAT_ATTACHMENT_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/chat/questions/{question_id}/answer",
@@ -619,8 +700,14 @@ fn app_router(state: AppState) -> Router {
             "/api/workspaces/{workspace_id}/chats/{chat_id}/delete",
             post(crate::http::chat::delete_chat),
         )
-        .route("/api/workspaces/{workspace_id}/git/status", get(crate::http::git::git_status))
-        .route("/api/workspaces/{workspace_id}/git/diff", get(crate::http::git::git_diff))
+        .route(
+            "/api/workspaces/{workspace_id}/git/status",
+            get(crate::http::git::git_status),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/git/diff",
+            get(crate::http::git::git_diff),
+        )
         .route(
             "/api/workspaces/{workspace_id}/git/branches",
             get(crate::http::git::git_branches),
@@ -642,7 +729,10 @@ fn app_router(state: AppState) -> Router {
             get(crate::http::terminal::terminal_socket),
         )
         .fallback(static_asset)
-        .layer(middleware::from_fn_with_state(auth_state, crate::http::auth::require_auth))
+        .layer(middleware::from_fn_with_state(
+            auth_state,
+            crate::http::auth::require_auth,
+        ))
         .with_state(state)
 }
 
@@ -1241,6 +1331,7 @@ struct ManualGeneralSettingsRequest {
 struct ManualWebSearchSettingsRequest {
     enabled: bool,
     active_provider: String,
+    api_proxy: Option<ManualApiProxySettingsRequest>,
     tavily_api_key: Option<String>,
     brave_api_key: Option<String>,
     clear_tavily_api_key: Option<bool>,
@@ -1669,6 +1760,7 @@ struct WebSearchSettingsSummary {
     enabled: bool,
     active_provider: String,
     providers: Vec<WebSearchProviderSummary>,
+    api_proxy: ApiProxySettingsSummary,
 }
 
 #[derive(Serialize)]
@@ -2292,7 +2384,6 @@ struct ChatToolCallSummary {
     is_error: bool,
 }
 
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 enum ChatMessagePart {
@@ -2859,7 +2950,6 @@ struct ToolHookOutcome {
     hook_summary: HookRunSummary,
 }
 
-
 struct ToolExecutionWithHooks {
     execution: ToolExecution,
     hook_summary: HookRunSummary,
@@ -2995,7 +3085,6 @@ async fn run_chat_context_in_background(
         );
     }
 }
-
 
 impl PreparedChatContext {
     fn capture_cancelled_llm_request(
@@ -4570,7 +4659,6 @@ impl PreparedChatContext {
     }
 }
 
-
 async fn prepare_chat_context(
     state: &AppState,
     config: &GlobalConfig,
@@ -4954,7 +5042,6 @@ impl PreparedChatContext {
 /// Splices resolved memory messages into the assembled prompt at the indices
 /// captured during prompt assembly. Updates the parallel source vectors so they
 /// stay aligned with the message list and shifts the active-tool start index.
-
 
 fn queue_memory_extraction_job(
     context: &PreparedChatContext,
@@ -5663,9 +5750,15 @@ async fn execute_web_search(
     let api_key = settings
         .api_key_for_provider(provider)
         .ok_or_else(|| format!("web_search provider '{provider}' is missing an API key"))?;
-    let client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder()
         .timeout(timeout)
-        .user_agent(FOCO_WEB_USER_AGENT)
+        .user_agent(FOCO_WEB_USER_AGENT);
+    if settings.api_proxy.enabled {
+        let proxy = reqwest::Proxy::all(settings.api_proxy.url.trim())
+            .map_err(|source| format!("failed to configure web_search proxy: {source}"))?;
+        client_builder = client_builder.proxy(proxy);
+    }
+    let client = client_builder
         .build()
         .map_err(|source| format!("failed to create web_search HTTP client: {source}"))?;
     let output = match provider {
@@ -7207,7 +7300,6 @@ fn estimate_tool_schema_tokens(tools: &[NeutralToolDefinition]) -> u64 {
         .sum()
 }
 
-
 fn neutral_tool_call_estimated_tokens(tool_call: &NeutralToolCall) -> u64 {
     let thought_tokens = tool_call
         .thought_signatures
@@ -7225,7 +7317,6 @@ fn neutral_tool_call_estimated_tokens(tool_call: &NeutralToolCall) -> u64 {
         + estimate_json_tokens(&tool_call.arguments)
         + thought_tokens
 }
-
 
 fn non_empty_trimmed(value: String, field_name: &str) -> Result<String, ApiError> {
     let value = value.trim().to_string();
@@ -7857,7 +7948,9 @@ impl ApiError {
         Self::internal(error.to_string())
     }
 
-    pub(crate) fn from_workspace_error(error: foco_store::workspace::WorkspaceDatabaseError) -> Self {
+    pub(crate) fn from_workspace_error(
+        error: foco_store::workspace::WorkspaceDatabaseError,
+    ) -> Self {
         match error {
             foco_store::workspace::WorkspaceDatabaseError::InvalidTodoGraph { .. }
             | foco_store::workspace::WorkspaceDatabaseError::MissingTodoGraph { .. } => {
@@ -9119,6 +9212,12 @@ fn web_search_settings_summary(settings: &WebSearchSettings) -> WebSearchSetting
     WebSearchSettingsSummary {
         enabled: settings.enabled,
         active_provider: settings.active_provider.clone(),
+        api_proxy: ApiProxySettingsSummary {
+            enabled: settings.api_proxy.enabled,
+            proxy_type: settings.api_proxy.proxy_type.clone(),
+            url: settings.api_proxy.url.clone(),
+            supported_types: api_proxy_type_summaries(),
+        },
         providers: vec![
             WebSearchProviderSummary {
                 provider: WEB_SEARCH_PROVIDER_TAVILY,
@@ -11231,6 +11330,29 @@ fn code_change_stats_from_changed_files(
     }
 }
 
+fn git_diff_file_line_stats_delta(
+    initial_stats: Option<&GitDiffFileLineStats>,
+    final_stats: Option<&GitDiffFileLineStats>,
+) -> Option<GitDiffFileLineStats> {
+    let initial = initial_stats.cloned().unwrap_or_default();
+    let final_stats = final_stats.cloned().unwrap_or_default();
+    if initial == final_stats {
+        return None;
+    }
+
+    let additions = final_stats.additions.saturating_sub(initial.additions);
+    let deletions = final_stats.deletions.saturating_sub(initial.deletions);
+    if additions == 0 && deletions == 0 {
+        return None;
+    }
+
+    Some(GitDiffFileLineStats {
+        additions,
+        deletions,
+        fingerprint: final_stats.fingerprint,
+    })
+}
+
 fn git_diff_changed_files(
     initial_stats: &GitDiffStatsByFile,
     final_stats: &GitDiffStatsByFile,
@@ -11238,14 +11360,19 @@ fn git_diff_changed_files(
     let mut changed_files = BTreeMap::new();
 
     for (path, final_file_stats) in final_stats {
-        if initial_stats.get(path) != Some(final_file_stats) {
-            changed_files.insert(path.clone(), final_file_stats.clone());
+        if let Some(delta) =
+            git_diff_file_line_stats_delta(initial_stats.get(path), Some(final_file_stats))
+        {
+            changed_files.insert(path.clone(), delta);
         }
     }
 
-    for path in initial_stats.keys() {
-        if !final_stats.contains_key(path) {
-            changed_files.insert(path.clone(), GitDiffFileLineStats::default());
+    for (path, initial_file_stats) in initial_stats {
+        if final_stats.contains_key(path) {
+            continue;
+        }
+        if let Some(delta) = git_diff_file_line_stats_delta(Some(initial_file_stats), None) {
+            changed_files.insert(path.clone(), delta);
         }
     }
 

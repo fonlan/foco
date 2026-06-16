@@ -1,7 +1,22 @@
-use std::{collections::{BTreeMap, HashSet}, convert::Infallible, time::Duration};
+use std::{
+    collections::{BTreeMap, HashSet},
+    convert::Infallible,
+    time::Duration,
+};
 
-use axum::{extract::{Path as AxumPath, Query, State}, response::sse::{Event, KeepAlive, Sse}, Json};
-use foco_store::{memory::MemoryDatabase, workspace::{LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, TodoGraphFilter, WorkspaceDatabase, workspace_database_path}};
+use axum::{
+    Json,
+    extract::{Path as AxumPath, Query, State},
+    response::sse::{Event, KeepAlive, Sse},
+};
+use foco_store::{
+    memory::MemoryDatabase,
+    workspace::{
+        LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
+        LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, TodoGraphFilter, WorkspaceDatabase,
+        workspace_database_path,
+    },
+};
 use tokio::sync::mpsc;
 
 use crate::*;
@@ -565,4 +580,3 @@ pub(crate) async fn delete_chat(
 
     workspace_response_from_config(&config, &state.active_chat_runs)
 }
-

@@ -8551,6 +8551,12 @@ function SettingsPanel({
         data.webSearch.activeProvider ||
         data.webSearch.providers[0]?.provider ||
         "tavily",
+      apiProxyEnabled: data.webSearch.apiProxy.enabled,
+      apiProxyType:
+        data.webSearch.apiProxy.proxyType ||
+        data.webSearch.apiProxy.supportedTypes[0]?.proxyType ||
+        "http",
+      apiProxyUrl: data.webSearch.apiProxy.url,
       braveApiKey: "",
       clearBraveApiKey: false,
       clearTavilyApiKey: false,
@@ -9028,6 +9034,11 @@ function SettingsPanel({
       const data = await requestJson<SettingsResponse>("/api/settings/web-search", {
         body: JSON.stringify({
           activeProvider: webSearchForm.activeProvider,
+          apiProxy: {
+            enabled: webSearchForm.apiProxyEnabled,
+            proxyType: webSearchForm.apiProxyType,
+            url: webSearchForm.apiProxyUrl,
+          },
           braveApiKey: webSearchForm.braveApiKey.trim() || null,
           clearBraveApiKey: webSearchForm.clearBraveApiKey,
           clearTavilyApiKey: webSearchForm.clearTavilyApiKey,
@@ -11138,6 +11149,76 @@ function SettingsPanel({
                       ))}
                     </select>
                   </label>
+                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                      {t("Web search proxy")}
+                    </legend>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-stone-800">
+                          {t("Proxy search API requests")}
+                        </p>
+                        <p className="mt-1 text-xs leading-5 text-stone-500">
+                          {t("Applies only to web_search requests sent to the configured search API.")}
+                        </p>
+                      </div>
+                      <label
+                        aria-label={t("Enable web search proxy")}
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                      >
+                        <input
+                          checked={webSearchForm.apiProxyEnabled}
+                          className="size-4 accent-teal-700"
+                          onChange={(event) =>
+                            setWebSearchForm((current) => ({
+                              ...current,
+                              apiProxyEnabled: event.target.checked,
+                            }))
+                          }
+                          type="checkbox"
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-3 grid gap-3 lg:grid-cols-[180px_1fr]">
+                      <label className="block">
+                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          {t("Proxy type")}
+                        </span>
+                        <select
+                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          onChange={(event) =>
+                            setWebSearchForm((current) => ({
+                              ...current,
+                              apiProxyType: event.target.value,
+                            }))
+                          }
+                          value={webSearchForm.apiProxyType}
+                        >
+                          {(settings?.webSearch.apiProxy.supportedTypes ?? apiProxyTypes).map(
+                            (proxyType) => (
+                              <option
+                                key={proxyType.proxyType}
+                                value={proxyType.proxyType}
+                              >
+                                {proxyType.label}
+                              </option>
+                            ),
+                          )}
+                        </select>
+                      </label>
+                      <TextField
+                        label={t("Proxy server")}
+                        onChange={(value) =>
+                          setWebSearchForm((current) => ({
+                            ...current,
+                            apiProxyUrl: value,
+                          }))
+                        }
+                        placeholder="127.0.0.1:7890"
+                        value={webSearchForm.apiProxyUrl}
+                      />
+                    </div>
+                  </fieldset>
                   <div className="grid gap-3 lg:grid-cols-2">
                     {(settings?.webSearch.providers ?? []).map((provider) => {
                       const keyField =
@@ -15606,6 +15687,9 @@ function emptyGeneralForm(): GeneralFormState {
 function emptyWebSearchForm(): WebSearchFormState {
   return {
     activeProvider: "tavily",
+    apiProxyEnabled: false,
+    apiProxyType: "http",
+    apiProxyUrl: "",
     braveApiKey: "",
     clearBraveApiKey: false,
     clearTavilyApiKey: false,

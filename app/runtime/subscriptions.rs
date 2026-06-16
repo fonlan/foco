@@ -1,4 +1,9 @@
-use std::{collections::HashMap, convert::Infallible, path::Path, sync::{Arc, Mutex}};
+use std::{
+    collections::HashMap,
+    convert::Infallible,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use axum::response::sse::Event;
 use foco_providers::NeutralChatAttachment;

@@ -582,6 +582,11 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Enable AI API proxy": "启用代理服务器",
     "Proxy type": "代理类型",
     "Proxy server": "代理服务器",
+    "Web search proxy": "Web 搜索代理",
+    "Proxy search API requests": "代理搜索 API 请求",
+    "Applies only to web_search requests sent to the configured search API.":
+      "仅应用于发送到已配置搜索 API 的 web_search 请求。",
+    "Enable web search proxy": "启用 Web 搜索代理",
     "Provider configuration": "供应商配置",
     "Edit provider": "编辑供应商",
     "Add provider": "添加供应商",

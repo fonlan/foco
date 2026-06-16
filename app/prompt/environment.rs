@@ -4,11 +4,13 @@ use chrono::{Local, SecondsFormat};
 use foco_providers::{NeutralChatMessage, NeutralChatRole};
 
 use crate::{
-    git_backend::is_git_workspace, neutral_text_message, non_empty_string, ApiError,
-    ENVIRONMENT_CONTEXT_MESSAGE_PREFIX,
+    ApiError, ENVIRONMENT_CONTEXT_MESSAGE_PREFIX, git_backend::is_git_workspace,
+    neutral_text_message, non_empty_string,
 };
 
-pub(crate) fn environment_context_message(workspace_path: &Path) -> Result<NeutralChatMessage, ApiError> {
+pub(crate) fn environment_context_message(
+    workspace_path: &Path,
+) -> Result<NeutralChatMessage, ApiError> {
     let now = Local::now();
     let shell = detected_shell()?;
     let git_repository = is_git_workspace(workspace_path)?;

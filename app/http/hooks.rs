@@ -1,12 +1,18 @@
 use axum::{
-    extract::{Path as AxumPath, Query, State},
     Json,
+    extract::{Path as AxumPath, Query, State},
+};
+use foco_store::{
+    config::{
+        SUPPORTED_HOOK_EVENTS, UNSUPPORTED_HOOK_EVENTS, save_workspace_hook_config,
+        workspace_hook_config_path,
+    },
+    workspace::WorkspaceDatabase,
 };
 use serde_json::json;
-use foco_store::{config::{save_workspace_hook_config, workspace_hook_config_path, SUPPORTED_HOOK_EVENTS, UNSUPPORTED_HOOK_EVENTS}, workspace::WorkspaceDatabase};
 
-use crate::*;
 use crate::hooks::HookRunRequest;
+use crate::*;
 
 pub(crate) async fn hooks_settings(
     State(state): State<AppState>,
@@ -238,4 +244,3 @@ pub(crate) async fn hook_runs(
 
     Ok(Json(HookRunsResponse { runs }))
 }
-

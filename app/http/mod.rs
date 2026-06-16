@@ -1,9 +1,9 @@
 pub mod assets;
 pub mod auth;
+pub mod chat;
 pub mod git;
+pub mod hooks;
+pub mod memory;
+pub mod settings;
 pub mod terminal;
 pub mod workspaces;
-pub mod hooks;
-pub mod settings;
-pub mod memory;
-pub mod chat;

@@ -466,8 +466,7 @@ fn background_code_graph_initialization_indexes_workspace_and_keeps_watcher() {
         1,
         "watcher must be retained after background indexing"
     );
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let context = database.code_graph_context().expect("code graph context");
     assert_eq!(context.indexed_files, 1);
     drop(database);
@@ -574,8 +573,8 @@ fn read_only_tool_progress_detector_warns_once_and_continues_varied_exploration(
     )]);
     assert!(matches!(warning, ReadOnlyToolProgressAction::Warn(_)));
 
-    for index in (READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD + 1)
-        ..(READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD + 8)
+    for index in
+        (READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD + 1)..(READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD + 8)
     {
         assert_eq!(
             detector.check(&[test_neutral_tool_call(
@@ -733,6 +732,15 @@ fn normalize_api_proxy_settings_preserves_updates_and_disables_proxy() {
     .expect("disable proxy");
     assert!(!disabled.enabled);
     assert!(disabled.url.is_empty());
+
+    let web_search_settings = WebSearchSettings {
+        api_proxy: current.clone(),
+        ..WebSearchSettings::default()
+    };
+    let preserved_web_search_proxy =
+        normalize_api_proxy_settings(&web_search_settings.api_proxy, None)
+            .expect("preserve current web search proxy settings");
+    assert_eq!(preserved_web_search_proxy, current);
 }
 
 #[test]
@@ -810,8 +818,7 @@ name: gitmemo
 #[test]
 fn enabled_skill_frontmatter_messages_list_enabled_skill_frontmatter() {
     let profile_dir = env::temp_dir().join(unique_id("foco-skill-frontmatter-profile-test"));
-    let workspace_dir =
-        env::temp_dir().join(unique_id("foco-skill-frontmatter-workspace-test"));
+    let workspace_dir = env::temp_dir().join(unique_id("foco-skill-frontmatter-workspace-test"));
     let skill_dir = profile_dir.join(".agents").join("skills").join("gitmemo");
     let skill_file = skill_dir.join("SKILL.md");
 
@@ -832,9 +839,8 @@ Search memory before repo work.
 
     let config = GlobalConfig::first_run(workspace_dir);
 
-    let messages =
-        enabled_skill_frontmatter_messages(&profile_dir, &config, DEFAULT_WORKSPACE_ID)
-            .expect("enabled skill frontmatter messages");
+    let messages = enabled_skill_frontmatter_messages(&profile_dir, &config, DEFAULT_WORKSPACE_ID)
+        .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].role, NeutralChatRole::User);
@@ -874,9 +880,8 @@ description: Project memory.
     let mut config = GlobalConfig::first_run(workspace_dir);
     config.skills.disabled.push("global:gitmemo".to_string());
 
-    let messages =
-        enabled_skill_frontmatter_messages(&profile_dir, &config, DEFAULT_WORKSPACE_ID)
-            .expect("enabled skill frontmatter messages");
+    let messages = enabled_skill_frontmatter_messages(&profile_dir, &config, DEFAULT_WORKSPACE_ID)
+        .expect("enabled skill frontmatter messages");
 
     assert!(messages.is_empty());
 
@@ -959,9 +964,8 @@ description:
     .expect("bad skill file write");
 
     let config = GlobalConfig::first_run(workspace_dir);
-    let messages =
-        enabled_skill_frontmatter_messages(&profile_dir, &config, DEFAULT_WORKSPACE_ID)
-            .expect("enabled skill frontmatter messages");
+    let messages = enabled_skill_frontmatter_messages(&profile_dir, &config, DEFAULT_WORKSPACE_ID)
+        .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
     assert!(messages[0].content.contains("name: gitmemo"));
@@ -973,8 +977,7 @@ description:
 #[test]
 fn selected_invalid_skill_reports_disabled_before_frontmatter_error() {
     let profile_dir = env::temp_dir().join(unique_id("foco-selected-invalid-skill-profile"));
-    let workspace_dir =
-        env::temp_dir().join(unique_id("foco-selected-invalid-skill-workspace"));
+    let workspace_dir = env::temp_dir().join(unique_id("foco-selected-invalid-skill-workspace"));
     let skill_dir = profile_dir.join(".agents").join("skills").join("broken");
 
     fs::create_dir_all(&skill_dir).expect("skill test directory");
@@ -1219,8 +1222,7 @@ fn normalize_windows_verbatim_path_removes_prefixes() {
 #[test]
 fn skills_settings_summary_strips_windows_verbatim_directory_prefixes() {
     let user_profile_dir = PathBuf::from(r"\\?\C:\Users\fonla");
-    let mut config =
-        GlobalConfig::first_run(PathBuf::from(r"\\?\C:\Users\fonla\.foco\workspace"));
+    let mut config = GlobalConfig::first_run(PathBuf::from(r"\\?\C:\Users\fonla\.foco\workspace"));
     config.workspaces[0].path = PathBuf::from(r"\\?\C:\Users\fonla\Projects\Foco");
 
     let summary = skills_settings_summary(&config, &user_profile_dir);
@@ -1604,9 +1606,7 @@ fn compress_runtime_tool_state_keeps_recent_batches_verbatim() {
             None,
         );
     }
-    assert!(
-        compress_runtime_tool_state_if_needed(&mut context, true).expect("second compression")
-    );
+    assert!(compress_runtime_tool_state_if_needed(&mut context, true).expect("second compression"));
     let snapshot_count = context
         .message_context_sources
         .iter()
@@ -1906,8 +1906,7 @@ fn text_attachments_use_original_path_in_user_prompt() {
     assert!(message.content.contains("## My request for Foco:"));
     assert!(!message.content.contains("SGVsbG8="));
 
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let metadata_json = user_message_metadata_json(&attachments).expect("attachment metadata");
     let stored_message = MessageRecord {
         id: "user-1".to_string(),
@@ -2072,8 +2071,7 @@ fn active_chat_run_registry_rejects_stale_guidance_run() {
 fn user_attachments_round_trip_into_neutral_history_and_message_parts() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-user-attachment-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let metadata_json = user_message_metadata_json(&[NeutralChatAttachment {
         id: "att-1".to_string(),
         name: "screenshot.png".to_string(),
@@ -2413,8 +2411,7 @@ fn persist_chat_result_writes_audit_status_code() {
     )
     .expect("persist chat result");
 
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let request = database
         .llm_request("request-1")
         .expect("llm request read")
@@ -2561,8 +2558,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
     )
     .expect("persist chat result");
 
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     assert!(
         database
             .llm_request("run-1")
@@ -2662,8 +2658,7 @@ fn persist_chat_result_writes_cancelled_captured_llm_request() {
     )
     .expect("persist cancelled chat result");
 
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     assert!(
         database
             .llm_request("run-1")
@@ -2815,8 +2810,7 @@ fn persist_failed_chat_result_keeps_tool_calls_without_assistant_message() {
     )
     .expect("failed chat result with tool calls should persist");
 
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let request = database
         .llm_request("request-1")
         .expect("llm request read")
@@ -2879,8 +2873,7 @@ fn active_chat_run_subscription_replays_cached_events_after_sequence() {
     assert!(subscription.replay[0].payload_json.contains(" world"));
 
     registration.finish();
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let run_events = database
         .run_events_for_run("run-1")
         .expect("run events for run");
@@ -2941,10 +2934,60 @@ fn git_diff_changed_files_lists_only_files_changed_since_turn_start() {
 
     let cleared_files = git_diff_changed_files(&git_diff_stats(&initial), &BTreeMap::new());
 
-    assert_eq!(cleared_files.len(), 1);
-    assert_eq!(cleared_files[0].0, "README.md");
-    assert_eq!(cleared_files[0].1.additions, 0);
-    assert_eq!(cleared_files[0].1.deletions, 0);
+    assert!(cleared_files.is_empty());
+}
+
+#[test]
+fn git_diff_changed_files_counts_only_line_count_delta_for_existing_dirty_files() {
+    let initial = GitDiffResponse {
+        path: None,
+        status: String::new(),
+        staged_diff: String::new(),
+        diff: [
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1,3 +1,3 @@",
+            "-old one",
+            "-old two",
+            "+new one",
+            "+new two",
+            " unchanged",
+            "",
+        ]
+        .join("\n"),
+        files: Vec::new(),
+    };
+    let final_diff = GitDiffResponse {
+        path: None,
+        status: String::new(),
+        staged_diff: String::new(),
+        diff: [
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1,4 +1,5 @@",
+            "-old one",
+            "-old two",
+            "-old three",
+            "+new one",
+            "+new two",
+            "+new three",
+            "+new four",
+            " unchanged",
+            "",
+        ]
+        .join("\n"),
+        files: Vec::new(),
+    };
+
+    let changed_files =
+        git_diff_changed_files(&git_diff_stats(&initial), &git_diff_stats(&final_diff));
+
+    assert_eq!(changed_files.len(), 1);
+    assert_eq!(changed_files[0].0, "README.md");
+    assert_eq!(changed_files[0].1.additions, 2);
+    assert_eq!(changed_files[0].1.deletions, 1);
 }
 
 #[test]
@@ -3452,12 +3495,9 @@ fn memory_extraction_existing_candidates_include_active_and_pending_memories() {
         false,
     );
 
-    let candidates = memory_extraction_existing_memory_candidates(
-        &global_memory,
-        &workspace_memory,
-        "chat-1",
-    )
-    .expect("existing memory candidates");
+    let candidates =
+        memory_extraction_existing_memory_candidates(&global_memory, &workspace_memory, "chat-1")
+            .expect("existing memory candidates");
     let facts = candidates
         .iter()
         .map(|fact| fact.fact.as_str())
@@ -3506,8 +3546,8 @@ fn memory_extraction_validates_required_fact_fields() {
         .map(|item| (item.evidence_id.as_str(), item))
         .collect::<HashMap<_, _>>();
 
-    let facts = validate_extracted_memory_facts(&output, &evidence_by_id)
-        .expect("valid extracted fact");
+    let facts =
+        validate_extracted_memory_facts(&output, &evidence_by_id).expect("valid extracted fact");
 
     assert_eq!(facts.len(), 1);
     assert_eq!(facts[0].scope, MemoryScope::Chat);
@@ -4060,8 +4100,7 @@ fn pack_neutral_messages_keeps_saved_tool_state_group_together() {
 
 #[tokio::test]
 async fn add_workspace_creates_missing_directory_and_registers_it() {
-    let existing_workspace_dir =
-        env::temp_dir().join(unique_id("foco-existing-workspace-test"));
+    let existing_workspace_dir = env::temp_dir().join(unique_id("foco-existing-workspace-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-add-workspace-profile-test"));
     let new_workspace_dir = env::temp_dir().join(unique_id("foco-new-workspace-test"));
 
@@ -4077,8 +4116,7 @@ async fn add_workspace_creates_missing_directory_and_registers_it() {
             name: "New Workspace".to_string(),
             path: new_workspace_dir.display().to_string(),
             content_base64: Some(
-                general_purpose::STANDARD
-                    .encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+                general_purpose::STANDARD.encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
             ),
         }),
     )
@@ -4103,9 +4141,10 @@ async fn add_workspace_creates_missing_directory_and_registers_it() {
         .expect("response workspace first");
     assert_eq!(response_workspace.name, "New Workspace");
     assert!(
-        response_workspace.logo_url.as_deref().is_some_and(
-            |logo_url| logo_url.starts_with("/api/workspaces/new-workspace/logo?v=")
-        )
+        response_workspace
+            .logo_url
+            .as_deref()
+            .is_some_and(|logo_url| logo_url.starts_with("/api/workspaces/new-workspace/logo?v="))
     );
     let logo = workspace_logo_file(&new_workspace_dir)
         .expect("workspace logo lookup")
@@ -4157,8 +4196,7 @@ async fn create_terminal_session_defaults_to_workspace_directory() {
 
     assert_eq!(response.working_directory, expected_directory);
 
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let stored_session = database
         .terminal_session(&response.id)
         .expect("stored terminal session")
@@ -4519,8 +4557,8 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         context.provider_request.prompt_cache_retention.as_deref(),
         Some(PROMPT_CACHE_RETENTION_24H)
     );
-    let final_request_json: Value = serde_json::from_str(&context.request_body_json)
-        .expect("final request body is valid JSON");
+    let final_request_json: Value =
+        serde_json::from_str(&context.request_body_json).expect("final request body is valid JSON");
     assert!(
         !final_request_json
             .to_string()
@@ -4557,8 +4595,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
 async fn chat_stream_starts_when_deferred_memory_fails() {
     let workspace_dir =
         env::temp_dir().join(unique_id("foco-memory-stream-failure-workspace-test"));
-    let profile_dir =
-        env::temp_dir().join(unique_id("foco-memory-stream-failure-profile-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-memory-stream-failure-profile-test"));
 
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
 
@@ -4726,8 +4763,7 @@ Use the existing product UI conventions.
 #[tokio::test]
 async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-memory-tools-disabled-test"));
-    let profile_dir =
-        env::temp_dir().join(unique_id("foco-memory-tools-disabled-profile-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-memory-tools-disabled-profile-test"));
 
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
 
@@ -4812,8 +4848,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
 #[tokio::test]
 async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-ripgrep-tools-disabled-test"));
-    let profile_dir =
-        env::temp_dir().join(unique_id("foco-ripgrep-tools-disabled-profile-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-ripgrep-tools-disabled-profile-test"));
 
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
 
@@ -5248,9 +5283,8 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
             .expect("chat insert");
     }
     {
-        let mut memory =
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
-                .expect("workspace memory database");
+        let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
         insert_test_memory_fact(
             &mut memory,
             "source-chat-renderer",
@@ -5470,8 +5504,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
                     status: "running".to_string(),
                     depends_on: Vec::new(),
                     acceptance: vec!["Panel renders current settings".to_string()],
-                    summary: "Implementation was started before the run was cancelled."
-                        .to_string(),
+                    summary: "Implementation was started before the run was cancelled.".to_string(),
                     created_at: String::new(),
                     updated_at: String::new(),
                     subtasks: Vec::new(),
@@ -5574,9 +5607,8 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
     let state = test_app_state(config.clone(), profile_dir.clone());
     WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     {
-        let mut memory =
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
-                .expect("workspace memory database");
+        let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
         insert_test_memory_fact(
             &mut memory,
             "source-workspace-renderer",
@@ -5655,9 +5687,8 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         );
     }
     {
-        let mut memory =
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
-                .expect("workspace memory database");
+        let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
         insert_test_memory_fact(
             &mut memory,
             "source-chat-renderer",
@@ -5780,9 +5811,8 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
             .expect("chat insert");
     }
     {
-        let mut memory =
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
-                .expect("workspace memory database");
+        let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
         insert_test_memory_fact(
             &mut memory,
             "source-cjk-formula",
@@ -5913,9 +5943,8 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     let state = test_app_state(config.clone(), profile_dir.clone());
     {
         WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
-        let mut memory =
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
-                .expect("workspace memory database");
+        let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
         insert_test_memory_fact(
             &mut memory,
             "source-context",
@@ -5975,9 +6004,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
             skill_ids: None,
             message: Some("Preview workspace memory usage".to_string()),
             assistant_draft: Some("Streaming assistant reply adds context.".to_string()),
-            assistant_draft_reasoning: Some(
-                "Streaming reasoning also adds context.".to_string(),
-            ),
+            assistant_draft_reasoning: Some("Streaming reasoning also adds context.".to_string()),
             attachments: Vec::new(),
         },
         PromptAssemblyPurpose::ContextPreview,
@@ -6007,8 +6034,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     .expect("context usage from response usage");
     assert_eq!(usage_from_response.used_message_tokens, 1_750);
 
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     assert!(database.chats().expect("chat list").is_empty());
     let memory_database =
         MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
@@ -6065,9 +6091,8 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
     let state = test_app_state(config.clone(), profile_dir.clone());
     {
         WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
-        let mut memory =
-            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
-                .expect("workspace memory database");
+        let mut memory = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
         for index in 0..=MEMORY_RETRIEVAL_LLM_FACT_LIMIT {
             insert_test_memory_fact(
                 &mut memory,
@@ -6389,10 +6414,9 @@ fn seed_memory_tool_fact(
             );
         }
         MemoryScope::Workspace | MemoryScope::Chat => {
-            let mut database = MemoryDatabase::open_workspace_at(workspace_database_path(
-                &context.workspace_path,
-            ))
-            .expect("workspace memory database");
+            let mut database =
+                MemoryDatabase::open_workspace_at(workspace_database_path(&context.workspace_path))
+                    .expect("workspace memory database");
             insert_test_memory_fact(
                 &mut database,
                 &source_id,

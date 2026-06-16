@@ -462,8 +462,9 @@ fn start_stdio_transport(
     // stderr handle makes Windows allocate a fresh console for the child once it
     // writes to stderr. Piping stderr keeps `CREATE_NO_WINDOW` effective and lets
     // us surface the server's own diagnostics in the log.
-    let (transport, stderr) =
-        TokioChildProcess::builder(command).stderr(Stdio::piped()).spawn()?;
+    let (transport, stderr) = TokioChildProcess::builder(command)
+        .stderr(Stdio::piped())
+        .spawn()?;
     if let Some(stderr) = stderr {
         drain_child_stderr(stderr);
     }
@@ -494,9 +495,8 @@ fn resolve_consoleless_command(
     command: &str,
     args: Vec<String>,
 ) -> std::io::Result<(std::path::PathBuf, Vec<String>, bool)> {
-    let resolved = which::which(command).map_err(|source| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, source.to_string())
-    })?;
+    let resolved = which::which(command)
+        .map_err(|source| std::io::Error::new(std::io::ErrorKind::NotFound, source.to_string()))?;
 
     let stem = resolved
         .file_stem()
@@ -509,7 +509,8 @@ fn resolve_consoleless_command(
         .map(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
         .unwrap_or(false);
 
-    if is_batch && stem.as_deref() == Some("npx")
+    if is_batch
+        && stem.as_deref() == Some("npx")
         && let Some((node, entry, pkg_args)) = resolve_npx_package_entry(&resolved, &args)?
     {
         let mut full_args = Vec::with_capacity(pkg_args.len() + 1);
@@ -581,8 +582,8 @@ fn resolve_npx_package_entry(
 /// subprocess.
 #[cfg(windows)]
 fn npm_npx_cache(node: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
-    use std::path::PathBuf;
     use std::os::windows::process::CommandExt;
+    use std::path::PathBuf;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     // Prefer explicit npm cache config.
@@ -597,9 +598,7 @@ fn npm_npx_cache(node: &std::path::Path) -> std::io::Result<Option<std::path::Pa
 
     // Conventional Windows location.
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let npx = PathBuf::from(local_app_data)
-            .join("npm-cache")
-            .join("_npx");
+        let npx = PathBuf::from(local_app_data).join("npm-cache").join("_npx");
         if npx.is_dir() {
             return Ok(Some(npx));
         }
@@ -678,7 +677,9 @@ fn npx_package_args(args: &[String]) -> Vec<String> {
 
 #[cfg(windows)]
 fn first_positional(args: &[String]) -> Option<&str> {
-    args.iter().find(|a| !a.starts_with('-')).map(String::as_str)
+    args.iter()
+        .find(|a| !a.starts_with('-'))
+        .map(String::as_str)
 }
 
 /// Strip a version suffix from a package spec: `pkg@1.2.3` -> `pkg`,

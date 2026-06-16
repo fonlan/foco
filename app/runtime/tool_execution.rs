@@ -1,25 +1,31 @@
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use std::{path::Path, sync::Arc, time::{Duration, Instant}};
-
-use foco_agent::{PendingToolCall, ToolExecutionMode, ToolExecutionPlan, ToolResourceLock, tool_resource_locks};
-use foco_mcp::{is_mcp_tool_name, McpRegistry};
+use foco_agent::{
+    PendingToolCall, ToolExecutionMode, ToolExecutionPlan, ToolResourceLock, tool_resource_locks,
+};
+use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
 use foco_store::config::{HookConfig, WebSearchSettings};
 use foco_tools::{
     ASK_QUESTION_TOOL, RUN_COMMAND_TOOL, SLEEP_TOOL, ToolCancellationToken, ToolExecution,
-    ToolOutputSink, builtin_tool_timeout_ms, execute_builtin_tool_for_chat_with_cancellation_and_output_sink,
+    ToolOutputSink, builtin_tool_timeout_ms,
+    execute_builtin_tool_for_chat_with_cancellation_and_output_sink,
 };
 use futures_util::future::join_all;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
-use crate::*;
 use super::{
     AskQuestionInput, QuestionAnswer, QuestionItem, QuestionItemAnswer, QuestionOption,
     QuestionRegistry, QuestionRequest, ToolOutputDeltaSink, ToolResourceLease,
     ToolResourceLockRegistry,
 };
+use crate::*;
 
 use foco_providers::NeutralToolCall;
 use foco_tools::{
@@ -30,8 +36,7 @@ use foco_tools::{
 use serde_json::Value;
 
 use crate::{
-    MAX_REPEATED_TOOL_CALL_BATCHES, MEMORY_SEARCH_TOOL_NAME,
-    READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD,
+    MAX_REPEATED_TOOL_CALL_BATCHES, MEMORY_SEARCH_TOOL_NAME, READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD,
 };
 
 #[derive(Clone, Debug, PartialEq)]

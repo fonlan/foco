@@ -1,16 +1,24 @@
 use axum::{
+    Json,
     extract::State,
     http::header,
     response::{IntoResponse, Response},
-    Json,
 };
 use foco_agent::build_default_system_prompt;
 use foco_providers::{normalized_base_url, parse_provider_kind, test_provider_connection};
-use foco_store::{config::PromptSettings, model_metadata::{MODELS_DEV_API_URL, parse_models_dev_metadata, read_model_metadata_cache, write_model_metadata_cache}};
+use foco_store::{
+    config::PromptSettings,
+    model_metadata::{
+        MODELS_DEV_API_URL, parse_models_dev_metadata, read_model_metadata_cache,
+        write_model_metadata_cache,
+    },
+};
 
 use crate::*;
 
-pub(crate) async fn settings(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
+pub(crate) async fn settings(
+    State(state): State<AppState>,
+) -> Result<Json<SettingsResponse>, ApiError> {
     let config = config_snapshot(&state)?;
 
     settings_response(&state, &config).await
@@ -78,6 +86,8 @@ pub(crate) async fn save_web_search_settings(
 
     config.web_search.enabled = request.enabled;
     config.web_search.active_provider = active_provider.to_string();
+    config.web_search.api_proxy =
+        normalize_api_proxy_settings(&config.web_search.api_proxy, request.api_proxy.as_ref())?;
     apply_web_search_api_key_update(
         &mut config.web_search.tavily_api_key,
         request.tavily_api_key,
@@ -394,7 +404,9 @@ pub(crate) async fn save_skills(
     settings_response(&state, &config).await
 }
 
-pub(crate) async fn refresh_skills(State(state): State<AppState>) -> Result<Json<SettingsResponse>, ApiError> {
+pub(crate) async fn refresh_skills(
+    State(state): State<AppState>,
+) -> Result<Json<SettingsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
     let discovery = discover_skills(&state.user_profile_dir, &config.workspaces);
 
@@ -672,4 +684,3 @@ pub(crate) async fn save_model_order(
 
     settings_response(&state, &config).await
 }
-

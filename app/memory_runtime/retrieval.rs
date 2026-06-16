@@ -8,8 +8,8 @@ use foco_store::{
     workspace::{MessageRecord, PromptContextInjectionRecord, WorkspaceDatabase},
 };
 
-use crate::*;
 use crate::prompt::{neutral_message_estimated_tokens, neutral_tool_call_from_record};
+use crate::*;
 
 pub(crate) fn splice_resolved_memory(
     messages: &mut Vec<NeutralChatMessage>,
@@ -1098,7 +1098,9 @@ fn memory_fact_scope_rank(fact: &MemoryFactRecord) -> u8 {
     }
 }
 
-pub(crate) fn chat_memory_used_summary(retrieved_fact: &RetrievedMemoryFact) -> ChatMemoryUsedSummary {
+pub(crate) fn chat_memory_used_summary(
+    retrieved_fact: &RetrievedMemoryFact,
+) -> ChatMemoryUsedSummary {
     let fact = &retrieved_fact.fact;
 
     ChatMemoryUsedSummary {

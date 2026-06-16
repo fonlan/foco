@@ -1,12 +1,19 @@
 use std::collections::HashSet;
 
-use axum::{extract::{Query, State}, Json};
-use foco_store::memory::{MemoryDatabase, MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, MemoryScope, MemorySourceRecord, MemoryStatus, NewMemoryFact, NewMemorySource, UpdateMemoryFact, UpdateMemorySource};
+use axum::{
+    Json,
+    extract::{Query, State},
+};
+use foco_store::memory::{
+    MemoryDatabase, MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, MemoryScope,
+    MemorySourceRecord, MemoryStatus, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
+    UpdateMemorySource,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::*;
 use crate::memory_runtime::{apply_memory_expiration_to_fact, expire_due_memories};
+use crate::*;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -365,7 +372,6 @@ pub(crate) fn refresh_memory_profile(
         .map_err(ApiError::from_memory_error)
 }
 
-
 pub(crate) async fn update_memory_status(
     State(state): State<AppState>,
     Json(request): Json<MemoryStatusRequest>,
@@ -640,4 +646,3 @@ pub(crate) async fn memory_sources(
 
     Ok(Json(MemorySourcesResponse { sources }))
 }
-

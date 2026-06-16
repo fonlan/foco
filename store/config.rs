@@ -700,6 +700,8 @@ pub struct WebSearchSettings {
     pub tavily_api_key: Option<String>,
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    #[serde(default)]
+    pub api_proxy: ApiProxySettings,
 }
 
 impl WebSearchSettings {
@@ -730,6 +732,7 @@ impl Default for WebSearchSettings {
             active_provider: default_web_search_provider(),
             tavily_api_key: None,
             brave_api_key: None,
+            api_proxy: ApiProxySettings::default(),
         }
     }
 }
@@ -1260,6 +1263,7 @@ fn validate_web_search_settings(
             format!("web_search.{active_provider} api key must be set when web search is enabled"),
         );
     }
+    validate_api_proxy_settings(config_path, "web_search.api_proxy", &settings.api_proxy)?;
 
     Ok(())
 }
@@ -2102,6 +2106,35 @@ mod tests {
         config.providers[0].api_proxy.url = "http://127.0.0.1:7890".to_string();
         let error = save_global_config(&paths.config_file, &config)
             .expect_err("proxy URL type mismatch should fail");
+        assert!(error.to_string().contains("does not match proxy type"));
+    }
+
+    #[test]
+    fn load_rejects_invalid_web_search_api_proxy_settings() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.web_search.api_proxy = ApiProxySettings {
+            enabled: true,
+            proxy_type: HTTP_PROXY_KIND.to_string(),
+            url: String::new(),
+        };
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("enabled web search proxy without URL should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("web_search.api_proxy.url must not be empty")
+        );
+
+        config.web_search.api_proxy.proxy_type = SOCKS_PROXY_KIND.to_string();
+        config.web_search.api_proxy.url = "http://127.0.0.1:7890".to_string();
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("web search proxy URL type mismatch should fail");
         assert!(error.to_string().contains("does not match proxy type"));
     }
 

@@ -76,8 +76,6 @@ pub(crate) fn interleaved_tool_state_messages(
     messages
 }
 
-
-
 fn validate_prompt_context_lengths(
     messages: &[NeutralChatMessage],
     message_source_sequences: &[Option<i64>],
@@ -97,7 +95,9 @@ fn validate_prompt_context_lengths(
     Ok(())
 }
 
-pub(crate) async fn ensure_context_compression(context: &mut PreparedChatContext) -> Result<usize, ApiError> {
+pub(crate) async fn ensure_context_compression(
+    context: &mut PreparedChatContext,
+) -> Result<usize, ApiError> {
     validate_prompt_context_lengths(
         &context.provider_request.messages,
         &context.message_source_sequences,
@@ -631,7 +631,9 @@ fn compact_tool_output_for_runtime_summary(tool_name: &str, content: &str) -> St
     }
 }
 
-pub(crate) fn snapshot_covered_sequences(snapshots: &[ContextCompressionSnapshotRecord]) -> HashSet<i64> {
+pub(crate) fn snapshot_covered_sequences(
+    snapshots: &[ContextCompressionSnapshotRecord],
+) -> HashSet<i64> {
     let mut sequences = HashSet::new();
 
     for snapshot in snapshots {
@@ -656,7 +658,9 @@ pub(crate) fn snapshot_covered_sequences(snapshots: &[ContextCompressionSnapshot
     sequences
 }
 
-pub(crate) fn compression_snapshot_message(snapshot: &ContextCompressionSnapshotRecord) -> NeutralChatMessage {
+pub(crate) fn compression_snapshot_message(
+    snapshot: &ContextCompressionSnapshotRecord,
+) -> NeutralChatMessage {
     neutral_text_message(
         NeutralChatRole::System,
         format!(
@@ -1171,7 +1175,9 @@ fn prompt_context_group_key(source: &PromptContextSource) -> Option<PromptContex
     }
 }
 
-pub(crate) fn prompt_context_source_bucket(source: &PromptContextSource) -> PromptContextSourceBucket {
+pub(crate) fn prompt_context_source_bucket(
+    source: &PromptContextSource,
+) -> PromptContextSourceBucket {
     match source {
         PromptContextSource::ReservedPrompt => PromptContextSourceBucket::ReservedPrompt,
         PromptContextSource::StableInjection => PromptContextSourceBucket::StableInjection,
@@ -1326,7 +1332,9 @@ fn context_breakdown_summary(breakdown: &ContextTokenBreakdown) -> String {
         .join("; ")
 }
 
-pub(crate) fn prompt_context_source_bucket_label(source: PromptContextSourceBucket) -> &'static str {
+pub(crate) fn prompt_context_source_bucket_label(
+    source: PromptContextSourceBucket,
+) -> &'static str {
     match source {
         PromptContextSourceBucket::ReservedPrompt => "reservedPrompt",
         PromptContextSourceBucket::StableInjection => "stableInjection",

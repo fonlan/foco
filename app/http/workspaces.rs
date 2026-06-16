@@ -1,18 +1,20 @@
 use std::fs;
 
 use axum::{
+    Json,
     body::Body,
     extract::{Path as AxumPath, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::Response,
-    Json,
 };
 use foco_store::workspace::WorkspaceDatabase;
 use foco_tools::set_ripgrep_path;
 
 use crate::*;
 
-pub(crate) async fn workspaces(State(state): State<AppState>) -> Result<Json<WorkspacesResponse>, ApiError> {
+pub(crate) async fn workspaces(
+    State(state): State<AppState>,
+) -> Result<Json<WorkspacesResponse>, ApiError> {
     let config = config_snapshot(&state)?;
 
     workspace_response_from_config(&config, &state.active_chat_runs)
@@ -232,4 +234,3 @@ pub(crate) async fn install_ripgrep(
         ripgrep: ripgrep_tool_summary(&status),
     }))
 }
-

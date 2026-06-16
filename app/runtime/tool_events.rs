@@ -1,5 +1,5 @@
-use tokio::sync::mpsc;
 use foco_tools::{ToolOutputChunk, ToolOutputSink, ToolOutputStream};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ToolOutputDeltaEvent {

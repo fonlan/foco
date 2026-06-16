@@ -710,10 +710,14 @@ export type WebSearchSettingsSummary = {
   enabled: boolean;
   activeProvider: string;
   providers: WebSearchProviderSummary[];
+  apiProxy: ApiProxySettingsSummary;
 };
 
 export type WebSearchFormState = {
   activeProvider: string;
+  apiProxyEnabled: boolean;
+  apiProxyType: string;
+  apiProxyUrl: string;
   braveApiKey: string;
   clearBraveApiKey: boolean;
   clearTavilyApiKey: boolean;

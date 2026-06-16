@@ -1,4 +1,7 @@
-use std::{collections::{HashMap, HashSet}, sync::{Arc, Mutex}};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
+};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -19,7 +22,6 @@ pub(crate) struct QuestionRegistration {
     pub(crate) answer_rx: oneshot::Receiver<QuestionAnswer>,
     _cleanup: QuestionCleanup,
 }
-
 
 struct QuestionCleanup {
     registry: QuestionRegistry,
@@ -90,7 +92,10 @@ pub(crate) struct QuestionAnswerResponse {
 }
 
 impl QuestionRegistry {
-    pub(crate) fn register(&self, request: QuestionRequest) -> Result<QuestionRegistration, ApiError> {
+    pub(crate) fn register(
+        &self,
+        request: QuestionRequest,
+    ) -> Result<QuestionRegistration, ApiError> {
         let question_id = request.id.clone();
         let (answer_tx, answer_rx) = oneshot::channel();
         let mut pending = self
