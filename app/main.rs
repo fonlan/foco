@@ -11182,7 +11182,7 @@ fn git_diff_summary(
         text.push_str("\n\n");
     }
     if language == "zh-CN" {
-        text.push_str("### 闁哄牜鍓濋悿鍡樼閿濆洨鍨抽柡鈧悷鏉啃梊n\n");
+        text.push_str("### 本轮代码变更\n\n");
         for file in changed_files {
             text.push_str("- ");
             text.push_str(&markdown_inline_code(&file.0));
@@ -12448,8 +12448,8 @@ struct TrayMenuLabels {
 fn tray_menu_labels(language: &str) -> Result<TrayMenuLabels, String> {
     match language {
         "zh-CN" => Ok(TrayMenuLabels {
-            open: "闁瑰灚鎸哥槐?Foco",
-            quit: "闂侇偀鍋撻柛?Foco",
+            open: "打开 Foco",
+            quit: "退出 Foco",
         }),
         "en" => Ok(TrayMenuLabels {
             open: "Open Foco",

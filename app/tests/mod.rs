@@ -427,8 +427,8 @@ fn tray_menu_labels_follow_app_language() {
     assert_eq!(
         tray_menu_labels("zh-CN").expect("Chinese tray labels"),
         TrayMenuLabels {
-            open: "鎵撳紑 Foco",
-            quit: "閫€鍑?Foco",
+            open: "打开 Foco",
+            quit: "退出 Foco",
         }
     );
 
@@ -2948,6 +2948,26 @@ fn git_diff_changed_files_lists_only_files_changed_since_turn_start() {
 }
 
 #[test]
+fn git_diff_summary_uses_chinese_heading_for_chinese_language() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-zh-diff-summary-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    gix::init(&workspace_dir).expect("init git repo");
+
+    let initial_stats =
+        Some(git_diff_stats_for_workspace(&workspace_dir).expect("initial git stats"));
+    fs::write(workspace_dir.join("note.txt"), "新内容\n").expect("write changed file");
+
+    let summary = git_diff_summary("完成。\n", &initial_stats, &workspace_dir, "zh-CN");
+
+    assert!(summary.text.contains("### 本轮代码变更\n\n"));
+    assert!(summary.text.contains("- `note.txt`: +1 / -0"));
+    assert_eq!(summary.stats.additions, 1);
+    assert_eq!(summary.stats.deletions, 0);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn chat_code_change_stats_sum_assistant_metadata() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-chat-code-stats-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -3119,11 +3139,11 @@ fn memory_prompt_search_filters_stop_terms() {
 
 #[test]
 fn memory_prompt_search_adds_cjk_contains_terms() {
-    let search = memory_prompt_search("鍏紡娓叉煋鐜板湪鏀寔鍚?)
-        .expect("prompt search should keep CJK terms");
+    let search =
+        memory_prompt_search("公式渲染现在支持吗？").expect("prompt search should keep CJK terms");
 
-    assert!(search.contains_terms.contains(&"鍏紡娓叉煋".to_string()));
-    assert!(search.contains_terms.contains(&"娓叉煋".to_string()));
+    assert!(search.contains_terms.contains(&"公式渲染".to_string()));
+    assert!(search.contains_terms.contains(&"渲染".to_string()));
 }
 
 #[test]
@@ -5470,7 +5490,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
-            message: Some("缁х画瀹屾垚鍓╀笅鐨勫伐浣?.to_string()),
+            message: Some("继续完成剩下的工作".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
@@ -5503,7 +5523,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
     );
     let current_user_index = messages
         .iter()
-        .position(|message| message.content == "缁х画瀹屾垚鍓╀笅鐨勫伐浣?)
+        .position(|message| message.content == "继续完成剩下的工作")
         .expect("current user message");
     assert!(todo_graph_index < current_user_index);
     assert_eq!(context.message_source_sequences[todo_graph_index], None);
@@ -5769,7 +5789,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
             "fact-cjk-formula",
             MemoryScope::Workspace,
             None,
-            "Markdown 棰勮宸茬粡鏀寔鍏紡娓叉煋銆?,
+            "Markdown 预览已经支持公式渲染。",
             false,
         );
         insert_test_memory_fact(
@@ -5778,7 +5798,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
             "fact-cjk-unrelated",
             MemoryScope::Workspace,
             None,
-            "璐﹀崟鍙戠エ浣跨敤鏈堝害璐㈠姟鏍囩銆?,
+            "账单发票使用月度财务标签。",
             false,
         );
     }
@@ -5793,7 +5813,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
-            message: Some("鐜板湪 markdown 棰勮鏀寔鍏紡鍚楋紵".to_string()),
+            message: Some("现在 markdown 预览支持公式吗？".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
@@ -5811,8 +5831,8 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
     let request_text = request_json.to_string();
 
     assert!(request_text.contains("Foco retrieved memory context"));
-    assert!(request_text.contains("Markdown 棰勮宸茬粡鏀寔鍏紡娓叉煋銆?));
-    assert!(!request_text.contains("璐﹀崟鍙戠エ浣跨敤鏈堝害璐㈠姟鏍囩銆?));
+    assert!(request_text.contains("Markdown 预览已经支持公式渲染。"));
+    assert!(!request_text.contains("账单发票使用月度财务标签。"));
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
