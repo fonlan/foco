@@ -20,12 +20,9 @@ use std::os::windows::process::CommandExt;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{
-        ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, Request, State,
-        ws::WebSocketUpgrade,
-    },
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State},
     http::{HeaderMap, StatusCode, header},
-    middleware::{self, Next},
+    middleware,
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -81,7 +78,7 @@ use foco_store::{
         LlmRequestAuditRow, LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint,
         LlmRequestEventRecord, LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot,
         NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewRunEvent,
-        NewTerminalSession, NewToolCall, NewToolResult, PromptContextInjectionRecord,
+        NewToolCall, NewToolResult, PromptContextInjectionRecord,
         TodoGraphFilter, TodoGraphRecord, TodoGraphTask, ToolCallCountRecord,
         ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
         initialize_workspace_databases, workspace_database_path,
@@ -110,14 +107,11 @@ use crate::platform::native_browser::{
     native_browser_probe, prune_native_browser_authorizations, select_directory, select_files,
 };
 
-use crate::git_backend::{
-    create_git_branch as create_git_branch_in_workspace, git_branches_response, git_diff_response,
-    git_status_response, is_git_workspace, switch_git_branch as switch_git_branch_in_workspace,
-};
 use crate::hooks::{
     EffectiveHookSummary, HookDecision, HookNotification, HookRunRequest, HookRunSummary,
     HookRuntime, effective_hook_summaries,
 };
+use crate::git_backend::{git_diff_response, is_git_workspace};
 
 #[cfg(all(windows, not(debug_assertions)))]
 use std::sync::atomic::AtomicU32;
@@ -310,7 +304,7 @@ impl TrayMenuUpdateNotifier {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     config: Arc<Mutex<GlobalConfig>>,
     config_file: PathBuf,
     memory_database_file: PathBuf,
@@ -1373,10 +1367,10 @@ fn app_router(state: AppState) -> Router {
     let auth_state = state.clone();
 
     Router::new()
-        .route("/api/health", get(health))
-        .route("/api/auth/status", get(auth_status))
-        .route("/api/auth/login", post(auth_login))
-        .route("/api/auth/logout", post(auth_logout))
+        .route("/api/health", get(crate::http::auth::health))
+        .route("/api/auth/status", get(crate::http::auth::auth_status))
+        .route("/api/auth/login", post(crate::http::auth::auth_login))
+        .route("/api/auth/logout", post(crate::http::auth::auth_logout))
         .route("/api/workspaces", get(workspaces))
         .route("/api/workspaces/add", post(add_workspace))
         .route("/api/workspaces/manual", post(save_workspace_settings))
@@ -1477,30 +1471,30 @@ fn app_router(state: AppState) -> Router {
             "/api/workspaces/{workspace_id}/chats/{chat_id}/delete",
             post(delete_chat),
         )
-        .route("/api/workspaces/{workspace_id}/git/status", get(git_status))
-        .route("/api/workspaces/{workspace_id}/git/diff", get(git_diff))
+        .route("/api/workspaces/{workspace_id}/git/status", get(crate::http::git::git_status))
+        .route("/api/workspaces/{workspace_id}/git/diff", get(crate::http::git::git_diff))
         .route(
             "/api/workspaces/{workspace_id}/git/branches",
-            get(git_branches),
+            get(crate::http::git::git_branches),
         )
         .route(
             "/api/workspaces/{workspace_id}/git/branches/switch",
-            post(switch_git_branch),
+            post(crate::http::git::switch_git_branch),
         )
         .route(
             "/api/workspaces/{workspace_id}/git/branches/create",
-            post(create_git_branch),
+            post(crate::http::git::create_git_branch),
         )
         .route(
             "/api/workspaces/{workspace_id}/terminal/session",
-            post(create_terminal_session),
+            post(crate::http::terminal::create_terminal_session),
         )
         .route(
             "/api/workspaces/{workspace_id}/terminal/{session_id}/ws",
-            get(terminal_socket),
+            get(crate::http::terminal::terminal_socket),
         )
         .fallback(static_asset)
-        .layer(middleware::from_fn_with_state(auth_state, require_auth))
+        .layer(middleware::from_fn_with_state(auth_state, crate::http::auth::require_auth))
         .with_state(state)
 }
 
@@ -1767,102 +1761,6 @@ fn initialize_code_graph_workspace(workspace: &WorkspaceConfig) -> AppResult<Cod
     );
 
     Ok(watcher)
-}
-
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        service: "foco",
-        status: "ok",
-    })
-}
-
-async fn require_auth(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    if auth_route_is_public(request.uri().path()) {
-        return next.run(request).await;
-    }
-
-    let config = match config_snapshot(&state) {
-        Ok(config) => config,
-        Err(error) => return error.into_response(),
-    };
-
-    if !web_auth_enabled(&config) || request_has_valid_auth_cookie(request.headers(), &config) {
-        return next.run(request).await;
-    }
-
-    ApiError::unauthorized("authentication required").into_response()
-}
-
-fn auth_route_is_public(path: &str) -> bool {
-    path == "/api/health"
-        || path == "/api/auth/status"
-        || path == "/api/auth/login"
-        || path == "/api/auth/logout"
-        || path == "/api/native/browser-probe.svg"
-        || !path.starts_with("/api/")
-}
-
-async fn auth_status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<AuthStatusResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
-    let enabled = web_auth_enabled(&config);
-    let authenticated = !enabled || request_has_valid_auth_cookie(&headers, &config);
-
-    Ok(Json(AuthStatusResponse {
-        enabled,
-        authenticated,
-    }))
-}
-
-async fn auth_login(
-    State(state): State<AppState>,
-    Json(request): Json<AuthLoginRequest>,
-) -> Result<Response, ApiError> {
-    let config = config_snapshot(&state)?;
-    let Some(password_hash) = config.app.web_server.password_hash.as_deref() else {
-        return Err(ApiError::bad_request("web authentication is not enabled"));
-    };
-
-    if !verify_password(&request.password, password_hash) {
-        return Err(ApiError::unauthorized("invalid password"));
-    }
-
-    let cookie = auth_cookie(password_hash);
-    Ok((
-        [(header::SET_COOKIE, cookie)],
-        Json(AuthStatusResponse {
-            enabled: true,
-            authenticated: true,
-        }),
-    )
-        .into_response())
-}
-
-async fn auth_logout(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let config = config_snapshot(&state)?;
-
-    Ok((
-        [(header::SET_COOKIE, expired_auth_cookie())],
-        Json(AuthStatusResponse {
-            enabled: web_auth_enabled(&config),
-            authenticated: false,
-        }),
-    )
-        .into_response())
-}
-
-#[derive(Serialize)]
-struct HealthResponse {
-    service: &'static str,
-    status: &'static str,
-}
-
-#[derive(Serialize)]
-struct AuthStatusResponse {
-    enabled: bool,
-    authenticated: bool,
 }
 
 async fn workspaces(State(state): State<AppState>) -> Result<Json<WorkspacesResponse>, ApiError> {
@@ -4432,151 +4330,6 @@ async fn delete_chat(
     workspace_response_from_config(&config, &state.active_chat_runs)
 }
 
-async fn git_status(
-    State(state): State<AppState>,
-    AxumPath(workspace_id): AxumPath<String>,
-) -> Result<Json<GitStatusResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
-    let workspace = workspace_by_id(&config, &workspace_id)?;
-
-    Ok(Json(git_status_response(&workspace.path)?))
-}
-
-async fn git_diff(
-    State(state): State<AppState>,
-    AxumPath(workspace_id): AxumPath<String>,
-    Query(query): Query<GitDiffQuery>,
-) -> Result<Json<GitDiffResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
-    let workspace = workspace_by_id(&config, &workspace_id)?;
-    let path = query
-        .path
-        .as_deref()
-        .map(normalize_workspace_relative_path)
-        .transpose()?;
-
-    Ok(Json(git_diff_response(&workspace.path, path)?))
-}
-
-async fn git_branches(
-    State(state): State<AppState>,
-    AxumPath(workspace_id): AxumPath<String>,
-) -> Result<Json<GitBranchesResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
-    let workspace = workspace_by_id(&config, &workspace_id)?;
-
-    if !is_git_workspace(&workspace.path)? {
-        return Ok(Json(GitBranchesResponse {
-            is_git_repository: false,
-            current_branch: None,
-            branches: Vec::new(),
-        }));
-    }
-
-    Ok(Json(git_branches_response(&workspace.path)?))
-}
-
-async fn switch_git_branch(
-    State(state): State<AppState>,
-    AxumPath(workspace_id): AxumPath<String>,
-    Json(request): Json<GitBranchRequest>,
-) -> Result<Json<GitBranchesResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
-    let workspace = workspace_by_id(&config, &workspace_id)?;
-
-    switch_git_branch_in_workspace(&workspace.path, request.name)?;
-
-    Ok(Json(git_branches_response(&workspace.path)?))
-}
-
-async fn create_git_branch(
-    State(state): State<AppState>,
-    AxumPath(workspace_id): AxumPath<String>,
-    Json(request): Json<GitBranchRequest>,
-) -> Result<Json<GitBranchesResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
-    let workspace = workspace_by_id(&config, &workspace_id)?;
-
-    create_git_branch_in_workspace(&workspace.path, request.name)?;
-
-    Ok(Json(git_branches_response(&workspace.path)?))
-}
-
-async fn create_terminal_session(
-    State(state): State<AppState>,
-    AxumPath(workspace_id): AxumPath<String>,
-) -> Result<Json<TerminalSessionResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
-    let workspace = workspace_by_id(&config, &workspace_id)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
-    let working_directory = terminal::shell_path(&workspace.path).display().to_string();
-
-    if !Path::new(&working_directory).is_dir() {
-        return Err(ApiError::bad_request(format!(
-            "terminal working directory does not exist: {working_directory}"
-        )));
-    }
-
-    let session_id = unique_id("terminal");
-    database
-        .upsert_terminal_session(NewTerminalSession {
-            id: &session_id,
-            name: "Workspace Terminal",
-            working_directory: &working_directory,
-            metadata_json: None,
-        })
-        .map_err(ApiError::from_workspace_error)?;
-
-    Ok(Json(TerminalSessionResponse {
-        id: session_id,
-        name: "Workspace Terminal".to_string(),
-        working_directory,
-    }))
-}
-
-async fn terminal_socket(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-    AxumPath((workspace_id, session_id)): AxumPath<(String, String)>,
-    Query(query): Query<TerminalSocketQuery>,
-) -> Result<Response, ApiError> {
-    let config = config_snapshot(&state)?;
-    let workspace = workspace_by_id(&config, &workspace_id)?;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
-    let session = database
-        .terminal_session(&session_id)
-        .map_err(ApiError::from_workspace_error)?
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("terminal session was not found: {session_id}"))
-        })?;
-
-    if session.closed_at.is_some() {
-        return Err(ApiError::bad_request(format!(
-            "terminal session is closed: {session_id}"
-        )));
-    }
-
-    let shutdown_rx = state.terminal_shutdown_tx.subscribe();
-    let registry = state.terminal_registry.clone();
-    let workspace_path = workspace.path.clone();
-    let terminal_shell = workspace.terminal_shell.clone();
-
-    Ok(ws.on_upgrade(move |socket| {
-        terminal::handle_terminal_socket(
-            socket,
-            shutdown_rx,
-            registry,
-            workspace_path,
-            terminal_shell,
-            session,
-            query.cols.unwrap_or(80),
-            query.rows.unwrap_or(24),
-        )
-    }))
-}
-
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspacePathRequest {
@@ -4721,12 +4474,6 @@ struct ManualApiProxySettingsRequest {
     enabled: bool,
     proxy_type: String,
     url: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct AuthLoginRequest {
-    password: String,
 }
 
 #[derive(Deserialize)]
@@ -5039,29 +4786,10 @@ struct AiStatisticsQuery {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GitDiffQuery {
-    path: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct TodoGraphQuery {
     status: Option<String>,
     task_id: Option<String>,
     include_subtasks: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GitBranchRequest {
-    name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TerminalSocketQuery {
-    cols: Option<u16>,
-    rows: Option<u16>,
 }
 
 #[derive(Serialize)]
@@ -5678,7 +5406,7 @@ struct AiRequestAuditEventSummary {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GitStatusResponse {
+pub(crate) struct GitStatusResponse {
     is_git_repository: bool,
     status: String,
     files: Vec<GitStatusFileSummary>,
@@ -5694,7 +5422,7 @@ struct GitStatusFileSummary {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GitDiffResponse {
+pub(crate) struct GitDiffResponse {
     path: Option<String>,
     status: String,
     diff: String,
@@ -5713,18 +5441,10 @@ type GitDiffStatsByFile = BTreeMap<String, GitDiffFileLineStats>;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GitBranchesResponse {
-    is_git_repository: bool,
-    current_branch: Option<String>,
-    branches: Vec<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct TerminalSessionResponse {
-    id: String,
-    name: String,
-    working_directory: String,
+pub(crate) struct GitBranchesResponse {
+    pub(crate) is_git_repository: bool,
+    pub(crate) current_branch: Option<String>,
+    pub(crate) branches: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -16314,7 +16034,7 @@ fn chat_title_for_prompt(message: &str, attachments: &[NeutralChatAttachment]) -
     chat_title(message)
 }
 
-fn unique_id(prefix: &str) -> String {
+pub(crate) fn unique_id(prefix: &str) -> String {
     let timestamp = Utc::now().timestamp_millis();
     let suffix = NEXT_ID_SUFFIX.fetch_add(1, Ordering::Relaxed);
 
@@ -16327,20 +16047,20 @@ struct ErrorResponse {
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
 }
 
 impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
         }
     }
 
-    fn unauthorized(message: impl Into<String>) -> Self {
+    pub(crate) fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
@@ -16354,7 +16074,7 @@ impl ApiError {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
@@ -16365,7 +16085,7 @@ impl ApiError {
         Self::internal(error.to_string())
     }
 
-    fn from_workspace_error(error: foco_store::workspace::WorkspaceDatabaseError) -> Self {
+    pub(crate) fn from_workspace_error(error: foco_store::workspace::WorkspaceDatabaseError) -> Self {
         match error {
             foco_store::workspace::WorkspaceDatabaseError::InvalidTodoGraph { .. }
             | foco_store::workspace::WorkspaceDatabaseError::MissingTodoGraph { .. } => {
@@ -17058,7 +16778,7 @@ fn attachment_content_type_for_path(path: &Path) -> String {
     .to_string()
 }
 
-fn config_snapshot(state: &AppState) -> Result<GlobalConfig, ApiError> {
+pub(crate) fn config_snapshot(state: &AppState) -> Result<GlobalConfig, ApiError> {
     let config = state
         .config
         .lock()
@@ -18580,7 +18300,7 @@ fn todo_graph_response(chat_id: &str, graph: Option<TodoGraphRecord>) -> TodoGra
     }
 }
 
-fn workspace_by_id<'a>(
+pub(crate) fn workspace_by_id<'a>(
     config: &'a GlobalConfig,
     workspace_id: &str,
 ) -> Result<&'a WorkspaceConfig, ApiError> {
@@ -18597,7 +18317,7 @@ fn workspace_by_id<'a>(
         .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))
 }
 
-fn normalize_workspace_relative_path(input: &str) -> Result<String, ApiError> {
+pub(crate) fn normalize_workspace_relative_path(input: &str) -> Result<String, ApiError> {
     let trimmed = input.trim();
 
     if trimmed.is_empty() {
@@ -20981,11 +20701,11 @@ fn browser_addr_for_listen_addr(addr: SocketAddr) -> SocketAddr {
     SocketAddr::from((host, addr.port()))
 }
 
-fn web_auth_enabled(config: &GlobalConfig) -> bool {
+pub(crate) fn web_auth_enabled(config: &GlobalConfig) -> bool {
     config.app.web_server.password_hash.is_some()
 }
 
-fn request_has_valid_auth_cookie(headers: &HeaderMap, config: &GlobalConfig) -> bool {
+pub(crate) fn request_has_valid_auth_cookie(headers: &HeaderMap, config: &GlobalConfig) -> bool {
     let Some(password_hash) = config.app.web_server.password_hash.as_deref() else {
         return true;
     };
@@ -21004,11 +20724,11 @@ fn cookie_value(cookie: &str, name: &str) -> Option<String> {
     })
 }
 
-fn auth_cookie(password_hash: &str) -> String {
+pub(crate) fn auth_cookie(password_hash: &str) -> String {
     format!("{AUTH_COOKIE_NAME}={password_hash}; Path=/; HttpOnly; SameSite=Strict")
 }
 
-fn expired_auth_cookie() -> String {
+pub(crate) fn expired_auth_cookie() -> String {
     format!("{AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
 }
 
@@ -21026,7 +20746,7 @@ fn hash_password(password: &str) -> Result<String, ApiError> {
     ))
 }
 
-fn verify_password(password: &str, password_hash: &str) -> bool {
+pub(crate) fn verify_password(password: &str, password_hash: &str) -> bool {
     let Some((algorithm, rest)) = password_hash.split_once(':') else {
         return false;
     };
