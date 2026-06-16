@@ -831,6 +831,12 @@ type ChatToolCallSummary = {
   input: JsonValue;
   output: JsonValue | null;
   isError: boolean;
+  liveOutput?: ChatToolLiveOutput;
+};
+
+type ChatToolLiveOutput = {
+  stdout: string;
+  stderr: string;
 };
 
 type ChatMessagePart =
@@ -1105,6 +1111,14 @@ type ChatStreamEvent =
       output: JsonValue;
       isError: boolean;
     }
+  | {
+      type: "toolOutputDelta";
+      assistantMessageId: string;
+      toolCallId: string;
+      stream: "stdout" | "stderr";
+      delta: string;
+    }
+
   | {
       type: "questionRequest";
       assistantMessageId: string;
@@ -5305,6 +5319,31 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "toolOutputDelta") {
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? {
+                    ...message,
+                    parts: applyToolOutputDeltaToParts(
+                      message.parts,
+                      streamEvent.toolCallId,
+                      streamEvent.stream,
+                      streamEvent.delta,
+                    ),
+                    toolCalls: applyToolOutputDelta(
+                      message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.stream,
+                      streamEvent.delta,
+                    ),
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
         if (streamEvent.type === "questionRequest") {
           setQuestionError(null);
           setPendingQuestion(streamEvent.request);
@@ -5937,6 +5976,31 @@ export function App() {
                       streamEvent.toolCallId,
                       streamEvent.output,
                       streamEvent.isError,
+                    ),
+                  }
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "toolOutputDelta") {
+          setMessagesForChatKey(runMessagesKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? {
+                    ...message,
+                    toolCalls: applyToolOutputDelta(
+                      message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.stream,
+                      streamEvent.delta,
+                    ),
+                    parts: applyToolOutputDeltaToParts(
+                      message.parts,
+                      streamEvent.toolCallId,
+                      streamEvent.stream,
+                      streamEvent.delta,
                     ),
                   }
                 : message,
@@ -9601,6 +9665,7 @@ function ToolCallBlock({ toolCall }: { toolCall: ChatToolCallSummary }) {
   const input = normalizedToolInput(toolCall.input);
   const detailText = toolCallDetailText(toolCall);
   const changeStats = toolCallChangeStats(toolCall);
+  const liveOutputText = toolLiveOutputText(toolCall.liveOutput);
 
   return (
     <details className="tool-call-block group min-w-0">
@@ -9654,6 +9719,15 @@ function ToolCallBlock({ toolCall }: { toolCall: ChatToolCallSummary }) {
               }`}
             >
               {formatJsonValue(toolCall.output)}
+            </pre>
+          </div>
+        ) : liveOutputText ? (
+          <div className="min-w-0">
+            <div className="mb-1 font-semibold text-stone-500">
+              {t("Live output")}
+            </div>
+            <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">
+              {liveOutputText}
             </pre>
           </div>
         ) : null}
@@ -21183,9 +21257,43 @@ function applyToolResult(
           output,
           isError,
           status: isError ? "error" : "completed",
+          liveOutput: undefined,
         }
-    : toolCall,
+      : toolCall,
   );
+}
+
+function applyToolOutputDelta(
+  toolCalls: ChatToolCallSummary[],
+  toolCallId: string,
+  stream: "stdout" | "stderr",
+  delta: string,
+) {
+  return toolCalls.map((toolCall) =>
+    toolCall.id === toolCallId && toolCall.output === null
+      ? {
+          ...toolCall,
+          liveOutput: appendToolLiveOutput(toolCall.liveOutput, stream, delta),
+        }
+      : toolCall,
+  );
+}
+
+function appendToolLiveOutput(
+  liveOutput: ChatToolLiveOutput | undefined,
+  stream: "stdout" | "stderr",
+  delta: string,
+): ChatToolLiveOutput {
+  return {
+    stdout:
+      stream === "stdout"
+        ? `${liveOutput?.stdout ?? ""}${delta}`
+        : liveOutput?.stdout ?? "",
+    stderr:
+      stream === "stderr"
+        ? `${liveOutput?.stderr ?? ""}${delta}`
+        : liveOutput?.stderr ?? "",
+  };
 }
 
 function resetStreamingAssistantMessage(
@@ -21428,6 +21536,32 @@ function applyToolResultToParts(
             output,
             isError,
             status: isError ? "error" : "completed",
+            liveOutput: undefined,
+          },
+        } satisfies ChatMessagePart)
+      : part,
+  );
+}
+
+function applyToolOutputDeltaToParts(
+  parts: ChatMessagePart[],
+  toolCallId: string,
+  stream: "stdout" | "stderr",
+  delta: string,
+): ChatMessagePart[] {
+  return parts.map((part) =>
+    part.type === "toolCall" &&
+    part.toolCall.id === toolCallId &&
+    part.toolCall.output === null
+      ? ({
+          type: "toolCall",
+          toolCall: {
+            ...part.toolCall,
+            liveOutput: appendToolLiveOutput(
+              part.toolCall.liveOutput,
+              stream,
+              delta,
+            ),
           },
         } satisfies ChatMessagePart)
       : part,
@@ -21490,6 +21624,22 @@ function normalizedToolCallSummary(
     output:
       toolCall.output === null ? null : normalizedJsonValue(toolCall.output),
   };
+}
+
+function toolLiveOutputText(liveOutput: ChatToolLiveOutput | undefined) {
+  if (!liveOutput) {
+    return null;
+  }
+
+  const parts: string[] = [];
+  if (liveOutput.stdout) {
+    parts.push(`[stdout]\n${liveOutput.stdout}`);
+  }
+  if (liveOutput.stderr) {
+    parts.push(`[stderr]\n${liveOutput.stderr}`);
+  }
+
+  return parts.length ? parts.join("\n") : null;
 }
 
 function toolStatusText(toolCall: ChatToolCallSummary, t: Translate) {
@@ -23165,6 +23315,34 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       toolCalls: toolCalls as ChatToolCallSummary[],
     };
   }
+  if (value.type === "toolOutputDelta" || value.type === "tool_output_delta") {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const toolCallId = stringField(value, "toolCallId", "tool_call_id");
+    const stream = stringField(value, "stream");
+    const delta = stringField(value, "delta");
+
+    if (
+      !assistantMessageId ||
+      !toolCallId ||
+      (stream !== "stdout" && stream !== "stderr") ||
+      delta === null
+    ) {
+      return null;
+    }
+
+    return {
+      type: "toolOutputDelta",
+      assistantMessageId,
+      toolCallId,
+      stream,
+      delta,
+    };
+  }
+
 
   if (value.type === "usage") {
     const usage = parseChatUsage(value.usage);

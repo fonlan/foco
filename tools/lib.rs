@@ -88,6 +88,22 @@ pub struct ToolExecution {
     pub is_error: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolOutputChunk {
+    pub stream: ToolOutputStream,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolOutputStream {
+    Stdout,
+    Stderr,
+}
+
+pub trait ToolOutputSink: Send + Sync {
+    fn output_chunk(&self, chunk: ToolOutputChunk);
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ToolCancellationToken {
     cancelled: Arc<AtomicBool>,
@@ -167,12 +183,31 @@ pub fn execute_builtin_tool_for_chat_with_cancellation(
     arguments: Value,
     cancellation_token: Option<ToolCancellationToken>,
 ) -> ToolExecution {
+    execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
+        workspace_path,
+        chat_id,
+        tool_name,
+        arguments,
+        cancellation_token,
+        None,
+    )
+}
+
+pub fn execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
+    workspace_path: &Path,
+    chat_id: Option<&str>,
+    tool_name: &str,
+    arguments: Value,
+    cancellation_token: Option<ToolCancellationToken>,
+    output_sink: Option<Arc<dyn ToolOutputSink>>,
+) -> ToolExecution {
     match execute_builtin_tool_inner(
         workspace_path,
         chat_id,
         tool_name,
         arguments,
         cancellation_token.as_ref(),
+        output_sink.as_deref(),
     ) {
         Ok(output) => ToolExecution {
             output,
@@ -242,6 +277,7 @@ fn execute_builtin_tool_inner(
     tool_name: &str,
     arguments: Value,
     cancellation_token: Option<&ToolCancellationToken>,
+    output_sink: Option<&dyn ToolOutputSink>,
 ) -> Result<Value, ToolRuntimeError> {
     match tool_name {
         READ_FILE_TOOL => read_file(workspace_path, arguments),
@@ -264,7 +300,7 @@ fn execute_builtin_tool_inner(
         ASK_QUESTION_TOOL => Err(ToolRuntimeError::InvalidArguments(
             "ask_question must be executed through the chat UI question bridge".to_string(),
         )),
-        RUN_COMMAND_TOOL => run_command(workspace_path, arguments, cancellation_token),
+        RUN_COMMAND_TOOL => run_command(workspace_path, arguments, cancellation_token, output_sink),
         SLEEP_TOOL => sleep_tool(arguments, cancellation_token),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
     }
@@ -595,8 +631,8 @@ fn search_text(
         workspace_path,
         Duration::from_millis(timeout_ms),
         cancellation_token,
+        None,
     )?;
-
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if output.status.code() == Some(1) {
@@ -929,6 +965,7 @@ fn run_command(
     workspace_path: &Path,
     arguments: Value,
     cancellation_token: Option<&ToolCancellationToken>,
+    output_sink: Option<&dyn ToolOutputSink>,
 ) -> Result<Value, ToolRuntimeError> {
     let request: RunCommandInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_RUN_COMMAND_TIMEOUT_MS)?;
@@ -964,6 +1001,7 @@ fn run_command(
         &cwd,
         Duration::from_millis(timeout_ms),
         cancellation_token,
+        output_sink,
     )?;
     let (stdout, stdout_truncated) = limited_output_text(&output.stdout);
     let (stderr, stderr_truncated) = limited_output_text(&output.stderr);
@@ -1893,6 +1931,7 @@ fn run_command_with_timeout(
     cwd: &Path,
     timeout: Duration,
     cancellation_token: Option<&ToolCancellationToken>,
+    output_sink: Option<&dyn ToolOutputSink>,
 ) -> Result<CommandRunOutput, ToolRuntimeError> {
     let command_label = command_label(command, args);
     let mut command_process = Command::new(command);
@@ -1922,6 +1961,11 @@ fn run_command_with_timeout(
     let started = Instant::now();
     let deadline = started + timeout;
     let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+    let mut stdout_output = Vec::new();
+    let mut stderr_output = Vec::new();
+    let mut stdout_complete = false;
+    let mut stderr_complete = false;
+    let mut exit_status = None;
 
     loop {
         if cancellation_token
@@ -1937,35 +1981,43 @@ fn run_command_with_timeout(
             });
         }
 
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|source| ToolRuntimeError::Command {
-                command: command_label.clone(),
-                source,
-            })?
-        {
-            let stdout = receive_command_pipe(
-                &command_label,
-                stdout_handle,
-                deadline,
-                timeout_ms,
-                pid,
-                cancellation_token,
-            )?;
-            let stderr = receive_command_pipe(
-                &command_label,
-                stderr_handle,
-                deadline,
-                timeout_ms,
-                pid,
-                cancellation_token,
-            )?;
-            return Ok(CommandRunOutput {
-                pid,
-                status,
-                stdout,
-                stderr,
-            });
+        drain_command_pipe(
+            &command_label,
+            &stdout_handle,
+            ToolOutputStream::Stdout,
+            &mut stdout_output,
+            &mut stdout_complete,
+            pid,
+            output_sink,
+        )?;
+        drain_command_pipe(
+            &command_label,
+            &stderr_handle,
+            ToolOutputStream::Stderr,
+            &mut stderr_output,
+            &mut stderr_complete,
+            pid,
+            output_sink,
+        )?;
+
+        if exit_status.is_none() {
+            exit_status = child
+                .try_wait()
+                .map_err(|source| ToolRuntimeError::Command {
+                    command: command_label.clone(),
+                    source,
+                })?;
+        }
+
+        if let Some(status) = exit_status {
+            if stdout_complete && stderr_complete {
+                return Ok(CommandRunOutput {
+                    pid,
+                    status,
+                    stdout: stdout_output,
+                    stderr: stderr_output,
+                });
+            }
         }
 
         if Instant::now() >= deadline {
@@ -1994,58 +2046,83 @@ struct CommandRunOutput {
     stderr: Vec<u8>,
 }
 
-fn read_command_pipe<T>(mut pipe: T) -> mpsc::Receiver<io::Result<Vec<u8>>>
+enum CommandPipeMessage {
+    Chunk(Vec<u8>),
+    Complete,
+}
+
+fn read_command_pipe<T>(mut pipe: T) -> mpsc::Receiver<io::Result<CommandPipeMessage>>
 where
     T: Read + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut output = Vec::new();
-        let result = pipe.read_to_end(&mut output).map(|_| output);
-        let _ = tx.send(result);
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => {
+                    let _ = tx.send(Ok(CommandPipeMessage::Complete));
+                    break;
+                }
+                Ok(bytes_read) => {
+                    if tx
+                        .send(Ok(CommandPipeMessage::Chunk(buffer[..bytes_read].to_vec())))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(source) => {
+                    let _ = tx.send(Err(source));
+                    break;
+                }
+            }
+        }
     });
     rx
 }
 
-fn receive_command_pipe(
+fn drain_command_pipe(
     command: &str,
-    receiver: mpsc::Receiver<io::Result<Vec<u8>>>,
-    deadline: Instant,
-    timeout_ms: u64,
+    receiver: &mpsc::Receiver<io::Result<CommandPipeMessage>>,
+    stream: ToolOutputStream,
+    output: &mut Vec<u8>,
+    complete: &mut bool,
     pid: u32,
-    cancellation_token: Option<&ToolCancellationToken>,
-) -> Result<Vec<u8>, ToolRuntimeError> {
-    loop {
-        if cancellation_token
-            .map(ToolCancellationToken::is_cancelled)
-            .unwrap_or(false)
-        {
-            return Err(ToolRuntimeError::CommandCancelled {
-                command: command.to_string(),
-                pid,
-            });
-        }
+    output_sink: Option<&dyn ToolOutputSink>,
+) -> Result<(), ToolRuntimeError> {
+    if *complete {
+        return Ok(());
+    }
 
-        let Some(remaining) = remaining_until(deadline) else {
-            return Err(ToolRuntimeError::CommandTimedOut {
-                command: command.to_string(),
-                pid,
-                timeout_ms,
-            });
-        };
-        match receiver.recv_timeout(remaining.min(Duration::from_millis(COMMAND_WAIT_POLL_MS))) {
-            Ok(Ok(output)) => return Ok(output),
+    loop {
+        match receiver.try_recv() {
+            Ok(Ok(CommandPipeMessage::Chunk(chunk))) => {
+                if let Some(output_sink) = output_sink {
+                    output_sink.output_chunk(ToolOutputChunk {
+                        stream: stream.clone(),
+                        text: String::from_utf8_lossy(&chunk).to_string(),
+                    });
+                }
+                output.extend_from_slice(&chunk);
+            }
+            Ok(Ok(CommandPipeMessage::Complete)) => {
+                *complete = true;
+                return Ok(());
+            }
             Ok(Err(source)) => {
                 return Err(ToolRuntimeError::Command {
                     command: command.to_string(),
                     source,
                 });
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(mpsc::TryRecvError::Empty) => return Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
                 return Err(ToolRuntimeError::Command {
                     command: command.to_string(),
-                    source: io::Error::other("output reader thread exited without result"),
+                    source: io::Error::other(format!(
+                        "{stream:?} reader thread exited without result for pid {pid}"
+                    )),
                 });
             }
         }

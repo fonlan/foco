@@ -100,9 +100,9 @@ use foco_tools::{
     GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
     GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL,
     RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolCancellationToken, ToolExecution,
-    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
-    builtin_tool_definitions, builtin_tool_timeout_ms,
-    execute_builtin_tool_for_chat_with_cancellation, set_ripgrep_path,
+    ToolOutputChunk, ToolOutputSink, ToolOutputStream, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL,
+    WEB_SEARCH_TOOL, WRITE_FILE_TOOL, builtin_tool_definitions, builtin_tool_timeout_ms,
+    execute_builtin_tool_for_chat_with_cancellation_and_output_sink, set_ripgrep_path,
 };
 use futures_util::{StreamExt, future::join_all};
 use rust_embed::Embed;
@@ -5908,6 +5908,36 @@ struct ChatToolCallSummary {
     is_error: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ToolOutputDeltaEvent {
+    assistant_message_id: String,
+    tool_call_id: String,
+    stream: ToolOutputStream,
+    delta: String,
+}
+
+#[derive(Clone)]
+struct ToolOutputDeltaSink {
+    assistant_message_id: String,
+    tool_call_id: String,
+    tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
+}
+
+impl ToolOutputSink for ToolOutputDeltaSink {
+    fn output_chunk(&self, chunk: ToolOutputChunk) {
+        if chunk.text.is_empty() {
+            return;
+        }
+
+        let _ = self.tx.send(ToolOutputDeltaEvent {
+            assistant_message_id: self.assistant_message_id.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+            stream: chunk.stream,
+            delta: chunk.text,
+        });
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 enum ChatMessagePart {
@@ -5988,6 +6018,12 @@ enum ChatSseEvent {
         tool_call_id: String,
         output: Value,
         is_error: bool,
+    },
+    ToolOutputDelta {
+        assistant_message_id: String,
+        tool_call_id: String,
+        stream: String,
+        delta: String,
     },
     QuestionRequest {
         assistant_message_id: String,
@@ -7926,6 +7962,8 @@ impl PreparedChatContext {
 
                             let next_tool_results = match {
                                 let (question_event_tx, mut question_event_rx) = mpsc::unbounded_channel();
+                                let (tool_output_delta_tx, mut tool_output_delta_rx) =
+                                    mpsc::unbounded_channel();
                                 let tool_results = execute_tool_calls_parallel(
                                     self.mcp_registry.clone(),
                                     self.hook_runtime.clone(),
@@ -7950,14 +7988,17 @@ impl PreparedChatContext {
                                     &self.llm_request_id,
                                     &self.model_id,
                                     &self.provider_id,
+                                    &self.assistant_message_id,
                                     self.global_config.app.llm_request_retry_count,
                                     tool_calls.clone(),
                                     execution_plan,
                                     self.tool_resource_locks.clone(),
                                     tool_cancellation_token.clone(),
+                                    tool_output_delta_tx,
                                 );
                                 tokio::pin!(tool_results);
                                 let mut question_events_open = true;
+                                let mut tool_output_delta_events_open = true;
 
                                 loop {
                                     let next = tokio::select! {
@@ -8005,21 +8046,38 @@ impl PreparedChatContext {
                                         }
                                         question_request = question_event_rx.recv(), if question_events_open => {
                                             match question_request {
-                                                Some(question_request) => Some(question_request),
+                                                Some(question_request) => Some(ChatSseEvent::QuestionRequest {
+                                                    assistant_message_id: self.assistant_message_id.clone(),
+                                                    request: question_request,
+                                                }),
                                                 None => {
                                                     question_events_open = false;
                                                     None
                                                 }
                                             }
                                         }
+                                        output_delta = tool_output_delta_rx.recv(), if tool_output_delta_events_open => {
+                                            match output_delta {
+                                                Some(output_delta) => Some(ChatSseEvent::ToolOutputDelta {
+                                                    assistant_message_id: output_delta.assistant_message_id,
+                                                    tool_call_id: output_delta.tool_call_id,
+                                                    stream: match output_delta.stream {
+                                                        ToolOutputStream::Stdout => "stdout".to_string(),
+                                                        ToolOutputStream::Stderr => "stderr".to_string(),
+                                                    },
+                                                    delta: output_delta.delta,
+                                                }),
+                                                None => {
+                                                    tool_output_delta_events_open = false;
+                                                    None
+                                                }
+                                            }
+                                        }
+
                                         tool_results = &mut tool_results => break tool_results,
                                     };
 
-                                    if let Some(question_request) = next {
-                                        let event = ChatSseEvent::QuestionRequest {
-                                            assistant_message_id: self.assistant_message_id.clone(),
-                                            request: question_request,
-                                        };
+                                    if let Some(event) = next {
                                         events.push(captured_event(&event));
                                         yield event;
                                     }
@@ -14399,11 +14457,13 @@ async fn execute_tool_calls_parallel(
     run_id: &str,
     model_id: &str,
     provider_id: &str,
+    assistant_message_id: &str,
     llm_request_retry_count: u32,
     tool_calls: Vec<NeutralToolCall>,
     execution_plan: ToolExecutionPlan,
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
+    tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
 ) -> Result<Vec<ToolHookOutcome>, ApiError> {
     let mut executed_by_index = (0..tool_calls.len())
         .map(|_| None)
@@ -14427,6 +14487,8 @@ async fn execute_tool_calls_parallel(
                         memory_tool_context.clone(),
                         tool_resource_lock_registry.clone(),
                         cancellation_token.clone(),
+                        tool_output_delta_tx.clone(),
+                        assistant_message_id,
                         workspace_id,
                         workspace_path,
                         chat_id,
@@ -14448,6 +14510,7 @@ async fn execute_tool_calls_parallel(
                     let run_id = run_id.to_string();
                     let model_id = model_id.to_string();
                     let provider_id = provider_id.to_string();
+                    let assistant_message_id = assistant_message_id.to_string();
                     let llm_request_retry_count = llm_request_retry_count;
                     let mcp_registry = mcp_registry.clone();
                     let hook_runtime = hook_runtime.clone();
@@ -14459,6 +14522,7 @@ async fn execute_tool_calls_parallel(
                     let memory_tool_context = memory_tool_context.clone();
                     let tool_resource_lock_registry = tool_resource_lock_registry.clone();
                     let cancellation_token = cancellation_token.clone();
+                    let tool_output_delta_tx = tool_output_delta_tx.clone();
                     let tool_call = tool_calls.get(tool_index).cloned();
 
                     tokio::spawn(async move {
@@ -14480,6 +14544,8 @@ async fn execute_tool_calls_parallel(
                                 memory_tool_context,
                                 tool_resource_lock_registry,
                                 cancellation_token,
+                                tool_output_delta_tx,
+                                &assistant_message_id,
                                 &workspace_id,
                                 &workspace_path,
                                 &chat_id,
@@ -14526,6 +14592,8 @@ async fn execute_tool_call(
     mut memory_tool_context: MemoryToolContext,
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
+    tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
+    assistant_message_id: &str,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -14548,6 +14616,8 @@ async fn execute_tool_call(
         memory_tool_context,
         tool_resource_lock_registry,
         cancellation_token.clone(),
+        tool_output_delta_tx,
+        assistant_message_id,
         workspace_id,
         workspace_path,
         chat_id,
@@ -14617,6 +14687,8 @@ async fn execute_tool(
     memory_tool_context: MemoryToolContext,
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
+    tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
+    assistant_message_id: &str,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -14997,15 +15069,26 @@ async fn execute_tool(
         let worker = tokio::task::spawn_blocking({
             let workspace_path = workspace_path.to_path_buf();
             let chat_id = chat_id.to_string();
+            let assistant_message_id = assistant_message_id.to_string();
+            let tool_call_id = tool_call_id.to_string();
             let tool_name = tool_name.clone();
             let cancellation_token = cancellation_token.clone();
             move || {
-                execute_builtin_tool_for_chat_with_cancellation(
+                execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
                     &workspace_path,
                     Some(&chat_id),
                     &tool_name,
                     arguments,
                     Some(cancellation_token),
+                    if tool_name == RUN_COMMAND_TOOL {
+                        Some(Arc::new(ToolOutputDeltaSink {
+                            assistant_message_id: assistant_message_id.clone(),
+                            tool_call_id: tool_call_id.clone(),
+                            tx: tool_output_delta_tx,
+                        }) as Arc<dyn ToolOutputSink>)
+                    } else {
+                        None
+                    },
                 )
             }
         });
@@ -16177,6 +16260,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::StreamReset { .. } => "stream_reset",
         ChatSseEvent::ToolCall { .. } => "tool_call",
         ChatSseEvent::ToolResult { .. } => "tool_result",
+        ChatSseEvent::ToolOutputDelta { .. } => "tool_output_delta",
         ChatSseEvent::QuestionRequest { .. } => "question_request",
         ChatSseEvent::HookNotification { .. } => "hook_notification",
         ChatSseEvent::GuidanceApplied { .. } => "guidance_applied",
