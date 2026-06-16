@@ -1515,7 +1515,7 @@ function ToolCallBlock({
           </span>
         ) : null}
         {detailText ? (
-          <span className="shrink-0 text-stone-300">路</span>
+          <span className="shrink-0 text-stone-300">·</span>
         ) : null}
         {detailText ? (
           <span
