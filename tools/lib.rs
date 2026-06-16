@@ -1,5 +1,9 @@
+mod command_tools;
 mod definitions;
 mod errors;
+mod file_tools;
+mod graph_tools;
+mod todo_tools;
 
 use std::{
     fs, io,
@@ -18,16 +22,11 @@ use std::{
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use foco_store::workspace::{
-    CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
-    CodeGraphSymbolRelationRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
-    TodoGraphTaskPatch, WorkspaceDatabase, WorkspaceDatabaseError,
-};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use foco_store::workspace::WorkspaceDatabaseError;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use crate::errors::{ToolRuntimeError, tool_error_output, tool_timeout_ms};
+use crate::errors::{ToolRuntimeError, tool_error_output};
 
 pub const READ_FILE_TOOL: &str = "read_file";
 pub const FIND_FILES_TOOL: &str = "find_files";
@@ -218,1239 +217,35 @@ fn execute_builtin_tool_inner(
     output_sink: Option<&dyn ToolOutputSink>,
 ) -> Result<Value, ToolRuntimeError> {
     match tool_name {
-        READ_FILE_TOOL => read_file(workspace_path, arguments),
-        FIND_FILES_TOOL => find_files(workspace_path, arguments),
-        GRAPH_FIND_SYMBOLS_TOOL => graph_find_symbols(workspace_path, arguments),
-        GRAPH_FIND_CALLERS_TOOL => graph_find_callers(workspace_path, arguments),
-        GRAPH_FIND_CALLEES_TOOL => graph_find_callees(workspace_path, arguments),
-        GRAPH_FIND_REFERENCES_TOOL => graph_find_references(workspace_path, arguments),
-        GRAPH_RELATED_FILES_TOOL => graph_related_files(workspace_path, arguments),
-        GRAPH_EXPLORE_TOOL => graph_explore(workspace_path, arguments),
-        SEARCH_TEXT_TOOL => search_text(workspace_path, arguments, cancellation_token),
+        READ_FILE_TOOL => file_tools::read_file(workspace_path, arguments),
+        FIND_FILES_TOOL => file_tools::find_files(workspace_path, arguments),
+        GRAPH_FIND_SYMBOLS_TOOL => graph_tools::graph_find_symbols(workspace_path, arguments),
+        GRAPH_FIND_CALLERS_TOOL => graph_tools::graph_find_callers(workspace_path, arguments),
+        GRAPH_FIND_CALLEES_TOOL => graph_tools::graph_find_callees(workspace_path, arguments),
+        GRAPH_FIND_REFERENCES_TOOL => graph_tools::graph_find_references(workspace_path, arguments),
+        GRAPH_RELATED_FILES_TOOL => graph_tools::graph_related_files(workspace_path, arguments),
+        GRAPH_EXPLORE_TOOL => graph_tools::graph_explore(workspace_path, arguments),
+        SEARCH_TEXT_TOOL => file_tools::search_text(workspace_path, arguments, cancellation_token),
         WEB_SEARCH_TOOL | WEB_FETCH_TOOL => Err(ToolRuntimeError::InvalidArguments(format!(
             "{tool_name} requires app web runtime configuration"
         ))),
-        WRITE_FILE_TOOL => write_file(workspace_path, arguments),
-        EDIT_FILE_TOOL => edit_file(workspace_path, arguments),
-        CREATE_TODO_GRAPH_TOOL => create_todo_graph(workspace_path, chat_id, arguments),
-        UPDATE_TODO_GRAPH_TOOL => update_todo_graph(workspace_path, chat_id, arguments),
-        GET_TODO_GRAPH_TOOL => get_todo_graph(workspace_path, chat_id, arguments),
+        WRITE_FILE_TOOL => file_tools::write_file(workspace_path, arguments),
+        EDIT_FILE_TOOL => file_tools::edit_file(workspace_path, arguments),
+        CREATE_TODO_GRAPH_TOOL => todo_tools::create_todo_graph(workspace_path, chat_id, arguments),
+        UPDATE_TODO_GRAPH_TOOL => todo_tools::update_todo_graph(workspace_path, chat_id, arguments),
+        GET_TODO_GRAPH_TOOL => todo_tools::get_todo_graph(workspace_path, chat_id, arguments),
         ASK_QUESTION_TOOL => Err(ToolRuntimeError::InvalidArguments(
             "ask_question must be executed through the chat UI question bridge".to_string(),
         )),
-        RUN_COMMAND_TOOL => run_command(workspace_path, arguments, cancellation_token, output_sink),
-        SLEEP_TOOL => sleep_tool(arguments, cancellation_token),
+        RUN_COMMAND_TOOL => {
+            command_tools::run_command(workspace_path, arguments, cancellation_token, output_sink)
+        }
+        SLEEP_TOOL => command_tools::sleep_tool(arguments, cancellation_token),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
     }
 }
 
-fn read_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: ReadFileInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
-    let requested_line_range = parse_optional_line_range(request.start_line, request.end_line)?;
-    let path = resolve_workspace_file(workspace_path, &request.path)?;
-    let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
-        path: path.clone(),
-        source,
-    })?;
-
-    if !metadata.is_file() {
-        return Err(ToolRuntimeError::NotFile(path));
-    }
-
-    let max_source_bytes = if requested_line_range.is_some() {
-        MAX_RANGED_READ_SOURCE_BYTES
-    } else {
-        MAX_FULL_READ_BYTES
-    };
-
-    if metadata.len() > max_source_bytes {
-        return Err(ToolRuntimeError::FileTooLarge {
-            path,
-            bytes: metadata.len(),
-            max_bytes: max_source_bytes,
-        });
-    }
-
-    let bytes = fs::read(&path).map_err(|source| ToolRuntimeError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let (content, _) = decode_text_file(&path, &bytes)?;
-    let line_range = if let Some(range) = requested_line_range {
-        Some(normalize_read_line_range(range, count_text_lines(&content))?)
-    } else {
-        None
-    };
-    let content = if let Some(range) = &line_range {
-        read_line_range(&content, range)
-    } else {
-        content
-    };
-    let content_start_line = line_range.as_ref().map(|range| range.start).unwrap_or(1);
-    let content = numbered_content(&content, content_start_line);
-    if line_range.is_some() && content.len() > MAX_RANGED_READ_OUTPUT_BYTES {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "read_file line range output is too large ({} bytes; max {MAX_RANGED_READ_OUTPUT_BYTES}); use a smaller line range",
-            content.len()
-        )));
-    }
-
-    Ok(json!({
-        "path": request.path,
-        "content": content,
-        "bytes": metadata.len(),
-        "startLine": line_range.as_ref().map(|range| range.start),
-        "endLine": line_range.as_ref().map(|range| range.end),
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn find_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: FindFilesInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
-    let input_path = request.path;
-    let path = resolve_workspace_path(workspace_path, &input_path)?;
-    let filter = GlobFilter::new(request.include, request.exclude)?;
-    let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
-        path: path.clone(),
-        source,
-    })?;
-
-    if !metadata.is_dir() {
-        return Err(ToolRuntimeError::NotDirectory(path));
-    }
-
-    let mut entries = Vec::new();
-    find_files_in_directory(workspace_path, &path, &filter, &mut entries)?;
-
-    entries.sort_by(|left, right| {
-        left.get("path")
-            .and_then(Value::as_str)
-            .cmp(&right.get("path").and_then(Value::as_str))
-    });
-    let truncated = entries.len() > MAX_FIND_ENTRIES;
-    entries.truncate(MAX_FIND_ENTRIES);
-
-    Ok(json!({
-        "path": input_path,
-        "include": filter.include_patterns(),
-        "exclude": filter.exclude_patterns(),
-        "entries": entries,
-        "truncated": truncated,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn find_files_in_directory(
-    workspace_path: &Path,
-    directory_path: &Path,
-    filter: &GlobFilter,
-    entries: &mut Vec<Value>,
-) -> Result<(), ToolRuntimeError> {
-    let mut directory_entries = fs::read_dir(directory_path)
-        .map_err(|source| ToolRuntimeError::Io {
-            path: directory_path.to_path_buf(),
-            source,
-        })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| ToolRuntimeError::Io {
-            path: directory_path.to_path_buf(),
-            source,
-        })?;
-    directory_entries.sort_by_key(|entry| entry.path());
-
-    for entry in directory_entries {
-        if entries.len() > MAX_FIND_ENTRIES {
-            return Ok(());
-        }
-        let entry_path = entry.path();
-        let file_type = entry.file_type().map_err(|source| ToolRuntimeError::Io {
-            path: entry_path.clone(),
-            source,
-        })?;
-        let metadata = entry.metadata().map_err(|source| ToolRuntimeError::Io {
-            path: entry_path.clone(),
-            source,
-        })?;
-        let kind = if file_type.is_dir() {
-            "directory"
-        } else if file_type.is_file() {
-            "file"
-        } else {
-            "other"
-        };
-        let relative_path = relative_workspace_path(workspace_path, &entry_path)?;
-
-        if filter.matches(&relative_path) {
-            entries.push(json!({
-                "path": relative_path,
-                "kind": kind,
-                "bytes": if file_type.is_file() { Some(metadata.len()) } else { None }
-            }));
-        }
-
-        if file_type.is_dir() {
-            find_files_in_directory(workspace_path, &entry_path, filter, entries)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn graph_find_symbols(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: GraphFindSymbolsInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
-    let query = non_empty_argument("query", &request.query)?;
-    let path = request
-        .path
-        .as_deref()
-        .map(normalize_workspace_path_text)
-        .transpose()?;
-    let limit = graph_limit(request.limit)?;
-    let database = open_code_graph_database(workspace_path)?;
-    let mut symbols = database.find_code_graph_symbols(
-        query,
-        request.kind.as_deref(),
-        path.as_deref(),
-        graph_query_limit(limit)?,
-    )?;
-    let truncated = truncate_records(&mut symbols, limit);
-
-    Ok(json!({
-        "query": query,
-        "kind": request.kind,
-        "path": path,
-        "symbols": symbols.into_iter().map(symbol_json).collect::<Vec<_>>(),
-        "truncated": truncated,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn graph_find_callers(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: GraphSymbolLookupInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
-    let database = open_code_graph_database(workspace_path)?;
-    let symbol = resolve_graph_symbol(&database, &request)?;
-    let limit = graph_limit(request.limit)?;
-    let mut callers = database.code_graph_callers(symbol.id, graph_query_limit(limit)?)?;
-    let truncated = truncate_records(&mut callers, limit);
-
-    Ok(json!({
-        "symbol": symbol_json(symbol),
-        "callers": callers.into_iter().map(relation_json).collect::<Vec<_>>(),
-        "truncated": truncated,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn graph_find_callees(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: GraphSymbolLookupInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
-    let database = open_code_graph_database(workspace_path)?;
-    let symbol = resolve_graph_symbol(&database, &request)?;
-    let limit = graph_limit(request.limit)?;
-    let mut callees = database.code_graph_callees(symbol.id, graph_query_limit(limit)?)?;
-    let truncated = truncate_records(&mut callees, limit);
-
-    Ok(json!({
-        "symbol": symbol_json(symbol),
-        "callees": callees.into_iter().map(relation_json).collect::<Vec<_>>(),
-        "truncated": truncated,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn graph_find_references(
-    workspace_path: &Path,
-    arguments: Value,
-) -> Result<Value, ToolRuntimeError> {
-    let request: GraphSymbolLookupInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
-    let database = open_code_graph_database(workspace_path)?;
-    let symbol = resolve_graph_symbol(&database, &request)?;
-    let limit = graph_limit(request.limit)?;
-    let mut references = database.code_graph_references(symbol.id, graph_query_limit(limit)?)?;
-    let truncated = truncate_records(&mut references, limit);
-
-    Ok(json!({
-        "symbol": symbol_json(symbol),
-        "references": references.into_iter().map(reference_json).collect::<Vec<_>>(),
-        "truncated": truncated,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn graph_related_files(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: GraphRelatedFilesInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
-    let path = normalize_workspace_path_text(&request.path)?;
-    let limit = graph_limit(request.limit)?;
-    let database = open_code_graph_database(workspace_path)?;
-    let mut files = database.code_graph_related_files(&path, graph_query_limit(limit)?)?;
-    let truncated = truncate_records(&mut files, limit);
-
-    Ok(json!({
-        "path": path,
-        "files": files.into_iter().map(related_file_json).collect::<Vec<_>>(),
-        "truncated": truncated,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn graph_explore(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: GraphExploreInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
-    let context_lines = graph_explore_context_lines(request.context_lines)?;
-    let database = open_code_graph_database(workspace_path)?;
-    let (symbols, query, path, truncated_matches) =
-        resolve_graph_explore_symbols(&database, &request)?;
-    let mut snippets = Vec::new();
-    let mut output_bytes = 0usize;
-    let mut output_truncated = false;
-
-    for symbol in symbols {
-        let snippet = graph_symbol_source_snippet(workspace_path, symbol, context_lines)?;
-        let content_bytes = snippet["content"]
-            .as_str()
-            .map(str::len)
-            .unwrap_or_default();
-        if output_bytes.saturating_add(content_bytes) > MAX_GRAPH_EXPLORE_OUTPUT_BYTES {
-            output_truncated = true;
-            break;
-        }
-        output_bytes = output_bytes.saturating_add(content_bytes);
-        snippets.push(snippet);
-    }
-
-    Ok(json!({
-        "query": query,
-        "path": path,
-        "contextLines": context_lines,
-        "snippets": snippets,
-        "truncated": truncated_matches || output_truncated,
-        "outputTruncated": output_truncated,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn search_text(
-    workspace_path: &Path,
-    arguments: Value,
-    cancellation_token: Option<&ToolCancellationToken>,
-) -> Result<Value, ToolRuntimeError> {
-    let request: SearchTextInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_SEARCH_TEXT_TIMEOUT_MS)?;
-    let input_path = request.path;
-    let path = resolve_workspace_path(workspace_path, &input_path)?;
-    let pattern = request.query.trim();
-
-    if pattern.is_empty() {
-        return Err(ToolRuntimeError::InvalidArguments(
-            "query must not be empty".to_string(),
-        ));
-    }
-
-    let rg_args = vec![
-        "--json".to_string(),
-        "--line-number".to_string(),
-        "--max-count".to_string(),
-        MAX_SEARCH_MATCHES.to_string(),
-        pattern.to_string(),
-        path.to_string_lossy().to_string(),
-    ];
-    let rg_command = ripgrep_command();
-    let output = run_command_with_timeout(
-        &rg_command,
-        &rg_args,
-        workspace_path,
-        Duration::from_millis(timeout_ms),
-        cancellation_token,
-        None,
-    )?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if output.status.code() == Some(1) {
-            return Ok(json!({
-                "query": pattern,
-                "path": input_path,
-                "matches": [],
-                "truncated": false,
-                "timeoutMs": timeout_ms
-            }));
-        }
-
-        return Err(ToolRuntimeError::CommandFailed {
-            command: rg_command,
-            status: output.status.code(),
-            stderr,
-        });
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut matches = Vec::new();
-    let mut truncated = false;
-    for line in stdout.lines() {
-        let event: Value =
-            serde_json::from_str(line).map_err(|source| ToolRuntimeError::InvalidToolOutput {
-                command: "rg".to_string(),
-                source,
-            })?;
-
-        if event.get("type").and_then(Value::as_str) != Some("match") {
-            continue;
-        }
-        if matches.len() >= MAX_SEARCH_MATCHES {
-            truncated = true;
-            break;
-        }
-
-        let data = event.get("data").ok_or_else(|| {
-            ToolRuntimeError::InvalidArguments("rg match event is missing data".to_string())
-        })?;
-        let absolute_path = data
-            .get("path")
-            .and_then(|path| path.get("text"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ToolRuntimeError::InvalidArguments("rg match event is missing path".to_string())
-            })?;
-        let line_number = data.get("line_number").and_then(Value::as_u64);
-        let text = data
-            .get("lines")
-            .and_then(|lines| lines.get("text"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim_end_matches(['\r', '\n'])
-            .to_string();
-
-        matches.push(json!({
-            "path": relative_workspace_path(workspace_path, Path::new(absolute_path))?,
-            "line": line_number,
-            "text": text
-        }));
-    }
-
-    Ok(json!({
-        "query": pattern,
-        "path": input_path,
-        "matches": matches,
-        "truncated": truncated,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn ripgrep_command() -> String {
-    RIPGREP_PATH
-        .get()
-        .and_then(|state| state.lock().ok().and_then(|path| path.clone()))
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|| "rg".to_string())
-}
-
-struct TextChangeStats {
-    lines_added: usize,
-    lines_removed: usize,
-}
-
-fn text_change_stats(old: &str, new: &str) -> Result<TextChangeStats, ToolRuntimeError> {
-    let input = gix::diff::blob::InternedInput::new(old.as_bytes(), new.as_bytes());
-    let diff =
-        gix::diff::blob::diff_with_slider_heuristics(gix::diff::blob::Algorithm::Histogram, &input);
-    let hunks = gix::diff::blob::UnifiedDiff::new(
-        &diff,
-        &input,
-        gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(Vec::new(), "\n"),
-        gix::diff::blob::unified_diff::ContextSize::default(),
-    )
-    .consume()
-    .map_err(|source| {
-        ToolRuntimeError::InvalidArguments(format!("failed to compute file change stats: {source}"))
-    })?;
-    let mut stats = TextChangeStats {
-        lines_added: 0,
-        lines_removed: 0,
-    };
-
-    for line in String::from_utf8_lossy(&hunks).lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
-            continue;
-        }
-        if line.starts_with('+') {
-            stats.lines_added += 1;
-        } else if line.starts_with('-') {
-            stats.lines_removed += 1;
-        }
-    }
-
-    Ok(stats)
-}
-
-fn write_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: WriteFileInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_WRITE_FILE_TIMEOUT_MS)?;
-    let path = resolve_workspace_write_path(workspace_path, &request.path)?;
-    let line_range = match (request.start_line, request.end_line) {
-        (None, None) => None,
-        (Some(start), Some(end)) => Some(LineRange::new(start, end)?),
-        _ => {
-            return Err(ToolRuntimeError::InvalidArguments(
-                "startLine and endLine must both be null for complete writes or both be integers for line-range writes".to_string(),
-            ));
-        }
-    };
-
-    let (content, encoding, change_stats) = match fs::metadata(&path) {
-        Ok(metadata) => {
-            if !metadata.is_file() {
-                return Err(ToolRuntimeError::NotFile(path));
-            }
-
-            let bytes = fs::read(&path).map_err(|source| ToolRuntimeError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            let (existing_content, encoding) = decode_text_file(&path, &bytes)?;
-            let content = if let Some(range) = line_range {
-                replace_line_range(&existing_content, range, &request.content)?
-            } else {
-                request.content
-            };
-            let change_stats = text_change_stats(&existing_content, &content)?;
-
-            (content, encoding, change_stats)
-        }
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
-            if line_range.is_some() {
-                return Err(ToolRuntimeError::InvalidArguments(
-                    "line-range writes require an existing file".to_string(),
-                ));
-            }
-
-            let change_stats = text_change_stats("", &request.content)?;
-
-            (request.content, TextEncoding::Utf8, change_stats)
-        }
-        Err(source) => {
-            return Err(ToolRuntimeError::Io {
-                path: path.clone(),
-                source,
-            });
-        }
-    };
-    let encoded = encode_text_file(&content, encoding);
-
-    fs::write(&path, &encoded).map_err(|source| ToolRuntimeError::Io {
-        path: path.clone(),
-        source,
-    })?;
-
-    Ok(json!({
-        "path": normalize_workspace_path_text(&request.path)?,
-        "bytes": encoded.len(),
-        "linesAdded": change_stats.lines_added,
-        "linesRemoved": change_stats.lines_removed,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn edit_file(workspace_path: &Path, arguments: Value) -> Result<Value, ToolRuntimeError> {
-    let request: EditFileInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_WRITE_FILE_TIMEOUT_MS)?;
-    if request.old_str.is_empty() {
-        return Err(ToolRuntimeError::InvalidArguments(
-            "oldStr must not be empty".to_string(),
-        ));
-    }
-
-    let replace_all = request.replace_all.unwrap_or(false);
-    let normalized_path = normalize_workspace_path_text(&request.path)?;
-    let path = resolve_workspace_file(workspace_path, &request.path)?;
-    let bytes = fs::read(&path).map_err(|source| ToolRuntimeError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let (existing_content, encoding) = decode_text_file(&path, &bytes)?;
-    let match_count = existing_content.matches(&request.old_str).count();
-
-    if match_count == 0 {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "oldStr was not found in {normalized_path}; call read_file to get the latest file content before retrying"
-        )));
-    }
-    if match_count > 1 && !replace_all {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "oldStr matched {match_count} times in {normalized_path}; set replaceAll to true to replace all matches, or provide a more specific oldStr from the latest read_file output"
-        )));
-    }
-
-    let content = if replace_all {
-        existing_content.replace(&request.old_str, &request.new_str)
-    } else {
-        existing_content.replacen(&request.old_str, &request.new_str, 1)
-    };
-    let change_stats = text_change_stats(&existing_content, &content)?;
-    let encoded = encode_text_file(&content, encoding);
-
-    fs::write(&path, &encoded).map_err(|source| ToolRuntimeError::Io {
-        path: path.clone(),
-        source,
-    })?;
-
-    Ok(json!({
-        "path": normalized_path,
-        "bytes": encoded.len(),
-        "replacements": match_count,
-        "replaceAll": replace_all,
-        "linesAdded": change_stats.lines_added,
-        "linesRemoved": change_stats.lines_removed,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn create_todo_graph(
-    workspace_path: &Path,
-    chat_id: Option<&str>,
-    arguments: Value,
-) -> Result<Value, ToolRuntimeError> {
-    let request: CreateTodoGraphInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TODO_GRAPH_TIMEOUT_MS)?;
-    let chat_id = required_chat_id(chat_id)?;
-    let mut database = open_todo_graph_database(workspace_path)?;
-    let graph = database.upsert_todo_graph(
-        chat_id,
-        request
-            .tasks
-            .into_iter()
-            .map(todo_graph_task_from_input)
-            .collect(),
-    )?;
-
-    Ok(todo_graph_json(graph, timeout_ms))
-}
-
-fn update_todo_graph(
-    workspace_path: &Path,
-    chat_id: Option<&str>,
-    arguments: Value,
-) -> Result<Value, ToolRuntimeError> {
-    let request: UpdateTodoGraphInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TODO_GRAPH_TIMEOUT_MS)?;
-    let chat_id = required_chat_id(chat_id)?;
-    let patch = TodoGraphTaskPatch {
-        title: request.patch.title,
-        status: request.patch.status,
-        depends_on: request.patch.depends_on,
-        acceptance: request.patch.acceptance,
-        summary: request.patch.summary,
-        subtasks: request
-            .patch
-            .subtasks
-            .map(|tasks| tasks.into_iter().map(todo_graph_task_from_input).collect()),
-    };
-    let mut database = open_todo_graph_database(workspace_path)?;
-    let graph = database.update_todo_graph_task(chat_id, &request.task_id, patch)?;
-
-    Ok(todo_graph_json(graph, timeout_ms))
-}
-
-fn get_todo_graph(
-    workspace_path: &Path,
-    chat_id: Option<&str>,
-    arguments: Value,
-) -> Result<Value, ToolRuntimeError> {
-    let request: GetTodoGraphInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_TODO_GRAPH_TIMEOUT_MS)?;
-    let chat_id = required_chat_id(chat_id)?;
-    let status = request
-        .status
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let task_id = request
-        .task_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let database = open_todo_graph_database(workspace_path)?;
-    let graph = database.filtered_todo_graph(
-        chat_id,
-        TodoGraphFilter {
-            status,
-            task_id,
-            include_subtasks: request.include_subtasks,
-        },
-    )?;
-
-    match graph {
-        Some(graph) => Ok(todo_graph_json(graph, timeout_ms)),
-        None => Ok(json!({
-            "chatId": chat_id,
-            "tasks": [],
-            "exists": false,
-            "createdAt": null,
-            "updatedAt": null,
-            "updatedTask": null,
-            "timeoutMs": timeout_ms
-        })),
-    }
-}
-
-fn run_command(
-    workspace_path: &Path,
-    arguments: Value,
-    cancellation_token: Option<&ToolCancellationToken>,
-    output_sink: Option<&dyn ToolOutputSink>,
-) -> Result<Value, ToolRuntimeError> {
-    let request: RunCommandInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_RUN_COMMAND_TIMEOUT_MS)?;
-    let command = request.command.trim();
-    let args = request.args.unwrap_or_default();
-    let cwd = match request.cwd.as_deref() {
-        Some(cwd) => resolve_workspace_path(workspace_path, cwd)?,
-        None => fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
-            path: workspace_path.to_path_buf(),
-            source,
-        })?,
-    };
-
-    if command.is_empty() {
-        return Err(ToolRuntimeError::InvalidArguments(
-            "command must not be empty".to_string(),
-        ));
-    }
-
-    if !fs::metadata(&cwd)
-        .map_err(|source| ToolRuntimeError::Io {
-            path: cwd.clone(),
-            source,
-        })?
-        .is_dir()
-    {
-        return Err(ToolRuntimeError::NotDirectory(cwd));
-    }
-
-    let output = run_command_with_timeout(
-        command,
-        &args,
-        &cwd,
-        Duration::from_millis(timeout_ms),
-        cancellation_token,
-        output_sink,
-    )?;
-    let (stdout, stdout_truncated) = limited_output_text(&output.stdout);
-    let (stderr, stderr_truncated) = limited_output_text(&output.stderr);
-
-    Ok(json!({
-        "command": command,
-        "args": args,
-        "cwd": relative_workspace_path(workspace_path, &cwd)?,
-        "pid": output.pid,
-        "status": output.status.code(),
-        "success": output.status.success(),
-        "stdout": stdout,
-        "stderr": stderr,
-        "stdoutTruncated": stdout_truncated,
-        "stderrTruncated": stderr_truncated,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn sleep_tool(
-    arguments: Value,
-    cancellation_token: Option<&ToolCancellationToken>,
-) -> Result<Value, ToolRuntimeError> {
-    let request: SleepInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_SLEEP_TIMEOUT_MS)?;
-
-    if request.duration_ms == 0 || request.duration_ms > timeout_ms {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "durationMs must be between 1 and timeoutMs ({timeout_ms}) milliseconds"
-        )));
-    }
-
-    let started = Instant::now();
-    let duration = Duration::from_millis(request.duration_ms);
-    loop {
-        if cancellation_token
-            .map(ToolCancellationToken::is_cancelled)
-            .unwrap_or(false)
-        {
-            return Err(ToolRuntimeError::Cancelled);
-        }
-
-        let elapsed = started.elapsed();
-        if elapsed >= duration {
-            break;
-        }
-
-        thread::sleep(
-            duration
-                .saturating_sub(elapsed)
-                .min(Duration::from_millis(COMMAND_WAIT_POLL_MS)),
-        );
-    }
-
-    Ok(json!({
-        "durationMs": request.duration_ms,
-        "timeoutMs": timeout_ms
-    }))
-}
-
-fn open_code_graph_database(workspace_path: &Path) -> Result<WorkspaceDatabase, ToolRuntimeError> {
-    WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
-}
-
-fn open_todo_graph_database(workspace_path: &Path) -> Result<WorkspaceDatabase, ToolRuntimeError> {
-    WorkspaceDatabase::open_or_create(workspace_path).map_err(ToolRuntimeError::WorkspaceDatabase)
-}
-
-fn required_chat_id(chat_id: Option<&str>) -> Result<&str, ToolRuntimeError> {
-    chat_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            ToolRuntimeError::InvalidArguments(
-                "todo graph tools require an active chat".to_string(),
-            )
-        })
-}
-
-fn resolve_graph_symbol(
-    database: &WorkspaceDatabase,
-    request: &GraphSymbolLookupInput,
-) -> Result<CodeGraphSymbolRecord, ToolRuntimeError> {
-    let symbol = request
-        .symbol
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    match (request.symbol_id, symbol) {
-        (Some(_), Some(_)) => Err(ToolRuntimeError::InvalidArguments(
-            "provide exactly one of symbolId or symbol".to_string(),
-        )),
-        (None, None) => Err(ToolRuntimeError::InvalidArguments(
-            "provide exactly one of symbolId or symbol".to_string(),
-        )),
-        (Some(symbol_id), None) => {
-            if request.path.is_some() {
-                return Err(ToolRuntimeError::InvalidArguments(
-                    "path can only be used when resolving by symbol name".to_string(),
-                ));
-            }
-
-            database.code_graph_symbol(symbol_id)?.ok_or_else(|| {
-                ToolRuntimeError::InvalidArguments(format!(
-                    "code graph symbol was not found: {symbol_id}"
-                ))
-            })
-        }
-        (None, Some(symbol)) => {
-            let path = request
-                .path
-                .as_deref()
-                .map(normalize_workspace_path_text)
-                .transpose()?;
-            let matches = database.find_code_graph_symbols(symbol, None, path.as_deref(), 3)?;
-
-            match matches.len() {
-                0 => Err(ToolRuntimeError::InvalidArguments(format!(
-                    "code graph symbol was not found: {symbol}"
-                ))),
-                1 => Ok(matches.into_iter().next().expect("one symbol")),
-                _ => {
-                    let candidates = matches
-                        .into_iter()
-                        .map(|candidate| {
-                            format!("{}:{}:{}", candidate.id, candidate.path, candidate.name)
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    Err(ToolRuntimeError::InvalidArguments(format!(
-                        "symbol name is ambiguous; call graph_find_symbols first and pass symbolId. Candidates: {candidates}"
-                    )))
-                }
-            }
-        }
-    }
-}
-
-fn resolve_graph_explore_symbols(
-    database: &WorkspaceDatabase,
-    request: &GraphExploreInput,
-) -> Result<
-    (
-        Vec<CodeGraphSymbolRecord>,
-        Option<String>,
-        Option<String>,
-        bool,
-    ),
-    ToolRuntimeError,
-> {
-    let query = request
-        .query
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-
-    match (request.symbol_id, query) {
-        (Some(_), Some(_)) => Err(ToolRuntimeError::InvalidArguments(
-            "provide exactly one of symbolId or query".to_string(),
-        )),
-        (None, None) => Err(ToolRuntimeError::InvalidArguments(
-            "provide exactly one of symbolId or query".to_string(),
-        )),
-        (Some(symbol_id), None) => {
-            if request.path.is_some() || request.kind.is_some() {
-                return Err(ToolRuntimeError::InvalidArguments(
-                    "path and kind can only be used when resolving by query".to_string(),
-                ));
-            }
-
-            let symbol = database.code_graph_symbol(symbol_id)?.ok_or_else(|| {
-                ToolRuntimeError::InvalidArguments(format!(
-                    "code graph symbol was not found: {symbol_id}"
-                ))
-            })?;
-            Ok((vec![symbol], None, None, false))
-        }
-        (None, Some(query)) => {
-            let limit = graph_explore_limit(request.limit)?;
-            let path = request
-                .path
-                .as_deref()
-                .map(normalize_workspace_path_text)
-                .transpose()?;
-            let mut symbols = database.find_code_graph_symbols(
-                query,
-                request.kind.as_deref(),
-                path.as_deref(),
-                graph_query_limit(limit)?,
-            )?;
-            let truncated = truncate_records(&mut symbols, limit);
-            Ok((symbols, Some(query.to_string()), path, truncated))
-        }
-    }
-}
-
-fn non_empty_argument<'a>(name: &str, value: &'a str) -> Result<&'a str, ToolRuntimeError> {
-    let trimmed = value.trim();
-
-    if trimmed.is_empty() {
-        Err(ToolRuntimeError::InvalidArguments(format!(
-            "{name} must not be empty"
-        )))
-    } else {
-        Ok(trimmed)
-    }
-}
-
-fn graph_limit(limit: Option<usize>) -> Result<usize, ToolRuntimeError> {
-    let limit = limit.unwrap_or(DEFAULT_GRAPH_RESULT_LIMIT);
-
-    if limit == 0 || limit > MAX_GRAPH_RESULT_LIMIT {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "limit must be between 1 and {MAX_GRAPH_RESULT_LIMIT}"
-        )));
-    }
-
-    Ok(limit)
-}
-
-fn graph_explore_limit(limit: Option<usize>) -> Result<usize, ToolRuntimeError> {
-    let limit = limit.unwrap_or(DEFAULT_GRAPH_EXPLORE_RESULT_LIMIT);
-
-    if limit == 0 || limit > MAX_GRAPH_EXPLORE_RESULT_LIMIT {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "limit must be between 1 and {MAX_GRAPH_EXPLORE_RESULT_LIMIT}"
-        )));
-    }
-
-    Ok(limit)
-}
-
-fn graph_explore_context_lines(context_lines: Option<usize>) -> Result<usize, ToolRuntimeError> {
-    let context_lines = context_lines.unwrap_or(DEFAULT_GRAPH_EXPLORE_CONTEXT_LINES);
-
-    if context_lines > MAX_GRAPH_EXPLORE_CONTEXT_LINES {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "contextLines must be between 0 and {MAX_GRAPH_EXPLORE_CONTEXT_LINES}"
-        )));
-    }
-
-    Ok(context_lines)
-}
-
-fn graph_query_limit(limit: usize) -> Result<i64, ToolRuntimeError> {
-    i64::try_from(limit + 1).map_err(|_| {
-        ToolRuntimeError::InvalidArguments("limit is too large for SQLite".to_string())
-    })
-}
-
-fn truncate_records<T>(records: &mut Vec<T>, limit: usize) -> bool {
-    let truncated = records.len() > limit;
-    records.truncate(limit);
-    truncated
-}
-
-struct GlobFilter {
-    include: Vec<String>,
-    exclude: Vec<String>,
-    include_set: Option<GlobSet>,
-    exclude_set: Option<GlobSet>,
-}
-
-impl GlobFilter {
-    fn new(
-        include: Option<Vec<String>>,
-        exclude: Option<Vec<String>>,
-    ) -> Result<Self, ToolRuntimeError> {
-        let include = normalize_glob_patterns("include", include)?;
-        let exclude = normalize_glob_patterns("exclude", exclude)?;
-        let include_set = compile_glob_set("include", &include)?;
-        let exclude_set = compile_glob_set("exclude", &exclude)?;
-
-        Ok(Self {
-            include,
-            exclude,
-            include_set,
-            exclude_set,
-        })
-    }
-
-    fn matches(&self, path: &str) -> bool {
-        if let Some(include_set) = &self.include_set
-            && !include_set.is_match(path)
-        {
-            return false;
-        }
-
-        if let Some(exclude_set) = &self.exclude_set
-            && exclude_set.is_match(path)
-        {
-            return false;
-        }
-
-        true
-    }
-
-    fn include_patterns(&self) -> &[String] {
-        &self.include
-    }
-
-    fn exclude_patterns(&self) -> &[String] {
-        &self.exclude
-    }
-}
-
-fn normalize_glob_patterns(
-    field_name: &str,
-    patterns: Option<Vec<String>>,
-) -> Result<Vec<String>, ToolRuntimeError> {
-    patterns
-        .unwrap_or_default()
-        .into_iter()
-        .map(|pattern| {
-            let pattern = pattern.trim();
-            if pattern.is_empty() {
-                return Err(ToolRuntimeError::InvalidArguments(format!(
-                    "{field_name} glob patterns must not be empty"
-                )));
-            }
-
-            Ok(pattern.replace('\\', "/"))
-        })
-        .collect()
-}
-
-fn compile_glob_set(
-    field_name: &str,
-    patterns: &[String],
-) -> Result<Option<GlobSet>, ToolRuntimeError> {
-    if patterns.is_empty() {
-        return Ok(None);
-    }
-
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        let glob = Glob::new(pattern).map_err(|source| {
-            ToolRuntimeError::InvalidArguments(format!(
-                "{field_name} glob pattern '{pattern}' is invalid: {source}"
-            ))
-        })?;
-        builder.add(glob);
-    }
-
-    builder.build().map(Some).map_err(|source| {
-        ToolRuntimeError::InvalidArguments(format!(
-            "{field_name} glob patterns are invalid: {source}"
-        ))
-    })
-}
-
-fn symbol_json(symbol: CodeGraphSymbolRecord) -> Value {
-    json!({
-        "symbolId": symbol.id,
-        "path": symbol.path,
-        "language": symbol.language,
-        "name": symbol.name,
-        "kind": symbol.kind,
-        "startLine": symbol.start_line,
-        "startColumn": symbol.start_column,
-        "endLine": symbol.end_line,
-        "endColumn": symbol.end_column,
-        "signature": symbol.signature,
-        "documentation": symbol.documentation
-    })
-}
-
-fn graph_symbol_source_snippet(
-    workspace_path: &Path,
-    symbol: CodeGraphSymbolRecord,
-    context_lines: usize,
-) -> Result<Value, ToolRuntimeError> {
-    let start_line = symbol
-        .start_line
-        .and_then(positive_i64_to_usize)
-        .ok_or_else(|| {
-            ToolRuntimeError::InvalidArguments(format!(
-                "code graph symbol {}:{} has no startLine",
-                symbol.path, symbol.name
-            ))
-        })?;
-    let end_line = symbol
-        .end_line
-        .and_then(positive_i64_to_usize)
-        .ok_or_else(|| {
-            ToolRuntimeError::InvalidArguments(format!(
-                "code graph symbol {}:{} has no endLine",
-                symbol.path, symbol.name
-            ))
-        })?;
-    if end_line < start_line {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "code graph symbol {}:{} has invalid line range {start_line}-{end_line}",
-            symbol.path, symbol.name
-        )));
-    }
-
-    let symbol_line_count = end_line - start_line + 1;
-    if symbol_line_count > MAX_GRAPH_EXPLORE_SYMBOL_LINES {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "code graph symbol {}:{} spans {symbol_line_count} lines; max {MAX_GRAPH_EXPLORE_SYMBOL_LINES}",
-            symbol.path, symbol.name
-        )));
-    }
-
-    let path = resolve_workspace_file(workspace_path, &symbol.path)?;
-    let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    if metadata.len() > MAX_RANGED_READ_SOURCE_BYTES {
-        return Err(ToolRuntimeError::FileTooLarge {
-            path,
-            bytes: metadata.len(),
-            max_bytes: MAX_RANGED_READ_SOURCE_BYTES,
-        });
-    }
-    let bytes = fs::read(&path).map_err(|source| ToolRuntimeError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let (content, _) = decode_text_file(&path, &bytes)?;
-    let line_count = count_text_lines(&content);
-    let range = normalize_read_line_range(
-        LineRange::new(
-            start_line.saturating_sub(context_lines).max(1),
-            end_line + context_lines,
-        )?,
-        line_count,
-    )?;
-    let snippet = numbered_content(&read_line_range(&content, &range), range.start);
-
-    let symbol_path = symbol.path.clone();
-
-    Ok(json!({
-        "symbol": symbol_json(symbol),
-        "path": symbol_path,
-        "startLine": range.start,
-        "endLine": range.end,
-        "content": snippet
-    }))
-}
-
-fn positive_i64_to_usize(value: i64) -> Option<usize> {
-    usize::try_from(value).ok().filter(|value| *value > 0)
-}
-
-fn relation_json(relation: CodeGraphSymbolRelationRecord) -> Value {
-    json!({
-        "edgeId": relation.edge_id,
-        "edgeKind": relation.edge_kind,
-        "metadata": relation.metadata_json,
-        "source": symbol_json(relation.source),
-        "target": symbol_json(relation.target)
-    })
-}
-
-fn reference_json(reference: CodeGraphReferenceRecord) -> Value {
-    json!({
-        "referenceId": reference.id,
-        "path": reference.path,
-        "language": reference.language,
-        "name": reference.name,
-        "startLine": reference.start_line,
-        "startColumn": reference.start_column,
-        "endLine": reference.end_line,
-        "endColumn": reference.end_column,
-        "symbol": reference.symbol.map(symbol_json)
-    })
-}
-
-fn related_file_json(file: CodeGraphRelatedFileRecord) -> Value {
-    json!({
-        "path": file.path,
-        "language": file.language,
-        "relation": file.relation,
-        "score": file.score
-    })
-}
-
-fn todo_graph_json(graph: TodoGraphRecord, timeout_ms: u64) -> Value {
-    json!({
-        "chatId": graph.chat_id,
-        "tasks": graph.tasks,
-        "exists": true,
-        "createdAt": graph.created_at,
-        "updatedAt": graph.updated_at,
-        "updatedTask": graph.updated_task,
-        "timeoutMs": timeout_ms
-    })
-}
-
-fn todo_graph_task_from_input(task: TodoGraphTaskInput) -> TodoGraphTask {
-    let _server_generated_timestamps = (task.created_at, task.updated_at);
-
-    TodoGraphTask {
-        id: task.id,
-        title: task.title,
-        status: task.status,
-        depends_on: task.depends_on,
-        acceptance: task.acceptance,
-        summary: task.summary,
-        created_at: String::new(),
-        updated_at: String::new(),
-        subtasks: task
-            .subtasks
-            .into_iter()
-            .map(todo_graph_task_from_input)
-            .collect(),
-    }
-}
-
-fn parse_arguments<T>(arguments: Value) -> Result<T, ToolRuntimeError>
+pub(crate) fn parse_arguments<T>(arguments: Value) -> Result<T, ToolRuntimeError>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -1460,14 +255,17 @@ where
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum TextEncoding {
+pub(crate) enum TextEncoding {
     Utf8,
     Utf8Bom,
     Utf16LeBom,
     Utf16BeBom,
 }
 
-fn decode_text_file(path: &Path, bytes: &[u8]) -> Result<(String, TextEncoding), ToolRuntimeError> {
+pub(crate) fn decode_text_file(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(String, TextEncoding), ToolRuntimeError> {
     if let Some(content) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
         let content = std::str::from_utf8(content)
             .map_err(|_| ToolRuntimeError::UnsupportedEncoding(path.to_path_buf()))?;
@@ -1510,7 +308,7 @@ fn decode_utf16_file(
     Ok((content, encoding))
 }
 
-fn encode_text_file(content: &str, encoding: TextEncoding) -> Vec<u8> {
+pub(crate) fn encode_text_file(content: &str, encoding: TextEncoding) -> Vec<u8> {
     match encoding {
         TextEncoding::Utf8 => content.as_bytes().to_vec(),
         TextEncoding::Utf8Bom => {
@@ -1536,13 +334,13 @@ fn encode_text_file(content: &str, encoding: TextEncoding) -> Vec<u8> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct LineRange {
-    start: usize,
-    end: usize,
+pub(crate) struct LineRange {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
 }
 
 impl LineRange {
-    fn new(start: usize, end: usize) -> Result<Self, ToolRuntimeError> {
+    pub(crate) fn new(start: usize, end: usize) -> Result<Self, ToolRuntimeError> {
         if start == 0 || end == 0 || end < start {
             return Err(ToolRuntimeError::InvalidArguments(
                 "line ranges are 1-based inclusive ranges and must satisfy startLine <= endLine"
@@ -1561,7 +359,7 @@ struct LineSpan {
     line_ending: Option<&'static str>,
 }
 
-fn parse_optional_line_range(
+pub(crate) fn parse_optional_line_range(
     start_line: Option<usize>,
     end_line: Option<usize>,
 ) -> Result<Option<LineRange>, ToolRuntimeError> {
@@ -1587,7 +385,7 @@ fn validate_line_range(range: LineRange, line_count: usize) -> Result<(), ToolRu
     Ok(())
 }
 
-fn normalize_read_line_range(
+pub(crate) fn normalize_read_line_range(
     range: LineRange,
     line_count: usize,
 ) -> Result<LineRange, ToolRuntimeError> {
@@ -1604,18 +402,18 @@ fn normalize_read_line_range(
     })
 }
 
-fn count_text_lines(content: &str) -> usize {
+pub(crate) fn count_text_lines(content: &str) -> usize {
     line_spans(content).len()
 }
 
-fn read_line_range(content: &str, range: &LineRange) -> String {
+pub(crate) fn read_line_range(content: &str, range: &LineRange) -> String {
     let spans = line_spans(content);
     let start = spans[range.start - 1].start_byte;
     let end = spans[range.end - 1].end_byte;
     content[start..end].to_string()
 }
 
-fn numbered_content(content: &str, start_line: usize) -> String {
+pub(crate) fn numbered_content(content: &str, start_line: usize) -> String {
     let mut numbered = String::new();
     for (index, span) in line_spans(content).into_iter().enumerate() {
         numbered.push_str(&(start_line + index).to_string());
@@ -1626,7 +424,7 @@ fn numbered_content(content: &str, start_line: usize) -> String {
     numbered
 }
 
-fn replace_line_range(
+pub(crate) fn replace_line_range(
     existing_content: &str,
     range: LineRange,
     replacement: &str,
@@ -1694,7 +492,10 @@ fn ends_with_line_ending(content: &str) -> bool {
     content.ends_with('\n') || content.ends_with('\r')
 }
 
-fn resolve_workspace_file(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
+pub(crate) fn resolve_workspace_file(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<PathBuf, ToolRuntimeError> {
     let path = resolve_workspace_path(workspace_path, input)?;
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
@@ -1708,7 +509,10 @@ fn resolve_workspace_file(workspace_path: &Path, input: &str) -> Result<PathBuf,
     }
 }
 
-fn resolve_workspace_path(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
+pub(crate) fn resolve_workspace_path(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<PathBuf, ToolRuntimeError> {
     let trimmed = normalize_workspace_path_text(input)?;
     let requested = Path::new(&trimmed);
 
@@ -1731,7 +535,7 @@ fn resolve_workspace_path(workspace_path: &Path, input: &str) -> Result<PathBuf,
     Ok(path)
 }
 
-fn resolve_workspace_write_path(
+pub(crate) fn resolve_workspace_write_path(
     workspace_path: &Path,
     input: &str,
 ) -> Result<PathBuf, ToolRuntimeError> {
@@ -1778,7 +582,7 @@ fn resolve_workspace_write_path(
     }
 }
 
-fn normalize_workspace_path_text(input: &str) -> Result<String, ToolRuntimeError> {
+pub(crate) fn normalize_workspace_path_text(input: &str) -> Result<String, ToolRuntimeError> {
     let trimmed = input.trim();
 
     if trimmed.is_empty() {
@@ -1808,7 +612,10 @@ fn normalize_workspace_path_text(input: &str) -> Result<String, ToolRuntimeError
     Ok(trimmed.replace('\\', "/"))
 }
 
-fn relative_workspace_path(workspace_path: &Path, path: &Path) -> Result<String, ToolRuntimeError> {
+pub(crate) fn relative_workspace_path(
+    workspace_path: &Path,
+    path: &Path,
+) -> Result<String, ToolRuntimeError> {
     let workspace = fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
         path: workspace_path.to_path_buf(),
         source,
@@ -1824,8 +631,7 @@ fn relative_workspace_path(workspace_path: &Path, path: &Path) -> Result<String,
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
-
-fn run_command_with_timeout(
+pub(crate) fn run_command_with_timeout(
     command: &str,
     args: &[String],
     cwd: &Path,
@@ -1939,11 +745,11 @@ fn run_command_with_timeout(
     }
 }
 
-struct CommandRunOutput {
-    pid: u32,
-    status: ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+pub(crate) struct CommandRunOutput {
+    pub(crate) pid: u32,
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 enum CommandPipeMessage {
@@ -2041,7 +847,7 @@ fn command_label(command: &str, args: &[String]) -> String {
     }
 }
 
-fn limited_output_text(output: &[u8]) -> (String, bool) {
+pub(crate) fn limited_output_text(output: &[u8]) -> (String, bool) {
     let truncated = output.len() > MAX_COMMAND_OUTPUT_BYTES;
     let bytes = if truncated {
         &output[..MAX_COMMAND_OUTPUT_BYTES]
@@ -2051,158 +857,6 @@ fn limited_output_text(output: &[u8]) -> (String, bool) {
 
     (String::from_utf8_lossy(bytes).to_string(), truncated)
 }
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReadFileInput {
-    path: String,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct FindFilesInput {
-    path: String,
-    include: Option<Vec<String>>,
-    exclude: Option<Vec<String>>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SearchTextInput {
-    query: String,
-    path: String,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphFindSymbolsInput {
-    query: String,
-    kind: Option<String>,
-    path: Option<String>,
-    limit: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphSymbolLookupInput {
-    symbol_id: Option<i64>,
-    symbol: Option<String>,
-    path: Option<String>,
-    limit: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphExploreInput {
-    symbol_id: Option<i64>,
-    query: Option<String>,
-    kind: Option<String>,
-    path: Option<String>,
-    limit: Option<usize>,
-    context_lines: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GraphRelatedFilesInput {
-    path: String,
-    limit: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WriteFileInput {
-    path: String,
-    content: String,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EditFileInput {
-    path: String,
-    old_str: String,
-    new_str: String,
-    replace_all: Option<bool>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateTodoGraphInput {
-    tasks: Vec<TodoGraphTaskInput>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct UpdateTodoGraphInput {
-    task_id: String,
-    patch: TodoGraphPatchInput,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GetTodoGraphInput {
-    status: Option<String>,
-    task_id: Option<String>,
-    include_subtasks: bool,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TodoGraphPatchInput {
-    title: Option<String>,
-    status: Option<String>,
-    depends_on: Option<Vec<String>>,
-    acceptance: Option<Vec<String>>,
-    summary: Option<String>,
-    subtasks: Option<Vec<TodoGraphTaskInput>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TodoGraphTaskInput {
-    id: String,
-    title: String,
-    status: String,
-    depends_on: Vec<String>,
-    acceptance: Vec<String>,
-    summary: String,
-    created_at: Option<String>,
-    updated_at: Option<String>,
-    subtasks: Vec<TodoGraphTaskInput>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RunCommandInput {
-    command: String,
-    args: Option<Vec<String>>,
-    cwd: Option<String>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SleepInput {
-    duration_ms: u64,
-    timeout_ms: Option<u64>,
-}
-
 
 impl From<WorkspaceDatabaseError> for ToolRuntimeError {
     fn from(source: WorkspaceDatabaseError) -> Self {
@@ -2532,7 +1186,7 @@ mod tests {
         assert_eq!(read_file.end_line, None);
         assert_eq!(read_file.timeout_ms, None);
 
-        let graph_symbols: GraphFindSymbolsInput = parse_arguments(json!({
+        let graph_symbols: graph_tools::GraphFindSymbolsInput = parse_arguments(json!({
             "query": "helper",
             "kind": null,
             "path": null,
@@ -2546,7 +1200,7 @@ mod tests {
         assert_eq!(graph_symbols.limit, None);
         assert_eq!(graph_symbols.timeout_ms, None);
 
-        let graph_lookup: GraphSymbolLookupInput = parse_arguments(json!({
+        let graph_lookup: graph_tools::GraphSymbolLookupInput = parse_arguments(json!({
             "symbolId": null,
             "symbol": "helper",
             "path": null,

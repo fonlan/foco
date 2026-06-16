@@ -480,7 +480,7 @@ Exit condition:
 
 ## Phase 5: Tools and Store Cleanup
 
-- [ ] Phase 5 complete
+- [x] Phase 5 complete
 
 Goal: finish medium-priority splits after the primary app files are under control.
 
@@ -488,10 +488,10 @@ Goal: finish medium-priority splits after the primary app files are under contro
 
 Split implementations by tool family:
 
-- [ ] file tools
-- [ ] graph tools
-- [ ] todo tools
-- [ ] command tools
+- [x] file tools
+- [x] graph tools
+- [x] todo tools
+- [x] command tools
 
 Keep the current public exports stable through `tools/lib.rs`.
 
@@ -531,7 +531,7 @@ These are maintenance improvements, not the first-line priority.
 
 Exit condition:
 
-- [ ] store modules are internally organized, but no higher-priority app split is blocked on them.
+- [x] store modules are internally organized, but no higher-priority app split is blocked on them.
 
 ## Recommended First Implementation Wave
 
