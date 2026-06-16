@@ -1175,11 +1175,8 @@ function ReasoningBlock({
   const { language, t } = useI18n();
   const [isExpanded, setIsExpanded] = useState(isStreaming);
   const preview = compactInlineText(reasoning);
-  const durationLabel =
-    durationMs === null ? null : formatNullableLatencySeconds(durationMs, language);
-  const durationTitle = durationLabel
-    ? t("Thinking duration {duration}", { duration: durationLabel })
-    : null;
+  const durationLabel = formatNullableLatencySeconds(durationMs, language);
+  const durationTitle = t("Thinking duration {duration}", { duration: durationLabel });
 
   useEffect(() => {
     setIsExpanded(isStreaming);

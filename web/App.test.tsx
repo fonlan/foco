@@ -1198,6 +1198,44 @@ describe("App verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("keeps the thinking duration visible when reply latency is unavailable", async () => {
+    const messagesWithUnknownThinkingDuration = {
+      ...chatMessages,
+      messages: chatMessages.messages.map((message) =>
+        message.id === "message-assistant"
+          ? {
+              ...message,
+              metrics: message.metrics
+                ? { ...message.metrics, totalLatencyMs: null }
+                : message.metrics,
+            }
+          : message,
+      ),
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...messagesWithUnknownThinkingDuration, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    render(<App />);
+
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    const reasoningToggle = screen.getByRole("button", {
+      name: "Expand thinking",
+    });
+
+    expect(within(reasoningToggle).getByText("n/a")).toBeInTheDocument();
+  });
+
   it("stops reading after the stream end event without surfacing transport close errors", async () => {
     render(<App />);
 
