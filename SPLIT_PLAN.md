@@ -454,16 +454,16 @@ Exit condition:
 
 ## Phase 4: Frontend State and Effect Extraction
 
-- [ ] Phase 4 complete
+- [x] Phase 4 complete
 
 Goal: reduce `web/App.tsx` to a coordinator rather than a state monolith.
 
 Move from `web/App.tsx` into `web/app/` and feature hooks:
 
-- [ ] route-driven state transitions
-- [ ] persisted UI preferences
-- [ ] feature-specific side effects
-- [ ] local feature data loaders where they do not need global knowledge
+- [x] route-driven state transitions
+- [x] persisted UI preferences
+- [x] feature-specific side effects
+- [x] local feature data loaders where they do not need global knowledge
 
 Likely end-state roles:
 
@@ -476,7 +476,7 @@ Do not force this too early. The component and type layers should already be sep
 
 Exit condition:
 
-- [ ] `App.tsx` is mostly composition and top-level wiring.
+- [x] `App.tsx` is mostly composition and top-level wiring.
 
 ## Phase 5: Tools and Store Cleanup
 

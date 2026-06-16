@@ -95,7 +95,7 @@ import type {
   AiStatisticsProviderBreakdown,
   AiStatisticsResponse,
   AiStatisticsSummary,
-  AiStatsFilterState,
+
   AppLanguageId,
   AppThemeId,
   AuthStatusResponse,
@@ -221,8 +221,6 @@ import {
   type GitDiffSection,
 } from "./features/git/diff-parser";
 import {
-  AI_STATS_COLUMN_IDS,
-  AI_STATS_VISIBLE_COLUMNS_STORAGE_KEY,
   ANALYTICS_CHART_COLORS,
   CHAT_BOTTOM_LOCK_THRESHOLD_PX,
   chartTooltipLabelStyle,
@@ -230,7 +228,6 @@ import {
   CONTEXT_PANEL_MAX_WIDTH,
   CONTEXT_PANEL_MIN_WIDTH,
   CREATE_BRANCH_OPTION_VALUE,
-  DEFAULT_AI_STATS_COLUMN_IDS,
   DEFAULT_SYSTEM_PROMPT_NAME,
   MAX_CHAT_ATTACHMENTS,
   MAX_CHAT_ATTACHMENT_BYTES,
@@ -244,6 +241,15 @@ import {
   type AiStatsColumnId,
 } from "./app/constants";
 import {
+  useBrowserPopState,
+  useDocumentLanguage,
+  useDocumentTheme,
+  useInitialBrowserRouteEffect,
+  useRightPanelResizeEffect,
+  useSidebarResizeEffect,
+} from "./app/app-effects";
+import { useAppRouting } from "./app/app-routing";
+import {
   browserPathForRoute,
   currentBrowserRoute,
 } from "./shared/browser-route";
@@ -255,6 +261,15 @@ import { WorkspaceDialog } from "./features/workspaces/WorkspaceDialog";
 import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
+import { errorMessage, requestJson, responseErrorMessage } from "./api/client";
+import {
+  readAiStatsVisibleColumnIds,
+  writeAiStatsVisibleColumnIds,
+} from "./features/stats/ai-stats-preferences";
+import {
+  emptyAiStatsFilters,
+  useAiStatisticsData,
+} from "./features/stats/use-ai-statistics-data";
 
 type ViewMode = "chat" | "settings" | "stats";
 type ContextPanelTab = "todo" | "git" | "memory" | "stats";
@@ -574,13 +589,8 @@ export function App() {
     [],
   );
 
-  useEffect(() => {
-    document.documentElement.lang = language;
-  }, [language]);
-
-  useEffect(() => {
-    document.documentElement.dataset.focoTheme = theme;
-  }, [theme]);
+  useDocumentLanguage(language);
+  useDocumentTheme(theme);
 
   useEffect(() => {
     activeWorkspaceIdRef.current = activeWorkspaceId;
@@ -1188,63 +1198,19 @@ export function App() {
     updateScheduledWorkspaceRunsByWorkspaceList(workspaces);
   }, [workspaces]);
 
-  useEffect(() => {
-    if (!isResizingDiffPanel) {
-      return;
-    }
+  useRightPanelResizeEffect({
+    isResizing: isResizingDiffPanel,
+    maxWidth: CONTEXT_PANEL_MAX_WIDTH,
+    minWidth: CONTEXT_PANEL_MIN_WIDTH,
+    onResizeEnd: () => setIsResizingDiffPanel(false),
+    setWidth: setDiffPanelWidth,
+  });
 
-    function handlePointerMove(event: PointerEvent) {
-      const nextWidth = window.innerWidth - event.clientX;
-      setDiffPanelWidth(
-        Math.min(
-          Math.max(nextWidth, CONTEXT_PANEL_MIN_WIDTH),
-          CONTEXT_PANEL_MAX_WIDTH,
-        ),
-      );
-    }
-
-    function handlePointerUp() {
-      setIsResizingDiffPanel(false);
-    }
-
-    const previousCursor = document.body.style.cursor;
-    const previousUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-
-    return () => {
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousUserSelect;
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-    };
-  }, [isResizingDiffPanel]);
-
-  useEffect(() => {
-    if (!isResizingSidebar) {
-      return;
-    }
-
-    function handlePointerMove(event: PointerEvent) {
-      updateSidebarWidthFromClientX(event.clientX);
-    }
-
-    function handlePointerUp() {
-      setIsResizingSidebar(false);
-    }
-
-    document.body.style.cursor = "col-resize";
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-
-    return () => {
-      document.body.style.cursor = "";
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-    };
-  }, [isResizingSidebar, updateSidebarWidthFromClientX]);
+  useSidebarResizeEffect({
+    isResizing: isResizingSidebar,
+    onPointerMove: updateSidebarWidthFromClientX,
+    onResizeEnd: () => setIsResizingSidebar(false),
+  });
 
   useEffect(() => {
     if (!workspaces.length) {
@@ -2835,32 +2801,27 @@ export function App() {
     hasManuallySelectedModelRef.current = true;
     setSelectedModelId(modelId);
   }
+  const {
+    applyBrowserRoute,
+    openCurrentChatView,
+    openSettingsSection,
+    openStatsView,
+  } = useAppRouting({
+    activeChatId,
+    activeChatKeyRef,
+    activeWorkspaceIdOrNull: activeWorkspace?.id ?? (activeWorkspaceId || null),
+    onMissingWorkspace: setError,
+    onSelectWorkspaceChat: selectWorkspaceChat,
+    onStartNewWorkspaceChat: startNewWorkspaceChat,
+    setActiveChatId,
+    setIsMobileWorkspaceOpen,
+    setMessages,
+    setSettingsSection,
+    setViewMode,
+    updateBrowserRoute,
+    workspaces,
+  });
 
-  function currentChatBrowserRoute(): BrowserRoute {
-    return {
-      chatId: activeChatId,
-      viewMode: "chat",
-      workspaceId: activeWorkspace?.id ?? (activeWorkspaceId || null),
-    };
-  }
-
-  function openSettingsSection(section: SettingsSection) {
-    setSettingsSection(section);
-    setViewMode("settings");
-    setIsMobileWorkspaceOpen(false);
-    updateBrowserRoute({ section, viewMode: "settings" });
-  }
-
-  function openStatsView() {
-    setViewMode("stats");
-    setIsMobileWorkspaceOpen(false);
-    updateBrowserRoute({ viewMode: "stats" });
-  }
-
-  function openCurrentChatView() {
-    setViewMode("chat");
-    updateBrowserRoute(currentChatBrowserRoute());
-  }
 
   function handleHomeNavClick() {
     if (viewMode !== "chat") {
@@ -2876,70 +2837,18 @@ export function App() {
     setIsWorkspaceSidebarOpen((current) => !current);
   }
 
-  function applyBrowserRoute(route: BrowserRoute) {
-    if (route.viewMode === "settings") {
-      setSettingsSection(route.section);
-      setViewMode("settings");
-      setIsMobileWorkspaceOpen(false);
-      return;
-    }
-
-    if (route.viewMode === "stats") {
-      setViewMode("stats");
-      setIsMobileWorkspaceOpen(false);
-      return;
-    }
-
-    setViewMode("chat");
-    setIsMobileWorkspaceOpen(false);
-    if (!route.workspaceId) {
-      setActiveChatId(null);
-      activeChatKeyRef.current = null;
-      setMessages([]);
-      return;
-    }
-
-    if (!workspaces.some((workspace) => workspace.id === route.workspaceId)) {
-      setError(`Workspace not found: ${route.workspaceId}`);
-      return;
-    }
-
-    if (route.chatId) {
-      selectWorkspaceChat(route.workspaceId, route.chatId, {
-        updateUrl: false,
-      });
-      return;
-    }
-
-    startNewWorkspaceChat(route.workspaceId, { updateUrl: false });
-  }
-
   applyBrowserRouteRef.current = applyBrowserRoute;
 
-  useEffect(() => {
-    if (
-      !canUseApp ||
-      isLoading ||
-      hasAppliedInitialBrowserRouteRef.current
-    ) {
-      return;
-    }
+  useInitialBrowserRouteEffect({
+    canUseApp,
+    hasAppliedInitialBrowserRouteRef,
+    initialBrowserRoute,
+    isLoading,
+    onApplyRoute: applyBrowserRoute,
+    onReplaceRoute: (route) => updateBrowserRoute(route, "replace"),
+  });
 
-    hasAppliedInitialBrowserRouteRef.current = true;
-    applyBrowserRoute(initialBrowserRoute);
-    updateBrowserRoute(initialBrowserRoute, "replace");
-  }, [canUseApp, initialBrowserRoute, isLoading, updateBrowserRoute]);
-
-  useEffect(() => {
-    function handlePopState() {
-      applyBrowserRouteRef.current(currentBrowserRoute());
-    }
-
-    window.addEventListener("popstate", handlePopState);
-    return () => {
-      window.removeEventListener("popstate", handlePopState);
-    };
-  }, []);
+  useBrowserPopState(applyBrowserRouteRef);
 
   async function handleCancelRun() {
     const currentChatKey = activeChatKeyRef.current;
@@ -6496,17 +6405,23 @@ function ApiStatsPanel({
   workspaces: WorkspaceSummary[];
 }) {
   const { language, t } = useI18n();
-  const [filters, setFilters] = useState<AiStatsFilterState>(
-    emptyAiStatsFilters,
-  );
-  const [stats, setStats] = useState<AiStatisticsResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-  const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null);
-  const [detail, setDetail] = useState<AiRequestDetailResponse | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
-  const [isLoadingDetail, setIsLoadingDetail] = useState(false);
-  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const {
+    closeRequestDetail,
+    copiedKey,
+    copyAuditText,
+    detail,
+    detailError,
+    error,
+    filters,
+    goToAuditPage: updateAuditPage,
+    isLoading,
+    isLoadingDetail,
+    loadStats,
+    openRequestDetail,
+    selectedRequestId,
+    stats,
+    updateAuditFilters,
+  } = useAiStatisticsData();
   const [visibleColumnIds, setVisibleColumnIds] = useState<
     Set<AiStatsColumnId>
   >(readAiStatsVisibleColumnIds);
@@ -6685,20 +6600,8 @@ function ApiStatsPanel({
     visibleColumnIds.has(column.id),
   );
 
-  function updateAuditFilters(update: Partial<AiStatsFilterState>) {
-    setFilters((current) => ({
-      ...current,
-      ...update,
-      page: "1",
-    }));
-  }
-
   function goToAuditPage(page: number) {
-    const maxPage = Math.max(1, totalPages);
-    setFilters((current) => ({
-      ...current,
-      page: String(Math.min(maxPage, Math.max(1, page))),
-    }));
+    updateAuditPage(page, totalPages);
   }
 
   function toggleAiStatsColumn(columnId: AiStatsColumnId) {
@@ -6718,63 +6621,9 @@ function ApiStatsPanel({
     });
   }
 
-  const loadStats = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
-
-    try {
-      const query = aiStatsQuery(filters);
-      const data = await requestJson<AiStatisticsResponse>(
-        `/api/ai-statistics${query ? `?${query}` : ""}`,
-      );
-      setStats(data);
-    } catch (requestError) {
-      setError(errorMessage(requestError));
-    } finally {
-      setIsLoading(false);
-    }
-  }, [filters]);
-
-  useEffect(() => {
-    void loadStats();
-  }, [loadStats]);
-
   useEffect(() => {
     writeAiStatsVisibleColumnIds(visibleColumnIds);
   }, [visibleColumnIds]);
-
-  async function openRequestDetail(request: AiRequestAuditSummary) {
-    setSelectedRequestId(request.id);
-    setDetail(null);
-    setDetailError(null);
-    setCopiedKey(null);
-    setIsLoadingDetail(true);
-
-    try {
-      const data = await requestJson<AiRequestDetailResponse>(
-        `/api/workspaces/${encodeURIComponent(
-          request.workspaceId,
-        )}/ai-statistics/${encodeURIComponent(request.id)}`,
-      );
-      setDetail(data);
-    } catch (requestError) {
-      setDetailError(errorMessage(requestError));
-    } finally {
-      setIsLoadingDetail(false);
-    }
-  }
-
-  async function copyAuditText(key: string, text: string) {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopiedKey(key);
-      window.setTimeout(() => {
-        setCopiedKey((current) => (current === key ? null : current));
-      }, 1600);
-    } catch (copyError) {
-      setDetailError(errorMessage(copyError));
-    }
-  }
 
   return (
     <div className="panel-scroll h-full min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
@@ -7093,12 +6942,7 @@ function ApiStatsPanel({
           detail={detail}
           error={detailError}
           isLoading={isLoadingDetail}
-          onClose={() => {
-            setSelectedRequestId(null);
-            setDetail(null);
-            setDetailError(null);
-            setCopiedKey(null);
-          }}
+          onClose={closeRequestDetail}
           onCopy={(key, text) => void copyAuditText(key, text)}
         />
       ) : null}
@@ -17356,51 +17200,9 @@ function formatLimit(value: number | null, label: string, language: AppLanguageI
     : `${label} ${formatNumber(value, language)}`;
 }
 
-function emptyAiStatsFilters(): AiStatsFilterState {
-  return {
-    chatId: "",
-    modelId: "",
-    page: "1",
-    pageSize: "20",
-    providerId: "",
-    startedAfter: "",
-    startedBefore: "",
-    status: "",
-    workspaceId: "",
-  };
-}
 
-function readAiStatsVisibleColumnIds(): Set<AiStatsColumnId> {
-  const savedValue = window.localStorage.getItem(AI_STATS_VISIBLE_COLUMNS_STORAGE_KEY);
-  if (!savedValue) {
-    return new Set(DEFAULT_AI_STATS_COLUMN_IDS);
-  }
 
-  const savedIds = JSON.parse(savedValue);
-  if (!Array.isArray(savedIds)) {
-    return new Set(DEFAULT_AI_STATS_COLUMN_IDS);
-  }
 
-  const visibleIds = savedIds.filter(isAiStatsColumnId);
-  return new Set(visibleIds.length ? visibleIds : DEFAULT_AI_STATS_COLUMN_IDS);
-}
-
-function writeAiStatsVisibleColumnIds(visibleColumnIds: Set<AiStatsColumnId>) {
-  const savedIds = AI_STATS_COLUMN_IDS.filter((columnId) =>
-    visibleColumnIds.has(columnId),
-  );
-  window.localStorage.setItem(
-    AI_STATS_VISIBLE_COLUMNS_STORAGE_KEY,
-    JSON.stringify(savedIds),
-  );
-}
-
-function isAiStatsColumnId(value: unknown): value is AiStatsColumnId {
-  return (
-    typeof value === "string" &&
-    (AI_STATS_COLUMN_IDS as readonly string[]).includes(value)
-  );
-}
 
 function emptyAiStatisticsSummary(): AiStatisticsSummary {
   return {
@@ -17667,29 +17469,6 @@ function aiOverviewQuery(filters: {
   }
   params.set("page", "1");
   params.set("pageSize", "1");
-
-  return params.toString();
-}
-
-function aiStatsQuery(filters: AiStatsFilterState) {
-  const params = new URLSearchParams();
-  const entries: [keyof AiStatsFilterState, string][] = [
-    ["workspaceId", filters.workspaceId],
-    ["chatId", filters.chatId],
-    ["providerId", filters.providerId],
-    ["modelId", filters.modelId],
-    ["status", filters.status],
-    ["startedAfter", datetimeLocalToRfc3339(filters.startedAfter)],
-    ["startedBefore", datetimeLocalToRfc3339(filters.startedBefore)],
-    ["page", filters.page.trim()],
-    ["pageSize", filters.pageSize.trim()],
-  ];
-
-  for (const [key, value] of entries) {
-    if (value) {
-      params.set(key, value);
-    }
-  }
 
   return params.toString();
 }
@@ -19483,45 +19262,7 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function responseErrorMessage(response: Response) {
-  const contentType = response.headers.get("content-type") ?? "";
 
-  if (contentType.includes("application/json")) {
-    const data = (await response.json()) as unknown;
-
-    if (isErrorResponse(data)) {
-      return data.error;
-    }
-  }
-
-  const text = await response.text();
-  return text || `request returned ${response.status}`;
-}
-
-async function requestJson<T>(
-  url: string,
-  init?: RequestInit,
-): Promise<T> {
-  const response = await fetch(url, {
-    cache: "no-store",
-    credentials: "same-origin",
-    ...init,
-  });
-  const contentType = response.headers.get("content-type") ?? "";
-  const data = contentType.includes("application/json")
-    ? ((await response.json()) as unknown)
-    : null;
-
-  if (!response.ok) {
-    if (isErrorResponse(data)) {
-      throw new Error(data.error);
-    }
-
-    throw new Error(`${url} returned ${response.status}`);
-  }
-
-  return data as T;
-}
 
 function nativePickerRequestInit(nativeBrowserToken: string): RequestInit {
   return {
@@ -19604,15 +19345,4 @@ function loadNativeProbeImage(url: string): Promise<boolean> {
   });
 }
 
-function isErrorResponse(value: unknown): value is { error: string } {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "error" in value &&
-    typeof value.error === "string"
-  );
-}
 
-function errorMessage(value: unknown) {
-  return value instanceof Error ? value.message : "Unknown error";
-}
