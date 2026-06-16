@@ -411,7 +411,7 @@ Exit condition:
 
 ## Phase 3: Runtime and Prompt Subsystems
 
-- [ ] Phase 3 complete
+- [x] Phase 3 complete
 
 Goal: isolate the highest-complexity backend logic after outer layers are already cleaner.
 
@@ -419,25 +419,25 @@ Goal: isolate the highest-complexity backend logic after outer layers are alread
 
 Move from `app/main.rs` into `app/runtime/`:
 
-- [ ] chat run queueing
-- [ ] stream subscription management
+- [x] chat run queueing
+- [x] stream subscription management
 - [x] tool call loop helpers
 - [x] tool output event plumbing
-- [ ] question registry runtime helpers
+- [x] question registry runtime helpers
 
 Move from `app/main.rs` into `app/prompt/`:
 
-- [ ] prompt assembly
-- [ ] prompt injection helpers
+- [x] prompt assembly
+- [x] prompt injection helpers
 - [x] environment prompt generation
-- [ ] context compression
+- [x] context compression
 - [x] prompt file loading
 
 Move from `app/main.rs` into `app/memory_runtime/`:
 
-- [ ] memory retrieval
-- [ ] ranking and FTS query helpers
-- [ ] memory usage summaries
+- [x] memory retrieval
+- [x] ranking and FTS query helpers
+- [x] memory usage summaries
 - [x] expiration helpers
 
 Important rule:
@@ -450,7 +450,7 @@ Risk note:
 
 Exit condition:
 
-- [ ] prompt assembly, tool execution, and memory retrieval are no longer buried in `app/main.rs`.
+- [x] prompt assembly, tool execution, and memory retrieval are no longer buried in `app/main.rs`.
 
 ## Phase 4: Frontend State and Effect Extraction
 
