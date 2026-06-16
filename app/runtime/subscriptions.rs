@@ -24,6 +24,7 @@ struct ActiveChatRun {
     workspace_id: String,
     chat_id: String,
     guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
+    accepting_guidance: bool,
     cancellation: ChatRunCancellation,
     events: Arc<Mutex<Vec<ChatRunEventFrame>>>,
     event_tx: broadcast::Sender<ChatRunEventFrame>,
@@ -132,6 +133,7 @@ impl ActiveChatRunRegistry {
                 workspace_id,
                 chat_id,
                 guidance_tx,
+                accepting_guidance: true,
                 cancellation: cancellation.clone(),
                 events: events.clone(),
                 event_tx: event_tx.clone(),
@@ -161,6 +163,14 @@ impl ActiveChatRunRegistry {
         }
     }
 
+    fn stop_accepting_guidance(&self, run_id: &str) {
+        if let Ok(mut runs) = self.runs.lock() {
+            if let Some(run) = runs.get_mut(run_id) {
+                run.accepting_guidance = false;
+            }
+        }
+    }
+
     pub(crate) fn active_run_for_chat(
         &self,
         workspace_id: &str,
@@ -170,12 +180,16 @@ impl ActiveChatRunRegistry {
             .runs
             .lock()
             .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
-        let mut matches = runs.iter().filter(|(_, run)| {
-            run.workspace_id == workspace_id
-                && run.chat_id == chat_id
-                && !*run.completed_rx.borrow()
-        });
-        let Some((run_id, run)) = matches.next() else {
+        let mut matches = runs
+            .iter()
+            .filter(|(_, run)| {
+                run.workspace_id == workspace_id
+                    && run.chat_id == chat_id
+                    && !*run.completed_rx.borrow()
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|(_, run)| !run.accepting_guidance);
+        let Some((run_id, run)) = matches.into_iter().next() else {
             return Ok(None);
         };
 
@@ -191,6 +205,7 @@ impl ActiveChatRunRegistry {
             workspace_id: run.workspace_id.clone(),
             chat_id: run.chat_id.clone(),
             last_sequence,
+            accepting_guidance: run.accepting_guidance,
         }))
     }
 
@@ -294,6 +309,11 @@ impl ActiveChatRunRegistry {
                 active_run.chat_id
             )));
         }
+        if !active_run.accepting_guidance {
+            return Err(ApiError::bad_request(format!(
+                "active chat run is no longer accepting guidance: {run_id}"
+            )));
+        }
 
         active_run.guidance_tx.send(guidance.clone()).map_err(|_| {
             ApiError::bad_request(format!(
@@ -362,6 +382,13 @@ impl ActiveChatRunRegistration {
             .map_err(|_| ApiError::internal("active chat run event cache lock is poisoned"))?
             .push(event_frame.clone());
         let _ = self.event_tx.send(event_frame);
+
+        if matches!(
+            event,
+            ChatSseEvent::Complete { .. } | ChatSseEvent::Error { .. }
+        ) {
+            self.registry.stop_accepting_guidance(&self.run_id);
+        }
 
         Ok(())
     }
@@ -463,6 +490,7 @@ pub(crate) struct ActiveChatRunSummary {
     workspace_id: String,
     chat_id: String,
     pub(crate) last_sequence: Option<i64>,
+    pub(crate) accepting_guidance: bool,
 }
 
 pub(crate) fn chat_run_subscription_stream(

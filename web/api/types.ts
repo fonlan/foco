@@ -74,6 +74,7 @@ export type ActiveChatRunSummary = {
   workspaceId: string;
   chatId: string;
   lastSequence: number | null;
+  acceptingGuidance: boolean;
 };
 
 export type ChatSummary = {
@@ -1293,6 +1294,7 @@ export type ActiveRunInfo = {
   runId: string | null;
   chatKey: string;
   lastSequence?: number | null;
+  acceptingGuidance: boolean;
 };
 
 // Settings response (aggregate type)

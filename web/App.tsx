@@ -2451,6 +2451,7 @@ export function App() {
       runInfo.workspaceId !== request.workspaceId ||
       runInfo.chatId !== request.chatId ||
       !runInfo.runId ||
+      !runInfo.acceptingGuidance ||
       !runningChatKeysRef.current.has(requestChatKey)
     ) {
       return null;
@@ -2692,6 +2693,7 @@ export function App() {
       !runInfo ||
       !runInfo.chatId ||
       !runInfo.runId ||
+      !runInfo.acceptingGuidance ||
       runInfo.chatKey !== chatKey ||
       !runningChatKeysRef.current.has(chatKey)
     ) {
@@ -3218,6 +3220,7 @@ export function App() {
     setChatRunning(chatKey, true);
     setChatRunFailed(chatKey, false);
     setActiveRunInfoForChatKey(chatKey, {
+      acceptingGuidance: activeRun.acceptingGuidance,
       chatId: activeRun.chatId,
       chatKey,
       lastSequence: activeRun.lastSequence,
@@ -3251,6 +3254,7 @@ export function App() {
           setChatRunFailed(chatKey, false);
           setChatRunning(chatKey, true);
           setActiveRunInfoForChatKey(chatKey, {
+            acceptingGuidance: true,
             chatId: streamEvent.chatId,
             chatKey,
             lastSequence: activeRun.lastSequence,
@@ -3317,6 +3321,7 @@ export function App() {
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
           setActiveRunInfoForChatKey(chatKey, {
+            acceptingGuidance: true,
             chatId: activeRun.chatId,
             chatKey,
             lastSequence: activeRun.lastSequence,
@@ -3395,6 +3400,8 @@ export function App() {
           refreshRunContextUsage();
           void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           setChatRunFailed(chatKey, false);
+          setChatRunning(chatKey, false);
+          setActiveRunInfoForChatKey(chatKey, null);
           setRetryRunRequest(null);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -3595,11 +3602,11 @@ export function App() {
     } finally {
       if (activeRunAbortByChatKeyRef.current.get(chatKey) === abortController) {
         activeRunAbortByChatKeyRef.current.delete(chatKey);
+        cancelScheduledContextUsageForChatKey(chatKey);
+        setChatRunning(chatKey, false);
+        setActiveRunInfoForChatKey(chatKey, null);
+        clearLiveChatStatistics(chatKey);
       }
-      cancelScheduledContextUsageForChatKey(chatKey);
-      setChatRunning(chatKey, false);
-      setActiveRunInfoForChatKey(chatKey, null);
-      clearLiveChatStatistics(chatKey);
       if (!streamHadError) {
         setPendingQuestion(null);
         setQuestionError(null);
@@ -3756,6 +3763,7 @@ export function App() {
     setDraftMessage("");
     setChatRunning(currentRunningChatKey, true);
     setActiveRunInfoForChatKey(currentRunningChatKey, {
+      acceptingGuidance: false,
       chatId: requestChatId,
       chatKey: currentRunningChatKey,
       runId: null,
@@ -3908,6 +3916,7 @@ export function App() {
           setChatRunning(currentRunningChatKey, true);
           activeRunId = streamEvent.llmRequestId ?? activeRunId;
           setActiveRunInfoForChatKey(currentRunningChatKey, {
+            acceptingGuidance: activeRunId !== null,
             chatId: streamEvent.chatId,
             chatKey: currentRunningChatKey,
             runId: activeRunId,
@@ -3985,6 +3994,7 @@ export function App() {
             currentAssistantMessageId = streamEvent.assistantMessageId;
           }
           setActiveRunInfoForChatKey(runMessagesKey, {
+            acceptingGuidance: activeRunId !== null,
             chatId: requestChatId,
             chatKey: runMessagesKey,
             runId: activeRunId,
@@ -4059,11 +4069,13 @@ export function App() {
           assistantDraftReasoning = "";
           latestResponseUsage = null;
           cancelScheduledContextUsageForChatKey(runMessagesKey);
+          setActiveRunInfoForChatKey(runMessagesKey, null);
           refreshRunContextUsage();
           if (requestChatId) {
             void loadChatStatistics(request.workspaceId, requestChatId);
           }
           setChatRunFailed(runMessagesKey, false);
+          setChatRunning(runMessagesKey, false);
           setRetryRunRequest(null);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -4291,11 +4303,11 @@ export function App() {
         abortController
       ) {
         activeRunAbortByChatKeyRef.current.delete(currentRunningChatKey);
+        cancelScheduledContextUsageForChatKey(currentRunningChatKey);
+        setChatRunning(currentRunningChatKey, false);
+        setActiveRunInfoForChatKey(currentRunningChatKey, null);
+        clearLiveChatStatistics(currentRunningChatKey);
       }
-      cancelScheduledContextUsageForChatKey(currentRunningChatKey);
-      setChatRunning(currentRunningChatKey, false);
-      setActiveRunInfoForChatKey(currentRunningChatKey, null);
-      clearLiveChatStatistics(currentRunningChatKey);
     }
 
     if (runSucceeded) {
@@ -4983,7 +4995,8 @@ export function App() {
                 chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
                 canGuideActiveRun={
                   activeRunInfo?.chatKey === activeChatKey &&
-                  activeRunInfo.runId !== null
+                  activeRunInfo.runId !== null &&
+                  activeRunInfo.acceptingGuidance
                 }
                 canUseNativePicker={canUseNativePicker}
                 draftAttachments={draftAttachments}
@@ -18991,6 +19004,11 @@ function normalizeActiveChatRunSummary(
   const workspaceId = stringField(value, "workspaceId", "workspace_id");
   const chatId = stringField(value, "chatId", "chat_id");
   const lastSequenceValue = fieldValue(value, "lastSequence", "last_sequence");
+  const acceptingGuidanceValue = fieldValue(
+    value,
+    "acceptingGuidance",
+    "accepting_guidance",
+  );
 
   if (!runId || !workspaceId || !chatId) {
     return null;
@@ -19002,6 +19020,7 @@ function normalizeActiveChatRunSummary(
     chatId,
     lastSequence:
       typeof lastSequenceValue === "number" ? lastSequenceValue : null,
+    acceptingGuidance: acceptingGuidanceValue === true,
   };
 }
 

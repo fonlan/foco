@@ -2068,6 +2068,87 @@ fn active_chat_run_registry_rejects_stale_guidance_run() {
 }
 
 #[test]
+fn active_chat_run_registry_rejects_guidance_after_complete_event() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-guidance-complete-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Complete guidance chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-1",
+            chat_id: "chat-1",
+            role: "user",
+            content: "Tell me something.",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("user message insert");
+    drop(database);
+
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            guidance_tx,
+        )
+        .expect("register active run");
+
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::Complete {
+                chat_id: "chat-1".to_string(),
+                assistant_message_id: "assistant-1".to_string(),
+                text: "Done.".to_string(),
+                reasoning: None,
+                usage: None,
+                stop_reason: Some("stop".to_string()),
+                metrics: ChatReplyMetrics {
+                    model_id: "model-1".to_string(),
+                    provider_id: "provider-1".to_string(),
+                    total_latency_ms: Some(1_000),
+                    first_token_latency_ms: Some(100),
+                    output_tokens: Some(5),
+                },
+                memories_used: Vec::new(),
+            },
+        )
+        .expect("complete record");
+
+    let summary = registry
+        .active_run_for_chat("workspace-1", "chat-1")
+        .expect("active run lookup")
+        .expect("run remains subscribable until stream end");
+    assert!(!summary.accepting_guidance);
+
+    let error = registry
+        .push_guidance(
+            "workspace-1",
+            ChatGuidanceRequest {
+                chat_id: "chat-1".to_string(),
+                run_id: "run-1".to_string(),
+                message: "Use this now.".to_string(),
+                attachments: Vec::new(),
+            },
+        )
+        .expect_err("completed run should reject guidance");
+
+    assert!(error.message.contains("no longer accepting guidance"));
+
+    drop(registration);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
 fn user_attachments_round_trip_into_neutral_history_and_message_parts() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-user-attachment-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
