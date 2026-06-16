@@ -146,6 +146,11 @@ pub enum ToolConflictError {
         first_call_id: String,
         second_call_id: String,
     },
+    MixedFileWriteMethods {
+        path: String,
+        first_call_id: String,
+        second_call_id: String,
+    },
     ResourceConflict {
         resource: ToolResource,
         first_call_id: String,
@@ -462,6 +467,7 @@ pub fn plan_tool_execution(
         analyzed_calls.push(AnalyzedToolCall {
             requires_sequential_execution: tool_call_requires_sequential_execution(&tool_call.name),
             locks,
+            file_write_kind: file_write_kind(&tool_call.name),
         });
     }
 
@@ -491,6 +497,12 @@ pub fn plan_tool_execution(
                 call_indices: vec![index],
             });
         } else {
+            push_parallel_group_before_matching_edit_file(
+                &mut groups,
+                &mut pending_parallel_indices,
+                &analyzed_calls,
+                analyzed_call,
+            );
             pending_parallel_indices.push(index);
         }
     }
@@ -565,10 +577,51 @@ pub fn tool_resource_locks_conflict(first: &ToolResourceLock, second: &ToolResou
         && accesses_conflict(first.access, second.access)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileWriteKind {
+    ReplaceExact,
+    LineRangeOrFull,
+}
+
 #[derive(Clone, Debug)]
 struct AnalyzedToolCall {
     requires_sequential_execution: bool,
     locks: Vec<ToolResourceLock>,
+    file_write_kind: Option<FileWriteKind>,
+}
+
+fn push_parallel_group_before_matching_edit_file(
+    groups: &mut Vec<ToolExecutionGroup>,
+    indices: &mut Vec<usize>,
+    analyzed_calls: &[AnalyzedToolCall],
+    current_call: &AnalyzedToolCall,
+) {
+    if current_call.file_write_kind != Some(FileWriteKind::ReplaceExact) {
+        return;
+    }
+
+    if indices.iter().any(|index| {
+        let pending_call = &analyzed_calls[*index];
+        pending_call.file_write_kind == Some(FileWriteKind::ReplaceExact)
+            && pending_call.locks.iter().any(|pending_lock| {
+                current_call
+                    .locks
+                    .iter()
+                    .any(|lock| edit_file_locks_overlap(pending_lock, lock))
+            })
+    }) {
+        push_parallel_group(groups, indices);
+    }
+}
+
+fn edit_file_locks_overlap(first: &ToolResourceLock, second: &ToolResourceLock) -> bool {
+    first.access == ToolResourceAccess::Write
+        && second.access == ToolResourceAccess::Write
+        && matches!(
+            (&first.resource, &second.resource),
+            (ToolResource::File(_), ToolResource::File(_))
+        )
+        && resources_overlap(&first.resource, &second.resource)
 }
 
 fn push_parallel_group(groups: &mut Vec<ToolExecutionGroup>, indices: &mut Vec<usize>) {
@@ -598,11 +651,36 @@ fn reject_conflicting_parallel_tool_calls(
                 && second_lock.access == ToolResourceAccess::Write
             {
                 if let ToolResource::File(path) = &first_lock.resource {
-                    return Err(ToolConflictError::SameFileWrite {
-                        path: path.clone(),
-                        first_call_id: first_call.id.clone(),
-                        second_call_id: second_call.id.clone(),
-                    });
+                    if first_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
+                        && second_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
+                    {
+                        continue;
+                    }
+
+                    return Err(
+                        match (
+                            first_analysis.file_write_kind,
+                            second_analysis.file_write_kind,
+                        ) {
+                            (
+                                Some(FileWriteKind::ReplaceExact),
+                                Some(FileWriteKind::LineRangeOrFull),
+                            )
+                            | (
+                                Some(FileWriteKind::LineRangeOrFull),
+                                Some(FileWriteKind::ReplaceExact),
+                            ) => ToolConflictError::MixedFileWriteMethods {
+                                path: path.clone(),
+                                first_call_id: first_call.id.clone(),
+                                second_call_id: second_call.id.clone(),
+                            },
+                            _ => ToolConflictError::SameFileWrite {
+                                path: path.clone(),
+                                first_call_id: first_call.id.clone(),
+                                second_call_id: second_call.id.clone(),
+                            },
+                        },
+                    );
                 }
             }
 
@@ -628,6 +706,14 @@ fn tool_call_requires_sequential_execution(tool_name: &str) -> bool {
             | UPDATE_TODO_GRAPH_TOOL_NAME
             | MEMORY_WRITE_TOOL_NAME
     ) || tool_name.starts_with(MCP_TOOL_NAME_PREFIX)
+}
+
+fn file_write_kind(tool_name: &str) -> Option<FileWriteKind> {
+    match tool_name {
+        EDIT_FILE_TOOL_NAME => Some(FileWriteKind::ReplaceExact),
+        WRITE_FILE_TOOL_NAME => Some(FileWriteKind::LineRangeOrFull),
+        _ => None,
+    }
 }
 
 fn required_path(tool_call: &PendingToolCall) -> Result<String, ToolConflictError> {
@@ -755,6 +841,14 @@ impl fmt::Display for ToolConflictError {
             } => write!(
                 formatter,
                 "same-file write conflict for '{path}' between tool calls '{first_call_id}' and '{second_call_id}'"
+            ),
+            Self::MixedFileWriteMethods {
+                path,
+                first_call_id,
+                second_call_id,
+            } => write!(
+                formatter,
+                "same-file edit_file/write_file conflict for '{path}' between tool calls '{first_call_id}' and '{second_call_id}'; call multiple edit_file operations sequentially, but do not batch edit_file with write_file for the same file because edit_file can change line numbers used by write_file"
             ),
             Self::ResourceConflict {
                 resource,
@@ -978,7 +1072,7 @@ mod tests {
     }
 
     #[test]
-    fn detects_same_file_write_conflicts_inside_one_turn() {
+    fn rejects_same_file_write_file_and_edit_file_inside_one_turn() {
         let calls = vec![
             PendingToolCall {
                 id: "call-a".to_string(),
@@ -996,10 +1090,44 @@ mod tests {
 
         assert_eq!(
             error,
-            ToolConflictError::SameFileWrite {
+            ToolConflictError::MixedFileWriteMethods {
                 path: "src/main.rs".to_string(),
                 first_call_id: "call-a".to_string(),
                 second_call_id: "call-c".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn plans_same_file_edit_files_as_ordered_groups() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-a".to_string(),
+                name: EDIT_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": "src/main.rs" }),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: EDIT_FILE_TOOL_NAME.to_string(),
+                arguments: json!({ "path": ".\\src\\main.rs" }),
+            },
+        ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![0],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![1],
+                    },
+                ]
             }
         );
     }
