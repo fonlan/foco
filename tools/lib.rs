@@ -2483,7 +2483,7 @@ fn web_search_definition() -> ToolDefinition {
 fn web_fetch_definition() -> ToolDefinition {
     ToolDefinition {
         name: WEB_FETCH_TOOL,
-        description: "Fetch an HTTP or HTTPS URL and return its readable text content with basic page metadata. Use this when the user provides a URL or when page details are needed from a known URL.",
+        description: "Fetch an HTTP or HTTPS URL and return readable text content with basic page metadata. For large pages, full fetches fail with an instruction to retry using a 1-based inclusive line range.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2492,12 +2492,22 @@ fn web_fetch_definition() -> ToolDefinition {
                     "type": "string",
                     "description": "HTTP or HTTPS URL to fetch."
                 },
+                "startLine": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Optional 1-based first readable-text line to return. Must be set together with endLine; null requests the full page."
+                },
+                "endLine": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "description": "Optional 1-based last readable-text line to return, inclusive. Must be set together with startLine; values beyond the page line count read through the final line."
+                },
                 "timeoutMs": {
                     "type": ["integer", "null"],
                     "description": "Optional tool timeout in milliseconds. Defaults to 15000."
                 }
             },
-            "required": ["url", "timeoutMs"]
+            "required": ["url", "startLine", "endLine", "timeoutMs"]
         }),
         strict: true,
     }

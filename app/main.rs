@@ -192,6 +192,7 @@ const DEFAULT_WEB_SEARCH_RESULT_LIMIT: usize = 5;
 const MAX_WEB_SEARCH_RESULT_LIMIT: usize = 10;
 const MAX_WEB_FETCH_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEB_FETCH_TEXT_CHARS: usize = 40_000;
+const MAX_WEB_FETCH_RANGED_TEXT_CHARS: usize = 40_000;
 const FOCO_WEB_USER_AGENT: &str = "Foco/0.1";
 // Timeout for model-based memory retrieval during prompt assembly.
 const MEMORY_RETRIEVAL_TIMEOUT_MS: u64 = 30_000;
@@ -6466,6 +6467,8 @@ struct WebSearchToolInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WebFetchToolInput {
     url: String,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
     timeout_ms: Option<u64>,
 }
 
@@ -12800,6 +12803,7 @@ async fn brave_search(
 
 async fn execute_web_fetch(input: WebFetchToolInput, timeout: Duration) -> Result<Value, String> {
     web_tool_timeout_ms_from_input(input.timeout_ms)?;
+    let requested_line_range = parse_web_fetch_line_range(input.start_line, input.end_line)?;
     let url = parse_fetch_url(&input.url)?;
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -12850,9 +12854,28 @@ async fn execute_web_fetch(input: WebFetchToolInput, timeout: Duration) -> Resul
     {
         (html_title(&raw_text), html_to_text(&raw_text))
     } else {
-        (None, raw_text)
+        (None, normalize_web_text(&raw_text))
     };
-    let (text, truncated) = truncate_chars(text.trim().to_string(), MAX_WEB_FETCH_TEXT_CHARS);
+    let text = text.trim().to_string();
+    let line_count = web_text_line_count(&text);
+    let char_count = text.chars().count();
+    let (text, start_line, end_line, truncated) = if let Some(range) = requested_line_range {
+        let range = normalize_web_fetch_line_range(range, line_count)?;
+        let ranged_text = web_text_line_range(&text, range);
+        if ranged_text.chars().count() > MAX_WEB_FETCH_RANGED_TEXT_CHARS {
+            return Err(format!(
+                "web_fetch line range output is too large (max {MAX_WEB_FETCH_RANGED_TEXT_CHARS} characters); use a smaller line range"
+            ));
+        }
+        (ranged_text, Some(range.0), Some(range.1), false)
+    } else {
+        if char_count > MAX_WEB_FETCH_TEXT_CHARS {
+            return Err(format!(
+                "web_fetch readable text is too large for a full read ({char_count} characters across {line_count} lines; max {MAX_WEB_FETCH_TEXT_CHARS}). Retry web_fetch with a smaller 1-based inclusive line range by setting startLine and endLine."
+            ));
+        }
+        (text, None, None, false)
+    };
 
     Ok(json!({
         "url": input.url,
@@ -12863,6 +12886,9 @@ async fn execute_web_fetch(input: WebFetchToolInput, timeout: Duration) -> Resul
         "text": text,
         "truncated": truncated,
         "bytes": bytes.len(),
+        "lineCount": line_count,
+        "startLine": start_line,
+        "endLine": end_line,
         "timeoutMs": timeout.as_millis().min(u128::from(u64::MAX)) as u64
     }))
 }
@@ -12906,6 +12932,58 @@ fn parse_fetch_url(value: &str) -> Result<reqwest::Url, String> {
             "web_fetch only supports http and https URLs, got '{scheme}'"
         )),
     }
+}
+
+fn parse_web_fetch_line_range(
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> Result<Option<(usize, usize)>, String> {
+    match (start_line, end_line) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) if start > 0 && start <= end => Ok(Some((start, end))),
+        (Some(_), Some(_)) => Err(
+            "startLine and endLine must be a 1-based inclusive range with startLine <= endLine"
+                .to_string(),
+        ),
+        _ => Err(
+            "startLine and endLine must both be null for full-page fetches or both be integers for ranged fetches"
+                .to_string(),
+        ),
+    }
+}
+
+fn normalize_web_fetch_line_range(
+    range: (usize, usize),
+    line_count: usize,
+) -> Result<(usize, usize), String> {
+    if line_count == 0 || range.0 > line_count {
+        return Err(format!(
+            "web_fetch line range {}-{} is outside the readable text; text has {line_count} lines",
+            range.0, range.1
+        ));
+    }
+
+    Ok((range.0, range.1.min(line_count)))
+}
+
+fn web_text_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.lines().count()
+    }
+}
+
+fn web_text_line_range(text: &str, range: (usize, usize)) -> String {
+    text.lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line_number = index + 1;
+            (line_number >= range.0 && line_number <= range.1)
+                .then(|| format!("{line_number}\t{line}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn format_web_status_error(context: &str, status: reqwest::StatusCode, body: &str) -> String {
