@@ -1,0 +1,28 @@
+export function workspaceItemClass(active: boolean) {
+  return `workspace-item flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-sm font-semibold ${
+    active ? "workspace-item-active text-teal-950" : "text-stone-700"
+  }`;
+}
+
+export function workspaceNameFromPath(path: string) {
+  const trimmedPath = path.trim().replace(/[\\/]+$/g, "");
+  const parts = trimmedPath.split(/[\\/]+/);
+
+  return parts.at(-1) ?? "";
+}
+
+export function workspaceMenuClass(active: boolean) {
+  return `workspace-menu flex min-w-0 items-center gap-1 rounded-xl border px-1.5 py-1 transition-colors ${
+    active
+      ? "workspace-menu-active border-teal-200 bg-teal-50 text-teal-950 shadow-sm"
+      : "border-transparent bg-stone-100/60 text-stone-700 hover:border-stone-200 hover:bg-white/90 hover:text-stone-950"
+  }`;
+}
+
+export function chatItemClass(active: boolean) {
+  return `chat-item flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-xs font-medium ${
+    active
+      ? "chat-item-active border-teal-100 bg-white text-stone-950 shadow-sm"
+      : "border-transparent text-stone-600 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
+  }`;
+}

@@ -1,0 +1,235 @@
+use std::fs;
+
+use axum::{
+    body::Body,
+    extract::{Path as AxumPath, State},
+    http::{header, StatusCode},
+    response::Response,
+    Json,
+};
+use foco_store::workspace::WorkspaceDatabase;
+use foco_tools::set_ripgrep_path;
+
+use crate::*;
+
+pub(crate) async fn workspaces(State(state): State<AppState>) -> Result<Json<WorkspacesResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+
+    workspace_response_from_config(&config, &state.active_chat_runs)
+}
+
+pub(crate) async fn add_workspace(
+    State(state): State<AppState>,
+    Json(request): Json<WorkspacePathRequest>,
+) -> Result<Json<WorkspacesResponse>, ApiError> {
+    let logo_content_base64 = request.content_base64.clone();
+    let logo = if logo_content_base64.is_some() {
+        let bytes = workspace_logo_request_bytes(&WorkspaceLogoRequest {
+            content_base64: logo_content_base64,
+        })?;
+        let kind = workspace_logo_kind(&bytes)?;
+        Some((bytes, kind))
+    } else {
+        None
+    };
+    let (name, requested_path) = validate_workspace_request(request)?;
+
+    if requested_path.exists() && !requested_path.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "workspace path exists but is not a directory: {}",
+            requested_path.display()
+        )));
+    }
+
+    if !requested_path.exists() {
+        fs::create_dir_all(&requested_path).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to create workspace directory {}: {}",
+                requested_path.display(),
+                source
+            ))
+        })?;
+    }
+
+    let path = canonical_workspace_path(&requested_path)?;
+    let mut config = config_snapshot(&state)?;
+
+    reject_registered_workspace_path(&config, &path, None)?;
+    WorkspaceDatabase::open_or_create(&path).map_err(ApiError::from_workspace_error)?;
+
+    if let Some((bytes, kind)) = logo {
+        save_workspace_logo_file(&path, &bytes, kind)?;
+    }
+
+    let id = unique_workspace_id(&config, &name);
+    config.workspaces.insert(
+        0,
+        WorkspaceConfig {
+            id,
+            name,
+            path,
+            pinned: false,
+            terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
+        },
+    );
+    save_config(&state, config.clone())?;
+    sync_all_mcp_workspaces(&state.mcp_registry, &config)
+        .await
+        .map_err(ApiError::from_mcp_error)?;
+
+    workspace_response_from_config(&config, &state.active_chat_runs)
+}
+
+pub(crate) async fn save_workspace_settings(
+    State(state): State<AppState>,
+    Json(request): Json<ManualWorkspaceRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let workspace_id = request.id.trim();
+    let name = request.name.trim();
+    let requested_path = validate_workspace_path(&request.path)?;
+    let terminal_shell = normalize_terminal_shell(&request.terminal_shell)?;
+    let common_commands = normalize_workspace_common_commands(&request.common_commands)?;
+
+    if workspace_id.is_empty() {
+        return Err(ApiError::bad_request("workspace id must not be empty"));
+    }
+
+    if name.is_empty() {
+        return Err(ApiError::bad_request("workspace name must not be empty"));
+    }
+
+    if requested_path.exists() && !requested_path.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "workspace path exists but is not a directory: {}",
+            requested_path.display()
+        )));
+    }
+
+    if !requested_path.exists() {
+        fs::create_dir_all(&requested_path).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to create workspace directory {}: {}",
+                requested_path.display(),
+                source
+            ))
+        })?;
+    }
+
+    let path = canonical_workspace_path(&requested_path)?;
+    reject_registered_workspace_path(&config, &path, Some(workspace_id))?;
+
+    let workspace = config
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.id == workspace_id)
+        .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
+
+    workspace.name = name.to_string();
+    workspace.path = path;
+    workspace.pinned = request.pinned;
+    workspace.terminal_shell = terminal_shell;
+    workspace.common_commands = common_commands;
+    group_pinned_workspaces(&mut config.workspaces);
+
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
+pub(crate) async fn save_workspace_order(
+    State(state): State<AppState>,
+    Json(request): Json<WorkspaceOrderRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+
+    reorder_workspaces(&mut config.workspaces, request.workspace_ids)?;
+    group_pinned_workspaces(&mut config.workspaces);
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
+pub(crate) async fn workspace_logo(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let Some(logo) = workspace_logo_file(&workspace.path)? else {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("workspace logo was not found"))
+            .expect("workspace logo response is valid"));
+    };
+    let (bytes, _) = read_workspace_logo_file(&logo.path)?;
+    let kind = workspace_logo_kind(&bytes)?;
+    if kind != logo.kind {
+        return Err(ApiError::bad_request(format!(
+            "workspace logo changed while it was being read: {}",
+            logo.path.display()
+        )));
+    }
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, kind.content_type)
+        .header(header::CACHE_CONTROL, "private, max-age=60")
+        .body(Body::from(bytes))
+        .expect("workspace logo response is valid"))
+}
+
+pub(crate) async fn save_workspace_logo(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<WorkspaceLogoRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let bytes = workspace_logo_request_bytes(&request)?;
+    let kind = workspace_logo_kind(&bytes)?;
+
+    save_workspace_logo_file(&workspace.path, &bytes, kind)?;
+
+    settings_response(&state, &config).await
+}
+
+pub(crate) async fn clear_workspace_logo(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+
+    clear_workspace_logo_file(&workspace.path)?;
+
+    settings_response(&state, &config).await
+}
+
+pub(crate) async fn install_ripgrep(
+    State(state): State<AppState>,
+) -> Result<Json<InstallRipgrepResponse>, ApiError> {
+    let _install_guard = state.ripgrep_install_lock.lock().await;
+    let install_dir = {
+        let status = state
+            .ripgrep_status
+            .lock()
+            .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
+        status.install_dir.clone()
+    };
+    let status = download_and_install_ripgrep(&install_dir).await?;
+    set_ripgrep_path(status.path.clone());
+    {
+        let mut current = state
+            .ripgrep_status
+            .lock()
+            .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
+        *current = status.clone();
+    }
+
+    Ok(Json(InstallRipgrepResponse {
+        ripgrep: ripgrep_tool_summary(&status),
+    }))
+}
+

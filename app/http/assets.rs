@@ -9,7 +9,7 @@ use rust_embed::Embed;
 
 #[derive(Embed)]
 #[folder = "../web/dist"]
-struct WebAssets;
+pub(crate) struct WebAssets;
 
 pub(crate) async fn static_asset(uri: axum::http::Uri) -> Response {
     let request_path = uri.path().trim_start_matches('/');

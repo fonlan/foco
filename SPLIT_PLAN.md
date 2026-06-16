@@ -339,7 +339,7 @@ Exit condition:
 
 ## Phase 2: Route and Panel Extraction
 
-- [ ] Phase 2 complete
+- [x] Phase 2 complete
 
 Goal: turn giant entry files into composition roots.
 
@@ -347,14 +347,14 @@ Goal: turn giant entry files into composition roots.
 
 Split `app/main.rs` handlers by domain:
 
-- [ ] `app/http/auth.rs`
-- [ ] `app/http/workspaces.rs`
-- [ ] `app/http/settings.rs`
-- [ ] `app/http/hooks.rs`
-- [ ] `app/http/memory.rs`
-- [ ] `app/http/chat.rs`
-- [ ] `app/http/git.rs`
-- [ ] `app/http/terminal.rs`
+- [x] `app/http/auth.rs`
+- [x] `app/http/workspaces.rs`
+- [x] `app/http/settings.rs`
+- [x] `app/http/hooks.rs`
+- [x] `app/http/memory.rs`
+- [x] `app/http/chat.rs`
+- [x] `app/http/git.rs`
+- [x] `app/http/terminal.rs`
 
 Leave in `main.rs`:
 
@@ -365,15 +365,15 @@ Leave in `main.rs`:
 
 Preferred order:
 
-- [ ] auth
-- [ ] assets
-- [ ] git
-- [ ] terminal
-- [ ] workspaces
-- [ ] hooks
-- [ ] settings
-- [ ] memory
-- [ ] chat
+- [x] auth
+- [x] assets
+- [x] git
+- [x] terminal
+- [x] workspaces
+- [x] hooks
+- [x] settings
+- [x] memory
+- [x] chat
 
 Reason for this order:
 
@@ -386,10 +386,10 @@ Split UI by feature.
 
 Move next:
 
-- [ ] leaf chat rendering blocks into `web/features/chat/`
-- [ ] terminal panel pieces into `web/features/terminal/`
-- [ ] workspace shell components into `web/features/workspaces/`
-- [ ] dialog components into their relevant feature folders
+- [x] leaf chat rendering blocks into `web/features/chat/`
+- [x] terminal panel pieces into `web/features/terminal/`
+- [x] workspace shell components into `web/features/workspaces/`
+- [x] dialog components into their relevant feature folders
 
 Leave in `App.tsx`:
 
@@ -399,15 +399,15 @@ Leave in `App.tsx`:
 
 Preferred order:
 
-- [ ] leaf components with small prop surfaces
-- [ ] terminal feature
-- [ ] workspace shell
-- [ ] larger chat panel structure
+- [x] leaf components with small prop surfaces
+- [x] terminal feature
+- [x] workspace shell
+- [x] larger chat panel structure
 
 Exit condition:
 
-- [ ] `app/main.rs` reads like an entrypoint, not an application dump.
-- [ ] `web/App.tsx` reads like an app shell, not a monolith of every component.
+- [x] `app/main.rs` reads like an entrypoint, not an application dump.
+- [x] `web/App.tsx` reads like an app shell, not a monolith of every component.
 
 ## Phase 3: Runtime and Prompt Subsystems
 
@@ -421,24 +421,24 @@ Move from `app/main.rs` into `app/runtime/`:
 
 - [ ] chat run queueing
 - [ ] stream subscription management
-- [ ] tool call loop helpers
-- [ ] tool output event plumbing
+- [x] tool call loop helpers
+- [x] tool output event plumbing
 - [ ] question registry runtime helpers
 
 Move from `app/main.rs` into `app/prompt/`:
 
 - [ ] prompt assembly
 - [ ] prompt injection helpers
-- [ ] environment prompt generation
+- [x] environment prompt generation
 - [ ] context compression
-- [ ] prompt file loading
+- [x] prompt file loading
 
 Move from `app/main.rs` into `app/memory_runtime/`:
 
 - [ ] memory retrieval
 - [ ] ranking and FTS query helpers
 - [ ] memory usage summaries
-- [ ] expiration helpers
+- [x] expiration helpers
 
 Important rule:
 
