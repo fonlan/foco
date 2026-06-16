@@ -1198,6 +1198,51 @@ describe("App verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("stops reading after the stream end event without surfacing transport close errors", async () => {
+    render(<App />);
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "finish cleanly",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        text: "Done without transport error.",
+        type: "complete",
+        metrics: {
+          firstTokenLatencyMs: 100,
+          modelId: "gpt-test",
+          outputTokens: 4,
+          providerId: "openai",
+          totalLatencyMs: 500,
+        },
+        reasoning: null,
+        stopReason: null,
+        usage: null,
+      });
+      enqueueChatStreamEvent({ type: "streamEnd" });
+    });
+
+    expect(await screen.findByText("Done without transport error.")).toBeInTheDocument();
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      activeChatStreamController?.error(new TypeError("network error"));
+    });
+
+    expect(screen.queryByText("network error")).not.toBeInTheDocument();
+    expect(screen.getByText("Model: gpt-test")).toBeInTheDocument();
+  });
+
   it("localizes completed tool status and uses success color", async () => {
     const zhSettings = {
       ...settings,

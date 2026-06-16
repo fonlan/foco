@@ -1120,6 +1120,7 @@ type ChatStreamEvent =
       metrics: ChatReplyMetrics;
       memoriesUsed: ChatMemoryUsedSummary[];
     }
+  | { type: "streamEnd" }
   | {
       type: "toolCall";
       assistantMessageId: string;
@@ -5568,6 +5569,10 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "streamEnd") {
+          return;
+        }
+
         if (streamEvent.type === "error") {
           streamHadError = true;
           setChatRunFailed(chatKey, true);
@@ -6238,6 +6243,10 @@ export function App() {
                 : message,
             ),
           );
+          return;
+        }
+
+        if (streamEvent.type === "streamEnd") {
           return;
         }
 
@@ -23300,8 +23309,15 @@ async function readChatStream(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let shouldStopReading = false;
+  const handleEvent = (event: ChatStreamEvent) => {
+    onEvent(event);
+    if (event.type === "streamEnd") {
+      shouldStopReading = true;
+    }
+  };
 
-  while (true) {
+  while (!shouldStopReading) {
     const { done, value } = await reader.read();
 
     if (done) {
@@ -23309,11 +23325,16 @@ async function readChatStream(
     }
 
     buffer += decoder.decode(value, { stream: true });
-    buffer = readSseFrames(buffer, onEvent);
+    buffer = readSseFrames(buffer, handleEvent);
+  }
+
+  if (shouldStopReading) {
+    await reader.cancel();
+    return;
   }
 
   buffer += decoder.decode();
-  readSseFrames(`${buffer}\n\n`, onEvent);
+  readSseFrames(`${buffer}\n\n`, handleEvent);
 }
 
 function readSseFrames(
@@ -23748,6 +23769,10 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       assistantMessageId,
       memoriesUsed,
     };
+  }
+
+  if (value.type === "streamEnd" || value.type === "stream_end") {
+    return { type: "streamEnd" };
   }
 
   if (value.type === "error") {

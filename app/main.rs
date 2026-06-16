@@ -6221,6 +6221,7 @@ enum ChatSseEvent {
         metrics: ChatReplyMetrics,
         memories_used: Vec<ChatMemoryUsedSummary>,
     },
+    StreamEnd,
     Error {
         message: String,
     },
@@ -6914,6 +6915,7 @@ fn chat_run_subscription_stream(
         }
 
         if *subscription.completed_rx.borrow() {
+            yield Ok(sse_event(&ChatSseEvent::StreamEnd));
             return;
         }
 
@@ -6927,6 +6929,7 @@ fn chat_run_subscription_stream(
                                 yield Ok(sse_event_payload(&event.payload_json));
                             }
                         }
+                        yield Ok(sse_event(&ChatSseEvent::StreamEnd));
                         return;
                     }
                 }
@@ -16457,6 +16460,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::MemoryResolved { .. } => "memory_resolved",
         ChatSseEvent::Usage { .. } => "usage",
         ChatSseEvent::Complete { .. } => "completion",
+        ChatSseEvent::StreamEnd => "stream_end",
         ChatSseEvent::Error { .. } => "error",
     };
 
