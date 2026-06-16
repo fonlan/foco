@@ -1029,44 +1029,116 @@ pub(crate) fn persist_chat_result(
     Ok(memory_extraction)
 }
 
+pub(crate) fn persist_running_llm_request(
+    context: &PreparedChatContext,
+    request_id: &str,
+    request_started_at: &str,
+    request_body_json: &str,
+    events: &[CapturedAuditEvent],
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: request_id,
+            workspace_id: &context.workspace_id,
+            chat_id: Some(&context.chat_id),
+            provider_id: &context.provider_id,
+            model_id: &context.model_id,
+            request_started_at,
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: Some(request_body_json),
+            response_body_json: None,
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    persist_llm_request_events(&mut database, request_id, events, 0)
+}
+
 fn persist_llm_request(
     database: &mut WorkspaceDatabase,
     context: &PreparedChatContext,
     request: &CapturedLlmRequest,
 ) -> Result<(), ApiError> {
-    database
-        .insert_llm_request(NewLlmRequest {
-            id: &request.id,
-            workspace_id: &context.workspace_id,
-            chat_id: Some(&context.chat_id),
-            provider_id: &context.provider_id,
-            model_id: &context.model_id,
-            request_started_at: &request.request_started_at,
-            first_token_at: request.outcome.first_token_at.as_deref(),
-            completed_at: Some(&request.outcome.completed_at),
-            input_tokens: request.outcome.input_tokens,
-            output_tokens: request.outcome.output_tokens,
-            cache_read_tokens: request.outcome.cache_read_tokens,
-            cache_write_tokens: request.outcome.cache_write_tokens,
-            first_token_latency_ms: request.outcome.first_token_latency_ms,
-            total_latency_ms: Some(request.outcome.total_latency_ms),
-            status_code: request.outcome.status_code,
-            final_state: request.outcome.final_state,
-            request_body_json: Some(&request.request_body_json),
-            response_body_json: request.outcome.response_body_json.as_deref(),
-        })
-        .map_err(ApiError::from_workspace_error)?;
+    if database
+        .llm_request(&request.id)
+        .map_err(ApiError::from_workspace_error)?
+        .is_some()
+    {
+        database
+            .update_llm_request_outcome(
+                &request.id,
+                UpdateLlmRequestOutcome {
+                    first_token_at: request.outcome.first_token_at.as_deref(),
+                    completed_at: Some(&request.outcome.completed_at),
+                    input_tokens: request.outcome.input_tokens,
+                    output_tokens: request.outcome.output_tokens,
+                    cache_read_tokens: request.outcome.cache_read_tokens,
+                    cache_write_tokens: request.outcome.cache_write_tokens,
+                    first_token_latency_ms: request.outcome.first_token_latency_ms,
+                    total_latency_ms: Some(request.outcome.total_latency_ms),
+                    status_code: request.outcome.status_code,
+                    final_state: request.outcome.final_state,
+                    response_body_json: request.outcome.response_body_json.as_deref(),
+                },
+            )
+            .map_err(ApiError::from_workspace_error)?;
+        let existing_event_count = database
+            .llm_request_events(&request.id)
+            .map_err(ApiError::from_workspace_error)?
+            .len();
+        persist_llm_request_events(database, &request.id, &request.events, existing_event_count)
+    } else {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: &request.id,
+                workspace_id: &context.workspace_id,
+                chat_id: Some(&context.chat_id),
+                provider_id: &context.provider_id,
+                model_id: &context.model_id,
+                request_started_at: &request.request_started_at,
+                first_token_at: request.outcome.first_token_at.as_deref(),
+                completed_at: Some(&request.outcome.completed_at),
+                input_tokens: request.outcome.input_tokens,
+                output_tokens: request.outcome.output_tokens,
+                cache_read_tokens: request.outcome.cache_read_tokens,
+                cache_write_tokens: request.outcome.cache_write_tokens,
+                first_token_latency_ms: request.outcome.first_token_latency_ms,
+                total_latency_ms: Some(request.outcome.total_latency_ms),
+                status_code: request.outcome.status_code,
+                final_state: request.outcome.final_state,
+                request_body_json: Some(&request.request_body_json),
+                response_body_json: request.outcome.response_body_json.as_deref(),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        persist_llm_request_events(database, &request.id, &request.events, 0)
+    }
+}
 
-    for (index, event) in request.events.iter().enumerate() {
+fn persist_llm_request_events(
+    database: &mut WorkspaceDatabase,
+    request_id: &str,
+    events: &[CapturedAuditEvent],
+    start_index: usize,
+) -> Result<(), ApiError> {
+    for (index, event) in events.iter().enumerate().skip(start_index) {
         let sequence = i64::try_from(index).map_err(|_| {
             ApiError::internal("too many LLM request events to fit SQLite sequence")
         })?;
-        let id = format!("{}-event-{sequence}", request.id);
+        let id = format!("{request_id}-event-{sequence}");
 
         database
             .insert_llm_request_event(NewLlmRequestEvent {
                 id: &id,
-                llm_request_id: &request.id,
+                llm_request_id: request_id,
                 sequence,
                 event_at: &event.event_at,
                 event_type: &event.event_type,

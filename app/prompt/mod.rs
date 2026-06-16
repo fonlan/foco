@@ -8,8 +8,8 @@ pub(crate) use compression::{
     compression_snapshot_message, context_usage_response, ensure_context_compression,
     interleaved_tool_state_messages, neutral_assistant_tool_call_message,
     neutral_message_estimated_tokens, neutral_tool_call_from_record, pack_neutral_messages,
-    persist_chat_result, recover_after_tool_round_cap, serialize_provider_request,
-    snapshot_covered_sequences,
+    persist_chat_result, persist_running_llm_request, recover_after_tool_round_cap,
+    serialize_provider_request, snapshot_covered_sequences,
 };
 pub(crate) use environment::environment_context_message;
 #[cfg(not(windows))]

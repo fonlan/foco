@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { errorMessage, requestJson } from "../../api/client";
 import type {
@@ -7,6 +7,8 @@ import type {
   AiStatisticsResponse,
   AiStatsFilterState,
 } from "../../api/types";
+
+const AI_STATS_POLL_INTERVAL_MS = 1000;
 
 export function emptyAiStatsFilters(): AiStatsFilterState {
   return {
@@ -34,26 +36,72 @@ export function useAiStatisticsData() {
   const [detailError, setDetailError] = useState<string | null>(null);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const selectedRequestRef = useRef<AiRequestAuditSummary | null>(null);
 
-  const loadStats = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
+  const loadRequestDetail = useCallback(
+    async (request: AiRequestAuditSummary, showLoading: boolean) => {
+      setDetailError(null);
+      if (showLoading) {
+        setDetail(null);
+        setCopiedKey(null);
+        setIsLoadingDetail(true);
+      }
 
-    try {
-      const query = aiStatsQuery(filters);
-      const data = await requestJson<AiStatisticsResponse>(
-        `/api/ai-statistics${query ? `?${query}` : ""}`,
-      );
-      setStats(data);
-    } catch (requestError) {
-      setError(errorMessage(requestError));
-    } finally {
-      setIsLoading(false);
-    }
-  }, [filters]);
+      try {
+        const data = await requestJson<AiRequestDetailResponse>(
+          `/api/workspaces/${encodeURIComponent(
+            request.workspaceId,
+          )}/ai-statistics/${encodeURIComponent(request.id)}`,
+        );
+        setDetail(data);
+      } catch (requestError) {
+        setDetailError(errorMessage(requestError));
+      } finally {
+        if (showLoading) {
+          setIsLoadingDetail(false);
+        }
+      }
+    },
+    [],
+  );
+
+  const loadStats = useCallback(
+    async (showLoading = true) => {
+      if (showLoading) {
+        setIsLoading(true);
+      }
+      setError(null);
+
+      try {
+        const query = aiStatsQuery(filters);
+        const data = await requestJson<AiStatisticsResponse>(
+          `/api/ai-statistics${query ? `?${query}` : ""}`,
+        );
+        setStats(data);
+        if (selectedRequestRef.current) {
+          void loadRequestDetail(selectedRequestRef.current, false);
+        }
+      } catch (requestError) {
+        setError(errorMessage(requestError));
+      } finally {
+        if (showLoading) {
+          setIsLoading(false);
+        }
+      }
+    },
+    [filters, loadRequestDetail],
+  );
 
   useEffect(() => {
     void loadStats();
+  }, [loadStats]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      void loadStats(false);
+    }, AI_STATS_POLL_INTERVAL_MS);
+
+    return () => window.clearInterval(intervalId);
   }, [loadStats]);
 
   const updateAuditFilters = useCallback((update: Partial<AiStatsFilterState>) => {
@@ -74,26 +122,11 @@ export function useAiStatisticsData() {
 
   const openRequestDetail = useCallback(
     async (request: AiRequestAuditSummary) => {
+      selectedRequestRef.current = request;
       setSelectedRequestId(request.id);
-      setDetail(null);
-      setDetailError(null);
-      setCopiedKey(null);
-      setIsLoadingDetail(true);
-
-      try {
-        const data = await requestJson<AiRequestDetailResponse>(
-          `/api/workspaces/${encodeURIComponent(
-            request.workspaceId,
-          )}/ai-statistics/${encodeURIComponent(request.id)}`,
-        );
-        setDetail(data);
-      } catch (requestError) {
-        setDetailError(errorMessage(requestError));
-      } finally {
-        setIsLoadingDetail(false);
-      }
+      await loadRequestDetail(request, true);
     },
-    [],
+    [loadRequestDetail],
   );
 
   const copyAuditText = useCallback(async (key: string, text: string) => {
@@ -109,6 +142,7 @@ export function useAiStatisticsData() {
   }, []);
 
   const closeRequestDetail = useCallback(() => {
+    selectedRequestRef.current = null;
     setSelectedRequestId(null);
     setDetail(null);
     setDetailError(null);

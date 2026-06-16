@@ -106,8 +106,8 @@ use crate::prompt::{
     configured_prompt_messages, context_usage_response, ensure_context_compression,
     environment_context_message, interleaved_tool_state_messages,
     neutral_assistant_tool_call_message, pack_neutral_messages, persist_chat_result,
-    prepare_prompt_context, recover_after_tool_round_cap, serialize_provider_request,
-    system_prompt_summaries, tool_prompt_infos,
+    persist_running_llm_request, prepare_prompt_context, recover_after_tool_round_cap,
+    serialize_provider_request, system_prompt_summaries, tool_prompt_infos,
 };
 use crate::runtime::{
     ActiveChatRunRegistration, ActiveChatRunRegistry, ActiveChatRunSubscription,
@@ -3406,6 +3406,18 @@ impl PreparedChatContext {
 
                         return;
                     }
+                }
+                if let Err(error) = persist_running_llm_request(
+                    &self,
+                    &turn_llm_request_id,
+                    &turn_request_started_at,
+                    &turn_request_body_json,
+                    &turn_events,
+                ) {
+                    yield ChatSseEvent::Error {
+                        message: error.message,
+                    };
+                    return;
                 }
                 let attempt_start_event = ChatSseEvent::StreamAttemptStart {
                     assistant_message_id: self.assistant_message_id.clone(),
