@@ -20,14 +20,12 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 #[cfg(windows)]
-use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
+use windows::Win32::System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS};
 
 const MCP_TOOL_PREFIX: &str = "mcp__";
 const MCP_TOOL_SEPARATOR: &str = "__";
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(7);
 const DEFAULT_TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -435,7 +433,7 @@ fn start_stdio_transport(
     let command = rmcp::transport::which_command(command)?;
     let mut command = CommandWrap::from(command);
     command
-        .wrap(CreationFlags(PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW)))
+        .wrap(CreationFlags(CREATE_NO_WINDOW | DETACHED_PROCESS))
         .wrap(KillOnDrop)
         .wrap(JobObject);
     command.command_mut().args(args).current_dir(workspace_path);
