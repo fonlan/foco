@@ -843,6 +843,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "which",
  "windows",
 ]
 

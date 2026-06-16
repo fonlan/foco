@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
     path::Path,
+    process::Stdio,
     time::Duration,
 };
 
@@ -20,7 +21,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 #[cfg(windows)]
-use windows::Win32::System::Threading::{CREATE_NO_WINDOW, DETACHED_PROCESS};
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 const MCP_TOOL_PREFIX: &str = "mcp__";
 const MCP_TOOL_SEPARATOR: &str = "__";
@@ -430,15 +431,283 @@ fn start_stdio_transport(
     args: Vec<String>,
     workspace_path: &Path,
 ) -> std::io::Result<TokioChildProcess> {
-    let command = rmcp::transport::which_command(command)?;
-    let mut command = CommandWrap::from(command);
-    command
-        .wrap(CreationFlags(CREATE_NO_WINDOW | DETACHED_PROCESS))
-        .wrap(KillOnDrop)
-        .wrap(JobObject);
-    command.command_mut().args(args).current_dir(workspace_path);
+    // `npx`/`npm` resolve to `npx.cmd`/`npm.cmd` batch shims on Windows. Launching a
+    // `.cmd`/`.bat` from a GUI-subsystem (console-less) parent always attaches a
+    // `conhost.exe` console window to the outermost `cmd.exe`, regardless of
+    // `CREATE_NO_WINDOW` — this is the visible window whose title shows "npm exec"
+    // then the cmd.exe path. Resolve to the underlying `node.exe` + entry script so
+    // no `cmd.exe` is spawned at all; fall back to the raw shim if that fails.
+    let (program, args, direct_node) = resolve_consoleless_command(command, args)?;
 
-    TokioChildProcess::new(command)
+    let mut command = CommandWrap::from(tokio::process::Command::new(program));
+    command.wrap(CreationFlags(CREATE_NO_WINDOW));
+
+    // The process-wrap `JobObject` wrapper spawns the child with `CREATE_SUSPENDED`
+    // then resumes its threads. Under a Windows-Terminal-as-default-terminal host
+    // that suspend/resume dance defeats `CREATE_NO_WINDOW` and surfaces a visible
+    // console window. JobObject/KillOnDrop only matter for cleaning up child
+    // process trees (the npx.exe → node → cmd → node chain); a resolved direct
+    // node.exe entry has no child tree, so skip them and rely on tokio's
+    // `kill_on_drop` instead. The shim fallback path still needs JobObject.
+    if !direct_node {
+        command.wrap(KillOnDrop).wrap(JobObject);
+    }
+    command.command_mut().args(args).current_dir(workspace_path);
+    if direct_node {
+        command.command_mut().kill_on_drop(true);
+    }
+
+    // rmcp's `TokioChildProcess::new` defaults `stderr` to `Stdio::inherit()`.
+    // A GUI-subsystem parent (release build) has no console, so inheriting a null
+    // stderr handle makes Windows allocate a fresh console for the child once it
+    // writes to stderr. Piping stderr keeps `CREATE_NO_WINDOW` effective and lets
+    // us surface the server's own diagnostics in the log.
+    let (transport, stderr) =
+        TokioChildProcess::builder(command).stderr(Stdio::piped()).spawn()?;
+    if let Some(stderr) = stderr {
+        drain_child_stderr(stderr);
+    }
+
+    Ok(transport)
+}
+
+/// Resolve a command so that launching it never spawns a `cmd.exe` wrapper or a
+/// console-allocating `node.exe` (npx).
+///
+/// On Windows, `npx`/`npm` resolve to npm-generated `npx.cmd`/`npm.cmd` batch
+/// shims. Launching a `.cmd`/`.bat` from a GUI-subsystem (console-less) parent
+/// always attaches a visible console to its `cmd.exe`. Worse, even if the shim is
+/// bypassed by running `node npx-cli.js` directly, npm's `npx-cli.js` itself
+/// spawns the package via `cmd.exe /c <bin>` with `stdio: 'inherit'`, which
+/// forces a console allocation on the node.exe process — a blank console window.
+///
+/// The only fully windowless path is to run the package's own bin entry directly
+/// via `node.exe`, with no npm/npx/cmd.exe in between. This locates the package
+/// in npm's npx cache (`<npm cache>/_npx/<hash>/node_modules/<pkg>`), reads its
+/// `package.json` bin field, and returns `node.exe <entry> [package args...]`.
+///
+/// The third tuple element is `true` when the command was rewritten to a direct
+/// `node.exe` invocation (no child process tree). Anything that cannot be
+/// rewritten returns the resolved path unchanged with `direct_node = false`.
+#[cfg(windows)]
+fn resolve_consoleless_command(
+    command: &str,
+    args: Vec<String>,
+) -> std::io::Result<(std::path::PathBuf, Vec<String>, bool)> {
+    let resolved = which::which(command).map_err(|source| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, source.to_string())
+    })?;
+
+    let stem = resolved
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    let is_batch = resolved
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+        .unwrap_or(false);
+
+    if is_batch && stem.as_deref() == Some("npx")
+        && let Some((node, entry, pkg_args)) = resolve_npx_package_entry(&resolved, &args)?
+    {
+        let mut full_args = Vec::with_capacity(pkg_args.len() + 1);
+        full_args.push(entry.to_string_lossy().into_owned());
+        full_args.extend(pkg_args);
+        return Ok((node, full_args, true));
+    }
+
+    Ok((resolved, args, false))
+}
+
+/// Resolve the `node` executable and the package bin entry that `npx <pkg>`
+/// would execute, returning `(node, entry, package_args)`.
+///
+/// Searches npm's npx cache (`<npm cache>/_npx/*/node_modules`) for a directory
+/// containing the package, reads its `package.json` `bin` field, and returns the
+/// entry path plus the args destined for the package (everything after the
+/// package spec, with npx-only flags like `-y` dropped).
+#[cfg(windows)]
+fn resolve_npx_package_entry(
+    shim: &std::path::Path,
+    args: &[String],
+) -> std::io::Result<Option<(std::path::PathBuf, std::path::PathBuf, Vec<String>)>> {
+    let Some(package_spec) = first_positional(args) else {
+        return Ok(None);
+    };
+    let package_name = package_name(package_spec);
+
+    let node = shim.parent().map(|dir| dir.join("node.exe"));
+    let Some(node) = node.filter(|n| n.is_file()) else {
+        return Ok(None);
+    };
+
+    let Some(npx_cache) = npm_npx_cache(&node)? else {
+        return Ok(None);
+    };
+
+    // Find the npx cache directory that contains this package.
+    let entries = match std::fs::read_dir(&npx_cache) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+    for entry in entries.flatten() {
+        let pkg_json = entry
+            .path()
+            .join("node_modules")
+            .join(package_name)
+            .join("package.json");
+        if let Ok((dir, bin_field)) = read_package_bin(&pkg_json)
+            && let Some(bin) = bin_field
+            && let Some(bin_name) = bin_field_for_name(&bin, package_name)
+            && {
+                let bin_path = dir.join(&bin_name);
+                bin_path.is_file()
+            }
+        {
+            let bin_path = dir.join(bin_name);
+            let pkg_args = npx_package_args(args);
+            return Ok(Some((node, bin_path, pkg_args)));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Locate npm's `_npx` cache directory from `node.exe`. npm stores its cache at
+/// `<cache>/_npx`. Prefer the `NPM_CONFIG_CACHE`/`npm_config_cache` env vars, then
+/// the conventional Windows AppData location, then ask `npm` via a hidden node
+/// subprocess.
+#[cfg(windows)]
+fn npm_npx_cache(node: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    use std::path::PathBuf;
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // Prefer explicit npm cache config.
+    for var in ["NPM_CONFIG_CACHE", "npm_config_cache"] {
+        if let Some(cache_dir) = std::env::var_os(var) {
+            let npx = PathBuf::from(cache_dir).join("_npx");
+            if npx.is_dir() {
+                return Ok(Some(npx));
+            }
+        }
+    }
+
+    // Conventional Windows location.
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let npx = PathBuf::from(local_app_data)
+            .join("npm-cache")
+            .join("_npx");
+        if npx.is_dir() {
+            return Ok(Some(npx));
+        }
+    }
+
+    // Ask npm directly via a console-less node subprocess.
+    let output = std::process::Command::new(node)
+        .arg("-e")
+        .arg("process.stdout.write(require('child_process').execSync('npm config get cache',{stdio:['ignore','pipe','ignore']}).toString().trim())")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()?;
+
+    if output.status.success() {
+        let cache = String::from_utf8_lossy(&output.stdout);
+        let npx = PathBuf::from(cache.trim()).join("_npx");
+        if npx.is_dir() {
+            return Ok(Some(npx));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Read a `package.json` and return its directory and parsed `bin` field.
+#[cfg(windows)]
+fn read_package_bin(
+    pkg_json: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, Option<serde_json::Value>)> {
+    let contents = std::fs::read_to_string(pkg_json)?;
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let dir = pkg_json
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
+    Ok((dir, value.get("bin").cloned()))
+}
+
+/// Given a `package.json` `bin` field (string or object), return the path for the
+/// given package name. For string bins, returns the string; for object bins,
+/// prefers the entry keyed by `package_name`, else the first entry.
+#[cfg(windows)]
+fn bin_field_for_name(bin: &serde_json::Value, package_name: &str) -> Option<String> {
+    match bin {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(map) => map
+            .get(package_name)
+            .or_else(|| map.values().next())
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        _ => None,
+    }
+}
+
+/// The args meant for the target package: everything after the first positional
+/// (the package spec), skipping `npx`-only flags that precede it (`-y`, `--yes`).
+#[cfg(windows)]
+fn npx_package_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut consumed_package = false;
+    for arg in args {
+        if !consumed_package {
+            if arg.starts_with('-') {
+                continue;
+            }
+            consumed_package = true;
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
+}
+
+#[cfg(windows)]
+fn first_positional(args: &[String]) -> Option<&str> {
+    args.iter().find(|a| !a.starts_with('-')).map(String::as_str)
+}
+
+/// Strip a version suffix from a package spec: `pkg@1.2.3` -> `pkg`,
+/// `@scope/pkg@2` -> `@scope/pkg`.
+#[cfg(windows)]
+fn package_name(spec: &str) -> &str {
+    if let Some(rest) = spec.strip_prefix('@') {
+        match rest.find('@') {
+            Some(idx) => &spec[..1 + idx],
+            None => spec,
+        }
+    } else {
+        spec.split('@').next().unwrap_or(spec)
+    }
+}
+
+#[cfg(windows)]
+fn drain_child_stderr(mut stderr: tokio::process::ChildStderr) {
+    use tokio::io::AsyncBufReadExt;
+
+    tokio::spawn(async move {
+        let reader = tokio::io::BufReader::new(&mut stderr);
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if !line.trim().is_empty() {
+                tracing::debug!(target: "mcp::stdio", "stderr: {line}");
+            }
+        }
+    });
 }
 
 #[cfg(not(windows))]
