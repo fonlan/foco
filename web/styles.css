@@ -1637,6 +1637,20 @@ body,
   white-space: nowrap;
 }
 
+.message-run-badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid color-mix(in srgb, var(--foco-accent) 38%, var(--foco-border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--foco-accent) 10%, var(--foco-panel));
+  color: var(--foco-text-muted);
+  font-size: 0.68rem;
+  font-weight: 650;
+  line-height: 1;
+  padding: 0.18rem 0.45rem;
+  white-space: nowrap;
+}
+
 .message-pending-badge {
   display: inline-flex;
   align-items: center;

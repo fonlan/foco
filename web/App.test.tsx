@@ -1281,6 +1281,61 @@ describe("App verification surfaces", () => {
     expect(screen.getByText("Model: gpt-test")).toBeInTheDocument();
   });
 
+  it("shows LLM reconnect and context compression badges in the assistant bubble", async () => {
+    render(<App />);
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "recover and compact",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        reason: "provider stream failed",
+        reasoning: null,
+        text: "",
+        toolCalls: [],
+        type: "streamReset",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        snapshotId: "ctx-1",
+        type: "contextCompression",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        text: "Recovered after compaction.",
+        type: "complete",
+        metrics: {
+          firstTokenLatencyMs: 100,
+          modelId: "gpt-test",
+          outputTokens: 4,
+          providerId: "openai",
+          totalLatencyMs: 500,
+        },
+        reasoning: null,
+        stopReason: null,
+        usage: null,
+      });
+      enqueueChatStreamEvent({ type: "streamEnd" });
+    });
+
+    const assistantText = await screen.findByText("Recovered after compaction.");
+    const assistantRow = assistantText.closest(".message-row");
+    expect(assistantRow).not.toBeNull();
+    expect(
+      within(assistantRow as HTMLElement).getByText("Reconnected"),
+    ).toBeInTheDocument();
+    expect(
+      within(assistantRow as HTMLElement).getByText("Compressed"),
+    ).toBeInTheDocument();
+  });
+
   it("localizes completed tool status and uses success color", async () => {
     const zhSettings = {
       ...settings,

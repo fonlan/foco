@@ -545,6 +545,22 @@ export function ChatPanel({
                                 {message.metrics.modelId}
                               </span>
                             ) : null}
+                            {!isUser && message.runBadges?.includes("llmReconnect") ? (
+                              <span
+                                className="message-run-badge"
+                                title={t("LLM request failed and reconnected")}
+                              >
+                                {t("Reconnected")}
+                              </span>
+                            ) : null}
+                            {!isUser && message.runBadges?.includes("contextCompression") ? (
+                              <span
+                                className="message-run-badge"
+                                title={t("Context compression was triggered")}
+                              >
+                                {t("Compressed")}
+                              </span>
+                            ) : null}
                           </span>
                           <span className="message-action-group">
                             {canManageQueuedMessage ? (

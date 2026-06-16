@@ -2455,6 +2455,10 @@ enum ChatSseEvent {
         reasoning: Option<String>,
         tool_calls: Vec<ChatToolCallSummary>,
     },
+    ContextCompression {
+        assistant_message_id: String,
+        snapshot_id: String,
+    },
     ToolCall {
         assistant_message_id: String,
         tool_call: ChatToolCallSummary,
@@ -3276,6 +3280,7 @@ impl PreparedChatContext {
                     yield event;
                 }
 
+                let previous_compression_snapshot_count = self.compression_snapshots.len();
                 let turn_active_tool_start_index = match ensure_context_compression(&mut self).await {
                     Ok(index) => index,
                     Err(error) => {
@@ -3312,6 +3317,16 @@ impl PreparedChatContext {
                     };
                     events.push(captured_event(&event));
                     yield event;
+                }
+                if self.compression_snapshots.len() > previous_compression_snapshot_count {
+                    if let Some(snapshot) = self.compression_snapshots.last() {
+                        let event = ChatSseEvent::ContextCompression {
+                            assistant_message_id: self.assistant_message_id.clone(),
+                            snapshot_id: snapshot.id.clone(),
+                        };
+                        events.push(captured_event(&event));
+                        yield event;
+                    }
                 }
                 let packed_messages = match pack_neutral_messages(
                     self.provider_request.messages.clone(),
@@ -7825,6 +7840,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::ReasoningDelta { .. } => "reasoning_delta",
         ChatSseEvent::StreamAttemptStart { .. } => "stream_attempt_start",
         ChatSseEvent::StreamReset { .. } => "stream_reset",
+        ChatSseEvent::ContextCompression { .. } => "context_compression",
         ChatSseEvent::ToolCall { .. } => "tool_call",
         ChatSseEvent::ToolResult { .. } => "tool_result",
         ChatSseEvent::ToolOutputDelta { .. } => "tool_output_delta",

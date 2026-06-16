@@ -182,6 +182,8 @@ export type QueuedMessageRunSummary = {
   assistantMessageId: string | null;
 };
 
+export type ChatRunBadge = "contextCompression" | "llmReconnect";
+
 export type ChatMessageSummary = {
   id: string;
   role: "assistant" | "user";
@@ -270,6 +272,11 @@ export type ChatStreamEvent =
     text: string;
     reasoning: string | null;
     toolCalls: ChatToolCallSummary[];
+  }
+  | {
+    type: "contextCompression";
+    assistantMessageId: string;
+    snapshotId: string;
   }
   | { type: "usage"; usage?: ChatUsage }
   | {
@@ -1234,6 +1241,7 @@ export type ShellMessage = {
   metrics: ChatReplyMetrics | null;
   memoriesUsed: ChatMemoryUsedSummary[];
   extractedMemories: ChatExtractedMemorySummary[];
+  runBadges?: ChatRunBadge[];
 };
 
 // Chat Tab types

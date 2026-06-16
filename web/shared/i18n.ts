@@ -157,6 +157,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Context usage {percent}%": "上下文使用量 {percent}%",
     "Context compression may run on the next send":
       "下次发送可能会触发上下文压缩",
+    "LLM request failed and reconnected": "大模型请求失败并已重连",
+    Reconnected: "已重连",
+    "Context compression was triggered": "已触发上下文压缩",
+    Compressed: "已压缩",
     "Git branch": "Git 分支",
     "Switch to branch {name}": "切换到分支 {name}",
     "No branches": "暂无分支",

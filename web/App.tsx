@@ -109,6 +109,7 @@ import type {
   ChatMessageSummary,
   ChatMessagesResponse,
   ChatReplyMetrics,
+  ChatRunBadge,
   ChatStatisticsResponse,
   ChatStreamEvent,
   ChatSummary,
@@ -3352,6 +3353,17 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "contextCompression") {
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? addChatRunBadge(message, "contextCompression")
+                : message,
+            ),
+          );
+          return;
+        }
+
         if (streamEvent.type === "usage") {
           latestResponseUsage =
             streamEvent.usage &&
@@ -3720,6 +3732,7 @@ export function App() {
         metrics: null,
         memoriesUsed: [],
         extractedMemories: [],
+        runBadges: [],
       };
 
       if (pendingUserMessageId) {
@@ -4018,6 +4031,17 @@ export function App() {
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? resetStreamingAssistantMessage(message, streamEvent)
+                : message,
+            ),
+          );
+          return;
+        }
+
+        if (streamEvent.type === "contextCompression") {
+          setMessagesForChatKey(runMessagesKey, (current) =>
+            current.map((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                ? addChatRunBadge(message, "contextCompression")
                 : message,
             ),
           );
@@ -16761,13 +16785,25 @@ function appendToolLiveOutput(
   };
 }
 
+function addChatRunBadge(
+  message: ShellMessage,
+  badge: ChatRunBadge,
+): ShellMessage {
+  const runBadges = message.runBadges ?? [];
+  if (runBadges.includes(badge)) {
+    return message;
+  }
+
+  return { ...message, runBadges: [...runBadges, badge] };
+}
+
 function resetStreamingAssistantMessage(
   message: ShellMessage,
   streamEvent: Extract<ChatStreamEvent, { type: "streamReset" }>,
 ): ShellMessage {
   const toolCalls = streamEvent.toolCalls.map(normalizedToolCallSummary);
   return {
-    ...message,
+    ...addChatRunBadge(message, "llmReconnect"),
     content: streamEvent.text,
     reasoning: streamEvent.reasoning,
     toolCalls,
@@ -18441,6 +18477,24 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       toolCalls: toolCalls as ChatToolCallSummary[],
     };
   }
+
+  if (
+    value.type === "contextCompression" ||
+    value.type === "context_compression"
+  ) {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const snapshotId = stringField(value, "snapshotId", "snapshot_id");
+
+    if (!assistantMessageId || !snapshotId) {
+      return null;
+    }
+
+    return { type: "contextCompression", assistantMessageId, snapshotId };
+  }
   if (value.type === "toolOutputDelta" || value.type === "tool_output_delta") {
     const assistantMessageId = stringField(
       value,
@@ -18990,6 +19044,7 @@ function streamingAssistantMessage(
     metrics: null,
     memoriesUsed,
     extractedMemories: [],
+    runBadges: [],
   };
 }
 
@@ -19061,6 +19116,7 @@ function normalizeChatMessageSummary(
     memoriesUsed,
     pendingMode,
     queuedRun,
+    runBadges: [],
     toolCalls,
     parts,
   };
