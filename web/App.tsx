@@ -12306,14 +12306,14 @@ function ContextMemoryGroup({
             </article>
           ))}
           {meta.totalPages > 1 ? (
-            <div className="flex flex-wrap items-center justify-end gap-3 mt-3 px-1">
+            <div className="context-memory-pagination-shell">
               <nav
                 aria-label={t("Memory pagination")}
-                className="flex items-center gap-1"
+                className="context-memory-pagination"
               >
                 <button
                   aria-label={t("Previous page")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                  className="context-memory-pagination-control inline-flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
                   disabled={meta.page <= 1}
                   onClick={() => onPageChange(meta.page - 1)}
                   title={t("Previous page")}
@@ -12325,7 +12325,7 @@ function ContextMemoryGroup({
                   item === "ellipsis" ? (
                     <span
                       aria-hidden="true"
-                      className="inline-flex size-9 items-center justify-center text-stone-400"
+                      className="context-memory-pagination-control context-memory-pagination-ellipsis inline-flex items-center justify-center text-stone-400"
                       key={`cm-ellipsis-${index}`}
                     >
                       ...
@@ -12338,7 +12338,7 @@ function ContextMemoryGroup({
                       aria-label={t("Go to page {page}", {
                         page: formatNumber(item, language),
                       })}
-                      className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${
+                      className={`context-memory-pagination-control inline-flex items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${
                         item === meta.page
                           ? "border-teal-700 bg-teal-700 text-white"
                           : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
@@ -12356,7 +12356,7 @@ function ContextMemoryGroup({
                 )}
                 <button
                   aria-label={t("Next page")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                  className="context-memory-pagination-control inline-flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
                   disabled={meta.totalPages === 0 || meta.page >= meta.totalPages}
                   onClick={() => onPageChange(meta.page + 1)}
                   title={t("Next page")}
