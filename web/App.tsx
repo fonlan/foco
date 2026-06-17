@@ -1146,7 +1146,13 @@ export function App() {
 
   useEffect(() => {
     setOpenChatTabs((current) => {
-      const next = current.filter((tab) => workspaceHasChatTab(workspaces, tab));
+      const next = current.filter(
+        (tab) =>
+          workspaceHasChatTab(workspaces, tab) ||
+          scheduledWorkspaceRunsRef.current.some(
+            (run) => run.workspaceId === tab.workspaceId && run.chatId === tab.chatId,
+          ),
+      );
       return next.length === current.length ? current : next;
     });
 
@@ -1860,6 +1866,7 @@ export function App() {
     activeWorkspaceIdRef.current = run.workspaceId;
     activeChatIdRef.current = run.chatId;
     activeChatKeyRef.current = run.chatKey;
+    openChatTab(run.workspaceId, run.chatId);
     setMessages(cachedMessages);
     setSelectedDiffPath(null);
     setViewMode("chat");
@@ -2570,6 +2577,7 @@ export function App() {
         request: {
           ...request,
           chatId: queued.chatId,
+          localChatKey: chatKey,
           pendingUserMessageId: queued.userMessageId,
           queuedUserMessageId: queued.userMessageId,
         },
@@ -3846,9 +3854,16 @@ export function App() {
               pendingChatId,
               streamEvent.chatId,
             );
+          } else if (request.localChatKey) {
+            openPendingChatTab(
+              request.workspaceId,
+              streamEvent.chatId,
+              request.content,
+            );
           } else {
             openChatTab(request.workspaceId, streamEvent.chatId);
           }
+
           if (runMessagesKey !== currentRunningChatKey) {
             setChatRunning(runMessagesKey, false);
             setActiveRunInfoForChatKey(runMessagesKey, null);
@@ -3898,11 +3913,7 @@ export function App() {
                 return message;
               }),
             );
-            if (request.localChatKey) {
-              updateScheduledWorkspaceRuns((current) =>
-                current.filter((run) => run.chatKey !== request.localChatKey),
-              );
-            }
+
             runMessagesKey = currentRunningChatKey;
           } else {
             setMessagesForChatKey(currentRunningChatKey, (current) =>
@@ -3947,7 +3958,7 @@ export function App() {
             activeChatKeyRef.current === currentRunningChatKey ||
             activeChatKeyRef.current === request.localChatKey ||
             activeChatKeyRef.current === null ||
-            Boolean(request.chatId);
+            Boolean(request.chatId && !request.localChatKey);
           if (
             shouldActivateStartedChat
           ) {
@@ -4332,6 +4343,12 @@ export function App() {
         setActiveRunInfoForChatKey(currentRunningChatKey, null);
         clearLiveChatStatistics(currentRunningChatKey);
       }
+    }
+
+    if (request.localChatKey) {
+      updateScheduledWorkspaceRuns((current) =>
+        current.filter((run) => run.chatKey !== request.localChatKey),
+      );
     }
 
     if (runSucceeded) {

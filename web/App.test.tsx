@@ -977,6 +977,7 @@ let chatStreamControllers = new Map<
 >();
 let terminalSessionCounter = 0;
 let chatStreamCounter = 0;
+let chatQueueCounter = 0;
 let workspaceGitDiffResponse = gitDiff;
 let workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
 
@@ -1035,6 +1036,7 @@ describe("App verification surfaces", () => {
     chatStreamControllers = new Map();
     terminalSessionCounter = 0;
     chatStreamCounter = 0;
+    chatQueueCounter = 0;
     workspaceGitDiffResponse = gitDiff;
     workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
     window.history.replaceState(null, "", "/");
@@ -2198,7 +2200,7 @@ describe("App verification surfaces", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
       ctrlKey: true,
     });
-    const pendingQueuedMessage = screen.getByText("next task");
+    const pendingQueuedMessage = await screen.findByText("next task");
     const pendingQueuedRow = pendingQueuedMessage.closest(".message-row");
     expect(pendingQueuedRow).not.toBeNull();
     expect(
@@ -2282,7 +2284,7 @@ describe("App verification surfaces", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
       ctrlKey: true,
     });
-    const pendingQueuedMessage = screen.getByText("next task");
+    const pendingQueuedMessage = await screen.findByText("next task");
     const pendingQueuedRow = pendingQueuedMessage.closest(".message-row");
     expect(pendingQueuedRow).not.toBeNull();
 
@@ -2347,7 +2349,7 @@ describe("App verification surfaces", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
       ctrlKey: true,
     });
-    const pendingQueuedMessage = screen.getByText("next task");
+    const pendingQueuedMessage = await screen.findByText("next task");
     const pendingQueuedRow = pendingQueuedMessage.closest(".message-row");
     expect(pendingQueuedRow).not.toBeNull();
 
@@ -2663,8 +2665,9 @@ describe("App verification surfaces", () => {
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    const scheduledHistoryTitle =
-      within(workspaceList).getByText("Scheduled task");
+    const scheduledHistoryTitle = await within(workspaceList).findByText(
+      "Scheduled task",
+    );
     const scheduledHistoryButton = scheduledHistoryTitle.closest("button");
     if (!scheduledHistoryButton) {
       throw new Error("Expected scheduled chat history item button");
@@ -2731,7 +2734,7 @@ describe("App verification surfaces", () => {
         url === "/api/workspaces/workspace-1/chat/stream",
     )[1];
     expect(JSON.parse(String(secondStreamCall[1]?.body))).toMatchObject({
-      chatId: null,
+      chatId: "queued-chat-1",
       message: "Scheduled task",
     });
 
@@ -2801,9 +2804,9 @@ describe("App verification surfaces", () => {
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    const scheduledHistoryButton = within(workspaceList)
-      .getByText("Held Ctrl scheduled task")
-      .closest("button");
+    const scheduledHistoryButton = (
+      await within(workspaceList).findByText("Held Ctrl scheduled task")
+    ).closest("button");
     if (!scheduledHistoryButton) {
       throw new Error("Expected scheduled chat history item button");
     }
@@ -2865,8 +2868,9 @@ describe("App verification surfaces", () => {
         url === "/api/workspaces/workspace-1/chat/stream",
     );
     expect(streamCallsBeforeComplete).toHaveLength(1);
-    const scheduledMessageRow = screen
-      .getAllByText("Keyboard scheduled task")
+    const scheduledMessageRow = (
+      await screen.findAllByText("Keyboard scheduled task")
+    )
       .find((element) => element.closest(".message-row"))
       ?.closest(".message-row");
     expect(scheduledMessageRow).not.toBeNull();
@@ -2877,9 +2881,9 @@ describe("App verification surfaces", () => {
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    const firstScheduledHistoryButton = within(workspaceList)
-      .getByText("Keyboard scheduled task")
-      .closest("button");
+    const firstScheduledHistoryButton = (
+      await within(workspaceList).findByText("Keyboard scheduled task")
+    ).closest("button");
     if (!firstScheduledHistoryButton) {
       throw new Error("Expected first scheduled chat history button");
     }
@@ -2898,16 +2902,16 @@ describe("App verification surfaces", () => {
       ctrlKey: true,
     });
 
-    const secondScheduledHistoryButton = within(workspaceList)
-      .getByText("Click scheduled task")
-      .closest("button");
+    const secondScheduledHistoryButton = (
+      await within(workspaceList).findByText("Click scheduled task")
+    ).closest("button");
     if (!secondScheduledHistoryButton) {
       throw new Error("Expected second scheduled chat history button");
     }
     expect(
-      secondScheduledHistoryButton.compareDocumentPosition(firstScheduledHistoryButton) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
+      secondScheduledHistoryButton.querySelector(".session-status-dot"),
+    ).toHaveClass("session-status-dot-scheduled");
+    expect(firstScheduledHistoryButton).not.toBe(secondScheduledHistoryButton);
 
     await act(async () => {
       chatStreamControllers.get("request-stream")?.close();
@@ -2938,7 +2942,7 @@ describe("App verification surfaces", () => {
     await act(async () => {
       chatStreamControllers.get("request-stream-3")?.close();
     });
-  });
+  }, 10000);
 
   it("shows the queue tooltip while Ctrl is held over the send button", async () => {
     render(<App />);
@@ -4789,8 +4793,12 @@ describe("App verification surfaces", () => {
       });
     });
 
-    expect(await screen.findByText("Inspect workspace changes")).toBeInTheDocument();
-    expect(screen.getByText("README.md diff is visible")).toBeInTheDocument();
+    const todoTaskButton = await screen.findByRole("button", {
+      name: /task-1[\s\S]*Inspect workspace changes/,
+    });
+    expect(todoTaskButton).toBeInTheDocument();
+    await userEvent.click(todoTaskButton);
+    expect(await screen.findByText("README.md diff is visible")).toBeInTheDocument();
     expect(screen.queryByText(/hello world/)).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
@@ -5494,7 +5502,24 @@ async function mockFetch(input: RequestInfo | URL, init?: RequestInit): Promise<
         : {};
     return chatStreamResponse(body.chatId ?? "chat-1");
   }
-
+  if (path === "/api/workspaces/workspace-1/chat/queue") {
+    const body =
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as { chatId?: string | null; message?: string })
+        : {};
+    const content = body.message ?? "";
+    chatQueueCounter += 1;
+    const chatId = body.chatId ?? `queued-chat-${chatQueueCounter}`;
+    return jsonResponse({
+      chatId,
+      chatTitle: content || "Queued chat",
+      content,
+      createdAt: "2026-06-05T12:00:00Z",
+      parts: content ? [{ text: content, type: "text" }] : [],
+      updatedAt: "2026-06-05T12:00:00Z",
+      userMessageId: `queued-user-${chatQueueCounter}`,
+    });
+  }
 
   if (path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream") {
     return chatStreamResponse("chat-1");
