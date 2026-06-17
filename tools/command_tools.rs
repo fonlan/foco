@@ -57,6 +57,7 @@ pub(crate) fn run_command(
         Duration::from_millis(timeout_ms),
         cancellation_token,
         output_sink,
+        None,
     )?;
     let (stdout, stdout_truncated) = limited_output_text(&output.stdout);
     let (stderr, stderr_truncated) = limited_output_text(&output.stderr);

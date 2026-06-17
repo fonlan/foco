@@ -11,7 +11,7 @@ use crate::{
     GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
     GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL,
     MAX_TOOL_TIMEOUT_MS, READ_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL,
-    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    ToolOutputStream, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
 };
 
 pub(crate) fn tool_error_output(error: &ToolRuntimeError) -> Value {
@@ -122,6 +122,13 @@ pub(crate) enum ToolRuntimeError {
         status: Option<i32>,
         stderr: String,
     },
+    CommandOutputTooLarge {
+        command: String,
+        pid: u32,
+        stream: ToolOutputStream,
+        bytes: usize,
+        max_bytes: usize,
+    },
     FileTooLarge {
         path: PathBuf,
         bytes: u64,
@@ -171,6 +178,16 @@ impl fmt::Display for ToolRuntimeError {
                 "{command} exited with status {:?}: {}",
                 status, stderr
             ),
+            Self::CommandOutputTooLarge {
+                command,
+                pid,
+                stream,
+                bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "{command} (pid {pid}) {stream:?} output is too large ({bytes} bytes; max {max_bytes})"
+            ),
             Self::FileTooLarge {
                 path,
                 bytes,
@@ -212,6 +229,7 @@ impl std::error::Error for ToolRuntimeError {
             | Self::CommandCancelled { .. }
             | Self::CommandTimedOut { .. }
             | Self::CommandFailed { .. }
+            | Self::CommandOutputTooLarge { .. }
             | Self::FileTooLarge { .. }
             | Self::InvalidArguments(_)
             | Self::InvalidPath(_)

@@ -53,6 +53,8 @@ const MAX_RANGED_READ_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_RANGED_READ_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_FIND_ENTRIES: usize = 200;
 const MAX_SEARCH_MATCHES: usize = 200;
+const MAX_SEARCH_TEXT_LINE_BYTES: usize = 4 * 1024;
+const MAX_SEARCH_TEXT_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_GRAPH_RESULT_LIMIT: usize = 20;
 const MAX_GRAPH_RESULT_LIMIT: usize = 50;
@@ -638,6 +640,7 @@ pub(crate) fn run_command_with_timeout(
     timeout: Duration,
     cancellation_token: Option<&ToolCancellationToken>,
     output_sink: Option<&dyn ToolOutputSink>,
+    output_limits: Option<CommandOutputLimits>,
 ) -> Result<CommandRunOutput, ToolRuntimeError> {
     let command_label = command_label(command, args);
     let mut command_process = Command::new(command);
@@ -687,7 +690,7 @@ pub(crate) fn run_command_with_timeout(
             });
         }
 
-        drain_command_pipe(
+        if let Err(error) = drain_command_pipe(
             &command_label,
             &stdout_handle,
             ToolOutputStream::Stdout,
@@ -695,8 +698,13 @@ pub(crate) fn run_command_with_timeout(
             &mut stdout_complete,
             pid,
             output_sink,
-        )?;
-        drain_command_pipe(
+            output_limits.and_then(|limits| limits.stdout_bytes),
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        if let Err(error) = drain_command_pipe(
             &command_label,
             &stderr_handle,
             ToolOutputStream::Stderr,
@@ -704,7 +712,12 @@ pub(crate) fn run_command_with_timeout(
             &mut stderr_complete,
             pid,
             output_sink,
-        )?;
+            output_limits.and_then(|limits| limits.stderr_bytes),
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
 
         if exit_status.is_none() {
             exit_status = child
@@ -752,6 +765,12 @@ pub(crate) struct CommandRunOutput {
     pub(crate) stderr: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct CommandOutputLimits {
+    pub(crate) stdout_bytes: Option<usize>,
+    pub(crate) stderr_bytes: Option<usize>,
+}
+
 enum CommandPipeMessage {
     Chunk(Vec<u8>),
     Complete,
@@ -796,6 +815,7 @@ fn drain_command_pipe(
     complete: &mut bool,
     pid: u32,
     output_sink: Option<&dyn ToolOutputSink>,
+    output_limit: Option<usize>,
 ) -> Result<(), ToolRuntimeError> {
     if *complete {
         return Ok(());
@@ -811,6 +831,17 @@ fn drain_command_pipe(
                     });
                 }
                 output.extend_from_slice(&chunk);
+                if let Some(limit) = output_limit
+                    && output.len() > limit
+                {
+                    return Err(ToolRuntimeError::CommandOutputTooLarge {
+                        command: command.to_string(),
+                        pid,
+                        stream: stream.clone(),
+                        bytes: output.len(),
+                        max_bytes: limit,
+                    });
+                }
             }
             Ok(Ok(CommandPipeMessage::Complete)) => {
                 *complete = true;

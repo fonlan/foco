@@ -5,9 +5,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    DEFAULT_FILE_TOOL_TIMEOUT_MS, DEFAULT_SEARCH_TEXT_TIMEOUT_MS, DEFAULT_WRITE_FILE_TIMEOUT_MS,
-    LineRange, MAX_FIND_ENTRIES, MAX_FULL_READ_BYTES, MAX_RANGED_READ_OUTPUT_BYTES,
-    MAX_RANGED_READ_SOURCE_BYTES, MAX_SEARCH_MATCHES, RIPGREP_PATH, TextEncoding,
+    CommandOutputLimits, DEFAULT_FILE_TOOL_TIMEOUT_MS, DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
+    DEFAULT_WRITE_FILE_TIMEOUT_MS, LineRange, MAX_FIND_ENTRIES, MAX_FULL_READ_BYTES,
+    MAX_RANGED_READ_OUTPUT_BYTES, MAX_RANGED_READ_SOURCE_BYTES, MAX_SEARCH_MATCHES,
+    MAX_SEARCH_TEXT_LINE_BYTES, MAX_SEARCH_TEXT_OUTPUT_BYTES, RIPGREP_PATH, TextEncoding,
     ToolCancellationToken, count_text_lines, decode_text_file, encode_text_file,
     errors::{ToolRuntimeError, tool_timeout_ms},
     normalize_read_line_range, normalize_workspace_path_text, numbered_content, parse_arguments,
@@ -295,19 +296,42 @@ pub(crate) fn search_text(
         "--json".to_string(),
         "--line-number".to_string(),
         "--max-count".to_string(),
-        MAX_SEARCH_MATCHES.to_string(),
+        (MAX_SEARCH_MATCHES + 1).to_string(),
+        "--max-columns".to_string(),
+        MAX_SEARCH_TEXT_LINE_BYTES.to_string(),
         pattern.to_string(),
         path.to_string_lossy().to_string(),
     ];
     let rg_command = ripgrep_command();
-    let output = run_command_with_timeout(
+    let output = match run_command_with_timeout(
         &rg_command,
         &rg_args,
         workspace_path,
         Duration::from_millis(timeout_ms),
         cancellation_token,
         None,
-    )?;
+        Some(CommandOutputLimits {
+            stdout_bytes: Some(MAX_SEARCH_TEXT_OUTPUT_BYTES),
+            stderr_bytes: Some(MAX_SEARCH_TEXT_OUTPUT_BYTES),
+        }),
+    ) {
+        Ok(output) => output,
+        Err(ToolRuntimeError::CommandOutputTooLarge { bytes, .. }) => {
+            return Err(search_text_too_many_matches_error(
+                pattern,
+                &input_path,
+                Some(bytes),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if output.stdout.len() > MAX_SEARCH_TEXT_OUTPUT_BYTES {
+        return Err(search_text_too_many_matches_error(
+            pattern,
+            &input_path,
+            Some(output.stdout.len()),
+        ));
+    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if output.status.code() == Some(1) {
@@ -329,7 +353,7 @@ pub(crate) fn search_text(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut matches = Vec::new();
-    let mut truncated = false;
+    let mut output_bytes = 0usize;
     for line in stdout.lines() {
         let event: Value =
             serde_json::from_str(line).map_err(|source| ToolRuntimeError::InvalidToolOutput {
@@ -341,8 +365,11 @@ pub(crate) fn search_text(
             continue;
         }
         if matches.len() >= MAX_SEARCH_MATCHES {
-            truncated = true;
-            break;
+            return Err(search_text_too_many_matches_error(
+                pattern,
+                &input_path,
+                None,
+            ));
         }
 
         let data = event.get("data").ok_or_else(|| {
@@ -363,9 +390,21 @@ pub(crate) fn search_text(
             .unwrap_or_default()
             .trim_end_matches(['\r', '\n'])
             .to_string();
+        let relative_path = relative_workspace_path(workspace_path, Path::new(absolute_path))?;
+        output_bytes = output_bytes
+            .saturating_add(relative_path.len())
+            .saturating_add(text.len())
+            .saturating_add(32);
+        if output_bytes > MAX_SEARCH_TEXT_OUTPUT_BYTES {
+            return Err(search_text_too_many_matches_error(
+                pattern,
+                &input_path,
+                Some(output_bytes),
+            ));
+        }
 
         matches.push(json!({
-            "path": relative_workspace_path(workspace_path, Path::new(absolute_path))?,
+            "path": relative_path,
             "line": line_number,
             "text": text
         }));
@@ -375,9 +414,22 @@ pub(crate) fn search_text(
         "query": pattern,
         "path": input_path,
         "matches": matches,
-        "truncated": truncated,
+        "truncated": false,
         "timeoutMs": timeout_ms
     }))
+}
+
+fn search_text_too_many_matches_error(
+    pattern: &str,
+    input_path: &str,
+    output_bytes: Option<usize>,
+) -> ToolRuntimeError {
+    let output_detail = output_bytes
+        .map(|bytes| format!("; collected output reached {bytes} bytes"))
+        .unwrap_or_default();
+    ToolRuntimeError::InvalidArguments(format!(
+        "search_text matched too much text for query '{pattern}' in '{input_path}'{output_detail}; refine the query with a more specific pattern or narrower path before searching again"
+    ))
 }
 
 fn ripgrep_command() -> String {
