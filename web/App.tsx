@@ -5065,6 +5065,7 @@ export function App() {
                                           onClick={() =>
                                             selectWorkspaceChat(workspace.id, chat.id)
                                           }
+                                          title={chat.title}
                                           type="button"
                                         >
                                           <span
@@ -5964,7 +5965,7 @@ function ChatTabBar({
                   className="min-w-0 flex-1 text-left"
                   onClick={() => onSelectTab(tab.workspaceId, tab.chatId)}
                   role="tab"
-                  title={`${title} 路 ${tab.workspaceName}`}
+                  title={title}
                   type="button"
                 >
                   <span className="block truncate text-sm font-semibold leading-5">
