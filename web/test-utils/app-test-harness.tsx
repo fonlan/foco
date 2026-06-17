@@ -583,6 +583,18 @@ export const gitDiff = {
   ],
   path: null,
   stagedDiff: "",
+  stagedFiles: [
+    {
+      indexStatus: "M",
+      path: "README.md",
+      worktreeStatus: "M",
+    },
+    {
+      indexStatus: "?",
+      path: "new-note.txt",
+      worktreeStatus: "?",
+    },
+  ],
   status: " M README.md\n?? new-note.txt\n M asset.bin\n",
 };
 
@@ -591,6 +603,7 @@ export const emptyGitDiff = {
   files: [],
   path: null,
   stagedDiff: "",
+  stagedFiles: [],
   status: "",
 };
 
@@ -625,6 +638,7 @@ export const generatedGitDiff = {
   ],
   path: null,
   stagedDiff: "",
+  stagedFiles: [],
   status: " M web/App.tsx\n M app/main.rs\n",
 };
 
@@ -1346,6 +1360,15 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         ? `${file.indexStatus}${file.worktreeStatus} ${file.path}\n`
         : appTestState.workspaceGitDiffResponse.status,
     });
+  }
+
+  if (
+    path === "/api/workspaces/workspace-1/git/stage" ||
+    path === "/api/workspaces/workspace-1/git/unstage" ||
+    path === "/api/workspaces/workspace-1/git/discard" ||
+    path === "/api/workspaces/workspace-1/git/commit"
+  ) {
+    return jsonResponse(appTestState.workspaceGitDiffResponse);
   }
 
   if (path === "/api/workspaces/workspace-1/context-usage") {

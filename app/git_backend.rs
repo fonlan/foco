@@ -50,6 +50,13 @@ pub(super) fn git_diff_response(
     let entries = status_entries_for_repo(workspace_path, &repo)?;
     let files = entries
         .iter()
+        .filter(|entry| entry.worktree_status != ' ')
+        .cloned()
+        .map(status_summary)
+        .collect::<Vec<_>>();
+    let staged_files = entries
+        .iter()
+        .filter(|entry| entry.index_status != ' ' && entry.index_status != '?')
         .cloned()
         .map(status_summary)
         .collect::<Vec<_>>();
@@ -71,6 +78,7 @@ pub(super) fn git_diff_response(
         diff,
         staged_diff,
         files,
+        staged_files,
     })
 }
 
@@ -197,6 +205,92 @@ pub(super) fn create_git_branch(workspace_path: &Path, name: String) -> Result<(
         ApiError::bad_request(format!("failed to create git branch '{branch}': {source}"))
     })?;
     set_head_to_branch(&repo, &ref_name, "checkout: moving by Foco")?;
+
+    Ok(())
+}
+
+pub(super) fn stage_git_file(workspace_path: &Path, workspace_relative_path: &str) -> Result<(), ApiError> {
+    let repo = open_repo(workspace_path)?;
+    let repo_path = repo_relative_path(workspace_path, &repo, workspace_relative_path)?;
+    let mut index = mutable_index(&repo)?;
+
+    replace_index_entry_from_worktree(&repo, &mut index, &repo_path)?;
+    write_index(index)?;
+
+    Ok(())
+}
+
+pub(super) fn unstage_git_file(
+    workspace_path: &Path,
+    workspace_relative_path: &str,
+) -> Result<(), ApiError> {
+    let repo = open_repo(workspace_path)?;
+    let repo_path = repo_relative_path(workspace_path, &repo, workspace_relative_path)?;
+    let mut index = mutable_index(&repo)?;
+    let head_tree_id = repo
+        .head_tree_id_or_empty()
+        .map_err(|source| ApiError::internal(format!("failed to read git HEAD tree: {source}")))?
+        .detach();
+    let head_tree = repo
+        .find_tree(head_tree_id)
+        .map_err(|source| ApiError::internal(format!("failed to read git HEAD tree: {source}")))?;
+
+    replace_index_entry_from_tree(&mut index, &head_tree, &repo_path)?;
+    write_index(index)?;
+
+    Ok(())
+}
+
+pub(super) fn discard_git_file(
+    workspace_path: &Path,
+    workspace_relative_path: &str,
+) -> Result<(), ApiError> {
+    let repo = open_repo(workspace_path)?;
+    let repo_path = repo_relative_path(workspace_path, &repo, workspace_relative_path)?;
+    let index = repo
+        .index_or_load_from_head_or_empty()
+        .map_err(|source| ApiError::internal(format!("failed to read git index: {source}")))?;
+    let Some(worktree_path) = repo.workdir_path(repo_path.as_bytes().as_bstr()) else {
+        return Err(ApiError::bad_request("path is outside git worktree"));
+    };
+    let Some(bytes) = blob_from_index(&repo, &index, &repo_path)? else {
+        remove_worktree_path(&worktree_path)?;
+        return Ok(());
+    };
+
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| {
+            ApiError::internal(format!("failed to create git worktree directory: {source}"))
+        })?;
+    }
+    std::fs::write(&worktree_path, bytes)
+        .map_err(|source| ApiError::internal(format!("failed to write git worktree file: {source}")))?;
+
+    Ok(())
+}
+
+pub(super) fn commit_staged_changes(workspace_path: &Path, message: String) -> Result<(), ApiError> {
+    let message = validate_commit_message(message)?;
+    let repo = open_repo(workspace_path)?;
+    let entries = status_entries_for_repo(workspace_path, &repo)?;
+    if entries
+        .iter()
+        .all(|entry| entry.index_status == ' ' || entry.index_status == '?')
+    {
+        return Err(ApiError::bad_request("no staged git changes to commit"));
+    }
+
+    let index = repo
+        .index_or_load_from_head_or_empty()
+        .map_err(|source| ApiError::internal(format!("failed to read git index: {source}")))?;
+    let tree_id = write_tree_from_index(&repo, &index)?;
+    let parents = repo
+        .head_id()
+        .map(|id| vec![id.detach()])
+        .unwrap_or_else(|_| Vec::new());
+
+    repo.commit("HEAD", message, tree_id, parents)
+        .map_err(|source| ApiError::bad_request(format!("failed to create git commit: {source}")))?;
 
     Ok(())
 }
@@ -461,6 +555,193 @@ fn blob_from_worktree(
     }
 }
 
+fn mutable_index(repo: &gix::Repository) -> Result<gix::index::File, ApiError> {
+    repo.open_index()
+        .map_err(|source| ApiError::internal(format!("failed to read git index: {source}")))
+}
+
+fn write_index(mut index: gix::index::File) -> Result<(), ApiError> {
+    index
+        .write(Default::default())
+        .map_err(|source| ApiError::internal(format!("failed to write git index: {source}")))
+}
+
+fn repo_relative_path(
+    workspace_path: &Path,
+    repo: &gix::Repository,
+    workspace_relative_path: &str,
+) -> Result<String, ApiError> {
+    let workspace_root = workspace_path.canonicalize().map_err(|source| {
+        ApiError::internal(format!("failed to resolve workspace path: {source}"))
+    })?;
+    let worktree_root = repo
+        .workdir()
+        .ok_or_else(|| ApiError::bad_request("git repository does not have a worktree"))?
+        .canonicalize()
+        .map_err(|source| {
+            ApiError::internal(format!("failed to resolve git worktree: {source}"))
+        })?;
+    let absolute_path = workspace_root.join(workspace_relative_path);
+    absolute_path
+        .strip_prefix(&worktree_root)
+        .map_err(|_| ApiError::bad_request("path is outside git worktree"))
+        .map(|path| path.display().to_string().replace('\\', "/"))
+}
+
+fn replace_index_entry_from_worktree(
+    repo: &gix::Repository,
+    index: &mut gix::index::File,
+    repo_path: &str,
+) -> Result<(), ApiError> {
+    remove_index_entry(index, repo_path);
+
+    let Some(bytes) = blob_from_worktree(repo, repo_path)? else {
+        index.sort_entries();
+        return Ok(());
+    };
+    let id = repo
+        .write_blob(bytes)
+        .map_err(|source| ApiError::internal(format!("failed to write git blob: {source}")))?
+        .detach();
+    index.dangerously_push_entry(
+        Default::default(),
+        id,
+        gix::index::entry::Flags::from_stage(gix::index::entry::Stage::Unconflicted),
+        gix::index::entry::Mode::FILE,
+        repo_path.as_bytes().as_bstr(),
+    );
+    index.sort_entries();
+
+    Ok(())
+}
+fn replace_index_entry_from_tree(
+    index: &mut gix::index::File,
+    tree: &gix::Tree<'_>,
+    repo_path: &str,
+) -> Result<(), ApiError> {
+    remove_index_entry(index, repo_path);
+
+    let Some(entry) = tree
+        .lookup_entry_by_path(repo_path)
+        .map_err(|source| ApiError::internal(format!("failed to read git tree entry: {source}")))?
+    else {
+        index.sort_entries();
+        return Ok(());
+    };
+    let mode = gix::index::entry::Mode::from(entry.mode());
+    index.dangerously_push_entry(
+        Default::default(),
+        entry.object_id(),
+        gix::index::entry::Flags::from_stage(gix::index::entry::Stage::Unconflicted),
+        mode,
+        repo_path.as_bytes().as_bstr(),
+    );
+    index.sort_entries();
+
+    Ok(())
+}
+
+fn remove_index_entry(index: &mut gix::index::File, repo_path: &str) {
+    index.remove_entries(|_, path, _| path == repo_path.as_bytes().as_bstr());
+}
+
+fn validate_commit_message(message: String) -> Result<String, ApiError> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err(ApiError::bad_request("git commit message must not be empty"));
+    }
+
+    Ok(message.to_string())
+}
+
+fn write_tree_from_index(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+) -> Result<gix::ObjectId, ApiError> {
+    let mut root = PendingTree::default();
+    for entry in index.entries() {
+        if entry.stage() != gix::index::entry::Stage::Unconflicted {
+            return Err(ApiError::bad_request(
+                "cannot commit git index with conflicted entries",
+            ));
+        }
+        let Some(mode) = entry.mode.to_tree_entry_mode() else {
+            return Err(ApiError::bad_request("git index contains non-tree entry mode"));
+        };
+        let path = entry.path(index);
+        let parts = path
+            .split(|byte| *byte == b'/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        if parts.is_empty() {
+            return Err(ApiError::bad_request("git index contains empty path"));
+        }
+        root.insert(&parts, mode.kind(), entry.id)?;
+    }
+
+    root.write(repo)
+}
+
+#[derive(Default)]
+struct PendingTree {
+    files: Vec<PendingTreeFile>,
+    directories: BTreeMap<Vec<u8>, PendingTree>,
+}
+
+struct PendingTreeFile {
+    name: Vec<u8>,
+    mode: gix::objs::tree::EntryKind,
+    oid: gix::ObjectId,
+}
+
+impl PendingTree {
+    fn insert(
+        &mut self,
+        parts: &[&[u8]],
+        mode: gix::objs::tree::EntryKind,
+        oid: gix::ObjectId,
+    ) -> Result<(), ApiError> {
+        let [name] = parts else {
+            let Some((directory, rest)) = parts.split_first() else {
+                return Err(ApiError::bad_request("git index contains empty path"));
+            };
+            return self
+                .directories
+                .entry(directory.to_vec())
+                .or_default()
+                .insert(rest, mode, oid);
+        };
+        self.files.push(PendingTreeFile {
+            name: name.to_vec(),
+            mode,
+            oid,
+        });
+        Ok(())
+    }
+
+    fn write(self, repo: &gix::Repository) -> Result<gix::ObjectId, ApiError> {
+        let mut entries = Vec::new();
+        for (name, directory) in self.directories {
+            entries.push(gix::objs::tree::Entry {
+                mode: gix::objs::tree::EntryKind::Tree.into(),
+                filename: name.into(),
+                oid: directory.write(repo)?,
+            });
+        }
+        for file in self.files {
+            entries.push(gix::objs::tree::Entry {
+                mode: file.mode.into(),
+                filename: file.name.into(),
+                oid: file.oid,
+            });
+        }
+        entries.sort();
+        let tree = gix::objs::Tree { entries };
+        repo.write_object(tree)
+            .map(|id| id.detach())
+            .map_err(|source| ApiError::internal(format!("failed to write git tree: {source}")))
+    }
+}
 fn remove_tracked_files_missing_from_target(
     repo: &gix::Repository,
     target_index: &gix::index::File,

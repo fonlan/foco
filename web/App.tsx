@@ -30,6 +30,7 @@
   LogOut,
   LoaderCircle,
   MessageSquare,
+  Minus,
   PanelBottom,
   PanelRight,
   Pencil,
@@ -47,6 +48,7 @@
   SunMoon,
   Terminal,
   Trash2,
+  Undo2,
   Upload,
   User,
   Webhook,
@@ -385,6 +387,8 @@ export function App() {
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
+  const [gitCommitMessage, setGitCommitMessage] = useState("");
+  const [gitOperationKey, setGitOperationKey] = useState<string | null>(null);
   const [todoGraph, setTodoGraph] = useState<TodoGraphResponse | null>(null);
   const [isLoadingTodoGraph, setIsLoadingTodoGraph] = useState(false);
   const [todoGraphError, setTodoGraphError] = useState<string | null>(null);
@@ -2317,6 +2321,76 @@ export function App() {
         ? current.filter((id) => id !== skillId)
         : [...current, skillId],
     );
+  }
+  async function handleGitFileOperation(
+    action: "stage" | "unstage" | "discard",
+    path: string,
+  ) {
+    if (!activeWorkspace) {
+      setDiffError(t("Select a workspace before using Git actions."));
+      return;
+    }
+
+    const operationKey = `${action}:${path}`;
+    setGitOperationKey(operationKey);
+    setDiffError(null);
+
+    try {
+      const data = await requestJson<GitDiffResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/${action}`,
+        {
+          body: JSON.stringify({ path }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setGitDiff(data);
+      setSelectedDiffPath(
+        selectedDiffPath && data.files.some((file) => file.path === selectedDiffPath)
+          ? selectedDiffPath
+          : null,
+      );
+    } catch (requestError) {
+      setDiffError(errorMessage(requestError));
+    } finally {
+      setGitOperationKey(null);
+    }
+  }
+
+  async function handleGitCommit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!activeWorkspace) {
+      setDiffError(t("Select a workspace before committing changes."));
+      return;
+    }
+
+    const message = gitCommitMessage.trim();
+    if (!message) {
+      setDiffError(t("Commit message must not be empty."));
+      return;
+    }
+
+    setGitOperationKey("commit");
+    setDiffError(null);
+
+    try {
+      const data = await requestJson<GitDiffResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/commit`,
+        {
+          body: JSON.stringify({ message }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setGitDiff(data);
+      setGitCommitMessage("");
+      setSelectedDiffPath(null);
+    } catch (requestError) {
+      setDiffError(errorMessage(requestError));
+    } finally {
+      setGitOperationKey(null);
+    }
   }
 
   function removeSelectedSkill(skillId: string) {
@@ -5483,10 +5557,15 @@ export function App() {
                     diffError={diffError}
                     diffResponse={gitDiff}
                     files={gitDiff?.files ?? []}
+                    gitCommitMessage={gitCommitMessage}
+                    gitOperationKey={gitOperationKey}
                     isLoadingChatStatistics={isLoadingChatStatistics}
                     isLoadingDiff={isLoadingDiff}
                     isLoadingContextMemories={isLoadingContextMemories}
                     isLoadingTodoGraph={isLoadingTodoGraph}
+                    onGitCommit={handleGitCommit}
+                    onGitCommitMessageChange={setGitCommitMessage}
+                    onGitFileOperation={(action, path) => void handleGitFileOperation(action, path)}
                     onRefreshDiff={() => {
                       if (activeWorkspace?.id) {
                         void loadGitDiff(activeWorkspace.id, selectedDiffPath);
@@ -7646,69 +7725,15 @@ function StatsCard({
   value: string;
 }) {
   return (
-    <article className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-sm font-semibold text-stone-600">{label}</span>
-        <Icon aria-hidden="true" className="size-4 text-teal-700" />
+    <article className="rounded-2xl border border-stone-200/80 bg-white p-5 shadow-sm">
+      <div className="flex items-center gap-2 text-sm font-semibold text-stone-600">
+        <Icon aria-hidden="true" className="size-4" />
+        <span>{label}</span>
       </div>
       <div className="mt-4 font-mono text-3xl font-semibold text-stone-950">
         {value}
       </div>
     </article>
-  );
-}
-
-function TodoGraphPanel({
-  error,
-  isLoading,
-  todoGraph,
-}: {
-  error: string | null;
-  isLoading: boolean;
-  todoGraph: TodoGraphResponse;
-}) {
-  const { language, t } = useI18n();
-
-  return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-800">
-            <ListChecks aria-hidden="true" className="size-5" />
-          </span>
-          <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold">
-              {t("ToDo graph")}
-            </h2>
-            <p className="truncate text-xs font-medium text-stone-500">
-              {todoGraph.updatedAt
-                ? t("Updated {time}", {
-                  time: formatTodoGraphDate(todoGraph.updatedAt, language),
-                })
-                : todoGraph.chatId}
-            </p>
-          </div>
-        </div>
-        {isLoading ? (
-          <LoaderCircle
-            aria-hidden="true"
-            className="size-4 shrink-0 animate-spin text-stone-500"
-          />
-        ) : null}
-      </div>
-      {error ? (
-        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
-          {error}
-        </div>
-      ) : null}
-      <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3">
-        <div className="space-y-2">
-          {todoGraph.tasks.map((task) => (
-            <TodoGraphTaskItem key={task.id} level={0} task={task} />
-          ))}
-        </div>
-      </div>
-    </div>
   );
 }
 
@@ -7723,11 +7748,16 @@ function ContextPanel({
   diffError,
   diffResponse,
   files,
+  gitCommitMessage,
+  gitOperationKey,
   isLoadingChatStatistics,
   isLoadingContextMemories,
   isLoadingDiff,
   isLoadingTodoGraph,
   onForgetContextMemory,
+  onGitCommit,
+  onGitCommitMessageChange,
+  onGitFileOperation,
   onMemoryPageChange,
   onRefreshDiff,
   onSelectDiffFile,
@@ -7746,11 +7776,16 @@ function ContextPanel({
   diffError: string | null;
   diffResponse: GitDiffResponse | null;
   files: GitStatusFileSummary[];
+  gitCommitMessage: string;
+  gitOperationKey: string | null;
   isLoadingChatStatistics: boolean;
   isLoadingContextMemories: boolean;
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
   onForgetContextMemory: (memory: MemoryFactRecord) => void;
+  onGitCommit: (event: FormEvent<HTMLFormElement>) => void;
+  onGitCommitMessageChange: (message: string) => void;
+  onGitFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
   onRefreshDiff: () => void;
   onSelectDiffFile: (path: string | null) => void;
@@ -7805,7 +7840,12 @@ function ContextPanel({
               diffError={diffError}
               diffResponse={diffResponse}
               files={files}
+              gitCommitMessage={gitCommitMessage}
+              gitOperationKey={gitOperationKey}
               isLoading={isLoadingDiff}
+              onCommit={onGitCommit}
+              onCommitMessageChange={onGitCommitMessageChange}
+              onFileOperation={onGitFileOperation}
               onRefresh={onRefreshDiff}
               onSelectFile={onSelectDiffFile}
               selectedPath={selectedPath}
@@ -7834,6 +7874,59 @@ function ContextPanel({
         ) : null}
       </div>
     </section>
+  );
+}
+
+
+function TodoGraphPanel({
+  error,
+  isLoading,
+  todoGraph,
+}: {
+  error: string | null;
+  isLoading: boolean;
+  todoGraph: TodoGraphResponse;
+}) {
+  const { language, t } = useI18n();
+
+  return (
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
+      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-800">
+            <ListChecks aria-hidden="true" className="size-5" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold">{t("ToDo graph")}</h2>
+            <p className="truncate text-xs font-medium text-stone-500">
+              {todoGraph.updatedAt
+                ? t("Updated {time}", {
+                  time: formatTodoGraphDate(todoGraph.updatedAt, language),
+                })
+                : todoGraph.chatId}
+            </p>
+          </div>
+        </div>
+        {isLoading ? (
+          <LoaderCircle
+            aria-hidden="true"
+            className="size-4 shrink-0 animate-spin text-stone-500"
+          />
+        ) : null}
+      </div>
+      {error ? (
+        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {error}
+        </div>
+      ) : null}
+      <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3">
+        <div className="space-y-2">
+          {todoGraph.tasks.map((task) => (
+            <TodoGraphTaskItem key={task.id} level={0} task={task} />
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -8440,7 +8533,12 @@ function GitDiffPanel({
   diffError,
   diffResponse,
   files,
+  gitCommitMessage,
+  gitOperationKey,
   isLoading,
+  onCommit,
+  onCommitMessageChange,
+  onFileOperation,
   onRefresh,
   onSelectFile,
   selectedPath,
@@ -8448,44 +8546,49 @@ function GitDiffPanel({
   diffError: string | null;
   diffResponse: GitDiffResponse | null;
   files: GitStatusFileSummary[];
+  gitCommitMessage: string;
+  gitOperationKey: string | null;
   isLoading: boolean;
+  onCommit: (event: FormEvent<HTMLFormElement>) => void;
+  onCommitMessageChange: (message: string) => void;
+  onFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onRefresh: () => void;
   onSelectFile: (path: string | null) => void;
   selectedPath: string | null;
 }) {
   const { t } = useI18n();
   const diffSections = parseGitDiffSections(diffResponse);
+  const stagedFiles = diffResponse?.stagedFiles ?? [];
+  const isCommitting = gitOperationKey === "commit";
 
   return (
-    <div className="relative flex h-full min-h-0 min-w-0 flex-col">
+    <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[#f8f8f8]">
       <div className="flex min-h-[var(--foco-header-height)] items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
             <GitCompare aria-hidden="true" className="size-4" />
           </span>
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold">{t("Git diff")}</h2>
+            <h2 className="truncate text-sm font-semibold">{t("Source Control")}</h2>
             <p className="truncate text-xs font-medium text-stone-500">
               {selectedPath ?? t("Workspace changes")}
             </p>
           </div>
         </div>
-        <div className="flex shrink-0 gap-2">
-          <button
-            aria-label={t("Refresh diff")}
-            className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-            disabled={isLoading}
-            onClick={onRefresh}
-            title={t("Refresh diff")}
-            type="button"
-          >
-            {isLoading ? (
-              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-            ) : (
-              <RefreshCw aria-hidden="true" className="size-4" />
-            )}
-          </button>
-        </div>
+        <button
+          aria-label={t("Refresh diff")}
+          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-stone-600 hover:bg-stone-200/80 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-400"
+          disabled={isLoading}
+          onClick={onRefresh}
+          title={t("Refresh diff")}
+          type="button"
+        >
+          {isLoading ? (
+            <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+          ) : (
+            <RefreshCw aria-hidden="true" className="size-4" />
+          )}
+        </button>
       </div>
 
       {diffError ? (
@@ -8494,58 +8597,183 @@ function GitDiffPanel({
         </div>
       ) : null}
 
-      <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3">
+      <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3">
+        <form className="mb-3 space-y-2 px-1" onSubmit={onCommit}>
+          <textarea
+            className="min-h-20 w-full resize-none rounded-md border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 shadow-inner outline-none placeholder:text-stone-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+            disabled={isCommitting}
+            onChange={(event) => onCommitMessageChange(event.target.value)}
+            placeholder={t("Commit message")}
+            value={gitCommitMessage}
+          />
+          <button
+            className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:text-stone-500"
+            disabled={isCommitting || !gitCommitMessage.trim() || stagedFiles.length === 0}
+            type="submit"
+          >
+            {isCommitting ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin" /> : null}
+            {t("Commit")}
+          </button>
+        </form>
+
+        <section className="mb-3">
+          <div className="mb-1 flex items-center justify-between px-1 text-[11px] font-semibold uppercase tracking-wide text-stone-500">
+            <span>{t("Staged Changes")}</span>
+            <span>{stagedFiles.length}</span>
+          </div>
+          <div className="space-y-0.5">
+            {stagedFiles.length ? (
+              stagedFiles.map((file) => (
+                <GitFileRow
+                  action="unstage"
+                  diffSections={diffSections}
+                  file={file}
+                  gitOperationKey={gitOperationKey}
+                  isLoading={isLoading}
+                  key={`staged-${file.path}`}
+                  onFileOperation={onFileOperation}
+                  onSelectFile={onSelectFile}
+                  selectedPath={selectedPath}
+                  showDiscard={false}
+                />
+              ))
+            ) : (
+              <div className="rounded-md border border-dashed border-stone-300 bg-white/70 px-3 py-2 text-xs text-stone-500">
+                {t("No staged changes")}
+              </div>
+            )}
+          </div>
+        </section>
+
+        <section>
+          <button
+            className={diffFileButtonClass(selectedPath === null)}
+            onClick={() => onSelectFile(null)}
+            type="button"
+          >
+            <span className="truncate text-[11px] font-semibold uppercase tracking-wide">
+              {t("Changes")}
+            </span>
+            <span className="text-xs text-stone-500">{files.length}</span>
+          </button>
+          <div className="mt-1 space-y-0.5">
+            {files.length ? (
+              files.map((file) => (
+                <GitFileRow
+                  action="stage"
+                  diffSections={diffSections}
+                  file={file}
+                  gitOperationKey={gitOperationKey}
+                  isLoading={isLoading}
+                  key={`unstaged-${file.path}`}
+                  onFileOperation={onFileOperation}
+                  onSelectFile={onSelectFile}
+                  selectedPath={selectedPath}
+                  showDiscard
+                />
+              ))
+            ) : (
+              <div className="rounded-md border border-dashed border-stone-300 bg-white/70 px-3 py-2 text-xs text-stone-500">
+                {t("No changes")}
+              </div>
+            )}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function GitFileRow({
+  action,
+  diffSections,
+  file,
+  gitOperationKey,
+  isLoading,
+  onFileOperation,
+  onSelectFile,
+  selectedPath,
+  showDiscard,
+}: {
+  action: "stage" | "unstage";
+  diffSections: GitDiffSection[];
+  file: GitStatusFileSummary;
+  gitOperationKey: string | null;
+  isLoading: boolean;
+  onFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
+  onSelectFile: (path: string | null) => void;
+  selectedPath: string | null;
+  showDiscard: boolean;
+}) {
+  const { t } = useI18n();
+  const isExpanded = selectedPath === file.path;
+  const label = statusLabel(file);
+  const actionKey = `${action}:${file.path}`;
+  const discardKey = `discard:${file.path}`;
+  const isActionLoading = gitOperationKey === actionKey;
+  const isDiscardLoading = gitOperationKey === discardKey;
+
+  return (
+    <div>
+      <div className={diffFileButtonClass(isExpanded)}>
         <button
-          className={diffFileButtonClass(selectedPath === null)}
-          onClick={() => onSelectFile(null)}
+          aria-label={`${file.path} ${label}`}
+          className="flex min-w-0 flex-1 items-center gap-1.5 py-0.5 text-left"
+          onClick={() => onSelectFile(isExpanded ? null : file.path)}
           type="button"
         >
-          <span className="truncate">{t("All changed files")}</span>
-          <span className="text-xs text-stone-500">{files.length}</span>
-        </button>
-        <div className="mt-2 space-y-1">
-          {files.length ? (
-            files.map((file) => {
-              const isExpanded = selectedPath === file.path;
-              const label = statusLabel(file);
-
-              return (
-                <div key={file.path}>
-                  <button
-                    aria-label={`${file.path} ${label}`}
-                    className={diffFileButtonClass(isExpanded)}
-                    onClick={() => onSelectFile(isExpanded ? null : file.path)}
-                    type="button"
-                  >
-                    {isExpanded ? (
-                      <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
-                    ) : (
-                      <ChevronRight aria-hidden="true" className="size-3.5 shrink-0" />
-                    )}
-                    <span className="min-w-0 flex-1 truncate text-left">
-                      {file.path}
-                    </span>
-                    <span className="shrink-0 rounded-md bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600">
-                      {label}
-                    </span>
-                  </button>
-                  {isExpanded ? (
-                    <InlineGitDiff
-                      isLoading={isLoading}
-                      path={file.path}
-                      sections={diffSections}
-                    />
-                  ) : null}
-                </div>
-              );
-            })
+          {isExpanded ? (
+            <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
           ) : (
-            <div className="rounded-lg border border-dashed border-stone-300 bg-stone-50/80 px-3 py-3 text-sm text-stone-500">
-              {t("No changes")}
-            </div>
+            <ChevronRight aria-hidden="true" className="size-3.5 shrink-0" />
           )}
-        </div>
+          <span className="min-w-0 flex-1 truncate text-left text-[13px]">
+            {file.path}
+          </span>
+        </button>
+        <span className={gitStatusBadgeClass(label)}>{label}</span>
+        <button
+          aria-label={t(action === "stage" ? "Stage file" : "Unstage file")}
+          className="inline-flex size-6 shrink-0 items-center justify-center rounded text-stone-500 hover:bg-stone-200 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-300"
+          disabled={gitOperationKey !== null}
+          onClick={(event) => {
+            event.stopPropagation();
+            onFileOperation(action, file.path);
+          }}
+          title={t(action === "stage" ? "Stage file" : "Unstage file")}
+          type="button"
+        >
+          {isActionLoading ? (
+            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+          ) : action === "stage" ? (
+            <Plus aria-hidden="true" className="size-3.5" />
+          ) : (
+            <Minus aria-hidden="true" className="size-3.5" />
+          )}
+        </button>
+        {showDiscard ? (
+          <button
+            aria-label={t("Discard file changes")}
+            className="inline-flex size-6 shrink-0 items-center justify-center rounded text-stone-500 hover:bg-rose-100 hover:text-rose-700 disabled:cursor-not-allowed disabled:text-stone-300"
+            disabled={gitOperationKey !== null}
+            onClick={(event) => {
+              event.stopPropagation();
+              onFileOperation("discard", file.path);
+            }}
+            title={t("Discard file changes")}
+            type="button"
+          >
+            {isDiscardLoading ? (
+              <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+            ) : (
+              <Undo2 aria-hidden="true" className="size-3.5" />
+            )}
+          </button>
+        ) : null}
       </div>
+      {isExpanded ? (
+        <InlineGitDiff isLoading={isLoading} path={file.path} sections={diffSections} />
+      ) : null}
     </div>
   );
 }
@@ -18937,6 +19165,22 @@ function statusLabel(file: GitStatusFileSummary) {
   const uniqueStatuses = [...new Set(statuses)];
 
   return uniqueStatuses.length ? uniqueStatuses.join("") : ".";
+}
+
+function gitStatusBadgeClass(label: string) {
+  const status = label[0] ?? ".";
+  const colorClass =
+    status === "M"
+      ? "bg-amber-100 text-amber-700 border-amber-200"
+      : status === "U" || status === "A"
+        ? "bg-emerald-100 text-emerald-700 border-emerald-200"
+        : status === "D"
+          ? "bg-rose-100 text-rose-700 border-rose-200"
+          : status === "R"
+            ? "bg-sky-100 text-sky-700 border-sky-200"
+            : "bg-stone-100 text-stone-600 border-stone-200";
+
+  return `shrink-0 rounded border px-1.5 py-0.5 font-mono text-[11px] font-semibold leading-none ${colorClass}`;
 }
 
 function normalizeGitStatus(status: string) {

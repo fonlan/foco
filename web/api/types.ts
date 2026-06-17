@@ -38,6 +38,7 @@ export type GitDiffResponse = {
   diff: string;
   stagedDiff: string;
   files: GitStatusFileSummary[];
+  stagedFiles: GitStatusFileSummary[];
 };
 
 export type GitDiffLineStats = {

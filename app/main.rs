@@ -725,9 +725,26 @@ fn app_router(state: AppState) -> Router {
             get(crate::http::git::git_diff),
         )
         .route(
+            "/api/workspaces/{workspace_id}/git/stage",
+            post(crate::http::git::stage_git_file),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/git/unstage",
+            post(crate::http::git::unstage_git_file),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/git/discard",
+            post(crate::http::git::discard_git_file),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/git/commit",
+            post(crate::http::git::commit_staged_changes),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/git/branches",
             get(crate::http::git::git_branches),
         )
+
         .route(
             "/api/workspaces/{workspace_id}/git/branches/switch",
             post(crate::http::git::switch_git_branch),
@@ -2346,6 +2363,7 @@ pub(crate) struct GitDiffResponse {
     diff: String,
     staged_diff: String,
     files: Vec<GitStatusFileSummary>,
+    staged_files: Vec<GitStatusFileSummary>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

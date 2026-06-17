@@ -5,8 +5,16 @@ use axum::{
 use serde::Deserialize;
 
 use crate::git_backend::{
-    create_git_branch as create_git_branch_in_workspace, git_branches_response, git_diff_response,
-    git_status_response, is_git_workspace, switch_git_branch as switch_git_branch_in_workspace,
+    commit_staged_changes as commit_staged_changes_in_workspace,
+    create_git_branch as create_git_branch_in_workspace,
+    discard_git_file as discard_git_file_in_workspace,
+    git_branches_response,
+    git_diff_response,
+    git_status_response,
+    is_git_workspace,
+    stage_git_file as stage_git_file_in_workspace,
+    switch_git_branch as switch_git_branch_in_workspace,
+    unstage_git_file as unstage_git_file_in_workspace,
 };
 use crate::{
     ApiError, AppState, GitBranchesResponse, GitDiffResponse, GitStatusResponse, config_snapshot,
@@ -37,6 +45,61 @@ pub(crate) async fn git_diff(
         .transpose()?;
 
     Ok(Json(git_diff_response(&workspace.path, path)?))
+}
+
+pub(crate) async fn stage_git_file(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<GitFileRequest>,
+) -> Result<Json<GitDiffResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let path = normalize_workspace_relative_path(&request.path)?;
+
+    stage_git_file_in_workspace(&workspace.path, &path)?;
+
+    Ok(Json(git_diff_response(&workspace.path, None)?))
+}
+
+pub(crate) async fn unstage_git_file(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<GitFileRequest>,
+) -> Result<Json<GitDiffResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let path = normalize_workspace_relative_path(&request.path)?;
+
+    unstage_git_file_in_workspace(&workspace.path, &path)?;
+
+    Ok(Json(git_diff_response(&workspace.path, None)?))
+}
+
+pub(crate) async fn discard_git_file(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<GitFileRequest>,
+) -> Result<Json<GitDiffResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let path = normalize_workspace_relative_path(&request.path)?;
+
+    discard_git_file_in_workspace(&workspace.path, &path)?;
+
+    Ok(Json(git_diff_response(&workspace.path, None)?))
+}
+
+pub(crate) async fn commit_staged_changes(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<GitCommitRequest>,
+) -> Result<Json<GitDiffResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+
+    commit_staged_changes_in_workspace(&workspace.path, request.message)?;
+
+    Ok(Json(git_diff_response(&workspace.path, None)?))
 }
 
 pub(crate) async fn git_branches(
@@ -87,6 +150,18 @@ pub(crate) async fn create_git_branch(
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GitDiffQuery {
     path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GitFileRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GitCommitRequest {
+    message: String,
 }
 
 #[derive(Deserialize)]
