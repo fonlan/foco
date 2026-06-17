@@ -62,6 +62,7 @@ import {
   ClipboardEvent as ReactClipboardEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
   WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
@@ -244,6 +245,7 @@ import {
   MOBILE_BREAKPOINT_PX,
   SAVED_PASSWORD_MASK,
   STREAM_CONTEXT_USAGE_REFRESH_DELAY_MS,
+  WORKSPACE_CHAT_CONTEXT_MENU_LONG_PRESS_MS,
   WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
   WORKSPACE_SIDEBAR_MAX_WIDTH,
   WORKSPACE_SIDEBAR_MIN_WIDTH,
@@ -282,6 +284,12 @@ import {
 
 type ViewMode = "chat" | "settings" | "stats";
 type ContextPanelTab = "todo" | "git" | "memory" | "stats";
+type WorkspaceChatContextMenuState = {
+  chat: WorkspaceChatListItem;
+  left: number;
+  top: number;
+  workspace: WorkspaceSummary;
+};
 
 type ChartDatum = {
   displayValue?: string;
@@ -338,6 +346,8 @@ export function App() {
   const [openChatTabs, setOpenChatTabs] = useState<OpenChatTab[]>([]);
   const [pendingDeleteChat, setPendingDeleteChat] =
     useState<PendingDeleteChat | null>(null);
+  const [workspaceChatContextMenu, setWorkspaceChatContextMenu] =
+    useState<WorkspaceChatContextMenuState | null>(null);
   const [chatMessagesByKey, setChatMessagesByKey] = useState<
     Record<string, ShellMessage[]>
   >({});
@@ -477,6 +487,8 @@ export function App() {
   const hasAppliedInitialBrowserRouteRef = useRef(false);
   const hasManuallySelectedModelRef = useRef(false);
   const workspaceSidebarRef = useRef<HTMLElement | null>(null);
+  const workspaceChatLongPressTimeoutRef = useRef<number | null>(null);
+  const suppressNextWorkspaceChatClickRef = useRef(false);
 
   const activeWorkspace = useMemo(
     () =>
@@ -1233,6 +1245,53 @@ export function App() {
     onPointerMove: updateSidebarWidthFromClientX,
     onResizeEnd: () => setIsResizingSidebar(false),
   });
+
+  useEffect(() => {
+    if (!workspaceChatContextMenu) {
+      return;
+    }
+
+    function closeWorkspaceChatContextMenuForPointer(event: PointerEvent) {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest(".workspace-chat-context-menu")
+      ) {
+        return;
+      }
+      setWorkspaceChatContextMenu(null);
+    }
+
+    function closeWorkspaceChatContextMenuForKey(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setWorkspaceChatContextMenu(null);
+      }
+    }
+
+    function closeWorkspaceChatContextMenu() {
+      setWorkspaceChatContextMenu(null);
+    }
+
+    window.addEventListener("pointerdown", closeWorkspaceChatContextMenuForPointer);
+    window.addEventListener("keydown", closeWorkspaceChatContextMenuForKey);
+    window.addEventListener("resize", closeWorkspaceChatContextMenu);
+    window.addEventListener("scroll", closeWorkspaceChatContextMenu, true);
+
+    return () => {
+      window.removeEventListener("pointerdown", closeWorkspaceChatContextMenuForPointer);
+      window.removeEventListener("keydown", closeWorkspaceChatContextMenuForKey);
+      window.removeEventListener("resize", closeWorkspaceChatContextMenu);
+      window.removeEventListener("scroll", closeWorkspaceChatContextMenu, true);
+    };
+  }, [workspaceChatContextMenu]);
+
+  useEffect(() => {
+    return () => {
+      if (workspaceChatLongPressTimeoutRef.current !== null) {
+        window.clearTimeout(workspaceChatLongPressTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!workspaces.length) {
@@ -2113,6 +2172,58 @@ export function App() {
       viewMode: "chat",
       workspaceId: activeWorkspaceId || workspaceId,
     });
+  }
+
+  function openWorkspaceChatContextMenu(
+    event: Pick<ReactMouseEvent<HTMLElement> | ReactPointerEvent<HTMLElement>, "clientX" | "clientY" | "preventDefault" | "stopPropagation">,
+    workspace: WorkspaceSummary,
+    chat: WorkspaceChatListItem,
+  ) {
+    event.preventDefault();
+    event.stopPropagation();
+    setWorkspaceChatContextMenu({
+      chat,
+      left: event.clientX,
+      top: event.clientY,
+      workspace,
+    });
+  }
+
+  function cancelWorkspaceChatLongPress() {
+    if (workspaceChatLongPressTimeoutRef.current === null) {
+      return;
+    }
+
+    window.clearTimeout(workspaceChatLongPressTimeoutRef.current);
+    workspaceChatLongPressTimeoutRef.current = null;
+  }
+
+  function startWorkspaceChatLongPress(
+    event: ReactPointerEvent<HTMLButtonElement>,
+    workspace: WorkspaceSummary,
+    chat: WorkspaceChatListItem,
+  ) {
+    cancelWorkspaceChatLongPress();
+
+    if (
+      event.pointerType === "mouse" ||
+      typeof window === "undefined" ||
+      window.innerWidth >= MOBILE_BREAKPOINT_PX
+    ) {
+      return;
+    }
+
+    const { clientX, clientY } = event;
+    workspaceChatLongPressTimeoutRef.current = window.setTimeout(() => {
+      workspaceChatLongPressTimeoutRef.current = null;
+      suppressNextWorkspaceChatClickRef.current = true;
+      setWorkspaceChatContextMenu({
+        chat,
+        left: clientX,
+        top: clientY,
+        workspace,
+      });
+    }, WORKSPACE_CHAT_CONTEXT_MENU_LONG_PRESS_MS);
   }
 
   function requestDeleteWorkspaceChat(workspace: WorkspaceSummary, chat: ChatSummary) {
@@ -5012,7 +5123,7 @@ export function App() {
                             </button>
                           </div>
                           {isExpanded ? (
-                            <div className="ml-4 mt-1 space-y-1 border-l border-stone-200/80 pl-2">
+                            <div className="mt-1 space-y-1 border-l border-stone-200/80 pl-3">
                               {workspaceChats.length > 0 ? (
                                 <>
                                   {visibleChats.map((chat) => {
@@ -5053,125 +5164,120 @@ export function App() {
                                     const chatDiffStats = chat.codeChangeStats;
 
                                     return (
-                                      <div
-                                        className="group flex min-w-0 items-center gap-1"
-                                        key={chat.id}
-                                      >
-                                        <button
-                                          aria-current={
-                                            isChatActive ? "page" : undefined
-                                          }
-                                          className={chatItemClass(isChatActive)}
-                                          onClick={() =>
-                                            selectWorkspaceChat(workspace.id, chat.id)
-                                          }
-                                          title={chat.title}
-                                          type="button"
-                                        >
-                                          <span
-                                            aria-hidden="true"
-                                            className={`session-status-dot ${statusDotClass}`}
-                                          />
-                                          <span className="min-w-0 flex-1">
-                                            <span className="block truncate">
-                                              {chat.title}
-                                            </span>
-                                            <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-stone-400">
-                                              <span className="min-w-0 truncate">
-                                                {formatChatCreatedAt(chat.createdAt)}
-                                              </span>
-                                              {chatDiffStats &&
-                                                hasGitDiffStats(chatDiffStats) ? (
-                                                <span
-                                                  aria-label={t(
-                                                    "Code changes +{additions} -{deletions}",
-                                                    {
-                                                      additions:
-                                                        chatDiffStats.additions,
-                                                      deletions:
-                                                        chatDiffStats.deletions,
-                                                    },
-                                                  )}
-                                                  className="chat-diff-stats"
-                                                  title={t(
-                                                    "Code changes +{additions} -{deletions}",
-                                                    {
-                                                      additions:
-                                                        chatDiffStats.additions,
-                                                      deletions:
-                                                        chatDiffStats.deletions,
-                                                    },
-                                                  )}
-                                                >
-                                                  <span className="chat-diff-add">
-                                                    +{chatDiffStats.additions}
-                                                  </span>
-                                                  <span className="chat-diff-delete">
-                                                    -{chatDiffStats.deletions}
-                                                  </span>
-                                                </span>
-                                              ) : null}
-                                            </span>
-                                          </span>
-                                        </button>
-                                        <button
-                                          aria-label={t("Delete chat {title}", {
-                                            title: chat.title,
-                                          })}
-                                          className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
-                                          disabled={Boolean(chat.scheduledRunId)}
-                                          onClick={() =>
-                                            requestDeleteWorkspaceChat(workspace, chat)
-                                          }
-                                          title={t("Delete chat")}
-                                          type="button"
-                                        >
-                                          <Trash2
-                                            aria-hidden="true"
-                                            className="size-3.5"
-                                          />
-                                        </button>
-                                      </div>
-                                    );
-                                  })}
-                                  {hiddenChatCount > 0 ? (
-                                    <div className="group flex min-w-0 items-center gap-1">
                                       <button
-                                        aria-label={t(
-                                          "Show {count} more chats in {name}",
-                                          {
-                                            count: nextVisibleChatCount,
-                                            name: workspace.name,
-                                          },
-                                        )}
-                                        className="flex min-h-10 min-w-0 flex-1 items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-stone-500 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
-                                        onClick={() =>
-                                          showMoreWorkspaceChats(workspace.id)
+                                        aria-current={
+                                          isChatActive ? "page" : undefined
                                         }
+                                        className={chatItemClass(isChatActive)}
+                                        key={chat.id}
+                                        onClick={() => {
+                                          if (suppressNextWorkspaceChatClickRef.current) {
+                                            suppressNextWorkspaceChatClickRef.current = false;
+                                            return;
+                                          }
+
+                                          selectWorkspaceChat(workspace.id, chat.id);
+                                        }}
+                                        onContextMenu={(event) =>
+                                          openWorkspaceChatContextMenu(
+                                            event,
+                                            workspace,
+                                            chat,
+                                          )
+                                        }
+                                        onPointerCancel={cancelWorkspaceChatLongPress}
+                                        onPointerDown={(event) =>
+                                          startWorkspaceChatLongPress(
+                                            event,
+                                            workspace,
+                                            chat,
+                                          )
+                                        }
+                                        onPointerLeave={cancelWorkspaceChatLongPress}
+                                        onPointerUp={cancelWorkspaceChatLongPress}
+                                        title={chat.title}
                                         type="button"
                                       >
-                                        <ChevronDown
+                                        <span
                                           aria-hidden="true"
-                                          className="size-3.5 shrink-0"
+                                          className={`session-status-dot ${statusDotClass}`}
                                         />
                                         <span className="min-w-0 flex-1">
                                           <span className="block truncate">
-                                            {t("Show {count} more chats", {
-                                              count: nextVisibleChatCount,
-                                            })}
+                                            {chat.title}
                                           </span>
-                                          <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-stone-400">
-                                            {t("{count} hidden chats", {
-                                              count: hiddenChatCount,
-                                            })}
+                                          <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-stone-400">
+                                            <span className="min-w-0 truncate">
+                                              {formatChatCreatedAt(chat.createdAt)}
+                                            </span>
+                                            {chatDiffStats &&
+                                              hasGitDiffStats(chatDiffStats) ? (
+                                              <span
+                                                aria-label={t(
+                                                  "Code changes +{additions} -{deletions}",
+                                                  {
+                                                    additions:
+                                                      chatDiffStats.additions,
+                                                    deletions:
+                                                      chatDiffStats.deletions,
+                                                  },
+                                                )}
+                                                className="chat-diff-stats"
+                                                title={t(
+                                                  "Code changes +{additions} -{deletions}",
+                                                  {
+                                                    additions:
+                                                      chatDiffStats.additions,
+                                                    deletions:
+                                                      chatDiffStats.deletions,
+                                                  },
+                                                )}
+                                              >
+                                                <span className="chat-diff-add">
+                                                  +{chatDiffStats.additions}
+                                                </span>
+                                                <span className="chat-diff-delete">
+                                                  -{chatDiffStats.deletions}
+                                                </span>
+                                              </span>
+                                            ) : null}
                                           </span>
                                         </span>
                                       </button>
-                                      <span
+                                    );
+                                  })}
+                                  {hiddenChatCount > 0 ? (
+                                    <button
+                                      aria-label={t(
+                                        "Show {count} more chats in {name}",
+                                        {
+                                          count: nextVisibleChatCount,
+                                          name: workspace.name,
+                                        },
+                                      )}
+                                      className="flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-stone-500 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
+                                      onClick={() =>
+                                        showMoreWorkspaceChats(workspace.id)
+                                      }
+                                      type="button"
+                                    >
+                                      <ChevronDown
                                         aria-hidden="true"
-                                        className="inline-flex size-7 shrink-0"
+                                        className="size-3.5 shrink-0"
                                       />
-                                    </div>
+                                      <span className="min-w-0 flex-1">
+                                        <span className="block truncate">
+                                          {t("Show {count} more chats", {
+                                            count: nextVisibleChatCount,
+                                          })}
+                                        </span>
+                                        <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-stone-400">
+                                          {t("{count} hidden chats", {
+                                            count: hiddenChatCount,
+                                          })}
+                                        </span>
+                                      </span>
+                                    </button>
                                   ) : null}
                                 </>
                               ) : (
@@ -5192,6 +5298,33 @@ export function App() {
                 </nav>
               </div>
             </aside>
+
+            {workspaceChatContextMenu ? (
+              <div
+                aria-label={workspaceChatContextMenu.chat.title}
+                className="workspace-chat-context-menu"
+                role="menu"
+                style={{
+                  left: workspaceChatContextMenu.left,
+                  top: workspaceChatContextMenu.top,
+                }}
+              >
+                <button
+                  className="workspace-chat-context-menu-item workspace-chat-context-menu-item-danger"
+                  disabled={Boolean(workspaceChatContextMenu.chat.scheduledRunId)}
+                  onClick={() => {
+                    const { chat, workspace } = workspaceChatContextMenu;
+                    setWorkspaceChatContextMenu(null);
+                    requestDeleteWorkspaceChat(workspace, chat);
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Trash2 aria-hidden="true" className="size-3.5" />
+                  <span>{t("Delete chat")}</span>
+                </button>
+              </div>
+            ) : null}
 
             <section className="app-main-panel flex min-w-0 flex-col">
               <header className="app-toolbar shrink-0 border-b border-stone-200/80 bg-white/80 backdrop-blur">

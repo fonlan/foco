@@ -20,7 +20,7 @@ export function workspaceMenuClass(active: boolean) {
 }
 
 export function chatItemClass(active: boolean) {
-  return `chat-item flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-xs font-medium ${
+  return `chat-item flex min-h-11 min-w-0 w-full items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-xs font-medium ${
     active
       ? "chat-item-active border-teal-100 bg-white text-stone-950 shadow-sm"
       : "border-transparent text-stone-600 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
