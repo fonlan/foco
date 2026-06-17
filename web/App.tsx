@@ -5672,7 +5672,11 @@ export function App() {
                 isSelectingAttachments={isSelectingAttachments}
                 messages={messages}
                 overviewRenderer={() => (
-                  <ApiOverviewPanel settings={settings} workspaces={workspaces} />
+                  <ApiOverviewPanel
+                    activeWorkspaceId={activeWorkspaceId}
+                    settings={settings}
+                    workspaces={workspaces}
+                  />
                 )}
                 onAddPastedImageAttachments={(files) =>
                   void handleAddPastedImageAttachments(files)
@@ -6644,18 +6648,26 @@ function NavRailButton({
 }
 
 function ApiOverviewPanel({
+  activeWorkspaceId,
   settings,
   workspaces,
 }: {
+  activeWorkspaceId: string;
   settings: SettingsResponse | null;
   workspaces: WorkspaceSummary[];
 }) {
   const { language, t } = useI18n();
+  const initialWorkspaceId = preferredOverviewWorkspaceId(
+    activeWorkspaceId,
+    workspaces,
+  );
   const [filters, setFilters] = useState({
     startedAfter: "",
     startedBefore: "",
-    workspaceId: "",
+    workspaceId: initialWorkspaceId,
   });
+  const [hasAppliedInitialWorkspace, setHasAppliedInitialWorkspace] =
+    useState(initialWorkspaceId !== "");
   const [stats, setStats] = useState<AiStatisticsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -6679,6 +6691,10 @@ function ApiOverviewPanel({
         ]),
       ),
     [settings?.configuredModels],
+  );
+  const preferredWorkspaceId = preferredOverviewWorkspaceId(
+    activeWorkspaceId,
+    workspaces,
   );
   const selectedWorkspace =
     workspaces.find((workspace) => workspace.id === filters.workspaceId) ?? null;
@@ -6726,6 +6742,10 @@ function ApiOverviewPanel({
   }));
 
   const loadOverview = useCallback(async () => {
+    if (!hasAppliedInitialWorkspace && settings !== null && workspaces.length > 0) {
+      return;
+    }
+
     setIsLoading(true);
     setError(null);
 
@@ -6740,13 +6760,26 @@ function ApiOverviewPanel({
     } finally {
       setIsLoading(false);
     }
-  }, [filters]);
+  }, [filters, hasAppliedInitialWorkspace, settings, workspaces.length]);
+
+  useEffect(() => {
+    if (hasAppliedInitialWorkspace || preferredWorkspaceId === "") {
+      return;
+    }
+
+    setFilters((current) => ({
+      ...current,
+      workspaceId: preferredWorkspaceId,
+    }));
+    setHasAppliedInitialWorkspace(true);
+  }, [hasAppliedInitialWorkspace, preferredWorkspaceId]);
 
   useEffect(() => {
     void loadOverview();
   }, [loadOverview]);
 
   function updateOverviewFilters(update: Partial<typeof filters>) {
+    setHasAppliedInitialWorkspace(true);
     setFilters((current) => ({
       ...current,
       ...update,
@@ -19023,6 +19056,20 @@ function liveToolBreakdown(messages: ShellMessage[]) {
       (left, right) =>
         right.callCount - left.callCount || left.toolName.localeCompare(right.toolName),
     );
+}
+
+function preferredOverviewWorkspaceId(
+  activeWorkspaceId: string,
+  workspaces: WorkspaceSummary[],
+) {
+  if (
+    activeWorkspaceId &&
+    workspaces.some((workspace) => workspace.id === activeWorkspaceId)
+  ) {
+    return activeWorkspaceId;
+  }
+
+  return workspaces[0]?.id ?? "";
 }
 
 function aiOverviewQuery(filters: {
