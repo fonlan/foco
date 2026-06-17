@@ -2028,18 +2028,72 @@ export function App() {
   function updateScheduledWorkspaceRunsByWorkspaceList(
     nextWorkspaces: WorkspaceSummary[],
   ) {
-    updateScheduledWorkspaceRuns((current) =>
-      current.filter((run) =>
+    updateScheduledWorkspaceRuns((current) => {
+      const currentByChatKey = new Map(
+        current.map((run) => [run.chatKey, run]),
+      );
+      const nextRuns = current.filter((run) =>
         nextWorkspaces.some(
           (workspace) =>
             workspace.id === run.workspaceId &&
             (!run.createdChatId ||
               !workspace.chats.some((chat) => chat.id === run.createdChatId)),
         ),
-      ),
-    );
-  }
+      );
+      const nextRunChatKeys = new Set(nextRuns.map((run) => run.chatKey));
 
+      for (const workspace of nextWorkspaces) {
+        for (const chat of workspace.chats) {
+          if (chat.queuedRun?.status !== "queued") {
+            continue;
+          }
+
+          const chatKey = chatRunKey(workspace.id, chat.id);
+          if (
+            nextRunChatKeys.has(chatKey) ||
+            !chat.queuedRun.modelId ||
+            !chat.queuedRun.providerId ||
+            !chat.queuedRun.content
+          ) {
+            continue;
+          }
+
+          const queuedRequest: RetryRunRequest = {
+            workspaceId: workspace.id,
+            chatId: chat.id,
+            content: chat.queuedRun.content,
+            attachments: [],
+            modelId: chat.queuedRun.modelId,
+            providerId: chat.queuedRun.providerId,
+            thinkingLevel: chat.queuedRun.thinkingLevel ?? "",
+            skillIds: chat.queuedRun.skillIds,
+            localChatKey: chatKey,
+            pendingUserMessageId: chat.queuedRun.userMessageId,
+            queuedUserMessageId: chat.queuedRun.userMessageId,
+          };
+          const existingRun = currentByChatKey.get(chatKey);
+          const scheduledRun: ScheduledWorkspaceRun = existingRun
+            ? { ...existingRun, request: queuedRequest, status: "queued" }
+            : {
+              id: chat.id,
+              workspaceId: workspace.id,
+              chatId: chat.id,
+              chatKey,
+              title: chat.title,
+              createdAt: chat.createdAt,
+              pendingUserMessageId: chat.queuedRun.userMessageId,
+              request: queuedRequest,
+              status: "queued",
+            };
+
+          nextRuns.push(scheduledRun);
+          nextRunChatKeys.add(chatKey);
+        }
+      }
+
+      return nextRuns;
+    });
+  }
   function restoreQueuedRunRequestsForChatKey(
     workspaceId: string,
     chatId: string,
@@ -2062,6 +2116,7 @@ export function App() {
         providerId: message.queuedRun?.providerId ?? "",
         thinkingLevel: message.queuedRun?.thinkingLevel ?? "",
         skillIds: message.queuedRun?.skillIds ?? [],
+        localChatKey: chatKey,
         pendingUserMessageId: message.id,
         queuedUserMessageId: message.id,
       }))
@@ -2070,6 +2125,39 @@ export function App() {
       );
 
     updateQueuedRunRequestsForChatKey(chatKey, () => queuedRequests);
+    const [queuedRequest] = queuedRequests;
+    if (!queuedRequest) {
+      return;
+    }
+
+    const workspaceChat = workspaces
+      .find((workspace) => workspace.id === workspaceId)
+      ?.chats.find((chat) => chat.id === chatId);
+    if (!workspaceChat) {
+      return;
+    }
+
+    updateScheduledWorkspaceRuns((current) => {
+      if (current.some((run) => run.chatKey === chatKey)) {
+        return current;
+      }
+
+      return [
+        ...current,
+        {
+          id: chatId,
+          workspaceId,
+          chatId,
+          chatKey,
+          title: workspaceChat.title,
+          createdAt: workspaceChat.createdAt,
+          pendingUserMessageId:
+            queuedRequest.pendingUserMessageId ?? queuedRequest.queuedUserMessageId,
+          request: queuedRequest,
+          status: "queued",
+        },
+      ];
+    });
   }
 
   function compareWorkspaceChatListItemsByCreatedAtDesc(

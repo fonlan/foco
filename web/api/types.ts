@@ -89,6 +89,11 @@ export type QueuedRunSummary = {
   status: "queued" | "running" | string;
   userMessageId: string;
   assistantMessageId: string | null;
+  modelId?: string | null;
+  providerId: string | null;
+  thinkingLevel: string | null;
+  skillIds: string[];
+  content?: string | null;
 };
 
 export type ActiveChatRunSummary = {

@@ -59,7 +59,14 @@ pub(crate) async fn queue_chat_message(
     let (chat_id, chat_title) = if prompt_context.is_new_chat {
         let chat_id = unique_id("chat");
         let title = chat_title_for_prompt(raw_message, &prompt_context.attachments);
-        let chat_metadata_json = queued_chat_metadata_json(&user_message_id)?;
+        let chat_metadata_json = queued_chat_metadata_json(
+            &user_message_id,
+            &requested_model_id,
+            requested_provider_id.as_deref(),
+            requested_thinking_level.as_deref(),
+            &requested_skill_ids,
+            message,
+        )?;
         database
             .insert_chat_with_metadata(&chat_id, &title, &chat_metadata_json)
             .map_err(ApiError::from_workspace_error)?;

@@ -2224,7 +2224,13 @@ struct QueuedRunSummary {
     status: String,
     user_message_id: String,
     assistant_message_id: Option<String>,
+    model_id: Option<String>,
+    provider_id: Option<String>,
+    thinking_level: Option<String>,
+    skill_ids: Vec<String>,
+    content: Option<String>,
 }
+
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -11879,11 +11885,23 @@ fn code_change_stats_from_changed_files(
     }
 }
 
-fn queued_chat_metadata_json(user_message_id: &str) -> Result<String, ApiError> {
+fn queued_chat_metadata_json(
+    user_message_id: &str,
+    model_id: &str,
+    provider_id: Option<&str>,
+    thinking_level: Option<&str>,
+    skill_ids: &[String],
+    content: &str,
+) -> Result<String, ApiError> {
     serde_json::to_string(&json!({
         "queuedRun": {
             "status": "queued",
             "userMessageId": user_message_id,
+            "modelId": model_id,
+            "providerId": provider_id,
+            "thinkingLevel": thinking_level,
+            "skillIds": skill_ids,
+            "content": content,
         }
     }))
     .map_err(|source| {
@@ -11892,6 +11910,7 @@ fn queued_chat_metadata_json(user_message_id: &str) -> Result<String, ApiError> 
         ))
     })
 }
+
 
 fn queued_user_message_metadata_json(
     attachments: &[NeutralChatAttachment],
@@ -12731,14 +12750,38 @@ fn queued_run_summary_from_chat_metadata(
         .ok_or_else(|| {
             ApiError::bad_request("chat metadata.queuedRun.userMessageId must be a string")
         })?;
+    let model_id =
+        string_json_field(queued_run, "modelId", "model_id").map(str::to_string);
+    let provider_id =
+        string_json_field(queued_run, "providerId", "provider_id").map(str::to_string);
+    let thinking_level =
+        string_json_field(queued_run, "thinkingLevel", "thinking_level").map(str::to_string);
     let assistant_message_id =
         string_json_field(queued_run, "assistantMessageId", "assistant_message_id")
             .map(str::to_string);
+    let content = string_json_field(queued_run, "content", "content").map(str::to_string);
+    let skill_ids = queued_run
+        .get("skillIds")
+        .or_else(|| queued_run.get("skill_ids"))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
 
     Ok(Some(QueuedRunSummary {
         status: status.to_string(),
         user_message_id: user_message_id.to_string(),
         assistant_message_id,
+        model_id,
+        provider_id,
+        thinking_level,
+        skill_ids,
+        content,
     }))
 }
 
