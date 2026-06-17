@@ -153,6 +153,18 @@ const CONTEXT_COMPRESSION_MAX_MESSAGE_CHARS: usize = 320;
 const CONTEXT_COMPRESSION_MAX_MESSAGE_ENTRIES: usize = 16;
 // Prefix used to identify injected context compression snapshot messages.
 const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
+// Metadata kind for deterministic local context compression snapshots.
+const CONTEXT_COMPRESSION_KIND_RULE: &str = "rule";
+// Metadata kind for model-generated fallback context compression snapshots.
+const CONTEXT_COMPRESSION_KIND_LLM: &str = "llm";
+// Numerator for the 95% model-generated fallback compression threshold.
+const LLM_CONTEXT_COMPRESSION_TRIGGER_NUMERATOR: u64 = 19;
+// Denominator for the 95% model-generated fallback compression threshold.
+const LLM_CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR: u64 = 20;
+// Timeout for model-generated fallback compression requests.
+const LLM_CONTEXT_COMPRESSION_TIMEOUT_MS: u64 = 120_000;
+// Maximum output tokens requested for model-generated fallback compression summaries.
+const LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS: u32 = 2048;
 // Percent of the model context budget reserved for memory profile and retrieved facts.
 const MEMORY_CONTEXT_BUDGET_PERCENT: u64 = 12;
 // Maximum active memory facts considered when building query-specific memory context.
@@ -2174,6 +2186,8 @@ struct ChatToolBreakdown {
 #[serde(rename_all = "camelCase")]
 struct ChatCompressionStatistics {
     snapshot_count: i64,
+    rule_snapshot_count: i64,
+    llm_snapshot_count: i64,
     original_token_count: i64,
     summary_token_count: i64,
     saved_token_count: i64,
@@ -2458,6 +2472,7 @@ enum ChatSseEvent {
     ContextCompression {
         assistant_message_id: String,
         snapshot_id: String,
+        kind: String,
     },
     ToolCall {
         assistant_message_id: String,
@@ -3323,6 +3338,7 @@ impl PreparedChatContext {
                         let event = ChatSseEvent::ContextCompression {
                             assistant_message_id: self.assistant_message_id.clone(),
                             snapshot_id: snapshot.id.clone(),
+                            kind: compression_snapshot_kind(snapshot).to_string(),
                         };
                         events.push(captured_event(&event));
                         yield event;
@@ -11128,13 +11144,37 @@ fn chat_compression_statistics(
         .iter()
         .map(|snapshot| snapshot.summary_token_count)
         .sum::<i64>();
+    let rule_snapshot_count = snapshots
+        .iter()
+        .filter(|snapshot| compression_snapshot_kind(snapshot) == CONTEXT_COMPRESSION_KIND_RULE)
+        .count() as i64;
+    let llm_snapshot_count = snapshots
+        .iter()
+        .filter(|snapshot| compression_snapshot_kind(snapshot) == CONTEXT_COMPRESSION_KIND_LLM)
+        .count() as i64;
 
     ChatCompressionStatistics {
         snapshot_count: snapshots.len() as i64,
+        rule_snapshot_count,
+        llm_snapshot_count,
         original_token_count,
         summary_token_count,
         saved_token_count: (original_token_count - summary_token_count).max(0),
     }
+}
+
+fn compression_snapshot_kind(snapshot: &ContextCompressionSnapshotRecord) -> &'static str {
+    serde_json::from_str::<Value>(&snapshot.metadata_json)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|kind| kind == CONTEXT_COMPRESSION_KIND_LLM)
+        .map(|_| CONTEXT_COMPRESSION_KIND_LLM)
+        .unwrap_or(CONTEXT_COMPRESSION_KIND_RULE)
 }
 
 fn chat_tool_breakdown(record: ToolCallCountRecord) -> ChatToolBreakdown {

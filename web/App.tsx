@@ -3357,7 +3357,7 @@ export function App() {
           setMessagesForChatKey(chatKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? addChatRunBadge(message, "contextCompression")
+                ? addChatRunBadge(message, contextCompressionBadge(streamEvent.kind))
                 : message,
             ),
           );
@@ -4041,7 +4041,7 @@ export function App() {
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? addChatRunBadge(message, "contextCompression")
+                ? addChatRunBadge(message, contextCompressionBadge(streamEvent.kind))
                 : message,
             ),
           );
@@ -7838,6 +7838,14 @@ function ContextStatsTab({
               label: item.toolName,
               value: formatNumber(item.callCount, language),
             })),
+            {
+              label: t("Rule compression snapshots"),
+              value: formatNumber(statistics.compression.ruleSnapshotCount, language),
+            },
+            {
+              label: t("LLM compression snapshots"),
+              value: formatNumber(statistics.compression.llmSnapshotCount, language),
+            },
             {
               label: t("Compression snapshots"),
               value: formatNumber(statistics.compression.snapshotCount, language),
@@ -16797,6 +16805,9 @@ function addChatRunBadge(
   return { ...message, runBadges: [...runBadges, badge] };
 }
 
+function contextCompressionBadge(kind: "rule" | "llm"): ChatRunBadge {
+  return kind === "llm" ? "contextCompressionLlm" : "contextCompressionRule";
+}
 function resetStreamingAssistantMessage(
   message: ShellMessage,
   streamEvent: Extract<ChatStreamEvent, { type: "streamReset" }>,
@@ -17443,6 +17454,8 @@ function emptyChatStatistics(
     toolBreakdown: [],
     compression: {
       snapshotCount: 0,
+      ruleSnapshotCount: 0,
+      llmSnapshotCount: 0,
       originalTokenCount: 0,
       summaryTokenCount: 0,
       savedTokenCount: 0,
@@ -18488,12 +18501,14 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       "assistant_message_id",
     );
     const snapshotId = stringField(value, "snapshotId", "snapshot_id");
+    const kindValue = stringField(value, "kind") ?? "rule";
+    const kind = kindValue === "llm" ? "llm" : "rule";
 
     if (!assistantMessageId || !snapshotId) {
       return null;
     }
 
-    return { type: "contextCompression", assistantMessageId, snapshotId };
+    return { type: "contextCompression", assistantMessageId, snapshotId, kind };
   }
   if (value.type === "toolOutputDelta" || value.type === "tool_output_delta") {
     const assistantMessageId = stringField(

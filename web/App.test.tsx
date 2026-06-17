@@ -816,7 +816,9 @@ const chatStatistics = {
   chatId: "chat-1",
   codeChangeStats: { additions: 12, deletions: 3 },
   compression: {
+    llmSnapshotCount: 0,
     originalTokenCount: 9000,
+    ruleSnapshotCount: 1,
     savedTokenCount: 6800,
     snapshotCount: 1,
     summaryTokenCount: 2200,
@@ -1302,6 +1304,7 @@ describe("App verification surfaces", () => {
       });
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
+        kind: "rule",
         snapshotId: "ctx-1",
         type: "contextCompression",
       });
@@ -1332,7 +1335,7 @@ describe("App verification surfaces", () => {
       within(assistantRow as HTMLElement).getByText("Reconnected"),
     ).toBeInTheDocument();
     expect(
-      within(assistantRow as HTMLElement).getByText("Compressed"),
+      within(assistantRow as HTMLElement).getByText("Rule compressed"),
     ).toBeInTheDocument();
   });
 

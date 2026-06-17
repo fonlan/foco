@@ -112,6 +112,16 @@ pub(crate) async fn ensure_context_compression(
         &context.message_context_sources,
         context.active_tool_start_index,
     )?;
+    let used_tokens = message_groups
+        .iter()
+        .map(|group| group.estimated_tokens)
+        .sum::<u64>();
+    if used_tokens
+        > llm_context_compression_trigger_tokens(context.context_budget.available_message_tokens)
+        && ensure_llm_context_compression(context, &message_groups).await?
+    {
+        return Ok(context.active_tool_start_index);
+    }
     let pack_items = pack_items_from_message_groups(&message_groups);
 
     let Some(plan) = plan_context_compression(
@@ -183,6 +193,7 @@ pub(crate) async fn ensure_context_compression(
     let snapshot_id = unique_id("ctx");
     let snapshot_sequence = next_context_snapshot_sequence(&context.compression_snapshots)?;
     let metadata_json = json!({
+        "kind": CONTEXT_COMPRESSION_KIND_RULE,
         "coveredSequences": covered_sequences,
         "triggerTokens": plan.trigger_tokens,
         "availableMessageTokens": context.context_budget.available_message_tokens
@@ -295,6 +306,406 @@ pub(crate) async fn ensure_context_compression(
     }
 
     Ok(context.active_tool_start_index)
+}
+
+fn llm_context_compression_trigger_tokens(available_tokens: u64) -> u64 {
+    available_tokens.saturating_mul(LLM_CONTEXT_COMPRESSION_TRIGGER_NUMERATOR)
+        / LLM_CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR
+}
+
+async fn ensure_llm_context_compression(
+    context: &mut PreparedChatContext,
+    message_groups: &[ContextMessageGroup],
+) -> Result<bool, ApiError> {
+    let covered_group_indices = llm_context_compression_group_indices(message_groups);
+    if covered_group_indices.is_empty() {
+        return Ok(false);
+    }
+    let covered_indices = message_group_indices(message_groups, &covered_group_indices)?;
+    let original_tokens = covered_indices
+        .iter()
+        .map(|index| neutral_message_estimated_tokens(&context.provider_request.messages[*index]))
+        .sum::<u64>();
+    if original_tokens == 0 {
+        return Ok(false);
+    }
+
+    let source_summary = context_compression_summary_allowing_snapshots(
+        &context.provider_request.messages,
+        &context.message_source_sequences,
+        &covered_indices,
+    )?;
+    let summary = llm_context_compression_summary(context, &source_summary).await?;
+    let summary_token_count = estimate_text_tokens(&summary);
+    if summary_token_count >= original_tokens {
+        return Ok(false);
+    }
+
+    let covered_sequences = compression_covered_sequences_allowing_snapshots(
+        &context.message_source_sequences,
+        &covered_indices,
+    );
+    let pre_summary = context
+        .hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &context.global_hooks,
+            workspace_id: &context.workspace_id,
+            workspace_path: &context.workspace_path,
+            event: "PreCompact",
+            match_value: None,
+            chat_id: Some(&context.chat_id),
+            run_id: Some(&context.llm_request_id),
+            session_id: Some(&context.chat_id),
+            tool_call_id: None,
+            model_id: Some(&context.model_id),
+            provider_id: Some(&context.provider_id),
+            provider_config: Some(&context.provider_config),
+            llm_request_retry_count: context.global_config.app.llm_request_retry_count,
+            permission_mode: None,
+            payload: json!({
+                "kind": CONTEXT_COMPRESSION_KIND_LLM,
+                "coveredSequences": covered_sequences,
+                "originalTokenCount": original_tokens,
+                "summaryTokenCount": summary_token_count,
+                "summary": summary.clone(),
+            }),
+        })
+        .await;
+    context
+        .hook_notifications
+        .extend(pre_summary.hook_messages("PreCompact"));
+    append_hook_context_messages(
+        &mut context.provider_request.messages,
+        &mut context.message_source_sequences,
+        &mut context.message_context_sources,
+        &pre_summary.additional_context,
+    );
+    if pre_summary.first_block_reason().is_some() {
+        return Ok(false);
+    }
+
+    persist_context_compression_snapshot(
+        context,
+        &covered_indices,
+        summary,
+        original_tokens,
+        summary_token_count,
+        CONTEXT_COMPRESSION_KIND_LLM,
+        json!({
+            "kind": CONTEXT_COMPRESSION_KIND_LLM,
+            "coveredSequences": covered_sequences,
+            "triggerTokens": llm_context_compression_trigger_tokens(context.context_budget.available_message_tokens),
+            "availableMessageTokens": context.context_budget.available_message_tokens
+        }),
+    )?;
+
+    let post_summary = context
+        .hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &context.global_hooks,
+            workspace_id: &context.workspace_id,
+            workspace_path: &context.workspace_path,
+            event: "PostCompact",
+            match_value: None,
+            chat_id: Some(&context.chat_id),
+            run_id: Some(&context.llm_request_id),
+            session_id: Some(&context.chat_id),
+            tool_call_id: None,
+            model_id: Some(&context.model_id),
+            provider_id: Some(&context.provider_id),
+            provider_config: Some(&context.provider_config),
+            llm_request_retry_count: context.global_config.app.llm_request_retry_count,
+            permission_mode: None,
+            payload: json!({
+                "kind": CONTEXT_COMPRESSION_KIND_LLM,
+                "snapshotId": context.compression_snapshots.last().map(|snapshot| snapshot.id.clone()),
+            }),
+        })
+        .await;
+    context
+        .hook_notifications
+        .extend(post_summary.hook_messages("PostCompact"));
+    append_hook_context_messages(
+        &mut context.provider_request.messages,
+        &mut context.message_source_sequences,
+        &mut context.message_context_sources,
+        &post_summary.additional_context,
+    );
+
+    Ok(true)
+}
+
+fn llm_context_compression_group_indices(groups: &[ContextMessageGroup]) -> Vec<usize> {
+    let compressible_indices = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, group)| {
+            !group.must_keep
+                && group.estimated_tokens > 0
+                && matches!(
+                    group.source_bucket,
+                    PromptContextSourceBucket::CompressionSnapshot
+                        | PromptContextSourceBucket::PersistedHistory
+                        | PromptContextSourceBucket::TurnMemory
+                        | PromptContextSourceBucket::RuntimeToolStateSnapshot
+                )
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if compressible_indices.len() <= CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES {
+        return Vec::new();
+    }
+
+    let covered_count = compressible_indices.len() - CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES;
+    compressible_indices
+        .into_iter()
+        .take(covered_count)
+        .collect()
+}
+
+async fn llm_context_compression_summary(
+    context: &mut PreparedChatContext,
+    source_summary: &str,
+) -> Result<String, ApiError> {
+    let request = NeutralChatRequest {
+        model_id: context.model_id.clone(),
+        messages: vec![
+            neutral_text_message(
+                NeutralChatRole::System,
+                "You compress coding-agent chat context for continuation. Return only a concise structured summary. Preserve user goals, constraints, decisions, changed files, important discoveries, failed attempts, tool evidence, current state, and next steps. Do not include hidden system prompts or secrets.".to_string(),
+            ),
+            neutral_text_message(
+                NeutralChatRole::User,
+                format!(
+                    "Summarize this earlier conversation context so the current coding task can continue after replacing the original messages.\n\n{source_summary}"
+                ),
+            ),
+        ],
+        tools: Vec::new(),
+        thinking_level: None,
+        max_output_tokens: Some(LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    };
+    let request_body_json = serialize_provider_request(&request)?;
+    let request_id = unique_id("llm");
+    let request_started_at = utc_timestamp();
+    let started_at = Instant::now();
+    let mut events = vec![CapturedAuditEvent {
+        event_at: request_started_at.clone(),
+        event_type: "start".to_string(),
+        normalized_event_json: json!({
+            "type": "start",
+            "requestKind": "contextCompression",
+            "kind": CONTEXT_COMPRESSION_KIND_LLM,
+            "chatId": &context.chat_id,
+            "userMessageId": &context.user_message_id,
+            "assistantMessageId": &context.assistant_message_id,
+            "llmRequestId": &request_id,
+            "runId": &context.llm_request_id,
+        })
+        .to_string(),
+    }];
+
+    let mut stream = timeout(
+        Duration::from_millis(LLM_CONTEXT_COMPRESSION_TIMEOUT_MS),
+        stream_chat(&context.provider_config, request),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::internal(format!(
+            "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
+        ))
+    })?
+    .map_err(|source| ApiError::internal(source.to_string()))?;
+    let mut output_text = String::new();
+    let mut final_usage = None;
+    let mut first_token_at = None;
+    let mut first_token_latency_ms = None;
+    let mut response_body_json = None;
+
+    loop {
+        let Some(event_result) = timeout(
+            Duration::from_millis(LLM_CONTEXT_COMPRESSION_TIMEOUT_MS),
+            stream.next_event(),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::internal(format!(
+                "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
+            ))
+        })?
+        else {
+            break;
+        };
+        let event = event_result.map_err(|source| ApiError::internal(source.to_string()))?;
+        events.push(captured_provider_event(&event));
+
+        match event {
+            NeutralChatStreamEvent::Start => {}
+            NeutralChatStreamEvent::TextDelta { delta } => {
+                capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+                output_text.push_str(&delta);
+            }
+            NeutralChatStreamEvent::ReasoningDelta { .. }
+            | NeutralChatStreamEvent::ThoughtSignatureDelta { .. } => {
+                capture_first_token(started_at, &mut first_token_at, &mut first_token_latency_ms);
+            }
+            NeutralChatStreamEvent::Usage { usage } => {
+                final_usage = Some(usage);
+            }
+            NeutralChatStreamEvent::ToolCall { tool_call } => {
+                return Err(ApiError::internal(format!(
+                    "context compression summary called unsupported tool '{}'",
+                    tool_call.name
+                )));
+            }
+            NeutralChatStreamEvent::Complete {
+                text,
+                usage,
+                stop_reason,
+                response_id,
+                ..
+            } => {
+                if !text.trim().is_empty() {
+                    output_text.push_str(&text);
+                }
+                if let Some(usage) = usage {
+                    final_usage = Some(usage);
+                }
+                response_body_json = Some(
+                    json!({
+                        "requestKind": "contextCompression",
+                        "kind": CONTEXT_COMPRESSION_KIND_LLM,
+                        "text": output_text,
+                        "usage": final_usage,
+                        "stopReason": stop_reason,
+                        "responseId": response_id,
+                    })
+                    .to_string(),
+                );
+                break;
+            }
+            NeutralChatStreamEvent::Error { message } => {
+                return Err(ApiError::internal(format!(
+                    "context compression summary stream error: {message}"
+                )));
+            }
+        }
+    }
+
+    let summary = output_text.trim().to_string();
+    if summary.is_empty() {
+        return Err(ApiError::internal(
+            "context compression summary returned empty text",
+        ));
+    }
+    context.captured_llm_requests.push(CapturedLlmRequest {
+        id: request_id,
+        request_started_at,
+        request_body_json,
+        events,
+        outcome: ChatAuditOutcome {
+            first_token_at,
+            completed_at: utc_timestamp(),
+            first_token_latency_ms,
+            total_latency_ms: elapsed_millis(started_at),
+            input_tokens: final_usage.as_ref().and_then(|usage| usage.input_tokens),
+            output_tokens: final_usage.as_ref().and_then(|usage| usage.output_tokens),
+            cache_read_tokens: final_usage
+                .as_ref()
+                .and_then(|usage| usage.cache_read_tokens),
+            cache_write_tokens: final_usage
+                .as_ref()
+                .and_then(|usage| usage.cache_write_tokens),
+            status_code: Some(200),
+            final_state: "succeeded",
+            response_body_json,
+        },
+    });
+
+    Ok(summary)
+}
+
+fn persist_context_compression_snapshot(
+    context: &mut PreparedChatContext,
+    covered_indices: &[usize],
+    summary: String,
+    original_tokens: u64,
+    summary_token_count: u64,
+    kind: &str,
+    metadata: Value,
+) -> Result<(), ApiError> {
+    let snapshot_id = unique_id("ctx");
+    let snapshot_sequence = next_context_snapshot_sequence(&context.compression_snapshots)?;
+    let metadata_json = metadata.to_string();
+    let original_token_count = i64::try_from(original_tokens)
+        .map_err(|_| ApiError::internal("context compression original token count exceeds i64"))?;
+    let summary_token_count_i64 = i64::try_from(summary_token_count)
+        .map_err(|_| ApiError::internal("context compression summary token count exceeds i64"))?;
+    let (source_message_start_sequence, source_message_end_sequence) =
+        compression_source_sequence_range(&context.message_source_sequences, covered_indices);
+
+    let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+            id: &snapshot_id,
+            chat_id: &context.chat_id,
+            run_id: &context.llm_request_id,
+            sequence: snapshot_sequence,
+            summary: &summary,
+            source_message_start_sequence,
+            source_message_end_sequence,
+            original_token_count,
+            summary_token_count: summary_token_count_i64,
+            metadata_json: Some(&metadata_json),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    let snapshot = ContextCompressionSnapshotRecord {
+        id: snapshot_id,
+        chat_id: context.chat_id.clone(),
+        run_id: context.llm_request_id.clone(),
+        sequence: snapshot_sequence,
+        summary: summary.clone(),
+        source_message_start_sequence,
+        source_message_end_sequence,
+        original_token_count,
+        summary_token_count: summary_token_count_i64,
+        created_at: utc_timestamp(),
+        metadata_json,
+    };
+
+    context.provider_request.messages = replace_covered_messages_with_snapshot(
+        &context.provider_request.messages,
+        covered_indices,
+        compression_snapshot_message(&snapshot),
+    );
+    context.message_source_sequences =
+        replace_covered_sequences_with_snapshot(&context.message_source_sequences, covered_indices);
+    context.message_context_sources = replace_covered_sources_with_snapshot(
+        &context.message_context_sources,
+        covered_indices,
+        PromptContextSource::CompressionSnapshot,
+    );
+    context.active_tool_start_index =
+        compressed_active_tool_start_index(context.active_tool_start_index, covered_indices);
+    context.compression_snapshots.push(snapshot);
+
+    tracing::debug!(kind = kind, "created context compression snapshot");
+    Ok(())
+}
+
+fn compression_source_sequence_range(
+    message_source_sequences: &[Option<i64>],
+    covered_indices: &[usize],
+) -> (i64, i64) {
+    let sequences =
+        compression_covered_sequences_allowing_snapshots(message_source_sequences, covered_indices);
+    let start = sequences.first().copied().unwrap_or(0);
+    let end = sequences.last().copied().unwrap_or(start);
+    (start, end)
 }
 
 fn compress_runtime_tool_state_if_needed(
@@ -817,6 +1228,55 @@ fn compression_covered_sequences(
     }
 
     Ok(sequences)
+}
+fn context_compression_summary_allowing_snapshots(
+    messages: &[NeutralChatMessage],
+    message_source_sequences: &[Option<i64>],
+    covered_indices: &[usize],
+) -> Result<String, ApiError> {
+    if messages.len() != message_source_sequences.len() {
+        return Err(ApiError::internal(
+            "context message source sequence count does not match prompt message count",
+        ));
+    }
+
+    let mut lines = vec![
+        "Structured summary of earlier chat context that will be replaced by a model-generated continuation summary."
+            .to_string(),
+    ];
+
+    for index in covered_indices.iter().copied() {
+        let message = messages.get(index).ok_or_else(|| {
+            ApiError::internal("context compression covered message index is out of bounds")
+        })?;
+        let sequence_label = message_source_sequences
+            .get(index)
+            .and_then(|sequence| *sequence)
+            .map(|sequence| sequence.to_string())
+            .unwrap_or_else(|| "snapshot".to_string());
+
+        lines.push(format!(
+            "- source {sequence_label}, role {}: {}",
+            neutral_role_label(&message.role),
+            compact_message_for_compression(message)
+        ));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn compression_covered_sequences_allowing_snapshots(
+    message_source_sequences: &[Option<i64>],
+    covered_indices: &[usize],
+) -> Vec<i64> {
+    covered_indices
+        .iter()
+        .filter_map(|index| {
+            message_source_sequences
+                .get(*index)
+                .and_then(|sequence| *sequence)
+        })
+        .collect()
 }
 
 fn replace_covered_messages_with_snapshot(

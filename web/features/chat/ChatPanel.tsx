@@ -553,12 +553,20 @@ export function ChatPanel({
                                 {t("Reconnected")}
                               </span>
                             ) : null}
-                            {!isUser && message.runBadges?.includes("contextCompression") ? (
+                            {!isUser && message.runBadges?.includes("contextCompressionRule") ? (
                               <span
                                 className="message-run-badge"
-                                title={t("Context compression was triggered")}
+                                title={t("Rule-based context compression was triggered")}
                               >
-                                {t("Compressed")}
+                                {t("Rule compressed")}
+                              </span>
+                            ) : null}
+                            {!isUser && message.runBadges?.includes("contextCompressionLlm") ? (
+                              <span
+                                className="message-run-badge"
+                                title={t("LLM summary context compression was triggered")}
+                              >
+                                {t("LLM compressed")}
                               </span>
                             ) : null}
                           </span>
