@@ -261,6 +261,17 @@ enum LanguageKind {
     Cpp,
     CSharp,
     Java,
+    Css,
+    Html,
+    Vue,
+    Ruby,
+    Php,
+    Shell,
+    Lua,
+    Kotlin,
+    Swift,
+    Yaml,
+    Dockerfile,
     Json,
     Toml,
     Markdown,
@@ -494,7 +505,7 @@ fn collect_symbols_and_imports(
         }
     }
 
-    if is_import_node(language, node) {
+    if is_import_node(language, node, text) {
         if let Some(module) = import_module(node, text) {
             imports.push(ExtractedImport {
                 module,
@@ -663,6 +674,78 @@ fn classify_symbol(language: LanguageKind, node: Node<'_>) -> Option<&'static st
             "field_declaration" | "variable_declarator" => Some("variable"),
             _ => None,
         },
+        LanguageKind::Css => match kind {
+            "rule_set" => Some("selector"),
+            "declaration" => Some("variable"),
+            "import_statement" | "at_rule" => Some("directive"),
+            _ => None,
+        },
+        LanguageKind::Html => match kind {
+            "element" | "script_element" | "style_element" => Some("element"),
+            _ => None,
+        },
+        LanguageKind::Vue => match kind {
+            "element" | "template_element" | "script_element" | "style_element" => Some("element"),
+            _ => None,
+        },
+        LanguageKind::Ruby => match kind {
+            "method" => Some("method"),
+            "singleton_method" => Some("method"),
+            "class" | "singleton_class" => Some("class"),
+            "module" => Some("module"),
+            "assignment" | "operator_assignment" => Some("variable"),
+            _ => None,
+        },
+        LanguageKind::Php => match kind {
+            "function_definition" => Some("function"),
+            "method_declaration" => Some("method"),
+            "class_declaration" | "anonymous_class" => Some("class"),
+            "interface_declaration" | "trait_declaration" => Some("trait"),
+            "enum_declaration" => Some("enum"),
+            "const_declaration" | "property_declaration" | "assignment_expression" => {
+                Some("variable")
+            }
+            _ => None,
+        },
+        LanguageKind::Shell => match kind {
+            "function_definition" => Some("function"),
+            "variable_assignment" | "declaration_command" => Some("variable"),
+            _ => None,
+        },
+        LanguageKind::Lua => match kind {
+            "function_declaration" => Some("function"),
+            "function_definition" if has_ancestor_kind(node, "function_declaration") => None,
+            "function_definition" => Some("function"),
+            "variable_declaration" | "assignment_statement" => Some("variable"),
+            _ => None,
+        },
+        LanguageKind::Kotlin => match kind {
+            "function_declaration" => Some("function"),
+            "class_declaration" | "object_declaration" => Some("class"),
+            "property_declaration" | "variable_declaration" => Some("variable"),
+            _ => None,
+        },
+        LanguageKind::Swift => match kind {
+            "function_declaration" | "init_declaration" => Some("function"),
+            "class_declaration" => Some("class"),
+            "struct_declaration" => Some("struct"),
+            "enum_declaration" => Some("enum"),
+            "protocol_declaration" => Some("trait"),
+            "typealias_declaration" => Some("type_alias"),
+            "property_declaration" => Some("variable"),
+            _ => None,
+        },
+        LanguageKind::Yaml => match kind {
+            "block_mapping_pair" | "flow_pair" => Some("variable"),
+            _ => None,
+        },
+        LanguageKind::Dockerfile => match kind {
+            "from_instruction" => Some("dependency"),
+            "run_instruction" => Some("command"),
+            "copy_instruction" | "add_instruction" => Some("file"),
+            "env_pair" | "arg_pair" | "label_pair" => Some("variable"),
+            _ => None,
+        },
         LanguageKind::Json | LanguageKind::Toml | LanguageKind::Markdown => None,
     }
 }
@@ -676,7 +759,11 @@ fn symbol_name(
         return clean_identifier_node(name_node, text);
     }
 
-    for field_name in ["pattern", "left", "declarator"] {
+    if let Some(name) = special_symbol_name(language, node, text) {
+        return Some(name);
+    }
+
+    for field_name in ["pattern", "left", "declarator", "key"] {
         if let Some(child) = node.child_by_field_name(field_name) {
             if let Some(identifier) = first_identifier(child) {
                 return clean_identifier_node(identifier, text);
@@ -695,7 +782,70 @@ fn symbol_name(
     first_identifier(node).and_then(|identifier| clean_identifier_node(identifier, text))
 }
 
-fn is_import_node(language: LanguageKind, node: Node<'_>) -> bool {
+fn special_symbol_name(
+    language: LanguageKind,
+    node: Node<'_>,
+    text: &str,
+) -> Option<(String, Point, Point)> {
+    match language {
+        LanguageKind::Css => css_symbol_name(node, text),
+        LanguageKind::Html | LanguageKind::Vue => html_symbol_name(node, text),
+        LanguageKind::Yaml => node
+            .child_by_field_name("key")
+            .and_then(|key| clean_named_node(key, text)),
+        LanguageKind::Dockerfile => dockerfile_symbol_name(node, text),
+        _ => None,
+    }
+}
+
+fn css_symbol_name(node: Node<'_>, text: &str) -> Option<(String, Point, Point)> {
+    first_node_of_kinds(
+        node,
+        &[
+            "id_name",
+            "class_name",
+            "tag_name",
+            "property_name",
+            "at_keyword",
+            "keyframes_name",
+            "identifier",
+        ],
+    )
+    .and_then(|name_node| clean_named_node(name_node, text))
+}
+
+fn html_symbol_name(node: Node<'_>, text: &str) -> Option<(String, Point, Point)> {
+    first_node_of_kinds(node, &["tag_name"]).and_then(|name_node| clean_named_node(name_node, text))
+}
+
+fn dockerfile_symbol_name(node: Node<'_>, text: &str) -> Option<(String, Point, Point)> {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        return clean_named_node(name_node, text);
+    }
+
+    first_node_of_kinds(
+        node,
+        &[
+            "image_spec",
+            "image_name",
+            "path",
+            "expose_port",
+            "shell_command",
+            "variable",
+            "unquoted_string",
+            "string_literal",
+        ],
+    )
+    .and_then(|name_node| clean_named_node(name_node, text))
+}
+
+fn is_import_node(language: LanguageKind, node: Node<'_>, text: &str) -> bool {
+    if language == LanguageKind::Ruby && node.kind() == "call" {
+        return first_identifier(node)
+            .and_then(|identifier| node_text(identifier, text))
+            .is_some_and(|name| matches!(name.as_str(), "require" | "load" | "require_relative"));
+    }
+
     matches!(
         (language, node.kind()),
         (LanguageKind::Rust, "use_declaration")
@@ -712,6 +862,18 @@ fn is_import_node(language: LanguageKind, node: Node<'_>) -> bool {
             | (LanguageKind::C | LanguageKind::Cpp, "preproc_include")
             | (LanguageKind::CSharp, "using_directive")
             | (LanguageKind::Java, "import_declaration")
+            | (LanguageKind::Css, "import_statement")
+            | (LanguageKind::Ruby, "call")
+            | (
+                LanguageKind::Php,
+                "namespace_use_declaration" | "include_expression"
+            )
+            | (LanguageKind::Kotlin, "import")
+            | (LanguageKind::Swift, "import_declaration")
+            | (
+                LanguageKind::Dockerfile,
+                "from_instruction" | "copy_instruction" | "add_instruction"
+            )
     )
 }
 
@@ -724,6 +886,11 @@ fn import_module(node: Node<'_>, text: &str) -> Option<String> {
             "interpreted_string_literal",
             "raw_string_literal",
             "system_lib_string",
+            "string_content",
+            "encapsed_string",
+            "namespace_name",
+            "image_spec",
+            "image_name",
         ],
     ) {
         return node_text(string_node, text).map(clean_module_text);
@@ -735,6 +902,16 @@ fn import_module(node: Node<'_>, text: &str) -> Option<String> {
             .trim_start_matches("use ")
             .trim_start_matches("import ")
             .trim_start_matches("from ")
+            .trim_start_matches("@import ")
+            .trim_start_matches("require ")
+            .trim_start_matches("require_relative ")
+            .trim_start_matches("load ")
+            .trim_start_matches("include ")
+            .trim_start_matches("require_once ")
+            .trim_start_matches("include_once ")
+            .trim_start_matches("FROM ")
+            .trim_start_matches("COPY ")
+            .trim_start_matches("ADD ")
             .trim_end_matches(';')
             .trim()
             .chars()
@@ -752,6 +929,10 @@ fn first_identifier(node: Node<'_>) -> Option<Node<'_>> {
             "field_identifier",
             "property_identifier",
             "shorthand_property_identifier",
+            "constant",
+            "scope_resolution",
+            "simple_identifier",
+            "variable_name",
         ],
     )
 }
@@ -786,6 +967,10 @@ fn is_identifier_node(node: Node<'_>) -> bool {
             | "field_identifier"
             | "property_identifier"
             | "shorthand_property_identifier"
+            | "constant"
+            | "scope_resolution"
+            | "simple_identifier"
+            | "variable_name"
     )
 }
 
@@ -809,6 +994,23 @@ fn clean_identifier_node(node: Node<'_>, text: &str) -> Option<(String, Point, P
         .trim_matches('"')
         .trim_matches('\'')
         .trim_matches('`')
+        .to_string();
+
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        None
+    } else {
+        Some((value, node.start_position(), node.end_position()))
+    }
+}
+
+fn clean_named_node(node: Node<'_>, text: &str) -> Option<(String, Point, Point)> {
+    let value = node_text(node, text)?;
+    let value = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`')
+        .trim_end_matches(';')
         .to_string();
 
     if value.is_empty() || value.chars().any(char::is_whitespace) {
@@ -928,7 +1130,9 @@ fn point_compare(left: Point, right: Point) -> i8 {
 }
 
 fn detect_language(file_path: &Path, text: Option<&str>) -> Option<LanguageKind> {
-    detect_language_by_extension(file_path).or_else(|| detect_language_by_content(text?))
+    detect_language_by_file_name(file_path)
+        .or_else(|| detect_language_by_extension(file_path))
+        .or_else(|| detect_language_by_content(text?))
 }
 
 fn detect_language_by_extension(file_path: &Path) -> Option<LanguageKind> {
@@ -948,9 +1152,30 @@ fn detect_language_by_extension(file_path: &Path) -> Option<LanguageKind> {
         "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Some(LanguageKind::Cpp),
         "cs" => Some(LanguageKind::CSharp),
         "java" => Some(LanguageKind::Java),
+        "css" => Some(LanguageKind::Css),
+        "html" | "htm" => Some(LanguageKind::Html),
+        "vue" => Some(LanguageKind::Vue),
+        "rb" | "rake" | "gemspec" => Some(LanguageKind::Ruby),
+        "php" | "phtml" | "php3" | "php4" | "php5" | "phps" => Some(LanguageKind::Php),
+        "sh" | "bash" | "bats" | "zsh" => Some(LanguageKind::Shell),
+        "lua" => Some(LanguageKind::Lua),
+        "kt" | "kts" => Some(LanguageKind::Kotlin),
+        "swift" => Some(LanguageKind::Swift),
+        "yaml" | "yml" => Some(LanguageKind::Yaml),
+        "dockerfile" => Some(LanguageKind::Dockerfile),
         "json" => Some(LanguageKind::Json),
         "toml" => Some(LanguageKind::Toml),
         "md" | "markdown" => Some(LanguageKind::Markdown),
+        _ => None,
+    }
+}
+
+fn detect_language_by_file_name(file_path: &Path) -> Option<LanguageKind> {
+    let file_name = file_path.file_name()?.to_str()?.to_ascii_lowercase();
+
+    match file_name.as_str() {
+        "dockerfile" | "containerfile" => Some(LanguageKind::Dockerfile),
+        "gemfile" | "rakefile" | "guardfile" | "podfile" | "capfile" => Some(LanguageKind::Ruby),
         _ => None,
     }
 }
@@ -966,6 +1191,15 @@ fn detect_language_by_content(text: &str) -> Option<LanguageKind> {
         Some(LanguageKind::Python)
     } else if first_line.contains("node") || first_line.contains("deno") {
         Some(LanguageKind::JavaScript)
+    } else if first_line.contains("ruby") {
+        Some(LanguageKind::Ruby)
+    } else if first_line.contains("bash")
+        || first_line.contains("/sh")
+        || first_line.contains("zsh")
+    {
+        Some(LanguageKind::Shell)
+    } else if first_line.contains("lua") {
+        Some(LanguageKind::Lua)
     } else {
         None
     }
@@ -984,6 +1218,17 @@ impl LanguageKind {
             Self::Cpp => "cpp",
             Self::CSharp => "csharp",
             Self::Java => "java",
+            Self::Css => "css",
+            Self::Html => "html",
+            Self::Vue => "vue",
+            Self::Ruby => "ruby",
+            Self::Php => "php",
+            Self::Shell => "shell",
+            Self::Lua => "lua",
+            Self::Kotlin => "kotlin",
+            Self::Swift => "swift",
+            Self::Yaml => "yaml",
+            Self::Dockerfile => "dockerfile",
             Self::Json => "json",
             Self::Toml => "toml",
             Self::Markdown => "markdown",
@@ -1002,6 +1247,17 @@ impl LanguageKind {
             Self::Cpp => Some(tree_sitter_cpp::LANGUAGE.into()),
             Self::CSharp => Some(tree_sitter_c_sharp::LANGUAGE.into()),
             Self::Java => Some(tree_sitter_java::LANGUAGE.into()),
+            Self::Css => Some(tree_sitter_css::LANGUAGE.into()),
+            Self::Html => Some(tree_sitter_htmlx::LANGUAGE.into()),
+            Self::Vue => Some(tree_sitter_vue_updated::language()),
+            Self::Ruby => Some(tree_sitter_ruby::LANGUAGE.into()),
+            Self::Php => Some(tree_sitter_php::LANGUAGE_PHP.into()),
+            Self::Shell => Some(tree_sitter_bash::LANGUAGE.into()),
+            Self::Lua => Some(tree_sitter_lua::LANGUAGE.into()),
+            Self::Kotlin => Some(tree_sitter_kotlin_ng::LANGUAGE.into()),
+            Self::Swift => Some(tree_sitter_swift::LANGUAGE.into()),
+            Self::Yaml => Some(tree_sitter_yaml::LANGUAGE.into()),
+            Self::Dockerfile => Some(tree_sitter_containerfile::LANGUAGE.into()),
             Self::Json => Some(tree_sitter_json::LANGUAGE.into()),
             Self::Toml => Some(tree_sitter_toml_ng::LANGUAGE.into()),
             Self::Markdown => None,
@@ -1294,6 +1550,125 @@ export function buildTitle(value: string): string {
             ),
             1
         );
+    }
+    #[test]
+    fn extracts_symbols_from_additional_tree_sitter_languages() {
+        let cases = [
+            (
+                LanguageKind::Css,
+                "style.css",
+                r#"@import "base.css";
+.hero { color: red; }
+"#,
+                "hero",
+            ),
+            (
+                LanguageKind::Html,
+                "index.html",
+                r#"<div>Hello</div>"#,
+                "div",
+            ),
+            (
+                LanguageKind::Vue,
+                "App.vue",
+                r#"<template><AppShell></AppShell></template><script>export default {}</script><style>.hero {}</style>"#,
+                "template",
+            ),
+            (
+                LanguageKind::Ruby,
+                "greeter.rb",
+                r#"require 'json'
+class Greeter
+  def call
+  end
+end
+"#,
+                "Greeter",
+            ),
+            (
+                LanguageKind::Php,
+                "greeter.php",
+                r#"<?php
+use App\Thing;
+class Greeter { public function call() {} }
+"#,
+                "Greeter",
+            ),
+            (
+                LanguageKind::Shell,
+                "build.sh",
+                r#"build() {
+  echo hi
+}
+NAME=value
+"#,
+                "build",
+            ),
+            (
+                LanguageKind::Lua,
+                "greeter.lua",
+                r#"local function greet()
+end
+local value = 1
+"#,
+                "greet",
+            ),
+            (
+                LanguageKind::Kotlin,
+                "Greeter.kt",
+                r#"package demo
+import kotlin.text.trim
+class Greeter {
+  fun greet() {}
+}
+val title = "hi"
+"#,
+                "Greeter",
+            ),
+            (
+                LanguageKind::Swift,
+                "Greeter.swift",
+                r#"import Foundation
+class Greeter { func greet() {} }
+let title = "hi"
+"#,
+                "Greeter",
+            ),
+            (
+                LanguageKind::Yaml,
+                "compose.yaml",
+                r#"services:
+  api:
+    image: example/api
+"#,
+                "services",
+            ),
+            (
+                LanguageKind::Dockerfile,
+                "Dockerfile",
+                r#"FROM alpine AS base
+ARG APP_HOME=/app
+ENV NODE_ENV=production
+COPY . /app
+RUN echo hello
+"#,
+                "alpine",
+            ),
+        ];
+
+        for (language, path, source, expected_symbol) in cases {
+            let extracted = extract_file(language, source, Path::new(path)).expect(path);
+
+            assert_eq!(extracted.parse_status, "parsed", "{path}");
+            assert!(
+                extracted
+                    .symbols
+                    .iter()
+                    .any(|symbol| symbol.name == expected_symbol),
+                "{path} missing symbol {expected_symbol}: {:?}",
+                extracted.symbols
+            );
+        }
     }
 
     fn query_count(connection: &Connection, sql: &str) -> i64 {
