@@ -209,7 +209,10 @@ pub(super) fn create_git_branch(workspace_path: &Path, name: String) -> Result<(
     Ok(())
 }
 
-pub(super) fn stage_git_file(workspace_path: &Path, workspace_relative_path: &str) -> Result<(), ApiError> {
+pub(super) fn stage_git_file(
+    workspace_path: &Path,
+    workspace_relative_path: &str,
+) -> Result<(), ApiError> {
     let repo = open_repo(workspace_path)?;
     let repo_path = repo_relative_path(workspace_path, &repo, workspace_relative_path)?;
     let mut index = mutable_index(&repo)?;
@@ -263,13 +266,17 @@ pub(super) fn discard_git_file(
             ApiError::internal(format!("failed to create git worktree directory: {source}"))
         })?;
     }
-    std::fs::write(&worktree_path, bytes)
-        .map_err(|source| ApiError::internal(format!("failed to write git worktree file: {source}")))?;
+    std::fs::write(&worktree_path, bytes).map_err(|source| {
+        ApiError::internal(format!("failed to write git worktree file: {source}"))
+    })?;
 
     Ok(())
 }
 
-pub(super) fn commit_staged_changes(workspace_path: &Path, message: String) -> Result<(), ApiError> {
+pub(super) fn commit_staged_changes(
+    workspace_path: &Path,
+    message: String,
+) -> Result<(), ApiError> {
     let message = validate_commit_message(message)?;
     let repo = open_repo(workspace_path)?;
     let entries = status_entries_for_repo(workspace_path, &repo)?;
@@ -290,7 +297,9 @@ pub(super) fn commit_staged_changes(workspace_path: &Path, message: String) -> R
         .unwrap_or_else(|_| Vec::new());
 
     repo.commit("HEAD", message, tree_id, parents)
-        .map_err(|source| ApiError::bad_request(format!("failed to create git commit: {source}")))?;
+        .map_err(|source| {
+            ApiError::bad_request(format!("failed to create git commit: {source}"))
+        })?;
 
     Ok(())
 }
@@ -648,7 +657,9 @@ fn remove_index_entry(index: &mut gix::index::File, repo_path: &str) {
 fn validate_commit_message(message: String) -> Result<String, ApiError> {
     let message = message.trim();
     if message.is_empty() {
-        return Err(ApiError::bad_request("git commit message must not be empty"));
+        return Err(ApiError::bad_request(
+            "git commit message must not be empty",
+        ));
     }
 
     Ok(message.to_string())
@@ -666,7 +677,9 @@ fn write_tree_from_index(
             ));
         }
         let Some(mode) = entry.mode.to_tree_entry_mode() else {
-            return Err(ApiError::bad_request("git index contains non-tree entry mode"));
+            return Err(ApiError::bad_request(
+                "git index contains non-tree entry mode",
+            ));
         };
         let path = entry.path(index);
         let parts = path

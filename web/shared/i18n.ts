@@ -307,10 +307,11 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Workspace changes": "工作区变更",
     "Refresh diff": "刷新 diff",
     "Commit message": "提交消息",
+    "Generate commit message": "生成提交消息",
     Commit: "提交",
     "Commit message must not be empty.": "提交消息不能为空。",
-    "Select a workspace before committing changes.": "提交变更前请选择工作区。",
-    "Select a workspace before using Git actions.": "执行 Git 操作前请选择工作区。",
+    "Select an enabled model before generating a commit message.":
+      "生成提交消息前请选择已启用模型。",
     "Staged Changes": "暂存变更",
     Changes: "变更",
     "No staged changes": "无暂存变更",

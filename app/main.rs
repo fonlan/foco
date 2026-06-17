@@ -197,6 +197,16 @@ const MAX_MEMORY_TOOL_SEARCH_LIMIT: u32 = 50;
 const MEMORY_EXTRACTION_TOOL_NAME: &str = "submit_memory_extraction";
 // Tool name the model must call to return relevant memories for prompt retrieval.
 const MEMORY_RETRIEVAL_TOOL_NAME: &str = "select_relevant_memory";
+const GIT_COMMIT_MESSAGE_TOOL_NAME: &str = "submit_commit_message";
+const GIT_COMMIT_MESSAGE_TIMEOUT_MS: u64 = 60_000;
+const GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS: u32 = 256;
+const GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS: usize = 60_000;
+const GIT_COMMIT_MESSAGE_SYSTEM_PROMPT: &str = "\
+Generate one concise Git commit message for the staged changes only. \
+Use the submit_commit_message tool exactly once. Do not return prose. \
+Prefer Conventional Commits format when the staged changes clearly map to a type, otherwise use a short imperative subject. \
+The subject must be at most 72 characters. Include an optional body only when it materially improves clarity. \
+Do not mention unstaged changes, model limitations, or that a diff was provided.";
 // Timeout for the background model call that extracts durable memory facts.
 const MEMORY_EXTRACTION_TIMEOUT_MS: u64 = 60_000;
 // One retry is enough for malformed model tool output; repeated failures are ignored.
@@ -741,10 +751,13 @@ fn app_router(state: AppState) -> Router {
             post(crate::http::git::commit_staged_changes),
         )
         .route(
+            "/api/workspaces/{workspace_id}/git/commit-message",
+            post(crate::http::git::generate_commit_message),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/git/branches",
             get(crate::http::git::git_branches),
         )
-
         .route(
             "/api/workspaces/{workspace_id}/git/branches/switch",
             post(crate::http::git::switch_git_branch),
@@ -2349,10 +2362,10 @@ pub(crate) struct GitStatusResponse {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct GitStatusFileSummary {
-    path: String,
-    index_status: String,
-    worktree_status: String,
+pub(crate) struct GitStatusFileSummary {
+    pub(crate) path: String,
+    pub(crate) index_status: String,
+    pub(crate) worktree_status: String,
 }
 
 #[derive(Serialize)]
@@ -2361,9 +2374,15 @@ pub(crate) struct GitDiffResponse {
     path: Option<String>,
     status: String,
     diff: String,
-    staged_diff: String,
+    pub(crate) staged_diff: String,
     files: Vec<GitStatusFileSummary>,
-    staged_files: Vec<GitStatusFileSummary>,
+    pub(crate) staged_files: Vec<GitStatusFileSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GitCommitMessageResponse {
+    message: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -6721,6 +6740,152 @@ fn memory_retrieval_tool_definition() -> NeutralToolDefinition {
         }),
         strict: true,
     }
+}
+
+fn git_commit_message_tool_definition() -> NeutralToolDefinition {
+    NeutralToolDefinition {
+        name: GIT_COMMIT_MESSAGE_TOOL_NAME.to_string(),
+        description: "Submit exactly one generated Git commit message for the staged changes."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "The complete commit message. The first line must be a concise imperative subject."
+                }
+            },
+            "required": ["message"]
+        }),
+        strict: true,
+    }
+}
+
+pub(crate) async fn generate_git_commit_message(
+    workspace_path: &Path,
+    workspace_id: &str,
+    config: &GlobalConfig,
+    model_id: String,
+    provider_id: String,
+    staged_files: &[GitStatusFileSummary],
+    staged_diff: &str,
+) -> Result<GitCommitMessageResponse, ApiError> {
+    let model_id = model_id.trim();
+    let provider_id = provider_id.trim();
+    if model_id.is_empty() {
+        return Err(ApiError::bad_request("model id must not be empty"));
+    }
+    if provider_id.is_empty() {
+        return Err(ApiError::bad_request("provider id must not be empty"));
+    }
+    if staged_files.is_empty() || staged_diff.trim().is_empty() {
+        return Err(ApiError::bad_request("no staged git changes to summarize"));
+    }
+
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
+    if !model.enabled {
+        return Err(ApiError::bad_request(format!(
+            "model '{}' is disabled",
+            model.id
+        )));
+    }
+    let limits = model.limits.as_ref().ok_or_else(|| {
+        ApiError::bad_request(format!("enabled model '{}' is missing limits", model.id))
+    })?;
+    if !model.provider_ids.iter().any(|id| id == provider_id) {
+        return Err(ApiError::bad_request(format!(
+            "provider '{}' is not associated with model '{}'",
+            provider_id, model.id
+        )));
+    }
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("provider '{}' was not found", provider_id))
+        })?;
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "provider '{}' is disabled",
+            provider.id
+        )));
+    }
+
+    let max_output_tokens = u32::try_from(limits.max_output_tokens)
+        .map_err(|_| {
+            ApiError::bad_request(format!(
+                "model '{}' max output tokens exceed u32: {}",
+                model.id, limits.max_output_tokens
+            ))
+        })?
+        .min(GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS);
+    let staged_files_json = serde_json::to_string_pretty(staged_files).map_err(|source| {
+        ApiError::internal(format!("failed to serialize staged git files: {source}"))
+    })?;
+    let staged_diff = if staged_diff.len() > GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS {
+        let truncated = staged_diff
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS)
+            .last()
+            .unwrap_or(0);
+        format!(
+            "{}\n\n[diff truncated to {} UTF-8 bytes for commit message generation]",
+            &staged_diff[..truncated],
+            GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS
+        )
+    } else {
+        staged_diff.to_string()
+    };
+    let request = NeutralChatRequest {
+        model_id: model.id.clone(),
+        messages: vec![
+            neutral_text_message(
+                NeutralChatRole::System,
+                GIT_COMMIT_MESSAGE_SYSTEM_PROMPT.to_string(),
+            ),
+            neutral_text_message(
+                NeutralChatRole::User,
+                format!(
+                    "workspaceId: {workspace_id}\n\nStaged files JSON:\n{staged_files_json}\n\nStaged diff:\n{staged_diff}"
+                ),
+            ),
+        ],
+        tools: vec![git_commit_message_tool_definition()],
+        thinking_level: None,
+        max_output_tokens: Some(max_output_tokens),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    };
+    let arguments = audited_provider_tool_request(
+        workspace_path,
+        workspace_id,
+        None,
+        provider_id,
+        &provider_connection_config(provider)?,
+        request,
+        "git_commit_message_generation",
+        GIT_COMMIT_MESSAGE_TOOL_NAME,
+        "commit message submission tool",
+        GIT_COMMIT_MESSAGE_TIMEOUT_MS,
+        0,
+    )
+    .await?;
+    let message = arguments
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .ok_or_else(|| ApiError::internal("generated commit message was empty"))?
+        .to_string();
+
+    Ok(GitCommitMessageResponse { message })
 }
 
 async fn audited_provider_tool_request(

@@ -149,6 +149,7 @@ impl QuestionRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn is_pending(&self, question_id: &str) -> Result<bool, ApiError> {
         let pending = self
             .pending

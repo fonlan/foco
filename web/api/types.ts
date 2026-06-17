@@ -41,6 +41,10 @@ export type GitDiffResponse = {
   stagedFiles: GitStatusFileSummary[];
 };
 
+export type GitCommitMessageResponse = {
+  message: string;
+};
+
 export type GitDiffLineStats = {
   additions: number;
   deletions: number;

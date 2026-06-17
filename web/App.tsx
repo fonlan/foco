@@ -43,6 +43,7 @@
   Server,
   Settings,
   SlidersHorizontal,
+  Sparkles,
   SquareTerminal,
   ScrollText,
   SunMoon,
@@ -137,6 +138,7 @@ import type {
   GeneralFormState,
   GeneralSettingsSummary,
   GitBranchesResponse,
+  GitCommitMessageResponse,
   GitDiffLineStats,
   GitDiffResponse,
   GitStatusFileSummary,
@@ -2386,6 +2388,42 @@ export function App() {
       setGitDiff(data);
       setGitCommitMessage("");
       setSelectedDiffPath(null);
+    } catch (requestError) {
+      setDiffError(errorMessage(requestError));
+    } finally {
+      setGitOperationKey(null);
+    }
+  }
+
+  async function handleGenerateGitCommitMessage() {
+    if (!activeWorkspace) {
+      setDiffError(t("Select a workspace before using Git actions."));
+      return;
+    }
+    if (!gitDiff?.stagedFiles.length) {
+      return;
+    }
+    if (!selectedModelId || !selectedProviderId) {
+      setDiffError(t("Select an enabled model before generating a commit message."));
+      return;
+    }
+
+    setGitOperationKey("generate-commit-message");
+    setDiffError(null);
+
+    try {
+      const data = await requestJson<GitCommitMessageResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/commit-message`,
+        {
+          body: JSON.stringify({
+            modelId: selectedModelId,
+            providerId: selectedProviderId,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setGitCommitMessage(data.message);
     } catch (requestError) {
       setDiffError(errorMessage(requestError));
     } finally {
@@ -5564,6 +5602,7 @@ export function App() {
                     isLoadingContextMemories={isLoadingContextMemories}
                     isLoadingTodoGraph={isLoadingTodoGraph}
                     onGitCommit={handleGitCommit}
+                    onGenerateGitCommitMessage={() => void handleGenerateGitCommitMessage()}
                     onGitCommitMessageChange={setGitCommitMessage}
                     onGitFileOperation={(action, path) => void handleGitFileOperation(action, path)}
                     onRefreshDiff={() => {
@@ -7755,6 +7794,7 @@ function ContextPanel({
   isLoadingDiff,
   isLoadingTodoGraph,
   onForgetContextMemory,
+  onGenerateGitCommitMessage,
   onGitCommit,
   onGitCommitMessageChange,
   onGitFileOperation,
@@ -7783,6 +7823,7 @@ function ContextPanel({
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
   onForgetContextMemory: (memory: MemoryFactRecord) => void;
+  onGenerateGitCommitMessage: () => void;
   onGitCommit: (event: FormEvent<HTMLFormElement>) => void;
   onGitCommitMessageChange: (message: string) => void;
   onGitFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
@@ -7844,6 +7885,7 @@ function ContextPanel({
               gitOperationKey={gitOperationKey}
               isLoading={isLoadingDiff}
               onCommit={onGitCommit}
+              onGenerateCommitMessage={onGenerateGitCommitMessage}
               onCommitMessageChange={onGitCommitMessageChange}
               onFileOperation={onGitFileOperation}
               onRefresh={onRefreshDiff}
@@ -8537,6 +8579,7 @@ function GitDiffPanel({
   gitOperationKey,
   isLoading,
   onCommit,
+  onGenerateCommitMessage,
   onCommitMessageChange,
   onFileOperation,
   onRefresh,
@@ -8550,6 +8593,7 @@ function GitDiffPanel({
   gitOperationKey: string | null;
   isLoading: boolean;
   onCommit: (event: FormEvent<HTMLFormElement>) => void;
+  onGenerateCommitMessage: () => void;
   onCommitMessageChange: (message: string) => void;
   onFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onRefresh: () => void;
@@ -8560,6 +8604,8 @@ function GitDiffPanel({
   const diffSections = parseGitDiffSections(diffResponse);
   const stagedFiles = diffResponse?.stagedFiles ?? [];
   const isCommitting = gitOperationKey === "commit";
+  const isGeneratingCommitMessage = gitOperationKey === "generate-commit-message";
+  const isCommitMessageInputDisabled = isCommitting || isGeneratingCommitMessage;
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[#f8f8f8]">
@@ -8599,16 +8645,32 @@ function GitDiffPanel({
 
       <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3">
         <form className="mb-3 space-y-2 px-1" onSubmit={onCommit}>
-          <textarea
-            className="min-h-20 w-full resize-none rounded-md border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 shadow-inner outline-none placeholder:text-stone-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
-            disabled={isCommitting}
-            onChange={(event) => onCommitMessageChange(event.target.value)}
-            placeholder={t("Commit message")}
-            value={gitCommitMessage}
-          />
+          <div className="relative">
+            <textarea
+              className="min-h-20 w-full resize-none rounded-md border border-stone-300 bg-white px-3 py-2 pr-11 text-sm text-stone-900 shadow-inner outline-none placeholder:text-stone-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+              disabled={isCommitMessageInputDisabled}
+              onChange={(event) => onCommitMessageChange(event.target.value)}
+              placeholder={t("Commit message")}
+              value={gitCommitMessage}
+            />
+            <button
+              aria-label={t("Generate commit message")}
+              className="absolute right-2 top-2 inline-flex size-7 items-center justify-center rounded-md text-teal-700 hover:bg-teal-50 hover:text-teal-900 disabled:cursor-not-allowed disabled:text-stone-300 disabled:hover:bg-transparent"
+              disabled={isCommitMessageInputDisabled || stagedFiles.length === 0}
+              onClick={onGenerateCommitMessage}
+              title={t("Generate commit message")}
+              type="button"
+            >
+              {isGeneratingCommitMessage ? (
+                <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+              ) : (
+                <Sparkles aria-hidden="true" className="size-4" />
+              )}
+            </button>
+          </div>
           <button
             className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:text-stone-500"
-            disabled={isCommitting || !gitCommitMessage.trim() || stagedFiles.length === 0}
+            disabled={isCommitMessageInputDisabled || !gitCommitMessage.trim() || stagedFiles.length === 0}
             type="submit"
           >
             {isCommitting ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin" /> : null}
