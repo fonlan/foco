@@ -148,7 +148,13 @@ export type ChatAttachmentPartSummary = {
 export type ChatMessagePart =
   | { type: "text"; text: string }
   | { type: "error"; text: string }
-  | { type: "reasoning"; text: string }
+  | {
+      type: "reasoning";
+      text: string;
+      durationMs?: number;
+      liveDurationMs?: number;
+      startedAtMs?: number;
+    }
   | { type: "attachment"; attachment: ChatAttachmentPartSummary }
   | { type: "toolCall"; toolCall: ChatToolCallSummary };
 

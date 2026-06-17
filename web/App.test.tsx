@@ -1974,6 +1974,86 @@ describe("App verification surfaces", () => {
     });
   });
 
+  it("tracks each streaming thinking block duration independently", async () => {
+    const nowSpy = vi.spyOn(Date, "now");
+    nowSpy.mockReturnValue(1_000);
+
+    try {
+      render(<App />);
+      await userEvent.click(await screen.findByText("Tool run"));
+      await userEvent.type(
+        await screen.findByPlaceholderText(defaultComposerPlaceholder),
+        "multi think",
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(activeChatStreamController).not.toBeNull());
+
+      await act(async () => {
+        enqueueChatStreamEvent({
+          assistantMessageId: "message-assistant-stream",
+          delta: "First plan.",
+          type: "reasoningDelta",
+        });
+      });
+
+      nowSpy.mockReturnValue(2_000);
+      await act(async () => {
+        enqueueChatStreamEvent({
+          assistantMessageId: "message-assistant-stream",
+          delta: "Interim answer.",
+          type: "textDelta",
+        });
+      });
+
+      nowSpy.mockReturnValue(5_000);
+      await act(async () => {
+        enqueueChatStreamEvent({
+          assistantMessageId: "message-assistant-stream",
+          delta: "Second plan.",
+          type: "reasoningDelta",
+        });
+      });
+
+      nowSpy.mockReturnValue(7_000);
+      await act(async () => {
+        enqueueChatStreamEvent({
+          assistantMessageId: "message-assistant-stream",
+          chatId: "chat-1",
+          memoriesUsed: [],
+          metrics: {
+            firstTokenLatencyMs: null,
+            modelId: "gpt-test",
+            outputTokens: null,
+            providerId: "openai",
+            totalLatencyMs: 9_000,
+          },
+          reasoning: "First plan.Second plan.",
+          stopReason: null,
+          text: "Interim answer.",
+          type: "complete",
+          usage: null,
+        });
+        activeChatStreamController?.close();
+      });
+
+      const answer = await screen.findByText("Interim answer.");
+      const assistantRow = answer.closest(".message-row") as HTMLElement | null;
+      expect(assistantRow).not.toBeNull();
+      const thinkingToggles = within(assistantRow as HTMLElement).getAllByRole(
+        "button",
+        { name: "Expand thinking" },
+      );
+      expect(thinkingToggles).toHaveLength(2);
+      expect(within(thinkingToggles[0]).getByText("1 s")).toBeInTheDocument();
+      expect(within(thinkingToggles[1]).getByText("2 s")).toBeInTheDocument();
+      expect(within(assistantRow as HTMLElement).getByText("First plan.", { selector: "span" })).toBeInTheDocument();
+      expect(within(assistantRow as HTMLElement).getByText("Second plan.", { selector: "span" })).toBeInTheDocument();
+      expect(answer).toBeInTheDocument();
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   it("sends guidance to the active run without ending the current stream", async () => {
     const fetchMock = vi.mocked(fetch);
     render(<App />);

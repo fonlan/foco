@@ -466,6 +466,9 @@ export function ChatPanel({
               const parts = message.parts.length
                 ? message.parts
                 : fallbackMessageParts(message);
+              const reasoningPartCount = parts.filter(
+                (part) => part.type === "reasoning",
+              ).length;
               const authorLabel = isUser ? "You" : "Foco Agent";
               const createdAtLabel = formatChatCreatedAt(message.createdAt);
               const copyText = messageCopyText(message, parts);
@@ -631,18 +634,24 @@ export function ChatPanel({
                           <MemoriesUsedBlock memories={message.memoriesUsed} />
                         ) : null}
                         {parts.length ? (
-                          parts.map((part, partIndex) => (
-                            <MessagePartBlock
-                              helpers={helpers}
-                              isError={message.status === "error"}
-                              isStreaming={message.status === "streaming"}
-                              isStreamingTail={partIndex === parts.length - 1}
-                              isUser={isUser}
-                              key={`${message.id}-part-${partIndex}`}
-                              part={part}
-                              reasoningDurationMs={message.metrics?.totalLatencyMs ?? null}
-                            />
-                          ))
+                          parts.map((part, partIndex) => {
+                            return (
+                              <MessagePartBlock
+                                helpers={helpers}
+                                isError={message.status === "error"}
+                                isStreaming={message.status === "streaming"}
+                                isStreamingTail={partIndex === parts.length - 1}
+                                isUser={isUser}
+                                key={`${message.id}-part-${partIndex}`}
+                                part={part}
+                                reasoningDurationFallbackMs={
+                                  reasoningPartCount === 1
+                                    ? message.metrics?.totalLatencyMs ?? null
+                                    : null
+                                }
+                              />
+                            );
+                          })
                         ) : message.status === "streaming" ? (
                           <LoaderCircle
                             aria-hidden="true"
@@ -1262,7 +1271,7 @@ function MessagePartBlock({
   isStreamingTail,
   isUser,
   part,
-  reasoningDurationMs,
+  reasoningDurationFallbackMs,
 }: {
   helpers: ChatPanelHelpers;
   isError: boolean;
@@ -1270,13 +1279,17 @@ function MessagePartBlock({
   isStreamingTail: boolean;
   isUser: boolean;
   part: ChatMessagePart;
-  reasoningDurationMs: number | null;
+  reasoningDurationFallbackMs: number | null;
 }) {
   if (part.type === "reasoning") {
     return (
       <ReasoningBlock
         helpers={helpers}
-        durationMs={reasoningDurationMs}
+        durationMs={
+          part.liveDurationMs ??
+          part.durationMs ??
+          reasoningDurationFallbackMs
+        }
         isStreaming={isStreaming && isStreamingTail}
         reasoning={part.text}
       />

@@ -298,7 +298,7 @@ type AiStatsColumn = {
   render: (request: AiRequestAuditSummary) => ReactNode;
 };
 
-
+const LIVE_REASONING_DURATION_REFRESH_MS = 250;
 
 export function App() {
   const [initialBrowserRoute] = useState(() => currentBrowserRoute());
@@ -3225,6 +3225,70 @@ export function App() {
           (!ignoreInterruptedId && message.id === assistantMessageId))
       );
     };
+
+    let activeReasoningStartedAtMs: number | null = null;
+    let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null = null;
+    const updateLiveReasoningDuration = (startedAtMs: number) => {
+      setMessagesForChatKey(chatKey, (current) =>
+        current.map((message) =>
+          isCurrentAssistantMessage(message) && message.status === "streaming"
+            ? {
+              ...message,
+              parts: updateActiveReasoningPartDuration(
+                message.parts,
+                startedAtMs,
+                Date.now(),
+              ),
+            }
+            : message,
+        ),
+      );
+    };
+    const startLiveReasoningDuration = () => {
+      if (activeReasoningStartedAtMs !== null) {
+        return activeReasoningStartedAtMs;
+      }
+      const startedAtMs = Date.now();
+      activeReasoningStartedAtMs = startedAtMs;
+      if (liveReasoningDurationTimer !== null) {
+        clearInterval(liveReasoningDurationTimer);
+      }
+      updateLiveReasoningDuration(startedAtMs);
+      liveReasoningDurationTimer = setInterval(
+        () => updateLiveReasoningDuration(startedAtMs),
+        LIVE_REASONING_DURATION_REFRESH_MS,
+      );
+      return startedAtMs;
+    };
+    const stopLiveReasoningDuration = () => {
+      if (liveReasoningDurationTimer !== null) {
+        clearInterval(liveReasoningDurationTimer);
+        liveReasoningDurationTimer = null;
+      }
+    };
+    const finishLiveReasoningDuration = (eventAssistantMessageId?: string) => {
+      const startedAtMs = activeReasoningStartedAtMs;
+      if (startedAtMs === null) {
+        return;
+      }
+      activeReasoningStartedAtMs = null;
+      stopLiveReasoningDuration();
+      const endedAtMs = Date.now();
+      setMessagesForChatKey(chatKey, (current) =>
+        current.map((message) =>
+          isCurrentAssistantMessage(message, eventAssistantMessageId)
+            ? {
+              ...message,
+              parts: finishActiveReasoningPart(
+                message.parts,
+                startedAtMs,
+                endedAtMs,
+              ),
+            }
+            : message,
+        ),
+      );
+    };
     // Resolve which assistant bubble a post-guidance event targets: once a
     // guidance boundary is crossed, events keep carrying the interrupted id but
     // must target the new bubble (`currentAssistantMessageId`).
@@ -3296,6 +3360,7 @@ export function App() {
         }
 
         if (streamEvent.type === "textDelta") {
+          finishLiveReasoningDuration(streamEvent.assistantMessageId);
           assistantDraft += streamEvent.delta;
           scheduleRunContextUsageRefresh();
           ensureStreamingAssistantMessage(
@@ -3316,6 +3381,7 @@ export function App() {
         }
 
         if (streamEvent.type === "reasoningDelta") {
+          const reasoningStartedAtMs = startLiveReasoningDuration();
           assistantDraftReasoning += streamEvent.delta;
           scheduleRunContextUsageRefresh();
           ensureStreamingAssistantMessage(
@@ -3327,7 +3393,11 @@ export function App() {
                 ? {
                   ...message,
                   reasoning: `${message.reasoning ?? ""}${streamEvent.delta}`,
-                  parts: appendReasoningPart(message.parts, streamEvent.delta),
+                  parts: appendReasoningPart(
+                    message.parts,
+                    streamEvent.delta,
+                    reasoningStartedAtMs,
+                  ),
                 }
                 : message,
             ),
@@ -3356,6 +3426,7 @@ export function App() {
         }
 
         if (streamEvent.type === "streamReset") {
+          finishLiveReasoningDuration(streamEvent.assistantMessageId);
           assistantDraft = streamEvent.text;
           assistantDraftReasoning = streamEvent.reasoning ?? "";
           latestResponseUsage = null;
@@ -3406,6 +3477,7 @@ export function App() {
         }
 
         if (streamEvent.type === "guidanceApplied") {
+          finishLiveReasoningDuration(currentAssistantMessageId);
           const previousAssistantId = currentAssistantMessageId;
           const guidanceAssistantId = `${streamEvent.id}-assistant`;
           currentAssistantMessageId = guidanceAssistantId;
@@ -3421,6 +3493,10 @@ export function App() {
         }
 
         if (streamEvent.type === "complete") {
+          const completedAtMs = Date.now();
+          const completedReasoningStartedAtMs = activeReasoningStartedAtMs;
+          activeReasoningStartedAtMs = null;
+          stopLiveReasoningDuration();
           const liveStatisticsUsage = streamEvent.usage ?? latestResponseUsage;
           updateLiveChatStatistics(chatKey, {
             modelId: streamEvent.metrics.modelId,
@@ -3445,8 +3521,18 @@ export function App() {
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? hasGuidanceTurns
-                  ? completedGuidanceAssistantMessage(message, streamEvent)
-                  : completedAssistantMessage(message, streamEvent)
+                  ? completedGuidanceAssistantMessage(
+                    message,
+                    streamEvent,
+                    completedReasoningStartedAtMs,
+                    completedAtMs,
+                  )
+                  : completedAssistantMessage(
+                    message,
+                    streamEvent,
+                    completedReasoningStartedAtMs,
+                    completedAtMs,
+                  )
                 : message,
             ),
           );
@@ -3454,6 +3540,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolCall") {
+          finishLiveReasoningDuration(streamEvent.assistantMessageId);
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
@@ -3531,6 +3618,7 @@ export function App() {
         }
 
         if (streamEvent.type === "hookNotification") {
+          finishLiveReasoningDuration(streamEvent.assistantMessageId);
           if (streamEvent.notification.level === "error") {
             setError(streamEvent.notification.message);
           }
@@ -3605,10 +3693,14 @@ export function App() {
         }
 
         if (streamEvent.type === "streamEnd") {
+          finishLiveReasoningDuration();
+          stopLiveReasoningDuration();
           return;
         }
 
         if (streamEvent.type === "error") {
+          finishLiveReasoningDuration();
+          stopLiveReasoningDuration();
           streamHadError = true;
           setChatRunFailed(chatKey, true);
           setChatRunning(chatKey, false);
@@ -3628,6 +3720,8 @@ export function App() {
 
       await refreshWorkspaces();
     } catch (requestError) {
+      finishLiveReasoningDuration();
+      stopLiveReasoningDuration();
       const wasCancelled =
         requestError instanceof DOMException && requestError.name === "AbortError";
       if (!wasCancelled) {
@@ -3635,6 +3729,8 @@ export function App() {
         setError(errorMessage(requestError));
       }
     } finally {
+      finishLiveReasoningDuration();
+      stopLiveReasoningDuration();
       if (activeRunAbortByChatKeyRef.current.get(chatKey) === abortController) {
         activeRunAbortByChatKeyRef.current.delete(chatKey);
         cancelScheduledContextUsageForChatKey(chatKey);
@@ -3826,7 +3922,69 @@ export function App() {
           message.id === eventAssistantMessageId) ||
         (currentAssistantMessageId === localAssistantId &&
           message.id === localAssistantId));
-
+    let activeReasoningStartedAtMs: number | null = null;
+    let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null = null;
+    const updateLiveReasoningDuration = (startedAtMs: number) => {
+      setMessagesForChatKey(runMessagesKey, (current) =>
+        current.map((message) =>
+          isCurrentAssistantMessage(message) && message.status === "streaming"
+            ? {
+              ...message,
+              parts: updateActiveReasoningPartDuration(
+                message.parts,
+                startedAtMs,
+                Date.now(),
+              ),
+            }
+            : message,
+        ),
+      );
+    };
+    const startLiveReasoningDuration = () => {
+      if (activeReasoningStartedAtMs !== null) {
+        return activeReasoningStartedAtMs;
+      }
+      const startedAtMs = Date.now();
+      activeReasoningStartedAtMs = startedAtMs;
+      if (liveReasoningDurationTimer !== null) {
+        clearInterval(liveReasoningDurationTimer);
+      }
+      updateLiveReasoningDuration(startedAtMs);
+      liveReasoningDurationTimer = setInterval(
+        () => updateLiveReasoningDuration(startedAtMs),
+        LIVE_REASONING_DURATION_REFRESH_MS,
+      );
+      return startedAtMs;
+    };
+    const stopLiveReasoningDuration = () => {
+      if (liveReasoningDurationTimer !== null) {
+        clearInterval(liveReasoningDurationTimer);
+        liveReasoningDurationTimer = null;
+      }
+    };
+    const finishLiveReasoningDuration = (eventAssistantMessageId?: string) => {
+      const startedAtMs = activeReasoningStartedAtMs;
+      if (startedAtMs === null) {
+        return;
+      }
+      activeReasoningStartedAtMs = null;
+      stopLiveReasoningDuration();
+      const endedAtMs = Date.now();
+      setMessagesForChatKey(runMessagesKey, (current) =>
+        current.map((message) =>
+          isCurrentAssistantMessage(message, eventAssistantMessageId)
+            ? {
+              ...message,
+              parts: finishActiveReasoningPart(
+                message.parts,
+                startedAtMs,
+                endedAtMs,
+              ),
+            }
+            : message,
+        ),
+      );
+    };
     try {
       const response = await fetch(
         `/api/workspaces/${encodeURIComponent(request.workspaceId)}/chat/stream`,
@@ -3990,6 +4148,7 @@ export function App() {
         }
 
         if (streamEvent.type === "textDelta") {
+          finishLiveReasoningDuration(streamEvent.assistantMessageId);
           assistantDraft += streamEvent.delta;
           scheduleRunContextUsageRefresh();
           setMessagesForChatKey(runMessagesKey, (current) =>
@@ -4007,6 +4166,7 @@ export function App() {
         }
 
         if (streamEvent.type === "reasoningDelta") {
+          const reasoningStartedAtMs = startLiveReasoningDuration();
           assistantDraftReasoning += streamEvent.delta;
           scheduleRunContextUsageRefresh();
           setMessagesForChatKey(runMessagesKey, (current) =>
@@ -4018,6 +4178,7 @@ export function App() {
                   parts: appendReasoningPart(
                     message.parts,
                     streamEvent.delta,
+                    reasoningStartedAtMs,
                   ),
                 }
                 : message,
@@ -4043,6 +4204,7 @@ export function App() {
         }
 
         if (streamEvent.type === "streamReset") {
+          finishLiveReasoningDuration(streamEvent.assistantMessageId);
           assistantDraft = streamEvent.text;
           assistantDraftReasoning = streamEvent.reasoning ?? "";
           latestResponseUsage = null;
@@ -4093,6 +4255,7 @@ export function App() {
         }
 
         if (streamEvent.type === "guidanceApplied") {
+          finishLiveReasoningDuration(currentAssistantMessageId);
           const previousAssistantId = currentAssistantMessageId;
           const guidanceAssistantId = `${streamEvent.id}-assistant`;
           currentAssistantMessageId = guidanceAssistantId;
@@ -4108,6 +4271,10 @@ export function App() {
         }
 
         if (streamEvent.type === "complete") {
+          const completedAtMs = Date.now();
+          const completedReasoningStartedAtMs = activeReasoningStartedAtMs;
+          activeReasoningStartedAtMs = null;
+          stopLiveReasoningDuration();
           const liveStatisticsUsage = streamEvent.usage ?? latestResponseUsage;
           updateLiveChatStatistics(runMessagesKey, {
             modelId: streamEvent.metrics.modelId,
@@ -4134,8 +4301,18 @@ export function App() {
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? hasGuidanceTurns
-                  ? completedGuidanceAssistantMessage(message, streamEvent)
-                  : completedAssistantMessage(message, streamEvent)
+                  ? completedGuidanceAssistantMessage(
+                    message,
+                    streamEvent,
+                    completedReasoningStartedAtMs,
+                    completedAtMs,
+                  )
+                  : completedAssistantMessage(
+                    message,
+                    streamEvent,
+                    completedReasoningStartedAtMs,
+                    completedAtMs,
+                  )
                 : message,
             ),
           );
@@ -4143,6 +4320,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolCall") {
+          finishLiveReasoningDuration(streamEvent.assistantMessageId);
           cancelScheduledContextUsageForChatKey(runMessagesKey);
           refreshRunContextUsage();
           setMessagesForChatKey(runMessagesKey, (current) =>
@@ -4221,6 +4399,7 @@ export function App() {
         }
 
         if (streamEvent.type === "hookNotification") {
+          finishLiveReasoningDuration(streamEvent.assistantMessageId);
           if (streamEvent.notification.level === "error") {
             setError(streamEvent.notification.message);
           }
@@ -4300,12 +4479,15 @@ export function App() {
           );
           return;
         }
-
         if (streamEvent.type === "streamEnd") {
+          finishLiveReasoningDuration();
+          stopLiveReasoningDuration();
           return;
         }
 
         if (streamEvent.type === "error") {
+          finishLiveReasoningDuration();
+          stopLiveReasoningDuration();
           streamHadError = true;
           setChatRunFailed(runMessagesKey, true);
           setChatRunning(currentRunningChatKey, false);
@@ -4326,6 +4508,8 @@ export function App() {
       await refreshWorkspaces();
       runSucceeded = !streamHadError;
     } catch (requestError) {
+      finishLiveReasoningDuration();
+      stopLiveReasoningDuration();
       const wasCancelled =
         requestError instanceof DOMException && requestError.name === "AbortError";
       const message = wasCancelled ? t("Run cancelled.") : errorMessage(requestError);
@@ -4348,6 +4532,8 @@ export function App() {
         ),
       );
     } finally {
+      finishLiveReasoningDuration();
+      stopLiveReasoningDuration();
       if (
         activeRunAbortByChatKeyRef.current.get(currentRunningChatKey) ===
         abortController
@@ -17084,12 +17270,21 @@ function resetStreamingAssistantMessage(
 function completedAssistantMessage(
   message: ShellMessage,
   streamEvent: Extract<ChatStreamEvent, { type: "complete" }>,
+  activeReasoningStartedAtMs: number | null,
+  completedAtMs: number,
 ): ShellMessage {
   let parts = message.parts;
   const nextReasoning = streamEvent.reasoning ?? null;
   const reasoningDelta = missingFinalSuffix(message.reasoning ?? "", nextReasoning ?? "");
   if (reasoningDelta) {
     parts = appendReasoningPart(parts, reasoningDelta);
+  }
+  if (activeReasoningStartedAtMs !== null) {
+    parts = finishActiveReasoningPart(
+      parts,
+      activeReasoningStartedAtMs,
+      completedAtMs,
+    );
   }
   const textDelta = missingFinalSuffix(message.content, streamEvent.text);
   if (textDelta) {
@@ -17118,14 +17313,24 @@ function completedAssistantMessage(
 function completedGuidanceAssistantMessage(
   message: ShellMessage,
   streamEvent: Extract<ChatStreamEvent, { type: "complete" }>,
+  activeReasoningStartedAtMs: number | null,
+  completedAtMs: number,
 ): ShellMessage {
+  const parts = activeReasoningStartedAtMs === null
+    ? message.parts
+    : finishActiveReasoningPart(
+      message.parts,
+      activeReasoningStartedAtMs,
+      completedAtMs,
+    );
+
   return {
     ...message,
     metrics: streamEvent.metrics,
     memoriesUsed: streamEvent.memoriesUsed,
     extractedMemories: message.extractedMemories,
     status: undefined,
-    parts: message.parts.length ? message.parts : fallbackMessageParts(message),
+    parts: parts.length ? parts : fallbackMessageParts(message),
   };
 }
 
@@ -17245,14 +17450,25 @@ function appendErrorPart(parts: ChatMessagePart[], text: string): ChatMessagePar
 function appendReasoningPart(
   parts: ChatMessagePart[],
   text: string,
+  startedAtMs?: number,
 ): ChatMessagePart[] {
   if (!text) {
     return parts;
   }
 
   const lastPart = parts[parts.length - 1];
-  if (lastPart?.type !== "reasoning") {
-    return [...parts, { type: "reasoning", text }];
+  if (lastPart?.type !== "reasoning" || lastPart.durationMs !== undefined) {
+    return startedAtMs === undefined
+      ? [...parts, { type: "reasoning", text }]
+      : [
+        ...parts,
+        {
+          type: "reasoning",
+          text,
+          startedAtMs,
+          liveDurationMs: 0,
+        },
+      ];
   }
 
   return [
@@ -17260,6 +17476,53 @@ function appendReasoningPart(
     {
       ...lastPart,
       text: lastPart.text + text,
+    },
+  ];
+}
+
+function updateActiveReasoningPartDuration(
+  parts: ChatMessagePart[],
+  startedAtMs: number,
+  nowMs: number,
+): ChatMessagePart[] {
+  const lastPart = parts[parts.length - 1];
+  if (
+    lastPart?.type !== "reasoning" ||
+    lastPart.startedAtMs !== startedAtMs ||
+    lastPart.durationMs !== undefined
+  ) {
+    return parts;
+  }
+
+  return [
+    ...parts.slice(0, -1),
+    {
+      ...lastPart,
+      liveDurationMs: Math.max(0, nowMs - startedAtMs),
+    },
+  ];
+}
+
+function finishActiveReasoningPart(
+  parts: ChatMessagePart[],
+  startedAtMs: number,
+  endedAtMs: number,
+): ChatMessagePart[] {
+  const lastPart = parts[parts.length - 1];
+  if (
+    lastPart?.type !== "reasoning" ||
+    lastPart.startedAtMs !== startedAtMs ||
+    lastPart.durationMs !== undefined
+  ) {
+    return parts;
+  }
+
+  return [
+    ...parts.slice(0, -1),
+    {
+      type: "reasoning",
+      text: lastPart.text,
+      durationMs: Math.max(0, endedAtMs - startedAtMs),
     },
   ];
 }
@@ -19446,7 +19709,19 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
 
   if (part.type === "reasoning") {
     const text = fieldValue(part, "text");
-    return typeof text === "string" ? { type: "reasoning", text } : null;
+    if (typeof text !== "string") {
+      return null;
+    }
+    const durationMs = fieldValue(part, "durationMs", "duration_ms");
+    const liveDurationMs = fieldValue(part, "liveDurationMs", "live_duration_ms");
+    const startedAtMs = fieldValue(part, "startedAtMs", "started_at_ms");
+    return {
+      type: "reasoning",
+      text,
+      ...(typeof durationMs === "number" ? { durationMs } : {}),
+      ...(typeof liveDurationMs === "number" ? { liveDurationMs } : {}),
+      ...(typeof startedAtMs === "number" ? { startedAtMs } : {}),
+    };
   }
 
   if (part.type === "attachment") {
