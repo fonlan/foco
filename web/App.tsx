@@ -1,4 +1,5 @@
-﻿import {
+﻿import focoLogoSvg from "../foco.svg?raw";
+import {
   Activity,
   ArrowDown,
   ArrowUp,
@@ -16060,14 +16061,11 @@ function SettingsPanel({
 
 function FocoLogoMark() {
   return (
-    <span className="foco-logo-mark inline-flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-[0_10px_24px_rgba(15,118,110,0.2)] ring-1 ring-stone-200/80">
-      <img
-        alt=""
-        aria-hidden="true"
-        className="size-full object-cover"
-        src="/foco.svg"
-      />
-    </span>
+    <span
+      aria-hidden="true"
+      className="foco-logo-mark inline-flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-[0_10px_24px_rgba(15,118,110,0.2)] ring-1 ring-stone-200/80"
+      dangerouslySetInnerHTML={{ __html: focoLogoSvg }}
+    />
   );
 }
 

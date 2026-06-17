@@ -1233,6 +1233,12 @@ body,
   box-shadow: none;
 }
 
+.foco-logo-mark > svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
 .foco-nav-rail-button {
   display: inline-flex;
   width: 2.25rem;
