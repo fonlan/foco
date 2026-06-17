@@ -149,6 +149,14 @@ impl QuestionRegistry {
         })
     }
 
+    pub(crate) fn is_pending(&self, question_id: &str) -> Result<bool, ApiError> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| ApiError::internal("question registry lock is poisoned"))?;
+        Ok(pending.contains_key(question_id))
+    }
+
     fn remove(&self, question_id: &str) {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(question_id);

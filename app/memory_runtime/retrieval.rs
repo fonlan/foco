@@ -249,6 +249,30 @@ fn is_stable_prompt_memory(fact: &MemoryFactRecord) -> bool {
             .is_some_and(|confidence| confidence >= STABLE_MEMORY_CONFIDENCE_THRESHOLD)
 }
 
+pub(crate) fn memory_retrieval_query_text(
+    current_user_request: Option<&str>,
+    existing_messages: &[MessageRecord],
+) -> Option<String> {
+    let current_user_request = current_user_request
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let mut query = format!("{MEMORY_RETRIEVAL_CURRENT_REQUEST_LABEL}\n{current_user_request}");
+
+    if let Some(previous_assistant_response) = existing_messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && !message.content.trim().is_empty())
+        .map(|message| message.content.trim())
+    {
+        query.push_str("\n\n");
+        query.push_str(MEMORY_RETRIEVAL_PREVIOUS_ASSISTANT_LABEL);
+        query.push('\n');
+        query.push_str(previous_assistant_response);
+    }
+
+    Some(query)
+}
+
 fn relevant_memory_facts_fts(
     global_memory: &mut MemoryDatabase,
     workspace_memory: &mut MemoryDatabase,
@@ -362,7 +386,7 @@ async fn relevant_memory_facts_llm(
     finish_relevant_memory_facts(facts, &mut global_memory, &mut workspace_memory)
 }
 
-fn llm_memory_retrieval_candidates(
+pub(crate) fn llm_memory_retrieval_candidates(
     global_memory: &MemoryDatabase,
     workspace_memory: &MemoryDatabase,
     chat_id: Option<&str>,
@@ -561,7 +585,9 @@ fn memory_retrieval_provider_request(
             ),
             neutral_text_message(
                 NeutralChatRole::User,
-                format!("User request:\n{query_text}\n\nMemory candidates JSON:\n{memories_json}"),
+                format!(
+                    "{MEMORY_RETRIEVAL_CURRENT_REQUEST_LABEL}\n{query_text}\n\nMemory candidates JSON:\n{memories_json}"
+                ),
             ),
         ],
         tools: vec![memory_retrieval_tool_definition()],
@@ -869,7 +895,7 @@ pub(crate) fn memory_fts_query(text: &str) -> Option<String> {
     }
 }
 
-fn memory_prompt_search(text: &str) -> Option<MemoryPromptSearch> {
+pub(crate) fn memory_prompt_search(text: &str) -> Option<MemoryPromptSearch> {
     let terms = memory_prompt_search_terms(text);
     if terms.is_empty() {
         return None;
@@ -882,7 +908,7 @@ fn memory_prompt_search(text: &str) -> Option<MemoryPromptSearch> {
     })
 }
 
-fn memory_prompt_search_terms(text: &str) -> Vec<String> {
+pub(crate) fn memory_prompt_search_terms(text: &str) -> Vec<String> {
     memory_search_terms(text)
         .into_iter()
         .filter(|term| !is_memory_prompt_stop_term(term))

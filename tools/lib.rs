@@ -898,10 +898,15 @@ impl From<WorkspaceDatabaseError> for ToolRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        command_tools::RunCommandInput,
+        file_tools::{EditFileInput, ReadFileInput, WriteFileInput, ripgrep_command},
+    };
     use foco_store::workspace::{
         NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
         NewCodeGraphSymbol, WorkspaceDatabase,
     };
+    use serde_json::json;
     use std::collections::BTreeSet;
 
     #[test]

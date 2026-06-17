@@ -708,7 +708,7 @@ fn compression_source_sequence_range(
     (start, end)
 }
 
-fn compress_runtime_tool_state_if_needed(
+pub(crate) fn compress_runtime_tool_state_if_needed(
     context: &mut PreparedChatContext,
     force: bool,
 ) -> Result<bool, ApiError> {
@@ -817,7 +817,9 @@ fn compress_runtime_tool_state_if_needed(
     Ok(true)
 }
 
-fn compress_all_runtime_tool_state(context: &mut PreparedChatContext) -> Result<bool, ApiError> {
+pub(crate) fn compress_all_runtime_tool_state(
+    context: &mut PreparedChatContext,
+) -> Result<bool, ApiError> {
     validate_prompt_context_lengths(
         &context.provider_request.messages,
         &context.message_source_sequences,
@@ -1610,7 +1612,7 @@ fn persist_llm_request_events(
 
     Ok(())
 }
-fn context_message_groups(
+pub(crate) fn context_message_groups(
     messages: &[NeutralChatMessage],
     message_source_sequences: &[Option<i64>],
     message_context_sources: &[PromptContextSource],
@@ -1751,7 +1753,7 @@ fn pack_items_from_message_groups(groups: &[ContextMessageGroup]) -> Vec<Context
         .collect()
 }
 
-fn context_token_breakdown(groups: &[ContextMessageGroup]) -> ContextTokenBreakdown {
+pub(crate) fn context_token_breakdown(groups: &[ContextMessageGroup]) -> ContextTokenBreakdown {
     const SOURCES: &[PromptContextSourceBucket] = &[
         PromptContextSourceBucket::ReservedPrompt,
         PromptContextSourceBucket::StableInjection,

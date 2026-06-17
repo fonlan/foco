@@ -319,7 +319,7 @@ CREATE INDEX prompt_context_injections_chat_kind_sequence_idx
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::workspace::{NewHookRun, WorkspaceDatabase};
 
     #[test]
     fn hook_runs_redact_secret_input_and_output_json() {

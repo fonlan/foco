@@ -432,7 +432,7 @@ fn search_text_too_many_matches_error(
     ))
 }
 
-fn ripgrep_command() -> String {
+pub(crate) fn ripgrep_command() -> String {
     RIPGREP_PATH
         .get()
         .and_then(|state| state.lock().ok().and_then(|path| path.clone()))
@@ -608,11 +608,11 @@ pub(crate) fn edit_file(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ReadFileInput {
-    path: String,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
-    timeout_ms: Option<u64>,
+pub(crate) struct ReadFileInput {
+    pub(crate) path: String,
+    pub(crate) start_line: Option<usize>,
+    pub(crate) end_line: Option<usize>,
+    pub(crate) timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -634,20 +634,20 @@ struct SearchTextInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct WriteFileInput {
-    path: String,
-    content: String,
-    start_line: Option<usize>,
-    end_line: Option<usize>,
-    timeout_ms: Option<u64>,
+pub(crate) struct WriteFileInput {
+    pub(crate) path: String,
+    pub(crate) content: String,
+    pub(crate) start_line: Option<usize>,
+    pub(crate) end_line: Option<usize>,
+    pub(crate) timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct EditFileInput {
-    path: String,
-    old_str: String,
-    new_str: String,
-    replace_all: Option<bool>,
-    timeout_ms: Option<u64>,
+pub(crate) struct EditFileInput {
+    pub(crate) path: String,
+    pub(crate) old_str: String,
+    pub(crate) new_str: String,
+    pub(crate) replace_all: Option<bool>,
+    pub(crate) timeout_ms: Option<u64>,
 }

@@ -395,7 +395,7 @@ async fn execute_tool_call(
     }
 }
 
-async fn execute_tool(
+pub(crate) async fn execute_tool(
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
     global_hooks: &HookConfig,
@@ -847,7 +847,7 @@ fn execution_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<Optio
     }
 }
 
-async fn wait_for_tool_resource_lock(
+pub(crate) async fn wait_for_tool_resource_lock(
     registry: &ToolResourceLockRegistry,
     workspace_id: &str,
     resource_locks: Vec<ToolResourceLock>,

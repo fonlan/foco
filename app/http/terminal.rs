@@ -95,7 +95,7 @@ pub(crate) struct TerminalSocketQuery {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TerminalSessionResponse {
-    id: String,
-    name: String,
-    working_directory: String,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) working_directory: String,
 }

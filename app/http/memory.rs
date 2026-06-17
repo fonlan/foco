@@ -133,15 +133,15 @@ pub(crate) struct MemoryListResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemoryExtractionJobSummary {
-    id: String,
-    scope: String,
-    chat_id: Option<String>,
-    status: String,
-    model_id: Option<String>,
-    error_message: Option<String>,
-    created_at: String,
-    started_at: Option<String>,
-    completed_at: Option<String>,
+    pub(crate) id: String,
+    pub(crate) scope: String,
+    pub(crate) chat_id: Option<String>,
+    pub(crate) status: String,
+    pub(crate) model_id: Option<String>,
+    pub(crate) error_message: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) started_at: Option<String>,
+    pub(crate) completed_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -325,7 +325,7 @@ pub(crate) async fn create_manual_memory(
     Ok(Json(MemoryMutationResponse { memory }))
 }
 
-fn memory_extraction_job_summaries(
+pub(crate) fn memory_extraction_job_summaries(
     scope: MemoryScope,
     database: &MemoryDatabase,
     chat_id: Option<&str>,

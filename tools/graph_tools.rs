@@ -483,21 +483,21 @@ fn related_file_json(file: CodeGraphRelatedFileRecord) -> Value {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GraphFindSymbolsInput {
-    query: String,
-    kind: Option<String>,
-    path: Option<String>,
-    limit: Option<usize>,
-    timeout_ms: Option<u64>,
+    pub(crate) query: String,
+    pub(crate) kind: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GraphSymbolLookupInput {
-    symbol_id: Option<i64>,
-    symbol: Option<String>,
-    path: Option<String>,
-    limit: Option<usize>,
-    timeout_ms: Option<u64>,
+    pub(crate) symbol_id: Option<i64>,
+    pub(crate) symbol: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]

@@ -4,7 +4,7 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 build = "build.rs"
-
+autotests = false
 [[bin]]
 name = "foco"
 path = "main.rs"

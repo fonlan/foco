@@ -1,6 +1,7 @@
 use super::{compression_snapshot_message, snapshot_covered_sequences};
 use crate::memory_runtime::{
-    neutral_messages_from_record, stored_turn_memory_messages_by_sequence,
+    memory_retrieval_query_text, neutral_messages_from_record,
+    stored_turn_memory_messages_by_sequence,
 };
 use crate::*;
 
@@ -271,6 +272,8 @@ pub(crate) async fn prepare_prompt_context(
         &prompt_context_injections,
         &active_stored_memory_keys,
     )?;
+    let memory_retrieval_query_text =
+        memory_retrieval_query_text(raw_message.as_deref(), &existing_messages);
     // For chat runs, memory retrieval is deferred to a later phase so that chat
     // record creation and the stream's `start` event are not blocked by
     // potentially slow memory lookups (e.g. LLM-based retrieval). The retrieval
@@ -287,7 +290,7 @@ pub(crate) async fn prepare_prompt_context(
                 config,
                 workspace,
                 chat_id.as_deref(),
-                raw_message.as_deref(),
+                memory_retrieval_query_text.as_deref(),
                 model,
                 provider,
                 &context_budget,
@@ -434,7 +437,7 @@ pub(crate) async fn prepare_prompt_context(
         Some(PendingMemoryRetrieval {
             workspace: workspace.clone(),
             chat_id_for_retrieval: chat_id.clone(),
-            query_text: raw_message.clone(),
+            query_text: memory_retrieval_query_text.clone(),
             chat_model: model.clone(),
             chat_provider: provider.clone(),
             purpose,

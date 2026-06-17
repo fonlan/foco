@@ -234,6 +234,10 @@ If there is nothing worth remembering, submit {\"facts\":[]}. \
 Suggested scopes mean: global for user-wide stable preferences, workspace for project-specific durable facts, chat for session-specific details.";
 // System prompt for model-based memory retrieval.
 const MEMORY_RETRIEVAL_SYSTEM_PROMPT: &str = "Select only Foco memory facts that are directly relevant to the user's current request. Use the select_relevant_memory tool exactly once. Do not return prose. Return factKeys in the order they should be injected. Include pinned facts only when relevant.";
+// Label for the current user request in memory retrieval inputs.
+const MEMORY_RETRIEVAL_CURRENT_REQUEST_LABEL: &str = "Current user request:";
+// Label for the latest completed assistant answer included for follow-up memory retrieval.
+const MEMORY_RETRIEVAL_PREVIOUS_ASSISTANT_LABEL: &str = "Previous assistant final response:";
 // Maximum number of attachments allowed on one chat or context-usage request.
 const MAX_CHAT_ATTACHMENTS: usize = 6;
 // Maximum size allowed for a single chat attachment.
@@ -4955,7 +4959,8 @@ async fn prepare_chat_context(
         provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
         serialize_provider_request(&provider_request)?
     };
-    let code_change_baseline = session_code_change_baseline_for_workspace(&prompt_context.workspace_path);
+    let code_change_baseline =
+        session_code_change_baseline_for_workspace(&prompt_context.workspace_path);
     if let SessionCodeChangeBaselineState::Unavailable { reason } = &code_change_baseline {
         tracing::warn!(
             workspace_id = %prompt_context.workspace_id,
@@ -11369,8 +11374,7 @@ fn session_code_change_baseline_for_workspace(
                     return SessionCodeChangeBaselineState::Unavailable {
                         reason: format!(
                             "code change stats disabled: dirty file baseline size {} bytes exceeds limit {} bytes",
-                            total_bytes,
-                            CODE_CHANGE_BASELINE_MAX_BYTES
+                            total_bytes, CODE_CHANGE_BASELINE_MAX_BYTES
                         ),
                     };
                 }
@@ -11386,7 +11390,6 @@ fn git_diff_stats_for_workspace(workspace_path: &Path) -> Result<GitDiffStatsByF
     let diff = git_diff_response(workspace_path, None).map_err(|error| format!("{error:?}"))?;
     Ok(git_diff_stats(&diff))
 }
-
 
 fn git_diff_stats(diff: &GitDiffResponse) -> GitDiffStatsByFile {
     let mut stats = BTreeMap::new();
@@ -11585,12 +11588,9 @@ fn read_workspace_text_file_with_size(
 }
 
 fn is_safe_relative_path(path: &str) -> bool {
-    Path::new(path).components().all(|component| {
-        matches!(
-            component,
-            Component::Normal(_) | Component::CurDir
-        )
-    })
+    Path::new(path)
+        .components()
+        .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 fn normalize_line_endings_for_code_change_stats(content: &str) -> String {
@@ -12968,6 +12968,3 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 
     diff == 0
 }
-
-#[cfg(test)]
-mod tests;

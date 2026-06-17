@@ -122,16 +122,14 @@ impl ProviderRequestOverride {
                     )))
                 }
             }
-            REQUEST_OVERRIDE_VALUE_TYPE_BOOLEAN => self
-                .value
-                .as_bool()
-                .map(Value::Bool)
-                .ok_or_else(|| {
+            REQUEST_OVERRIDE_VALUE_TYPE_BOOLEAN => {
+                self.value.as_bool().map(Value::Bool).ok_or_else(|| {
                     ProviderConfigError::InvalidRequest(format!(
                         "request override '{}' value must be a boolean",
                         self.name
                     ))
-                }),
+                })
+            }
             _ => Err(ProviderConfigError::InvalidRequest(format!(
                 "request override value type must be '{REQUEST_OVERRIDE_VALUE_TYPE_STRING}', '{REQUEST_OVERRIDE_VALUE_TYPE_NUMBER}', or '{REQUEST_OVERRIDE_VALUE_TYPE_BOOLEAN}': {value_type}"
             ))),
@@ -1344,7 +1342,14 @@ mod tests {
             prompt_cache_retention: Some("24h".to_string()),
         };
 
-        let options = genai_chat_options(&request).expect("chat options");
+        let config = ProviderConnectionConfig {
+            kind: ProviderKind::OpenAiResponses,
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+        };
+        let options = genai_chat_options(&config, &request).expect("chat options");
 
         assert_eq!(options.temperature, Some(0.0));
         assert_eq!(options.top_p, Some(1.0));
@@ -1367,7 +1372,15 @@ mod tests {
             prompt_cache_retention: Some("1h".to_string()),
         };
 
-        let error = genai_chat_options(&request).expect_err("unsupported retention should fail");
+        let config = ProviderConnectionConfig {
+            kind: ProviderKind::OpenAiResponses,
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+        };
+        let error =
+            genai_chat_options(&config, &request).expect_err("unsupported retention should fail");
 
         assert!(
             error

@@ -1,7 +1,35 @@
 use super::*;
 use std::collections::BTreeSet;
 
-use foco_store::config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
+use axum::extract::{Path as AxumPath, State};
+use foco_agent::{
+    ToolResource, ToolResourceAccess, ToolResourceLock, context_compression_trigger_tokens,
+};
+use foco_store::{
+    config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PromptSettings},
+    workspace::{LlmRequestAuditFilters, NewTerminalSession},
+};
+use foco_tools::{
+    GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL, READ_FILE_TOOL, SEARCH_TEXT_TOOL,
+    ToolCancellationToken,
+};
+use serde_json::json;
+
+use crate::http::{
+    memory::memory_extraction_job_summaries, terminal::create_terminal_session,
+    workspaces::add_workspace,
+};
+use crate::memory_runtime::{
+    llm_memory_retrieval_candidates, memory_prompt_search, memory_prompt_search_terms,
+    memory_retrieval_query_text, neutral_messages_from_record, resolve_prompt_context_memory,
+};
+use crate::prompt::{
+    compress_all_runtime_tool_state, compress_runtime_tool_state_if_needed, context_message_groups,
+    context_token_breakdown,
+};
+use crate::runtime::{
+    QuestionItem, QuestionItemAnswer, QuestionOption, execute_tool, wait_for_tool_resource_lock,
+};
 
 fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
     NeutralToolCall {
@@ -327,6 +355,8 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
         },
         registry,
         ToolCancellationToken::new(),
+        mpsc::unbounded_channel().0,
+        "assistant-1",
         "workspace-1",
         workspace.path(),
         "chat-1",
@@ -1059,10 +1089,8 @@ fn question_registry_rejects_invalid_answer_without_consuming_question() {
     assert!(error.message.contains("requires answers for all"));
     assert!(
         registry
-            .pending
-            .lock()
-            .expect("question registry lock")
-            .contains_key("question-1")
+            .is_pending("question-1")
+            .expect("question registry pending check")
     );
 
     registry
@@ -1096,10 +1124,8 @@ fn question_registry_rejects_invalid_answer_without_consuming_question() {
     assert_eq!(received_answer.answers[1].answer, "prod");
     assert!(
         !registry
-            .pending
-            .lock()
-            .expect("question registry lock")
-            .contains_key("question-1")
+            .is_pending("question-1")
+            .expect("question registry pending check")
     );
 }
 
@@ -2153,6 +2179,7 @@ fn active_chat_run_registry_rejects_guidance_after_complete_event() {
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
+#[test]
 fn user_attachments_round_trip_into_neutral_history_and_message_parts() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-user-attachment-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -3004,7 +3031,8 @@ fn session_code_changed_files_excludes_preexisting_dirty_content() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-session-dirty-code-stats-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     gix::init(&workspace_dir).expect("init git repo");
-    fs::write(workspace_dir.join("README.md"), "preexisting dirty\n").expect("dirty before baseline");
+    fs::write(workspace_dir.join("README.md"), "preexisting dirty\n")
+        .expect("dirty before baseline");
 
     let baseline = session_code_change_baseline_for_workspace(&workspace_dir);
     fs::write(workspace_dir.join("README.md"), "current turn\n").expect("edit during session");
@@ -4320,6 +4348,7 @@ Search memory before repo work.
         &config,
         &config.workspaces[0].id,
         ChatStreamRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -4443,6 +4472,7 @@ Search memory before repo work.
         &config,
         &config.workspaces[0].id,
         ChatStreamRequest {
+            queued_user_message_id: None,
             chat_id: Some(new_context.chat_id.clone()),
             model_id: "model".to_string(),
             provider_id: None,
@@ -4565,6 +4595,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         &config,
         &config.workspaces[0].id,
         ChatStreamRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -4676,6 +4707,7 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
         &config,
         &config.workspaces[0].id,
         ChatStreamRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -4769,6 +4801,7 @@ Use the existing product UI conventions.
         &config,
         &config.workspaces[0].id,
         ChatStreamRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -4845,6 +4878,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -4855,6 +4889,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ChatRun,
     )
     .await
@@ -4936,6 +4971,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -4946,6 +4982,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ChatRun,
     )
     .await
@@ -4985,6 +5022,7 @@ async fn prepare_prompt_context_hides_web_search_without_enabled_search_api() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -4995,6 +5033,7 @@ async fn prepare_prompt_context_hides_web_search_without_enabled_search_api() {
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ChatRun,
     )
     .await
@@ -5036,6 +5075,7 @@ async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -5046,6 +5086,7 @@ async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ChatRun,
     )
     .await
@@ -5122,6 +5163,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -5132,6 +5174,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ChatRun,
     )
     .await
@@ -5234,6 +5277,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         &config,
         &config.workspaces[0].id,
         ChatStreamRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -5260,6 +5304,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         &config,
         &config.workspaces[0].id,
         ChatStreamRequest {
+            queued_user_message_id: None,
             chat_id: Some(first_context.chat_id.clone()),
             model_id: "review-model".to_string(),
             provider_id: None,
@@ -5399,6 +5444,7 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: Some("chat-1".to_string()),
             model_id: "model".to_string(),
             provider_id: None,
@@ -5409,6 +5455,7 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ChatRun,
     )
     .await
@@ -5568,6 +5615,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: Some("chat-1".to_string()),
             model_id: "model".to_string(),
             provider_id: None,
@@ -5578,6 +5626,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ChatRun,
     )
     .await
@@ -5676,6 +5725,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         &config,
         &config.workspaces[0].id,
         ChatStreamRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -5756,6 +5806,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         &config,
         &config.workspaces[0].id,
         ChatStreamRequest {
+            queued_user_message_id: None,
             chat_id: Some(first_context.chat_id.clone()),
             model_id: "model".to_string(),
             provider_id: None,
@@ -5890,6 +5941,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: Some("chat-1".to_string()),
             model_id: "model".to_string(),
             provider_id: None,
@@ -5900,6 +5952,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ChatRun,
     )
     .await
@@ -5918,6 +5971,62 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
+}
+
+#[test]
+fn memory_retrieval_query_text_uses_only_current_request_for_first_turn() {
+    let query = memory_retrieval_query_text(Some("  Explain the renderer plan.  "), &[])
+        .expect("memory retrieval query");
+
+    assert_eq!(
+        query,
+        format!("{MEMORY_RETRIEVAL_CURRENT_REQUEST_LABEL}\nExplain the renderer plan.")
+    );
+    assert!(!query.contains(MEMORY_RETRIEVAL_PREVIOUS_ASSISTANT_LABEL));
+}
+
+#[test]
+fn memory_retrieval_query_text_includes_latest_assistant_response_for_followup() {
+    let messages = vec![
+        MessageRecord {
+            id: "user-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            role: "user".to_string(),
+            content: "Design a renderer plan.".to_string(),
+            sequence: 0,
+            created_at: "2026-06-17T00:00:00Z".to_string(),
+            metadata_json: "{}".to_string(),
+        },
+        MessageRecord {
+            id: "assistant-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            role: "assistant".to_string(),
+            content: "Implement renderer plan B.".to_string(),
+            sequence: 1,
+            created_at: "2026-06-17T00:00:01Z".to_string(),
+            metadata_json: "{}".to_string(),
+        },
+        MessageRecord {
+            id: "assistant-2".to_string(),
+            chat_id: "chat-1".to_string(),
+            role: "assistant".to_string(),
+            content: "  Final conclusion: use plan C.  ".to_string(),
+            sequence: 2,
+            created_at: "2026-06-17T00:00:02Z".to_string(),
+            metadata_json: "{}".to_string(),
+        },
+    ];
+
+    let query = memory_retrieval_query_text(Some("  Start implementation.  "), &messages)
+        .expect("memory retrieval query");
+
+    assert_eq!(
+        query,
+        format!(
+            "{MEMORY_RETRIEVAL_CURRENT_REQUEST_LABEL}\nStart implementation.\n\n{MEMORY_RETRIEVAL_PREVIOUS_ASSISTANT_LABEL}\nFinal conclusion: use plan C."
+        )
+    );
+    assert!(!query.contains("Implement renderer plan B."));
 }
 
 #[test]
@@ -6014,6 +6123,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -6024,6 +6134,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ContextPreview,
     )
     .await
@@ -6050,6 +6161,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -6060,6 +6172,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
             assistant_draft_reasoning: Some("Streaming reasoning also adds context.".to_string()),
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ContextPreview,
     )
     .await
@@ -6165,6 +6278,7 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
         &config,
         &config.workspaces[0].id,
         PromptContextRequest {
+            queued_user_message_id: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -6175,6 +6289,7 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
             assistant_draft_reasoning: None,
             attachments: Vec::new(),
         },
+        None,
         PromptAssemblyPurpose::ContextPreview,
     )
     .await

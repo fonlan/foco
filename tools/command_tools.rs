@@ -120,11 +120,11 @@ pub(crate) fn sleep_tool(
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RunCommandInput {
-    command: String,
-    args: Option<Vec<String>>,
-    cwd: Option<String>,
-    timeout_ms: Option<u64>,
+pub(crate) struct RunCommandInput {
+    pub(crate) command: String,
+    pub(crate) args: Option<Vec<String>>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
