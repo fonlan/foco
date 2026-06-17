@@ -3541,3 +3541,72 @@ summary:focus-visible {
     transition-duration: 0.01ms !important;
   }
 }
+
+.context-sidebar-splitter {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -0.25rem;
+  z-index: 10;
+  width: 0.5rem;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+  background: transparent;
+}
+
+@media (max-width: 767px) {
+  .app-shell.app-shell-with-context {
+    grid-template-rows: minmax(0, 1fr) minmax(
+        var(--context-panel-min-height),
+        min(var(--context-panel-mobile-height), 72dvh)
+      );
+  }
+
+  .message-list {
+    padding: 0.625rem;
+  }
+
+  .message-stack {
+    max-width: 100%;
+  }
+
+  .message-bubble {
+    width: 100%;
+    gap: 0;
+  }
+
+  .message-bubble .message-avatar {
+    display: none;
+  }
+
+  .context-sidebar-splitter {
+    top: -0.375rem;
+    right: 0;
+    bottom: auto;
+    left: 0;
+    width: auto;
+    height: 0.75rem;
+    cursor: row-resize;
+  }
+
+  .context-sidebar-splitter::before {
+    position: absolute;
+    top: 0.3125rem;
+    right: 0.75rem;
+    left: 0.75rem;
+    height: 1px;
+    content: "";
+    background: var(--foco-border-strong);
+    transition:
+      background 120ms ease,
+      height 120ms ease;
+  }
+
+  .context-sidebar-splitter:hover::before,
+  .context-sidebar-splitter:focus-visible::before,
+  .context-sidebar-splitter-active::before {
+    height: 2px;
+    background: var(--foco-accent);
+  }
+}

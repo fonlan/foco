@@ -67,17 +67,25 @@ export function useBrowserPopState(
 
 type PanelResizeEffectOptions = {
   isResizing: boolean;
+  maxHeightRatio: number;
   maxWidth: number;
+  minHeight: number;
   minWidth: number;
+  mobileBreakpoint: number;
   onResizeEnd: () => void;
+  setHeight: (value: number | ((current: number) => number)) => void;
   setWidth: (value: number | ((current: number) => number)) => void;
 };
 
 export function useRightPanelResizeEffect({
   isResizing,
+  maxHeightRatio,
   maxWidth,
+  minHeight,
   minWidth,
+  mobileBreakpoint,
   onResizeEnd,
+  setHeight,
   setWidth,
 }: PanelResizeEffectOptions) {
   useEffect(() => {
@@ -86,6 +94,13 @@ export function useRightPanelResizeEffect({
     }
 
     function handlePointerMove(event: PointerEvent) {
+      if (window.innerWidth < mobileBreakpoint) {
+        const maxHeight = Math.floor(window.innerHeight * maxHeightRatio);
+        const nextHeight = window.innerHeight - event.clientY;
+        setHeight(Math.min(Math.max(nextHeight, minHeight), maxHeight));
+        return;
+      }
+
       const nextWidth = window.innerWidth - event.clientX;
       setWidth(Math.min(Math.max(nextWidth, minWidth), maxWidth));
     }
@@ -96,7 +111,7 @@ export function useRightPanelResizeEffect({
 
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
-    document.body.style.cursor = "col-resize";
+    document.body.style.cursor = window.innerWidth < mobileBreakpoint ? "row-resize" : "col-resize";
     document.body.style.userSelect = "none";
     window.addEventListener("pointermove", handlePointerMove);
     window.addEventListener("pointerup", handlePointerUp);
@@ -107,7 +122,17 @@ export function useRightPanelResizeEffect({
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
     };
-  }, [isResizing, maxWidth, minWidth, onResizeEnd, setWidth]);
+  }, [
+    isResizing,
+    maxHeightRatio,
+    maxWidth,
+    minHeight,
+    minWidth,
+    mobileBreakpoint,
+    onResizeEnd,
+    setHeight,
+    setWidth,
+  ]);
 }
 
 type SidebarResizeEffectOptions = {

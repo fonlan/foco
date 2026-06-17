@@ -30,7 +30,7 @@
   LogOut,
   LoaderCircle,
   MessageSquare,
-  PanelRight,
+  PanelBottom,
   Pencil,
   Play,
   PlugZap,
@@ -226,7 +226,10 @@ import {
   CHAT_BOTTOM_LOCK_THRESHOLD_PX,
   chartTooltipLabelStyle,
   chartTooltipStyle,
+  CONTEXT_PANEL_DEFAULT_MOBILE_HEIGHT,
+  CONTEXT_PANEL_MAX_HEIGHT_RATIO,
   CONTEXT_PANEL_MAX_WIDTH,
+  CONTEXT_PANEL_MIN_HEIGHT,
   CONTEXT_PANEL_MIN_WIDTH,
   CREATE_BRANCH_OPTION_VALUE,
   DEFAULT_SYSTEM_PROMPT_NAME,
@@ -234,6 +237,7 @@ import {
   MAX_CHAT_ATTACHMENT_BYTES,
   MAX_CHAT_ATTACHMENT_TOTAL_BYTES,
   MEMORY_KIND_OPTIONS,
+  MOBILE_BREAKPOINT_PX,
   SAVED_PASSWORD_MASK,
   STREAM_CONTEXT_USAGE_REFRESH_DELAY_MS,
   WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
@@ -352,6 +356,9 @@ export function App() {
   const [contextPanelTab, setContextPanelTab] =
     useState<ContextPanelTab>("todo");
   const [diffPanelWidth, setDiffPanelWidth] = useState(CONTEXT_PANEL_MIN_WIDTH);
+  const [contextPanelMobileHeight, setContextPanelMobileHeight] = useState(
+    CONTEXT_PANEL_DEFAULT_MOBILE_HEIGHT,
+  );
   const [isResizingDiffPanel, setIsResizingDiffPanel] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(WORKSPACE_SIDEBAR_MIN_WIDTH);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
@@ -1207,9 +1214,13 @@ export function App() {
 
   useRightPanelResizeEffect({
     isResizing: isResizingDiffPanel,
+    maxHeightRatio: CONTEXT_PANEL_MAX_HEIGHT_RATIO,
     maxWidth: CONTEXT_PANEL_MAX_WIDTH,
+    minHeight: CONTEXT_PANEL_MIN_HEIGHT,
     minWidth: CONTEXT_PANEL_MIN_WIDTH,
+    mobileBreakpoint: MOBILE_BREAKPOINT_PX,
     onResizeEnd: () => setIsResizingDiffPanel(false),
+    setHeight: setContextPanelMobileHeight,
     setWidth: setDiffPanelWidth,
   });
 
@@ -4555,16 +4566,18 @@ export function App() {
             <FocoNavRail
               activeMode={viewMode}
               canLogout={canLogout}
+              contextPanelButton={null}
               isSavingTheme={isSavingTheme}
               onAddWorkspace={openWorkspaceDialog}
               onLogout={handleLogout}
+              onHomeClick={handleHomeNavClick}
               onOpenSettings={() => openSettingsSection("general")}
               onOpenStats={openStatsView}
-              onHomeClick={handleHomeNavClick}
               onReturnHome={openCurrentChatView}
               onToggleTheme={() =>
                 void saveAppTheme(theme === "dark" ? "light" : "dark")
               }
+              terminalButton={null}
               theme={theme}
             />
             <section className="global-main-panel min-w-0">
@@ -4596,6 +4609,8 @@ export function App() {
             style={
               {
                 "--diff-panel-width": `${diffPanelWidth}px`,
+                "--context-panel-min-height": `${CONTEXT_PANEL_MIN_HEIGHT}px`,
+                "--context-panel-mobile-height": `${contextPanelMobileHeight}px`,
                 "--sidebar-width": `${sidebarWidth}px`,
               } as CSSProperties
             }
@@ -4613,6 +4628,21 @@ export function App() {
               canLogout={canLogout}
               isSavingTheme={isSavingTheme}
               onAddWorkspace={openWorkspaceDialog}
+              contextPanelButton={{
+                active: isContextPanelOpen,
+                icon: PanelBottom,
+                label: isContextPanelOpen
+                  ? t("Close context panel")
+                  : t("Open context panel"),
+                onClick: () => setIsContextPanelOpen((current) => !current),
+              }}
+              terminalButton={{
+                active: isTerminalOpen,
+                disabled: !activeWorkspace,
+                icon: SquareTerminal,
+                label: isTerminalOpen ? t("Close terminal") : t("Open terminal"),
+                onClick: toggleWorkspaceTerminal,
+              }}
               onLogout={handleLogout}
               onOpenSettings={() => openSettingsSection("general")}
               onOpenStats={openStatsView}
@@ -4984,48 +5014,7 @@ export function App() {
                     runningChatKeys={runningChatKeys}
                     tabs={chatTabs}
                   />
-                  <div className="chat-header-actions">
-                    <button
-                      aria-label={
-                        isTerminalOpen ? t("Close terminal") : t("Open terminal")
-                      }
-                      className={`chat-toolbar-button terminal-toolbar-button ${isTerminalOpen ? "chat-toolbar-button-active" : ""
-                        } disabled:cursor-not-allowed disabled:text-stone-400`}
-                      disabled={!activeWorkspace}
-                      onClick={toggleWorkspaceTerminal}
-                      title={
-                        isTerminalOpen ? t("Terminal (1)") : t("Terminal")
-                      }
-                      type="button"
-                    >
-                      <span
-                        aria-hidden="true"
-                        className={`terminal-status-dot ${isTerminalOpen ? "terminal-status-dot-running" : ""
-                          }`}
-                      />
-                      <SquareTerminal aria-hidden="true" className="size-4" />
-                    </button>
-                    <button
-                      aria-label={
-                        isContextPanelOpen
-                          ? t("Close context panel")
-                          : t("Open context panel")
-                      }
-                      className={`chat-toolbar-button ${isContextPanelOpen ? "chat-toolbar-button-active" : ""
-                        }`}
-                      onClick={() => {
-                        setIsContextPanelOpen((current) => !current);
-                      }}
-                      title={
-                        isContextPanelOpen
-                          ? t("Close context panel")
-                          : t("Open context panel")
-                      }
-                      type="button"
-                    >
-                      <PanelRight aria-hidden="true" className="size-4" />
-                    </button>
-                  </div>
+                  <div className="chat-header-actions" />
                 </div>
               </header>
               <ChatPanel
@@ -5116,7 +5105,11 @@ export function App() {
                   <div
                     aria-label={t("Resize context panel")}
                     aria-orientation="vertical"
-                    className="context-sidebar-splitter absolute bottom-0 left-0 top-0 z-10 hidden w-1 cursor-col-resize bg-transparent hover:bg-teal-500/40 lg:block"
+                    aria-valuemax={CONTEXT_PANEL_MAX_WIDTH}
+                    aria-valuemin={CONTEXT_PANEL_MIN_WIDTH}
+                    aria-valuenow={diffPanelWidth}
+                    className={`context-sidebar-splitter ${isResizingDiffPanel ? "context-sidebar-splitter-active" : ""
+                      }`}
                     onKeyDown={(event) => {
                       if (event.key === "ArrowLeft") {
                         event.preventDefault();
@@ -5129,6 +5122,23 @@ export function App() {
                         event.preventDefault();
                         setDiffPanelWidth((current) =>
                           Math.max(current - 24, CONTEXT_PANEL_MIN_WIDTH),
+                        );
+                      }
+
+                      if (event.key === "ArrowUp") {
+                        event.preventDefault();
+                        setContextPanelMobileHeight((current) =>
+                          Math.min(
+                            current + 24,
+                            Math.floor(window.innerHeight * CONTEXT_PANEL_MAX_HEIGHT_RATIO),
+                          ),
+                        );
+                      }
+
+                      if (event.key === "ArrowDown") {
+                        event.preventDefault();
+                        setContextPanelMobileHeight((current) =>
+                          Math.max(current - 24, CONTEXT_PANEL_MIN_HEIGHT),
                         );
                       }
                     }}
@@ -5825,9 +5835,18 @@ function ChatTabBar({
   );
 }
 
+type NavRailAction = {
+  active: boolean;
+  disabled?: boolean;
+  icon: LucideIcon;
+  label: string;
+  onClick: () => void;
+};
+
 function FocoNavRail({
   activeMode,
   canLogout,
+  contextPanelButton,
   isSavingTheme,
   onAddWorkspace,
   onLogout,
@@ -5836,10 +5855,12 @@ function FocoNavRail({
   onOpenStats,
   onReturnHome,
   onToggleTheme,
+  terminalButton,
   theme,
 }: {
   activeMode: ViewMode;
   canLogout: boolean;
+  contextPanelButton: NavRailAction | null;
   isSavingTheme: boolean;
   onAddWorkspace: () => void;
   onLogout: () => Promise<void>;
@@ -5848,6 +5869,7 @@ function FocoNavRail({
   onOpenStats: () => void;
   onReturnHome: () => void;
   onToggleTheme: () => void;
+  terminalButton: NavRailAction | null;
   theme: AppThemeId;
 }) {
   const { t } = useI18n();
@@ -5886,6 +5908,8 @@ function FocoNavRail({
         />
       </div>
       <div className="foco-nav-rail-bottom">
+        {terminalButton ? <NavRailButton {...terminalButton} /> : null}
+        {contextPanelButton ? <NavRailButton {...contextPanelButton} /> : null}
         <NavRailButton
           active={false}
           icon={FolderPlus}
@@ -5918,13 +5942,7 @@ function NavRailButton({
   icon: Icon,
   label,
   onClick,
-}: {
-  active: boolean;
-  disabled?: boolean;
-  icon: LucideIcon;
-  label: string;
-  onClick: () => void;
-}) {
+}: NavRailAction) {
   return (
     <button
       aria-label={label}
