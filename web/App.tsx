@@ -31,6 +31,7 @@
   LoaderCircle,
   MessageSquare,
   PanelBottom,
+  PanelRight,
   Pencil,
   Play,
   PlugZap,
@@ -4633,7 +4634,7 @@ export function App() {
               onAddWorkspace={openWorkspaceDialog}
               contextPanelButton={{
                 active: isContextPanelOpen,
-                icon: PanelBottom,
+                icon: ResponsiveContextPanelIcon,
                 label: isContextPanelOpen
                   ? t("Close context panel")
                   : t("Open context panel"),
@@ -5841,10 +5842,23 @@ function ChatTabBar({
 type NavRailAction = {
   active: boolean;
   disabled?: boolean;
-  icon: LucideIcon;
+  icon: (props: { className?: string; "aria-hidden"?: boolean | "true" | "false" }) => ReactNode;
   label: string;
   onClick: () => void;
 };
+
+function ResponsiveContextPanelIcon({
+  className,
+}: {
+  className?: string;
+}) {
+  return (
+    <>
+      <PanelRight aria-hidden="true" className={`${className ?? ""} hidden md:block`} />
+      <PanelBottom aria-hidden="true" className={`${className ?? ""} md:hidden`} />
+    </>
+  );
+}
 
 function FocoNavRail({
   activeMode,
