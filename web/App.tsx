@@ -6738,7 +6738,7 @@ function ApiStatsPanel({
     requests.map((request) => request.modelId),
   );
   const statusOptions = auditOptions(
-    ["succeeded", "failed", "cancelled", "completed"].map((status) => ({
+    ["succeeded", "failed", "running", "cancelled", "completed"].map((status) => ({
       label: auditStatusText(status, t),
       value: status,
     })),
@@ -18273,6 +18273,10 @@ function auditStatusText(status: string, t: Translate) {
 
   if (status === "failed") {
     return t("failed");
+  }
+
+  if (status === "running") {
+    return t("running");
   }
 
   if (status === "cancelled") {

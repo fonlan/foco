@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   activeMemory,
+  aiStatistics,
+  aiStatisticsDetail,
   appTestState,
   changeInput,
   defaultComposerPlaceholder,
@@ -481,6 +483,64 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       screen.queryByRole("dialog", { name: "Request details" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("localizes running status in API request details", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/settings") {
+        return Promise.resolve(jsonResponse({
+          ...settings,
+          general: {
+            ...settings.general,
+            language: "zh-CN",
+          },
+        }));
+      }
+
+      if (path === "/api/ai-statistics") {
+        return Promise.resolve(jsonResponse({
+          ...aiStatistics,
+          requests: [
+            {
+              ...aiStatistics.requests[0],
+              finalState: "running",
+            },
+          ],
+        }));
+      }
+
+      if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
+        return Promise.resolve(jsonResponse({
+          ...aiStatisticsDetail,
+          request: {
+            ...aiStatisticsDetail.request,
+            finalState: "running",
+          },
+        }));
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "API 详情" }))[0]);
+    const table = await screen.findByRole("table");
+    expect(within(table).getByText("运行中")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "查看请求详情" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "请求详情" });
+    expect(within(dialog).getByText("状态")).toBeInTheDocument();
+    expect(within(dialog).getByText("运行中")).toBeInTheDocument();
   });
 
   it("loads saved API request audit column settings", async () => {
