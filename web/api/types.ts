@@ -64,6 +64,11 @@ export type WorkspaceFileTreeNode = {
   children: WorkspaceFileTreeNode[];
 };
 
+export type WorkspaceFileContentResponse = {
+  content: string;
+  path: string;
+};
+
 export type WorkspaceFilesResponse = {
   root: WorkspaceFileTreeNode;
 };

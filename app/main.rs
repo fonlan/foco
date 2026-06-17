@@ -551,6 +551,10 @@ fn app_router(state: AppState) -> Router {
             get(crate::http::workspaces::workspace_files),
         )
         .route(
+            "/api/workspaces/{workspace_id}/files/content",
+            post(crate::http::workspaces::workspace_file_content),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/files/delete",
             post(crate::http::workspaces::delete_workspace_file),
         )
@@ -2170,6 +2174,13 @@ pub(crate) struct WorkspaceFileRequest {
 pub(crate) struct RenameWorkspaceFileRequest {
     pub(crate) path: String,
     pub(crate) new_name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileContentResponse {
+    pub(crate) content: String,
+    pub(crate) path: String,
 }
 
 #[derive(Serialize)]

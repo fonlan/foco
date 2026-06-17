@@ -78,6 +78,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import * as monaco from "monaco-editor";
 import {
   Bar,
   BarChart,
@@ -218,6 +219,7 @@ import type {
   WebSearchFormState,
   WorkspaceChatListItem,
   WorkspaceCommonCommandSummary,
+  WorkspaceFileContentResponse,
   WorkspaceFilesResponse,
   WorkspaceFileTreeNode,
   WorkspaceFormState,
@@ -299,6 +301,28 @@ type WorkspaceChatContextMenuState = {
   workspace: WorkspaceSummary;
 };
 
+type OpenFileTab = {
+  workspaceId: string;
+  path: string;
+  name: string;
+  workspaceName: string;
+  workspaceLogoUrl: string | null;
+};
+
+type ActiveMainTab =
+  | { type: "chat"; workspaceId: string; chatId: string | null }
+  | { type: "file"; workspaceId: string; path: string };
+
+type MainTabSummary =
+  | (ChatTabSummary & { type: "chat" })
+  | (OpenFileTab & { type: "file"; title: string });
+
+type WorkspaceFileEditorState = {
+  content: string;
+  error: string | null;
+  isLoading: boolean;
+};
+
 type WorkspaceFileContextMenuState = {
   left: number;
   node: WorkspaceFileTreeNode;
@@ -357,7 +381,16 @@ export function App() {
   );
   const [messages, setMessages] = useState<ShellMessage[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [activeMainTab, setActiveMainTab] = useState<ActiveMainTab>({
+    chatId: null,
+    type: "chat",
+    workspaceId: "",
+  });
   const [openChatTabs, setOpenChatTabs] = useState<OpenChatTab[]>([]);
+  const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
+  const [workspaceFileEditors, setWorkspaceFileEditors] = useState<
+    Record<string, WorkspaceFileEditorState>
+  >({});
   const [pendingDeleteChat, setPendingDeleteChat] =
     useState<PendingDeleteChat | null>(null);
   const [workspaceChatContextMenu, setWorkspaceChatContextMenu] =
@@ -562,10 +595,35 @@ export function App() {
       ),
     [queuedRunRequests],
   );
-  const chatTabs = useMemo(
-    () => openChatTabs.map((tab) => hydrateChatTab(tab, workspaces)),
-    [openChatTabs, workspaces],
+  const mainTabs = useMemo<MainTabSummary[]>(
+    () => [
+      ...openChatTabs.map((tab) => ({
+        ...hydrateChatTab(tab, workspaces),
+        type: "chat" as const,
+      })),
+      ...openFileTabs.map((tab) => ({
+        ...tab,
+        title: tab.name,
+        type: "file" as const,
+      })),
+    ],
+    [openChatTabs, openFileTabs, workspaces],
   );
+  const activeFileEditorKey =
+    activeMainTab.type === "file"
+      ? workspaceFileEditorKey(activeMainTab.workspaceId, activeMainTab.path)
+      : null;
+  const activeFileTab =
+    activeMainTab.type === "file"
+      ? openFileTabs.find(
+        (tab) =>
+          tab.workspaceId === activeMainTab.workspaceId &&
+          tab.path === activeMainTab.path,
+      ) ?? null
+      : null;
+  const activeFileEditor = activeFileEditorKey
+    ? workspaceFileEditors[activeFileEditorKey] ?? null
+    : null;
   const openChatKeySet = useMemo(
     () =>
       new Set(
@@ -1239,6 +1297,13 @@ export function App() {
           scheduledWorkspaceRunsRef.current.some(
             (run) => run.workspaceId === tab.workspaceId && run.chatId === tab.chatId,
           ),
+      );
+      return next.length === current.length ? current : next;
+    });
+
+    setOpenFileTabs((current) => {
+      const next = current.filter((tab) =>
+        workspaces.some((workspace) => workspace.id === tab.workspaceId),
       );
       return next.length === current.length ? current : next;
     });
@@ -2039,6 +2104,7 @@ export function App() {
     const cachedMessages = chatMessagesByKey[run.chatKey] ?? [];
     setActiveWorkspaceId(run.workspaceId);
     setActiveChatId(run.chatId);
+    setActiveMainTab({ chatId: run.chatId, type: "chat", workspaceId: run.workspaceId });
     setExpandedWorkspaceId(run.workspaceId);
     activeWorkspaceIdRef.current = run.workspaceId;
     activeChatIdRef.current = run.chatId;
@@ -2072,6 +2138,7 @@ export function App() {
       setActiveWorkspaceChatRefs(workspaceId, chatId);
       setActiveWorkspaceId(workspaceId);
       setActiveChatId(chatId);
+      setActiveMainTab({ chatId, type: "chat", workspaceId });
       setExpandedWorkspaceId(workspaceId);
       openChatTab(workspaceId, chatId);
       activeChatKeyRef.current = chatKey;
@@ -2134,6 +2201,7 @@ export function App() {
 
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(chatId);
+    setActiveMainTab({ chatId, type: "chat", workspaceId });
     setExpandedWorkspaceId(workspaceId);
     openChatTab(workspaceId, chatId);
     setActiveWorkspaceChatRefs(workspaceId, chatId);
@@ -2153,6 +2221,7 @@ export function App() {
     setActiveWorkspaceChatRefs(workspaceId, null);
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
+    setActiveMainTab({ chatId: null, type: "chat", workspaceId });
     setMessages([]);
     setSelectedDiffPath(null);
     setViewMode("chat");
@@ -2174,6 +2243,72 @@ export function App() {
         fallbackWorkspaceName: workspace?.name ?? t("Workspace"),
       }),
     );
+  }
+
+  async function openWorkspaceFileTab(node: WorkspaceFileTreeNode) {
+    if (!activeWorkspace) {
+      setWorkspaceFilesError(t("Select a workspace before using file actions."));
+      return;
+    }
+    if (node.kind !== "file" || !node.path) {
+      return;
+    }
+
+    const workspaceId = activeWorkspace.id;
+    const workspaceName = activeWorkspace.name;
+    const workspaceLogoUrl = activeWorkspace.logoUrl ?? null;
+    const editorKey = workspaceFileEditorKey(workspaceId, node.path);
+
+    setOpenFileTabs((current) =>
+      upsertOpenFileTab(current, {
+        name: node.name,
+        path: node.path,
+        workspaceId,
+        workspaceLogoUrl,
+        workspaceName,
+      }),
+    );
+    setActiveWorkspaceId(workspaceId);
+    setExpandedWorkspaceId(workspaceId);
+    setActiveMainTab({ path: node.path, type: "file", workspaceId });
+    setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
+    setWorkspaceFileEditors((current) => ({
+      ...current,
+      [editorKey]: current[editorKey] ?? {
+        content: "",
+        error: null,
+        isLoading: true,
+      },
+    }));
+
+    try {
+      const response = await requestJson<WorkspaceFileContentResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/files/content`,
+        {
+          body: JSON.stringify({ path: node.path }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setWorkspaceFileEditors((current) => ({
+        ...current,
+        [editorKey]: {
+          content: response.content,
+          error: null,
+          isLoading: false,
+        },
+      }));
+    } catch (requestError) {
+      setWorkspaceFileEditors((current) => ({
+        ...current,
+        [editorKey]: {
+          content: current[editorKey]?.content ?? "",
+          error: errorMessage(requestError),
+          isLoading: false,
+        },
+      }));
+    }
   }
 
   function openPendingChatTab(
@@ -2234,14 +2369,67 @@ export function App() {
     });
   }
 
+  function selectMainTab(tab: MainTabSummary) {
+    if (tab.type === "chat") {
+      selectWorkspaceChat(tab.workspaceId, tab.chatId);
+      return;
+    }
+
+    setActiveWorkspaceId(tab.workspaceId);
+    setExpandedWorkspaceId(tab.workspaceId);
+    setActiveMainTab({ path: tab.path, type: "file", workspaceId: tab.workspaceId });
+    setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
+  }
+
+  function closeMainTab(tab: MainTabSummary) {
+    if (tab.type === "chat") {
+      closeChatTab(tab.workspaceId, tab.chatId);
+      return;
+    }
+
+    const tabIndex = mainTabs.findIndex(
+      (current) => current.type === "file" && current.workspaceId === tab.workspaceId && current.path === tab.path,
+    );
+    setOpenFileTabs((current) =>
+      current.filter(
+        (current) => current.workspaceId !== tab.workspaceId || current.path !== tab.path,
+      ),
+    );
+    setWorkspaceFileEditors((current) => {
+      const next = { ...current };
+      delete next[workspaceFileEditorKey(tab.workspaceId, tab.path)];
+      return next;
+    });
+
+    if (
+      activeMainTab.type !== "file" ||
+      activeMainTab.workspaceId !== tab.workspaceId ||
+      activeMainTab.path !== tab.path
+    ) {
+      return;
+    }
+
+    const nextTabs = mainTabs.filter(
+      (current) => !(current.type === "file" && current.workspaceId === tab.workspaceId && current.path === tab.path),
+    );
+    const nextTab = nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    if (nextTab) {
+      selectMainTab(nextTab);
+      return;
+    }
+
+    setActiveMainTab({ chatId: null, type: "chat", workspaceId: activeWorkspaceId || tab.workspaceId });
+  }
+
   function closeChatTab(workspaceId: string, chatId: string) {
     const chatKey = chatRunKey(workspaceId, chatId);
     if (runningChatKeys.has(chatKey)) {
       return;
     }
 
-    const tabIndex = openChatTabs.findIndex(
-      (tab) => tab.workspaceId === workspaceId && tab.chatId === chatId,
+    const tabIndex = mainTabs.findIndex(
+      (tab) => tab.type === "chat" && tab.workspaceId === workspaceId && tab.chatId === chatId,
     );
     setOpenChatTabs((current) =>
       current.filter(
@@ -2252,24 +2440,28 @@ export function App() {
     removeMessagesForChatKey(chatKey);
     removeContextUsageForChatKey(chatKey);
 
-    if (activeWorkspaceId !== workspaceId || activeChatId !== chatId) {
+    if (
+      activeMainTab.type !== "chat" ||
+      activeMainTab.workspaceId !== workspaceId ||
+      activeMainTab.chatId !== chatId
+    ) {
       return;
     }
 
-    const nextTabs = openChatTabs.filter(
-      (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
+    const nextTabs = mainTabs.filter(
+      (tab) => !(tab.type === "chat" && tab.workspaceId === workspaceId && tab.chatId === chatId),
     );
-    const nextTab =
-      nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    const nextTab = nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
 
     if (nextTab) {
-      selectWorkspaceChat(nextTab.workspaceId, nextTab.chatId);
+      selectMainTab(nextTab);
       return;
     }
 
     setActiveWorkspaceChatRefs(activeWorkspaceId || workspaceId, null);
     setActiveChatId(null);
     setMessages([]);
+    setActiveMainTab({ chatId: null, type: "chat", workspaceId: activeWorkspaceId || workspaceId });
     updateBrowserRoute({
       chatId: null,
       viewMode: "chat",
@@ -2421,6 +2613,69 @@ export function App() {
         : [...current, skillId],
     );
   }
+  function renameWorkspaceFileTab(workspaceId: string, path: string, newName: string) {
+    setOpenFileTabs((current) =>
+      current.map((tab) => {
+        if (tab.workspaceId !== workspaceId || tab.path !== path) {
+          return tab;
+        }
+        const nextPath = workspaceRenamedFilePath(path, newName);
+        return {
+          ...tab,
+          name: newName,
+          path: nextPath,
+        };
+      }),
+    );
+    setWorkspaceFileEditors((current) => {
+      const oldKey = workspaceFileEditorKey(workspaceId, path);
+      const nextPath = workspaceRenamedFilePath(path, newName);
+      const newKey = workspaceFileEditorKey(workspaceId, nextPath);
+      if (!(oldKey in current)) {
+        return current;
+      }
+      const next = { ...current, [newKey]: current[oldKey] };
+      delete next[oldKey];
+      return next;
+    });
+    setActiveMainTab((current) =>
+      current.type === "file" && current.workspaceId === workspaceId && current.path === path
+        ? { path: workspaceRenamedFilePath(path, newName), type: "file", workspaceId }
+        : current,
+    );
+  }
+
+  function closeWorkspaceFileTabsForPath(workspaceId: string, path: string) {
+    setOpenFileTabs((current) =>
+      current.filter(
+        (tab) =>
+          tab.workspaceId !== workspaceId ||
+          (tab.path !== path && !tab.path.startsWith(`${path}/`)),
+      ),
+    );
+    setWorkspaceFileEditors((current) => {
+      const next = { ...current };
+      for (const key of Object.keys(next)) {
+        const prefix = `${workspaceId}:`;
+        if (!key.startsWith(prefix)) {
+          continue;
+        }
+        const filePath = key.slice(prefix.length);
+        if (filePath === path || filePath.startsWith(`${path}/`)) {
+          delete next[key];
+        }
+      }
+      return next;
+    });
+    if (
+      activeMainTab.type === "file" &&
+      activeMainTab.workspaceId === workspaceId &&
+      (activeMainTab.path === path || activeMainTab.path.startsWith(`${path}/`))
+    ) {
+      setActiveMainTab({ chatId: activeChatId, type: "chat", workspaceId });
+    }
+  }
+
   async function handleWorkspaceFileOperation(
     action: "delete" | "rename",
     path: string,
@@ -2445,6 +2700,12 @@ export function App() {
         },
       );
       setWorkspaceFiles(data);
+      if (action === "delete") {
+        closeWorkspaceFileTabsForPath(activeWorkspace.id, path);
+      }
+      if (action === "rename" && newName) {
+        renameWorkspaceFileTab(activeWorkspace.id, path, newName);
+      }
       setExpandedFileTreePaths((current) => new Set([...current, ""]));
       if (isContextPanelOpen && contextPanelTab === "git") {
         void loadGitDiff(activeWorkspace.id, selectedDiffPath);
@@ -5597,6 +5858,20 @@ export function App() {
               >
                 <button
                   className="workspace-chat-context-menu-item"
+                  disabled={workspaceFileContextMenu.node.kind !== "file"}
+                  onClick={() => {
+                    const { node } = workspaceFileContextMenu;
+                    setWorkspaceFileContextMenu(null);
+                    void openWorkspaceFileTab(node);
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <FileText aria-hidden="true" className="size-3.5" />
+                  <span>{t("Open")}</span>
+                </button>
+                <button
+                  className="workspace-chat-context-menu-item"
                   onClick={() => {
                     const { node } = workspaceFileContextMenu;
                     setWorkspaceFileContextMenu(null);
@@ -5638,85 +5913,91 @@ export function App() {
             <section className="app-main-panel flex min-w-0 flex-col">
               <header className="app-toolbar shrink-0 border-b border-stone-200/80 bg-white/80 backdrop-blur">
                 <div className="flex min-w-0 items-center justify-between gap-2">
-                  <ChatTabBar
-                    activeChatId={activeChatId}
-                    activeWorkspaceId={activeWorkspaceId}
-                    onCloseTab={closeChatTab}
-                    onSelectTab={selectWorkspaceChat}
+                  <MainTabBar
+                    activeTab={activeMainTab}
+                    onCloseTab={closeMainTab}
+                    onSelectTab={selectMainTab}
                     runningChatKeys={runningChatKeys}
-                    tabs={chatTabs}
+                    tabs={mainTabs}
                   />
                   <div className="chat-header-actions" />
                 </div>
               </header>
-              <ChatPanel
-                activeWorkspaceName={activeWorkspace?.name ?? null}
-                helpers={chatPanelHelpers}
-                availableModels={availableModels}
-                branchError={branchError}
-                chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
-                canGuideActiveRun={
-                  activeRunInfo?.chatKey === activeChatKey &&
-                  activeRunInfo.runId !== null &&
-                  activeRunInfo.acceptingGuidance
-                }
-                canUseNativePicker={canUseNativePicker}
-                draftAttachments={draftAttachments}
-                draftMessage={draftMessage}
-                gitBranches={gitBranches}
-                contextUsage={contextUsage}
-                isLoadingSettings={isLoadingSettings}
-                isLoadingBranches={isLoadingBranches}
-                isLoadingContextUsage={isLoadingContextUsage}
-                isSendingMessage={isSendingMessage}
-                isSelectingAttachments={isSelectingAttachments}
-                messages={messages}
-                overviewRenderer={() => (
-                  <ApiOverviewPanel
-                    activeWorkspaceId={activeWorkspaceId}
-                    settings={settings}
-                    workspaces={workspaces}
-                  />
-                )}
-                onAddPastedImageAttachments={(files) =>
-                  void handleAddPastedImageAttachments(files)
-                }
-                onBranchChange={(branch) => void handleGitBranchChange(branch)}
-                onDraftMessageChange={setDraftMessage}
-                onGuideQueuedMessage={(messageId) =>
-                  void handleGuideQueuedMessage(messageId)
-                }
-                onSelectAttachments={(files) =>
-                  void handleSelectDraftAttachments(files)
-                }
-                onCancelRun={() => void handleCancelRun()}
-                onGuideActiveRun={() => void handleGuideActiveRun()}
-                onQueueActiveRun={handleQueueActiveRun}
-                onModelChange={handleChatModelChange}
-                onProviderChange={setSelectedProviderId}
-                onRemoveAttachment={handleRemoveDraftAttachment}
-                onRemoveSkill={removeSelectedSkill}
-                onRetryRun={() => void handleRetryRun()}
-                onSubmit={(event, options) =>
-                  void handleSendMessage(event, options)
-                }
-                onThinkingLevelChange={setSelectedThinkingLevel}
-                onToggleSkill={toggleSelectedSkill}
-                onWithdrawQueuedMessage={handleWithdrawQueuedMessage}
-                canRetryRun={retryRunRequest !== null && !isSendingMessage}
-                queuedRunCount={queuedRunRequests.length}
-                queuedMessageIds={queuedMessageIds}
-                selectedGitBranch={selectedGitBranch}
-                selectedModelId={selectedModelId}
-                selectedProviderId={selectedProviderId}
-                selectedSkillIds={selectedSkillIds}
-                selectedThinkingLevel={selectedThinkingLevel}
-                settings={settings}
-                providers={settings?.providers ?? []}
-                skills={detectedSkills}
-                thinkingLevels={thinkingLevels}
-                workspaces={workspaces}
-              />
+              {activeMainTab.type === "file" && activeFileTab ? (
+                <WorkspaceFileEditorPanel
+                  editor={activeFileEditor}
+                  file={activeFileTab}
+                />
+              ) : (
+                <ChatPanel
+                  activeWorkspaceName={activeWorkspace?.name ?? null}
+                  helpers={chatPanelHelpers}
+                  availableModels={availableModels}
+                  branchError={branchError}
+                  chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
+                  canGuideActiveRun={
+                    activeRunInfo?.chatKey === activeChatKey &&
+                    activeRunInfo.runId !== null &&
+                    activeRunInfo.acceptingGuidance
+                  }
+                  canUseNativePicker={canUseNativePicker}
+                  draftAttachments={draftAttachments}
+                  draftMessage={draftMessage}
+                  gitBranches={gitBranches}
+                  contextUsage={contextUsage}
+                  isLoadingSettings={isLoadingSettings}
+                  isLoadingBranches={isLoadingBranches}
+                  isLoadingContextUsage={isLoadingContextUsage}
+                  isSendingMessage={isSendingMessage}
+                  isSelectingAttachments={isSelectingAttachments}
+                  messages={messages}
+                  overviewRenderer={() => (
+                    <ApiOverviewPanel
+                      activeWorkspaceId={activeWorkspaceId}
+                      settings={settings}
+                      workspaces={workspaces}
+                    />
+                  )}
+                  onAddPastedImageAttachments={(files) =>
+                    void handleAddPastedImageAttachments(files)
+                  }
+                  onBranchChange={(branch) => void handleGitBranchChange(branch)}
+                  onDraftMessageChange={setDraftMessage}
+                  onGuideQueuedMessage={(messageId) =>
+                    void handleGuideQueuedMessage(messageId)
+                  }
+                  onSelectAttachments={(files) =>
+                    void handleSelectDraftAttachments(files)
+                  }
+                  onCancelRun={() => void handleCancelRun()}
+                  onGuideActiveRun={() => void handleGuideActiveRun()}
+                  onQueueActiveRun={handleQueueActiveRun}
+                  onModelChange={handleChatModelChange}
+                  onProviderChange={setSelectedProviderId}
+                  onRemoveAttachment={handleRemoveDraftAttachment}
+                  onRemoveSkill={removeSelectedSkill}
+                  onRetryRun={() => void handleRetryRun()}
+                  onSubmit={(event, options) =>
+                    void handleSendMessage(event, options)
+                  }
+                  onThinkingLevelChange={setSelectedThinkingLevel}
+                  onToggleSkill={toggleSelectedSkill}
+                  onWithdrawQueuedMessage={handleWithdrawQueuedMessage}
+                  canRetryRun={retryRunRequest !== null && !isSendingMessage}
+                  queuedRunCount={queuedRunRequests.length}
+                  queuedMessageIds={queuedMessageIds}
+                  selectedGitBranch={selectedGitBranch}
+                  selectedModelId={selectedModelId}
+                  selectedProviderId={selectedProviderId}
+                  selectedSkillIds={selectedSkillIds}
+                  selectedThinkingLevel={selectedThinkingLevel}
+                  settings={settings}
+                  providers={settings?.providers ?? []}
+                  skills={detectedSkills}
+                  thinkingLevels={thinkingLevels}
+                  workspaces={workspaces}
+                />
+              )}
               {isTerminalOpen ? (
                 <TerminalPanel
                   errorMessage={errorMessage}
@@ -5830,6 +6111,7 @@ export function App() {
                         return next;
                       });
                     }}
+                    onOpenWorkspaceFile={(node) => void openWorkspaceFileTab(node)}
                     onOpenWorkspaceFileMenu={(event, node) => {
                       event.preventDefault();
                       setWorkspaceFileContextMenu({
@@ -6276,20 +6558,18 @@ function QuestionDialog({
   );
 }
 
-function ChatTabBar({
-  activeChatId,
-  activeWorkspaceId,
+function MainTabBar({
+  activeTab,
   onCloseTab,
   onSelectTab,
   runningChatKeys,
   tabs,
 }: {
-  activeChatId: string | null;
-  activeWorkspaceId: string;
-  onCloseTab: (workspaceId: string, chatId: string) => void;
-  onSelectTab: (workspaceId: string, chatId: string) => void;
+  activeTab: ActiveMainTab;
+  onCloseTab: (tab: MainTabSummary) => void;
+  onSelectTab: (tab: MainTabSummary) => void;
   runningChatKeys: Set<string>;
-  tabs: ChatTabSummary[];
+  tabs: MainTabSummary[];
 }) {
   const { t } = useI18n();
   const tabsContainerRef = useRef<HTMLDivElement>(null);
@@ -6432,12 +6712,12 @@ function ChatTabBar({
       >
         {tabs.length ? (
           tabs.map((tab) => {
-            const isActive =
-              activeWorkspaceId === tab.workspaceId && activeChatId === tab.chatId;
-            const isRunning = runningChatKeys.has(
-              chatRunKey(tab.workspaceId, tab.chatId),
-            );
-            const title = tab.title || t("Chat");
+            const isActive = mainTabMatches(activeTab, tab);
+            const isRunning =
+              tab.type === "chat" &&
+              runningChatKeys.has(chatRunKey(tab.workspaceId, tab.chatId));
+            const title = tab.title || t(tab.type === "chat" ? "Chat" : "Files");
+            const key = mainTabKey(tab);
 
             return (
               <div
@@ -6445,18 +6725,21 @@ function ChatTabBar({
                     ? "border-teal-200 bg-white text-stone-950 shadow-sm"
                     : "border-stone-200 bg-stone-50/80 text-stone-600 hover:border-stone-300 hover:bg-white"
                   }`}
-                key={chatRunKey(tab.workspaceId, tab.chatId)}
+                key={key}
               >
                 <button
                   aria-selected={isActive}
                   className="min-w-0 flex-1 text-left"
-                  onClick={() => onSelectTab(tab.workspaceId, tab.chatId)}
+                  onClick={() => onSelectTab(tab)}
                   role="tab"
                   title={title}
                   type="button"
                 >
-                  <span className="block truncate text-sm font-semibold leading-5">
-                    {title}
+                  <span className="flex min-w-0 items-center gap-1.5 truncate text-sm font-semibold leading-5">
+                    {tab.type === "file" ? (
+                      <FileText aria-hidden="true" className="size-3.5 shrink-0 text-slate-500" />
+                    ) : null}
+                    <span className="min-w-0 truncate">{title}</span>
                   </span>
                   <span className="flex min-w-0 items-center gap-1 text-[11px] font-medium leading-4 text-stone-400">
                     <WorkspaceIcon
@@ -6479,7 +6762,7 @@ function ChatTabBar({
                     <button
                       aria-label={t("Close chat tab {title}", { title })}
                       className="inline-flex size-7 items-center justify-center rounded-md text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
-                      onClick={() => onCloseTab(tab.workspaceId, tab.chatId)}
+                      onClick={() => onCloseTab(tab)}
                       title={t("Close")}
                       type="button"
                     >
@@ -8071,6 +8354,7 @@ function ContextPanel({
   onRenameWorkspaceFile,
   onDeleteWorkspaceFile,
   onToggleFileTreePath,
+  onOpenWorkspaceFile,
   onOpenWorkspaceFileMenu,
   onSelectDiffFile,
   onTabChange,
@@ -8110,6 +8394,7 @@ function ContextPanel({
   onRenameWorkspaceFile: (path: string, newName: string) => void;
   onDeleteWorkspaceFile: (path: string) => void;
   onToggleFileTreePath: (path: string) => void;
+  onOpenWorkspaceFile: (node: WorkspaceFileTreeNode) => void;
   onOpenWorkspaceFileMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
   onSelectDiffFile: (path: string | null) => void;
   onTabChange: (tab: ContextPanelTab) => void;
@@ -8168,6 +8453,7 @@ function ContextPanel({
             isLoading={isLoadingWorkspaceFiles}
             operationKey={workspaceFileOperationKey}
             onDeleteFile={onDeleteWorkspaceFile}
+            onOpenFile={onOpenWorkspaceFile}
             onOpenContextMenu={onOpenWorkspaceFileMenu}
             onRefresh={onRefreshWorkspaceFiles}
             onRenameFile={onRenameWorkspaceFile}
@@ -8220,12 +8506,115 @@ function ContextPanel({
   );
 }
 
+function WorkspaceFileEditorPanel({
+  editor,
+  file,
+}: {
+  editor: WorkspaceFileEditorState | null;
+  file: OpenFileTab;
+}) {
+  const { t } = useI18n();
+  const language = monacoLanguageForPath(file.path);
+
+  return (
+    <section className="workspace-file-editor flex min-h-0 flex-1 flex-col">
+      <header className="workspace-file-editor-header">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-700">
+            <FileText aria-hidden="true" className="size-5" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold text-stone-950">{file.name}</h2>
+            <p className="truncate text-xs font-medium text-stone-500">{file.path}</p>
+          </div>
+        </div>
+        {editor?.isLoading ? (
+          <span className="inline-flex items-center gap-2 text-xs font-medium text-stone-500">
+            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+            {t("Loading...")}
+          </span>
+        ) : null}
+      </header>
+      {editor?.error ? (
+        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {editor.error}
+        </div>
+      ) : null}
+      <div className="workspace-file-editor-body">
+        <MonacoFileEditor
+          language={language}
+          path={`${file.workspaceId}/${file.path}`}
+          value={editor?.content ?? ""}
+        />
+      </div>
+    </section>
+  );
+}
+
+function MonacoFileEditor({
+  language,
+  path,
+  value,
+}: {
+  language: string;
+  path: string;
+  value: string;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
+  const modelRef = useRef<monaco.editor.ITextModel | null>(null);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return undefined;
+    }
+
+    const model = monaco.editor.createModel(
+      value,
+      language,
+      monaco.Uri.parse(`file:///${path}`),
+    );
+    const editor = monaco.editor.create(container, {
+      automaticLayout: true,
+      fontSize: 13,
+      language,
+      minimap: { enabled: true },
+      model,
+      readOnly: true,
+      scrollBeyondLastLine: false,
+      theme: "vs",
+      wordWrap: "off",
+    });
+    editorRef.current = editor;
+    modelRef.current = model;
+
+    return () => {
+      editor.dispose();
+      model.dispose();
+      editorRef.current = null;
+      modelRef.current = null;
+    };
+  }, [language, path]);
+
+  useEffect(() => {
+    const model = modelRef.current;
+    if (!model || model.getValue() === value) {
+      return;
+    }
+    model.setValue(value);
+  }, [value]);
+
+  return <div className="workspace-file-monaco" ref={containerRef} />;
+}
+
 function WorkspaceFilesTab({
   error,
   expandedPaths,
   isLoading,
   operationKey,
   onDeleteFile,
+  onOpenFile,
   onOpenContextMenu,
   onRefresh,
   onRenameFile,
@@ -8237,6 +8626,7 @@ function WorkspaceFilesTab({
   isLoading: boolean;
   operationKey: string | null;
   onDeleteFile: (path: string) => void;
+  onOpenFile: (node: WorkspaceFileTreeNode) => void;
   onOpenContextMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
   onRefresh: () => void;
   onRenameFile: (path: string, newName: string) => void;
@@ -8285,6 +8675,7 @@ function WorkspaceFilesTab({
               expandedPaths={expandedPaths}
               node={response.root}
               onDeleteFile={onDeleteFile}
+              onOpenFile={onOpenFile}
               onOpenContextMenu={onOpenContextMenu}
               onRenameFile={onRenameFile}
               onTogglePath={onTogglePath}
@@ -8306,6 +8697,7 @@ function WorkspaceFileTreeNodeRow({
   expandedPaths,
   node,
   onDeleteFile,
+  onOpenFile,
   onOpenContextMenu,
   onRenameFile,
   onTogglePath,
@@ -8315,6 +8707,7 @@ function WorkspaceFileTreeNodeRow({
   expandedPaths: Set<string>;
   node: WorkspaceFileTreeNode;
   onDeleteFile: (path: string) => void;
+  onOpenFile: (node: WorkspaceFileTreeNode) => void;
   onOpenContextMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
   onRenameFile: (path: string, newName: string) => void;
   onTogglePath: (path: string) => void;
@@ -8334,6 +8727,13 @@ function WorkspaceFileTreeNodeRow({
           if (node.path) {
             onOpenContextMenu(event, node);
           }
+        }}
+        onDoubleClick={() => {
+          if (isDirectory) {
+            onTogglePath(node.path);
+            return;
+          }
+          onOpenFile(node);
         }}
         role="treeitem"
         style={{ paddingLeft: `${depth * 0.875 + 0.25}rem` }}
@@ -8413,6 +8813,7 @@ function WorkspaceFileTreeNodeRow({
             key={child.path || child.name}
             node={child}
             onDeleteFile={onDeleteFile}
+            onOpenFile={onOpenFile}
             onOpenContextMenu={onOpenContextMenu}
             onRenameFile={onRenameFile}
             onTogglePath={onTogglePath}
@@ -16607,6 +17008,87 @@ function upsertOpenChatTab(tabs: OpenChatTab[], nextTab: OpenChatTab) {
   }
 
   return [...tabs, nextTab];
+}
+
+function upsertOpenFileTab(tabs: OpenFileTab[], nextTab: OpenFileTab) {
+  if (
+    tabs.some(
+      (tab) => tab.workspaceId === nextTab.workspaceId && tab.path === nextTab.path,
+    )
+  ) {
+    return tabs;
+  }
+
+  return [...tabs, nextTab];
+}
+
+function mainTabKey(tab: MainTabSummary) {
+  return tab.type === "chat"
+    ? `chat:${chatRunKey(tab.workspaceId, tab.chatId)}`
+    : workspaceFileEditorKey(tab.workspaceId, tab.path);
+}
+
+function mainTabMatches(activeTab: ActiveMainTab, tab: MainTabSummary) {
+  if (activeTab.type !== tab.type || activeTab.workspaceId !== tab.workspaceId) {
+    return false;
+  }
+
+  if (tab.type === "chat") {
+    return activeTab.type === "chat" && activeTab.chatId === tab.chatId;
+  }
+
+  return activeTab.type === "file" && activeTab.path === tab.path;
+}
+
+function workspaceFileEditorKey(workspaceId: string, path: string) {
+  return `${workspaceId}:${path}`;
+}
+
+function workspaceRenamedFilePath(path: string, newName: string) {
+  const separatorIndex = path.lastIndexOf("/");
+  return separatorIndex < 0
+    ? newName
+    : `${path.slice(0, separatorIndex + 1)}${newName}`;
+}
+
+function monacoLanguageForPath(path: string) {
+  const extension = path.split(".").pop()?.toLowerCase() ?? "";
+  const languageByExtension: Record<string, string> = {
+    c: "c",
+    cc: "cpp",
+    cpp: "cpp",
+    cs: "csharp",
+    css: "css",
+    go: "go",
+    h: "cpp",
+    hpp: "cpp",
+    html: "html",
+    java: "java",
+    js: "javascript",
+    json: "json",
+    jsx: "javascript",
+    kt: "kotlin",
+    less: "less",
+    lua: "lua",
+    md: "markdown",
+    php: "php",
+    py: "python",
+    rb: "ruby",
+    rs: "rust",
+    sass: "scss",
+    scss: "scss",
+    sh: "shell",
+    sql: "sql",
+    swift: "swift",
+    toml: "toml",
+    ts: "typescript",
+    tsx: "typescript",
+    xml: "xml",
+    yaml: "yaml",
+    yml: "yaml",
+  };
+
+  return languageByExtension[extension] ?? "plaintext";
 }
 
 function workspaceHasChat(

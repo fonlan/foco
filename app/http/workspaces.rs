@@ -60,6 +60,41 @@ pub(crate) async fn delete_workspace_file(
     }))
 }
 
+pub(crate) async fn workspace_file_content(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<WorkspaceFileRequest>,
+) -> Result<Json<WorkspaceFileContentResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let path = workspace_file_path(&workspace.path, &request.path)?;
+    let metadata = fs::metadata(&path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "workspace file was not found: {}: {}",
+            request.path, source
+        ))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "workspace path is not a file: {}",
+            request.path
+        )));
+    }
+
+    let content = fs::read_to_string(&path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read workspace file {} as UTF-8 text: {}",
+            request.path, source
+        ))
+    })?;
+
+    Ok(Json(WorkspaceFileContentResponse {
+        content,
+        path: request.path,
+    }))
+}
+
 pub(crate) async fn rename_workspace_file(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
