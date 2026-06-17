@@ -15,6 +15,7 @@ import {
   deferred,
   enqueueChatStreamEvent,
   enqueueChatStreamEventForRun,
+  generatedGitDiff,
   jsonResponse,
   memoryExtractionJob,
   memorySource,
@@ -33,6 +34,26 @@ import {
 describe("app-panels-stats verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
+  it("shows git file names before muted directories in the diff panel", async () => {
+    appTestState.workspaceGitDiffResponse = generatedGitDiff;
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Git" }));
+
+    const appRow = await screen.findByRole("button", { name: /web\/App\.tsx M/ });
+    const appFileName = within(appRow).getByText("App.tsx");
+    const appDirectory = within(appRow).getByText("web");
+
+    expect(appFileName.compareDocumentPosition(appDirectory)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(appFileName).toHaveClass("text-stone-900");
+    expect(appDirectory).toHaveClass("text-stone-400");
+    expect(within(appRow).queryByText("web/App.tsx")).not.toBeInTheDocument();
+  });
+
   it("toggles the context panel and opens the terminal panel for the active workspace", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
@@ -43,13 +64,13 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Open context panel" }));
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
-    expect(await screen.findByText("README.md")).toBeInTheDocument();
+    expect(await screen.findAllByRole("button", { name: /README\.md M/ })).toHaveLength(2);
     expect(screen.queryByText(/hello world/)).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: /README\.md M/ }));
+    await userEvent.click(screen.getAllByRole("button", { name: /README\.md M/ })[0]);
 
-    expect(await screen.findByText(/hello world/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /new-note\.txt U/ })).toBeInTheDocument();
+    expect((await screen.findAllByText(/hello world/))[0]).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /new-note\.txt U/ })).toHaveLength(2);
 
     await userEvent.click(screen.getByRole("button", { name: "Open terminal" }));
 
@@ -181,15 +202,15 @@ describe("app-panels-stats verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
-    expect(screen.getByText("Git diff")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /README\.md M/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /new-note\.txt U/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /asset\.bin M/ })).toBeInTheDocument();
+    expect(screen.getByText("Source Control")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /README\.md M/ })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: /new-note\.txt U/ })).toHaveLength(2);
+    expect(screen.getAllByRole("button", { name: /asset\.bin M/ }).length).toBeGreaterThan(0);
     expect(screen.queryByText(/hello world/)).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: /README\.md M/ }));
+    await userEvent.click(screen.getAllByRole("button", { name: /README\.md M/ })[0]);
 
-    const inlineDiffLine = await screen.findByText(/hello world/);
+    const inlineDiffLine = (await screen.findAllByText(/hello world/))[0];
     expect(inlineDiffLine).toBeInTheDocument();
     const inlineDiffScrollRegion = inlineDiffLine.closest(
       ".panel-scroll",

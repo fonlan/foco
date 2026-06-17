@@ -8775,6 +8775,7 @@ function GitFileRow({
   const discardKey = `discard:${file.path}`;
   const isActionLoading = gitOperationKey === actionKey;
   const isDiscardLoading = gitOperationKey === discardKey;
+  const pathParts = gitFilePathParts(file.path);
 
   return (
     <div>
@@ -8790,8 +8791,15 @@ function GitFileRow({
           ) : (
             <ChevronRight aria-hidden="true" className="size-3.5 shrink-0" />
           )}
-          <span className="min-w-0 flex-1 truncate text-left text-[13px]">
-            {file.path}
+          <span className="flex min-w-0 flex-1 items-baseline gap-1.5 text-left">
+            <span className="min-w-0 truncate text-[13px] font-medium text-stone-900">
+              {pathParts.name}
+            </span>
+            {pathParts.directory ? (
+              <span className="shrink truncate text-xs text-stone-400">
+                {pathParts.directory}
+              </span>
+            ) : null}
           </span>
         </button>
         <span className={gitStatusBadgeClass(label)}>{label}</span>
@@ -16125,6 +16133,18 @@ function diffFileButtonClass(active: boolean) {
       ? "diff-file-button-active bg-teal-50 text-teal-950 shadow-sm"
       : "text-stone-700 hover:bg-stone-50 hover:text-stone-950"
     }`;
+}
+
+function gitFilePathParts(path: string) {
+  const separatorIndex = path.lastIndexOf("/");
+  if (separatorIndex === -1) {
+    return { directory: "", name: path };
+  }
+
+  return {
+    directory: path.slice(0, separatorIndex),
+    name: path.slice(separatorIndex + 1),
+  };
 }
 
 function settingsSectionTitle(section: SettingsSection, t: Translate) {
