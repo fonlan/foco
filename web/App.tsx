@@ -177,6 +177,9 @@ import type {
   PromptSettingsFormState,
   PromptSettingsSummary,
   ProviderFormState,
+  ProviderRequestOverrideFormState,
+  ProviderRequestOverrideTarget,
+  ProviderRequestOverrideValueType,
   ProviderTestResponse,
   ProviderTestState,
   QueueChatMessageResponse,
@@ -266,7 +269,7 @@ import { WorkspaceDialog } from "./features/workspaces/WorkspaceDialog";
 import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
-import { errorMessage, requestJson, responseErrorMessage } from "./api/client";
+import { errorMessage, requestJson, responseErrorMessage } from "./shared/api-client";
 import {
   readAiStatsVisibleColumnIds,
   writeAiStatsVisibleColumnIds,
@@ -8978,6 +8981,15 @@ function SettingsPanel({
       id: provider.id,
       kind: provider.kind,
       name: provider.name,
+      requestOverrides: provider.requestOverrides.map((overrideRule) => ({
+        target: overrideRule.target,
+        name: overrideRule.name,
+        valueType: overrideRule.valueType,
+        value:
+          overrideRule.valueType === "boolean"
+            ? Boolean(overrideRule.value)
+            : String(overrideRule.value),
+      })),
     });
     setIsProviderDialogOpen(true);
   }
@@ -10149,6 +10161,50 @@ function SettingsPanel({
     setWorkspaceOrderPreview(null);
   }
 
+  function addProviderRequestOverride() {
+    setProviderForm((current) => ({
+      ...current,
+      requestOverrides: [
+        ...current.requestOverrides,
+        emptyProviderRequestOverride(),
+      ],
+    }));
+  }
+
+  function updateProviderRequestOverride(
+    index: number,
+    patch: Partial<ProviderRequestOverrideFormState>,
+  ) {
+    setProviderForm((current) => ({
+      ...current,
+      requestOverrides: current.requestOverrides.map((overrideRule, overrideIndex) => {
+        if (overrideIndex !== index) {
+          return overrideRule;
+        }
+
+        const nextRule = { ...overrideRule, ...patch };
+        if (patch.valueType === "boolean" && typeof nextRule.value !== "boolean") {
+          nextRule.value = true;
+        } else if (patch.valueType === "string" && typeof nextRule.value !== "string") {
+          nextRule.value = String(nextRule.value);
+        } else if (patch.valueType === "number" && typeof nextRule.value !== "number") {
+          nextRule.value = "";
+        }
+
+        return nextRule;
+      }),
+    }));
+  }
+
+  function deleteProviderRequestOverride(index: number) {
+    setProviderForm((current) => ({
+      ...current,
+      requestOverrides: current.requestOverrides.filter(
+        (_overrideRule, overrideIndex) => overrideIndex !== index,
+      ),
+    }));
+  }
+
   async function saveProvider(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsSavingProvider(true);
@@ -10173,6 +10229,13 @@ function SettingsPanel({
               nextProviderId(providerForm.name, providerForm.kind, providers),
             kind: providerForm.kind,
             name: providerForm.name,
+            requestOverrides: providerForm.requestOverrides.map((overrideRule) => ({
+              ...overrideRule,
+              value:
+                overrideRule.valueType === "number"
+                  ? Number(overrideRule.value)
+                  : overrideRule.value,
+            })),
           }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
@@ -13982,7 +14045,7 @@ function SettingsPanel({
                   <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
                   <form
                     aria-label={t("Provider configuration")}
-                    className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] w-[min(96vw,58rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
                     onSubmit={(event) => void saveProvider(event)}
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
@@ -14201,13 +14264,145 @@ function SettingsPanel({
                           </div>
                         </div>
                       </div>
+                      <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-2">
+                            <SlidersHorizontal aria-hidden="true" className="size-4 text-teal-700" />
+                            <h4 className="text-sm font-semibold text-stone-950">
+                              {t("Request overrides")}
+                            </h4>
+                          </div>
+                          <button
+                            className="inline-flex h-8 items-center gap-1 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            onClick={addProviderRequestOverride}
+                            type="button"
+                          >
+                            <Plus aria-hidden="true" className="size-3.5" />
+                            {t("Add override")}
+                          </button>
+                        </div>
+                        <p className="mt-2 text-xs leading-5 text-stone-500">
+                          {t("Override top-level request headers or body fields for this provider.")}
+                        </p>
+                        <div className="mt-3 space-y-3">
+                          {providerForm.requestOverrides.length ? (
+                            providerForm.requestOverrides.map((overrideRule, overrideIndex) => (
+                              <div
+                                className="rounded-lg border border-stone-200 bg-white p-3"
+                                key={overrideIndex}
+                              >
+                                <div className="grid gap-3 lg:grid-cols-[7rem_minmax(0,1fr)_8rem_minmax(0,1fr)_2.5rem]">
+                                  <label className="block">
+                                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                      {t("Target")}
+                                    </span>
+                                    <select
+                                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                      onChange={(event) =>
+                                        updateProviderRequestOverride(overrideIndex, {
+                                          target: event.target.value as ProviderRequestOverrideTarget,
+                                        })
+                                      }
+                                      value={overrideRule.target}
+                                    >
+                                      <option value="header">{t("Header")}</option>
+                                      <option value="body">{t("Body")}</option>
+                                    </select>
+                                  </label>
+                                  <TextField
+                                    label={t("Field")}
+                                    onChange={(value) =>
+                                      updateProviderRequestOverride(overrideIndex, { name: value })
+                                    }
+                                    placeholder={overrideRule.target === "header" ? "User-Agent" : "model"}
+                                    value={overrideRule.name}
+                                  />
+                                  <label className="block">
+                                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                      {t("Value type")}
+                                    </span>
+                                    <select
+                                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                      onChange={(event) =>
+                                        updateProviderRequestOverride(overrideIndex, {
+                                          valueType: event.target.value as ProviderRequestOverrideValueType,
+                                        })
+                                      }
+                                      value={overrideRule.valueType}
+                                    >
+                                      <option value="string">{t("String")}</option>
+                                      <option value="number">{t("Number")}</option>
+                                      <option value="boolean">{t("Boolean")}</option>
+                                    </select>
+                                  </label>
+                                  {overrideRule.valueType === "boolean" ? (
+                                    <label className="block">
+                                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                        {t("Value")}
+                                      </span>
+                                      <select
+                                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                        onChange={(event) =>
+                                          updateProviderRequestOverride(overrideIndex, {
+                                            value: event.target.value === "true",
+                                          })
+                                        }
+                                        value={overrideRule.value ? "true" : "false"}
+                                      >
+                                        <option value="true">true</option>
+                                        <option value="false">false</option>
+                                      </select>
+                                    </label>
+                                  ) : (
+                                    <TextField
+                                      label={t("Value")}
+                                      onChange={(value) =>
+                                        updateProviderRequestOverride(overrideIndex, { value })
+                                      }
+                                      placeholder={
+                                        overrideRule.valueType === "number"
+                                          ? "1"
+                                          : overrideRule.target === "header"
+                                            ? "Foco/1.0"
+                                            : "gpt-4.1"
+                                      }
+                                      value={String(overrideRule.value)}
+                                    />
+                                  )}
+                                  <button
+                                    aria-label={t("Delete override")}
+                                    className="mt-6 inline-flex size-10 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 hover:bg-rose-50"
+                                    onClick={() => deleteProviderRequestOverride(overrideIndex)}
+                                    title={t("Delete override")}
+                                    type="button"
+                                  >
+                                    <Trash2 aria-hidden="true" className="size-4" />
+                                  </button>
+                                </div>
+                              </div>
+                            ))
+                          ) : (
+                            <p className="rounded-lg border border-dashed border-stone-300 bg-white px-3 py-3 text-xs text-stone-500">
+                              {t("No request overrides configured.")}
+                            </p>
+                          )}
+                        </div>
+                      </div>
                       <button
                         aria-label={t("Save provider")}
                         className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
                         disabled={
                           isSavingProvider ||
                           !providerForm.name.trim() ||
-                          !providerForm.kind.trim()
+                          !providerForm.kind.trim() ||
+                          providerForm.requestOverrides.some(
+                            (overrideRule) =>
+                              !overrideRule.name.trim() ||
+                              (overrideRule.valueType !== "boolean" &&
+                                String(overrideRule.value).trim() === "") ||
+                              (overrideRule.valueType === "number" &&
+                                Number.isNaN(Number(overrideRule.value))),
+                          )
                         }
                         title={t("Save provider")}
                         type="submit"
@@ -15678,6 +15873,15 @@ function memoryStatusLabel(status: string, t: Translate) {
   }
 }
 
+function emptyProviderRequestOverride(): ProviderRequestOverrideFormState {
+  return {
+    target: "header",
+    name: "",
+    valueType: "string",
+    value: "",
+  };
+}
+
 function CapabilityPill({
   className,
   label,
@@ -15748,6 +15952,7 @@ function emptyProviderForm(): ProviderFormState {
     id: "",
     kind: "",
     name: "",
+    requestOverrides: [],
   };
 }
 

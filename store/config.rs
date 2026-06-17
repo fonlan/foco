@@ -7,8 +7,8 @@ use std::{
 
 use foco_mcp::{McpServerDefinition, McpTransportKind, validate_server_definitions};
 use foco_providers::{
-    HTTP_PROXY_KIND, SOCKS_PROXY_KIND, normalized_base_url, normalized_proxy_url,
-    parse_provider_kind,
+    HTTP_PROXY_KIND, ProviderRequestOverride, SOCKS_PROXY_KIND, normalized_base_url,
+    normalized_proxy_url, parse_provider_kind,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -428,6 +428,14 @@ impl GlobalConfig {
                 })?;
             }
             validate_api_proxy_settings(config_path, "provider.api_proxy", &provider.api_proxy)?;
+            for request_override in &provider.request_overrides {
+                request_override
+                    .validate()
+                    .map_err(|source| ConfigError::Validation {
+                        path: config_path.map(Path::to_path_buf),
+                        message: source.to_string(),
+                    })?;
+            }
         }
 
         validate_unique_named_items(
@@ -914,6 +922,8 @@ pub struct ProviderSettings {
     pub enabled: bool,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub request_overrides: Vec<ProviderRequestOverride>,
     #[serde(default)]
     pub api_proxy: ApiProxySettings,
 }
@@ -2081,6 +2091,7 @@ mod tests {
             enabled: true,
             base_url: None,
             api_key: None,
+            request_overrides: Vec::new(),
             api_proxy: ApiProxySettings {
                 enabled: true,
                 proxy_type: HTTP_PROXY_KIND.to_string(),
@@ -2358,6 +2369,7 @@ mod tests {
             enabled: true,
             base_url: None,
             api_key: Some("sk-test-secret".to_string()),
+            request_overrides: Vec::new(),
             api_proxy: ApiProxySettings::default(),
         });
 

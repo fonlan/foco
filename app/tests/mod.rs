@@ -45,6 +45,7 @@ fn test_prepared_chat_context(
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
+            request_overrides: Vec::new(),
         },
         provider_request: NeutralChatRequest {
             model_id: "gpt-5.4".to_string(),
@@ -307,6 +308,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
+            request_overrides: Vec::new(),
         },
         &WebSearchSettings::default(),
         QuestionRegistry::default(),
@@ -2400,6 +2402,7 @@ fn persist_chat_result_writes_audit_status_code() {
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
+            request_overrides: Vec::new(),
         },
         provider_request: NeutralChatRequest {
             model_id: "gpt-5.4".to_string(),
@@ -2560,6 +2563,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
+            request_overrides: Vec::new(),
         },
         provider_request: NeutralChatRequest {
             model_id: "gpt-5.4".to_string(),
@@ -2801,6 +2805,7 @@ fn persist_failed_chat_result_keeps_tool_calls_without_assistant_message() {
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
+            request_overrides: Vec::new(),
         },
         provider_request: NeutralChatRequest {
             model_id: "gpt-5.4".to_string(),
@@ -4335,6 +4340,7 @@ Search memory before repo work.
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -4579,6 +4585,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -4690,6 +4697,7 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -4777,6 +4785,7 @@ Use the existing product UI conventions.
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -4857,6 +4866,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -4941,6 +4951,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -5131,6 +5142,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -5227,6 +5239,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -5337,6 +5350,7 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -5541,6 +5555,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -5667,6 +5682,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -5865,6 +5881,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -6003,6 +6020,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -6151,6 +6169,7 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {
@@ -6579,6 +6598,7 @@ fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
         enabled: true,
         base_url: None,
         api_key: None,
+        request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
     config.models.push(ModelSettings {

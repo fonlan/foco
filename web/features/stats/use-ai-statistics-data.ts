@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { errorMessage, requestJson } from "../../api/client";
+import { errorMessage, requestJson } from "../../shared/api-client";
 import type {
   AiRequestAuditSummary,
   AiRequestDetailResponse,

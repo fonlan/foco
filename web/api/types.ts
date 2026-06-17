@@ -622,6 +622,24 @@ export type ApiProxySettingsSummary = {
   url: string;
 };
 
+export type ProviderRequestOverrideValueType = "boolean" | "number" | "string";
+
+export type ProviderRequestOverrideTarget = "body" | "header";
+
+export type ProviderRequestOverride = {
+  target: ProviderRequestOverrideTarget;
+  name: string;
+  valueType: ProviderRequestOverrideValueType;
+  value: boolean | number | string;
+};
+
+export type ProviderRequestOverrideFormState = {
+  target: ProviderRequestOverrideTarget;
+  name: string;
+  valueType: ProviderRequestOverrideValueType;
+  value: boolean | string;
+};
+
 export type ConfiguredProviderSummary = {
   apiProxy: ApiProxySettingsSummary;
   id: string;
@@ -631,6 +649,7 @@ export type ConfiguredProviderSummary = {
   enabled: boolean;
   baseUrl: string | null;
   hasApiKey: boolean;
+  requestOverrides: ProviderRequestOverride[];
   warnings: string[];
 };
 
@@ -645,6 +664,7 @@ export type ProviderFormState = {
   id: string;
   kind: string;
   name: string;
+  requestOverrides: ProviderRequestOverrideFormState[];
 };
 
 export type ProviderTestResponse = {

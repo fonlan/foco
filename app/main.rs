@@ -37,7 +37,7 @@ use foco_providers::{
     DEFAULT_OPENAI_BASE_URL, NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest,
     NeutralChatRole, NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
     OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig,
-    normalized_proxy_url, parse_provider_kind, stream_chat,
+    ProviderRequestOverride, normalized_proxy_url, parse_provider_kind, stream_chat,
 };
 use foco_store::{
     config::{
@@ -1418,6 +1418,7 @@ struct ManualProviderRequest {
     base_url: Option<String>,
     api_key: Option<String>,
     clear_api_key: Option<bool>,
+    request_overrides: Vec<ProviderRequestOverride>,
 }
 
 #[derive(Deserialize)]
@@ -1918,6 +1919,7 @@ struct ConfiguredProviderSummary {
     enabled: bool,
     base_url: Option<String>,
     has_api_key: bool,
+    request_overrides: Vec<ProviderRequestOverride>,
     warnings: Vec<String>,
 }
 
@@ -9248,6 +9250,7 @@ fn configured_provider_summary(provider: &ProviderSettings) -> ConfiguredProvide
             .as_deref()
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false),
+        request_overrides: provider.request_overrides.clone(),
         warnings: provider_warnings(provider),
     }
 }
@@ -10328,6 +10331,7 @@ fn provider_connection_config(
             .api_proxy
             .enabled
             .then(|| provider.api_proxy.url.clone()),
+        request_overrides: provider.request_overrides.clone(),
     })
 }
 

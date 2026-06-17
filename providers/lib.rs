@@ -2,7 +2,7 @@ use std::fmt;
 
 use futures_util::StreamExt;
 use genai::{
-    Client, WebConfig,
+    Client, Headers, WebConfig,
     adapter::AdapterKind,
     chat::{
         CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart,
@@ -13,6 +13,7 @@ use genai::{
 };
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
 pub const OPENAI_RESPONSES_KIND: &str = "openai-responses";
@@ -49,12 +50,102 @@ impl ProviderKind {
     }
 }
 
+const REQUEST_OVERRIDE_TARGET_HEADER: &str = "header";
+const REQUEST_OVERRIDE_TARGET_BODY: &str = "body";
+const REQUEST_OVERRIDE_VALUE_TYPE_STRING: &str = "string";
+const REQUEST_OVERRIDE_VALUE_TYPE_NUMBER: &str = "number";
+const REQUEST_OVERRIDE_VALUE_TYPE_BOOLEAN: &str = "boolean";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderRequestOverride {
+    pub target: String,
+    pub name: String,
+    pub value_type: String,
+    pub value: Value,
+}
+
+impl Eq for ProviderRequestOverride {}
+
+impl ProviderRequestOverride {
+    pub fn validate(&self) -> Result<(), ProviderConfigError> {
+        self.normalized_target()?;
+        self.normalized_name()?;
+        self.normalized_value()?;
+        Ok(())
+    }
+
+    fn normalized_target(&self) -> Result<&str, ProviderConfigError> {
+        let target = self.target.trim();
+
+        match target {
+            REQUEST_OVERRIDE_TARGET_HEADER | REQUEST_OVERRIDE_TARGET_BODY => Ok(target),
+            _ => Err(ProviderConfigError::InvalidRequest(format!(
+                "request override target must be '{REQUEST_OVERRIDE_TARGET_HEADER}' or '{REQUEST_OVERRIDE_TARGET_BODY}': {target}"
+            ))),
+        }
+    }
+
+    fn normalized_name(&self) -> Result<&str, ProviderConfigError> {
+        let name = self.name.trim();
+
+        if name.is_empty() {
+            return Err(ProviderConfigError::InvalidRequest(
+                "request override name must not be empty".to_string(),
+            ));
+        }
+
+        Ok(name)
+    }
+
+    fn normalized_value(&self) -> Result<Value, ProviderConfigError> {
+        let value_type = self.value_type.trim();
+
+        match value_type {
+            REQUEST_OVERRIDE_VALUE_TYPE_STRING => self
+                .value
+                .as_str()
+                .map(|value| Value::String(value.to_string()))
+                .ok_or_else(|| {
+                    ProviderConfigError::InvalidRequest(format!(
+                        "request override '{}' value must be a string",
+                        self.name
+                    ))
+                }),
+            REQUEST_OVERRIDE_VALUE_TYPE_NUMBER => {
+                if self.value.is_number() {
+                    Ok(self.value.clone())
+                } else {
+                    Err(ProviderConfigError::InvalidRequest(format!(
+                        "request override '{}' value must be a number",
+                        self.name
+                    )))
+                }
+            }
+            REQUEST_OVERRIDE_VALUE_TYPE_BOOLEAN => self
+                .value
+                .as_bool()
+                .map(Value::Bool)
+                .ok_or_else(|| {
+                    ProviderConfigError::InvalidRequest(format!(
+                        "request override '{}' value must be a boolean",
+                        self.name
+                    ))
+                }),
+            _ => Err(ProviderConfigError::InvalidRequest(format!(
+                "request override value type must be '{REQUEST_OVERRIDE_VALUE_TYPE_STRING}', '{REQUEST_OVERRIDE_VALUE_TYPE_NUMBER}', or '{REQUEST_OVERRIDE_VALUE_TYPE_BOOLEAN}': {value_type}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderConnectionConfig {
     pub kind: ProviderKind,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub proxy_url: Option<String>,
+    pub request_overrides: Vec<ProviderRequestOverride>,
 }
 impl ProviderConnectionConfig {
     fn provider_error_context(
@@ -317,7 +408,7 @@ pub async fn stream_chat(
     let chat_request = genai_chat_request(&request)?;
     let error_context =
         config.provider_error_context("opening provider stream", &request.model_id)?;
-    let options = genai_chat_options(&request)?;
+    let options = genai_chat_options(config, &request)?;
     let model = genai::ModelIden::new(config.kind.adapter_kind(), request.model_id.clone());
     let response = client
         .exec_chat_stream(model, chat_request, Some(&options))
@@ -614,7 +705,10 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
     }
 }
 
-fn genai_chat_options(request: &NeutralChatRequest) -> Result<ChatOptions, ProviderConfigError> {
+fn genai_chat_options(
+    config: &ProviderConnectionConfig,
+    request: &NeutralChatRequest,
+) -> Result<ChatOptions, ProviderConfigError> {
     let mut options = ChatOptions::default()
         .with_temperature(0.0)
         .with_top_p(1.0)
@@ -650,6 +744,45 @@ fn genai_chat_options(request: &NeutralChatRequest) -> Result<ChatOptions, Provi
             }
         };
         options = options.with_cache_control(cache_control);
+    }
+
+    apply_request_overrides(options, &config.request_overrides)
+}
+
+fn apply_request_overrides(
+    mut options: ChatOptions,
+    overrides: &[ProviderRequestOverride],
+) -> Result<ChatOptions, ProviderConfigError> {
+    let mut headers = Vec::new();
+    let mut body = Map::new();
+
+    for override_rule in overrides {
+        let target = override_rule.normalized_target()?;
+        let name = override_rule.normalized_name()?.to_string();
+        let value = override_rule.normalized_value()?;
+
+        match target {
+            REQUEST_OVERRIDE_TARGET_HEADER => {
+                let Some(header_value) = value.as_str() else {
+                    return Err(ProviderConfigError::InvalidRequest(format!(
+                        "header request override '{name}' value must be a string"
+                    )));
+                };
+                headers.push((name, header_value.to_string()));
+            }
+            REQUEST_OVERRIDE_TARGET_BODY => {
+                body.insert(name, value);
+            }
+            _ => unreachable!("request override target was validated"),
+        }
+    }
+
+    if !headers.is_empty() {
+        options = options.with_extra_headers(Headers::from(headers));
+    }
+
+    if !body.is_empty() {
+        options = options.with_extra_body(Value::Object(body));
     }
 
     Ok(options)
@@ -1022,6 +1155,7 @@ mod tests {
             base_url: Some("https://user:secret@example.test/v1?api_key=hidden#frag".to_string()),
             api_key: Some("sk-test".to_string()),
             proxy_url: Some("http://127.0.0.1:7890".to_string()),
+            request_overrides: Vec::new(),
         };
 
         let context = config

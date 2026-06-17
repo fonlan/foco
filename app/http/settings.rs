@@ -251,6 +251,11 @@ pub(crate) async fn save_manual_provider(
         .map(|provider| provider.api_proxy.clone())
         .unwrap_or_default();
     let api_proxy = normalize_api_proxy_settings(&current_api_proxy, request.api_proxy.as_ref())?;
+    for request_override in &request.request_overrides {
+        request_override
+            .validate()
+            .map_err(|source| ApiError::bad_request(source.to_string()))?;
+    }
     let provider = ProviderSettings {
         id: id.to_string(),
         name: name.to_string(),
@@ -258,6 +263,7 @@ pub(crate) async fn save_manual_provider(
         enabled: request.enabled,
         base_url: normalized_base_url,
         api_key,
+        request_overrides: request.request_overrides,
         api_proxy,
     };
 
