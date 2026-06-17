@@ -88,7 +88,7 @@ use crate::platform::native_browser::{
     native_browser_probe, prune_native_browser_authorizations, select_directory, select_files,
 };
 
-use crate::git_backend::git_diff_response;
+use crate::git_backend::{git_diff_response, git_head_text_for_workspace_path};
 use crate::hooks::{
     EffectiveHookSummary, HookDecision, HookNotification, HookRunRequest, HookRunSummary,
     HookRuntime, effective_hook_summaries,
@@ -2353,6 +2353,20 @@ struct GitDiffFileLineStats {
 
 type GitDiffStatsByFile = BTreeMap<String, GitDiffFileLineStats>;
 
+#[derive(Clone, Debug, Default)]
+struct SessionCodeChangeBaseline {
+    files: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Clone, Debug)]
+enum SessionCodeChangeBaselineState {
+    Available(SessionCodeChangeBaseline),
+    Unavailable { reason: String },
+}
+
+const CODE_CHANGE_BASELINE_MAX_FILES: usize = 500;
+const CODE_CHANGE_BASELINE_MAX_BYTES: u64 = 20 * 1024 * 1024;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GitBranchesResponse {
@@ -2575,7 +2589,7 @@ struct PreparedChatContext {
     next_runtime_tool_batch_index: usize,
     hook_context_messages: Vec<String>,
     hook_notifications: Vec<HookNotification>,
-    initial_git_diff_stats: Option<GitDiffStatsByFile>,
+    code_change_baseline: SessionCodeChangeBaselineState,
     code_change_stats: CodeChangeStats,
     pending_memory_retrieval: Option<PendingMemoryRetrieval>,
 }
@@ -3067,6 +3081,54 @@ impl CapturedLlmRequest {
             outcome: cancelled_audit_outcome(started_at, message),
         }
     }
+}
+
+fn persist_completed_llm_request(
+    context: &PreparedChatContext,
+    request: &CapturedLlmRequest,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .update_llm_request_outcome(
+            &request.id,
+            UpdateLlmRequestOutcome {
+                first_token_at: request.outcome.first_token_at.as_deref(),
+                completed_at: Some(&request.outcome.completed_at),
+                input_tokens: request.outcome.input_tokens,
+                output_tokens: request.outcome.output_tokens,
+                cache_read_tokens: request.outcome.cache_read_tokens,
+                cache_write_tokens: request.outcome.cache_write_tokens,
+                first_token_latency_ms: request.outcome.first_token_latency_ms,
+                total_latency_ms: Some(request.outcome.total_latency_ms),
+                status_code: request.outcome.status_code,
+                final_state: request.outcome.final_state,
+                response_body_json: request.outcome.response_body_json.as_deref(),
+            },
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    let existing_event_count = database
+        .llm_request_events(&request.id)
+        .map_err(ApiError::from_workspace_error)?
+        .len();
+    for (index, event) in request.events.iter().enumerate().skip(existing_event_count) {
+        let sequence = i64::try_from(index).map_err(|_| {
+            ApiError::internal("too many LLM request events to fit SQLite sequence")
+        })?;
+        let id = format!("{}-event-{sequence}", request.id);
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: &id,
+                llm_request_id: &request.id,
+                sequence,
+                event_at: &event.event_at,
+                event_type: &event.event_type,
+                raw_chunk_json: None,
+                normalized_event_json: &event.normalized_event_json,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    Ok(())
 }
 
 async fn run_chat_context_in_background(
@@ -3937,7 +3999,7 @@ impl PreparedChatContext {
                                 final_usage = Some(total_usage.clone());
                             }
                             let turn_total_latency_ms = elapsed_millis(turn_started_at);
-                            self.captured_llm_requests.push(CapturedLlmRequest {
+                            let completed_turn_request = CapturedLlmRequest {
                                 id: turn_llm_request_id.clone(),
                                 request_started_at: turn_request_started_at.clone(),
                                 request_body_json: turn_request_body_json.clone(),
@@ -3967,7 +4029,14 @@ impl PreparedChatContext {
                                         "responseId": response_id.clone(),
                                     }).to_string()),
                                 },
-                            });
+                            };
+                            if let Err(error) = persist_completed_llm_request(&self, &completed_turn_request) {
+                                yield ChatSseEvent::Error {
+                                    message: error.message,
+                                };
+                                return;
+                            }
+                            self.captured_llm_requests.push(completed_turn_request);
                             let turn_metrics = turn_reply_metrics(
                                 &self.model_id,
                                 &self.provider_id,
@@ -4058,7 +4127,7 @@ impl PreparedChatContext {
                                 }
                                 let git_diff_summary_result = git_diff_summary(
                                     &assistant_message_text,
-                                    &self.initial_git_diff_stats,
+                                    &self.code_change_baseline,
                                     &self.workspace_path,
                                     &self.global_config.app.language,
                                 );
@@ -4493,17 +4562,19 @@ impl PreparedChatContext {
                                 yield result_event;
                             }
                             if tool_results_affect_git_diff(&next_executed_tool_calls) {
-                                let event = ChatSseEvent::GitDiffRefresh {
-                                    workspace_id: self.workspace_id.clone(),
-                                    code_change_stats: code_change_stats_from_changed_files(
-                                        &git_diff_changed_files_for_workspace(
-                                            &self.initial_git_diff_stats,
-                                            &self.workspace_path,
+                                if let Ok(changed_files) = session_code_changed_files_for_workspace(
+                                    &self.code_change_baseline,
+                                    &self.workspace_path,
+                                ) {
+                                    let event = ChatSseEvent::GitDiffRefresh {
+                                        workspace_id: self.workspace_id.clone(),
+                                        code_change_stats: code_change_stats_from_changed_files(
+                                            &changed_files,
                                         ),
-                                    ),
-                                };
-                                events.push(captured_event(&event));
-                                yield event;
+                                    };
+                                    events.push(captured_event(&event));
+                                    yield event;
+                                }
                             }
                             if tool_results_affect_todo_graph(&next_executed_tool_calls) {
                                 let event = ChatSseEvent::TodoGraphRefresh {
@@ -4884,7 +4955,14 @@ async fn prepare_chat_context(
         provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
         serialize_provider_request(&provider_request)?
     };
-    let initial_git_diff_stats = git_diff_stats_for_workspace(&prompt_context.workspace_path);
+    let code_change_baseline = session_code_change_baseline_for_workspace(&prompt_context.workspace_path);
+    if let SessionCodeChangeBaselineState::Unavailable { reason } = &code_change_baseline {
+        tracing::warn!(
+            workspace_id = %prompt_context.workspace_id,
+            reason = %reason,
+            "code change stats unavailable for chat run"
+        );
+    }
 
     Ok(PreparedChatContext {
         workspace_id: prompt_context.workspace_id,
@@ -4919,7 +4997,7 @@ async fn prepare_chat_context(
         next_runtime_tool_batch_index: 0,
         hook_context_messages,
         hook_notifications,
-        initial_git_diff_stats,
+        code_change_baseline,
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval,
     })
@@ -11260,11 +11338,55 @@ fn assistant_message_text(assistant_text: &str, tool_calls: &[ExecutedToolCall])
         assistant_text.to_string()
     }
 }
+fn session_code_change_baseline_for_workspace(
+    workspace_path: &Path,
+) -> SessionCodeChangeBaselineState {
+    let initial_stats = match git_diff_stats_for_workspace(workspace_path) {
+        Ok(stats) => stats,
+        Err(error) => {
+            return SessionCodeChangeBaselineState::Unavailable {
+                reason: error.to_string(),
+            };
+        }
+    };
+    if initial_stats.len() > CODE_CHANGE_BASELINE_MAX_FILES {
+        return SessionCodeChangeBaselineState::Unavailable {
+            reason: format!(
+                "code change stats disabled: dirty file count {} exceeds limit {}",
+                initial_stats.len(),
+                CODE_CHANGE_BASELINE_MAX_FILES
+            ),
+        };
+    }
 
-fn git_diff_stats_for_workspace(workspace_path: &Path) -> Option<GitDiffStatsByFile> {
-    let diff = git_diff_response(workspace_path, None).ok()?;
-    Some(git_diff_stats(&diff))
+    let mut total_bytes = 0_u64;
+    let mut files = BTreeMap::new();
+    for path in initial_stats.keys() {
+        match read_workspace_text_file_with_size(workspace_path, path) {
+            Ok((content, bytes)) => {
+                total_bytes = total_bytes.saturating_add(bytes);
+                if total_bytes > CODE_CHANGE_BASELINE_MAX_BYTES {
+                    return SessionCodeChangeBaselineState::Unavailable {
+                        reason: format!(
+                            "code change stats disabled: dirty file baseline size {} bytes exceeds limit {} bytes",
+                            total_bytes,
+                            CODE_CHANGE_BASELINE_MAX_BYTES
+                        ),
+                    };
+                }
+                files.insert(path.clone(), content);
+            }
+            Err(reason) => return SessionCodeChangeBaselineState::Unavailable { reason },
+        }
+    }
+    SessionCodeChangeBaselineState::Available(SessionCodeChangeBaseline { files })
 }
+
+fn git_diff_stats_for_workspace(workspace_path: &Path) -> Result<GitDiffStatsByFile, String> {
+    let diff = git_diff_response(workspace_path, None).map_err(|error| format!("{error:?}"))?;
+    Ok(git_diff_stats(&diff))
+}
+
 
 fn git_diff_stats(diff: &GitDiffResponse) -> GitDiffStatsByFile {
     let mut stats = BTreeMap::new();
@@ -11335,11 +11457,14 @@ struct GitDiffSummary {
 
 fn git_diff_summary(
     assistant_text: &str,
-    initial_stats: &Option<GitDiffStatsByFile>,
+    baseline: &SessionCodeChangeBaselineState,
     workspace_path: &Path,
     language: &str,
 ) -> GitDiffSummary {
-    let changed_files = git_diff_changed_files_for_workspace(initial_stats, workspace_path);
+    let changed_files = match session_code_changed_files_for_workspace(baseline, workspace_path) {
+        Ok(changed_files) => changed_files,
+        Err(_) => Vec::new(),
+    };
     if changed_files.is_empty() {
         return GitDiffSummary {
             text: assistant_text.to_string(),
@@ -11379,18 +11504,120 @@ fn git_diff_summary(
     GitDiffSummary { text, stats }
 }
 
-fn git_diff_changed_files_for_workspace(
-    initial_stats: &Option<GitDiffStatsByFile>,
+fn session_code_changed_files_for_workspace(
+    baseline_state: &SessionCodeChangeBaselineState,
     workspace_path: &Path,
-) -> Vec<(String, GitDiffFileLineStats)> {
-    let Some(initial_stats) = initial_stats else {
-        return Vec::new();
+) -> Result<Vec<(String, GitDiffFileLineStats)>, String> {
+    let SessionCodeChangeBaselineState::Available(baseline) = baseline_state else {
+        return Ok(Vec::new());
     };
-    let Some(final_stats) = git_diff_stats_for_workspace(workspace_path) else {
-        return Vec::new();
-    };
+    let current_git_stats = git_diff_stats_for_workspace(workspace_path)?;
 
-    git_diff_changed_files(initial_stats, &final_stats)
+    let mut paths = baseline.files.keys().cloned().collect::<HashSet<_>>();
+    paths.extend(current_git_stats.keys().cloned());
+    let mut paths = paths.into_iter().collect::<Vec<_>>();
+    paths.sort();
+
+    let mut changed_files = Vec::new();
+    for path in paths {
+        let baseline_content = match baseline.files.get(&path) {
+            Some(content) => content.clone(),
+            None => git_head_text_for_workspace_path(workspace_path, &path)
+                .map_err(|error| format!("{error:?}"))?,
+        };
+        let current_content = read_workspace_text_file(workspace_path, &path)?;
+        if baseline_content == current_content {
+            continue;
+        }
+        let stats = text_code_change_stats(
+            baseline_content.as_deref().unwrap_or_default(),
+            current_content.as_deref().unwrap_or_default(),
+        );
+        if stats.additions == 0 && stats.deletions == 0 {
+            continue;
+        }
+        changed_files.push((
+            path,
+            GitDiffFileLineStats {
+                additions: stats.additions,
+                deletions: stats.deletions,
+                fingerprint: String::new(),
+            },
+        ));
+    }
+
+    Ok(changed_files)
+}
+fn read_workspace_text_file(workspace_path: &Path, path: &str) -> Result<Option<String>, String> {
+    read_workspace_text_file_with_size(workspace_path, path).map(|(content, _)| content)
+}
+
+fn read_workspace_text_file_with_size(
+    workspace_path: &Path,
+    path: &str,
+) -> Result<(Option<String>, u64), String> {
+    if !is_safe_relative_path(path) {
+        return Err(format!(
+            "code change stats disabled: unsafe workspace-relative path '{path}'"
+        ));
+    }
+    match fs::read(workspace_path.join(path)) {
+        Ok(bytes) => {
+            let byte_count = bytes.len() as u64;
+            let content = String::from_utf8(bytes).map_err(|_| {
+                format!(
+                    "code change stats disabled: file '{}' is not valid UTF-8 text",
+                    path
+                )
+            })?;
+            Ok((Some(content), byte_count))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((None, 0)),
+        Err(error) => Err(format!(
+            "code change stats disabled: failed to read file '{}': {}",
+            path, error
+        )),
+    }
+}
+
+fn is_safe_relative_path(path: &str) -> bool {
+    Path::new(path).components().all(|component| {
+        matches!(
+            component,
+            Component::Normal(_) | Component::CurDir
+        )
+    })
+}
+
+fn text_code_change_stats(old: &str, new: &str) -> CodeChangeStats {
+    let input = gix::diff::blob::InternedInput::new(old.as_bytes(), new.as_bytes());
+    let diff =
+        gix::diff::blob::diff_with_slider_heuristics(gix::diff::blob::Algorithm::Histogram, &input);
+    let hunks = match gix::diff::blob::UnifiedDiff::new(
+        &diff,
+        &input,
+        gix::diff::blob::unified_diff::ConsumeBinaryHunk::new(Vec::new(), "\n"),
+        gix::diff::blob::unified_diff::ContextSize::default(),
+    )
+    .consume()
+    {
+        Ok(hunks) => hunks,
+        Err(_) => return CodeChangeStats::default(),
+    };
+    let mut stats = CodeChangeStats::default();
+
+    for line in String::from_utf8_lossy(&hunks).lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            stats.additions += 1;
+        } else if line.starts_with('-') {
+            stats.deletions += 1;
+        }
+    }
+
+    stats
 }
 
 fn code_change_stats_from_changed_files(
@@ -11400,55 +11627,6 @@ fn code_change_stats_from_changed_files(
         additions: changed_files.iter().map(|(_, stats)| stats.additions).sum(),
         deletions: changed_files.iter().map(|(_, stats)| stats.deletions).sum(),
     }
-}
-
-fn git_diff_file_line_stats_delta(
-    initial_stats: Option<&GitDiffFileLineStats>,
-    final_stats: Option<&GitDiffFileLineStats>,
-) -> Option<GitDiffFileLineStats> {
-    let initial = initial_stats.cloned().unwrap_or_default();
-    let final_stats = final_stats.cloned().unwrap_or_default();
-    if initial == final_stats {
-        return None;
-    }
-
-    let additions = final_stats.additions.saturating_sub(initial.additions);
-    let deletions = final_stats.deletions.saturating_sub(initial.deletions);
-    if additions == 0 && deletions == 0 {
-        return None;
-    }
-
-    Some(GitDiffFileLineStats {
-        additions,
-        deletions,
-        fingerprint: final_stats.fingerprint,
-    })
-}
-
-fn git_diff_changed_files(
-    initial_stats: &GitDiffStatsByFile,
-    final_stats: &GitDiffStatsByFile,
-) -> Vec<(String, GitDiffFileLineStats)> {
-    let mut changed_files = BTreeMap::new();
-
-    for (path, final_file_stats) in final_stats {
-        if let Some(delta) =
-            git_diff_file_line_stats_delta(initial_stats.get(path), Some(final_file_stats))
-        {
-            changed_files.insert(path.clone(), delta);
-        }
-    }
-
-    for (path, initial_file_stats) in initial_stats {
-        if final_stats.contains_key(path) {
-            continue;
-        }
-        if let Some(delta) = git_diff_file_line_stats_delta(Some(initial_file_stats), None) {
-            changed_files.insert(path.clone(), delta);
-        }
-    }
-
-    changed_files.into_iter().collect()
 }
 
 fn queued_chat_metadata_json(user_message_id: &str) -> Result<String, ApiError> {

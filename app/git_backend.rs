@@ -74,6 +74,41 @@ pub(super) fn git_diff_response(
     })
 }
 
+pub(super) fn git_head_text_for_workspace_path(
+    workspace_path: &Path,
+    workspace_relative_path: &str,
+) -> Result<Option<String>, ApiError> {
+    let repo = open_repo(workspace_path)?;
+    let worktree_root = repo
+        .workdir()
+        .ok_or_else(|| ApiError::bad_request("git repository does not have a worktree"))?
+        .canonicalize()
+        .map_err(|source| {
+            ApiError::internal(format!("failed to resolve git worktree: {source}"))
+        })?;
+    let workspace_root = workspace_path.canonicalize().map_err(|source| {
+        ApiError::internal(format!("failed to resolve workspace path: {source}"))
+    })?;
+    let absolute_path = workspace_root.join(workspace_relative_path);
+    let repo_path = absolute_path
+        .strip_prefix(&worktree_root)
+        .map_err(|_| ApiError::bad_request("path is outside git worktree"))?
+        .display()
+        .to_string()
+        .replace('\\', "/");
+    let head_tree_id = repo
+        .head_tree_id_or_empty()
+        .map_err(|source| ApiError::internal(format!("failed to read git HEAD tree: {source}")))?
+        .detach();
+    let head_tree = repo
+        .find_tree(head_tree_id)
+        .map_err(|source| ApiError::internal(format!("failed to read git HEAD tree: {source}")))?;
+    let Some(bytes) = blob_from_tree(&repo, &head_tree, &repo_path)? else {
+        return Ok(None);
+    };
+    Ok(String::from_utf8(bytes).ok())
+}
+
 pub(super) fn git_branches_response(
     workspace_path: &Path,
 ) -> Result<GitBranchesResponse, ApiError> {

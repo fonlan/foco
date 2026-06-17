@@ -83,7 +83,9 @@ fn test_prepared_chat_context(
         next_runtime_tool_batch_index: 0,
         hook_context_messages: Vec::new(),
         hook_notifications: Vec::new(),
-        initial_git_diff_stats: None,
+        code_change_baseline: SessionCodeChangeBaselineState::Unavailable {
+            reason: "test baseline unavailable".to_string(),
+        },
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
     }
@@ -2450,7 +2452,9 @@ fn persist_chat_result_writes_audit_status_code() {
         next_runtime_tool_batch_index: 0,
         hook_context_messages: Vec::new(),
         hook_notifications: Vec::new(),
-        initial_git_diff_stats: None,
+        code_change_baseline: SessionCodeChangeBaselineState::Unavailable {
+            reason: "test baseline unavailable".to_string(),
+        },
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
     };
@@ -2614,7 +2618,9 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         next_runtime_tool_batch_index: 0,
         hook_context_messages: Vec::new(),
         hook_notifications: Vec::new(),
-        initial_git_diff_stats: None,
+        code_change_baseline: SessionCodeChangeBaselineState::Unavailable {
+            reason: "test baseline unavailable".to_string(),
+        },
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
     };
@@ -2853,7 +2859,9 @@ fn persist_failed_chat_result_keeps_tool_calls_without_assistant_message() {
         next_runtime_tool_batch_index: 0,
         hook_context_messages: Vec::new(),
         hook_notifications: Vec::new(),
-        initial_git_diff_stats: None,
+        code_change_baseline: SessionCodeChangeBaselineState::Unavailable {
+            reason: "test baseline unavailable".to_string(),
+        },
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
     };
@@ -2970,110 +2978,46 @@ fn active_chat_run_subscription_replays_cached_events_after_sequence() {
 }
 
 #[test]
-fn git_diff_changed_files_lists_only_files_changed_since_turn_start() {
-    let initial = GitDiffResponse {
-        path: None,
-        status: String::new(),
-        staged_diff: String::new(),
-        diff: [
-            "diff --git a/README.md b/README.md",
-            "--- a/README.md",
-            "+++ b/README.md",
-            "@@ -1 +1 @@",
-            "-old",
-            "+new",
-            "",
-        ]
-        .join("\n"),
-        files: Vec::new(),
-    };
-    let final_diff = GitDiffResponse {
-        path: None,
-        status: String::new(),
-        staged_diff: String::new(),
-        diff: [
-            "diff --git a/README.md b/README.md",
-            "--- a/README.md",
-            "+++ b/README.md",
-            "@@ -1 +1 @@",
-            "-old",
-            "+new",
-            "diff --git a/app/main.rs b/app/main.rs",
-            "--- a/app/main.rs",
-            "+++ b/app/main.rs",
-            "@@ -0,0 +1,2 @@",
-            "+line one",
-            "+line two",
-            "",
-        ]
-        .join("\n"),
-        files: Vec::new(),
-    };
+fn session_code_changed_files_counts_net_changes_from_session_baseline() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-session-net-code-stats-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    gix::init(&workspace_dir).expect("init git repo");
+    fs::write(workspace_dir.join("README.md"), "value = 1\n").expect("seed file");
 
-    let changed_files =
-        git_diff_changed_files(&git_diff_stats(&initial), &git_diff_stats(&final_diff));
+    let baseline = session_code_change_baseline_for_workspace(&workspace_dir);
+    fs::write(workspace_dir.join("README.md"), "value = 2\n").expect("first edit");
+    fs::write(workspace_dir.join("README.md"), "value = 3\n").expect("second edit");
 
-    assert_eq!(changed_files.len(), 1);
-    assert_eq!(changed_files[0].0, "app/main.rs");
-    assert_eq!(changed_files[0].1.additions, 2);
-    assert_eq!(changed_files[0].1.deletions, 0);
-
-    let cleared_files = git_diff_changed_files(&git_diff_stats(&initial), &BTreeMap::new());
-
-    assert!(cleared_files.is_empty());
-}
-
-#[test]
-fn git_diff_changed_files_counts_only_line_count_delta_for_existing_dirty_files() {
-    let initial = GitDiffResponse {
-        path: None,
-        status: String::new(),
-        staged_diff: String::new(),
-        diff: [
-            "diff --git a/README.md b/README.md",
-            "--- a/README.md",
-            "+++ b/README.md",
-            "@@ -1,3 +1,3 @@",
-            "-old one",
-            "-old two",
-            "+new one",
-            "+new two",
-            " unchanged",
-            "",
-        ]
-        .join("\n"),
-        files: Vec::new(),
-    };
-    let final_diff = GitDiffResponse {
-        path: None,
-        status: String::new(),
-        staged_diff: String::new(),
-        diff: [
-            "diff --git a/README.md b/README.md",
-            "--- a/README.md",
-            "+++ b/README.md",
-            "@@ -1,4 +1,5 @@",
-            "-old one",
-            "-old two",
-            "-old three",
-            "+new one",
-            "+new two",
-            "+new three",
-            "+new four",
-            " unchanged",
-            "",
-        ]
-        .join("\n"),
-        files: Vec::new(),
-    };
-
-    let changed_files =
-        git_diff_changed_files(&git_diff_stats(&initial), &git_diff_stats(&final_diff));
+    let changed_files = session_code_changed_files_for_workspace(&baseline, &workspace_dir)
+        .expect("session changed files");
 
     assert_eq!(changed_files.len(), 1);
     assert_eq!(changed_files[0].0, "README.md");
-    assert_eq!(changed_files[0].1.additions, 2);
+    assert_eq!(changed_files[0].1.additions, 1);
     assert_eq!(changed_files[0].1.deletions, 1);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn session_code_changed_files_excludes_preexisting_dirty_content() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-session-dirty-code-stats-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    gix::init(&workspace_dir).expect("init git repo");
+    fs::write(workspace_dir.join("README.md"), "preexisting dirty\n").expect("dirty before baseline");
+
+    let baseline = session_code_change_baseline_for_workspace(&workspace_dir);
+    fs::write(workspace_dir.join("README.md"), "current turn\n").expect("edit during session");
+
+    let changed_files = session_code_changed_files_for_workspace(&baseline, &workspace_dir)
+        .expect("session changed files");
+
+    assert_eq!(changed_files.len(), 1);
+    assert_eq!(changed_files[0].0, "README.md");
+    assert_eq!(changed_files[0].1.additions, 1);
+    assert_eq!(changed_files[0].1.deletions, 1);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
 #[test]
@@ -3082,11 +3026,10 @@ fn git_diff_summary_uses_chinese_heading_for_chinese_language() {
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     gix::init(&workspace_dir).expect("init git repo");
 
-    let initial_stats =
-        Some(git_diff_stats_for_workspace(&workspace_dir).expect("initial git stats"));
+    let baseline = session_code_change_baseline_for_workspace(&workspace_dir);
     fs::write(workspace_dir.join("note.txt"), "新内容\n").expect("write changed file");
 
-    let summary = git_diff_summary("完成。\n", &initial_stats, &workspace_dir, "zh-CN");
+    let summary = git_diff_summary("完成。\n", &baseline, &workspace_dir, "zh-CN");
 
     assert!(summary.text.contains("### 本轮代码变更\n\n"));
     assert!(summary.text.contains("- `note.txt`: +1 / -0"));
