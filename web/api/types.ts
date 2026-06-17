@@ -56,6 +56,18 @@ export type GitBranchesResponse = {
   branches: string[];
 };
 
+export type WorkspaceFileTreeNode = {
+  name: string;
+  path: string;
+  kind: "directory" | "file";
+  sizeBytes: number;
+  children: WorkspaceFileTreeNode[];
+};
+
+export type WorkspaceFilesResponse = {
+  root: WorkspaceFileTreeNode;
+};
+
 // JSON types
 
 export type JsonValue =

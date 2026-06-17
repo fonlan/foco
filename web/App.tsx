@@ -16,6 +16,7 @@ import {
   Download,
   Eye,
   EyeOff,
+  Files,
   FileText,
   Folder,
   FolderPlus,
@@ -217,6 +218,8 @@ import type {
   WebSearchFormState,
   WorkspaceChatListItem,
   WorkspaceCommonCommandSummary,
+  WorkspaceFilesResponse,
+  WorkspaceFileTreeNode,
   WorkspaceFormState,
   WorkspaceIconDraft,
   WorkspaceSummary,
@@ -288,12 +291,18 @@ import {
 } from "./features/stats/use-ai-statistics-data";
 
 type ViewMode = "chat" | "settings" | "stats";
-type ContextPanelTab = "todo" | "git" | "memory" | "stats";
+type ContextPanelTab = "todo" | "files" | "git" | "memory" | "stats";
 type WorkspaceChatContextMenuState = {
   chat: WorkspaceChatListItem;
   left: number;
   top: number;
   workspace: WorkspaceSummary;
+};
+
+type WorkspaceFileContextMenuState = {
+  left: number;
+  node: WorkspaceFileTreeNode;
+  top: number;
 };
 
 type ChartDatum = {
@@ -353,6 +362,8 @@ export function App() {
     useState<PendingDeleteChat | null>(null);
   const [workspaceChatContextMenu, setWorkspaceChatContextMenu] =
     useState<WorkspaceChatContextMenuState | null>(null);
+  const [workspaceFileContextMenu, setWorkspaceFileContextMenu] =
+    useState<WorkspaceFileContextMenuState | null>(null);
   const [chatMessagesByKey, setChatMessagesByKey] = useState<
     Record<string, ShellMessage[]>
   >({});
@@ -392,6 +403,13 @@ export function App() {
   const [diffError, setDiffError] = useState<string | null>(null);
   const [gitCommitMessage, setGitCommitMessage] = useState("");
   const [gitOperationKey, setGitOperationKey] = useState<string | null>(null);
+  const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFilesResponse | null>(null);
+  const [expandedFileTreePaths, setExpandedFileTreePaths] = useState<Set<string>>(
+    () => new Set([""]),
+  );
+  const [isLoadingWorkspaceFiles, setIsLoadingWorkspaceFiles] = useState(false);
+  const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
+  const [workspaceFileOperationKey, setWorkspaceFileOperationKey] = useState<string | null>(null);
   const [todoGraph, setTodoGraph] = useState<TodoGraphResponse | null>(null);
   const [isLoadingTodoGraph, setIsLoadingTodoGraph] = useState(false);
   const [todoGraphError, setTodoGraphError] = useState<string | null>(null);
@@ -810,6 +828,25 @@ export function App() {
     }
   }, []);
 
+  const loadWorkspaceFiles = useCallback(async (workspaceId: string) => {
+    setIsLoadingWorkspaceFiles(true);
+    setWorkspaceFilesError(null);
+
+    try {
+      const data = await requestJson<WorkspaceFilesResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/files`,
+      );
+      setWorkspaceFiles(data);
+      return data;
+    } catch (requestError) {
+      setWorkspaceFiles(null);
+      setWorkspaceFilesError(errorMessage(requestError));
+      return null;
+    } finally {
+      setIsLoadingWorkspaceFiles(false);
+    }
+  }, []);
+
   const loadGitDiff = useCallback(async (workspaceId: string, path: string | null) => {
     setIsLoadingDiff(true);
     setDiffError(null);
@@ -1041,6 +1078,26 @@ export function App() {
       isCurrent = false;
     };
   }, [canUseApp, settings?.nativeTools.browserProbePort]);
+
+  useEffect(() => {
+    if (!activeWorkspace?.id) {
+      setWorkspaceFiles(null);
+      setWorkspaceFilesError(null);
+      setIsLoadingWorkspaceFiles(false);
+      return;
+    }
+
+    if (!isContextPanelOpen || contextPanelTab !== "files") {
+      return;
+    }
+
+    void loadWorkspaceFiles(activeWorkspace.id);
+  }, [
+    activeWorkspace?.id,
+    contextPanelTab,
+    isContextPanelOpen,
+    loadWorkspaceFiles,
+  ]);
 
   useEffect(() => {
     if (!activeWorkspace?.id) {
@@ -1299,6 +1356,45 @@ export function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!workspaceFileContextMenu) {
+      return;
+    }
+
+    function closeWorkspaceFileContextMenuForPointer(event: PointerEvent) {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest(".workspace-file-context-menu")
+      ) {
+        return;
+      }
+      setWorkspaceFileContextMenu(null);
+    }
+
+    function closeWorkspaceFileContextMenuForKey(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setWorkspaceFileContextMenu(null);
+      }
+    }
+
+    function closeWorkspaceFileContextMenu() {
+      setWorkspaceFileContextMenu(null);
+    }
+
+    window.addEventListener("pointerdown", closeWorkspaceFileContextMenuForPointer);
+    window.addEventListener("keydown", closeWorkspaceFileContextMenuForKey);
+    window.addEventListener("resize", closeWorkspaceFileContextMenu);
+    window.addEventListener("scroll", closeWorkspaceFileContextMenu, true);
+
+    return () => {
+      window.removeEventListener("pointerdown", closeWorkspaceFileContextMenuForPointer);
+      window.removeEventListener("keydown", closeWorkspaceFileContextMenuForKey);
+      window.removeEventListener("resize", closeWorkspaceFileContextMenu);
+      window.removeEventListener("scroll", closeWorkspaceFileContextMenu, true);
+    };
+  }, [workspaceFileContextMenu]);
 
   useEffect(() => {
     if (!workspaces.length) {
@@ -2325,6 +2421,41 @@ export function App() {
         : [...current, skillId],
     );
   }
+  async function handleWorkspaceFileOperation(
+    action: "delete" | "rename",
+    path: string,
+    newName?: string,
+  ) {
+    if (!activeWorkspace) {
+      setWorkspaceFilesError(t("Select a workspace before using file actions."));
+      return;
+    }
+
+    const operationKey = `${action}:${path}`;
+    setWorkspaceFileOperationKey(operationKey);
+    setWorkspaceFilesError(null);
+
+    try {
+      const data = await requestJson<WorkspaceFilesResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/files/${action}`,
+        {
+          body: JSON.stringify(action === "rename" ? { path, newName } : { path }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setWorkspaceFiles(data);
+      setExpandedFileTreePaths((current) => new Set([...current, ""]));
+      if (isContextPanelOpen && contextPanelTab === "git") {
+        void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+      }
+    } catch (requestError) {
+      setWorkspaceFilesError(errorMessage(requestError));
+    } finally {
+      setWorkspaceFileOperationKey(null);
+    }
+  }
+
   async function handleGitFileOperation(
     action: "stage" | "unstage" | "discard",
     path: string,
@@ -5277,86 +5408,101 @@ export function App() {
                                     const chatDiffStats = chat.codeChangeStats;
 
                                     return (
-                                      <button
-                                        aria-current={
-                                          isChatActive ? "page" : undefined
-                                        }
-                                        className={chatItemClass(isChatActive)}
-                                        key={chat.id}
-                                        onClick={() => {
-                                          if (suppressNextWorkspaceChatClickRef.current) {
-                                            suppressNextWorkspaceChatClickRef.current = false;
-                                            return;
+                                      <div className="group flex min-w-0 items-center gap-1" key={chat.id}>
+                                        <button
+                                          aria-current={
+                                            isChatActive ? "page" : undefined
                                           }
+                                          className={chatItemClass(isChatActive)}
+                                          onClick={() => {
+                                            if (suppressNextWorkspaceChatClickRef.current) {
+                                              suppressNextWorkspaceChatClickRef.current = false;
+                                              return;
+                                            }
 
-                                          selectWorkspaceChat(workspace.id, chat.id);
-                                        }}
-                                        onContextMenu={(event) =>
-                                          openWorkspaceChatContextMenu(
-                                            event,
-                                            workspace,
-                                            chat,
-                                          )
-                                        }
-                                        onPointerCancel={cancelWorkspaceChatLongPress}
-                                        onPointerDown={(event) =>
-                                          startWorkspaceChatLongPress(
-                                            event,
-                                            workspace,
-                                            chat,
-                                          )
-                                        }
-                                        onPointerLeave={cancelWorkspaceChatLongPress}
-                                        onPointerUp={cancelWorkspaceChatLongPress}
-                                        title={chat.title}
-                                        type="button"
-                                      >
-                                        <span
-                                          aria-hidden="true"
-                                          className={`session-status-dot ${statusDotClass}`}
-                                        />
-                                        <span className="min-w-0 flex-1">
-                                          <span className="block truncate">
-                                            {chat.title}
-                                          </span>
-                                          <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-stone-400">
-                                            <span className="min-w-0 truncate">
-                                              {formatChatCreatedAt(chat.createdAt)}
+                                            selectWorkspaceChat(workspace.id, chat.id);
+                                          }}
+                                          onContextMenu={(event) =>
+                                            openWorkspaceChatContextMenu(
+                                              event,
+                                              workspace,
+                                              chat,
+                                            )
+                                          }
+                                          onPointerCancel={cancelWorkspaceChatLongPress}
+                                          onPointerDown={(event) =>
+                                            startWorkspaceChatLongPress(
+                                              event,
+                                              workspace,
+                                              chat,
+                                            )
+                                          }
+                                          onPointerLeave={cancelWorkspaceChatLongPress}
+                                          onPointerUp={cancelWorkspaceChatLongPress}
+                                          title={chat.title}
+                                          type="button"
+                                        >
+                                          <span
+                                            aria-hidden="true"
+                                            className={`session-status-dot ${statusDotClass}`}
+                                          />
+                                          <span className="min-w-0 flex-1">
+                                            <span className="block truncate">
+                                              {chat.title}
                                             </span>
-                                            {chatDiffStats &&
-                                              hasGitDiffStats(chatDiffStats) ? (
-                                              <span
-                                                aria-label={t(
-                                                  "Code changes +{additions} -{deletions}",
-                                                  {
-                                                    additions:
-                                                      chatDiffStats.additions,
-                                                    deletions:
-                                                      chatDiffStats.deletions,
-                                                  },
-                                                )}
-                                                className="chat-diff-stats"
-                                                title={t(
-                                                  "Code changes +{additions} -{deletions}",
-                                                  {
-                                                    additions:
-                                                      chatDiffStats.additions,
-                                                    deletions:
-                                                      chatDiffStats.deletions,
-                                                  },
-                                                )}
-                                              >
-                                                <span className="chat-diff-add">
-                                                  +{chatDiffStats.additions}
-                                                </span>
-                                                <span className="chat-diff-delete">
-                                                  -{chatDiffStats.deletions}
-                                                </span>
+                                            <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-stone-400">
+                                              <span className="min-w-0 truncate">
+                                                {formatChatCreatedAt(chat.createdAt)}
                                               </span>
-                                            ) : null}
+                                              {chatDiffStats &&
+                                                hasGitDiffStats(chatDiffStats) ? (
+                                                <span
+                                                  aria-label={t(
+                                                    "Code changes +{additions} -{deletions}",
+                                                    {
+                                                      additions:
+                                                        chatDiffStats.additions,
+                                                      deletions:
+                                                        chatDiffStats.deletions,
+                                                    },
+                                                  )}
+                                                  className="chat-diff-stats"
+                                                  title={t(
+                                                    "Code changes +{additions} -{deletions}",
+                                                    {
+                                                      additions:
+                                                        chatDiffStats.additions,
+                                                      deletions:
+                                                        chatDiffStats.deletions,
+                                                    },
+                                                  )}
+                                                >
+                                                  <span className="chat-diff-add">
+                                                    +{chatDiffStats.additions}
+                                                  </span>
+                                                  <span className="chat-diff-delete">
+                                                    -{chatDiffStats.deletions}
+                                                  </span>
+                                                </span>
+                                              ) : null}
+                                            </span>
                                           </span>
-                                        </span>
-                                      </button>
+                                        </button>
+                                        <button
+                                          aria-label={t("Delete chat {title}", {
+                                            title: chat.title,
+                                          })}
+                                          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-stone-400 opacity-0 transition group-hover:opacity-100 focus:opacity-100 hover:bg-rose-50 hover:text-rose-700"
+                                          disabled={Boolean(chat.scheduledRunId)}
+                                          onClick={() => {
+                                            requestDeleteWorkspaceChat(workspace, chat);
+                                          }}
+                                          title={t("Delete chat")}
+                                          type="button"
+                                        >
+                                          <Trash2 aria-hidden="true" className="size-3.5" />
+                                        </button>
+                                      </div>
                                     );
                                   })}
                                   {hiddenChatCount > 0 ? (
@@ -5435,6 +5581,56 @@ export function App() {
                 >
                   <Trash2 aria-hidden="true" className="size-3.5" />
                   <span>{t("Delete chat")}</span>
+                </button>
+              </div>
+            ) : null}
+
+            {workspaceFileContextMenu ? (
+              <div
+                aria-label={workspaceFileContextMenu.node.name}
+                className="workspace-chat-context-menu workspace-file-context-menu"
+                role="menu"
+                style={{
+                  left: workspaceFileContextMenu.left,
+                  top: workspaceFileContextMenu.top,
+                }}
+              >
+                <button
+                  className="workspace-chat-context-menu-item"
+                  onClick={() => {
+                    const { node } = workspaceFileContextMenu;
+                    setWorkspaceFileContextMenu(null);
+                    const nextName = window.prompt(t("Rename file"), node.name);
+                    if (nextName === null) {
+                      return;
+                    }
+                    const trimmedName = nextName.trim();
+                    if (!trimmedName || trimmedName === node.name) {
+                      return;
+                    }
+                    void handleWorkspaceFileOperation("rename", node.path, trimmedName);
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Pencil aria-hidden="true" className="size-3.5" />
+                  <span>{t("Rename")}</span>
+                </button>
+                <button
+                  className="workspace-chat-context-menu-item workspace-chat-context-menu-item-danger"
+                  onClick={() => {
+                    const { node } = workspaceFileContextMenu;
+                    setWorkspaceFileContextMenu(null);
+                    if (!window.confirm(t("Delete file confirmation"))) {
+                      return;
+                    }
+                    void handleWorkspaceFileOperation("delete", node.path);
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Trash2 aria-hidden="true" className="size-3.5" />
+                  <span>{t("Delete")}</span>
                 </button>
               </div>
             ) : null}
@@ -5598,14 +5794,46 @@ export function App() {
                     files={gitDiff?.files ?? []}
                     gitCommitMessage={gitCommitMessage}
                     gitOperationKey={gitOperationKey}
+                    expandedFileTreePaths={expandedFileTreePaths}
                     isLoadingChatStatistics={isLoadingChatStatistics}
                     isLoadingDiff={isLoadingDiff}
                     isLoadingContextMemories={isLoadingContextMemories}
                     isLoadingTodoGraph={isLoadingTodoGraph}
+                    isLoadingWorkspaceFiles={isLoadingWorkspaceFiles}
                     onGitCommit={handleGitCommit}
                     onGenerateGitCommitMessage={() => void handleGenerateGitCommitMessage()}
                     onGitCommitMessageChange={setGitCommitMessage}
                     onGitFileOperation={(action, path) => void handleGitFileOperation(action, path)}
+                    onRefreshWorkspaceFiles={() => {
+                      if (activeWorkspace?.id) {
+                        void loadWorkspaceFiles(activeWorkspace.id);
+                      }
+                    }}
+                    onRenameWorkspaceFile={(path, newName) =>
+                      void handleWorkspaceFileOperation("rename", path, newName)
+                    }
+                    onDeleteWorkspaceFile={(path) =>
+                      void handleWorkspaceFileOperation("delete", path)
+                    }
+                    onToggleFileTreePath={(path) => {
+                      setExpandedFileTreePaths((current) => {
+                        const next = new Set(current);
+                        if (next.has(path)) {
+                          next.delete(path);
+                        } else {
+                          next.add(path);
+                        }
+                        return next;
+                      });
+                    }}
+                    onOpenWorkspaceFileMenu={(event, node) => {
+                      event.preventDefault();
+                      setWorkspaceFileContextMenu({
+                        left: event.clientX,
+                        node,
+                        top: event.clientY,
+                      });
+                    }}
                     onRefreshDiff={() => {
                       if (activeWorkspace?.id) {
                         void loadGitDiff(activeWorkspace.id, selectedDiffPath);
@@ -5620,6 +5848,9 @@ export function App() {
                     }}
                     selectedPath={selectedDiffPath}
                     todoGraph={todoGraph}
+                    workspaceFiles={workspaceFiles}
+                    workspaceFileOperationKey={workspaceFileOperationKey}
+                    workspaceFilesError={workspaceFilesError}
                     todoGraphError={todoGraphError}
                   />
                 </div>
@@ -7790,10 +8021,12 @@ function ContextPanel({
   files,
   gitCommitMessage,
   gitOperationKey,
+  expandedFileTreePaths,
   isLoadingChatStatistics,
   isLoadingContextMemories,
   isLoadingDiff,
   isLoadingTodoGraph,
+  isLoadingWorkspaceFiles,
   onForgetContextMemory,
   onGenerateGitCommitMessage,
   onGitCommit,
@@ -7801,11 +8034,19 @@ function ContextPanel({
   onGitFileOperation,
   onMemoryPageChange,
   onRefreshDiff,
+  onRefreshWorkspaceFiles,
+  onRenameWorkspaceFile,
+  onDeleteWorkspaceFile,
+  onToggleFileTreePath,
+  onOpenWorkspaceFileMenu,
   onSelectDiffFile,
   onTabChange,
   selectedPath,
   todoGraph,
   todoGraphError,
+  workspaceFiles,
+  workspaceFileOperationKey,
+  workspaceFilesError,
 }: {
   activeTab: ContextPanelTab;
   chatStatistics: ChatStatisticsResponse | null;
@@ -7819,10 +8060,12 @@ function ContextPanel({
   files: GitStatusFileSummary[];
   gitCommitMessage: string;
   gitOperationKey: string | null;
+  expandedFileTreePaths: Set<string>;
   isLoadingChatStatistics: boolean;
   isLoadingContextMemories: boolean;
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
+  isLoadingWorkspaceFiles: boolean;
   onForgetContextMemory: (memory: MemoryFactRecord) => void;
   onGenerateGitCommitMessage: () => void;
   onGitCommit: (event: FormEvent<HTMLFormElement>) => void;
@@ -7830,15 +8073,24 @@ function ContextPanel({
   onGitFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
   onRefreshDiff: () => void;
+  onRefreshWorkspaceFiles: () => void;
+  onRenameWorkspaceFile: (path: string, newName: string) => void;
+  onDeleteWorkspaceFile: (path: string) => void;
+  onToggleFileTreePath: (path: string) => void;
+  onOpenWorkspaceFileMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
   onSelectDiffFile: (path: string | null) => void;
   onTabChange: (tab: ContextPanelTab) => void;
   selectedPath: string | null;
   todoGraph: TodoGraphResponse | null;
   todoGraphError: string | null;
+  workspaceFiles: WorkspaceFilesResponse | null;
+  workspaceFileOperationKey: string | null;
+  workspaceFilesError: string | null;
 }) {
   const { t } = useI18n();
   const tabs: { id: ContextPanelTab; label: string; icon: LucideIcon }[] = [
     { id: "todo", label: "ToDo", icon: ListChecks },
+    { id: "files", label: "Files", icon: Files },
     { id: "git", label: "Git", icon: GitCompare },
     { id: "memory", label: "Memory", icon: Brain },
     { id: "stats", label: "Stats", icon: BarChart3 },
@@ -7873,6 +8125,21 @@ function ContextPanel({
             error={todoGraphError}
             isLoading={isLoadingTodoGraph}
             todoGraph={todoGraph}
+          />
+        ) : null}
+
+        {activeTab === "files" ? (
+          <WorkspaceFilesTab
+            error={workspaceFilesError}
+            expandedPaths={expandedFileTreePaths}
+            isLoading={isLoadingWorkspaceFiles}
+            operationKey={workspaceFileOperationKey}
+            onDeleteFile={onDeleteWorkspaceFile}
+            onOpenContextMenu={onOpenWorkspaceFileMenu}
+            onRefresh={onRefreshWorkspaceFiles}
+            onRenameFile={onRenameWorkspaceFile}
+            onTogglePath={onToggleFileTreePath}
+            response={workspaceFiles}
           />
         ) : null}
 
@@ -7917,6 +8184,210 @@ function ContextPanel({
         ) : null}
       </div>
     </section>
+  );
+}
+
+function WorkspaceFilesTab({
+  error,
+  expandedPaths,
+  isLoading,
+  operationKey,
+  onDeleteFile,
+  onOpenContextMenu,
+  onRefresh,
+  onRenameFile,
+  onTogglePath,
+  response,
+}: {
+  error: string | null;
+  expandedPaths: Set<string>;
+  isLoading: boolean;
+  operationKey: string | null;
+  onDeleteFile: (path: string) => void;
+  onOpenContextMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
+  onRefresh: () => void;
+  onRenameFile: (path: string, newName: string) => void;
+  onTogglePath: (path: string) => void;
+  response: WorkspaceFilesResponse | null;
+}) {
+  const { t } = useI18n();
+
+  return (
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
+      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-3">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-sky-50 text-sky-800">
+            <Files aria-hidden="true" className="size-5" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold">{t("Files")}</h2>
+            <p className="truncate text-xs font-medium text-stone-500">
+              {t("Workspace file tree")}
+            </p>
+          </div>
+        </div>
+        <button
+          aria-label={t("Refresh files")}
+          className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
+          disabled={isLoading}
+          onClick={onRefresh}
+          title={t("Refresh files")}
+          type="button"
+        >
+          <RefreshCw aria-hidden="true" className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
+        </button>
+      </div>
+
+      {error ? (
+        <div className="mx-4 mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+          {error}
+        </div>
+      ) : null}
+
+      <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3">
+        {response ? (
+          <div className="workspace-file-tree" role="tree">
+            <WorkspaceFileTreeNodeRow
+              depth={0}
+              expandedPaths={expandedPaths}
+              node={response.root}
+              onDeleteFile={onDeleteFile}
+              onOpenContextMenu={onOpenContextMenu}
+              onRenameFile={onRenameFile}
+              onTogglePath={onTogglePath}
+              operationKey={operationKey}
+            />
+          </div>
+        ) : (
+          <div className="rounded-xl border border-dashed border-stone-300 bg-white/60 px-3 py-4 text-sm text-stone-500">
+            {isLoading ? t("Loading files...") : t("No files")}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function WorkspaceFileTreeNodeRow({
+  depth,
+  expandedPaths,
+  node,
+  onDeleteFile,
+  onOpenContextMenu,
+  onRenameFile,
+  onTogglePath,
+  operationKey,
+}: {
+  depth: number;
+  expandedPaths: Set<string>;
+  node: WorkspaceFileTreeNode;
+  onDeleteFile: (path: string) => void;
+  onOpenContextMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
+  onRenameFile: (path: string, newName: string) => void;
+  onTogglePath: (path: string) => void;
+  operationKey: string | null;
+}) {
+  const { t } = useI18n();
+  const isDirectory = node.kind === "directory";
+  const isExpanded = expandedPaths.has(node.path);
+  const isBusy = operationKey === `delete:${node.path}` || operationKey === `rename:${node.path}`;
+
+  return (
+    <div role="none">
+      <div
+        aria-expanded={isDirectory ? isExpanded : undefined}
+        className="workspace-file-tree-row"
+        onContextMenu={(event) => {
+          if (node.path) {
+            onOpenContextMenu(event, node);
+          }
+        }}
+        role="treeitem"
+        style={{ paddingLeft: `${depth * 0.875 + 0.25}rem` }}
+      >
+        <button
+          aria-label={isExpanded ? t("Collapse folder") : t("Expand folder")}
+          className="workspace-file-tree-toggle"
+          disabled={!isDirectory}
+          onClick={() => {
+            if (isDirectory) {
+              onTogglePath(node.path);
+            }
+          }}
+          tabIndex={isDirectory ? 0 : -1}
+          type="button"
+        >
+          {isDirectory ? (
+            isExpanded ? (
+              <ChevronDown aria-hidden="true" className="size-3.5" />
+            ) : (
+              <ChevronRight aria-hidden="true" className="size-3.5" />
+            )
+          ) : null}
+        </button>
+        {isDirectory ? (
+          <Folder aria-hidden="true" className="workspace-file-tree-icon workspace-file-tree-folder-icon" />
+        ) : (
+          <FileText aria-hidden="true" className="workspace-file-tree-icon workspace-file-tree-file-icon" />
+        )}
+        <span className="workspace-file-tree-name" title={node.path || node.name}>
+          {node.name}
+        </span>
+        {isBusy ? <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin text-stone-400" /> : null}
+        {!isDirectory ? (
+          <span className="workspace-file-tree-size">{formatFileSize(node.sizeBytes)}</span>
+        ) : null}
+        {node.path ? (
+          <span className="workspace-file-tree-actions">
+            <button
+              aria-label={t("Rename file")}
+              className="workspace-file-tree-action"
+              onClick={() => {
+                const nextName = window.prompt(t("Rename file"), node.name);
+                if (nextName === null) {
+                  return;
+                }
+                const trimmedName = nextName.trim();
+                if (!trimmedName || trimmedName === node.name) {
+                  return;
+                }
+                onRenameFile(node.path, trimmedName);
+              }}
+              type="button"
+            >
+              <Pencil aria-hidden="true" className="size-3.5" />
+            </button>
+            <button
+              aria-label={t("Delete")}
+              className="workspace-file-tree-action workspace-file-tree-action-danger"
+              onClick={() => {
+                if (window.confirm(t("Delete file confirmation"))) {
+                  onDeleteFile(node.path);
+                }
+              }}
+              type="button"
+            >
+              <Trash2 aria-hidden="true" className="size-3.5" />
+            </button>
+          </span>
+        ) : null}
+      </div>
+      {isDirectory && isExpanded
+        ? node.children.map((child) => (
+          <WorkspaceFileTreeNodeRow
+            depth={depth + 1}
+            expandedPaths={expandedPaths}
+            key={child.path || child.name}
+            node={child}
+            onDeleteFile={onDeleteFile}
+            onOpenContextMenu={onOpenContextMenu}
+            onRenameFile={onRenameFile}
+            onTogglePath={onTogglePath}
+            operationKey={operationKey}
+          />
+        ))
+        : null}
+    </div>
   );
 }
 

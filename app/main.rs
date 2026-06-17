@@ -547,6 +547,18 @@ fn app_router(state: AppState) -> Router {
             post(crate::http::workspaces::save_workspace_order),
         )
         .route(
+            "/api/workspaces/{workspace_id}/files",
+            get(crate::http::workspaces::workspace_files),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/files/delete",
+            post(crate::http::workspaces::delete_workspace_file),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/files/rename",
+            post(crate::http::workspaces::rename_workspace_file),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/logo",
             get(crate::http::workspaces::workspace_logo)
                 .post(crate::http::workspaces::save_workspace_logo)
@@ -2145,6 +2157,42 @@ struct WorkspaceSummary {
     terminal_shell: String,
     common_commands: Vec<WorkspaceCommonCommandSummary>,
     chats: Vec<ChatSummary>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileRequest {
+    pub(crate) path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RenameWorkspaceFileRequest {
+    pub(crate) path: String,
+    pub(crate) new_name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFilesResponse {
+    pub(crate) root: WorkspaceFileTreeNode,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileTreeNode {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) kind: WorkspaceFileTreeNodeKind,
+    pub(crate) size_bytes: u64,
+    pub(crate) children: Vec<WorkspaceFileTreeNode>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum WorkspaceFileTreeNodeKind {
+    Directory,
+    File,
 }
 
 #[derive(Serialize)]
