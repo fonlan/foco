@@ -3492,6 +3492,124 @@ describe("App verification surfaces", () => {
     expect(await screen.findByText("API overview")).toBeInTheDocument();
     expect(messageList.scrollTop).toBe(0);
   });
+  it("sorts workspace chat history by chat creation time and shows seconds", async () => {
+    workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          chatSummary(
+            "chat-updated-later",
+            "Updated later",
+            "2026-06-05T09:00:01Z",
+            "2026-06-05T13:00:01Z",
+          ),
+          chatSummary(
+            "chat-created-later",
+            "Created later",
+            "2026-06-05T10:00:02Z",
+            "2026-06-05T10:00:02Z",
+          ),
+          chatSummary(
+            "chat-created-earlier",
+            "Created earlier",
+            "2026-06-05T08:00:03Z",
+            "2026-06-05T14:00:03Z",
+          ),
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    render(<App />);
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const createdLaterTitle = await within(workspaceList).findByText("Created later");
+    const updatedLaterTitle = await within(workspaceList).findByText("Updated later");
+    const createdEarlierTitle = await within(workspaceList).findByText("Created earlier");
+    const createdLaterButton = createdLaterTitle.closest("button");
+    const updatedLaterButton = updatedLaterTitle.closest("button");
+    const createdEarlierButton = createdEarlierTitle.closest("button");
+    if (!createdLaterButton || !updatedLaterButton || !createdEarlierButton) {
+      throw new Error("Expected workspace chat history item buttons");
+    }
+
+    expect(
+      createdLaterButton.compareDocumentPosition(updatedLaterButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(
+      updatedLaterButton.compareDocumentPosition(createdEarlierButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(within(createdLaterButton).getByText(/:02\b/)).toBeInTheDocument();
+    expect(within(updatedLaterButton).getByText(/:01\b/)).toBeInTheDocument();
+    expect(within(createdEarlierButton).getByText(/:03\b/)).toBeInTheDocument();
+  });
+
+  it("places scheduled workspace chats by chat creation time", async () => {
+    workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          chatSummary(
+            "chat-created-later",
+            "Created later",
+            "2026-06-05T13:00:00Z",
+            "2026-06-05T13:00:00Z",
+          ),
+          chatSummary(
+            "chat-created-earlier",
+            "Created earlier",
+            "2026-06-05T11:00:00Z",
+            "2026-06-05T15:00:00Z",
+          ),
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    render(<App />);
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    await within(workspaceList).findByRole("button", { name: "Default" });
+    await userEvent.click(within(workspaceList).getByRole("button", { name: "Default" }));
+    await userEvent.click(
+      within(workspaceList).getByRole("button", { name: "New chat in Default" }),
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "Queued chat",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }), {
+      ctrlKey: true,
+    });
+
+    const createdLaterButton = (
+      await within(workspaceList).findByText("Created later")
+    ).closest("button");
+    const queuedButton = (await within(workspaceList).findByText("Queued chat")).closest(
+      "button",
+    );
+    const createdEarlierButton = (
+      await within(workspaceList).findByText("Created earlier")
+    ).closest("button");
+    if (!createdLaterButton || !queuedButton || !createdEarlierButton) {
+      throw new Error("Expected workspace chat history item buttons");
+    }
+
+    expect(
+      createdLaterButton.compareDocumentPosition(queuedButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(
+      queuedButton.compareDocumentPosition(createdEarlierButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
 
   it("reflects chat tab and running state in workspace chat dots", async () => {
     render(<App />);

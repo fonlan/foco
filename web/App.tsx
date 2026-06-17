@@ -4939,8 +4939,7 @@ export function App() {
                             title: run.title,
                             updatedAt: run.createdAt,
                           }),
-                        )
-                        .sort(compareWorkspaceChatListItemsByCreatedAtDesc);
+                        );
                       const persistedWorkspaceChats: WorkspaceChatListItem[] = workspace.chats.map(
                         (chat) => ({
                           ...chat,
@@ -4951,7 +4950,7 @@ export function App() {
                       const workspaceChats: WorkspaceChatListItem[] = [
                         ...scheduledChats,
                         ...persistedWorkspaceChats,
-                      ];
+                      ].sort(compareWorkspaceChatListItemsByCreatedAtDesc);
                       const visibleChatCount =
                         selectedChatIndex >= configuredVisibleChatCount
                           ? selectedChatIndex + 1
@@ -18733,6 +18732,7 @@ function formatChatCreatedAt(value: string) {
     hour: "2-digit",
     minute: "2-digit",
     month: "short",
+    second: "2-digit",
     year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
   }).format(date);
 }
