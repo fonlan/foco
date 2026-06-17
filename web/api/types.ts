@@ -69,6 +69,11 @@ export type WorkspaceFileContentResponse = {
   path: string;
 };
 
+export type WorkspaceFileSaveResponse = {
+  content: string;
+  path: string;
+};
+
 export type WorkspaceFilesResponse = {
   root: WorkspaceFileTreeNode;
 };

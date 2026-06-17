@@ -13,6 +13,7 @@ import {
   CircleAlert,
   Code2,
   Copy,
+  ClipboardPaste,
   Download,
   Eye,
   EyeOff,
@@ -40,6 +41,9 @@ import {
   PlugZap,
   Plus,
   RefreshCw,
+  Redo2,
+  Save,
+  Scissors,
   Search,
   Send,
   Server,
@@ -49,6 +53,7 @@ import {
   SquareTerminal,
   ScrollText,
   SunMoon,
+  WrapText,
   Terminal,
   Trash2,
   Undo2,
@@ -220,6 +225,7 @@ import type {
   WorkspaceChatListItem,
   WorkspaceCommonCommandSummary,
   WorkspaceFileContentResponse,
+  WorkspaceFileSaveResponse,
   WorkspaceFilesResponse,
   WorkspaceFileTreeNode,
   WorkspaceFormState,
@@ -320,7 +326,10 @@ type MainTabSummary =
 type WorkspaceFileEditorState = {
   content: string;
   error: string | null;
+  isDirty: boolean;
   isLoading: boolean;
+  isSaving: boolean;
+  lastSavedContent: string;
 };
 
 type WorkspaceFileContextMenuState = {
@@ -2366,7 +2375,10 @@ export function App() {
       [editorKey]: current[editorKey] ?? {
         content: "",
         error: null,
+        isDirty: false,
         isLoading: true,
+        isSaving: false,
+        lastSavedContent: "",
       },
     }));
 
@@ -2384,7 +2396,10 @@ export function App() {
         [editorKey]: {
           content: response.content,
           error: null,
+          isDirty: false,
           isLoading: false,
+          isSaving: false,
+          lastSavedContent: response.content,
         },
       }));
     } catch (requestError) {
@@ -2393,11 +2408,104 @@ export function App() {
         [editorKey]: {
           content: current[editorKey]?.content ?? "",
           error: errorMessage(requestError),
+          isDirty: current[editorKey]?.isDirty ?? false,
           isLoading: false,
+          isSaving: false,
+          lastSavedContent: current[editorKey]?.lastSavedContent ?? "",
         },
       }));
     }
   }
+
+  const updateWorkspaceFileEditorContent = useCallback(
+    (workspaceId: string, path: string, content: string) => {
+      const editorKey = workspaceFileEditorKey(workspaceId, path);
+      setWorkspaceFileEditors((current) => {
+        const editor = current[editorKey];
+        if (!editor || editor.content === content) {
+          return current;
+        }
+
+        return {
+          ...current,
+          [editorKey]: {
+            ...editor,
+            content,
+            isDirty: content !== editor.lastSavedContent,
+          },
+        };
+      });
+    },
+    [],
+  );
+
+  const saveWorkspaceFileEditor = useCallback(
+    async (file: OpenFileTab, content: string) => {
+      const editorKey = workspaceFileEditorKey(file.workspaceId, file.path);
+      setWorkspaceFileEditors((current) => {
+        const editor = current[editorKey];
+        if (!editor) {
+          return current;
+        }
+
+        return {
+          ...current,
+          [editorKey]: {
+            ...editor,
+            content,
+            error: null,
+            isSaving: true,
+          },
+        };
+      });
+
+      try {
+        const response = await requestJson<WorkspaceFileSaveResponse>(
+          `/api/workspaces/${encodeURIComponent(file.workspaceId)}/files/save`,
+          {
+            body: JSON.stringify({ content, path: file.path }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
+        setWorkspaceFileEditors((current) => {
+          const editor = current[editorKey];
+          if (!editor) {
+            return current;
+          }
+
+          return {
+            ...current,
+            [editorKey]: {
+              ...editor,
+              content: response.content,
+              error: null,
+              isDirty: false,
+              isSaving: false,
+              lastSavedContent: response.content,
+            },
+          };
+        });
+      } catch (requestError) {
+        setWorkspaceFileEditors((current) => {
+          const editor = current[editorKey];
+          if (!editor) {
+            return current;
+          }
+
+          return {
+            ...current,
+            [editorKey]: {
+              ...editor,
+              error: errorMessage(requestError),
+              isSaving: false,
+            },
+          };
+        });
+      }
+    },
+    [],
+  );
 
   function openPendingChatTab(
     workspaceId: string,
@@ -6015,6 +6123,8 @@ export function App() {
                 <WorkspaceFileEditorPanel
                   editor={activeFileEditor}
                   file={activeFileTab}
+                  onChangeContent={updateWorkspaceFileEditorContent}
+                  onSave={saveWorkspaceFileEditor}
                 />
               ) : (
                 <ChatPanel
@@ -8597,12 +8707,25 @@ function ContextPanel({
 function WorkspaceFileEditorPanel({
   editor,
   file,
+  onChangeContent,
+  onSave,
 }: {
   editor: WorkspaceFileEditorState | null;
   file: OpenFileTab;
+  onChangeContent: (workspaceId: string, path: string, content: string) => void;
+  onSave: (file: OpenFileTab, content: string) => void;
 }) {
   const { t } = useI18n();
   const language = monacoLanguageForPath(file.path);
+  const editorPath = `${file.workspaceId}/${file.path}`;
+  const handleChange = useCallback(
+    (content: string) => onChangeContent(file.workspaceId, file.path, content),
+    [file.path, file.workspaceId, onChangeContent],
+  );
+  const handleSave = useCallback(
+    (content: string) => onSave(file, content),
+    [file, onSave],
+  );
 
   return (
     <section className="workspace-file-editor flex min-h-0 flex-1 flex-col">
@@ -8612,16 +8735,27 @@ function WorkspaceFileEditorPanel({
             <FileText aria-hidden="true" className="size-5" />
           </span>
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold text-stone-950">{file.name}</h2>
+            <h2 className="truncate text-sm font-semibold text-stone-950">
+              {file.name}
+              {editor?.isDirty ? <span aria-hidden="true"> *</span> : null}
+            </h2>
             <p className="truncate text-xs font-medium text-stone-500">{file.path}</p>
           </div>
         </div>
-        {editor?.isLoading ? (
-          <span className="inline-flex items-center gap-2 text-xs font-medium text-stone-500">
-            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-            {t("Loading...")}
-          </span>
-        ) : null}
+        <div className="flex shrink-0 items-center gap-3">
+          {editor?.isSaving ? (
+            <span className="inline-flex items-center gap-2 text-xs font-medium text-stone-500">
+              <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+              {t("Saving...")}
+            </span>
+          ) : null}
+          {editor?.isLoading ? (
+            <span className="inline-flex items-center gap-2 text-xs font-medium text-stone-500">
+              <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+              {t("Loading...")}
+            </span>
+          ) : null}
+        </div>
       </header>
       {editor?.error ? (
         <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
@@ -8630,8 +8764,13 @@ function WorkspaceFileEditorPanel({
       ) : null}
       <div className="workspace-file-editor-body">
         <MonacoFileEditor
+          canSave={!editor?.isLoading && !editor?.isSaving}
+          isDirty={editor?.isDirty ?? false}
+          isSaving={editor?.isSaving ?? false}
           language={language}
-          path={`${file.workspaceId}/${file.path}`}
+          onChange={handleChange}
+          onSave={handleSave}
+          path={editorPath}
           value={editor?.content ?? ""}
         />
       </div>
@@ -8639,18 +8778,82 @@ function WorkspaceFileEditorPanel({
   );
 }
 
+type MonacoFileEditorCommand =
+  | "save"
+  | "cut"
+  | "copy"
+  | "paste"
+  | "undo"
+  | "redo"
+  | "find"
+  | "toggleWordWrap";
+
 function MonacoFileEditor({
+  canSave,
+  isDirty,
+  isSaving,
   language,
+  onChange,
+  onSave,
   path,
   value,
 }: {
+  canSave: boolean;
+  isDirty: boolean;
+  isSaving: boolean;
   language: string;
+  onChange: (value: string) => void;
+  onSave: (value: string) => void;
   path: string;
   value: string;
 }) {
+  const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const modelRef = useRef<monaco.editor.ITextModel | null>(null);
+  const ignoreModelChangeRef = useRef(false);
+  const [wordWrapEnabled, setWordWrapEnabled] = useState(false);
+
+  const focusEditor = useCallback(() => {
+    editorRef.current?.focus();
+  }, []);
+
+  const runEditorCommand = useCallback(
+    (command: MonacoFileEditorCommand) => {
+      const editor = editorRef.current;
+      if (!editor) {
+        return;
+      }
+
+      if (command === "save") {
+        if (canSave) {
+          onSave(editor.getValue());
+        }
+        editor.focus();
+        return;
+      }
+
+      if (command === "toggleWordWrap") {
+        const nextEnabled = !wordWrapEnabled;
+        editor.updateOptions({ wordWrap: nextEnabled ? "on" : "off" });
+        setWordWrapEnabled(nextEnabled);
+        editor.focus();
+        return;
+      }
+
+      const commandIdByAction: Record<Exclude<MonacoFileEditorCommand, "save" | "toggleWordWrap">, string> = {
+        copy: "editor.action.clipboardCopyAction",
+        cut: "editor.action.clipboardCutAction",
+        find: "actions.find",
+        paste: "editor.action.clipboardPasteAction",
+        redo: "redo",
+        undo: "undo",
+      };
+      editor.trigger("workspace-file-toolbar", commandIdByAction[command], null);
+      editor.focus();
+    },
+    [canSave, onSave, wordWrapEnabled],
+  );
 
   useEffect(() => {
     const container = containerRef.current;
@@ -8669,31 +8872,129 @@ function MonacoFileEditor({
       language,
       minimap: { enabled: true },
       model,
-      readOnly: true,
+      readOnly: false,
       scrollBeyondLastLine: false,
       theme: "vs",
-      wordWrap: "off",
+      wordWrap: wordWrapEnabled ? "on" : "off",
     });
+    const changeDisposable = model.onDidChangeContent(() => {
+      if (!ignoreModelChangeRef.current) {
+        onChange(model.getValue());
+      }
+    });
+    editor.addCommand(
+      monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
+      () => {
+        onSave(editor.getValue());
+      },
+    );
     editorRef.current = editor;
     modelRef.current = model;
 
     return () => {
+      changeDisposable.dispose();
       editor.dispose();
       model.dispose();
       editorRef.current = null;
       modelRef.current = null;
     };
-  }, [language, path]);
+  }, [language, onChange, onSave, path]);
 
   useEffect(() => {
     const model = modelRef.current;
     if (!model || model.getValue() === value) {
       return;
     }
+    ignoreModelChangeRef.current = true;
     model.setValue(value);
+    ignoreModelChangeRef.current = false;
   }, [value]);
 
-  return <div className="workspace-file-monaco" ref={containerRef} />;
+  return (
+    <div className="workspace-file-editor-shell">
+      <div aria-label={t("Editor toolbar")} className="workspace-file-editor-toolbar" role="toolbar">
+        <EditorToolbarButton
+          disabled={!canSave || isSaving}
+          icon={Save}
+          isActive={isDirty}
+          label={t("Save")}
+          onClick={() => runEditorCommand("save")}
+        />
+        <span className="workspace-file-editor-toolbar-separator" />
+        <EditorToolbarButton
+          icon={Scissors}
+          label={t("Cut")}
+          onClick={() => runEditorCommand("cut")}
+        />
+        <EditorToolbarButton
+          icon={Copy}
+          label={t("Copy")}
+          onClick={() => runEditorCommand("copy")}
+        />
+        <EditorToolbarButton
+          icon={ClipboardPaste}
+          label={t("Paste")}
+          onClick={() => runEditorCommand("paste")}
+        />
+        <span className="workspace-file-editor-toolbar-separator" />
+        <EditorToolbarButton
+          icon={Undo2}
+          label={t("Undo")}
+          onClick={() => runEditorCommand("undo")}
+        />
+        <EditorToolbarButton
+          icon={Redo2}
+          label={t("Redo")}
+          onClick={() => runEditorCommand("redo")}
+        />
+        <span className="workspace-file-editor-toolbar-separator" />
+        <EditorToolbarButton
+          icon={Search}
+          label={t("Find")}
+          onClick={() => runEditorCommand("find")}
+        />
+        <EditorToolbarButton
+          icon={WrapText}
+          isActive={wordWrapEnabled}
+          label={t("Word wrap")}
+          onClick={() => runEditorCommand("toggleWordWrap")}
+        />
+      </div>
+      <div
+        className="workspace-file-monaco"
+        onMouseDown={focusEditor}
+        ref={containerRef}
+      />
+    </div>
+  );
+}
+
+function EditorToolbarButton({
+  disabled = false,
+  icon: Icon,
+  isActive = false,
+  label,
+  onClick,
+}: {
+  disabled?: boolean;
+  icon: LucideIcon;
+  isActive?: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      aria-label={label}
+      aria-pressed={isActive || undefined}
+      className={`workspace-file-editor-toolbar-button ${isActive ? "workspace-file-editor-toolbar-button-active" : ""}`}
+      disabled={disabled}
+      onClick={onClick}
+      title={label}
+      type="button"
+    >
+      <Icon aria-hidden="true" className="size-4" />
+    </button>
+  );
 }
 
 function WorkspaceFilesTab({

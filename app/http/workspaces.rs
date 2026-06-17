@@ -95,6 +95,41 @@ pub(crate) async fn workspace_file_content(
     }))
 }
 
+pub(crate) async fn save_workspace_file(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Json(request): Json<SaveWorkspaceFileRequest>,
+) -> Result<Json<WorkspaceFileSaveResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let path = workspace_file_path(&workspace.path, &request.path)?;
+    let metadata = fs::metadata(&path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "workspace file was not found: {}: {}",
+            request.path, source
+        ))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "workspace path is not a file: {}",
+            request.path
+        )));
+    }
+
+    fs::write(&path, request.content.as_bytes()).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to save workspace file {}: {}",
+            request.path, source
+        ))
+    })?;
+
+    Ok(Json(WorkspaceFileSaveResponse {
+        content: request.content,
+        path: request.path,
+    }))
+}
+
 pub(crate) async fn rename_workspace_file(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
