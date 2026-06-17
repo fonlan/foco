@@ -3021,6 +3021,17 @@ fn session_code_changed_files_excludes_preexisting_dirty_content() {
 }
 
 #[test]
+fn text_code_change_stats_ignores_line_ending_only_changes() {
+    let old = normalize_line_endings_for_code_change_stats("one\ntwo\nthree\n");
+    let new = normalize_line_endings_for_code_change_stats("one\r\ntwo\r\nthree\r\n");
+
+    let stats = text_code_change_stats(&old, &new);
+
+    assert_eq!(stats.additions, 0);
+    assert_eq!(stats.deletions, 0);
+}
+
+#[test]
 fn git_diff_summary_uses_chinese_heading_for_chinese_language() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-zh-diff-summary-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");

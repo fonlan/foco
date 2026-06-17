@@ -11530,8 +11530,12 @@ fn session_code_changed_files_for_workspace(
             continue;
         }
         let stats = text_code_change_stats(
-            baseline_content.as_deref().unwrap_or_default(),
-            current_content.as_deref().unwrap_or_default(),
+            &normalize_line_endings_for_code_change_stats(
+                baseline_content.as_deref().unwrap_or_default(),
+            ),
+            &normalize_line_endings_for_code_change_stats(
+                current_content.as_deref().unwrap_or_default(),
+            ),
         );
         if stats.additions == 0 && stats.deletions == 0 {
             continue;
@@ -11587,6 +11591,10 @@ fn is_safe_relative_path(path: &str) -> bool {
             Component::Normal(_) | Component::CurDir
         )
     })
+}
+
+fn normalize_line_endings_for_code_change_stats(content: &str) -> String {
+    content.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn text_code_change_stats(old: &str, new: &str) -> CodeChangeStats {
