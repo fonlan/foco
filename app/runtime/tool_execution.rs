@@ -23,7 +23,7 @@ use tokio::time::timeout;
 use super::{
     AskQuestionInput, QuestionAnswer, QuestionItem, QuestionItemAnswer, QuestionOption,
     QuestionRegistry, QuestionRequest, ToolOutputDeltaSink, ToolResourceLease,
-    ToolResourceLockRegistry,
+    ToolResourceLockRegistry, execute_web_tool, is_web_tool_name, web_tool_timeout_ms,
 };
 use crate::*;
 

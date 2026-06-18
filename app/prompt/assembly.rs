@@ -3,6 +3,7 @@ use crate::memory_runtime::{
     memory_retrieval_query_text, neutral_messages_from_record,
     stored_turn_memory_messages_by_sequence,
 };
+use crate::runtime::web_search_enabled;
 use crate::*;
 
 pub(crate) async fn prepare_prompt_context(
