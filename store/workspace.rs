@@ -723,14 +723,24 @@ impl WorkspaceDatabase {
                     )
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                  ON CONFLICT(id) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    run_id = excluded.run_id,
                     message_id = excluded.message_id,
+                    tool_name = excluded.tool_name,
+                    input_json = excluded.input_json,
                     status = excluded.status,
                     started_at = excluded.started_at,
                     completed_at = excluded.completed_at
-                 WHERE tool_calls.chat_id = excluded.chat_id
-                    AND tool_calls.run_id = excluded.run_id
-                    AND tool_calls.tool_name = excluded.tool_name
-                    AND tool_calls.input_json = excluded.input_json",
+                 WHERE NOT EXISTS (
+                    SELECT 1 FROM tool_results
+                    WHERE tool_results.tool_call_id = tool_calls.id
+                 )
+                    OR (
+                        tool_calls.chat_id = excluded.chat_id
+                        AND tool_calls.run_id = excluded.run_id
+                        AND tool_calls.tool_name = excluded.tool_name
+                        AND tool_calls.input_json = excluded.input_json
+                    )",
                 params![
                     tool_call.id,
                     tool_call.chat_id,
@@ -747,7 +757,7 @@ impl WorkspaceDatabase {
         if changed == 0 {
             return Err(WorkspaceDatabaseError::InvalidToolCall {
                 message: format!(
-                    "tool call '{}' already exists with a different chat, run, name, or input",
+                    "tool call '{}' already exists with a completed tool result and a different chat, run, name, or input",
                     tool_call.id
                 ),
             });

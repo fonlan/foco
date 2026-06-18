@@ -12,8 +12,8 @@ use foco_store::{
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
         NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
         TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome,
-        WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, initialize_workspace_databases,
-        workspace_database_path,
+        WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, WorkspaceDatabaseError,
+        initialize_workspace_databases, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -983,6 +983,213 @@ fn repository_helpers_round_trip_tool_calls_and_results() {
     let output: Value = serde_json::from_str(&result.output_json).expect("output json");
     assert_eq!(output["content"], "hello");
     assert_eq!(output["authorization"], "[REDACTED]");
+}
+
+#[test]
+fn upsert_tool_call_overwrites_incomplete_stub_with_different_run_or_input() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Tool chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Tool calls.",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("assistant message insert");
+
+    // A prior run persisted a tool call stub that was cancelled before its
+    // result arrived, leaving an incomplete row under the old run id.
+    database
+        .upsert_tool_call(NewToolCall {
+            id: "call-stub",
+            chat_id: "chat-1",
+            run_id: "run-old",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"OLD.md"}"#,
+            status: "cancelled",
+            started_at: "2026-06-18T14:10:00.000Z",
+            completed_at: Some("2026-06-18T14:10:05.000Z"),
+        })
+        .expect("cancelled stub upsert");
+
+    // The new run reuses the same provider call id with a different run and
+    // different input. Because the stub has no tool result, it must be
+    // overwritten rather than rejected.
+    database
+        .upsert_tool_call(NewToolCall {
+            id: "call-stub",
+            chat_id: "chat-1",
+            run_id: "run-new",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"NEW.md"}"#,
+            status: "running",
+            started_at: "2026-06-18T14:17:00.000Z",
+            completed_at: None,
+        })
+        .expect("overwrite incomplete stub");
+
+    let records = database
+        .tool_calls_for_chat("chat-1")
+        .expect("tool calls for chat");
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.run_id, "run-new");
+    assert_eq!(record.status, "running");
+    let input: Value = serde_json::from_str(&record.input_json).expect("input json");
+    assert_eq!(input["path"], "NEW.md");
+    assert!(record.result.is_none());
+}
+
+#[test]
+fn upsert_tool_call_rejects_overwrite_of_call_with_completed_result() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Tool chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Tool calls.",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("assistant message insert");
+
+    // A genuinely completed tool call (has a tool result) is audit history and
+    // must not be clobbered by a later attempt with a different run or input.
+    database
+        .upsert_tool_call(NewToolCall {
+            id: "call-done",
+            chat_id: "chat-1",
+            run_id: "run-old",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md"}"#,
+            status: "completed",
+            started_at: "2026-06-18T14:10:00.000Z",
+            completed_at: Some("2026-06-18T14:10:01.000Z"),
+        })
+        .expect("completed tool call upsert");
+    database
+        .upsert_tool_result(NewToolResult {
+            id: "call-done-result",
+            tool_call_id: "call-done",
+            output_json: r#"{"content":"hello"}"#,
+            is_error: false,
+            created_at: "2026-06-18T14:10:01.000Z",
+        })
+        .expect("tool result upsert");
+
+    let error = database
+        .upsert_tool_call(NewToolCall {
+            id: "call-done",
+            chat_id: "chat-1",
+            run_id: "run-new",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"DIFFERENT.md"}"#,
+            status: "running",
+            started_at: "2026-06-18T14:17:00.000Z",
+            completed_at: None,
+        })
+        .expect_err("overwrite of completed tool call must be rejected");
+    assert!(
+        matches!(error, WorkspaceDatabaseError::InvalidToolCall { .. }),
+        "expected InvalidToolCall, got {error:?}"
+    );
+
+    let records = database
+        .tool_calls_for_chat("chat-1")
+        .expect("tool calls for chat");
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.run_id, "run-old");
+    assert_eq!(record.status, "completed");
+    let input: Value = serde_json::from_str(&record.input_json).expect("input json");
+    assert_eq!(input["path"], "README.md");
+    assert!(record.result.is_some());
+}
+
+#[test]
+fn upsert_tool_call_promotes_status_for_completed_call_with_matching_identity() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Tool chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Tool calls.",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("assistant message insert");
+
+    // The streaming path writes the call as running under the chat run id.
+    database
+        .upsert_tool_call(NewToolCall {
+            id: "call-promote",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md"}"#,
+            status: "running",
+            started_at: "2026-06-18T14:10:00.000Z",
+            completed_at: None,
+        })
+        .expect("running tool call upsert");
+    database
+        .upsert_tool_result(NewToolResult {
+            id: "call-promote-result",
+            tool_call_id: "call-promote",
+            output_json: r#"{"content":"hello"}"#,
+            is_error: false,
+            created_at: "2026-06-18T14:10:01.000Z",
+        })
+        .expect("tool result upsert");
+    // The finalize path re-upserts the same call (same chat, run, name, input)
+    // to promote its status to completed even though a result now exists.
+    database
+        .upsert_tool_call(NewToolCall {
+            id: "call-promote",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md"}"#,
+            status: "completed",
+            started_at: "2026-06-18T14:10:00.000Z",
+            completed_at: Some("2026-06-18T14:10:01.000Z"),
+        })
+        .expect("identity-matched status promotion");
+
+    let records = database
+        .tool_calls_for_chat("chat-1")
+        .expect("tool calls for chat");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, "completed");
+    assert!(records[0].result.is_some());
 }
 
 #[test]
