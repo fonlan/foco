@@ -8786,34 +8786,6 @@ function WorkspaceFileEditorPanel({
 
   return (
     <section className="workspace-file-editor flex min-h-0 flex-1 flex-col">
-      <header className="workspace-file-editor-header">
-        <div className="flex min-w-0 items-center gap-2">
-          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-700">
-            <FileText aria-hidden="true" className="size-5" />
-          </span>
-          <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold text-stone-950">
-              {file.name}
-              {editor?.isDirty ? <span aria-hidden="true"> *</span> : null}
-            </h2>
-            <p className="truncate text-xs font-medium text-stone-500">{file.path}</p>
-          </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-3">
-          {editor?.isSaving ? (
-            <span className="inline-flex items-center gap-2 text-xs font-medium text-stone-500">
-              <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-              {t("Saving...")}
-            </span>
-          ) : null}
-          {editor?.isLoading ? (
-            <span className="inline-flex items-center gap-2 text-xs font-medium text-stone-500">
-              <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-              {t("Loading...")}
-            </span>
-          ) : null}
-        </div>
-      </header>
       {editor?.error ? (
         <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
           {editor.error}
