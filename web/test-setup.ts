@@ -82,6 +82,16 @@ Object.defineProperty(window.HTMLElement.prototype, "scrollIntoView", {
   value: vi.fn(),
 });
 
+Object.defineProperty(window.HTMLElement.prototype, "setPointerCapture", {
+  configurable: true,
+  value: vi.fn(),
+});
+
+Object.defineProperty(window.HTMLElement.prototype, "releasePointerCapture", {
+  configurable: true,
+  value: vi.fn(),
+});
+
 Object.defineProperty(window.HTMLCanvasElement.prototype, "getContext", {
   configurable: true,
   value: vi.fn(() => null),

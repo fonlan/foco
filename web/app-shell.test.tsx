@@ -441,6 +441,64 @@ describe("app-shell verification surfaces", () => {
     });
   });
 
+  it("resizes the context panel height on mobile browsers", async () => {
+    const originalInnerWidth = window.innerWidth;
+    const originalInnerHeight = window.innerHeight;
+
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 390,
+    });
+    Object.defineProperty(window, "innerHeight", {
+      configurable: true,
+      value: 844,
+    });
+
+    try {
+      renderApp();
+      await screen.findByPlaceholderText(defaultComposerPlaceholder);
+      await userEvent.click(await screen.findByRole("button", { name: "Open context panel" }));
+
+      const splitter = await screen.findByRole("separator", {
+        name: "Resize context panel",
+      });
+      const appShell = splitter.closest(".app-shell") as HTMLElement | null;
+      if (!appShell) {
+        throw new Error("Expected context panel splitter inside app shell");
+      }
+
+      fireEvent.pointerDown(splitter, { clientY: 620, pointerId: 1 });
+
+      await waitFor(() => {
+        expect(document.body.style.cursor).toBe("row-resize");
+        expect(document.body.style.userSelect).toBe("none");
+        expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe("224px");
+      });
+
+      fireEvent.pointerMove(window, { clientY: 560 });
+
+      await waitFor(() => {
+        expect(appShell.style.getPropertyValue("--context-panel-mobile-height")).toBe("284px");
+      });
+
+      fireEvent.pointerUp(window);
+
+      await waitFor(() => {
+        expect(document.body.style.cursor).toBe("");
+        expect(document.body.style.userSelect).toBe("");
+      });
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+      Object.defineProperty(window, "innerHeight", {
+        configurable: true,
+        value: originalInnerHeight,
+      });
+    }
+  });
+
   it("prompts to install ripgrep when the search dependency is missing", async () => {
     const missingRipgrepSettings = {
       ...settings,
