@@ -6,12 +6,16 @@ use foco_agent::{
     ToolResource, ToolResourceAccess, ToolResourceLock, context_compression_trigger_tokens,
 };
 use foco_store::{
-    config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PromptSettings},
+    config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PromptSettings, WebSearchSettings},
+    memory::{
+        MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, NewMemoryExtractionJob,
+        NewMemoryFact, NewMemorySource,
+    },
     workspace::{LlmRequestAuditFilters, NewTerminalSession},
 };
 use foco_tools::{
     GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL, READ_FILE_TOOL, SEARCH_TEXT_TOOL,
-    ToolCancellationToken,
+    ToolCancellationToken, WEB_FETCH_TOOL, WEB_SEARCH_TOOL,
 };
 use serde_json::json;
 
@@ -20,8 +24,13 @@ use crate::http::{
     workspaces::add_workspace,
 };
 use crate::memory_runtime::{
-    llm_memory_retrieval_candidates, memory_prompt_search, memory_prompt_search_terms,
-    memory_retrieval_query_text, neutral_messages_from_record, resolve_prompt_context_memory,
+    MemoryExtractionEvidenceCandidate, MemoryExtractionTask, MemorySearchToolInput,
+    MemoryWriteToolInput, execute_memory_search_tool, execute_memory_write_tool,
+    llm_memory_retrieval_candidates, memory_extraction_existing_memory_candidates,
+    memory_extraction_provider_request, memory_extraction_target_status, memory_prompt_search,
+    memory_prompt_search_terms, memory_retrieval_query_text, neutral_messages_from_record,
+    parse_memory_extraction_output, resolve_prompt_context_memory, should_queue_memory_extraction,
+    store_extracted_memory_facts, validate_extracted_memory_facts,
 };
 use crate::prompt::{
     compress_all_runtime_tool_state, compress_runtime_tool_state_if_needed, context_message_groups,
@@ -2369,6 +2378,140 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
 }
 
 #[test]
+fn historical_chat_materializes_interleaved_parts_once_from_audit_events() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-history-parts-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "History order")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Before.After.",
+            sequence: 0,
+            metadata_json: Some(r#"{"reasoning":"Think one.Think two."}"#),
+        })
+        .expect("assistant insert");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-1",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-1"),
+            provider_id: "openai-responses",
+            model_id: "gpt-test",
+            request_started_at: "2026-06-18T10:00:00Z",
+            first_token_at: Some("2026-06-18T10:00:00Z"),
+            completed_at: Some("2026-06-18T10:00:01Z"),
+            input_tokens: Some(10),
+            output_tokens: Some(10),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            first_token_latency_ms: Some(10),
+            total_latency_ms: Some(1000),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: Some("{}"),
+            response_body_json: Some("{}"),
+        })
+        .expect("request insert");
+    for (sequence, event_type, value) in [
+        (0, "start", json!({ "assistantMessageId": "assistant-1" })),
+        (
+            1,
+            "reasoning_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Think one." }),
+        ),
+        (
+            2,
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Before." }),
+        ),
+        (
+            3,
+            "tool_call",
+            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-1" } }),
+        ),
+        (
+            4,
+            "reasoning_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Think two." }),
+        ),
+        (
+            5,
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "After." }),
+        ),
+        (6, "completion", json!({})),
+    ] {
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: &format!("event-{sequence}"),
+                llm_request_id: "request-1",
+                sequence,
+                event_at: "2026-06-18T10:00:00Z",
+                event_type,
+                raw_chunk_json: None,
+                normalized_event_json: &value.to_string(),
+            })
+            .expect("event insert");
+    }
+    database
+        .insert_tool_call(NewToolCall {
+            id: "tool-1",
+            chat_id: "chat-1",
+            run_id: "request-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md"}"#,
+            status: "completed",
+            started_at: "2026-06-18T10:00:00Z",
+            completed_at: Some("2026-06-18T10:00:01Z"),
+        })
+        .expect("tool insert");
+    database
+        .insert_tool_result(NewToolResult {
+            id: "tool-result-1",
+            tool_call_id: "tool-1",
+            output_json: r#"{"content":"large result"}"#,
+            is_error: false,
+            created_at: "2026-06-18T10:00:01Z",
+        })
+        .expect("tool result insert");
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
+        .into_iter()
+        .next()
+        .expect("assistant summary");
+    assert!(
+        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text } if text == "Think one.")
+    );
+    assert!(matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Before."));
+    assert!(
+        matches!(&summary.parts[2], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-1")
+    );
+    assert!(
+        matches!(&summary.parts[3], ChatMessagePart::Reasoning { text } if text == "Think two.")
+    );
+    assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "After."));
+
+    let saved = database
+        .message("assistant-1")
+        .expect("saved message read")
+        .expect("saved message");
+    assert!(saved.metadata_json.contains(r#""tool_call_id":"tool-1""#));
+    assert!(!saved.metadata_json.contains("large result"));
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn workspace_logo_file_detects_manual_logo_png() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-test"));
     let logo_dir = workspace_dir.join(".foco");
@@ -3952,7 +4095,7 @@ fn chat_message_summary_includes_assistant_reply_metrics() {
         .expect("llm start event insert");
 
     let messages = database.messages_for_chat("chat-1").expect("messages");
-    let summary = chat_message_summaries(&database, &workspace_dir, None, "chat-1", messages)
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
         .expect("message summaries")
         .into_iter()
         .next()
@@ -4023,7 +4166,7 @@ fn chat_message_summary_includes_assistant_extracted_memories() {
         .expect("memory fact insert");
 
     let messages = database.messages_for_chat("chat-1").expect("messages");
-    let summary = chat_message_summaries(&database, &workspace_dir, None, "chat-1", messages)
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
         .expect("message summaries")
         .into_iter()
         .next()
@@ -4108,7 +4251,7 @@ fn chat_message_summary_aggregates_multiple_llm_request_metrics() {
     }
 
     let messages = database.messages_for_chat("chat-1").expect("messages");
-    let summary = chat_message_summaries(&database, &workspace_dir, None, "chat-1", messages)
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
         .expect("message summaries")
         .into_iter()
         .next()

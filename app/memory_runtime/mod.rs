@@ -35,8 +35,8 @@ pub(crate) use retrieval::{
 pub(crate) use tools::memory_retrieval_tool_definition;
 #[cfg(test)]
 pub(crate) use tools::{
-    MemorySearchMatch, collect_memory_search_matches, execute_memory_search_tool,
-    execute_memory_write_tool, memory_extraction_tool_definition, memory_retrieval_tool_definition,
+    MemorySearchMatch, MemorySearchToolInput, MemoryWriteToolInput, collect_memory_search_matches,
+    execute_memory_search_tool, execute_memory_write_tool, memory_extraction_tool_definition,
     memory_search_fact_matches_scope, memory_tool_timeout_ms_from_input, push_memory_search_match,
 };
 pub(crate) use tools::{

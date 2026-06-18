@@ -621,6 +621,17 @@ fn repository_helpers_round_trip_core_records() {
         .expect("messages for chat after inserted upsert");
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[1].content, "Streaming reply");
+    database
+        .update_message_metadata(
+            "message-2",
+            r#"{"parts":[{"type":"text","text":"Streaming reply"}]}"#,
+        )
+        .expect("message metadata update");
+    let updated_message = database
+        .message("message-2")
+        .expect("updated message read")
+        .expect("updated message");
+    assert!(updated_message.metadata_json.contains("Streaming reply"));
 
     database
         .insert_run_event(NewRunEvent {

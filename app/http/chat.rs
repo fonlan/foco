@@ -395,7 +395,7 @@ pub(crate) async fn chat_messages(
         .iter()
         .find(|workspace| workspace.id == workspace_id)
         .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
 
     if database
@@ -412,7 +412,7 @@ pub(crate) async fn chat_messages(
         .messages_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?;
     let messages = chat_message_summaries(
-        &database,
+        &mut database,
         &workspace.path,
         Some(&state.memory_database_file),
         chat_id,
