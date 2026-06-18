@@ -1890,7 +1890,7 @@ pub(crate) fn prompt_context_source_bucket_label(
 
 pub(crate) fn context_usage_response(
     context: &PreparedPromptContext,
-    latest_response_usage: Option<&NeutralUsage>,
+    latest_response_usage: &NeutralUsage,
 ) -> Result<ContextUsageResponse, ApiError> {
     let message_groups = context_message_groups(
         &context.provider_request.messages,
@@ -1899,16 +1899,16 @@ pub(crate) fn context_usage_response(
         context.active_tool_start_index,
     )?;
     let pack_items = pack_items_from_message_groups(&message_groups);
-    let estimated_message_tokens = pack_items
-        .iter()
-        .map(|item| item.estimated_tokens)
-        .sum::<u64>();
-    let used_message_tokens = match latest_response_usage {
-        Some(usage) => context_used_message_tokens_from_response_usage(context, usage)?,
-        None => estimated_message_tokens,
-    };
-    let available_message_tokens = context.context_budget.available_message_tokens;
-    let compression_trigger_tokens = context_compression_trigger_tokens(available_message_tokens);
+    let used_message_tokens =
+        context_used_message_tokens_from_response_usage(latest_response_usage)?;
+    let available_message_tokens = context.context_budget.context_window;
+    let compression_trigger_tokens = context
+        .context_budget
+        .system_prompt_tokens
+        .saturating_add(context.context_budget.tool_schema_tokens)
+        .saturating_add(context_compression_trigger_tokens(
+            context.context_budget.available_message_tokens,
+        ));
     let usage_percent = percentage_ceil(used_message_tokens, available_message_tokens);
     let compression_trigger_percent =
         percentage_ceil(compression_trigger_tokens, available_message_tokens);
@@ -1934,10 +1934,7 @@ pub(crate) fn context_usage_response(
     })
 }
 
-fn context_used_message_tokens_from_response_usage(
-    context: &PreparedPromptContext,
-    usage: &NeutralUsage,
-) -> Result<u64, ApiError> {
+fn context_used_message_tokens_from_response_usage(usage: &NeutralUsage) -> Result<u64, ApiError> {
     let input_tokens = usage
         .input_tokens
         .ok_or_else(|| ApiError::bad_request("latestResponseUsage.inputTokens is required"))?;
@@ -1948,14 +1945,7 @@ fn context_used_message_tokens_from_response_usage(
         .ok_or_else(|| ApiError::bad_request("latestResponseUsage.outputTokens is required"))?;
     let output_tokens =
         non_negative_context_usage_token(output_tokens, "latestResponseUsage.outputTokens")?;
-    let request_overhead_tokens = context
-        .context_budget
-        .system_prompt_tokens
-        .saturating_add(context.context_budget.tool_schema_tokens);
-
-    Ok(input_tokens
-        .saturating_sub(request_overhead_tokens)
-        .saturating_add(output_tokens))
+    Ok(input_tokens.saturating_add(output_tokens))
 }
 
 fn non_negative_context_usage_token(value: i64, field_name: &str) -> Result<u64, ApiError> {

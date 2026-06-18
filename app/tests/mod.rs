@@ -6139,9 +6139,18 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     )
     .await
     .expect("prompt context");
-    let usage = context_usage_response(&prompt_context, None).expect("context usage");
+    let usage = context_usage_response(
+        &prompt_context,
+        &NeutralUsage {
+            input_tokens: Some(1_500),
+            output_tokens: Some(250),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+        },
+    )
+    .expect("context usage from response usage");
 
-    assert!(usage.used_message_tokens > 0);
+    assert_eq!(usage.used_message_tokens, 1_750);
     assert!(usage.memory_context_tokens > 0);
     assert_eq!(
         usage.memory_context_tokens,
@@ -6153,53 +6162,21 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
     );
     assert_eq!(
         usage.compression_trigger_tokens,
-        context_compression_trigger_tokens(usage.available_message_tokens)
-    );
-    assert_eq!(usage.compression_trigger_percent, 80);
-    let prompt_context_with_assistant = prepare_prompt_context(
-        &state,
-        &config,
-        &config.workspaces[0].id,
-        PromptContextRequest {
-            queued_user_message_id: None,
-            chat_id: None,
-            model_id: "model".to_string(),
-            provider_id: None,
-            thinking_level: None,
-            skill_ids: None,
-            message: Some("Preview workspace memory usage".to_string()),
-            assistant_draft: Some("Streaming assistant reply adds context.".to_string()),
-            assistant_draft_reasoning: Some("Streaming reasoning also adds context.".to_string()),
-            attachments: Vec::new(),
-        },
-        None,
-        PromptAssemblyPurpose::ContextPreview,
-    )
-    .await
-    .expect("prompt context with assistant draft");
-    let usage_with_assistant =
-        context_usage_response(&prompt_context_with_assistant, None).expect("context usage");
-    assert!(usage_with_assistant.used_message_tokens > usage.used_message_tokens);
-
-    let response_input_tokens = prompt_context_with_assistant
-        .context_budget
-        .system_prompt_tokens
-        + prompt_context_with_assistant
+        prompt_context
             .context_budget
-            .tool_schema_tokens
-        + 1_500;
-    let usage_from_response = context_usage_response(
-        &prompt_context_with_assistant,
-        Some(&NeutralUsage {
-            input_tokens: Some(response_input_tokens as i64),
-            output_tokens: Some(250),
-            cache_read_tokens: Some(0),
-            cache_write_tokens: Some(0),
-        }),
-    )
-    .expect("context usage from response usage");
-    assert_eq!(usage_from_response.used_message_tokens, 1_750);
-
+            .system_prompt_tokens
+            .saturating_add(prompt_context.context_budget.tool_schema_tokens)
+            .saturating_add(context_compression_trigger_tokens(
+                prompt_context.context_budget.available_message_tokens
+            ))
+    );
+    assert_eq!(
+        usage.compression_trigger_percent,
+        usage
+            .compression_trigger_tokens
+            .saturating_mul(100)
+            .div_ceil(usage.available_message_tokens)
+    );
     let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     assert!(database.chats().expect("chat list").is_empty());
     let memory_database =

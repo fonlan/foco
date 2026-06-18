@@ -1622,12 +1622,7 @@ struct ContextUsageRequest {
     provider_id: Option<String>,
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
-    draft_message: Option<String>,
-    assistant_draft: Option<String>,
-    assistant_draft_reasoning: Option<String>,
-    latest_response_usage: Option<NeutralUsage>,
-    #[serde(default)]
-    attachments: Vec<ChatAttachmentInput>,
+    latest_response_usage: NeutralUsage,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1722,10 +1717,10 @@ impl ContextUsageRequest {
             provider_id: self.provider_id,
             thinking_level: self.thinking_level,
             skill_ids: self.skill_ids,
-            message: optional_trimmed_string(self.draft_message),
-            assistant_draft: self.assistant_draft,
-            assistant_draft_reasoning: self.assistant_draft_reasoning,
-            attachments: self.attachments,
+            message: None,
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
         }
     }
 }

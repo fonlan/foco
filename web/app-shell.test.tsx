@@ -608,30 +608,22 @@ describe("app-shell verification surfaces", () => {
     ).toBe(false);
   });
 
-  it("loads opened chat context usage without recomputing while drafting", async () => {
+  it("does not estimate context usage for opened chats or composer drafts", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
     await userEvent.click(await screen.findByText("Tool run"));
     const usage = await screen.findByRole("status", {
-      name: "Context usage 47%",
+      name: "Context usage 0%",
     });
-    expect(usage).toHaveTextContent("47%");
+    expect(usage).toHaveTextContent("0%");
 
     const usageCallsBeforeDraft = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCallsBeforeDraft.length).toBeGreaterThan(0);
-    const [, init] = usageCallsBeforeDraft.at(-1)!;
-    expect(typeof init?.body).toBe("string");
-    expect(JSON.parse(init?.body as string)).toMatchObject({
-      assistantDraft: null,
-      assistantDraftReasoning: null,
-      chatId: "chat-1",
-      draftMessage: null,
-    });
+    expect(usageCallsBeforeDraft).toHaveLength(0);
 
     await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
 

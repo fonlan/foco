@@ -207,7 +207,7 @@ pub(crate) async fn context_usage(
 
     Ok(Json(context_usage_response(
         &prompt_context,
-        latest_response_usage.as_ref(),
+        &latest_response_usage,
     )?))
 }
 

@@ -5,7 +5,6 @@ import type { SettingsSection } from "../api/types";
 export const DEFAULT_SYSTEM_PROMPT_NAME = "Default";
 export const CREATE_BRANCH_OPTION_VALUE = "__create_branch__";
 export const CHAT_BOTTOM_LOCK_THRESHOLD_PX = 24;
-export const STREAM_CONTEXT_USAGE_REFRESH_DELAY_MS = 1200;
 export const WORKSPACE_CHAT_HISTORY_PAGE_SIZE = 5;
 export const WORKSPACE_CHAT_CONTEXT_MENU_LONG_PRESS_MS = 520;
 export const WORKSPACE_SIDEBAR_MIN_WIDTH = 232;

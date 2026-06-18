@@ -497,14 +497,7 @@ export type ContextUsageRefreshRequest = {
   providerId: string;
   thinkingLevel: string;
   skillIds: string[];
-  assistantDraft: string;
-  assistantDraftReasoning: string;
-  latestResponseUsage: ChatUsage | null;
-};
-
-export type ScheduledContextUsageRefresh = {
-  request: ContextUsageRefreshRequest;
-  timeoutId: number;
+  latestResponseUsage: ChatUsage;
 };
 
 export type ContextMemoryScopeState = {

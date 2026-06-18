@@ -37,8 +37,8 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
     expect(
-      await screen.findByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+      await screen.findByRole("status", { name: "Context usage 0%" }),
+    ).toHaveTextContent("0%");
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
       "continue",
@@ -47,8 +47,8 @@ describe("app-chat-stream verification surfaces", () => {
     await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
 
     expect(
-      screen.getByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+      screen.getByRole("status", { name: "Context usage 0%" }),
+    ).toHaveTextContent("0%");
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
@@ -58,25 +58,14 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(
-      await screen.findByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+      await screen.findByRole("status", { name: "Context usage 0%" }),
+    ).toHaveTextContent("0%");
     const usageCalls = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCalls.length).toBeGreaterThan(0);
-    const [, init] = usageCalls.at(-1)!;
-    expect(typeof init?.body).toBe("string");
-    expect(JSON.parse(init?.body as string)).toMatchObject({
-      assistantDraftReasoning: null,
-      chatId: "chat-1",
-      draftMessage: null,
-      latestResponseUsage: null,
-    });
-    expect(JSON.parse(init?.body as string).assistantDraft).not.toBe(
-      "Partial answer.",
-    );
+    expect(usageCalls).toHaveLength(0);
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -101,10 +90,7 @@ describe("app-chat-stream verification surfaces", () => {
     const [, usageInit] = usageCallsAfterUsage.at(-1)!;
     expect(typeof usageInit?.body).toBe("string");
     expect(JSON.parse(usageInit?.body as string)).toMatchObject({
-      assistantDraft: "Partial answer.",
-      assistantDraftReasoning: null,
       chatId: "chat-1",
-      draftMessage: null,
       latestResponseUsage: {
         cacheReadTokens: 0,
         cacheWriteTokens: 0,
@@ -139,38 +125,28 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    await waitFor(() => {
-      const usageCallsAfterComplete = fetchMock.mock.calls.filter(
-        ([url]) =>
-          typeof url === "string" &&
-          url === "/api/workspaces/workspace-1/context-usage",
-      );
-      expect(usageCallsAfterComplete.length).toBeGreaterThan(
-        usageCallCountBeforeComplete,
-      );
-      const [, completeUsageInit] = usageCallsAfterComplete.at(-1)!;
-      expect(typeof completeUsageInit?.body).toBe("string");
-      expect(JSON.parse(completeUsageInit?.body as string)).toMatchObject({
-        assistantDraft: null,
-        assistantDraftReasoning: null,
-        chatId: "chat-1",
-        draftMessage: null,
-        latestResponseUsage: null,
-      });
-    });
+    const usageCallsAfterComplete = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    );
+    expect(usageCallsAfterComplete).toHaveLength(usageCallCountBeforeComplete);
+    expect(
+      screen.getByRole("status", { name: "Context usage 64%" }),
+    ).toHaveTextContent("64%");
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
     });
   });
 
-  it("coalesces streaming draft context usage refreshes", async () => {
+  it("does not estimate context usage from streaming deltas", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
     expect(
-      await screen.findByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+      await screen.findByRole("status", { name: "Context usage 0%" }),
+    ).toHaveTextContent("0%");
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
       "continue",
@@ -184,95 +160,29 @@ describe("app-chat-stream verification surfaces", () => {
         url === "/api/workspaces/workspace-1/context-usage",
     ).length;
 
-    const originalSetTimeout = window.setTimeout.bind(window);
-    const originalClearTimeout = window.clearTimeout.bind(window);
-    let scheduledRefresh: (() => void) | null = null;
-    type WindowSetTimeout = typeof window.setTimeout;
-    type WindowSetTimeoutReturn = ReturnType<WindowSetTimeout>;
-    const scheduledRefreshTimeoutHandle =
-      Symbol("context-usage-refresh") as unknown as WindowSetTimeoutReturn;
-    let scheduledRefreshTimeout: WindowSetTimeoutReturn | null = null;
-    let scheduledRefreshCount = 0;
-    let cancelledScheduledRefreshCount = 0;
-    const setTimeoutSpy = vi
-      .spyOn(window, "setTimeout")
-      .mockImplementation((
-        handler: Parameters<WindowSetTimeout>[0],
-        timeout?: Parameters<WindowSetTimeout>[1],
-        ...args: unknown[]
-      ): WindowSetTimeoutReturn => {
-        if (timeout === 1200 && typeof handler === "function") {
-          scheduledRefreshCount += 1;
-          scheduledRefresh = () => handler(...args);
-          scheduledRefreshTimeout = scheduledRefreshTimeoutHandle;
-          return scheduledRefreshTimeoutHandle;
-        }
-
-        return originalSetTimeout(
-          handler as (...handlerArgs: unknown[]) => void,
-          timeout,
-          ...args,
-        ) as unknown as WindowSetTimeoutReturn;
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Part one. ",
+        type: "textDelta",
       });
-    const clearTimeoutSpy = vi
-      .spyOn(window, "clearTimeout")
-      .mockImplementation((timeoutId) => {
-        if (timeoutId === scheduledRefreshTimeout) {
-          cancelledScheduledRefreshCount += 1;
-        } else {
-          originalClearTimeout(timeoutId);
-        }
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Part two.",
+        type: "textDelta",
       });
-    try {
-      await act(async () => {
-        enqueueChatStreamEvent({
-          assistantMessageId: "message-assistant-stream",
-          delta: "Part one. ",
-          type: "textDelta",
-        });
-        enqueueChatStreamEvent({
-          assistantMessageId: "message-assistant-stream",
-          delta: "Part two.",
-          type: "textDelta",
-        });
-      });
-      expect(setTimeoutSpy).toHaveBeenCalled();
-      expect(scheduledRefreshCount).toBe(1);
-      expect(cancelledScheduledRefreshCount).toBe(0);
-      expect(scheduledRefresh).not.toBeNull();
+    });
 
-      expect(
-        fetchMock.mock.calls.filter(
-          ([url]) =>
-            typeof url === "string" &&
-            url === "/api/workspaces/workspace-1/context-usage",
-        ),
-      ).toHaveLength(usageCallCountBeforeDeltas);
-
-      await act(async () => {
-        scheduledRefresh?.();
-        await Promise.resolve();
-      });
-
-      const usageCalls = fetchMock.mock.calls.filter(
+    expect(
+      fetchMock.mock.calls.filter(
         ([url]) =>
           typeof url === "string" &&
           url === "/api/workspaces/workspace-1/context-usage",
-      );
-      expect(usageCalls).toHaveLength(usageCallCountBeforeDeltas + 1);
-      const [, init] = usageCalls.at(-1)!;
-      expect(typeof init?.body).toBe("string");
-      expect(JSON.parse(init?.body as string)).toMatchObject({
-        assistantDraft: "Part one. Part two.",
-        assistantDraftReasoning: null,
-        chatId: "chat-1",
-        draftMessage: null,
-        latestResponseUsage: null,
-      });
-    } finally {
-      setTimeoutSpy.mockRestore();
-      clearTimeoutSpy.mockRestore();
-    }
+      ),
+    ).toHaveLength(usageCallCountBeforeDeltas);
+    expect(
+      screen.getByRole("status", { name: "Context usage 0%" }),
+    ).toHaveTextContent("0%");
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
@@ -284,8 +194,8 @@ describe("app-chat-stream verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Tool run"));
     expect(
-      await screen.findByRole("status", { name: "Context usage 47%" }),
-    ).toHaveTextContent("47%");
+      await screen.findByRole("status", { name: "Context usage 0%" }),
+    ).toHaveTextContent("0%");
     await userEvent.type(
       await screen.findByPlaceholderText(defaultComposerPlaceholder),
       "continue",
@@ -313,8 +223,8 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
     expect(
-      await screen.findByRole("status", { name: "Context usage 23%" }),
-    ).toHaveTextContent("23%");
+      await screen.findByRole("status", { name: "Context usage 0%" }),
+    ).toHaveTextContent("0%");
 
     await act(async () => {
       enqueueChatStreamEventForRun("request-stream", {
@@ -329,8 +239,8 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(
-      screen.getByRole("status", { name: "Context usage 23%" }),
-    ).toHaveTextContent("23%");
+      screen.getByRole("status", { name: "Context usage 0%" }),
+    ).toHaveTextContent("0%");
 
     await userEvent.click(screen.getByRole("tab", { name: /Tool run/ }));
     expect(
@@ -1884,10 +1794,7 @@ describe("app-chat-stream verification surfaces", () => {
     const [, usageInit] = usageCalls.at(-1)!;
     expect(typeof usageInit?.body).toBe("string");
     expect(JSON.parse(usageInit?.body as string)).toMatchObject({
-      assistantDraft: "Still running.",
-      assistantDraftReasoning: null,
       chatId: "chat-1",
-      draftMessage: null,
       latestResponseUsage: {
         cacheReadTokens: 0,
         cacheWriteTokens: 0,
@@ -1922,25 +1829,15 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    await waitFor(() => {
-      const usageCallsAfterComplete = fetchMock.mock.calls.filter(
-        ([url]) =>
-          typeof url === "string" &&
-          url === "/api/workspaces/workspace-1/context-usage",
-      );
-      expect(usageCallsAfterComplete.length).toBeGreaterThan(
-        usageCallCountBeforeComplete,
-      );
-      const [, completeUsageInit] = usageCallsAfterComplete.at(-1)!;
-      expect(typeof completeUsageInit?.body).toBe("string");
-      expect(JSON.parse(completeUsageInit?.body as string)).toMatchObject({
-        assistantDraft: null,
-        assistantDraftReasoning: null,
-        chatId: "chat-1",
-        draftMessage: null,
-        latestResponseUsage: null,
-      });
-    });
+    const usageCallsAfterComplete = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    );
+    expect(usageCallsAfterComplete).toHaveLength(usageCallCountBeforeComplete);
+    expect(
+      screen.getByRole("status", { name: "Context usage 64%" }),
+    ).toHaveTextContent("64%");
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();

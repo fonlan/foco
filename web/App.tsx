@@ -204,7 +204,6 @@ import type {
   QuestionOptionSummary,
   QuestionRequestSummary,
   RetryRunRequest,
-  ScheduledContextUsageRefresh,
   ScheduledWorkspaceRun,
   SettingsResponse,
   SettingsSection,
@@ -262,7 +261,6 @@ import {
   MEMORY_KIND_OPTIONS,
   MOBILE_BREAKPOINT_PX,
   SAVED_PASSWORD_MASK,
-  STREAM_CONTEXT_USAGE_REFRESH_DELAY_MS,
   WORKSPACE_CHAT_CONTEXT_MENU_LONG_PRESS_MS,
   WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
   WORKSPACE_SIDEBAR_MAX_WIDTH,
@@ -538,9 +536,6 @@ export function App() {
   const contextUsageRequestIdByChatKeyRef = useRef<Map<string, number>>(
     new Map(),
   );
-  const scheduledContextUsageByChatKeyRef = useRef<
-    Map<string, ScheduledContextUsageRefresh>
-  >(new Map());
   const todoGraphRequestIdRef = useRef(0);
   const selectedModelIdRef = useRef("");
   const selectedProviderIdRef = useRef("");
@@ -763,25 +758,10 @@ export function App() {
       [chatKey]: false,
     }));
 
-    if (!selectedModelId || !selectedProviderId) {
-      contextUsageRequestIdByChatKeyRef.current.set(
-        chatKey,
-        (contextUsageRequestIdByChatKeyRef.current.get(chatKey) ?? 0) + 1,
-      );
-      return;
-    }
-
-    void refreshContextUsage({
-      assistantDraft: "",
-      assistantDraftReasoning: "",
-      chatId: activeChatId,
-      latestResponseUsage: null,
-      modelId: selectedModelId,
-      providerId: selectedProviderId,
-      skillIds: [],
-      thinkingLevel: selectedThinkingLevel,
-      workspaceId: activeWorkspaceId,
-    });
+    contextUsageRequestIdByChatKeyRef.current.set(
+      chatKey,
+      (contextUsageRequestIdByChatKeyRef.current.get(chatKey) ?? 0) + 1,
+    );
   }, [
     activeChatId,
     activeWorkspaceId,
@@ -805,10 +785,6 @@ export function App() {
 
   useEffect(
     () => () => {
-      for (const scheduled of scheduledContextUsageByChatKeyRef.current.values()) {
-        window.clearTimeout(scheduled.timeoutId);
-      }
-      scheduledContextUsageByChatKeyRef.current.clear();
       for (const abortController of contextUsageAbortByChatKeyRef.current.values()) {
         abortController.abort();
       }
@@ -1779,11 +1755,9 @@ export function App() {
       contextUsageIdentityByChatKeyRef.current.set(toChatKey, identity);
     }
 
-    cancelScheduledContextUsageForChatKey(fromChatKey);
   }
 
   function cancelContextUsageRequestForChatKey(chatKey: string) {
-    cancelScheduledContextUsageForChatKey(chatKey);
     contextUsageAbortByChatKeyRef.current.get(chatKey)?.abort();
     contextUsageAbortByChatKeyRef.current.delete(chatKey);
     contextUsageRequestIdByChatKeyRef.current.set(
@@ -1794,44 +1768,6 @@ export function App() {
       ...current,
       [chatKey]: false,
     }));
-  }
-
-  function cancelScheduledContextUsageForChatKey(chatKey: string) {
-    const scheduled = scheduledContextUsageByChatKeyRef.current.get(chatKey);
-    if (!scheduled) {
-      return;
-    }
-
-    window.clearTimeout(scheduled.timeoutId);
-    scheduledContextUsageByChatKeyRef.current.delete(chatKey);
-  }
-
-  function scheduleContextUsageRefresh(request: ContextUsageRefreshRequest) {
-    if (!request.chatId) {
-      return;
-    }
-
-    const chatKey = chatRunKey(request.workspaceId, request.chatId);
-    const scheduled = scheduledContextUsageByChatKeyRef.current.get(chatKey);
-    if (scheduled) {
-      scheduledContextUsageByChatKeyRef.current.set(chatKey, {
-        ...scheduled,
-        request,
-      });
-      return;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      const latest = scheduledContextUsageByChatKeyRef.current.get(chatKey);
-      scheduledContextUsageByChatKeyRef.current.delete(chatKey);
-      if (latest) {
-        void refreshContextUsage(latest.request);
-      }
-    }, STREAM_CONTEXT_USAGE_REFRESH_DELAY_MS);
-    scheduledContextUsageByChatKeyRef.current.set(chatKey, {
-      request,
-      timeoutId,
-    });
   }
 
   function removeContextUsageForChatKey(chatKey: string) {
@@ -3773,7 +3709,16 @@ export function App() {
     }
 
     const chatKey = chatRunKey(request.workspaceId, request.chatId);
-    cancelScheduledContextUsageForChatKey(chatKey);
+    contextUsageIdentityByChatKeyRef.current.set(
+      chatKey,
+      [
+        request.workspaceId,
+        request.chatId,
+        request.modelId,
+        request.providerId,
+        request.thinkingLevel,
+      ].join("\u0000"),
+    );
     const requestId =
       (contextUsageRequestIdByChatKeyRef.current.get(chatKey) ?? 0) + 1;
     contextUsageRequestIdByChatKeyRef.current.set(chatKey, requestId);
@@ -3795,11 +3740,7 @@ export function App() {
             providerId: request.providerId,
             thinkingLevel: request.thinkingLevel || null,
             skillIds: request.skillIds.length ? request.skillIds : null,
-            draftMessage: null,
-            assistantDraft: request.assistantDraft || null,
-            assistantDraftReasoning: request.assistantDraftReasoning || null,
             latestResponseUsage: request.latestResponseUsage,
-            attachments: [],
           }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
@@ -3998,8 +3939,6 @@ export function App() {
     // id lets us route those events to `currentAssistantMessageId` instead of
     // the stale bubble that the event id would otherwise match.
     let interruptedAssistantMessageId: string | null = null;
-    let assistantDraft = "";
-    let assistantDraftReasoning = "";
     let latestResponseUsage: ChatUsage | null = null;
     let liveStartedAtMs = Date.now();
     let hasGuidanceTurns = false;
@@ -4007,32 +3946,11 @@ export function App() {
     const refreshRunContextUsage = () => {
       const modelId = selectedModelIdRef.current;
       const providerId = selectedProviderIdRef.current;
-      if (!modelId || !providerId) {
+      if (!modelId || !providerId || !latestResponseUsage) {
         return;
       }
 
       void refreshContextUsage({
-        assistantDraft,
-        assistantDraftReasoning,
-        chatId: activeRun.chatId,
-        latestResponseUsage,
-        modelId,
-        providerId,
-        skillIds: [],
-        thinkingLevel: selectedThinkingLevelRef.current,
-        workspaceId: activeRun.workspaceId,
-      });
-    };
-    const scheduleRunContextUsageRefresh = () => {
-      const modelId = selectedModelIdRef.current;
-      const providerId = selectedProviderIdRef.current;
-      if (!modelId || !providerId) {
-        return;
-      }
-
-      scheduleContextUsageRefresh({
-        assistantDraft,
-        assistantDraftReasoning,
         chatId: activeRun.chatId,
         latestResponseUsage,
         modelId,
@@ -4227,8 +4145,6 @@ export function App() {
 
         if (streamEvent.type === "textDelta") {
           finishLiveReasoningDuration(streamEvent.assistantMessageId);
-          assistantDraft += streamEvent.delta;
-          scheduleRunContextUsageRefresh();
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
@@ -4248,8 +4164,6 @@ export function App() {
 
         if (streamEvent.type === "reasoningDelta") {
           const reasoningStartedAtMs = startLiveReasoningDuration();
-          assistantDraftReasoning += streamEvent.delta;
-          scheduleRunContextUsageRefresh();
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
@@ -4293,10 +4207,7 @@ export function App() {
 
         if (streamEvent.type === "streamReset") {
           finishLiveReasoningDuration(streamEvent.assistantMessageId);
-          assistantDraft = streamEvent.text;
-          assistantDraftReasoning = streamEvent.reasoning ?? "";
           latestResponseUsage = null;
-          cancelScheduledContextUsageForChatKey(chatKey);
           updateLiveChatStatistics(chatKey, {
             modelId: selectedModelIdRef.current,
             providerId: selectedProviderIdRef.current,
@@ -4331,7 +4242,6 @@ export function App() {
               streamEvent.usage.outputTokens !== null
               ? streamEvent.usage
               : null;
-          cancelScheduledContextUsageForChatKey(chatKey);
           updateLiveChatStatistics(chatKey, {
             modelId: selectedModelIdRef.current,
             providerId: selectedProviderIdRef.current,
@@ -4370,11 +4280,6 @@ export function App() {
             startedAtMs: liveStartedAtMs,
             usage: liveStatisticsUsage,
           });
-          assistantDraft = "";
-          assistantDraftReasoning = "";
-          latestResponseUsage = null;
-          cancelScheduledContextUsageForChatKey(chatKey);
-          refreshRunContextUsage();
           void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           setChatRunFailed(chatKey, false);
           setChatRunning(chatKey, false);
@@ -4599,7 +4504,6 @@ export function App() {
       stopLiveReasoningDuration();
       if (activeRunAbortByChatKeyRef.current.get(chatKey) === abortController) {
         activeRunAbortByChatKeyRef.current.delete(chatKey);
-        cancelScheduledContextUsageForChatKey(chatKey);
         setChatRunning(chatKey, false);
         setActiveRunInfoForChatKey(chatKey, null);
         clearLiveChatStatistics(chatKey);
@@ -4641,8 +4545,6 @@ export function App() {
       ? chatRunKey(request.workspaceId, requestChatId)
       : pendingChatRunKey(request.workspaceId, runKey));
     let currentRunningChatKey = runMessagesKey;
-    let assistantDraft = "";
-    let assistantDraftReasoning = "";
     let latestResponseUsage: ChatUsage | null = null;
     let liveStartedAtMs = Date.now();
     let runSucceeded = false;
@@ -4651,22 +4553,11 @@ export function App() {
     let activeRunId: string | null = null;
     const abortController = new AbortController();
     const refreshRunContextUsage = () => {
+      if (!latestResponseUsage) {
+        return;
+      }
+
       void refreshContextUsage({
-        assistantDraft,
-        assistantDraftReasoning,
-        chatId: requestChatId,
-        latestResponseUsage,
-        modelId: request.modelId,
-        providerId: request.providerId,
-        skillIds: request.skillIds,
-        thinkingLevel: request.thinkingLevel,
-        workspaceId: request.workspaceId,
-      });
-    };
-    const scheduleRunContextUsageRefresh = () => {
-      scheduleContextUsageRefresh({
-        assistantDraft,
-        assistantDraftReasoning,
         chatId: requestChatId,
         latestResponseUsage,
         modelId: request.modelId,
@@ -5015,8 +4906,6 @@ export function App() {
 
         if (streamEvent.type === "textDelta") {
           finishLiveReasoningDuration(streamEvent.assistantMessageId);
-          assistantDraft += streamEvent.delta;
-          scheduleRunContextUsageRefresh();
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5033,8 +4922,6 @@ export function App() {
 
         if (streamEvent.type === "reasoningDelta") {
           const reasoningStartedAtMs = startLiveReasoningDuration();
-          assistantDraftReasoning += streamEvent.delta;
-          scheduleRunContextUsageRefresh();
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5071,10 +4958,7 @@ export function App() {
 
         if (streamEvent.type === "streamReset") {
           finishLiveReasoningDuration(streamEvent.assistantMessageId);
-          assistantDraft = streamEvent.text;
-          assistantDraftReasoning = streamEvent.reasoning ?? "";
           latestResponseUsage = null;
-          cancelScheduledContextUsageForChatKey(runMessagesKey);
           updateLiveChatStatistics(runMessagesKey, {
             modelId: request.modelId,
             providerId: request.providerId,
@@ -5109,7 +4993,6 @@ export function App() {
               streamEvent.usage.outputTokens !== null
               ? streamEvent.usage
               : null;
-          cancelScheduledContextUsageForChatKey(runMessagesKey);
           updateLiveChatStatistics(runMessagesKey, {
             modelId: request.modelId,
             providerId: request.providerId,
@@ -5148,12 +5031,7 @@ export function App() {
             startedAtMs: liveStartedAtMs,
             usage: liveStatisticsUsage,
           });
-          assistantDraft = "";
-          assistantDraftReasoning = "";
-          latestResponseUsage = null;
-          cancelScheduledContextUsageForChatKey(runMessagesKey);
           setActiveRunInfoForChatKey(runMessagesKey, null);
-          refreshRunContextUsage();
           if (requestChatId) {
             void loadChatStatistics(request.workspaceId, requestChatId);
           }
@@ -5187,8 +5065,6 @@ export function App() {
 
         if (streamEvent.type === "toolCall") {
           finishLiveReasoningDuration(streamEvent.assistantMessageId);
-          cancelScheduledContextUsageForChatKey(runMessagesKey);
-          refreshRunContextUsage();
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5207,8 +5083,6 @@ export function App() {
         }
 
         if (streamEvent.type === "toolResult") {
-          cancelScheduledContextUsageForChatKey(runMessagesKey);
-          refreshRunContextUsage();
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5405,7 +5279,6 @@ export function App() {
         abortController
       ) {
         activeRunAbortByChatKeyRef.current.delete(currentRunningChatKey);
-        cancelScheduledContextUsageForChatKey(currentRunningChatKey);
         setChatRunning(currentRunningChatKey, false);
         setActiveRunInfoForChatKey(currentRunningChatKey, null);
         clearLiveChatStatistics(currentRunningChatKey);
