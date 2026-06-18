@@ -1791,7 +1791,7 @@ fn recover_after_tool_round_cap_compresses_pending_tool_calls_once() {
 }
 
 #[test]
-fn neutral_messages_from_record_replays_saved_tool_state_in_order() {
+fn neutral_messages_from_record_replays_complete_tool_state_and_skips_incomplete_calls() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-tool-state-replay-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let mut database =
@@ -1850,6 +1850,32 @@ fn neutral_messages_from_record_replays_saved_tool_state_in_order() {
             })
             .expect("tool result insert");
     }
+    database
+        .insert_tool_call(NewToolCall {
+            id: "call-incomplete",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "run_command",
+            input_json: r#"{"command":"git status"}"#,
+            status: "cancelled",
+            started_at: "2026-06-05T07:00:02Z",
+            completed_at: Some("2026-06-05T07:00:03Z"),
+        })
+        .expect("incomplete cancelled tool call insert");
+    database
+        .insert_tool_call(NewToolCall {
+            id: "call-incomplete-completed",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "run_command",
+            input_json: r#"{"command":"git commit"}"#,
+            status: "completed",
+            started_at: "2026-06-05T07:00:04Z",
+            completed_at: Some("2026-06-05T07:00:05Z"),
+        })
+        .expect("incomplete completed tool call insert");
 
     let message = database
         .messages_for_chat("chat-1")
@@ -1872,6 +1898,12 @@ fn neutral_messages_from_record_replays_saved_tool_state_in_order() {
     assert_eq!(messages[4].role, NeutralChatRole::Assistant);
     assert_eq!(messages[4].content, "Done.");
     assert_eq!(messages[4].reasoning.as_deref(), Some("Used tools."));
+    assert!(messages.iter().all(|message| {
+        message.tool_calls.iter().all(|tool_call| {
+            tool_call.call_id != "call-incomplete"
+                && tool_call.call_id != "call-incomplete-completed"
+        })
+    }));
 
     drop(messages);
     drop(database);

@@ -873,6 +873,25 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    pub fn delete_incomplete_tool_calls_for_run(
+        &mut self,
+        run_id: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        self.connection
+            .execute(
+                "DELETE FROM tool_calls
+                 WHERE run_id = ?1
+                    AND NOT EXISTS (
+                        SELECT 1 FROM tool_results
+                        WHERE tool_results.tool_call_id = tool_calls.id
+                    )",
+                params![run_id],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
     pub fn tool_calls_for_message(
         &self,
         message_id: &str,

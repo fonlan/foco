@@ -1241,12 +1241,15 @@ pub(crate) fn neutral_messages_from_record(
 
         let mut messages = Vec::with_capacity(tool_calls.len() * 2 + 1);
         for tool_call in tool_calls {
-            let result = tool_call.result.clone().ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "assistant message '{}' tool call '{}' is missing a tool result",
-                    message.id, tool_call.id
-                ))
-            })?;
+            let Some(result) = tool_call.result.clone() else {
+                tracing::warn!(
+                    assistant_message_id = %message.id,
+                    tool_call_id = %tool_call.id,
+                    tool_call_status = %tool_call.status,
+                    "skipping incomplete persisted tool call while rebuilding provider prompt"
+                );
+                continue;
+            };
 
             messages.push(NeutralChatMessage {
                 role: NeutralChatRole::Assistant,

@@ -944,6 +944,22 @@ fn repository_helpers_round_trip_tool_calls_and_results() {
             created_at: "2026-06-03T10:00:00.100Z",
         })
         .expect("tool result upsert");
+    database
+        .upsert_tool_call(NewToolCall {
+            id: "tool-call-incomplete",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "run_command",
+            input_json: r#"{"command":"git status"}"#,
+            status: "completed",
+            started_at: "2026-06-03T10:00:00.200Z",
+            completed_at: Some("2026-06-03T10:00:00.300Z"),
+        })
+        .expect("incomplete tool call upsert");
+    database
+        .delete_incomplete_tool_calls_for_run("run-1")
+        .expect("delete incomplete tool calls");
 
     let records = database
         .tool_calls_for_message("assistant-1")

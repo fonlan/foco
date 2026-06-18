@@ -500,6 +500,11 @@ impl ActiveChatRunRegistration {
                     .delete_running_tool_calls_for_run(&self.run_id)
                     .map_err(ApiError::from_workspace_error)?;
             }
+            ChatSseEvent::Complete { .. } => {
+                database
+                    .delete_incomplete_tool_calls_for_run(&self.run_id)
+                    .map_err(ApiError::from_workspace_error)?;
+            }
             ChatSseEvent::Error { .. } => {
                 let completed_at = utc_timestamp();
                 database
