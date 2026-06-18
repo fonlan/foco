@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use foco_agent::estimate_text_tokens;
-use foco_providers::{NeutralChatMessage, NeutralChatRequest, NeutralChatRole};
+use foco_providers::{NeutralChatRequest, NeutralChatRole};
 use foco_store::{
     config::GlobalConfig,
     memory::{MemoryDatabase, MemoryFactRecord, MemoryScope},
@@ -10,6 +10,35 @@ use foco_store::{
 
 use crate::prompt::{neutral_message_estimated_tokens, neutral_tool_call_from_record};
 use crate::*;
+
+#[derive(Clone, Debug)]
+pub(crate) struct RetrievedMemoryFact {
+    pub(crate) fact: MemoryFactRecord,
+    pub(crate) source: RetrievedMemorySource,
+    pub(crate) rank: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetrievedMemorySource {
+    Direct,
+    Related,
+}
+
+impl RetrievedMemorySource {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Related => "related",
+        }
+    }
+
+    pub(crate) fn rank(self) -> usize {
+        match self {
+            Self::Direct => 0,
+            Self::Related => 1,
+        }
+    }
+}
 
 pub(crate) fn splice_resolved_memory(
     messages: &mut Vec<NeutralChatMessage>,

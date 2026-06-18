@@ -439,6 +439,8 @@ Move from `app/main.rs` into `app/memory_runtime/`:
 - [x] ranking and FTS query helpers
 - [x] memory usage summaries
 - [x] expiration helpers
+- [x] memory extraction runtime helpers
+- [x] memory tool runtime helpers
 
 Important rule:
 

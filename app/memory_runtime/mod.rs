@@ -1,17 +1,46 @@
 mod expiration;
+mod extraction;
 mod retrieval;
+mod tools;
 
 pub(crate) use expiration::{apply_memory_expiration_to_fact, expire_due_memories};
-#[cfg(test)]
-pub(crate) use retrieval::resolve_prompt_context_memory;
+pub(crate) use extraction::{
+    MemoryExtractionHandle, call_memory_retrieval_provider,
+    memory_extraction_error_should_be_ignored, memory_target_status_for_prompt,
+    parse_memory_retrieval_output, queue_memory_extraction_job,
+};
 pub(crate) use retrieval::{
-    active_prompt_context_memory_keys, chat_extracted_memory_summary, memory_fact_key,
-    memory_fact_prompt_order, memory_fts_query, memory_prompt_context, memory_retrieval_query_text,
-    neutral_messages_from_record, persist_pending_prompt_context_injections, prompt_cache_key,
-    splice_resolved_memory, stored_prompt_context_record_memory_keys,
-    stored_stable_prompt_context_messages, stored_turn_memory_messages_by_sequence,
+    RetrievedMemoryFact, active_prompt_context_memory_keys, chat_extracted_memory_summary,
+    memory_fact_key, memory_fact_prompt_order, memory_fts_query, memory_prompt_context,
+    memory_retrieval_query_text, neutral_messages_from_record,
+    persist_pending_prompt_context_injections, prompt_cache_key, splice_resolved_memory,
+    stored_prompt_context_record_memory_keys, stored_stable_prompt_context_messages,
+    stored_turn_memory_messages_by_sequence,
+};
+pub(crate) use tools::{
+    MemoryToolContext, execute_memory_tool, is_memory_tool_name, memory_tool_definitions,
+    memory_tool_timeout_ms,
+};
+#[cfg(test)]
+pub(crate) use extraction::{
+    ExtractedMemoryEvidenceReference, ExtractedMemoryFact, ExtractedMemoryRelationCandidate,
+    MemoryExtractionEvidenceCandidate, MemoryExtractionOutput, MemoryExtractionTask,
+    MemoryRetrievalOutput, extraction_provider_for_model,
+    memory_extraction_evidence_candidates, memory_extraction_existing_memory_candidates,
+    memory_extraction_provider_request, memory_extraction_target_status,
+    parse_memory_extraction_output, run_memory_extraction_job, run_memory_extraction_job_inner,
+    should_queue_memory_extraction, store_extracted_memory_facts, validate_extracted_memory_facts,
 };
 #[cfg(test)]
 pub(crate) use retrieval::{
-    llm_memory_retrieval_candidates, memory_prompt_search, memory_prompt_search_terms,
+    RetrievedMemorySource, llm_memory_retrieval_candidates, memory_prompt_search,
+    memory_prompt_search_terms, resolve_prompt_context_memory,
 };
+#[cfg(test)]
+pub(crate) use tools::{
+    MemorySearchMatch, collect_memory_search_matches, execute_memory_search_tool,
+    execute_memory_write_tool, memory_extraction_tool_definition,
+    memory_retrieval_tool_definition, memory_search_fact_matches_scope,
+    memory_tool_timeout_ms_from_input, push_memory_search_match,
+};
+pub(crate) use tools::memory_retrieval_tool_definition;
