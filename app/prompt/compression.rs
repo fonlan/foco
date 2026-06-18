@@ -1429,11 +1429,23 @@ pub(crate) fn persist_chat_result(
     }
 
     let assistant_message_id = if let Some(assistant_text) = assistant_text {
+        let tool_call_summaries = tool_calls
+            .iter()
+            .map(executed_tool_call_summary)
+            .collect::<Vec<_>>();
+        let parts = finalized_assistant_message_parts(
+            &context.assistant_message_id,
+            events,
+            assistant_text,
+            assistant_reasoning,
+            &tool_call_summaries,
+        )?;
         let metadata_json = assistant_message_metadata_json(
             assistant_reasoning,
             &context.memories_used,
             &context.code_change_stats,
             None,
+            Some(&parts),
         )?;
         database
             .upsert_message_content(NewMessage {

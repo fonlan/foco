@@ -1183,6 +1183,49 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn facts_for_source_references(
+        &self,
+        source_type: MemorySourceType,
+        source_ids: &[String],
+    ) -> Result<Vec<(String, MemoryFactRecord)>, MemoryDatabaseError> {
+        if source_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        for source_id in source_ids {
+            require_non_empty("source_id", source_id)?;
+        }
+
+        let placeholders = (2..=source_ids.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
+                    f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                    f.updated_at, s.source_id
+             FROM memory_facts f
+             JOIN memory_fact_sources fs ON fs.fact_id = f.id
+             JOIN memory_sources s ON s.id = fs.source_id
+             WHERE s.source_type = ?1
+               AND s.source_id IN ({placeholders})
+             ORDER BY f.created_at ASC, f.id ASC",
+        );
+        let mut parameters = Vec::with_capacity(source_ids.len() + 1);
+        parameters.push(source_type.as_str());
+        parameters.extend(source_ids.iter().map(String::as_str));
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(params_from_iter(parameters), |row| {
+                Ok((row.get(13)?, memory_fact_from_row(row)?))
+            })
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn source_count_for_fact(&self, fact_id: &str) -> Result<i64, MemoryDatabaseError> {
         require_non_empty("fact_id", fact_id)?;
         source_count_for_fact(&self.connection, &self.database_path, fact_id)

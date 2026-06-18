@@ -667,6 +667,12 @@ fn repository_helpers_round_trip_core_records() {
     assert_eq!(request.provider_id, "openai");
     assert_eq!(request.input_tokens, Some(3));
     assert_eq!(request.final_state, "completed");
+    let metrics = database
+        .llm_request_metrics_for_chat("chat-1")
+        .expect("chat request metrics");
+    assert_eq!(metrics.len(), 1);
+    assert_eq!(metrics[0].id, "request-1");
+    assert_eq!(metrics[0].output_tokens, Some(5));
 
     database
         .insert_context_compression_snapshot(NewContextCompressionSnapshot {
@@ -918,8 +924,12 @@ fn repository_helpers_round_trip_tool_calls_and_results() {
     let records = database
         .tool_calls_for_message("assistant-1")
         .expect("tool calls for message");
+    let chat_records = database
+        .tool_calls_for_chat("chat-1")
+        .expect("tool calls for chat");
 
     assert_eq!(records.len(), 1);
+    assert_eq!(chat_records, records);
     assert_eq!(records[0].id, "tool-call-1");
     assert_eq!(records[0].tool_name, "read_file");
     assert_eq!(records[0].status, "completed");

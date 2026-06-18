@@ -206,6 +206,16 @@ pub struct LlmRequestRecord {
     pub response_body_json: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlmRequestMetricsRecord {
+    pub id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub first_token_latency_ms: Option<i64>,
+    pub total_latency_ms: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LlmRequestAuditFilters<'a> {
     pub workspace_id: Option<&'a str>,

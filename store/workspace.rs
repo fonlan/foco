@@ -21,13 +21,14 @@ pub use workspace_records::{
     CodeGraphRelatedFileRecord, CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord,
     ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
     LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
-    LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestRecord,
-    MessageRecord, NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport,
-    NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun,
-    NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewRunEvent,
-    NewTerminalSession, NewToolCall, NewToolResult, PromptContextInjectionRecord, RunEventRecord,
-    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
-    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
+    LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
+    LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, NewCodeGraphEdge,
+    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
+    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+    NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
+    PromptContextInjectionRecord, RunEventRecord, TerminalSessionRecord, TodoGraphFilter,
+    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -765,6 +766,62 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn tool_calls_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<ToolCallWithResultRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    tool_calls.id,
+                    tool_calls.chat_id,
+                    tool_calls.run_id,
+                    tool_calls.message_id,
+                    tool_calls.tool_name,
+                    tool_calls.input_json,
+                    tool_calls.status,
+                    tool_calls.started_at,
+                    tool_calls.completed_at,
+                    tool_results.id,
+                    tool_results.output_json,
+                    tool_results.is_error,
+                    tool_results.created_at
+                 FROM tool_calls
+                 LEFT JOIN tool_results ON tool_results.tool_call_id = tool_calls.id
+                 WHERE tool_calls.chat_id = ?1
+                 ORDER BY tool_calls.started_at ASC, tool_calls.id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(ToolCallWithResultRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    message_id: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    input_json: row.get(5)?,
+                    status: row.get(6)?,
+                    started_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                    result: match row.get::<_, Option<String>>(9)? {
+                        Some(id) => Some(ToolResultRecord {
+                            id,
+                            tool_call_id: row.get(0)?,
+                            output_json: row.get(10)?,
+                            is_error: row.get::<_, i64>(11)? != 0,
+                            created_at: row.get(12)?,
+                        }),
+                        None => None,
+                    },
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn tool_call_counts_for_chat(
         &self,
         chat_id: &str,
@@ -943,6 +1000,37 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn llm_request_metrics_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<LlmRequestMetricsRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    id, provider_id, model_id, first_token_latency_ms,
+                    total_latency_ms, output_tokens
+                 FROM llm_requests
+                 WHERE chat_id = ?1
+                 ORDER BY request_started_at ASC, id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(LlmRequestMetricsRecord {
+                    id: row.get(0)?,
+                    provider_id: row.get(1)?,
+                    model_id: row.get(2)?,
+                    first_token_latency_ms: row.get(3)?,
+                    total_latency_ms: row.get(4)?,
+                    output_tokens: row.get(5)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn insert_llm_request_event(
         &mut self,
         event: NewLlmRequestEvent<'_>,
@@ -1024,6 +1112,48 @@ impl WorkspaceDatabase {
                  FROM llm_request_events
                  INNER JOIN llm_requests
                     ON llm_requests.id = llm_request_events.llm_request_id
+                 WHERE llm_requests.chat_id = ?1
+                 ORDER BY llm_requests.request_started_at ASC,
+                    llm_request_events.sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(LlmRequestEventRecord {
+                    id: row.get(0)?,
+                    llm_request_id: row.get(1)?,
+                    sequence: row.get(2)?,
+                    event_at: row.get(3)?,
+                    event_type: row.get(4)?,
+                    raw_chunk_json: row.get(5)?,
+                    normalized_event_json: row.get(6)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn llm_request_start_events_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<LlmRequestEventRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    llm_request_events.id,
+                    llm_request_events.llm_request_id,
+                    llm_request_events.sequence,
+                    llm_request_events.event_at,
+                    llm_request_events.event_type,
+                    NULL,
+                    llm_request_events.normalized_event_json
+                 FROM llm_requests
+                 INNER JOIN llm_request_events
+                    ON llm_request_events.llm_request_id = llm_requests.id
+                    AND llm_request_events.event_type = 'start'
+                    AND llm_request_events.sequence = 0
                  WHERE llm_requests.chat_id = ?1
                  ORDER BY llm_requests.request_started_at ASC,
                     llm_request_events.sequence ASC",

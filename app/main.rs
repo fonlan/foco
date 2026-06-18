@@ -55,10 +55,10 @@ use foco_store::{
         ChatRecord, CodeChangeStats, ContextCompressionSnapshotRecord,
         LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
         LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
-        LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot, NewLlmRequest,
-        NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewToolCall, NewToolResult,
-        PromptContextInjectionRecord, TodoGraphRecord, TodoGraphTask, ToolCallCountRecord,
-        ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot,
+        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewToolCall,
+        NewToolResult, PromptContextInjectionRecord, TodoGraphRecord, TodoGraphTask,
+        ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
         initialize_workspace_databases, workspace_database_path,
     },
 };
@@ -1634,7 +1634,7 @@ struct ChatAttachmentInput {
     size_bytes: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatAttachmentPart {
     id: String,
@@ -2530,7 +2530,7 @@ struct QueuedMessageRunSummary {
     assistant_message_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatToolCallSummary {
     id: String,
@@ -2541,13 +2541,21 @@ struct ChatToolCallSummary {
     is_error: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 enum ChatMessagePart {
     Text { text: String },
     Reasoning { text: String },
     Attachment { attachment: ChatAttachmentPart },
     ToolCall { tool_call: ChatToolCallSummary },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+enum StoredChatMessagePart {
+    Text { text: String },
+    Reasoning { text: String },
+    ToolCall { tool_call_id: String },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -9349,17 +9357,58 @@ fn assistant_memories_used_from_metadata(
     })
 }
 
+fn assistant_parts_from_metadata(
+    metadata_json: &str,
+    tool_calls: &[ChatToolCallSummary],
+) -> Result<Option<Vec<ChatMessagePart>>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
+    let Some(parts) = metadata.get("parts") else {
+        return Ok(None);
+    };
+
+    let stored_parts = serde_json::from_value::<Vec<StoredChatMessagePart>>(parts.clone())
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to parse assistant message metadata.parts: {source}"
+            ))
+        })?;
+    let tool_calls_by_id = tool_calls
+        .iter()
+        .map(|tool_call| (tool_call.id.as_str(), tool_call))
+        .collect::<HashMap<_, _>>();
+    stored_parts
+        .into_iter()
+        .map(|part| match part {
+            StoredChatMessagePart::Text { text } => Ok(ChatMessagePart::Text { text }),
+            StoredChatMessagePart::Reasoning { text } => Ok(ChatMessagePart::Reasoning { text }),
+            StoredChatMessagePart::ToolCall { tool_call_id } => tool_calls_by_id
+                .get(tool_call_id.as_str())
+                .map(|tool_call| ChatMessagePart::ToolCall {
+                    tool_call: (*tool_call).clone(),
+                })
+                .ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "assistant message metadata references missing tool call '{tool_call_id}'"
+                    ))
+                }),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
 fn assistant_message_metadata_json(
     reasoning: Option<&str>,
     memories_used: &[ChatMemoryUsedSummary],
     code_change_stats: &CodeChangeStats,
     streaming_state: Option<&str>,
+    parts: Option<&[StoredChatMessagePart]>,
 ) -> Result<String, ApiError> {
     if reasoning.is_none()
         && memories_used.is_empty()
         && code_change_stats.additions == 0
         && code_change_stats.deletions == 0
         && streaming_state.is_none()
+        && parts.is_none()
     {
         return Ok("{}".to_string());
     }
@@ -9382,6 +9431,9 @@ fn assistant_message_metadata_json(
             "streamingState".to_string(),
             Value::String(streaming_state.to_string()),
         );
+    }
+    if let Some(parts) = parts {
+        metadata.insert("parts".to_string(), json!(parts));
     }
 
     serde_json::to_string(&Value::Object(metadata)).map_err(|source| {
@@ -9823,117 +9875,167 @@ fn non_empty_string(value: &str) -> Option<String> {
     }
 }
 
-fn chat_message_summary(
+fn chat_message_summaries(
     database: &WorkspaceDatabase,
     workspace_path: &Path,
     global_memory_database_file: Option<&Path>,
-    message: MessageRecord,
-    llm_request_events: &[LlmRequestEventRecord],
-) -> Result<ChatMessageSummary, ApiError> {
-    let tool_calls = database
-        .tool_calls_for_message(&message.id)
+    chat_id: &str,
+    messages: Vec<MessageRecord>,
+) -> Result<Vec<ChatMessageSummary>, ApiError> {
+    let assistant_message_ids = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+
+    let mut tool_calls_by_message = HashMap::<String, Vec<ChatToolCallSummary>>::new();
+    for tool_call in database
+        .tool_calls_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+    {
+        let Some(message_id) = tool_call.message_id.clone() else {
+            continue;
+        };
+        tool_calls_by_message
+            .entry(message_id)
+            .or_default()
+            .push(chat_tool_call_summary(tool_call)?);
+    }
+
+    let requests_by_id = database
+        .llm_request_metrics_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?
         .into_iter()
-        .map(chat_tool_call_summary)
-        .collect::<Result<Vec<_>, _>>()?;
-    let reasoning = if message.role == "assistant" {
-        assistant_reasoning_from_metadata(&message.metadata_json)?
-    } else {
-        None
-    };
-    let memories_used = if message.role == "assistant" {
-        assistant_memories_used_from_metadata(&message.metadata_json)?
-    } else {
-        Vec::new()
-    };
-    let extracted_memories = if message.role == "assistant" {
-        let workspace_memory_database =
-            MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
-                .map_err(ApiError::from_memory_error)?;
-        let mut facts = workspace_memory_database
-            .facts_for_source_reference(MemorySourceType::AssistantMessage, &message.id)
-            .map_err(ApiError::from_memory_error)?;
-        if let Some(global_memory_database_file) = global_memory_database_file {
-            let global_memory_database =
-                MemoryDatabase::open_or_create_global_at(global_memory_database_file)
-                    .map_err(ApiError::from_memory_error)?;
-            facts.extend(
-                global_memory_database
-                    .facts_for_source_reference(MemorySourceType::AssistantMessage, &message.id)
-                    .map_err(ApiError::from_memory_error)?,
-            );
+        .map(|request| (request.id.clone(), request))
+        .collect::<HashMap<_, _>>();
+    let mut request_ids_by_message = HashMap::<String, Vec<String>>::new();
+    for event in database
+        .llm_request_start_events_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+    {
+        let value = parse_json_value(&event.normalized_event_json, "LLM start event")?;
+        let Some(message_id) =
+            string_json_field(&value, "assistantMessageId", "assistant_message_id")
+        else {
+            continue;
+        };
+        let request_ids = request_ids_by_message
+            .entry(message_id.to_string())
+            .or_default();
+        if !request_ids.contains(&event.llm_request_id) {
+            request_ids.push(event.llm_request_id);
         }
-        facts
-            .into_iter()
-            .map(chat_extracted_memory_summary)
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let parts = chat_message_parts(
-        &message,
-        reasoning.as_deref(),
-        &tool_calls,
-        llm_request_events,
-    )?;
-    let metrics = if message.role == "assistant" {
-        assistant_reply_metrics(database, &message.id, llm_request_events)?
-    } else {
-        None
-    };
-
-    let queued_run = if message.role == "user" {
-        queued_run_summary_from_message_metadata(&message.metadata_json)?
-    } else {
-        None
-    };
-    let pending_mode = queued_run
-        .as_ref()
-        .and_then(|queued_run| (queued_run.status == "queued").then(|| "queued".to_string()));
-
-    Ok(ChatMessageSummary {
-        id: message.id,
-        reasoning,
-        pending_mode,
-        queued_run,
-        role: message.role,
-        content: message.content,
-        created_at: message.created_at,
-        tool_calls,
-        parts,
-        metrics,
-        memories_used,
-        extracted_memories,
-    })
-}
-
-fn assistant_reply_metrics(
-    database: &WorkspaceDatabase,
-    message_id: &str,
-    llm_request_events: &[LlmRequestEventRecord],
-) -> Result<Option<ChatReplyMetrics>, ApiError> {
-    let request_ids = assistant_message_request_ids(message_id, llm_request_events)?;
-    if request_ids.is_empty() {
-        return Ok(None);
+    }
+    let mut metrics_by_message = HashMap::new();
+    for (message_id, request_ids) in request_ids_by_message {
+        let requests = request_ids
+            .iter()
+            .map(|request_id| {
+                requests_by_id.get(request_id).cloned().ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "assistant message '{message_id}' is linked to missing LLM request '{request_id}'"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !requests.is_empty() {
+            metrics_by_message.insert(message_id, chat_reply_metrics_from_requests(&requests));
+        }
     }
 
-    let mut requests = Vec::with_capacity(request_ids.len());
-    for request_id in request_ids {
-        let request = database
-            .llm_request(&request_id)
-            .map_err(ApiError::from_workspace_error)?
-            .ok_or_else(|| {
-                ApiError::internal(format!(
-                    "assistant message '{message_id}' is linked to missing LLM request '{request_id}'"
-                ))
-            })?;
-        requests.push(request);
+    let mut extracted_memories_by_message =
+        HashMap::<String, Vec<ChatExtractedMemorySummary>>::new();
+    let workspace_memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(workspace_path))
+            .map_err(ApiError::from_memory_error)?;
+    for (message_id, fact) in workspace_memory_database
+        .facts_for_source_references(MemorySourceType::AssistantMessage, &assistant_message_ids)
+        .map_err(ApiError::from_memory_error)?
+    {
+        extracted_memories_by_message
+            .entry(message_id)
+            .or_default()
+            .push(chat_extracted_memory_summary(fact));
+    }
+    if let Some(global_memory_database_file) = global_memory_database_file {
+        let global_memory_database =
+            MemoryDatabase::open_or_create_global_at(global_memory_database_file)
+                .map_err(ApiError::from_memory_error)?;
+        for (message_id, fact) in global_memory_database
+            .facts_for_source_references(MemorySourceType::AssistantMessage, &assistant_message_ids)
+            .map_err(ApiError::from_memory_error)?
+        {
+            extracted_memories_by_message
+                .entry(message_id)
+                .or_default()
+                .push(chat_extracted_memory_summary(fact));
+        }
     }
 
-    Ok(Some(chat_reply_metrics_from_requests(&requests)))
+    messages
+        .into_iter()
+        .filter(|message| message.role == "user" || message.role == "assistant")
+        .map(|message| {
+            let tool_calls = tool_calls_by_message
+                .remove(&message.id)
+                .unwrap_or_default();
+            let reasoning = if message.role == "assistant" {
+                assistant_reasoning_from_metadata(&message.metadata_json)?
+            } else {
+                None
+            };
+            let memories_used = if message.role == "assistant" {
+                assistant_memories_used_from_metadata(&message.metadata_json)?
+            } else {
+                Vec::new()
+            };
+            let parts = if message.role == "assistant" {
+                assistant_parts_from_metadata(&message.metadata_json, &tool_calls)?.unwrap_or_else(
+                    || {
+                        fallback_chat_message_parts(
+                            &message.content,
+                            reasoning.as_deref(),
+                            &tool_calls,
+                        )
+                    },
+                )
+            } else {
+                let mut parts = fallback_chat_message_parts(&message.content, None, &[]);
+                parts.extend(chat_attachment_message_parts(&message.metadata_json)?);
+                parts
+            };
+            let queued_run = if message.role == "user" {
+                queued_run_summary_from_message_metadata(&message.metadata_json)?
+            } else {
+                None
+            };
+            let pending_mode = queued_run.as_ref().and_then(|queued_run| {
+                (queued_run.status == "queued").then(|| "queued".to_string())
+            });
+            let metrics = metrics_by_message.remove(&message.id);
+            let extracted_memories = extracted_memories_by_message
+                .remove(&message.id)
+                .unwrap_or_default();
+
+            Ok(ChatMessageSummary {
+                id: message.id,
+                role: message.role,
+                content: message.content,
+                created_at: message.created_at,
+                reasoning,
+                pending_mode,
+                queued_run,
+                tool_calls,
+                parts,
+                metrics,
+                memories_used,
+                extracted_memories,
+            })
+        })
+        .collect()
 }
 
-fn chat_reply_metrics_from_requests(requests: &[LlmRequestRecord]) -> ChatReplyMetrics {
+fn chat_reply_metrics_from_requests(requests: &[LlmRequestMetricsRecord]) -> ChatReplyMetrics {
     let first_request = requests
         .first()
         .expect("assistant reply metrics require at least one LLM request");
@@ -9957,6 +10059,7 @@ fn sum_optional_i64(values: impl IntoIterator<Item = Option<i64>>) -> Option<i64
     Some(total)
 }
 
+#[cfg(test)]
 fn chat_message_parts(
     message: &MessageRecord,
     reasoning: Option<&str>,
@@ -10152,6 +10255,7 @@ fn queued_run_summary_from_message_metadata(
     }))
 }
 
+#[cfg(test)]
 fn assistant_message_request_ids(
     message_id: &str,
     llm_request_events: &[LlmRequestEventRecord],
@@ -10218,6 +10322,155 @@ fn fallback_chat_message_parts(
             .map(|tool_call| ChatMessagePart::ToolCall { tool_call }),
     );
     parts
+}
+
+fn finalized_assistant_message_parts(
+    assistant_message_id: &str,
+    events: &[CapturedAuditEvent],
+    assistant_text: &str,
+    assistant_reasoning: Option<&str>,
+    tool_calls: &[ChatToolCallSummary],
+) -> Result<Vec<StoredChatMessagePart>, ApiError> {
+    let tool_calls_by_id = tool_calls
+        .iter()
+        .map(|tool_call| (tool_call.id.as_str(), tool_call))
+        .collect::<HashMap<_, _>>();
+    let mut seen_tool_call_ids = HashSet::new();
+    let mut parts = Vec::new();
+
+    for event in events {
+        if !matches!(
+            event.event_type.as_str(),
+            "text_delta" | "reasoning_delta" | "tool_call" | "stream_reset"
+        ) {
+            continue;
+        }
+        let value = parse_json_value(&event.normalized_event_json, "chat history event")?;
+        if !event_matches_assistant_message(&value, assistant_message_id) {
+            continue;
+        }
+
+        match event.event_type.as_str() {
+            "text_delta" => {
+                if let Some(delta) = string_json_field(&value, "delta", "delta") {
+                    push_text_part(&mut parts, delta);
+                }
+            }
+            "reasoning_delta" => {
+                if let Some(delta) = string_json_field(&value, "delta", "delta") {
+                    push_reasoning_part(&mut parts, delta);
+                }
+            }
+            "tool_call" => {
+                if let Some(tool_call) = value.get("toolCall").or_else(|| value.get("tool_call"))
+                    && let Some(tool_call_id) = string_json_field(tool_call, "id", "callId")
+                        .or_else(|| string_json_field(tool_call, "call_id", "callId"))
+                {
+                    push_finalized_tool_call_part(
+                        &mut parts,
+                        &mut seen_tool_call_ids,
+                        &tool_calls_by_id,
+                        tool_call_id,
+                    );
+                }
+            }
+            "stream_reset" => {
+                parts.clear();
+                seen_tool_call_ids.clear();
+                if let Some(reasoning) =
+                    nullable_string_json_field(&value, "reasoning", "reasoning")
+                {
+                    push_reasoning_part(&mut parts, reasoning);
+                }
+                if let Some(text) = string_json_field(&value, "text", "text") {
+                    push_text_part(&mut parts, text);
+                }
+                if let Some(reset_tool_calls) = value
+                    .get("toolCalls")
+                    .or_else(|| value.get("tool_calls"))
+                    .and_then(Value::as_array)
+                {
+                    for tool_call in reset_tool_calls {
+                        if let Some(tool_call_id) = string_json_field(tool_call, "id", "callId")
+                            .or_else(|| string_json_field(tool_call, "call_id", "callId"))
+                        {
+                            push_finalized_tool_call_part(
+                                &mut parts,
+                                &mut seen_tool_call_ids,
+                                &tool_calls_by_id,
+                                tool_call_id,
+                            );
+                        }
+                    }
+                }
+            }
+            _ => unreachable!("history event type was filtered above"),
+        }
+    }
+
+    if assistant_reasoning.is_some()
+        && !parts
+            .iter()
+            .any(|part| matches!(part, ChatMessagePart::Reasoning { .. }))
+    {
+        parts.insert(
+            0,
+            ChatMessagePart::Reasoning {
+                text: assistant_reasoning
+                    .expect("reasoning was checked above")
+                    .to_string(),
+            },
+        );
+    }
+    if !assistant_text.is_empty()
+        && !parts
+            .iter()
+            .any(|part| matches!(part, ChatMessagePart::Text { .. }))
+    {
+        push_text_part(&mut parts, assistant_text);
+    }
+    for tool_call in tool_calls {
+        push_finalized_tool_call_part(
+            &mut parts,
+            &mut seen_tool_call_ids,
+            &tool_calls_by_id,
+            &tool_call.id,
+        );
+    }
+
+    if parts.is_empty() {
+        parts = fallback_chat_message_parts(assistant_text, assistant_reasoning, tool_calls);
+    }
+
+    parts
+        .into_iter()
+        .map(|part| match part {
+            ChatMessagePart::Text { text } => Ok(StoredChatMessagePart::Text { text }),
+            ChatMessagePart::Reasoning { text } => Ok(StoredChatMessagePart::Reasoning { text }),
+            ChatMessagePart::ToolCall { tool_call } => Ok(StoredChatMessagePart::ToolCall {
+                tool_call_id: tool_call.id,
+            }),
+            ChatMessagePart::Attachment { .. } => Err(ApiError::internal(
+                "assistant message history parts must not contain attachments",
+            )),
+        })
+        .collect()
+}
+
+fn push_finalized_tool_call_part(
+    parts: &mut Vec<ChatMessagePart>,
+    seen_tool_call_ids: &mut HashSet<String>,
+    tool_calls_by_id: &HashMap<&str, &ChatToolCallSummary>,
+    tool_call_id: &str,
+) {
+    if !seen_tool_call_ids.insert(tool_call_id.to_string()) {
+        return;
+    }
+    if let Some(tool_call) = tool_calls_by_id.get(tool_call_id) {
+        parts.push(ChatMessagePart::ToolCall {
+            tool_call: (*tool_call).clone(),
+        });
+    }
 }
 
 fn push_text_part(parts: &mut Vec<ChatMessagePart>, text: &str) {

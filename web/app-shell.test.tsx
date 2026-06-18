@@ -23,6 +23,7 @@ import {
   resetAppTestEnvironment,
   secondaryWorkspace,
   settings,
+  secondChatMessages,
   todoGraph,
   workspace,
   workspaceMemory,
@@ -841,6 +842,51 @@ describe("app-shell verification surfaces", () => {
 
     expect(await screen.findByText("API overview")).toBeInTheDocument();
     expect(messageList.scrollTop).toBe(0);
+  });
+
+  it("opens and selects a historical chat tab before its messages finish loading", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const delayedMessages = deferred<Response>();
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
+        return delayedMessages.promise;
+      }
+      return mockFetch(input, init);
+    });
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Second chat"));
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(within(tabList).getByRole("tab", { name: /Second chat/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    const messageList = document.querySelector(".message-list");
+    expect(messageList).not.toBeNull();
+    expect(within(messageList as HTMLElement).getByText("Loading...")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    await act(async () => {
+      delayedMessages.resolve(jsonResponse(secondChatMessages));
+      await delayedMessages.promise;
+    });
+
+    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.queryByText("Second answer.")).not.toBeInTheDocument();
+
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Second chat/ }));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
   });
 
 });

@@ -396,6 +396,7 @@ export function App() {
     workspaceId: "",
   });
   const [openChatTabs, setOpenChatTabs] = useState<OpenChatTab[]>([]);
+  const [loadingChatKeys, setLoadingChatKeys] = useState<Set<string>>(() => new Set());
   const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
   const [workspaceFileEditors, setWorkspaceFileEditors] = useState<
     Record<string, WorkspaceFileEditorState>
@@ -543,6 +544,8 @@ export function App() {
   const activeChatKeyRef = useRef<string | null>(null);
   const activeWorkspaceIdRef = useRef("");
   const activeChatIdRef = useRef<string | null>(null);
+  const loadingChatKeysRef = useRef<Set<string>>(new Set());
+  const loadingChatControllersRef = useRef<Map<string, AbortController>>(new Map());
   const runningChatKeysRef = useRef<Set<string>>(new Set());
   const activeRunInfoByChatKeyRef = useRef<Record<string, ActiveRunInfo>>({});
   const queuedRunRequestsByChatKeyRef = useRef<
@@ -567,6 +570,8 @@ export function App() {
     activeChatId === null || isPendingChatId(activeChatId)
       ? activeChatKeyRef.current
       : chatRunKey(activeWorkspaceId, activeChatId);
+  const isLoadingActiveChatMessages =
+    activeChatKey !== null && loadingChatKeys.has(activeChatKey);
   const activeContextUsageKey =
     activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)
       ? chatRunKey(activeWorkspaceId, activeChatId)
@@ -2196,29 +2201,30 @@ export function App() {
   async function loadChatMessages(
     workspaceId: string,
     chatId: string,
-    options: { updateUrl?: boolean } = {},
   ) {
     setError(null);
+    const chatKey = chatRunKey(workspaceId, chatId);
+    const existingController = loadingChatControllersRef.current.get(chatKey);
+    if (existingController && !existingController.signal.aborted) {
+      return;
+    }
+    loadingChatKeysRef.current.add(chatKey);
+    const controller = new AbortController();
+    loadingChatControllersRef.current.set(chatKey, controller);
+    setLoadingChatKeys((current) => new Set(current).add(chatKey));
 
     try {
       const data = await requestJson<ChatMessagesResponse>(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages`,
+        { signal: controller.signal },
       );
-      const chatKey = chatRunKey(workspaceId, chatId);
       const nextMessages = data.messages.map(normalizeChatMessageSummary);
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
-      setActiveWorkspaceChatRefs(workspaceId, chatId);
-      setActiveWorkspaceId(workspaceId);
-      setActiveChatId(chatId);
-      setActiveMainTab({ chatId, type: "chat", workspaceId });
-      setExpandedWorkspaceId(workspaceId);
-      openChatTab(workspaceId, chatId);
-      activeChatKeyRef.current = chatKey;
-      setMessages(nextMessages);
       setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
       restoreQueuedRunRequestsForChatKey(workspaceId, chatId, nextMessages);
-      setViewMode("chat");
-      setIsMobileWorkspaceOpen(false);
+      if (activeChatKeyRef.current === chatKey) {
+        setMessages(nextMessages);
+      }
       if (activeRun) {
         void subscribeActiveChatRun(activeRun);
       } else {
@@ -2226,11 +2232,20 @@ export function App() {
         setActiveRunInfoForChatKey(chatKey, null);
         clearWorkspaceChatActiveRun(workspaceId, chatId);
       }
-      if (options.updateUrl !== false) {
-        updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
-      }
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      if (activeChatKeyRef.current === chatKey) {
+        setError(errorMessage(requestError));
+      }
+    } finally {
+      if (loadingChatControllersRef.current.get(chatKey) === controller) {
+        loadingChatControllersRef.current.delete(chatKey);
+        loadingChatKeysRef.current.delete(chatKey);
+        setLoadingChatKeys((current) => {
+          const next = new Set(current);
+          next.delete(chatKey);
+          return next;
+        });
+      }
     }
   }
 
@@ -2264,10 +2279,28 @@ export function App() {
     }
 
     const chatKey = chatRunKey(workspaceId, chatId);
+    for (const [loadingChatKey, controller] of loadingChatControllersRef.current) {
+      if (loadingChatKey !== chatKey) {
+        controller.abort();
+      }
+    }
     const cachedMessages = chatMessagesByKey[chatKey];
 
     if (!cachedMessages) {
-      void loadChatMessages(workspaceId, chatId, options);
+      setActiveWorkspaceId(workspaceId);
+      setActiveChatId(chatId);
+      setActiveMainTab({ chatId, type: "chat", workspaceId });
+      setExpandedWorkspaceId(workspaceId);
+      openChatTab(workspaceId, chatId);
+      setActiveWorkspaceChatRefs(workspaceId, chatId);
+      setMessages([]);
+      setSelectedDiffPath(null);
+      setViewMode("chat");
+      setIsMobileWorkspaceOpen(false);
+      if (options.updateUrl !== false) {
+        updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
+      }
+      void loadChatMessages(workspaceId, chatId);
       return;
     }
 
@@ -6059,6 +6092,7 @@ export function App() {
                   isLoadingSettings={isLoadingSettings}
                   isLoadingBranches={isLoadingBranches}
                   isLoadingContextUsage={isLoadingContextUsage}
+                  isLoadingMessages={isLoadingActiveChatMessages}
                   isSendingMessage={isSendingMessage}
                   isSelectingAttachments={isSelectingAttachments}
                   messages={messages}

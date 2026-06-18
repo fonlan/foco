@@ -2300,6 +2300,75 @@ fn chat_message_parts_ignore_unknown_tool_call_audit_events() {
 }
 
 #[test]
+fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
+    let tool_call = ChatToolCallSummary {
+        id: "tool-1".to_string(),
+        name: "read_file".to_string(),
+        status: "completed".to_string(),
+        input: json!({ "path": "README.md" }),
+        output: Some(json!({ "content": "large result" })),
+        is_error: false,
+    };
+    let events = [
+        (
+            "text_delta",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "delta": "Before."
+            }),
+        ),
+        (
+            "tool_call",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "toolCall": { "id": "tool-1" }
+            }),
+        ),
+        (
+            "text_delta",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "delta": "After."
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(event_type, value)| CapturedAuditEvent {
+        event_at: "2026-06-18T10:00:00Z".to_string(),
+        event_type: event_type.to_string(),
+        normalized_event_json: value.to_string(),
+    })
+    .collect::<Vec<_>>();
+
+    let stored_parts = finalized_assistant_message_parts(
+        "assistant-1",
+        &events,
+        "Before.After.",
+        None,
+        std::slice::from_ref(&tool_call),
+    )
+    .expect("stored parts");
+    let metadata_json = assistant_message_metadata_json(
+        None,
+        &[],
+        &CodeChangeStats::default(),
+        None,
+        Some(&stored_parts),
+    )
+    .expect("assistant metadata");
+    assert!(!metadata_json.contains("large result"));
+
+    let parts = assistant_parts_from_metadata(&metadata_json, std::slice::from_ref(&tool_call))
+        .expect("hydrate parts")
+        .expect("stored parts present");
+    assert!(matches!(&parts[0], ChatMessagePart::Text { text } if text == "Before."));
+    assert!(
+        matches!(&parts[1], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-1")
+    );
+    assert!(matches!(&parts[2], ChatMessagePart::Text { text } if text == "After."));
+}
+
+#[test]
 fn workspace_logo_file_detects_manual_logo_png() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-test"));
     let logo_dir = workspace_dir.join(".foco");
@@ -3882,17 +3951,12 @@ fn chat_message_summary_includes_assistant_reply_metrics() {
         })
         .expect("llm start event insert");
 
-    let message = database
-        .messages_for_chat("chat-1")
-        .expect("messages")
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
         .into_iter()
         .next()
-        .expect("assistant message");
-    let events = database
-        .llm_request_events_for_chat("chat-1")
-        .expect("llm request events");
-    let summary = chat_message_summary(&database, &workspace_dir, None, message, &events)
-        .expect("message summary");
+        .expect("assistant summary");
     let metrics = summary.metrics.expect("assistant metrics");
 
     assert_eq!(metrics.model_id, "gpt-5.4");
@@ -3958,14 +4022,12 @@ fn chat_message_summary_includes_assistant_extracted_memories() {
         })
         .expect("memory fact insert");
 
-    let message = database
-        .messages_for_chat("chat-1")
-        .expect("messages")
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
         .into_iter()
         .next()
-        .expect("assistant message");
-    let summary = chat_message_summary(&database, &workspace_dir, None, message, &[])
-        .expect("message summary");
+        .expect("assistant summary");
 
     assert_eq!(summary.extracted_memories.len(), 1);
     assert_eq!(summary.extracted_memories[0].id, "fact-1");
@@ -4045,17 +4107,12 @@ fn chat_message_summary_aggregates_multiple_llm_request_metrics() {
             .expect("llm start event insert");
     }
 
-    let message = database
-        .messages_for_chat("chat-1")
-        .expect("messages")
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
         .into_iter()
         .next()
-        .expect("assistant message");
-    let events = database
-        .llm_request_events_for_chat("chat-1")
-        .expect("llm request events");
-    let summary = chat_message_summary(&database, &workspace_dir, None, message, &events)
-        .expect("message summary");
+        .expect("assistant summary");
     let metrics = summary.metrics.expect("assistant metrics");
 
     assert_eq!(metrics.total_latency_ms, Some(2500));

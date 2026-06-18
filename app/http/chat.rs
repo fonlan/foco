@@ -408,26 +408,16 @@ pub(crate) async fn chat_messages(
         )));
     }
 
-    let llm_request_events = database
-        .llm_request_events_for_chat(chat_id)
-        .map_err(ApiError::from_workspace_error)?;
-    let mut messages = Vec::new();
-    for message in database
+    let message_records = database
         .messages_for_chat(chat_id)
-        .map_err(ApiError::from_workspace_error)?
-    {
-        if message.role != "user" && message.role != "assistant" {
-            continue;
-        }
-
-        messages.push(chat_message_summary(
-            &database,
-            &workspace.path,
-            Some(&state.memory_database_file),
-            message,
-            &llm_request_events,
-        )?);
-    }
+        .map_err(ApiError::from_workspace_error)?;
+    let messages = chat_message_summaries(
+        &database,
+        &workspace.path,
+        Some(&state.memory_database_file),
+        chat_id,
+        message_records,
+    )?;
 
     let active_run = state
         .active_chat_runs

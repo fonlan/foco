@@ -99,6 +99,7 @@ export function ChatPanel({
   queuedRunCount,
   isLoadingBranches,
   isLoadingContextUsage,
+  isLoadingMessages,
   isLoadingSettings,
   isSendingMessage,
   isSelectingAttachments,
@@ -148,6 +149,7 @@ export function ChatPanel({
   queuedRunCount: number;
   isLoadingBranches: boolean;
   isLoadingContextUsage: boolean;
+  isLoadingMessages: boolean;
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
   isSelectingAttachments: boolean;
@@ -672,6 +674,11 @@ export function ChatPanel({
                 </div>
               );
             })
+          ) : isLoadingMessages ? (
+            <div className="flex min-h-48 items-center justify-center gap-2 text-sm font-medium text-stone-500">
+              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+              <span>{t("Loading...")}</span>
+            </div>
           ) : (
             overviewRenderer()
           )}

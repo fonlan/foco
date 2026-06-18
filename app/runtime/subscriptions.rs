@@ -444,6 +444,7 @@ impl ActiveChatRunRegistration {
             &self.memories_used,
             &CodeChangeStats::default(),
             self.assistant_draft.status.as_metadata_value(),
+            None,
         )?;
 
         database
