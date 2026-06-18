@@ -249,6 +249,7 @@ import {
   chartTooltipLabelStyle,
   chartTooltipStyle,
   CONTEXT_PANEL_DEFAULT_MOBILE_HEIGHT,
+  CONTEXT_PANEL_DEFAULT_WIDTH,
   CONTEXT_PANEL_MAX_HEIGHT_RATIO,
   CONTEXT_PANEL_MAX_WIDTH,
   CONTEXT_PANEL_MIN_HEIGHT,
@@ -428,7 +429,7 @@ export function App() {
   );
   const [contextPanelTab, setContextPanelTab] =
     useState<ContextPanelTab>("todo");
-  const [diffPanelWidth, setDiffPanelWidth] = useState(CONTEXT_PANEL_MIN_WIDTH);
+  const [diffPanelWidth, setDiffPanelWidth] = useState(CONTEXT_PANEL_DEFAULT_WIDTH);
   const [contextPanelMobileHeight, setContextPanelMobileHeight] = useState(
     CONTEXT_PANEL_DEFAULT_MOBILE_HEIGHT,
   );
