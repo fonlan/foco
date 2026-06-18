@@ -910,7 +910,20 @@ fn repository_helpers_round_trip_tool_calls_and_results() {
         })
         .expect("assistant message insert");
     database
-        .insert_tool_call(NewToolCall {
+        .upsert_tool_call(NewToolCall {
+            id: "tool-call-1",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md","apiKey":"secret-value"}"#,
+            status: "running",
+            started_at: "2026-06-03T10:00:00.000Z",
+            completed_at: None,
+        })
+        .expect("running tool call upsert");
+    database
+        .upsert_tool_call(NewToolCall {
             id: "tool-call-1",
             chat_id: "chat-1",
             run_id: "run-1",
@@ -921,16 +934,16 @@ fn repository_helpers_round_trip_tool_calls_and_results() {
             started_at: "2026-06-03T10:00:00.000Z",
             completed_at: Some("2026-06-03T10:00:00.100Z"),
         })
-        .expect("tool call insert");
+        .expect("completed tool call upsert");
     database
-        .insert_tool_result(NewToolResult {
+        .upsert_tool_result(NewToolResult {
             id: "tool-result-1",
             tool_call_id: "tool-call-1",
             output_json: r#"{"content":"hello","authorization":"Bearer secret"}"#,
             is_error: false,
             created_at: "2026-06-03T10:00:00.100Z",
         })
-        .expect("tool result insert");
+        .expect("tool result upsert");
 
     let records = database
         .tool_calls_for_message("assistant-1")

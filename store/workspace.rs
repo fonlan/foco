@@ -708,6 +708,54 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    pub fn upsert_tool_call(
+        &mut self,
+        tool_call: NewToolCall<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let input_json = redact_audit_json(tool_call.input_json, "tool_call.input_json")?;
+        let changed = self
+            .connection
+            .execute(
+                "INSERT INTO tool_calls
+                    (
+                        id, chat_id, run_id, message_id, tool_name,
+                        input_json, status, started_at, completed_at
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(id) DO UPDATE SET
+                    message_id = excluded.message_id,
+                    status = excluded.status,
+                    started_at = excluded.started_at,
+                    completed_at = excluded.completed_at
+                 WHERE tool_calls.chat_id = excluded.chat_id
+                    AND tool_calls.run_id = excluded.run_id
+                    AND tool_calls.tool_name = excluded.tool_name
+                    AND tool_calls.input_json = excluded.input_json",
+                params![
+                    tool_call.id,
+                    tool_call.chat_id,
+                    tool_call.run_id,
+                    tool_call.message_id,
+                    tool_call.tool_name,
+                    input_json,
+                    tool_call.status,
+                    tool_call.started_at,
+                    tool_call.completed_at
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if changed == 0 {
+            return Err(WorkspaceDatabaseError::InvalidToolCall {
+                message: format!(
+                    "tool call '{}' already exists with a different chat, run, name, or input",
+                    tool_call.id
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
     pub fn insert_tool_result(
         &mut self,
         tool_result: NewToolResult<'_>,
@@ -726,6 +774,99 @@ impl WorkspaceDatabase {
                     if tool_result.is_error { 1_i64 } else { 0_i64 },
                     tool_result.created_at
                 ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn upsert_tool_result(
+        &mut self,
+        tool_result: NewToolResult<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let output_json = redact_audit_json(tool_result.output_json, "tool_result.output_json")?;
+        let changed = self
+            .connection
+            .execute(
+                "INSERT INTO tool_results
+                    (id, tool_call_id, output_json, is_error, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    output_json = excluded.output_json,
+                    is_error = excluded.is_error,
+                    created_at = excluded.created_at
+                 WHERE tool_results.tool_call_id = excluded.tool_call_id",
+                params![
+                    tool_result.id,
+                    tool_result.tool_call_id,
+                    output_json,
+                    if tool_result.is_error { 1_i64 } else { 0_i64 },
+                    tool_result.created_at
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if changed == 0 {
+            return Err(WorkspaceDatabaseError::InvalidToolCall {
+                message: format!(
+                    "tool result '{}' already exists for a different tool call",
+                    tool_result.id
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn complete_tool_call(
+        &mut self,
+        tool_call_id: &str,
+        status: &str,
+        completed_at: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE tool_calls
+                 SET status = ?2, completed_at = ?3
+                 WHERE id = ?1",
+                params![tool_call_id, status, completed_at],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if updated == 0 {
+            return Err(WorkspaceDatabaseError::MissingToolCall {
+                id: tool_call_id.to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn complete_running_tool_calls_for_run(
+        &mut self,
+        run_id: &str,
+        status: &str,
+        completed_at: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        self.connection
+            .execute(
+                "UPDATE tool_calls
+                 SET status = ?2, completed_at = ?3
+                 WHERE run_id = ?1 AND status = 'running'",
+                params![run_id, status, completed_at],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn delete_running_tool_calls_for_run(
+        &mut self,
+        run_id: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        self.connection
+            .execute(
+                "DELETE FROM tool_calls WHERE run_id = ?1 AND status = 'running'",
+                params![run_id],
             )
             .map_err(|source| self.sqlite_error(source))?;
 
@@ -2667,6 +2808,9 @@ pub enum WorkspaceDatabaseError {
     InvalidMessageMetadata {
         message: String,
     },
+    InvalidToolCall {
+        message: String,
+    },
     InvalidTodoGraph {
         message: String,
     },
@@ -2688,6 +2832,9 @@ pub enum WorkspaceDatabaseError {
         chat_id: String,
     },
     MissingTerminalSession {
+        id: String,
+    },
+    MissingToolCall {
         id: String,
     },
     MissingLlmRequest {
@@ -2722,6 +2869,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             Self::InvalidMessageMetadata { message } => {
                 write!(formatter, "invalid message metadata: {message}")
             }
+            Self::InvalidToolCall { message } => {
+                write!(formatter, "invalid tool call data: {message}")
+            }
             Self::InvalidTodoGraph { message } => {
                 write!(formatter, "invalid todo graph: {message}")
             }
@@ -2742,6 +2892,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             }
             Self::MissingTerminalSession { id } => {
                 write!(formatter, "terminal session was not found: {id}")
+            }
+            Self::MissingToolCall { id } => {
+                write!(formatter, "tool call was not found: {id}")
             }
             Self::MissingLlmRequest { id } => {
                 write!(formatter, "LLM request audit row was not found: {id}")
@@ -2785,11 +2938,13 @@ impl std::error::Error for WorkspaceDatabaseError {
             Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
             | Self::InvalidMessageMetadata { .. }
+            | Self::InvalidToolCall { .. }
             | Self::InvalidTodoGraph { .. }
             | Self::MissingDatabaseParent { .. }
             | Self::MissingLlmRequest { .. }
             | Self::MissingTodoGraph { .. }
             | Self::MissingTerminalSession { .. }
+            | Self::MissingToolCall { .. }
             | Self::NonUtf8Path { .. }
             | Self::UnsupportedSchemaVersion { .. }
             | Self::WorkspaceNotDirectory { .. } => None,

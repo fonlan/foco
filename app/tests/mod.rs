@@ -2089,6 +2089,155 @@ fn active_chat_run_record_event_persists_streaming_assistant_message() {
 }
 
 #[test]
+fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-cancelled-tool-history-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Cancelled tool chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-1",
+            chat_id: "chat-1",
+            role: "user",
+            content: "Inspect the workspace.",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("user message insert");
+    drop(database);
+
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            guidance_tx,
+        )
+        .expect("register active run");
+
+    for event in [
+        ChatSseEvent::ToolCall {
+            assistant_message_id: "assistant-1".to_string(),
+            tool_call: ChatToolCallSummary {
+                id: "tool-reset".to_string(),
+                name: "read_file".to_string(),
+                status: "running".to_string(),
+                input: json!({ "path": "discarded.txt" }),
+                output: None,
+                is_error: false,
+            },
+        },
+        ChatSseEvent::StreamReset {
+            assistant_message_id: "assistant-1".to_string(),
+            reason: "retry provider turn".to_string(),
+            text: String::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+        },
+        ChatSseEvent::ToolCall {
+            assistant_message_id: "assistant-1".to_string(),
+            tool_call: ChatToolCallSummary {
+                id: "tool-1".to_string(),
+                name: "read_file".to_string(),
+                status: "running".to_string(),
+                input: json!({ "path": "README.md" }),
+                output: None,
+                is_error: false,
+            },
+        },
+        ChatSseEvent::ToolResult {
+            assistant_message_id: "assistant-1".to_string(),
+            tool_call_id: "tool-1".to_string(),
+            output: json!({ "content": "hello" }),
+            is_error: false,
+        },
+        ChatSseEvent::ToolCall {
+            assistant_message_id: "assistant-1".to_string(),
+            tool_call: ChatToolCallSummary {
+                id: "tool-2".to_string(),
+                name: "run_command".to_string(),
+                status: "running".to_string(),
+                input: json!({ "command": "cargo test" }),
+                output: None,
+                is_error: false,
+            },
+        },
+    ] {
+        registration
+            .record_event(&workspace_dir, "chat-1", &event)
+            .expect("tool event record");
+    }
+    registration.cancellation().cancel();
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::Error {
+                message: "chat run cancelled".to_string(),
+            },
+        )
+        .expect("cancel event record");
+
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database reopen");
+    let tool_calls = database
+        .tool_calls_for_chat("chat-1")
+        .expect("tool calls for chat");
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0].message_id.as_deref(), Some("assistant-1"));
+    assert_eq!(tool_calls[0].status, "completed");
+    assert_eq!(
+        tool_calls[0]
+            .result
+            .as_ref()
+            .expect("completed tool result")
+            .output_json,
+        r#"{"content":"hello"}"#
+    );
+    assert_eq!(tool_calls[1].message_id.as_deref(), Some("assistant-1"));
+    assert_eq!(tool_calls[1].status, "cancelled");
+    assert!(tool_calls[1].result.is_none());
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summaries = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries");
+    let assistant = summaries
+        .iter()
+        .find(|message| message.id == "assistant-1")
+        .expect("assistant summary");
+    assert_eq!(assistant.tool_calls.len(), 2);
+    assert_eq!(assistant.tool_calls[0].status, "completed");
+    assert_eq!(assistant.tool_calls[1].status, "cancelled");
+    assert_eq!(
+        assistant
+            .parts
+            .iter()
+            .filter(|part| matches!(part, ChatMessagePart::ToolCall { .. }))
+            .count(),
+        2
+    );
+
+    let saved = database
+        .message("assistant-1")
+        .expect("assistant read")
+        .expect("assistant message");
+    let metadata = parse_json_value(&saved.metadata_json, "assistant metadata")
+        .expect("assistant metadata json");
+    assert_eq!(metadata["streamingState"], "cancelled");
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn active_chat_run_registry_rejects_stale_guidance_run() {
     let registry = ActiveChatRunRegistry::default();
     let error = registry
@@ -3022,7 +3171,7 @@ fn persist_chat_result_writes_cancelled_captured_llm_request() {
 }
 
 #[test]
-fn persist_failed_chat_result_keeps_tool_calls_without_assistant_message() {
+fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-failed-tool-call-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     {
@@ -3151,9 +3300,19 @@ fn persist_failed_chat_result_keeps_tool_calls_without_assistant_message() {
     let messages = database
         .messages_for_chat("chat-1")
         .expect("chat messages read");
+    let tool_calls = database
+        .tool_calls_for_chat("chat-1")
+        .expect("chat tool calls read");
 
     assert_eq!(request.final_state, "failed");
-    assert!(messages.is_empty());
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].id, "assistant-1");
+    assert!(messages[0].content.is_empty());
+    let metadata = parse_json_value(&messages[0].metadata_json, "assistant metadata")
+        .expect("assistant metadata json");
+    assert_eq!(metadata["streamingState"], "failed");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].message_id.as_deref(), Some("assistant-1"));
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");

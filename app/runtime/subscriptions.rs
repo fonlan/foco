@@ -7,7 +7,9 @@ use std::{
 
 use axum::response::sse::Event;
 use foco_providers::NeutralChatAttachment;
-use foco_store::workspace::{CodeChangeStats, NewMessage, NewRunEvent, WorkspaceDatabase};
+use foco_store::workspace::{
+    CodeChangeStats, NewMessage, NewRunEvent, NewToolCall, NewToolResult, WorkspaceDatabase,
+};
 use foco_tools::ToolCancellationToken;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -90,7 +92,7 @@ impl ChatRunCancellation {
 
     pub(crate) fn cancel(&self) {
         self.tool_token.cancel();
-        let _ = self.tx.send(true);
+        self.tx.send_replace(true);
     }
 }
 
@@ -375,6 +377,7 @@ impl ActiveChatRunRegistration {
                 })
                 .map_err(ApiError::from_workspace_error)?;
             self.persist_assistant_draft_for_event(&mut database, chat_id, event)?;
+            self.persist_tool_state_for_event(&mut database, chat_id, event)?;
         }
 
         self.events
@@ -414,6 +417,12 @@ impl ActiveChatRunRegistration {
                 self.assistant_draft.reasoning.push_str(delta);
                 self.assistant_draft.status = StreamingAssistantStatus::Streaming;
             }
+            ChatSseEvent::ToolCall {
+                assistant_message_id,
+                ..
+            } if assistant_message_id == &self.assistant_message_id => {
+                self.assistant_draft.status = StreamingAssistantStatus::Streaming;
+            }
             ChatSseEvent::Error { .. }
                 if self.assistant_draft.status == StreamingAssistantStatus::Streaming =>
             {
@@ -427,6 +436,88 @@ impl ActiveChatRunRegistration {
         }
 
         self.persist_assistant_draft(database, chat_id)
+    }
+
+    fn persist_tool_state_for_event(
+        &self,
+        database: &mut WorkspaceDatabase,
+        chat_id: &str,
+        event: &ChatSseEvent,
+    ) -> Result<(), ApiError> {
+        match event {
+            ChatSseEvent::ToolCall {
+                assistant_message_id,
+                tool_call,
+            } if assistant_message_id == &self.assistant_message_id => {
+                let input_json = serde_json::to_string(&tool_call.input).map_err(|source| {
+                    ApiError::internal(format!("failed to serialize tool input: {source}"))
+                })?;
+                let started_at = utc_timestamp();
+                database
+                    .upsert_tool_call(NewToolCall {
+                        id: &tool_call.id,
+                        chat_id,
+                        run_id: &self.run_id,
+                        message_id: Some(&self.assistant_message_id),
+                        tool_name: &tool_call.name,
+                        input_json: &input_json,
+                        status: "running",
+                        started_at: &started_at,
+                        completed_at: None,
+                    })
+                    .map_err(ApiError::from_workspace_error)?;
+            }
+            ChatSseEvent::ToolResult {
+                assistant_message_id,
+                tool_call_id,
+                output,
+                is_error,
+            } if assistant_message_id == &self.assistant_message_id => {
+                let output_json = serde_json::to_string(output).map_err(|source| {
+                    ApiError::internal(format!("failed to serialize tool output: {source}"))
+                })?;
+                let completed_at = utc_timestamp();
+                let result_id = format!("{tool_call_id}-result");
+                database
+                    .upsert_tool_result(NewToolResult {
+                        id: &result_id,
+                        tool_call_id,
+                        output_json: &output_json,
+                        is_error: *is_error,
+                        created_at: &completed_at,
+                    })
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .complete_tool_call(
+                        tool_call_id,
+                        if *is_error { "error" } else { "completed" },
+                        &completed_at,
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
+            }
+            ChatSseEvent::StreamReset { .. } => {
+                database
+                    .delete_running_tool_calls_for_run(&self.run_id)
+                    .map_err(ApiError::from_workspace_error)?;
+            }
+            ChatSseEvent::Error { .. } => {
+                let completed_at = utc_timestamp();
+                database
+                    .complete_running_tool_calls_for_run(
+                        &self.run_id,
+                        if self.cancellation_is_active() {
+                            "cancelled"
+                        } else {
+                            "error"
+                        },
+                        &completed_at,
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
+            }
+            _ => {}
+        }
+
+        Ok(())
     }
 
     fn cancellation_is_active(&self) -> bool {

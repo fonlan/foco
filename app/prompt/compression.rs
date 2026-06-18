@@ -1458,6 +1458,36 @@ pub(crate) fn persist_chat_result(
             })
             .map_err(ApiError::from_workspace_error)?;
         Some(context.assistant_message_id.as_str())
+    } else if !tool_calls.is_empty() {
+        if database
+            .message(&context.assistant_message_id)
+            .map_err(ApiError::from_workspace_error)?
+            .is_none()
+        {
+            let streaming_state = match final_state {
+                "cancelled" => Some("cancelled"),
+                "failed" => Some("failed"),
+                _ => None,
+            };
+            let metadata_json = assistant_message_metadata_json(
+                None,
+                &context.memories_used,
+                &context.code_change_stats,
+                streaming_state,
+                None,
+            )?;
+            database
+                .upsert_message_content(NewMessage {
+                    id: &context.assistant_message_id,
+                    chat_id: &context.chat_id,
+                    role: "assistant",
+                    content: "",
+                    sequence: context.assistant_sequence,
+                    metadata_json: Some(&metadata_json),
+                })
+                .map_err(ApiError::from_workspace_error)?;
+        }
+        Some(context.assistant_message_id.as_str())
     } else {
         None
     };
@@ -1472,7 +1502,7 @@ pub(crate) fn persist_chat_result(
         let result_id = format!("{}-result", tool_call.id);
 
         database
-            .insert_tool_call(NewToolCall {
+            .upsert_tool_call(NewToolCall {
                 id: &tool_call.id,
                 chat_id: &context.chat_id,
                 run_id: &context.llm_request_id,
@@ -1489,7 +1519,7 @@ pub(crate) fn persist_chat_result(
             })
             .map_err(ApiError::from_workspace_error)?;
         database
-            .insert_tool_result(NewToolResult {
+            .upsert_tool_result(NewToolResult {
                 id: &result_id,
                 tool_call_id: &tool_call.id,
                 output_json: &output_json,
