@@ -645,16 +645,23 @@ export function App() {
       ),
     [openChatTabs],
   );
+  const configuredModelsByName = useMemo(
+    () =>
+      [...(settings?.configuredModels ?? [])].sort((left, right) =>
+        left.displayName.localeCompare(right.displayName),
+      ),
+    [settings?.configuredModels],
+  );
   const availableModels = useMemo(
     () =>
-      (settings?.configuredModels ?? []).filter(
+      configuredModelsByName.filter(
         (model) =>
           model.enabled &&
           model.canEnable &&
           model.activeProviderId !== null &&
           model.providerIds.length > 0,
       ),
-    [settings],
+    [configuredModelsByName],
   );
   const detectedSkills = useMemo(
     () => settings?.skills.detected ?? [],
@@ -7705,10 +7712,12 @@ function ApiStatsPanel({
     requests.map((request) => request.providerId),
   );
   const modelOptions = auditOptions(
-    settings?.configuredModels.map((model) => ({
-      label: model.displayName,
-      value: model.id,
-    })) ?? [],
+    settings?.configuredModels
+      .map((model) => ({
+        label: model.displayName,
+        value: model.id,
+      }))
+      .sort((left, right) => left.label.localeCompare(right.label)) ?? [],
     requests.map((request) => request.modelId),
   );
   const statusOptions = auditOptions(
@@ -10418,26 +10427,37 @@ function SettingsPanel({
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const configuredModels =
     settings?.configuredModels ?? metadata?.configuredModels ?? [];
+  const configuredModelsByName = useMemo(
+    () =>
+      [...configuredModels].sort((left, right) =>
+        left.displayName.localeCompare(right.displayName),
+      ),
+    [configuredModels],
+  );
   const passwordInputValue =
     generalForm.password ||
     (settings?.general.webServer.passwordEnabled && !isEditingGeneralPassword
       ? SAVED_PASSWORD_MASK
       : "");
   const orderedConfiguredModels = useMemo(() => {
+    const sortedConfiguredModels = [...configuredModels].sort((left, right) =>
+      left.displayName.localeCompare(right.displayName),
+    );
+
     if (!modelOrderPreview) {
-      return configuredModels;
+      return sortedConfiguredModels;
     }
 
     const modelsById = new Map(
-      configuredModels.map((model) => [model.id, model]),
+      sortedConfiguredModels.map((model) => [model.id, model]),
     );
     const previewModels = modelOrderPreview
       .map((modelId) => modelsById.get(modelId))
       .filter((model): model is ConfiguredModelSummary => Boolean(model));
 
-    return previewModels.length === configuredModels.length
+    return previewModels.length === sortedConfiguredModels.length
       ? previewModels
-      : configuredModels;
+      : sortedConfiguredModels;
   }, [configuredModels, modelOrderPreview]);
   const orderedWorkspaces = useMemo(() => {
     if (!workspaceOrderPreview) {
@@ -14070,7 +14090,7 @@ function SettingsPanel({
                             value={memorySettingsForm.extractionModelId}
                           >
                             <option value="">{t("Current chat model")}</option>
-                            {(settings?.configuredModels ?? []).map((model) => (
+                            {configuredModelsByName.map((model) => (
                               <option key={model.id} value={model.id}>
                                 {model.displayName}
                               </option>
@@ -14144,7 +14164,7 @@ function SettingsPanel({
                             value={memorySettingsForm.retrievalModelId}
                           >
                             <option value="">{t("Current chat model")}</option>
-                            {(settings?.configuredModels ?? []).map((model) => (
+                            {configuredModelsByName.map((model) => (
                               <option key={model.id} value={model.id}>
                                 {model.displayName}
                               </option>
