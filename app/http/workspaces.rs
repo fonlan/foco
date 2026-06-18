@@ -3,22 +3,6 @@ use std::{fs, path::Path};
 const WORKSPACE_FILE_TREE_MAX_DEPTH: usize = 12;
 const WORKSPACE_FILE_TREE_MAX_NODES: usize = 8_000;
 const WORKSPACE_FILE_TREE_INITIAL_DEPTH: usize = 2;
-const WORKSPACE_FILE_TREE_IGNORED_DIR_NAMES: &[&str] = &[
-    ".codegraph",
-    ".foco",
-    ".git",
-    ".mem",
-    ".next",
-    ".parcel-cache",
-    ".svelte-kit",
-    ".turbo",
-    ".vite",
-    "build",
-    "coverage",
-    "dist",
-    "node_modules",
-    "target",
-];
 
 use axum::{
     Json,
@@ -473,7 +457,6 @@ fn workspace_file_tree_children(
             ))
         })?;
 
-    entries.retain(|entry| !workspace_file_tree_should_skip_entry(entry.path().as_path()));
     entries.sort_by(|left, right| {
         let left_path = left.path();
         let right_path = right.path();
@@ -564,7 +547,7 @@ fn workspace_file_tree(
 }
 
 fn workspace_file_tree_directory_has_children(path: &Path) -> Result<bool, ApiError> {
-    let entries = fs::read_dir(path).map_err(|source| {
+    let mut entries = fs::read_dir(path).map_err(|source| {
         ApiError::internal(format!(
             "failed to read workspace directory {}: {}",
             path.display(),
@@ -572,28 +555,17 @@ fn workspace_file_tree_directory_has_children(path: &Path) -> Result<bool, ApiEr
         ))
     })?;
 
-    for entry in entries {
-        let entry = entry.map_err(|source| {
+    entries
+        .next()
+        .transpose()
+        .map_err(|source| {
             ApiError::internal(format!(
                 "failed to read workspace directory entry {}: {}",
                 path.display(),
                 source
             ))
-        })?;
-        if !workspace_file_tree_should_skip_entry(entry.path().as_path()) {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-fn workspace_file_tree_should_skip_entry(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-
-    path.is_dir() && WORKSPACE_FILE_TREE_IGNORED_DIR_NAMES.contains(&name)
+        })
+        .map(|entry| entry.is_some())
 }
 
 fn workspace_file_parent_path(path: &str) -> String {
