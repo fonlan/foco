@@ -8720,7 +8720,7 @@ function ContextPanel({
 
         {activeTab === "git" ? (
           <div className="flex min-h-0 flex-1 flex-col">
-            <GitDiffPanel
+            <SourceControlPanel
               diffError={diffError}
               diffResponse={diffResponse}
               files={files}
@@ -8890,6 +8890,8 @@ function MonacoFileEditor({
     if (!container) {
       return undefined;
     }
+
+    registerTomlMonacoLanguage();
 
     const model = monaco.editor.createModel(
       value,
@@ -9903,7 +9905,7 @@ function TodoGraphTaskItem({
   );
 }
 
-function GitDiffPanel({
+function SourceControlPanel({
   diffError,
   diffResponse,
   files,
@@ -17506,6 +17508,67 @@ function replaceWorkspaceFileNodeChildren(
       replaceWorkspaceFileNodeChildren(child, path, children),
     ),
   };
+}
+
+function registerTomlMonacoLanguage() {
+  if (monaco.languages.getLanguages().some((language) => language.id === "toml")) {
+    return;
+  }
+
+  monaco.languages.register({
+    id: "toml",
+    aliases: ["TOML", "toml"],
+    extensions: [".toml"],
+    mimetypes: ["application/toml"],
+  });
+  monaco.languages.setMonarchTokensProvider("toml", {
+    defaultToken: "",
+    tokenPostfix: ".toml",
+    escapes: /\\(?:[btnfr"\\]|u[0-9A-Fa-f]{4}|U[0-9A-Fa-f]{8})/,
+    tokenizer: {
+      root: [
+        [/^\s*(\[+)([^\]]+)(\]+)/, ["delimiter.bracket", "type.identifier", "delimiter.bracket"]],
+        [/^\s*([A-Za-z0-9_-]+)(\s*=)/, ["key", "delimiter"]],
+        { include: "@values" },
+        [/#.*$/, "comment"],
+      ],
+      values: [
+        [/"""/, "string", "multilineDoubleString"],
+        [/'''/, "string", "multilineSingleString"],
+        [/"/, "string", "doubleString"],
+        [/'/, "string", "singleString"],
+        [/\b(?:true|false)\b/, "keyword"],
+        [/\b\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?\b/, "number.date"],
+        [/[+-]?\b(?:0x[0-9A-Fa-f_]+|0o[0-7_]+|0b[01_]+)\b/, "number"],
+        [/[+-]?\b\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d[\d_]*)?\b/, "number"],
+        [/[\[\]{}.,]/, "delimiter"],
+        [/#.*$/, "comment"],
+      ],
+      doubleString: [
+        [/[^\\"#]+/, "string"],
+        [/@escapes/, "string.escape"],
+        [/\\./, "string.escape.invalid"],
+        [/"/, "string", "@pop"],
+        [/#.*$/, "comment"],
+      ],
+      singleString: [
+        [/[^']+/, "string"],
+        [/'/, "string", "@pop"],
+      ],
+      multilineDoubleString: [
+        [/[^\\"]+/, "string"],
+        [/@escapes/, "string.escape"],
+        [/\\./, "string.escape.invalid"],
+        [/"""/, "string", "@pop"],
+        [/"/, "string"],
+      ],
+      multilineSingleString: [
+        [/[^']+/, "string"],
+        [/'''/, "string", "@pop"],
+        [/'/, "string"],
+      ],
+    },
+  });
 }
 
 function monacoLanguageForPath(path: string) {
