@@ -2,6 +2,7 @@ use std::{fs, path::Path};
 
 const WORKSPACE_FILE_TREE_MAX_DEPTH: usize = 12;
 const WORKSPACE_FILE_TREE_MAX_NODES: usize = 8_000;
+const WORKSPACE_FILE_TREE_INITIAL_DEPTH: usize = 2;
 const WORKSPACE_FILE_TREE_IGNORED_DIR_NAMES: &[&str] = &[
     ".codegraph",
     ".foco",
@@ -22,7 +23,7 @@ const WORKSPACE_FILE_TREE_IGNORED_DIR_NAMES: &[&str] = &[
 use axum::{
     Json,
     body::Body,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{StatusCode, header},
     response::Response,
 };
@@ -43,11 +44,39 @@ pub(crate) async fn workspace_files(
     }))
 }
 
+pub(crate) async fn workspace_file_children(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Query(query): Query<WorkspaceFileChildrenQuery>,
+) -> Result<Json<WorkspaceFileChildrenResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let path = workspace_file_list_path(&workspace.path, &query.path)?;
+    let metadata = fs::metadata(&path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "workspace file was not found: {}: {}",
+            query.path, source
+        ))
+    })?;
+
+    if !metadata.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "workspace path is not a directory: {}",
+            query.path
+        )));
+    }
+
+    Ok(Json(WorkspaceFileChildrenResponse {
+        path: query.path,
+        children: workspace_file_tree_children(&workspace.path, &path, 0, false)?,
+    }))
+}
+
 pub(crate) async fn delete_workspace_file(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
     Json(request): Json<WorkspaceFileRequest>,
-) -> Result<Json<WorkspaceFilesResponse>, ApiError> {
+) -> Result<Json<WorkspaceFileChildrenResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
     let path = workspace_file_path(&workspace.path, &request.path)?;
@@ -74,8 +103,12 @@ pub(crate) async fn delete_workspace_file(
         })?;
     }
 
-    Ok(Json(WorkspaceFilesResponse {
-        root: workspace_file_tree_response(&workspace.path)?,
+    let parent = workspace_file_parent_path(&request.path);
+    let parent_path = workspace_file_list_path(&workspace.path, &parent)?;
+
+    Ok(Json(WorkspaceFileChildrenResponse {
+        path: parent,
+        children: workspace_file_tree_children(&workspace.path, &parent_path, 0, false)?,
     }))
 }
 
@@ -153,7 +186,7 @@ pub(crate) async fn rename_workspace_file(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
     Json(request): Json<RenameWorkspaceFileRequest>,
-) -> Result<Json<WorkspaceFilesResponse>, ApiError> {
+) -> Result<Json<WorkspaceFileChildrenResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
     let source_path = workspace_file_path(&workspace.path, &request.path)?;
@@ -177,8 +210,12 @@ pub(crate) async fn rename_workspace_file(
         ))
     })?;
 
-    Ok(Json(WorkspaceFilesResponse {
-        root: workspace_file_tree_response(&workspace.path)?,
+    let parent = workspace_file_parent_path(&request.path);
+    let parent_path = workspace_file_list_path(&workspace.path, &parent)?;
+
+    Ok(Json(WorkspaceFileChildrenResponse {
+        path: parent,
+        children: workspace_file_tree_children(&workspace.path, &parent_path, 0, false)?,
     }))
 }
 
@@ -406,13 +443,60 @@ pub(crate) async fn install_ripgrep(
 }
 
 fn workspace_file_tree_response(workspace_root: &Path) -> Result<WorkspaceFileTreeNode, ApiError> {
-    let mut scan = WorkspaceFileTreeScan::default();
-    workspace_file_tree(workspace_root, workspace_root, true, 0, &mut scan)
+    workspace_file_tree(workspace_root, workspace_root, true, 1, true)
 }
 
-#[derive(Default)]
-struct WorkspaceFileTreeScan {
-    visited_nodes: usize,
+fn workspace_file_tree_children(
+    workspace_root: &Path,
+    path: &Path,
+    depth: usize,
+    load_grandchildren: bool,
+) -> Result<Vec<WorkspaceFileTreeNode>, ApiError> {
+    if depth > WORKSPACE_FILE_TREE_MAX_DEPTH {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = fs::read_dir(path)
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to read workspace directory {}: {}",
+                path.display(),
+                source
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to read workspace directory entry {}: {}",
+                path.display(),
+                source
+            ))
+        })?;
+
+    entries.retain(|entry| !workspace_file_tree_should_skip_entry(entry.path().as_path()));
+    entries.sort_by(|left, right| {
+        let left_path = left.path();
+        let right_path = right.path();
+        let left_is_dir = left_path.is_dir();
+        let right_is_dir = right_path.is_dir();
+
+        right_is_dir
+            .cmp(&left_is_dir)
+            .then_with(|| left.file_name().cmp(&right.file_name()))
+    });
+
+    let mut children = Vec::new();
+    for entry in entries.into_iter().take(WORKSPACE_FILE_TREE_MAX_NODES) {
+        children.push(workspace_file_tree(
+            workspace_root,
+            &entry.path(),
+            false,
+            depth + 1,
+            load_grandchildren && depth + 1 < WORKSPACE_FILE_TREE_INITIAL_DEPTH,
+        )?);
+    }
+
+    Ok(children)
 }
 
 fn workspace_file_tree(
@@ -420,10 +504,8 @@ fn workspace_file_tree(
     path: &Path,
     is_root: bool,
     depth: usize,
-    scan: &mut WorkspaceFileTreeScan,
+    load_children: bool,
 ) -> Result<WorkspaceFileTreeNode, ApiError> {
-    scan.visited_nodes = scan.visited_nodes.saturating_add(1);
-
     let metadata = fs::metadata(path).map_err(|source| {
         ApiError::internal(format!(
             "failed to read workspace file metadata {}: {}",
@@ -454,55 +536,17 @@ fn workspace_file_tree(
         ApiError::internal(format!("workspace file escaped root: {}", path.display()))
     })?;
     let path_text = relative_path.to_string_lossy().replace('\\', "/");
-    let mut children = Vec::new();
-
-    if metadata.is_dir()
-        && depth < WORKSPACE_FILE_TREE_MAX_DEPTH
-        && scan.visited_nodes < WORKSPACE_FILE_TREE_MAX_NODES
-    {
-        let mut entries = fs::read_dir(path)
-            .map_err(|source| {
-                ApiError::internal(format!(
-                    "failed to read workspace directory {}: {}",
-                    path.display(),
-                    source
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|source| {
-                ApiError::internal(format!(
-                    "failed to read workspace directory entry {}: {}",
-                    path.display(),
-                    source
-                ))
-            })?;
-
-        entries.retain(|entry| !workspace_file_tree_should_skip_entry(entry.path().as_path()));
-        entries.sort_by(|left, right| {
-            let left_path = left.path();
-            let right_path = right.path();
-            let left_is_dir = left_path.is_dir();
-            let right_is_dir = right_path.is_dir();
-
-            right_is_dir
-                .cmp(&left_is_dir)
-                .then_with(|| left.file_name().cmp(&right.file_name()))
-        });
-
-        for entry in entries {
-            if scan.visited_nodes >= WORKSPACE_FILE_TREE_MAX_NODES {
-                break;
-            }
-
-            children.push(workspace_file_tree(
-                workspace_root,
-                &entry.path(),
-                false,
-                depth + 1,
-                scan,
-            )?);
-        }
-    }
+    let (children, children_loaded, has_children) = if metadata.is_dir() {
+        let has_children = workspace_file_tree_directory_has_children(path)?;
+        let children = if load_children {
+            workspace_file_tree_children(workspace_root, path, depth, true)?
+        } else {
+            Vec::new()
+        };
+        (children, load_children, has_children)
+    } else {
+        (Vec::new(), true, false)
+    };
 
     Ok(WorkspaceFileTreeNode {
         name,
@@ -513,8 +557,35 @@ fn workspace_file_tree(
         } else {
             0
         },
+        has_children,
+        children_loaded,
         children,
     })
+}
+
+fn workspace_file_tree_directory_has_children(path: &Path) -> Result<bool, ApiError> {
+    let entries = fs::read_dir(path).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to read workspace directory {}: {}",
+            path.display(),
+            source
+        ))
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            ApiError::internal(format!(
+                "failed to read workspace directory entry {}: {}",
+                path.display(),
+                source
+            ))
+        })?;
+        if !workspace_file_tree_should_skip_entry(entry.path().as_path()) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn workspace_file_tree_should_skip_entry(path: &Path) -> bool {
@@ -523,6 +594,24 @@ fn workspace_file_tree_should_skip_entry(path: &Path) -> bool {
     };
 
     path.is_dir() && WORKSPACE_FILE_TREE_IGNORED_DIR_NAMES.contains(&name)
+}
+
+fn workspace_file_parent_path(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
+}
+
+fn workspace_file_list_path(
+    workspace_root: &Path,
+    input: &str,
+) -> Result<std::path::PathBuf, ApiError> {
+    if input.trim().is_empty() {
+        return Ok(workspace_root.to_path_buf());
+    }
+
+    let relative_path = normalize_workspace_relative_path(input)?;
+    Ok(workspace_root.join(relative_path))
 }
 
 fn workspace_file_path(workspace_root: &Path, input: &str) -> Result<std::path::PathBuf, ApiError> {

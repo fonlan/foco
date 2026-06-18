@@ -224,6 +224,7 @@ import type {
   WebSearchFormState,
   WorkspaceChatListItem,
   WorkspaceCommonCommandSummary,
+  WorkspaceFileChildrenResponse,
   WorkspaceFileContentResponse,
   WorkspaceFileSaveResponse,
   WorkspaceFilesResponse,
@@ -448,6 +449,9 @@ export function App() {
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFilesResponse | null>(null);
   const [expandedFileTreePaths, setExpandedFileTreePaths] = useState<Set<string>>(
     () => new Set([""]),
+  );
+  const [loadingWorkspaceDirectoryPaths, setLoadingWorkspaceDirectoryPaths] = useState<Set<string>>(
+    () => new Set(),
   );
   const [isLoadingWorkspaceFiles, setIsLoadingWorkspaceFiles] = useState(false);
   const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
@@ -904,6 +908,7 @@ export function App() {
         `/api/workspaces/${encodeURIComponent(workspaceId)}/files`,
       );
       setWorkspaceFiles(data);
+      setLoadingWorkspaceDirectoryPaths(new Set());
       return data;
     } catch (requestError) {
       setWorkspaceFiles(null);
@@ -913,6 +918,39 @@ export function App() {
       setIsLoadingWorkspaceFiles(false);
     }
   }, []);
+
+  const loadWorkspaceDirectoryChildren = useCallback(
+    async (workspaceId: string, path: string) => {
+      setLoadingWorkspaceDirectoryPaths((current) => new Set(current).add(path));
+      setWorkspaceFilesError(null);
+
+      try {
+        const query = new URLSearchParams({ path });
+        const data = await requestJson<WorkspaceFileChildrenResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/files/children?${query.toString()}`,
+        );
+        setWorkspaceFiles((current) =>
+          current
+            ? {
+                ...current,
+                root: replaceWorkspaceFileNodeChildren(current.root, data.path, data.children),
+              }
+            : current,
+        );
+        return data;
+      } catch (requestError) {
+        setWorkspaceFilesError(errorMessage(requestError));
+        return null;
+      } finally {
+        setLoadingWorkspaceDirectoryPaths((current) => {
+          const next = new Set(current);
+          next.delete(path);
+          return next;
+        });
+      }
+    },
+    [],
+  );
 
   const loadGitDiff = useCallback(async (workspaceId: string, path: string | null) => {
     setIsLoadingDiff(true);
@@ -2887,7 +2925,7 @@ export function App() {
     setWorkspaceFilesError(null);
 
     try {
-      const data = await requestJson<WorkspaceFilesResponse>(
+      const data = await requestJson<WorkspaceFileChildrenResponse>(
         `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/files/${action}`,
         {
           body: JSON.stringify(action === "rename" ? { path, newName } : { path }),
@@ -2895,14 +2933,29 @@ export function App() {
           method: "POST",
         },
       );
-      setWorkspaceFiles(data);
       if (action === "delete") {
         closeWorkspaceFileTabsForPath(activeWorkspace.id, path);
+        setExpandedFileTreePaths((current) => {
+          const next = new Set([...current, ""]);
+          for (const expandedPath of current) {
+            if (expandedPath === path || expandedPath.startsWith(`${path}/`)) {
+              next.delete(expandedPath);
+            }
+          }
+          return next;
+        });
       }
       if (action === "rename" && newName) {
         renameWorkspaceFileTab(activeWorkspace.id, path, newName);
       }
-      setExpandedFileTreePaths((current) => new Set([...current, ""]));
+      setWorkspaceFiles((current) =>
+        current
+          ? {
+              ...current,
+              root: replaceWorkspaceFileNodeChildren(current.root, data.path, data.children),
+            }
+          : current,
+      );
       if (isContextPanelOpen && contextPanelTab === "git") {
         void loadGitDiff(activeWorkspace.id, selectedDiffPath);
       }
@@ -6284,16 +6337,31 @@ export function App() {
                     onDeleteWorkspaceFile={(path) =>
                       void handleWorkspaceFileOperation("delete", path)
                     }
-                    onToggleFileTreePath={(path) => {
-                      setExpandedFileTreePaths((current) => {
-                        const next = new Set(current);
-                        if (next.has(path)) {
-                          next.delete(path);
-                        } else {
-                          next.add(path);
+                    loadingWorkspaceDirectoryPaths={loadingWorkspaceDirectoryPaths}
+                    onToggleFileTreePath={async (node) => {
+                      const isExpanded = expandedFileTreePaths.has(node.path);
+                      if (isExpanded) {
+                        setExpandedFileTreePaths((current) => {
+                          const next = new Set(current);
+                          next.delete(node.path);
+                          return next;
+                        });
+                        return;
+                      }
+
+                      if (
+                        activeWorkspace?.id &&
+                        node.kind === "directory" &&
+                        node.hasChildren &&
+                        !node.childrenLoaded
+                      ) {
+                        const loaded = await loadWorkspaceDirectoryChildren(activeWorkspace.id, node.path);
+                        if (!loaded) {
+                          return;
                         }
-                        return next;
-                      });
+                      }
+
+                      setExpandedFileTreePaths((current) => new Set([...current, node.path]));
                     }}
                     onOpenWorkspaceFile={(node) => void openWorkspaceFileTab(node)}
                     onOpenWorkspaceFileMenu={(event, node) => {
@@ -8524,6 +8592,7 @@ function ContextPanel({
   expandedFileTreePaths,
   isLoadingChatStatistics,
   isLoadingContextMemories,
+  loadingWorkspaceDirectoryPaths,
   isLoadingDiff,
   isLoadingTodoGraph,
   isLoadingWorkspaceFiles,
@@ -8564,6 +8633,7 @@ function ContextPanel({
   expandedFileTreePaths: Set<string>;
   isLoadingChatStatistics: boolean;
   isLoadingContextMemories: boolean;
+  loadingWorkspaceDirectoryPaths: Set<string>;
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
   isLoadingWorkspaceFiles: boolean;
@@ -8577,7 +8647,7 @@ function ContextPanel({
   onRefreshWorkspaceFiles: () => void;
   onRenameWorkspaceFile: (path: string, newName: string) => void;
   onDeleteWorkspaceFile: (path: string) => void;
-  onToggleFileTreePath: (path: string) => void;
+  onToggleFileTreePath: (node: WorkspaceFileTreeNode) => void | Promise<void>;
   onOpenWorkspaceFile: (node: WorkspaceFileTreeNode) => void;
   onOpenWorkspaceFileMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
   onSelectDiffFile: (path: string | null) => void;
@@ -8636,6 +8706,7 @@ function ContextPanel({
             expandedPaths={expandedFileTreePaths}
             isLoading={isLoadingWorkspaceFiles}
             operationKey={workspaceFileOperationKey}
+            loadingPaths={loadingWorkspaceDirectoryPaths}
             onDeleteFile={onDeleteWorkspaceFile}
             onOpenFile={onOpenWorkspaceFile}
             onOpenContextMenu={onOpenWorkspaceFileMenu}
@@ -8987,6 +9058,7 @@ function WorkspaceFilesTab({
   error,
   expandedPaths,
   isLoading,
+  loadingPaths,
   operationKey,
   onDeleteFile,
   onOpenFile,
@@ -8999,13 +9071,14 @@ function WorkspaceFilesTab({
   error: string | null;
   expandedPaths: Set<string>;
   isLoading: boolean;
+  loadingPaths: Set<string>;
   operationKey: string | null;
   onDeleteFile: (path: string) => void;
   onOpenFile: (node: WorkspaceFileTreeNode) => void;
   onOpenContextMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
   onRefresh: () => void;
   onRenameFile: (path: string, newName: string) => void;
-  onTogglePath: (path: string) => void;
+  onTogglePath: (node: WorkspaceFileTreeNode) => void | Promise<void>;
   response: WorkspaceFilesResponse | null;
 }) {
   const { t } = useI18n();
@@ -9048,6 +9121,7 @@ function WorkspaceFilesTab({
             <WorkspaceFileTreeNodeRow
               depth={0}
               expandedPaths={expandedPaths}
+              loadingPaths={loadingPaths}
               node={response.root}
               onDeleteFile={onDeleteFile}
               onOpenFile={onOpenFile}
@@ -9070,6 +9144,7 @@ function WorkspaceFilesTab({
 function WorkspaceFileTreeNodeRow({
   depth,
   expandedPaths,
+  loadingPaths,
   node,
   onDeleteFile,
   onOpenFile,
@@ -9080,18 +9155,20 @@ function WorkspaceFileTreeNodeRow({
 }: {
   depth: number;
   expandedPaths: Set<string>;
+  loadingPaths: Set<string>;
   node: WorkspaceFileTreeNode;
   onDeleteFile: (path: string) => void;
   onOpenFile: (node: WorkspaceFileTreeNode) => void;
   onOpenContextMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
   onRenameFile: (path: string, newName: string) => void;
-  onTogglePath: (path: string) => void;
+  onTogglePath: (node: WorkspaceFileTreeNode) => void | Promise<void>;
   operationKey: string | null;
 }) {
   const { t } = useI18n();
   const isDirectory = node.kind === "directory";
   const isExpanded = expandedPaths.has(node.path);
   const isBusy = operationKey === `delete:${node.path}` || operationKey === `rename:${node.path}`;
+  const isLoadingDirectory = loadingPaths.has(node.path);
 
   return (
     <div role="none">
@@ -9105,7 +9182,7 @@ function WorkspaceFileTreeNodeRow({
         }}
         onDoubleClick={() => {
           if (isDirectory) {
-            onTogglePath(node.path);
+            void onTogglePath(node);
             return;
           }
           onOpenFile(node);
@@ -9119,7 +9196,7 @@ function WorkspaceFileTreeNodeRow({
           disabled={!isDirectory}
           onClick={() => {
             if (isDirectory) {
-              onTogglePath(node.path);
+              void onTogglePath(node);
             }
           }}
           tabIndex={isDirectory ? 0 : -1}
@@ -9141,7 +9218,7 @@ function WorkspaceFileTreeNodeRow({
         <span className="workspace-file-tree-name" title={node.path || node.name}>
           {node.name}
         </span>
-        {isBusy ? <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin text-stone-400" /> : null}
+        {isBusy || isLoadingDirectory ? <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin text-stone-400" /> : null}
         {!isDirectory ? (
           <span className="workspace-file-tree-size">{formatFileSize(node.sizeBytes)}</span>
         ) : null}
@@ -9186,6 +9263,7 @@ function WorkspaceFileTreeNodeRow({
             depth={depth + 1}
             expandedPaths={expandedPaths}
             key={child.path || child.name}
+            loadingPaths={loadingPaths}
             node={child}
             onDeleteFile={onDeleteFile}
             onOpenFile={onOpenFile}
@@ -17424,6 +17502,37 @@ function workspaceRenamedFilePath(path: string, newName: string) {
   return separatorIndex < 0
     ? newName
     : `${path.slice(0, separatorIndex + 1)}${newName}`;
+}
+
+function workspaceParentFilePath(path: string) {
+  const separatorIndex = path.lastIndexOf("/");
+  return separatorIndex < 0 ? "" : path.slice(0, separatorIndex);
+}
+
+function replaceWorkspaceFileNodeChildren(
+  node: WorkspaceFileTreeNode,
+  path: string,
+  children: WorkspaceFileTreeNode[],
+): WorkspaceFileTreeNode {
+  if (node.path === path) {
+    return {
+      ...node,
+      children,
+      childrenLoaded: true,
+      hasChildren: children.length > 0,
+    };
+  }
+
+  if (!node.children.length) {
+    return node;
+  }
+
+  return {
+    ...node,
+    children: node.children.map((child) =>
+      replaceWorkspaceFileNodeChildren(child, path, children),
+    ),
+  };
 }
 
 function monacoLanguageForPath(path: string) {

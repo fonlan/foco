@@ -972,6 +972,57 @@ export const hookRunDetail = {
   },
 };
 
+
+export const workspaceFilesResponse = {
+  root: {
+    children: [
+      {
+        children: [
+          {
+            children: [],
+            childrenLoaded: true,
+            hasChildren: false,
+            kind: "file",
+            name: "button.tsx",
+            path: "src/components/button.tsx",
+            sizeBytes: 512,
+          },
+        ],
+        childrenLoaded: true,
+        hasChildren: true,
+        kind: "directory",
+        name: "components",
+        path: "src/components",
+        sizeBytes: 0,
+      },
+      {
+        children: [],
+        childrenLoaded: false,
+        hasChildren: true,
+        kind: "directory",
+        name: "pages",
+        path: "src/pages",
+        sizeBytes: 0,
+      },
+      {
+        children: [],
+        childrenLoaded: true,
+        hasChildren: false,
+        kind: "file",
+        name: "main.ts",
+        path: "src/main.ts",
+        sizeBytes: 1024,
+      },
+    ],
+    childrenLoaded: true,
+    hasChildren: true,
+    kind: "directory",
+    name: "workspace",
+    path: "",
+    sizeBytes: 0,
+  },
+};
+
 export const importedHooks = {
   config: { disableAllHooks: false },
   importedFiles: ["C:\\Users\\fonla\\.claude\\settings.json"],
@@ -1133,6 +1184,32 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         },
       ],
     });
+  }
+
+  if (path === "/api/workspaces/workspace-1/files") {
+    return jsonResponse(workspaceFilesResponse);
+  }
+
+  if (path === "/api/workspaces/workspace-1/files/children") {
+    const childPath = requestUrl.searchParams.get("path");
+    if (childPath === "src/pages") {
+      return jsonResponse({
+        children: [
+          {
+            children: [],
+            childrenLoaded: true,
+            hasChildren: false,
+            kind: "file",
+            name: "index.tsx",
+            path: "src/pages/index.tsx",
+            sizeBytes: 256,
+          },
+        ],
+        path: "src/pages",
+      });
+    }
+
+    return jsonResponse({ children: [], path: childPath ?? "" });
   }
 
   if (path === "/api/native/install-ripgrep") {

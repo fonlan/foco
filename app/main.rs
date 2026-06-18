@@ -551,6 +551,10 @@ fn app_router(state: AppState) -> Router {
             get(crate::http::workspaces::workspace_files),
         )
         .route(
+            "/api/workspaces/{workspace_id}/files/children",
+            get(crate::http::workspaces::workspace_file_children),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/files/content",
             post(crate::http::workspaces::workspace_file_content),
         )
@@ -2175,6 +2179,12 @@ pub(crate) struct WorkspaceFileRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileChildrenQuery {
+    pub(crate) path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SaveWorkspaceFileRequest {
     pub(crate) path: String,
     pub(crate) content: String,
@@ -2208,11 +2218,20 @@ pub(crate) struct WorkspaceFilesResponse {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileChildrenResponse {
+    pub(crate) path: String,
+    pub(crate) children: Vec<WorkspaceFileTreeNode>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceFileTreeNode {
     pub(crate) name: String,
     pub(crate) path: String,
     pub(crate) kind: WorkspaceFileTreeNodeKind,
     pub(crate) size_bytes: u64,
+    pub(crate) has_children: bool,
+    pub(crate) children_loaded: bool,
     pub(crate) children: Vec<WorkspaceFileTreeNode>,
 }
 
@@ -2247,7 +2266,6 @@ struct QueuedRunSummary {
     skill_ids: Vec<String>,
     content: Option<String>,
 }
-
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -11928,7 +11946,6 @@ fn queued_chat_metadata_json(
     })
 }
 
-
 fn queued_user_message_metadata_json(
     attachments: &[NeutralChatAttachment],
     model_id: &str,
@@ -12767,8 +12784,7 @@ fn queued_run_summary_from_chat_metadata(
         .ok_or_else(|| {
             ApiError::bad_request("chat metadata.queuedRun.userMessageId must be a string")
         })?;
-    let model_id =
-        string_json_field(queued_run, "modelId", "model_id").map(str::to_string);
+    let model_id = string_json_field(queued_run, "modelId", "model_id").map(str::to_string);
     let provider_id =
         string_json_field(queued_run, "providerId", "provider_id").map(str::to_string);
     let thinking_level =

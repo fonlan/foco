@@ -61,6 +61,8 @@ export type WorkspaceFileTreeNode = {
   path: string;
   kind: "directory" | "file";
   sizeBytes: number;
+  hasChildren: boolean;
+  childrenLoaded: boolean;
   children: WorkspaceFileTreeNode[];
 };
 
@@ -76,6 +78,11 @@ export type WorkspaceFileSaveResponse = {
 
 export type WorkspaceFilesResponse = {
   root: WorkspaceFileTreeNode;
+};
+
+export type WorkspaceFileChildrenResponse = {
+  path: string;
+  children: WorkspaceFileTreeNode[];
 };
 
 // JSON types

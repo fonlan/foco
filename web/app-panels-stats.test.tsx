@@ -618,4 +618,38 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByRole("checkbox", { name: "Provider" })).not.toBeChecked();
   });
 
+
+  it("lazy loads workspace file tree children on demand", async () => {
+    const fetchMock = vi.mocked(fetch);
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+
+    expect(await screen.findByText("Workspace file tree")).toBeInTheDocument();
+    expect(screen.getByText("main.ts")).toBeInTheDocument();
+    expect(screen.getByText("components")).toBeInTheDocument();
+    expect(screen.getByText("pages")).toBeInTheDocument();
+
+    expect(
+      fetchMock.mock.calls.some((call) => String(call[0]).includes("/files/children")),
+    ).toBe(false);
+
+    const pagesRow = screen.getByText("pages").closest("div[role='treeitem']");
+    expect(pagesRow).not.toBeNull();
+    await userEvent.click(
+      within(pagesRow as HTMLElement).getByRole("button", { name: "Expand folder" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some((call) =>
+          String(call[0]).includes("/files/children?path=src%2Fpages"),
+        ),
+      ).toBe(true),
+    );
+    expect(await screen.findByText("index.tsx")).toBeInTheDocument();
+  });
+
 });
