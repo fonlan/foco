@@ -20,8 +20,8 @@ use foco_tools::{
 use serde_json::json;
 
 use crate::http::{
-    memory::memory_extraction_job_summaries, terminal::create_terminal_session,
-    workspaces::add_workspace,
+    memory::memory_extraction_job_summaries, settings::associate_provider_with_local_models,
+    terminal::create_terminal_session, workspaces::add_workspace,
 };
 use crate::memory_runtime::{
     MemoryExtractionEvidenceCandidate, MemoryExtractionTask, MemorySearchToolInput,
@@ -1136,6 +1136,38 @@ fn question_registry_rejects_invalid_answer_without_consuming_question() {
             .is_pending("question-1")
             .expect("question registry pending check")
     );
+}
+
+#[test]
+fn new_provider_is_associated_with_matching_local_models() {
+    let mut models = vec![
+        test_model_settings("matched-without-provider"),
+        ModelSettings {
+            provider_ids: vec!["existing".to_string()],
+            active_provider_id: Some("existing".to_string()),
+            ..test_model_settings("matched-with-provider")
+        },
+        test_model_settings("not-returned"),
+    ];
+
+    associate_provider_with_local_models(
+        &mut models,
+        "new-provider",
+        &[
+            "matched-without-provider".to_string(),
+            "matched-with-provider".to_string(),
+        ],
+    );
+
+    assert_eq!(models[0].provider_ids, vec!["new-provider"]);
+    assert_eq!(
+        models[0].active_provider_id.as_deref(),
+        Some("new-provider")
+    );
+    assert_eq!(models[1].provider_ids, vec!["existing", "new-provider"]);
+    assert_eq!(models[1].active_provider_id.as_deref(), Some("existing"));
+    assert!(models[2].provider_ids.is_empty());
+    assert_eq!(models[2].active_provider_id, None);
 }
 
 #[test]

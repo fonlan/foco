@@ -5,7 +5,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use foco_agent::build_default_system_prompt;
-use foco_providers::{normalized_base_url, parse_provider_kind, test_provider_connection};
+use foco_providers::{
+    fetch_provider_model_ids, normalized_base_url, parse_provider_kind, test_provider_connection,
+};
 use foco_store::{
     config::PromptSettings,
     model_metadata::{
@@ -224,6 +226,7 @@ pub(crate) async fn save_manual_provider(
     let kind = request.kind.trim();
     let base_url = optional_trimmed_string(request.base_url);
     let existing_provider = config.providers.iter().find(|provider| provider.id == id);
+    let is_new_provider = existing_provider.is_none();
     let api_key = match optional_trimmed_string(request.api_key) {
         Some(value) => Some(value),
         None if request.clear_api_key.unwrap_or(false) => None,
@@ -267,6 +270,13 @@ pub(crate) async fn save_manual_provider(
         api_proxy,
     };
 
+    if is_new_provider {
+        let model_ids = fetch_provider_model_ids(&provider_connection_config(&provider)?)
+            .await
+            .map_err(ApiError::from_provider_config_error)?;
+        associate_provider_with_local_models(&mut config.models, &provider.id, &model_ids);
+    }
+
     if let Some(stored_provider) = config
         .providers
         .iter_mut()
@@ -280,6 +290,30 @@ pub(crate) async fn save_manual_provider(
     save_config(&state, config.clone())?;
 
     settings_response(&state, &config).await
+}
+
+pub(crate) fn associate_provider_with_local_models(
+    models: &mut [ModelSettings],
+    provider_id: &str,
+    provider_model_ids: &[String],
+) {
+    let provider_model_ids = provider_model_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+
+    for model in models {
+        if !provider_model_ids.contains(model.id.as_str()) {
+            continue;
+        }
+
+        if !model.provider_ids.iter().any(|id| id == provider_id) {
+            model.provider_ids.push(provider_id.to_string());
+        }
+        if model.active_provider_id.is_none() {
+            model.active_provider_id = Some(provider_id.to_string());
+        }
+    }
 }
 
 pub(crate) async fn delete_provider(

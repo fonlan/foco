@@ -226,9 +226,9 @@ impl ProviderConnectionConfig {
     }
 }
 
-pub async fn test_provider_connection(
+pub async fn fetch_provider_model_ids(
     config: &ProviderConnectionConfig,
-) -> Result<usize, ProviderConfigError> {
+) -> Result<Vec<String>, ProviderConfigError> {
     let url = format!("{}models", config.endpoint_url()?);
     let response = config
         .reqwest_client()?
@@ -259,7 +259,26 @@ pub async fn test_provider_connection(
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| ProviderConfigError::MissingRequiredField("models.data".to_string()))?;
 
-    Ok(models.len())
+    models
+        .iter()
+        .enumerate()
+        .map(|(index, model)| {
+            model
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    ProviderConfigError::MissingRequiredField(format!("models.data[{index}].id"))
+                })
+        })
+        .collect()
+}
+
+pub async fn test_provider_connection(
+    config: &ProviderConnectionConfig,
+) -> Result<usize, ProviderConfigError> {
+    Ok(fetch_provider_model_ids(config).await?.len())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
