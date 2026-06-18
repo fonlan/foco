@@ -27,36 +27,32 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    build_available_tools_prompt, build_default_system_prompt, calculate_context_budget,
-    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
-    plan_tool_execution,
+    build_available_tools_prompt, calculate_context_budget, estimate_json_tokens,
+    estimate_text_tokens, pack_context, plan_context_compression, plan_tool_execution,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};
 use foco_providers::{
-    DEFAULT_OPENAI_BASE_URL, NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest,
-    NeutralChatRole, NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
-    OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig,
-    ProviderRequestOverride, normalized_proxy_url, parse_provider_kind, stream_chat,
+    NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
+    NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
+    OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig, ProviderRequestOverride,
+    normalized_proxy_url, parse_provider_kind, stream_chat,
 };
 use foco_store::{
     config::{
         ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL, GlobalConfig,
-        HookConfig, HookEventMap, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig, MemorySettings,
-        ModelLimits, ModelSettings, ProviderSettings, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE,
-        SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
-        SUPPORTED_HOOK_EVENTS, SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS,
-        SkillSettings, SystemPromptSettings, UNSUPPORTED_HOOK_EVENTS, WEB_SEARCH_PROVIDER_BRAVE,
-        WEB_SEARCH_PROVIDER_TAVILY, WebSearchSettings, WebServerSettings, WorkspaceCommonCommand,
-        WorkspaceConfig, load_or_create_global_config, load_workspace_hook_config,
-        save_global_config, workspace_hook_config_path,
+        HookConfig, McpServerConfig, MemorySettings, ModelLimits, ModelSettings, ProviderSettings,
+        SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SUPPORTED_API_PROXY_TYPES,
+        SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS,
+        SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings, SystemPromptSettings, WebServerSettings,
+        WorkspaceCommonCommand, WorkspaceConfig, load_or_create_global_config, save_global_config,
     },
     memory::{MemoryDatabase, MemoryDatabaseError, MemoryScope, MemorySourceType, MemoryStatus},
     model_metadata::{
         ModelMetadataCache, ModelMetadataError, ModelMetadataRecord, read_model_metadata_cache,
     },
     workspace::{
-        ChatRecord, CodeChangeStats, ContextCompressionSnapshotRecord, HookRunRecord,
+        ChatRecord, CodeChangeStats, ContextCompressionSnapshotRecord,
         LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
         LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
         LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot, NewLlmRequest,
@@ -87,7 +83,7 @@ use crate::platform::native_browser::{
 use crate::git_backend::{git_diff_response, git_head_text_for_workspace_path};
 use crate::hooks::{
     EffectiveHookSummary, HookDecision, HookNotification, HookRunRequest, HookRunSummary,
-    HookRuntime, effective_hook_summaries,
+    HookRuntime,
 };
 use crate::http::memory::{EditMemorySourceRequest, refresh_memory_profile};
 use crate::memory_runtime::{
@@ -122,13 +118,24 @@ use std::sync::atomic::AtomicU32;
 
 mod git_backend;
 mod hooks;
+mod hooks_support;
 mod http;
 mod logging;
 mod memory_runtime;
 mod platform;
 mod prompt;
 mod runtime;
+mod settings_runtime;
 mod terminal;
+pub(crate) use hooks_support::{
+    claude_hook_settings_paths, default_hook_provider, hook_run_detail_from_record,
+    hook_run_summary_row, hooks_settings_response, import_claude_hook_config,
+};
+#[cfg(test)]
+pub(crate) use settings_runtime::skills_settings_summary;
+pub(crate) use settings_runtime::{
+    configured_model_summary_for_config, settings_response, workspace_response_from_config,
+};
 #[cfg(test)]
 mod tests;
 
@@ -7145,617 +7152,6 @@ fn memory_source_updates(
         .collect()
 }
 
-async fn settings_response(
-    state: &AppState,
-    config: &GlobalConfig,
-) -> Result<Json<SettingsResponse>, ApiError> {
-    let active_workspace_id = config.app.active_workspace_id.clone();
-    let mcp_statuses = state.mcp_registry.statuses(&active_workspace_id).await;
-    let default_system_prompt = build_default_system_prompt();
-
-    Ok(Json(SettingsResponse {
-        general: GeneralSettingsSummary {
-            auto_start_enabled: config.app.auto_start_enabled,
-            web_server: WebServerSettingsSummary {
-                listen_host: config.app.web_server.listen_host.clone(),
-                listen_port: config.app.web_server.listen_port,
-                password_enabled: web_auth_enabled(config),
-            },
-            llm_request_retry_count: config.app.llm_request_retry_count,
-            max_llm_request_retry_count: MAX_LLM_REQUEST_RETRY_COUNT,
-            language: config.app.language.clone(),
-            theme: config.app.theme.clone(),
-            hook_audit_enabled: config.hooks.audit_enabled,
-            supported_languages: SUPPORTED_APP_LANGUAGES
-                .iter()
-                .map(|language| AppLanguageSummary {
-                    id: *language,
-                    name: app_language_name(*language),
-                })
-                .collect(),
-            supported_themes: SUPPORTED_APP_THEMES
-                .iter()
-                .map(|theme| AppThemeSummary {
-                    id: *theme,
-                    name: app_theme_name(*theme),
-                })
-                .collect(),
-        },
-        native_tools: NativeToolsSummary {
-            browser_probe_port: state.listen_addr.port(),
-            ripgrep: {
-                let status = state
-                    .ripgrep_status
-                    .lock()
-                    .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
-                ripgrep_tool_summary(&status)
-            },
-        },
-        web_search: web_search_settings_summary(&config.web_search),
-        memory: MemorySettingsSummary {
-            enabled: config.memory.enabled,
-            extraction_mode: config.memory.extraction_mode.clone(),
-            retrieval_mode: config.memory.retrieval_mode.clone(),
-            retention_days: config.memory.retention_days,
-            extraction_model_id: config.memory.extraction_model_id.clone(),
-            retrieval_model_id: config.memory.retrieval_model_id.clone(),
-            extraction_modes: vec![
-                MemoryExtractionModeSummary {
-                    value: "manual",
-                    label: "Manual",
-                },
-                MemoryExtractionModeSummary {
-                    value: "pending_review",
-                    label: "Pending review",
-                },
-                MemoryExtractionModeSummary {
-                    value: "automatic",
-                    label: "Automatic",
-                },
-                MemoryExtractionModeSummary {
-                    value: "disabled",
-                    label: "Disabled",
-                },
-            ],
-            retrieval_modes: vec![
-                MemoryExtractionModeSummary {
-                    value: "fts",
-                    label: "SQLite FTS",
-                },
-                MemoryExtractionModeSummary {
-                    value: "llm",
-                    label: "Model matching",
-                },
-            ],
-        },
-        prompts: PromptSettingsSummary {
-            system_prompt: config.prompts.system_prompt.clone(),
-            default_system_prompt: default_system_prompt.clone(),
-            system_prompts: system_prompt_summaries(&config.prompts, &default_system_prompt),
-            files: config
-                .prompts
-                .files
-                .iter()
-                .map(|path| {
-                    normalize_windows_verbatim_path(path.clone())
-                        .display()
-                        .to_string()
-                })
-                .collect(),
-            extra_text: config.prompts.extra_text.clone(),
-        },
-        workspaces: config
-            .workspaces
-            .iter()
-            .map(configured_workspace_summary)
-            .collect::<Result<Vec<_>, _>>()?,
-        terminal_shells: terminal_shell_summaries(),
-        provider_kinds: vec![
-            ProviderKindSummary {
-                kind: OPENAI_CHAT_KIND,
-                label: "OpenAI Chat",
-                default_base_url: DEFAULT_OPENAI_BASE_URL,
-            },
-            ProviderKindSummary {
-                kind: OPENAI_RESPONSES_KIND,
-                label: "OpenAI Responses",
-                default_base_url: DEFAULT_OPENAI_BASE_URL,
-            },
-        ],
-        thinking_levels: vec![
-            ThinkingLevelSummary {
-                value: "minimal",
-                label: "Minimal",
-            },
-            ThinkingLevelSummary {
-                value: "low",
-                label: "Low",
-            },
-            ThinkingLevelSummary {
-                value: "medium",
-                label: "Medium",
-            },
-            ThinkingLevelSummary {
-                value: "high",
-                label: "High",
-            },
-            ThinkingLevelSummary {
-                value: "xhigh",
-                label: "Extra High",
-            },
-        ],
-        mcp_transports: vec![
-            McpTransportSummary {
-                transport: "stdio",
-                label: "Stdio",
-            },
-            McpTransportSummary {
-                transport: "streamable-http",
-                label: "Streamable HTTP",
-            },
-        ],
-        providers: config
-            .providers
-            .iter()
-            .map(configured_provider_summary)
-            .collect(),
-        configured_models: config
-            .models
-            .iter()
-            .map(|model| configured_model_summary_for_config(model, config))
-            .collect(),
-        mcp_servers: config
-            .mcp
-            .servers
-            .iter()
-            .map(|server| configured_mcp_server_summary(server, &mcp_statuses))
-            .collect(),
-        skills: skills_settings_summary(config, &state.user_profile_dir),
-    }))
-}
-
-async fn hooks_settings_response(
-    state: &AppState,
-    config: &GlobalConfig,
-    workspace_id: Option<&str>,
-) -> Result<Json<HooksSettingsResponse>, ApiError> {
-    let workspace = selected_hooks_workspace(config, workspace_id)?;
-    let workspace_config = load_workspace_hook_config(&workspace.path)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let effective = effective_hook_summaries(&config.hooks, &workspace.path)
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let recent_runs = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?
-        .hook_runs(50)
-        .map_err(ApiError::from_workspace_error)?
-        .into_iter()
-        .map(hook_run_summary_row)
-        .collect();
-
-    Ok(Json(HooksSettingsResponse {
-        supported_events: SUPPORTED_HOOK_EVENTS.to_vec(),
-        unsupported_events: UNSUPPORTED_HOOK_EVENTS.to_vec(),
-        global: HookConfigScopeSummary {
-            source: "global".to_string(),
-            path: display_path(&state.config_file),
-            workspace_id: None,
-            config: config.hooks.clone(),
-        },
-        workspace: HookConfigScopeSummary {
-            source: "workspace".to_string(),
-            path: display_path(&workspace_hook_config_path(&workspace.path)),
-            workspace_id: Some(workspace.id.clone()),
-            config: workspace_config,
-        },
-        effective,
-        recent_runs,
-    }))
-}
-
-fn selected_hooks_workspace<'a>(
-    config: &'a GlobalConfig,
-    workspace_id: Option<&str>,
-) -> Result<&'a WorkspaceConfig, ApiError> {
-    match workspace_id.and_then(|value| {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed)
-        }
-    }) {
-        Some(workspace_id) => workspace_by_id(config, workspace_id),
-        None => workspace_by_id(config, &config.app.active_workspace_id),
-    }
-}
-
-fn hook_run_summary_row(record: HookRunRecord) -> HookRunSummaryRow {
-    HookRunSummaryRow {
-        id: record.id,
-        workspace_id: record.workspace_id,
-        chat_id: record.chat_id,
-        run_id: record.run_id,
-        tool_call_id: record.tool_call_id,
-        event: record.event,
-        hook_source: record.hook_source,
-        handler_type: record.handler_type,
-        status: record.status,
-        exit_code: record.exit_code,
-        stdout_preview: record.stdout_preview,
-        stderr_preview: record.stderr_preview,
-        started_at: record.started_at,
-        completed_at: record.completed_at,
-    }
-}
-
-fn hook_run_detail_from_record(record: HookRunRecord) -> Result<HookRunDetail, ApiError> {
-    let input = parse_json_value(&record.input_json, "hook run input")?;
-    let output = record
-        .output_json
-        .as_deref()
-        .map(|json| parse_json_value(json, "hook run output"))
-        .transpose()?;
-
-    Ok(HookRunDetail {
-        id: record.id,
-        workspace_id: record.workspace_id,
-        chat_id: record.chat_id,
-        run_id: record.run_id,
-        tool_call_id: record.tool_call_id,
-        event: record.event,
-        hook_source: record.hook_source,
-        handler_type: record.handler_type,
-        input,
-        output,
-        status: record.status,
-        exit_code: record.exit_code,
-        stdout_preview: record.stdout_preview,
-        stderr_preview: record.stderr_preview,
-        started_at: record.started_at,
-        completed_at: record.completed_at,
-    })
-}
-
-fn claude_hook_settings_paths(base_path: &Path) -> Vec<PathBuf> {
-    vec![
-        base_path.join(".claude").join("settings.json"),
-        base_path.join(".claude").join("settings.local.json"),
-    ]
-}
-
-fn import_claude_hook_config(
-    paths: &[PathBuf],
-) -> Result<(HookConfig, Vec<String>, Vec<String>), ApiError> {
-    let mut config = HookConfig::default();
-    let mut imported_files = Vec::new();
-    let mut validation_errors = Vec::new();
-
-    for path in paths {
-        if !path.exists() {
-            continue;
-        }
-        let content = fs::read_to_string(&path).map_err(|source| {
-            ApiError::internal(format!("failed to read {}: {source}", path.display()))
-        })?;
-        let value = serde_json::from_str::<Value>(&content).map_err(|source| {
-            ApiError::bad_request(format!("failed to parse {}: {source}", path.display()))
-        })?;
-        let Some(imported) = hook_config_from_claude_settings(&value).map_err(|message| {
-            ApiError::bad_request(format!("failed to import {}: {message}", path.display()))
-        })?
-        else {
-            continue;
-        };
-
-        imported_files.push(display_path(&path));
-        config.disable_all_hooks = imported.disable_all_hooks;
-        merge_hook_event_maps(&mut config.hooks, imported.hooks);
-    }
-
-    for event in config.hooks.keys() {
-        if UNSUPPORTED_HOOK_EVENTS.contains(&event.as_str()) {
-            validation_errors.push(format!(
-                "{event} is a Claude Code hook event that Foco does not support yet"
-            ));
-        } else if !SUPPORTED_HOOK_EVENTS.contains(&event.as_str()) {
-            validation_errors.push(format!("{event} is not a supported Foco hook event"));
-        }
-    }
-
-    Ok((config, imported_files, validation_errors))
-}
-
-fn hook_config_from_claude_settings(value: &Value) -> Result<Option<HookConfig>, String> {
-    let mut config = HookConfig::default();
-    let mut found = false;
-
-    if let Some(disable_all_hooks) = value.get("disableAllHooks") {
-        config.disable_all_hooks = disable_all_hooks
-            .as_bool()
-            .ok_or_else(|| "disableAllHooks must be a boolean".to_string())?;
-        found = true;
-    }
-
-    if let Some(hooks) = value.get("hooks") {
-        config.hooks = serde_json::from_value::<HookEventMap>(hooks.clone())
-            .map_err(|source| format!("hooks do not match Foco hook shape: {source}"))?;
-        found = true;
-    }
-
-    Ok(found.then_some(config))
-}
-
-fn merge_hook_event_maps(target: &mut HookEventMap, imported: HookEventMap) {
-    for (event, mut groups) in imported {
-        target.entry(event).or_default().append(&mut groups);
-    }
-}
-
-fn default_hook_provider(
-    config: &GlobalConfig,
-) -> Option<Result<(String, String, ProviderConnectionConfig), ApiError>> {
-    let model = config
-        .models
-        .iter()
-        .find(|model| model.enabled && model.active_provider_id.is_some())?;
-    let provider_id = model.active_provider_id.as_deref()?;
-    let provider = match config.providers.iter().find(|provider| {
-        provider.id == provider_id
-            && provider.enabled
-            && model.provider_ids.iter().any(|id| id == provider_id)
-    }) {
-        Some(provider) => provider,
-        None => return None,
-    };
-
-    Some(
-        provider_connection_config(provider)
-            .map(|provider_config| (model.id.clone(), provider.id.clone(), provider_config)),
-    )
-}
-
-fn configured_workspace_summary(
-    workspace: &WorkspaceConfig,
-) -> Result<ConfiguredWorkspaceSummary, ApiError> {
-    Ok(ConfiguredWorkspaceSummary {
-        id: workspace.id.clone(),
-        name: workspace.name.clone(),
-        path: display_path(&workspace.path),
-        logo_url: workspace_logo_url(workspace)?,
-        pinned: workspace.pinned,
-        terminal_shell: workspace.terminal_shell.clone(),
-        common_commands: workspace_common_command_summaries(&workspace.common_commands),
-        is_default: workspace.id == foco_store::config::DEFAULT_WORKSPACE_ID,
-    })
-}
-
-fn workspace_common_command_summaries(
-    commands: &[WorkspaceCommonCommand],
-) -> Vec<WorkspaceCommonCommandSummary> {
-    commands
-        .iter()
-        .map(|command| WorkspaceCommonCommandSummary {
-            name: command.name.clone(),
-            command: command.command.clone(),
-        })
-        .collect()
-}
-
-fn terminal_shell_summaries() -> Vec<TerminalShellSummary> {
-    SUPPORTED_TERMINAL_SHELLS
-        .iter()
-        .map(|shell| TerminalShellSummary {
-            shell: *shell,
-            label: terminal_shell_label(shell),
-        })
-        .collect()
-}
-
-fn api_proxy_type_summaries() -> Vec<ApiProxyTypeSummary> {
-    SUPPORTED_API_PROXY_TYPES
-        .iter()
-        .map(|proxy_type| ApiProxyTypeSummary {
-            proxy_type: *proxy_type,
-            label: api_proxy_type_label(proxy_type),
-        })
-        .collect()
-}
-
-fn api_proxy_type_label(proxy_type: &str) -> &'static str {
-    match proxy_type {
-        "http" => "HTTP",
-        "socks" => "SOCKS",
-        _ => "Unknown",
-    }
-}
-
-fn terminal_shell_label(shell: &str) -> &'static str {
-    match shell {
-        "powershell" => "PowerShell",
-        "cmd" => "Command Prompt",
-        "bash" => "Bash",
-        "zsh" => "Zsh",
-        _ => "Unknown",
-    }
-}
-
-fn configured_provider_summary(provider: &ProviderSettings) -> ConfiguredProviderSummary {
-    ConfiguredProviderSummary {
-        api_proxy: ApiProxySettingsSummary {
-            enabled: provider.api_proxy.enabled,
-            proxy_type: provider.api_proxy.proxy_type.clone(),
-            url: provider.api_proxy.url.clone(),
-            supported_types: api_proxy_type_summaries(),
-        },
-        id: provider.id.clone(),
-        name: provider.name.clone(),
-        kind: provider.kind.clone(),
-        kind_label: provider_kind_label(&provider.kind),
-        enabled: provider.enabled,
-        base_url: provider.base_url.clone(),
-        has_api_key: provider
-            .api_key
-            .as_deref()
-            .map(|value| !value.trim().is_empty())
-            .unwrap_or(false),
-        request_overrides: provider.request_overrides.clone(),
-        warnings: provider_warnings(provider),
-    }
-}
-
-fn web_search_settings_summary(settings: &WebSearchSettings) -> WebSearchSettingsSummary {
-    WebSearchSettingsSummary {
-        enabled: settings.enabled,
-        active_provider: settings.active_provider.clone(),
-        api_proxy: ApiProxySettingsSummary {
-            enabled: settings.api_proxy.enabled,
-            proxy_type: settings.api_proxy.proxy_type.clone(),
-            url: settings.api_proxy.url.clone(),
-            supported_types: api_proxy_type_summaries(),
-        },
-        providers: vec![
-            WebSearchProviderSummary {
-                provider: WEB_SEARCH_PROVIDER_TAVILY,
-                label: "Tavily",
-                has_api_key: settings
-                    .api_key_for_provider(WEB_SEARCH_PROVIDER_TAVILY)
-                    .is_some(),
-            },
-            WebSearchProviderSummary {
-                provider: WEB_SEARCH_PROVIDER_BRAVE,
-                label: "Brave Search",
-                has_api_key: settings
-                    .api_key_for_provider(WEB_SEARCH_PROVIDER_BRAVE)
-                    .is_some(),
-            },
-        ],
-    }
-}
-
-fn configured_mcp_server_summary(
-    server: &McpServerConfig,
-    statuses: &[foco_mcp::McpServerStatus],
-) -> ConfiguredMcpServerSummary {
-    let status = statuses.iter().find(|status| status.id == server.id);
-    let state = status
-        .map(|status| mcp_server_state_name(status.state).to_string())
-        .unwrap_or_else(|| {
-            if server.enabled {
-                "stopped".to_string()
-            } else {
-                "disabled".to_string()
-            }
-        });
-    let error = status.and_then(|status| status.error.clone());
-    let tool_count = status.map(|status| status.tool_count).unwrap_or(0);
-
-    ConfiguredMcpServerSummary {
-        id: server.id.clone(),
-        name: server.name.clone(),
-        enabled: server.enabled,
-        transport: server.transport.clone(),
-        transport_label: mcp_transport_label(&server.transport),
-        command: server.command.clone(),
-        args: server.args.clone(),
-        url: server.url.clone(),
-        state,
-        error,
-        tool_count,
-        warnings: mcp_server_warnings(server),
-    }
-}
-
-fn mcp_server_warnings(server: &McpServerConfig) -> Vec<String> {
-    let mut warnings = Vec::new();
-
-    if !server.enabled {
-        warnings.push("MCP server is disabled.".to_string());
-    }
-
-    if let Err(error) = server.to_definition() {
-        warnings.push(error.to_string());
-    }
-
-    warnings
-}
-
-fn skills_settings_summary(
-    config: &GlobalConfig,
-    user_profile_dir: &Path,
-) -> SkillsSettingsSummary {
-    let disabled_skill_ids = config
-        .skills
-        .disabled
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let discovery = discover_skills(user_profile_dir, &config.workspaces);
-    let required_disabled_skill_ids = discovery
-        .required_disabled
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-
-    SkillsSettingsSummary {
-        directories: skill_search_roots(user_profile_dir, &config.workspaces)
-            .iter()
-            .map(|root| display_path(&root.directory))
-            .collect(),
-        detected: discovery
-            .skills
-            .iter()
-            .map(|skill| {
-                let can_enable = !skill_is_required_disabled(skill, &required_disabled_skill_ids);
-                configured_skill_summary(
-                    skill,
-                    can_enable && !skill_is_disabled(skill, &disabled_skill_ids),
-                    can_enable,
-                )
-            })
-            .collect(),
-        errors: discovery.errors,
-    }
-}
-
-fn configured_skill_summary(
-    skill: &SkillSettings,
-    enabled: bool,
-    can_enable: bool,
-) -> ConfiguredSkillSummary {
-    ConfiguredSkillSummary {
-        key: skill.key.clone(),
-        id: skill.id.clone(),
-        name: skill.name.clone(),
-        description: skill.description.clone(),
-        path: skill.path.display().to_string(),
-        scope: skill.scope.clone(),
-        workspace_id: skill.workspace_id.clone(),
-        workspace_name: skill.workspace_name.clone(),
-        enabled,
-        can_enable,
-        warnings: skill_warnings(skill, enabled, can_enable),
-    }
-}
-
-fn skill_warnings(skill: &SkillSettings, enabled: bool, can_enable: bool) -> Vec<String> {
-    let mut warnings = Vec::new();
-
-    if !enabled {
-        warnings.push("Skill is disabled.".to_string());
-    }
-
-    if !can_enable {
-        warnings
-            .push("Skill frontmatter is invalid and must be fixed before enabling.".to_string());
-    }
-
-    if let Err(message) = parse_skill_file(&skill.path) {
-        warnings.push(message);
-    }
-
-    warnings
-}
-
 fn message_with_selected_skills(
     user_profile_dir: &Path,
     config: &GlobalConfig,
@@ -8493,60 +7889,6 @@ fn provider_warnings(provider: &ProviderSettings) -> Vec<String> {
     warnings
 }
 
-fn configured_model_summary_for_config(
-    model: &ModelSettings,
-    config: &GlobalConfig,
-) -> ConfiguredModelSummary {
-    let mut summary = configured_model_summary(model);
-    summary.supports_thinking = model_supports_thinking(model, config);
-    summary.warnings = model_warnings(model, config, summary.can_enable, summary.supports_thinking);
-    summary
-}
-
-fn workspace_response_from_config(
-    config: &GlobalConfig,
-    active_chat_runs: &ActiveChatRunRegistry,
-) -> Result<Json<WorkspacesResponse>, ApiError> {
-    let mut workspaces = Vec::with_capacity(config.workspaces.len());
-
-    for workspace in &config.workspaces {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
-        let code_change_stats_by_chat = database
-            .chat_code_change_stats()
-            .map_err(ApiError::from_workspace_error)?;
-        let chats = database
-            .chats()
-            .map_err(ApiError::from_workspace_error)?
-            .into_iter()
-            .map(|chat| {
-                let active_run = active_chat_runs.active_run_for_chat(&workspace.id, &chat.id)?;
-                let code_change_stats = code_change_stats_by_chat
-                    .get(&chat.id)
-                    .cloned()
-                    .unwrap_or_default();
-                chat_summary(chat, code_change_stats, active_run)
-            })
-            .collect::<Result<Vec<_>, ApiError>>()?;
-
-        workspaces.push(WorkspaceSummary {
-            id: workspace.id.clone(),
-            name: workspace.name.clone(),
-            path: display_path(&workspace.path),
-            logo_url: workspace_logo_url(workspace)?,
-            pinned: workspace.pinned,
-            terminal_shell: workspace.terminal_shell.clone(),
-            common_commands: workspace_common_command_summaries(&workspace.common_commands),
-            chats,
-        });
-    }
-
-    Ok(Json(WorkspacesResponse {
-        active_workspace_id: config.app.active_workspace_id.clone(),
-        workspaces,
-    }))
-}
-
 fn todo_graph_response(chat_id: &str, graph: Option<TodoGraphRecord>) -> TodoGraphResponse {
     match graph {
         Some(graph) => TodoGraphResponse {
@@ -8631,39 +7973,6 @@ fn model_metadata_response(
             .iter()
             .map(|model| configured_model_summary_for_config(model, config))
             .collect(),
-    }
-}
-
-fn configured_model_summary(model: &ModelSettings) -> ConfiguredModelSummary {
-    let context_window = model.limits.as_ref().map(|limits| limits.context_window);
-    let max_output_tokens = model.limits.as_ref().map(|limits| limits.max_output_tokens);
-    let mut missing_limits = Vec::new();
-
-    if context_window.is_none() {
-        missing_limits.push("contextWindow");
-    }
-
-    if max_output_tokens.is_none() {
-        missing_limits.push("maxOutputTokens");
-    }
-
-    ConfiguredModelSummary {
-        id: model.id.clone(),
-        display_name: model.display_name.clone(),
-        enabled: model.enabled,
-        metadata_key: model.metadata_key.clone(),
-        metadata_source_url: model.metadata_source_url.clone(),
-        metadata_refreshed_at: model.metadata_refreshed_at.clone(),
-        context_window,
-        max_output_tokens,
-        can_enable: missing_limits.is_empty(),
-        missing_limits,
-        provider_ids: model.provider_ids.clone(),
-        active_provider_id: model.active_provider_id.clone(),
-        thinking_level: model.thinking_level.clone(),
-        system_prompt_name: model.system_prompt_name.clone(),
-        supports_thinking: false,
-        warnings: Vec::new(),
     }
 }
 
