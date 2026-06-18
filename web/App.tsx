@@ -15949,7 +15949,12 @@ function SettingsPanel({
             <section className="grid gap-4">
               {isProviderDialogOpen ? (
                 <>
-                  <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+                  <button
+                    aria-label={t("Close provider configuration backdrop")}
+                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    onClick={() => setIsProviderDialogOpen(false)}
+                    type="button"
+                  />
                   <form
                     aria-label={t("Provider configuration")}
                     className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] w-[min(96vw,58rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"

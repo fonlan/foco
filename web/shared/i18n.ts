@@ -634,6 +634,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Enable provider": "启用供应商",
     "Delete provider": "删除供应商",
     "Close provider configuration": "关闭供应商配置",
+    "Close provider configuration backdrop": "关闭供应商配置背景",
     Protocol: "协议",
     "Base URL": "Base URL",
     "API key": "API key",
