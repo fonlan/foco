@@ -5824,7 +5824,7 @@ export function App() {
                             </button>
                           </div>
                           {isExpanded ? (
-                            <div className="mt-1 space-y-1 border-l border-stone-200/80 pl-3">
+                            <div className="mt-1 space-y-1 border-l border-stone-200/80 pl-3 pr-1.5">
                               {workspaceChats.length > 0 ? (
                                 <>
                                   {visibleChats.map((chat) => {
@@ -5865,101 +5865,87 @@ export function App() {
                                     const chatDiffStats = chat.codeChangeStats;
 
                                     return (
-                                      <div className="group flex min-w-0 items-center gap-1" key={chat.id}>
-                                        <button
-                                          aria-current={
-                                            isChatActive ? "page" : undefined
+                                      <button
+                                        aria-current={
+                                          isChatActive ? "page" : undefined
+                                        }
+                                        className={chatItemClass(isChatActive)}
+                                        key={chat.id}
+                                        onClick={() => {
+                                          if (suppressNextWorkspaceChatClickRef.current) {
+                                            suppressNextWorkspaceChatClickRef.current =
+                                              false;
+                                            return;
                                           }
-                                          className={chatItemClass(isChatActive)}
-                                          onClick={() => {
-                                            if (suppressNextWorkspaceChatClickRef.current) {
-                                              suppressNextWorkspaceChatClickRef.current = false;
-                                              return;
-                                            }
 
-                                            selectWorkspaceChat(workspace.id, chat.id);
-                                          }}
-                                          onContextMenu={(event) =>
-                                            openWorkspaceChatContextMenu(
-                                              event,
-                                              workspace,
-                                              chat,
-                                            )
-                                          }
-                                          onPointerCancel={cancelWorkspaceChatLongPress}
-                                          onPointerDown={(event) =>
-                                            startWorkspaceChatLongPress(
-                                              event,
-                                              workspace,
-                                              chat,
-                                            )
-                                          }
-                                          onPointerLeave={cancelWorkspaceChatLongPress}
-                                          onPointerUp={cancelWorkspaceChatLongPress}
-                                          title={chat.title}
-                                          type="button"
-                                        >
-                                          <span
-                                            aria-hidden="true"
-                                            className={`session-status-dot ${statusDotClass}`}
-                                          />
-                                          <span className="min-w-0 flex-1">
-                                            <span className="block truncate">
-                                              {chat.title}
-                                            </span>
-                                            <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-stone-400">
-                                              <span className="min-w-0 truncate">
-                                                {formatChatCreatedAt(chat.createdAt)}
-                                              </span>
-                                              {chatDiffStats &&
-                                                hasGitDiffStats(chatDiffStats) ? (
-                                                <span
-                                                  aria-label={t(
-                                                    "Code changes +{additions} -{deletions}",
-                                                    {
-                                                      additions:
-                                                        chatDiffStats.additions,
-                                                      deletions:
-                                                        chatDiffStats.deletions,
-                                                    },
-                                                  )}
-                                                  className="chat-diff-stats"
-                                                  title={t(
-                                                    "Code changes +{additions} -{deletions}",
-                                                    {
-                                                      additions:
-                                                        chatDiffStats.additions,
-                                                      deletions:
-                                                        chatDiffStats.deletions,
-                                                    },
-                                                  )}
-                                                >
-                                                  <span className="chat-diff-add">
-                                                    +{chatDiffStats.additions}
-                                                  </span>
-                                                  <span className="chat-diff-delete">
-                                                    -{chatDiffStats.deletions}
-                                                  </span>
-                                                </span>
-                                              ) : null}
-                                            </span>
+                                          selectWorkspaceChat(workspace.id, chat.id);
+                                        }}
+                                        onContextMenu={(event) =>
+                                          openWorkspaceChatContextMenu(
+                                            event,
+                                            workspace,
+                                            chat,
+                                          )
+                                        }
+                                        onPointerCancel={cancelWorkspaceChatLongPress}
+                                        onPointerDown={(event) =>
+                                          startWorkspaceChatLongPress(
+                                            event,
+                                            workspace,
+                                            chat,
+                                          )
+                                        }
+                                        onPointerLeave={cancelWorkspaceChatLongPress}
+                                        onPointerUp={cancelWorkspaceChatLongPress}
+                                        title={chat.title}
+                                        type="button"
+                                      >
+                                        <span
+                                          aria-hidden="true"
+                                          className={`session-status-dot ${statusDotClass}`}
+                                        />
+                                        <span className="min-w-0 flex-1">
+                                          <span className="block truncate">
+                                            {chat.title}
                                           </span>
-                                        </button>
-                                        <button
-                                          aria-label={t("Delete chat {title}", {
-                                            title: chat.title,
-                                          })}
-                                          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-stone-400 opacity-0 transition group-hover:opacity-100 focus:opacity-100 hover:bg-rose-50 hover:text-rose-700"
-                                          disabled={Boolean(chat.scheduledRunId)}
-                                          onClick={() => {
-                                            requestDeleteWorkspaceChat(workspace, chat);
-                                          }}
-                                          title={t("Delete chat")}
-                                          type="button"
-                                        >
-                                          <Trash2 aria-hidden="true" className="size-3.5" />
-                                        </button>
-                                      </div>
+                                          <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-stone-400">
+                                            <span className="min-w-0 truncate">
+                                              {formatChatCreatedAt(chat.createdAt)}
+                                            </span>
+                                            {chatDiffStats &&
+                                              hasGitDiffStats(chatDiffStats) ? (
+                                              <span
+                                                aria-label={t(
+                                                  "Code changes +{additions} -{deletions}",
+                                                  {
+                                                    additions:
+                                                      chatDiffStats.additions,
+                                                    deletions:
+                                                      chatDiffStats.deletions,
+                                                  },
+                                                )}
+                                                className="chat-diff-stats"
+                                                title={t(
+                                                  "Code changes +{additions} -{deletions}",
+                                                  {
+                                                    additions:
+                                                      chatDiffStats.additions,
+                                                    deletions:
+                                                      chatDiffStats.deletions,
+                                                  },
+                                                )}
+                                              >
+                                                <span className="chat-diff-add">
+                                                  +{chatDiffStats.additions}
+                                                </span>
+                                                <span className="chat-diff-delete">
+                                                  -{chatDiffStats.deletions}
+                                                </span>
+                                              </span>
+                                            ) : null}
+                                          </span>
+                                        </span>
+                                      </button>
                                     );
                                   })}
                                   {hiddenChatCount > 0 ? (
