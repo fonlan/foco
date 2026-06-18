@@ -1,0 +1,9 @@
+# Line-ending policy: everything is LF in the repo and on checkout.
+* text=auto eol=lf
+
+# Windows batch scripts are kept verbatim (currently CRLF) — never normalize.
+*.bat -text
+*.cmd -text
+
+# Lock files are text; force LF.
+*.lock text eol=lf
