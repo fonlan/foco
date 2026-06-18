@@ -4,8 +4,8 @@ use foco_providers::NeutralToolDefinition;
 use foco_store::{
     config::MemorySettings,
     memory::{
-        MemoryDatabase, MemoryFactRecord, MemoryKind, MemoryScope, MemorySourceType,
-        MemoryStatus, NewMemoryFact, NewMemorySource,
+        MemoryDatabase, MemoryFactRecord, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus,
+        NewMemoryFact, NewMemorySource,
     },
     workspace::workspace_database_path,
 };

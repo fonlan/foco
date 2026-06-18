@@ -12,8 +12,8 @@ use foco_store::memory::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::memory_runtime::{apply_memory_expiration_to_fact, expire_due_memories};
 use crate::memory_runtime::memory_extraction_error_should_be_ignored;
+use crate::memory_runtime::{apply_memory_expiration_to_fact, expire_due_memories};
 use crate::*;
 
 #[derive(Debug, Deserialize)]

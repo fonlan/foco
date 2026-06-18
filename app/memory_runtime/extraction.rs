@@ -16,11 +16,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::http::memory::refresh_memory_profile;
+use crate::memory_runtime::tools::memory_extraction_tool_definition;
 use crate::memory_runtime::{
     apply_memory_expiration_to_fact, chat_extracted_memory_summary, memory_fact_key,
     memory_fact_prompt_order,
 };
-use crate::memory_runtime::tools::memory_extraction_tool_definition;
 use crate::*;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -685,7 +685,9 @@ pub(crate) fn memory_extraction_error_should_be_ignored(error_message: Option<&s
         || message.starts_with("extracted fact ")
 }
 
-pub(crate) fn parse_memory_retrieval_output(value: Value) -> Result<MemoryRetrievalOutput, ApiError> {
+pub(crate) fn parse_memory_retrieval_output(
+    value: Value,
+) -> Result<MemoryRetrievalOutput, ApiError> {
     serde_json::from_value(value).map_err(|source| {
         ApiError::bad_request(format!("malformed memory retrieval JSON: {source}"))
     })
