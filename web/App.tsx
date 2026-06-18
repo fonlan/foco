@@ -7014,7 +7014,7 @@ function MainTabBar({
                   ) : (
                     <button
                       aria-label={t("Close chat tab {title}", { title })}
-                      className="inline-flex size-7 items-center justify-center rounded-md text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100"
+                      className="inline-flex size-7 items-center justify-center rounded-md text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
                       onClick={() => onCloseTab(tab)}
                       title={t("Close")}
                       type="button"
