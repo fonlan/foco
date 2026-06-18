@@ -1477,6 +1477,7 @@ body,
   display: flex;
   min-height: 2rem;
   min-width: 0;
+  cursor: pointer;
   align-items: center;
   gap: 0.375rem;
   border-radius: 0.625rem;
