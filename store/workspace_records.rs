@@ -1,7 +1,226 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::workspace::WorkspaceDatabaseError;
+use foco_agent::{
+    AgentAttemptId, AgentAttemptStatus, AgentDefinitionId, AgentInstanceId, AgentInstanceStatus,
+    AgentMessageId, AgentMessageKind, AgentRole, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
+    AgentTaskWaitMode, AgentTeamId, AgentTeamStatus,
+};
+
+use crate::{config::AgentDefinitionSettings, workspace::WorkspaceDatabaseError};
+
+#[derive(Clone, Debug)]
+pub struct NewAgentTeam<'a> {
+    pub id: &'a AgentTeamId,
+    pub chat_id: &'a str,
+    pub coordinator_instance_id: &'a AgentInstanceId,
+    pub coordinator_definition: &'a AgentDefinitionSettings,
+    pub max_concurrent_runs: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTeamRecord {
+    pub id: AgentTeamId,
+    pub chat_id: String,
+    pub coordinator_instance_id: AgentInstanceId,
+    pub status: AgentTeamStatus,
+    pub max_concurrent_runs: i64,
+    pub next_event_sequence: i64,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentInstanceRecord {
+    pub id: AgentInstanceId,
+    pub team_id: AgentTeamId,
+    pub definition_id: AgentDefinitionId,
+    pub definition_revision: u64,
+    pub definition_snapshot: AgentDefinitionSettings,
+    pub role: AgentRole,
+    pub status: AgentInstanceStatus,
+    pub next_task_sequence: i64,
+    pub next_message_sequence: i64,
+    pub context_generation: i64,
+    pub last_scheduled_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewAgentTask<'a> {
+    pub id: &'a AgentTaskId,
+    pub team_id: &'a AgentTeamId,
+    pub owner_instance_id: &'a AgentInstanceId,
+    pub origin_instance_id: Option<&'a AgentInstanceId>,
+    pub parent_task_id: Option<&'a AgentTaskId>,
+    pub input_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTaskRecord {
+    pub id: AgentTaskId,
+    pub team_id: AgentTeamId,
+    pub owner_instance_id: AgentInstanceId,
+    pub origin_instance_id: Option<AgentInstanceId>,
+    pub parent_task_id: Option<AgentTaskId>,
+    pub sequence: i64,
+    pub status: AgentTaskStatus,
+    pub input_json: String,
+    pub result_json: Option<String>,
+    pub error_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentTaskStateUpdate<'a> {
+    pub team_id: &'a AgentTeamId,
+    pub task_id: &'a AgentTaskId,
+    pub expected_status: AgentTaskStatus,
+    pub transition: AgentTaskTransition,
+    pub result_json: Option<&'a str>,
+    pub error_json: Option<&'a str>,
+    pub interruption_reason: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentAttemptRecord {
+    pub id: AgentAttemptId,
+    pub team_id: AgentTeamId,
+    pub task_id: AgentTaskId,
+    pub sequence: i64,
+    pub status: AgentAttemptStatus,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub interruption_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentReconciliationRecord {
+    pub attempt: AgentAttemptRecord,
+    pub task: AgentTaskRecord,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewAgentTaskDependency<'a> {
+    pub team_id: &'a AgentTeamId,
+    pub waiting_task_id: &'a AgentTaskId,
+    pub dependency_task_id: &'a AgentTaskId,
+    pub wait_mode: AgentTaskWaitMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTaskDependencyRecord {
+    pub team_id: AgentTeamId,
+    pub waiting_task_id: AgentTaskId,
+    pub dependency_task_id: AgentTaskId,
+    pub wait_mode: AgentTaskWaitMode,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewAgentMessage<'a> {
+    pub id: &'a AgentMessageId,
+    pub team_id: &'a AgentTeamId,
+    pub sender_instance_id: Option<&'a AgentInstanceId>,
+    pub receiver_instance_id: &'a AgentInstanceId,
+    pub related_task_id: Option<&'a AgentTaskId>,
+    pub reply_to_message_id: Option<&'a AgentMessageId>,
+    pub kind: AgentMessageKind,
+    pub content: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMessageRecord {
+    pub id: AgentMessageId,
+    pub team_id: AgentTeamId,
+    pub sender_instance_id: Option<AgentInstanceId>,
+    pub receiver_instance_id: AgentInstanceId,
+    pub related_task_id: Option<AgentTaskId>,
+    pub reply_to_message_id: Option<AgentMessageId>,
+    pub kind: AgentMessageKind,
+    pub content: String,
+    pub sequence: i64,
+    pub created_at: String,
+    pub consumed_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewAgentEvent<'a> {
+    pub team_id: &'a AgentTeamId,
+    pub event_type: &'a str,
+    pub instance_id: Option<&'a AgentInstanceId>,
+    pub task_id: Option<&'a AgentTaskId>,
+    pub attempt_id: Option<&'a AgentAttemptId>,
+    pub message_id: Option<&'a AgentMessageId>,
+    pub payload_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEventRecord {
+    pub team_id: AgentTeamId,
+    pub sequence: i64,
+    pub event_type: String,
+    pub instance_id: Option<AgentInstanceId>,
+    pub task_id: Option<AgentTaskId>,
+    pub attempt_id: Option<AgentAttemptId>,
+    pub message_id: Option<AgentMessageId>,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewAgentContextEntry<'a> {
+    pub id: &'a str,
+    pub team_id: &'a AgentTeamId,
+    pub instance_id: &'a AgentInstanceId,
+    pub generation: i64,
+    pub sequence: i64,
+    pub role: &'a str,
+    pub content_json: &'a str,
+    pub source_task_id: Option<&'a AgentTaskId>,
+    pub source_message_id: Option<&'a AgentMessageId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentContextEntryRecord {
+    pub id: String,
+    pub team_id: AgentTeamId,
+    pub instance_id: AgentInstanceId,
+    pub generation: i64,
+    pub sequence: i64,
+    pub role: String,
+    pub content_json: String,
+    pub source_task_id: Option<AgentTaskId>,
+    pub source_message_id: Option<AgentMessageId>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewAgentContextSnapshot<'a> {
+    pub id: &'a str,
+    pub team_id: &'a AgentTeamId,
+    pub instance_id: &'a AgentInstanceId,
+    pub generation: i64,
+    pub sequence: i64,
+    pub entries_json: &'a str,
+    pub token_count: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentContextSnapshotRecord {
+    pub id: String,
+    pub team_id: AgentTeamId,
+    pub instance_id: AgentInstanceId,
+    pub generation: i64,
+    pub sequence: i64,
+    pub entries_json: String,
+    pub token_count: Option<i64>,
+    pub created_at: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatRecord {
@@ -151,6 +370,10 @@ pub struct NewLlmRequest<'a> {
     pub id: &'a str,
     pub workspace_id: &'a str,
     pub chat_id: Option<&'a str>,
+    pub agent_team_id: Option<&'a AgentTeamId>,
+    pub agent_instance_id: Option<&'a AgentInstanceId>,
+    pub agent_task_id: Option<&'a AgentTaskId>,
+    pub agent_attempt_id: Option<&'a AgentAttemptId>,
     pub provider_id: &'a str,
     pub model_id: &'a str,
     pub request_started_at: &'a str,
@@ -188,6 +411,10 @@ pub struct LlmRequestRecord {
     pub id: String,
     pub workspace_id: Option<String>,
     pub chat_id: Option<String>,
+    pub agent_team_id: Option<AgentTeamId>,
+    pub agent_instance_id: Option<AgentInstanceId>,
+    pub agent_task_id: Option<AgentTaskId>,
+    pub agent_attempt_id: Option<AgentAttemptId>,
     pub provider_id: String,
     pub model_id: String,
     pub request_started_at: String,

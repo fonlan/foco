@@ -317,6 +317,230 @@ CREATE INDEX prompt_context_injections_chat_kind_sequence_idx
     ON prompt_context_injections (chat_id, kind, sequence);
 "#;
 
+pub(crate) const MIGRATION_010: &str = r#"
+CREATE TABLE agent_teams (
+    id TEXT PRIMARY KEY NOT NULL CHECK (id GLOB 'agent-team-*'),
+    chat_id TEXT NOT NULL UNIQUE REFERENCES chats(id) ON DELETE CASCADE,
+    coordinator_instance_id TEXT NOT NULL CHECK (coordinator_instance_id GLOB 'agent-instance-*'),
+    status TEXT NOT NULL CHECK (status IN ('active', 'paused', 'draining', 'stopped', 'failed')),
+    max_concurrent_runs INTEGER NOT NULL CHECK (max_concurrent_runs > 0),
+    next_event_sequence INTEGER NOT NULL DEFAULT 0 CHECK (next_event_sequence >= 0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (id, coordinator_instance_id)
+        REFERENCES agent_instances(team_id, id)
+        DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE agent_instances (
+    id TEXT PRIMARY KEY NOT NULL CHECK (id GLOB 'agent-instance-*'),
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    definition_id TEXT NOT NULL CHECK (definition_id GLOB 'agent-definition-*'),
+    definition_revision INTEGER NOT NULL CHECK (definition_revision > 0),
+    definition_snapshot_json TEXT NOT NULL CHECK (json_valid(definition_snapshot_json)),
+    role TEXT NOT NULL CHECK (role IN ('coordinator', 'worker')),
+    status TEXT NOT NULL CHECK (status IN ('idle', 'running', 'waiting', 'paused', 'draining', 'stopped', 'failed')),
+    next_task_sequence INTEGER NOT NULL DEFAULT 0 CHECK (next_task_sequence >= 0),
+    next_message_sequence INTEGER NOT NULL DEFAULT 0 CHECK (next_message_sequence >= 0),
+    context_generation INTEGER NOT NULL DEFAULT 0 CHECK (context_generation >= 0),
+    last_scheduled_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (team_id, id)
+);
+
+CREATE UNIQUE INDEX agent_instances_one_coordinator_idx
+    ON agent_instances (team_id)
+    WHERE role = 'coordinator';
+CREATE INDEX agent_instances_team_status_idx
+    ON agent_instances (team_id, status);
+
+CREATE TABLE agent_tasks (
+    id TEXT PRIMARY KEY NOT NULL CHECK (id GLOB 'agent-task-*'),
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    owner_instance_id TEXT NOT NULL,
+    origin_instance_id TEXT,
+    parent_task_id TEXT,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'waiting', 'completed', 'failed', 'cancelled', 'interrupted')),
+    input_json TEXT NOT NULL CHECK (json_valid(input_json)),
+    result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+    error_json TEXT CHECK (error_json IS NULL OR json_valid(error_json)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    UNIQUE (team_id, id),
+    UNIQUE (owner_instance_id, sequence),
+    FOREIGN KEY (team_id, owner_instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id, origin_instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (team_id, parent_task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE RESTRICT
+);
+
+CREATE UNIQUE INDEX agent_tasks_one_active_per_instance_idx
+    ON agent_tasks (owner_instance_id)
+    WHERE status IN ('running', 'waiting');
+CREATE INDEX agent_tasks_runnable_idx
+    ON agent_tasks (team_id, status, owner_instance_id, sequence)
+    WHERE status = 'queued';
+CREATE INDEX agent_tasks_parent_idx
+    ON agent_tasks (team_id, parent_task_id);
+
+CREATE TABLE agent_task_dependencies (
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    waiting_task_id TEXT NOT NULL,
+    dependency_task_id TEXT NOT NULL,
+    wait_mode TEXT NOT NULL CHECK (wait_mode IN ('all', 'any')),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (waiting_task_id, dependency_task_id),
+    CHECK (waiting_task_id <> dependency_task_id),
+    FOREIGN KEY (team_id, waiting_task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id, dependency_task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX agent_task_dependencies_waiting_idx
+    ON agent_task_dependencies (team_id, waiting_task_id);
+CREATE INDEX agent_task_dependencies_dependency_idx
+    ON agent_task_dependencies (team_id, dependency_task_id);
+
+CREATE TABLE agent_messages (
+    id TEXT PRIMARY KEY NOT NULL CHECK (id GLOB 'agent-message-*'),
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    sender_instance_id TEXT,
+    receiver_instance_id TEXT NOT NULL,
+    related_task_id TEXT,
+    reply_to_message_id TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('information', 'request', 'response')),
+    content TEXT NOT NULL CHECK (length(content) > 0),
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    created_at TEXT NOT NULL,
+    consumed_at TEXT,
+    UNIQUE (team_id, id),
+    UNIQUE (receiver_instance_id, sequence),
+    FOREIGN KEY (team_id, sender_instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (team_id, receiver_instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id, related_task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, reply_to_message_id)
+        REFERENCES agent_messages(team_id, id) ON DELETE SET NULL
+);
+
+CREATE INDEX agent_messages_unread_idx
+    ON agent_messages (receiver_instance_id, sequence)
+    WHERE consumed_at IS NULL;
+CREATE INDEX agent_messages_task_idx
+    ON agent_messages (team_id, related_task_id);
+
+CREATE TABLE agent_attempts (
+    id TEXT PRIMARY KEY NOT NULL CHECK (id GLOB 'agent-attempt-*'),
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    status TEXT NOT NULL CHECK (status IN ('running', 'suspended', 'completed', 'failed', 'cancelled', 'interrupted')),
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    interruption_reason TEXT,
+    UNIQUE (team_id, id),
+    UNIQUE (task_id, sequence),
+    FOREIGN KEY (team_id, task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX agent_attempts_one_active_per_task_idx
+    ON agent_attempts (task_id)
+    WHERE status IN ('running', 'suspended');
+CREATE INDEX agent_attempts_reconciliation_idx
+    ON agent_attempts (status, team_id, task_id)
+    WHERE status IN ('running', 'suspended');
+
+CREATE TABLE agent_events (
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    event_type TEXT NOT NULL CHECK (length(event_type) > 0),
+    instance_id TEXT,
+    task_id TEXT,
+    attempt_id TEXT,
+    message_id TEXT,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, sequence),
+    FOREIGN KEY (team_id, instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, attempt_id)
+        REFERENCES agent_attempts(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, message_id)
+        REFERENCES agent_messages(team_id, id) ON DELETE SET NULL
+);
+
+CREATE INDEX agent_events_entity_idx
+    ON agent_events (team_id, instance_id, task_id, sequence);
+
+CREATE TABLE agent_context_entries (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    instance_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+    content_json TEXT NOT NULL CHECK (json_valid(content_json)),
+    source_task_id TEXT,
+    source_message_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (team_id, id),
+    UNIQUE (instance_id, generation, sequence),
+    FOREIGN KEY (team_id, instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id, source_task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, source_message_id)
+        REFERENCES agent_messages(team_id, id) ON DELETE SET NULL
+);
+
+CREATE INDEX agent_context_entries_owner_idx
+    ON agent_context_entries (instance_id, generation, sequence);
+
+CREATE TABLE agent_context_snapshots (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    instance_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    entries_json TEXT NOT NULL CHECK (json_valid(entries_json)),
+    token_count INTEGER CHECK (token_count IS NULL OR token_count >= 0),
+    created_at TEXT NOT NULL,
+    UNIQUE (team_id, id),
+    UNIQUE (instance_id, generation, sequence),
+    FOREIGN KEY (team_id, instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX agent_context_snapshots_owner_idx
+    ON agent_context_snapshots (instance_id, generation, sequence);
+
+ALTER TABLE llm_requests
+    ADD COLUMN agent_team_id TEXT REFERENCES agent_teams(id) ON DELETE SET NULL;
+ALTER TABLE llm_requests
+    ADD COLUMN agent_instance_id TEXT REFERENCES agent_instances(id) ON DELETE SET NULL;
+ALTER TABLE llm_requests
+    ADD COLUMN agent_task_id TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL;
+ALTER TABLE llm_requests
+    ADD COLUMN agent_attempt_id TEXT REFERENCES agent_attempts(id) ON DELETE SET NULL;
+
+CREATE INDEX llm_requests_agent_team_idx ON llm_requests (agent_team_id, request_started_at);
+CREATE INDEX llm_requests_agent_instance_idx ON llm_requests (agent_instance_id, request_started_at);
+CREATE INDEX llm_requests_agent_task_idx ON llm_requests (agent_task_id, request_started_at);
+CREATE INDEX llm_requests_agent_attempt_idx ON llm_requests (agent_attempt_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

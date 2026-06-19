@@ -2,11 +2,18 @@ use std::{
     collections::{HashMap, HashSet},
     fmt, fs, io,
     path::{Path, PathBuf},
+    str::FromStr,
     time::Duration,
 };
 
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use foco_agent::{
+    AgentAttemptId, AgentAttemptStatus, AgentDomainError, AgentEntityKind, AgentInstanceId,
+    AgentInstanceStatus, AgentMessageId, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
+    AgentTeamId,
+};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::config::WorkspaceConfig;
@@ -17,27 +24,31 @@ mod workspace_records;
 mod workspace_schema;
 
 pub use workspace_records::{
-    ChatRecord, CodeChangeStats, CodeGraphContextRecord, CodeGraphReferenceRecord,
-    CodeGraphRelatedFileRecord, CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord,
-    ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
-    LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
-    LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
-    LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, NewCodeGraphEdge,
-    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-    NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
-    PromptContextInjectionRecord, RunEventRecord, TerminalSessionRecord, TodoGraphFilter,
-    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
+    AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
+    AgentInstanceRecord, AgentMessageRecord, AgentReconciliationRecord, AgentTaskDependencyRecord,
+    AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, ChatRecord, CodeChangeStats,
+    CodeGraphContextRecord, CodeGraphReferenceRecord, CodeGraphRelatedFileRecord,
+    CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord,
+    HookRunRecord, LlmRequestAuditFilters, LlmRequestAuditModelBreakdown,
+    LlmRequestAuditProviderBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
+    LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord,
+    MessageRecord, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentMessage,
+    NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
+    NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot,
+    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection,
+    NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult, PromptContextInjectionRecord,
+    RunEventRecord, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
+    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
+    UpdateLlmRequestOutcome,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
-    MIGRATION_008, MIGRATION_009, Migration,
+    MIGRATION_008, MIGRATION_009, MIGRATION_010, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 9;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 10;
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -78,6 +89,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 9,
         sql: MIGRATION_009,
+    },
+    Migration {
+        version: 10,
+        sql: MIGRATION_010,
     },
 ];
 
@@ -1045,6 +1060,7 @@ impl WorkspaceDatabase {
         request: NewLlmRequest<'_>,
     ) -> Result<(), WorkspaceDatabaseError> {
         validate_llm_request_tokens(&request)?;
+        validate_llm_agent_references(&self.connection, &self.database_path, &request)?;
 
         let cache_ratio = calculate_cache_ratio(request.input_tokens, request.cache_read_tokens)?;
         let request_body_json =
@@ -1056,18 +1072,23 @@ impl WorkspaceDatabase {
             .execute(
                 "INSERT INTO llm_requests
                     (
-                        id, workspace_id, chat_id, provider_id, model_id, request_started_at,
+                        id, workspace_id, chat_id, agent_team_id, agent_instance_id,
+                        agent_task_id, agent_attempt_id, provider_id, model_id, request_started_at,
                         first_token_at, completed_at, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, cache_ratio,
                         first_token_latency_ms, total_latency_ms, status_code, final_state,
                         request_body_json, response_body_json
                     )
                  VALUES
-                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
                 params![
                     request.id,
                     request.workspace_id,
                     request.chat_id,
+                    request.agent_team_id.map(AgentTeamId::as_str),
+                    request.agent_instance_id.map(AgentInstanceId::as_str),
+                    request.agent_task_id.map(AgentTaskId::as_str),
+                    request.agent_attempt_id.map(AgentAttemptId::as_str),
                     request.provider_id,
                     request.model_id,
                     request.request_started_at,
@@ -1156,7 +1177,8 @@ impl WorkspaceDatabase {
         self.connection
             .query_row(
                 "SELECT
-                    id, workspace_id, chat_id, provider_id, model_id, request_started_at,
+                    id, workspace_id, chat_id, agent_team_id, agent_instance_id,
+                    agent_task_id, agent_attempt_id, provider_id, model_id, request_started_at,
                     first_token_at, completed_at, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, cache_ratio,
                     first_token_latency_ms, total_latency_ms, status_code, final_state,
@@ -1169,22 +1191,26 @@ impl WorkspaceDatabase {
                         id: row.get(0)?,
                         workspace_id: row.get(1)?,
                         chat_id: row.get(2)?,
-                        provider_id: row.get(3)?,
-                        model_id: row.get(4)?,
-                        request_started_at: row.get(5)?,
-                        first_token_at: row.get(6)?,
-                        completed_at: row.get(7)?,
-                        input_tokens: row.get(8)?,
-                        output_tokens: row.get(9)?,
-                        cache_read_tokens: row.get(10)?,
-                        cache_write_tokens: row.get(11)?,
-                        cache_ratio: row.get(12)?,
-                        first_token_latency_ms: row.get(13)?,
-                        total_latency_ms: row.get(14)?,
-                        status_code: row.get(15)?,
-                        final_state: row.get(16)?,
-                        request_body_json: row.get(17)?,
-                        response_body_json: row.get(18)?,
+                        agent_team_id: optional_agent_id_from_row(row, 3)?,
+                        agent_instance_id: optional_agent_id_from_row(row, 4)?,
+                        agent_task_id: optional_agent_id_from_row(row, 5)?,
+                        agent_attempt_id: optional_agent_id_from_row(row, 6)?,
+                        provider_id: row.get(7)?,
+                        model_id: row.get(8)?,
+                        request_started_at: row.get(9)?,
+                        first_token_at: row.get(10)?,
+                        completed_at: row.get(11)?,
+                        input_tokens: row.get(12)?,
+                        output_tokens: row.get(13)?,
+                        cache_read_tokens: row.get(14)?,
+                        cache_write_tokens: row.get(15)?,
+                        cache_ratio: row.get(16)?,
+                        first_token_latency_ms: row.get(17)?,
+                        total_latency_ms: row.get(18)?,
+                        status_code: row.get(19)?,
+                        final_state: row.get(20)?,
+                        request_body_json: row.get(21)?,
+                        response_body_json: row.get(22)?,
                     })
                 },
             )
@@ -1829,6 +1855,1232 @@ impl WorkspaceDatabase {
             })
             .map_err(|source| self.sqlite_error(source))?;
 
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn create_agent_team(
+        &mut self,
+        team: NewAgentTeam<'_>,
+    ) -> Result<(AgentTeamRecord, AgentInstanceRecord), WorkspaceDatabaseError> {
+        if team.max_concurrent_runs <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "max_concurrent_runs must be greater than 0".to_string(),
+            });
+        }
+        let snapshot_json =
+            serde_json::to_string(team.coordinator_definition).map_err(|source| {
+                WorkspaceDatabaseError::AgentRuntimeJson {
+                    field: "definition_snapshot_json",
+                    source,
+                }
+            })?;
+        validate_agent_definition_snapshot(&snapshot_json)?;
+
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO agent_teams
+                    (id, chat_id, coordinator_instance_id, status, max_concurrent_runs,
+                     next_event_sequence, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 'active', ?4, 0, ?5, ?5)",
+                params![
+                    team.id.as_str(),
+                    team.chat_id,
+                    team.coordinator_instance_id.as_str(),
+                    team.max_concurrent_runs,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO agent_instances
+                    (id, team_id, definition_id, definition_revision,
+                     definition_snapshot_json, role, status, next_task_sequence,
+                     next_message_sequence, context_generation, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'coordinator', 'idle', 0, 0, 0, ?6, ?6)",
+                params![
+                    team.coordinator_instance_id.as_str(),
+                    team.id.as_str(),
+                    team.coordinator_definition.id.as_str(),
+                    i64::try_from(team.coordinator_definition.revision).map_err(|_| {
+                        WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                            message: "agent definition revision exceeds SQLite integer range"
+                                .to_string(),
+                        }
+                    })?,
+                    snapshot_json,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let team_record = self.agent_team(team.id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "created agent team was not found".to_string(),
+            }
+        })?;
+        let instance_record = self
+            .agent_instance(team.coordinator_instance_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "created coordinator instance was not found".to_string(),
+            })?;
+        Ok((team_record, instance_record))
+    }
+
+    pub fn agent_team(
+        &self,
+        team_id: &AgentTeamId,
+    ) -> Result<Option<AgentTeamRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, chat_id, coordinator_instance_id, status, max_concurrent_runs,
+                        next_event_sequence, created_at, updated_at
+                 FROM agent_teams WHERE id = ?1",
+                params![team_id.as_str()],
+                agent_team_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn agent_team_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<AgentTeamRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, chat_id, coordinator_instance_id, status, max_concurrent_runs,
+                        next_event_sequence, created_at, updated_at
+                 FROM agent_teams WHERE chat_id = ?1",
+                params![chat_id],
+                agent_team_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn agent_instance(
+        &self,
+        instance_id: &AgentInstanceId,
+    ) -> Result<Option<AgentInstanceRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, team_id, definition_id, definition_revision,
+                        definition_snapshot_json, role, status, next_task_sequence,
+                        next_message_sequence, context_generation, last_scheduled_at,
+                        created_at, updated_at
+                 FROM agent_instances WHERE id = ?1",
+                params![instance_id.as_str()],
+                agent_instance_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn agent_instances_for_team(
+        &self,
+        team_id: &AgentTeamId,
+    ) -> Result<Vec<AgentInstanceRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, team_id, definition_id, definition_revision,
+                        definition_snapshot_json, role, status, next_task_sequence,
+                        next_message_sequence, context_generation, last_scheduled_at,
+                        created_at, updated_at
+                 FROM agent_instances WHERE team_id = ?1
+                 ORDER BY CASE role WHEN 'coordinator' THEN 0 ELSE 1 END, created_at, id",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![team_id.as_str()], agent_instance_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn enqueue_agent_task(
+        &mut self,
+        task: NewAgentTask<'_>,
+    ) -> Result<AgentTaskRecord, WorkspaceDatabaseError> {
+        validate_agent_json(task.input_json, "input_json")?;
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        ensure_agent_entity_team(
+            &transaction,
+            "agent_instances",
+            task.owner_instance_id.as_str(),
+            task.team_id,
+            AgentEntityKind::Instance,
+            &database_path,
+        )?;
+        if let Some(origin_instance_id) = task.origin_instance_id {
+            ensure_agent_entity_team(
+                &transaction,
+                "agent_instances",
+                origin_instance_id.as_str(),
+                task.team_id,
+                AgentEntityKind::Instance,
+                &database_path,
+            )?;
+        }
+        if let Some(parent_task_id) = task.parent_task_id {
+            ensure_agent_entity_team(
+                &transaction,
+                "agent_tasks",
+                parent_task_id.as_str(),
+                task.team_id,
+                AgentEntityKind::Task,
+                &database_path,
+            )?;
+        }
+
+        let sequence: i64 = transaction
+            .query_row(
+                "SELECT next_task_sequence FROM agent_instances
+                 WHERE id = ?1 AND team_id = ?2",
+                params![task.owner_instance_id.as_str(), task.team_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE agent_instances
+                 SET next_task_sequence = next_task_sequence + 1, updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2",
+                params![task.owner_instance_id.as_str(), task.team_id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO agent_tasks
+                    (id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+                     sequence, status, input_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?8)",
+                params![
+                    task.id.as_str(),
+                    task.team_id.as_str(),
+                    task.owner_instance_id.as_str(),
+                    task.origin_instance_id.map(AgentInstanceId::as_str),
+                    task.parent_task_id.map(AgentTaskId::as_str),
+                    sequence,
+                    task.input_json,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        self.agent_task(task.id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "created agent task was not found".to_string(),
+            })
+    }
+
+    pub fn agent_task(
+        &self,
+        task_id: &AgentTaskId,
+    ) -> Result<Option<AgentTaskRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                AGENT_TASK_SELECT_BY_ID,
+                params![task_id.as_str()],
+                agent_task_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn agent_tasks_for_team(
+        &self,
+        team_id: &AgentTeamId,
+    ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+                        sequence, status, input_json, result_json, error_json, created_at,
+                        updated_at, started_at, completed_at
+                 FROM agent_tasks WHERE team_id = ?1
+                 ORDER BY owner_instance_id, sequence",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![team_id.as_str()], agent_task_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn runnable_agent_tasks(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
+        if limit <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "runnable Agent task query limit must be greater than 0".to_string(),
+            });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT task.id, task.team_id, task.owner_instance_id,
+                        task.origin_instance_id, task.parent_task_id, task.sequence,
+                        task.status, task.input_json, task.result_json, task.error_json,
+                        task.created_at, task.updated_at, task.started_at, task.completed_at
+                 FROM agent_tasks AS task
+                 JOIN agent_instances AS instance ON instance.id = task.owner_instance_id
+                 JOIN agent_teams AS team ON team.id = task.team_id
+                 WHERE task.status = 'queued' AND instance.status = 'idle'
+                   AND team.status = 'active'
+                   AND NOT EXISTS (
+                        SELECT 1 FROM agent_tasks AS earlier_task
+                        WHERE earlier_task.owner_instance_id = task.owner_instance_id
+                          AND earlier_task.sequence < task.sequence
+                          AND earlier_task.status IN ('queued', 'running', 'waiting')
+                   )
+                   AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM agent_task_dependencies AS dependency
+                            WHERE dependency.waiting_task_id = task.id
+                        )
+                        OR (
+                            EXISTS (
+                                SELECT 1 FROM agent_task_dependencies AS dependency
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND dependency.wait_mode = 'all'
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM agent_task_dependencies AS dependency
+                                JOIN agent_tasks AS required_task
+                                  ON required_task.id = dependency.dependency_task_id
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND required_task.status <> 'completed'
+                            )
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM agent_task_dependencies AS dependency
+                            JOIN agent_tasks AS required_task
+                              ON required_task.id = dependency.dependency_task_id
+                            WHERE dependency.waiting_task_id = task.id
+                              AND dependency.wait_mode = 'any'
+                              AND required_task.status = 'completed'
+                        )
+                   )
+                 ORDER BY task.created_at, task.team_id, task.owner_instance_id, task.sequence
+                 LIMIT ?1",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![limit], agent_task_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn claim_runnable_agent_task(
+        &mut self,
+        team_id: &AgentTeamId,
+        task_id: &AgentTaskId,
+        attempt_id: &AgentAttemptId,
+    ) -> Result<Option<AgentTaskRecord>, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let runnable = transaction
+            .query_row(
+                "SELECT task.owner_instance_id
+                 FROM agent_tasks AS task
+                 JOIN agent_instances AS instance ON instance.id = task.owner_instance_id
+                 JOIN agent_teams AS team ON team.id = task.team_id
+                 WHERE task.id = ?1 AND task.team_id = ?2 AND task.status = 'queued'
+                   AND instance.status = 'idle' AND team.status = 'active'
+                   AND NOT EXISTS (
+                        SELECT 1 FROM agent_tasks AS earlier_task
+                        WHERE earlier_task.owner_instance_id = task.owner_instance_id
+                          AND earlier_task.sequence < task.sequence
+                          AND earlier_task.status IN ('queued', 'running', 'waiting')
+                   )
+                   AND (
+                        NOT EXISTS (
+                            SELECT 1 FROM agent_task_dependencies AS dependency
+                            WHERE dependency.waiting_task_id = task.id
+                        )
+                        OR (
+                            EXISTS (
+                                SELECT 1 FROM agent_task_dependencies AS dependency
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND dependency.wait_mode = 'all'
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM agent_task_dependencies AS dependency
+                                JOIN agent_tasks AS required_task
+                                  ON required_task.id = dependency.dependency_task_id
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND required_task.status <> 'completed'
+                            )
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM agent_task_dependencies AS dependency
+                            JOIN agent_tasks AS required_task
+                              ON required_task.id = dependency.dependency_task_id
+                            WHERE dependency.waiting_task_id = task.id
+                              AND dependency.wait_mode = 'any'
+                              AND required_task.status = 'completed'
+                        )
+                   )",
+                params![task_id.as_str(), team_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(owner_instance_id) = runnable else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(None);
+        };
+        let attempt_sequence: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), -1) + 1 FROM agent_attempts WHERE task_id = ?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'running', started_at = COALESCE(started_at, ?3),
+                     completed_at = NULL, updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2 AND status = 'queued'",
+                params![task_id.as_str(), team_id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated != 1 {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(None);
+        }
+        transaction
+            .execute(
+                "INSERT INTO agent_attempts
+                    (id, team_id, task_id, sequence, status, started_at)
+                 VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
+                params![
+                    attempt_id.as_str(),
+                    team_id.as_str(),
+                    task_id.as_str(),
+                    attempt_sequence,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let instance_updated = transaction
+            .execute(
+                "UPDATE agent_instances
+                 SET status = 'running', last_scheduled_at = ?3, updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2 AND status = 'idle'",
+                params![owner_instance_id, team_id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if instance_updated != 1 {
+            return Err(WorkspaceDatabaseError::AgentDomain {
+                source: AgentDomainError::queue_conflict(
+                    AgentInstanceId::new(owner_instance_id)
+                        .map_err(|source| WorkspaceDatabaseError::AgentDomain { source })?,
+                ),
+            });
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        self.agent_task(task_id)
+    }
+
+    pub fn update_agent_task_state(
+        &mut self,
+        update: AgentTaskStateUpdate<'_>,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        if update.transition == AgentTaskTransition::Start {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "queued tasks must be started through claim_runnable_agent_task"
+                    .to_string(),
+            });
+        }
+        let target_status = update
+            .expected_status
+            .apply(update.transition)
+            .map_err(|source| WorkspaceDatabaseError::AgentDomain { source })?;
+        if let Some(result_json) = update.result_json {
+            validate_agent_json(result_json, "result_json")?;
+        }
+        if let Some(error_json) = update.error_json {
+            validate_agent_json(error_json, "error_json")?;
+        }
+
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let owner_instance_id = transaction
+            .query_row(
+                "SELECT owner_instance_id FROM agent_tasks
+                 WHERE id = ?1 AND team_id = ?2 AND status = ?3",
+                params![
+                    update.task_id.as_str(),
+                    update.team_id.as_str(),
+                    update.expected_status.as_str()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(owner_instance_id) = owner_instance_id else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        };
+        let completed_at = target_status.is_terminal().then_some(now.as_str());
+        let clear_for_retry = update.transition == AgentTaskTransition::Retry;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = ?4,
+                     result_json = CASE WHEN ?8 THEN NULL ELSE ?5 END,
+                     error_json = CASE WHEN ?8 THEN NULL ELSE ?6 END,
+                     started_at = CASE WHEN ?8 THEN NULL ELSE started_at END,
+                     completed_at = CASE WHEN ?8 THEN NULL ELSE ?7 END,
+                     updated_at = ?9
+                 WHERE id = ?1 AND team_id = ?2 AND status = ?3",
+                params![
+                    update.task_id.as_str(),
+                    update.team_id.as_str(),
+                    update.expected_status.as_str(),
+                    target_status.as_str(),
+                    update.result_json,
+                    update.error_json,
+                    completed_at,
+                    clear_for_retry,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated != 1 {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        }
+
+        let attempt_target = match update.transition {
+            AgentTaskTransition::Wait => Some(AgentAttemptStatus::Suspended),
+            AgentTaskTransition::Resume => Some(AgentAttemptStatus::Running),
+            AgentTaskTransition::Complete => Some(AgentAttemptStatus::Completed),
+            AgentTaskTransition::Fail => Some(AgentAttemptStatus::Failed),
+            AgentTaskTransition::Cancel
+                if matches!(
+                    update.expected_status,
+                    AgentTaskStatus::Running | AgentTaskStatus::Waiting
+                ) =>
+            {
+                Some(AgentAttemptStatus::Cancelled)
+            }
+            AgentTaskTransition::Interrupt => Some(AgentAttemptStatus::Interrupted),
+            AgentTaskTransition::Start
+            | AgentTaskTransition::Cancel
+            | AgentTaskTransition::Retry => None,
+        };
+        if let Some(attempt_target) = attempt_target {
+            let attempt_completed_at = attempt_target.is_terminal().then_some(now.as_str());
+            let attempt_updated = transaction
+                .execute(
+                    "UPDATE agent_attempts
+                     SET status = ?3, completed_at = ?4, interruption_reason = ?5
+                     WHERE task_id = ?1 AND team_id = ?2
+                       AND status IN ('running', 'suspended')",
+                    params![
+                        update.task_id.as_str(),
+                        update.team_id.as_str(),
+                        attempt_target.as_str(),
+                        attempt_completed_at,
+                        update.interruption_reason
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if attempt_updated != 1 {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!(
+                        "task '{}' has no active attempt for transition {:?}",
+                        update.task_id, update.transition
+                    ),
+                });
+            }
+        }
+
+        let instance_status = match (update.expected_status, target_status) {
+            (AgentTaskStatus::Queued, _) => None,
+            (_, AgentTaskStatus::Running) => Some(AgentInstanceStatus::Running),
+            (_, AgentTaskStatus::Waiting) => Some(AgentInstanceStatus::Waiting),
+            (_, status) if status.is_terminal() => Some(AgentInstanceStatus::Idle),
+            _ => None,
+        };
+        if let Some(instance_status) = instance_status {
+            transaction
+                .execute(
+                    "UPDATE agent_instances SET status = ?3, updated_at = ?4
+                     WHERE id = ?1 AND team_id = ?2",
+                    params![
+                        owner_instance_id,
+                        update.team_id.as_str(),
+                        instance_status.as_str(),
+                        now
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
+    }
+
+    pub fn agent_attempts_for_task(
+        &self,
+        task_id: &AgentTaskId,
+    ) -> Result<Vec<AgentAttemptRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, team_id, task_id, sequence, status, started_at,
+                        completed_at, interruption_reason
+                 FROM agent_attempts WHERE task_id = ?1 ORDER BY sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![task_id.as_str()], |row| {
+                Ok(AgentAttemptRecord {
+                    id: agent_id_from_row(row, 0)?,
+                    team_id: agent_id_from_row(row, 1)?,
+                    task_id: agent_id_from_row(row, 2)?,
+                    sequence: row.get(3)?,
+                    status: agent_enum_from_row(row, 4)?,
+                    started_at: row.get(5)?,
+                    completed_at: row.get(6)?,
+                    interruption_reason: row.get(7)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn insert_agent_message(
+        &mut self,
+        message: NewAgentMessage<'_>,
+    ) -> Result<AgentMessageRecord, WorkspaceDatabaseError> {
+        if message.content.trim().is_empty() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "agent message content must not be empty".to_string(),
+            });
+        }
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        ensure_agent_entity_team(
+            &transaction,
+            "agent_instances",
+            message.receiver_instance_id.as_str(),
+            message.team_id,
+            AgentEntityKind::Instance,
+            &database_path,
+        )?;
+        if let Some(sender_instance_id) = message.sender_instance_id {
+            ensure_agent_entity_team(
+                &transaction,
+                "agent_instances",
+                sender_instance_id.as_str(),
+                message.team_id,
+                AgentEntityKind::Instance,
+                &database_path,
+            )?;
+        }
+        if let Some(related_task_id) = message.related_task_id {
+            ensure_agent_entity_team(
+                &transaction,
+                "agent_tasks",
+                related_task_id.as_str(),
+                message.team_id,
+                AgentEntityKind::Task,
+                &database_path,
+            )?;
+        }
+        if let Some(reply_to_message_id) = message.reply_to_message_id {
+            ensure_agent_entity_team(
+                &transaction,
+                "agent_messages",
+                reply_to_message_id.as_str(),
+                message.team_id,
+                AgentEntityKind::Message,
+                &database_path,
+            )?;
+        }
+        let sequence: i64 = transaction
+            .query_row(
+                "SELECT next_message_sequence FROM agent_instances
+                 WHERE id = ?1 AND team_id = ?2",
+                params![
+                    message.receiver_instance_id.as_str(),
+                    message.team_id.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE agent_instances
+                 SET next_message_sequence = next_message_sequence + 1, updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2",
+                params![
+                    message.receiver_instance_id.as_str(),
+                    message.team_id.as_str(),
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO agent_messages
+                    (id, team_id, sender_instance_id, receiver_instance_id, related_task_id,
+                     reply_to_message_id, kind, content, sequence, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    message.id.as_str(),
+                    message.team_id.as_str(),
+                    message.sender_instance_id.map(AgentInstanceId::as_str),
+                    message.receiver_instance_id.as_str(),
+                    message.related_task_id.map(AgentTaskId::as_str),
+                    message.reply_to_message_id.map(AgentMessageId::as_str),
+                    message.kind.as_str(),
+                    message.content,
+                    sequence,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        self.agent_message(message.id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "created agent message was not found".to_string(),
+            }
+        })
+    }
+
+    pub fn agent_message(
+        &self,
+        message_id: &AgentMessageId,
+    ) -> Result<Option<AgentMessageRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                AGENT_MESSAGE_SELECT_BY_ID,
+                params![message_id.as_str()],
+                agent_message_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn agent_messages_after(
+        &self,
+        receiver_instance_id: &AgentInstanceId,
+        sequence: i64,
+    ) -> Result<Vec<AgentMessageRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, team_id, sender_instance_id, receiver_instance_id,
+                        related_task_id, reply_to_message_id, kind, content, sequence,
+                        created_at, consumed_at
+                 FROM agent_messages
+                 WHERE receiver_instance_id = ?1 AND sequence > ?2
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(
+                params![receiver_instance_id.as_str(), sequence],
+                agent_message_from_row,
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn mark_agent_message_consumed(
+        &mut self,
+        message_id: &AgentMessageId,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE agent_messages SET consumed_at = ?2
+                 WHERE id = ?1 AND consumed_at IS NULL",
+                params![message_id.as_str(), now],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn insert_agent_task_dependency(
+        &mut self,
+        dependency: NewAgentTaskDependency<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        ensure_agent_entity_team(
+            &transaction,
+            "agent_tasks",
+            dependency.waiting_task_id.as_str(),
+            dependency.team_id,
+            AgentEntityKind::Task,
+            &database_path,
+        )?;
+        ensure_agent_entity_team(
+            &transaction,
+            "agent_tasks",
+            dependency.dependency_task_id.as_str(),
+            dependency.team_id,
+            AgentEntityKind::Task,
+            &database_path,
+        )?;
+        if dependency.waiting_task_id == dependency.dependency_task_id
+            || agent_dependency_path_exists(
+                &transaction,
+                dependency.team_id,
+                dependency.dependency_task_id,
+                dependency.waiting_task_id,
+                &database_path,
+            )?
+        {
+            return Err(WorkspaceDatabaseError::AgentDomain {
+                source: AgentDomainError::dependency_cycle(dependency.waiting_task_id.clone()),
+            });
+        }
+        let existing_mode = transaction
+            .query_row(
+                "SELECT wait_mode FROM agent_task_dependencies
+                 WHERE team_id = ?1 AND waiting_task_id = ?2 LIMIT 1",
+                params![
+                    dependency.team_id.as_str(),
+                    dependency.waiting_task_id.as_str()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if existing_mode
+            .as_deref()
+            .is_some_and(|mode| mode != dependency.wait_mode.as_str())
+        {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "all dependencies for a waiting task must use the same wait mode"
+                    .to_string(),
+            });
+        }
+        transaction
+            .execute(
+                "INSERT INTO agent_task_dependencies
+                    (team_id, waiting_task_id, dependency_task_id, wait_mode, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    dependency.team_id.as_str(),
+                    dependency.waiting_task_id.as_str(),
+                    dependency.dependency_task_id.as_str(),
+                    dependency.wait_mode.as_str(),
+                    now_timestamp()
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))
+    }
+
+    pub fn agent_task_dependencies(
+        &self,
+        waiting_task_id: &AgentTaskId,
+    ) -> Result<Vec<AgentTaskDependencyRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT team_id, waiting_task_id, dependency_task_id, wait_mode, created_at
+                 FROM agent_task_dependencies
+                 WHERE waiting_task_id = ?1
+                 ORDER BY dependency_task_id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![waiting_task_id.as_str()], |row| {
+                Ok(AgentTaskDependencyRecord {
+                    team_id: agent_id_from_row(row, 0)?,
+                    waiting_task_id: agent_id_from_row(row, 1)?,
+                    dependency_task_id: agent_id_from_row(row, 2)?,
+                    wait_mode: agent_enum_from_row(row, 3)?,
+                    created_at: row.get(4)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn agent_task_dependencies_satisfied(
+        &self,
+        waiting_task_id: &AgentTaskId,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let (total, completed, wait_mode): (i64, i64, Option<String>) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN task.status = 'completed' THEN 1 ELSE 0 END), 0),
+                        MIN(dependency.wait_mode)
+                 FROM agent_task_dependencies AS dependency
+                 JOIN agent_tasks AS task ON task.id = dependency.dependency_task_id
+                 WHERE dependency.waiting_task_id = ?1",
+                params![waiting_task_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if total == 0 {
+            return Ok(true);
+        }
+        Ok(match wait_mode.as_deref() {
+            Some("all") => completed == total,
+            Some("any") => completed > 0,
+            _ => false,
+        })
+    }
+
+    pub fn delete_agent_task_dependencies(
+        &mut self,
+        waiting_task_id: &AgentTaskId,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        self.connection
+            .execute(
+                "DELETE FROM agent_task_dependencies WHERE waiting_task_id = ?1",
+                params![waiting_task_id.as_str()],
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn append_agent_event(
+        &mut self,
+        event: NewAgentEvent<'_>,
+    ) -> Result<AgentEventRecord, WorkspaceDatabaseError> {
+        if event.event_type.trim().is_empty() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "agent event type must not be empty".to_string(),
+            });
+        }
+        let payload_json = redact_agent_json(event.payload_json, "payload_json")?;
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let sequence: i64 = transaction
+            .query_row(
+                "SELECT next_event_sequence FROM agent_teams WHERE id = ?1",
+                params![event.team_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE agent_teams
+                 SET next_event_sequence = next_event_sequence + 1, updated_at = ?2
+                 WHERE id = ?1",
+                params![event.team_id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO agent_events
+                    (team_id, sequence, event_type, instance_id, task_id, attempt_id,
+                     message_id, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    event.team_id.as_str(),
+                    sequence,
+                    event.event_type,
+                    event.instance_id.map(AgentInstanceId::as_str),
+                    event.task_id.map(AgentTaskId::as_str),
+                    event.attempt_id.map(AgentAttemptId::as_str),
+                    event.message_id.map(AgentMessageId::as_str),
+                    payload_json,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(AgentEventRecord {
+            team_id: event.team_id.clone(),
+            sequence,
+            event_type: event.event_type.to_string(),
+            instance_id: event.instance_id.cloned(),
+            task_id: event.task_id.cloned(),
+            attempt_id: event.attempt_id.cloned(),
+            message_id: event.message_id.cloned(),
+            payload_json,
+            created_at: now,
+        })
+    }
+
+    pub fn agent_events_after(
+        &self,
+        team_id: &AgentTeamId,
+        sequence: i64,
+    ) -> Result<Vec<AgentEventRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT team_id, sequence, event_type, instance_id, task_id, attempt_id,
+                        message_id, payload_json, created_at
+                 FROM agent_events
+                 WHERE team_id = ?1 AND sequence > ?2
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![team_id.as_str(), sequence], |row| {
+                Ok(AgentEventRecord {
+                    team_id: agent_id_from_row(row, 0)?,
+                    sequence: row.get(1)?,
+                    event_type: row.get(2)?,
+                    instance_id: optional_agent_id_from_row(row, 3)?,
+                    task_id: optional_agent_id_from_row(row, 4)?,
+                    attempt_id: optional_agent_id_from_row(row, 5)?,
+                    message_id: optional_agent_id_from_row(row, 6)?,
+                    payload_json: row.get(7)?,
+                    created_at: row.get(8)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn insert_agent_context_entry(
+        &mut self,
+        entry: NewAgentContextEntry<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        validate_agent_json(entry.content_json, "content_json")?;
+        self.connection
+            .execute(
+                "INSERT INTO agent_context_entries
+                    (id, team_id, instance_id, generation, sequence, role, content_json,
+                     source_task_id, source_message_id, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    entry.id,
+                    entry.team_id.as_str(),
+                    entry.instance_id.as_str(),
+                    entry.generation,
+                    entry.sequence,
+                    entry.role,
+                    entry.content_json,
+                    entry.source_task_id.map(AgentTaskId::as_str),
+                    entry.source_message_id.map(AgentMessageId::as_str),
+                    now_timestamp()
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(())
+    }
+
+    pub fn agent_context_entries(
+        &self,
+        instance_id: &AgentInstanceId,
+        generation: i64,
+        after_sequence: i64,
+    ) -> Result<Vec<AgentContextEntryRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, team_id, instance_id, generation, sequence, role, content_json,
+                        source_task_id, source_message_id, created_at
+                 FROM agent_context_entries
+                 WHERE instance_id = ?1 AND generation = ?2 AND sequence > ?3
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(
+                params![instance_id.as_str(), generation, after_sequence],
+                |row| {
+                    Ok(AgentContextEntryRecord {
+                        id: row.get(0)?,
+                        team_id: agent_id_from_row(row, 1)?,
+                        instance_id: agent_id_from_row(row, 2)?,
+                        generation: row.get(3)?,
+                        sequence: row.get(4)?,
+                        role: row.get(5)?,
+                        content_json: row.get(6)?,
+                        source_task_id: optional_agent_id_from_row(row, 7)?,
+                        source_message_id: optional_agent_id_from_row(row, 8)?,
+                        created_at: row.get(9)?,
+                    })
+                },
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn insert_agent_context_snapshot(
+        &mut self,
+        snapshot: NewAgentContextSnapshot<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        validate_agent_json(snapshot.entries_json, "entries_json")?;
+        if snapshot
+            .token_count
+            .is_some_and(|token_count| token_count < 0)
+        {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "agent context snapshot token_count must not be negative".to_string(),
+            });
+        }
+        self.connection
+            .execute(
+                "INSERT INTO agent_context_snapshots
+                    (id, team_id, instance_id, generation, sequence, entries_json,
+                     token_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    snapshot.id,
+                    snapshot.team_id.as_str(),
+                    snapshot.instance_id.as_str(),
+                    snapshot.generation,
+                    snapshot.sequence,
+                    snapshot.entries_json,
+                    snapshot.token_count,
+                    now_timestamp()
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(())
+    }
+
+    pub fn latest_agent_context_snapshot(
+        &self,
+        instance_id: &AgentInstanceId,
+        generation: i64,
+    ) -> Result<Option<AgentContextSnapshotRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, team_id, instance_id, generation, sequence, entries_json,
+                        token_count, created_at
+                 FROM agent_context_snapshots
+                 WHERE instance_id = ?1 AND generation = ?2
+                 ORDER BY sequence DESC LIMIT 1",
+                params![instance_id.as_str(), generation],
+                |row| {
+                    Ok(AgentContextSnapshotRecord {
+                        id: row.get(0)?,
+                        team_id: agent_id_from_row(row, 1)?,
+                        instance_id: agent_id_from_row(row, 2)?,
+                        generation: row.get(3)?,
+                        sequence: row.get(4)?,
+                        entries_json: row.get(5)?,
+                        token_count: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn startup_agent_reconciliation(
+        &self,
+    ) -> Result<Vec<AgentReconciliationRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    attempt.id, attempt.team_id, attempt.task_id, attempt.sequence,
+                    attempt.status, attempt.started_at, attempt.completed_at,
+                    attempt.interruption_reason,
+                    task.id, task.team_id, task.owner_instance_id, task.origin_instance_id,
+                    task.parent_task_id, task.sequence, task.status, task.input_json,
+                    task.result_json, task.error_json, task.created_at, task.updated_at,
+                    task.started_at, task.completed_at
+                 FROM agent_attempts AS attempt
+                 JOIN agent_tasks AS task ON task.id = attempt.task_id
+                 WHERE attempt.status IN ('running', 'suspended')
+                    OR task.status IN ('running', 'waiting')
+                 ORDER BY attempt.team_id, task.owner_instance_id, task.sequence",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(AgentReconciliationRecord {
+                    attempt: AgentAttemptRecord {
+                        id: agent_id_from_row(row, 0)?,
+                        team_id: agent_id_from_row(row, 1)?,
+                        task_id: agent_id_from_row(row, 2)?,
+                        sequence: row.get(3)?,
+                        status: agent_enum_from_row(row, 4)?,
+                        started_at: row.get(5)?,
+                        completed_at: row.get(6)?,
+                        interruption_reason: row.get(7)?,
+                    },
+                    task: AgentTaskRecord {
+                        id: agent_id_from_row(row, 8)?,
+                        team_id: agent_id_from_row(row, 9)?,
+                        owner_instance_id: agent_id_from_row(row, 10)?,
+                        origin_instance_id: optional_agent_id_from_row(row, 11)?,
+                        parent_task_id: optional_agent_id_from_row(row, 12)?,
+                        sequence: row.get(13)?,
+                        status: agent_enum_from_row(row, 14)?,
+                        input_json: row.get(15)?,
+                        result_json: row.get(16)?,
+                        error_json: row.get(17)?,
+                        created_at: row.get(18)?,
+                        updated_at: row.get(19)?,
+                        started_at: row.get(20)?,
+                        completed_at: row.get(21)?,
+                    },
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
     }
 
@@ -2829,8 +4081,370 @@ impl WorkspaceDatabase {
     }
 }
 
+const AGENT_TASK_SELECT_BY_ID: &str =
+    "SELECT id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+            sequence, status, input_json, result_json, error_json, created_at, updated_at,
+            started_at, completed_at
+     FROM agent_tasks WHERE id = ?1";
+
+const AGENT_MESSAGE_SELECT_BY_ID: &str =
+    "SELECT id, team_id, sender_instance_id, receiver_instance_id, related_task_id,
+            reply_to_message_id, kind, content, sequence, created_at, consumed_at
+     FROM agent_messages WHERE id = ?1";
+
+fn agent_team_from_row(row: &Row<'_>) -> rusqlite::Result<AgentTeamRecord> {
+    Ok(AgentTeamRecord {
+        id: agent_id_from_row(row, 0)?,
+        chat_id: row.get(1)?,
+        coordinator_instance_id: agent_id_from_row(row, 2)?,
+        status: agent_enum_from_row(row, 3)?,
+        max_concurrent_runs: row.get(4)?,
+        next_event_sequence: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+fn agent_instance_from_row(row: &Row<'_>) -> rusqlite::Result<AgentInstanceRecord> {
+    let revision: i64 = row.get(3)?;
+    let snapshot_json: String = row.get(4)?;
+    Ok(AgentInstanceRecord {
+        id: agent_id_from_row(row, 0)?,
+        team_id: agent_id_from_row(row, 1)?,
+        definition_id: agent_id_from_row(row, 2)?,
+        definition_revision: u64::try_from(revision).map_err(|source| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Integer,
+                Box::new(source),
+            )
+        })?,
+        definition_snapshot: serde_json::from_str(&snapshot_json).map_err(|source| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(source),
+            )
+        })?,
+        role: agent_enum_from_row(row, 5)?,
+        status: agent_enum_from_row(row, 6)?,
+        next_task_sequence: row.get(7)?,
+        next_message_sequence: row.get(8)?,
+        context_generation: row.get(9)?,
+        last_scheduled_at: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+fn agent_task_from_row(row: &Row<'_>) -> rusqlite::Result<AgentTaskRecord> {
+    Ok(AgentTaskRecord {
+        id: agent_id_from_row(row, 0)?,
+        team_id: agent_id_from_row(row, 1)?,
+        owner_instance_id: agent_id_from_row(row, 2)?,
+        origin_instance_id: optional_agent_id_from_row(row, 3)?,
+        parent_task_id: optional_agent_id_from_row(row, 4)?,
+        sequence: row.get(5)?,
+        status: agent_enum_from_row(row, 6)?,
+        input_json: row.get(7)?,
+        result_json: row.get(8)?,
+        error_json: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
+        started_at: row.get(12)?,
+        completed_at: row.get(13)?,
+    })
+}
+
+fn agent_message_from_row(row: &Row<'_>) -> rusqlite::Result<AgentMessageRecord> {
+    Ok(AgentMessageRecord {
+        id: agent_id_from_row(row, 0)?,
+        team_id: agent_id_from_row(row, 1)?,
+        sender_instance_id: optional_agent_id_from_row(row, 2)?,
+        receiver_instance_id: agent_id_from_row(row, 3)?,
+        related_task_id: optional_agent_id_from_row(row, 4)?,
+        reply_to_message_id: optional_agent_id_from_row(row, 5)?,
+        kind: agent_enum_from_row(row, 6)?,
+        content: row.get(7)?,
+        sequence: row.get(8)?,
+        created_at: row.get(9)?,
+        consumed_at: row.get(10)?,
+    })
+}
+
+fn agent_id_from_row<T>(row: &Row<'_>, index: usize) -> rusqlite::Result<T>
+where
+    T: FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    let value: String = row.get(index)?;
+    value.parse().map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(source),
+        )
+    })
+}
+
+fn optional_agent_id_from_row<T>(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<T>>
+where
+    T: FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    row.get::<_, Option<String>>(index)?
+        .map(|value| {
+            value.parse().map_err(|source| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Text,
+                    Box::new(source),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn agent_enum_from_row<T>(row: &Row<'_>, index: usize) -> rusqlite::Result<T>
+where
+    T: DeserializeOwned,
+{
+    let value: String = row.get(index)?;
+    serde_json::from_value(Value::String(value)).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(source),
+        )
+    })
+}
+
+fn ensure_agent_entity_team(
+    transaction: &Transaction<'_>,
+    table: &str,
+    entity_id: &str,
+    expected_team_id: &AgentTeamId,
+    entity_kind: AgentEntityKind,
+    database_path: &Path,
+) -> Result<(), WorkspaceDatabaseError> {
+    let sql = match table {
+        "agent_instances" => "SELECT team_id FROM agent_instances WHERE id = ?1",
+        "agent_tasks" => "SELECT team_id FROM agent_tasks WHERE id = ?1",
+        "agent_messages" => "SELECT team_id FROM agent_messages WHERE id = ?1",
+        _ => {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("unsupported agent entity table '{table}'"),
+            });
+        }
+    };
+    let actual_team_id = transaction
+        .query_row(sql, params![entity_id], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))?
+        .ok_or_else(|| WorkspaceDatabaseError::InvalidAgentRuntimeData {
+            message: format!("{entity_kind} '{entity_id}' was not found"),
+        })?;
+    if actual_team_id != expected_team_id.as_str() {
+        return Err(WorkspaceDatabaseError::AgentDomain {
+            source: AgentDomainError::cross_team_reference(entity_kind, entity_id),
+        });
+    }
+    Ok(())
+}
+
+fn agent_dependency_path_exists(
+    transaction: &Transaction<'_>,
+    team_id: &AgentTeamId,
+    start_task_id: &AgentTaskId,
+    target_task_id: &AgentTaskId,
+    database_path: &Path,
+) -> Result<bool, WorkspaceDatabaseError> {
+    transaction
+        .query_row(
+            "WITH RECURSIVE dependency_path(task_id) AS (
+                SELECT ?2
+                UNION
+                SELECT dependency.dependency_task_id
+                FROM agent_task_dependencies AS dependency
+                JOIN dependency_path AS path
+                  ON dependency.waiting_task_id = path.task_id
+                WHERE dependency.team_id = ?1
+             )
+             SELECT EXISTS(SELECT 1 FROM dependency_path WHERE task_id = ?3)",
+            params![
+                team_id.as_str(),
+                start_task_id.as_str(),
+                target_task_id.as_str()
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))
+}
+
+fn validate_agent_json(value: &str, field: &'static str) -> Result<(), WorkspaceDatabaseError> {
+    serde_json::from_str::<Value>(value)
+        .map(|_| ())
+        .map_err(|source| WorkspaceDatabaseError::AgentRuntimeJson { field, source })
+}
+
+fn redact_agent_json(value: &str, field: &'static str) -> Result<String, WorkspaceDatabaseError> {
+    let mut parsed = serde_json::from_str::<Value>(value)
+        .map_err(|source| WorkspaceDatabaseError::AgentRuntimeJson { field, source })?;
+    redact_json_value(&mut parsed);
+    serde_json::to_string(&parsed)
+        .map_err(|source| WorkspaceDatabaseError::AgentRuntimeJson { field, source })
+}
+
+fn validate_agent_definition_snapshot(value: &str) -> Result<(), WorkspaceDatabaseError> {
+    let parsed = serde_json::from_str::<Value>(value).map_err(|source| {
+        WorkspaceDatabaseError::AgentRuntimeJson {
+            field: "definition_snapshot_json",
+            source,
+        }
+    })?;
+    if json_contains_secret_key(&parsed) {
+        return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+            message: "agent definition snapshot contains a sensitive field".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_llm_agent_references(
+    connection: &Connection,
+    database_path: &Path,
+    request: &NewLlmRequest<'_>,
+) -> Result<(), WorkspaceDatabaseError> {
+    let has_agent_reference = request.agent_team_id.is_some()
+        || request.agent_instance_id.is_some()
+        || request.agent_task_id.is_some()
+        || request.agent_attempt_id.is_some();
+    if !has_agent_reference {
+        return Ok(());
+    }
+    let team_id =
+        request
+            .agent_team_id
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message:
+                    "agent_team_id is required when an LLM request has Agent runtime references"
+                        .to_string(),
+            })?;
+    let team_chat_id = connection
+        .query_row(
+            "SELECT chat_id FROM agent_teams WHERE id = ?1",
+            params![team_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))?
+        .ok_or_else(|| WorkspaceDatabaseError::InvalidAgentRuntimeData {
+            message: format!("agent team '{team_id}' was not found"),
+        })?;
+    if request
+        .chat_id
+        .is_some_and(|chat_id| chat_id != team_chat_id)
+    {
+        return Err(WorkspaceDatabaseError::AgentDomain {
+            source: AgentDomainError::cross_team_reference(
+                AgentEntityKind::Team,
+                team_id.to_string(),
+            ),
+        });
+    }
+
+    for (table, id, kind) in [
+        (
+            "agent_instances",
+            request.agent_instance_id.map(AgentInstanceId::as_str),
+            AgentEntityKind::Instance,
+        ),
+        (
+            "agent_tasks",
+            request.agent_task_id.map(AgentTaskId::as_str),
+            AgentEntityKind::Task,
+        ),
+        (
+            "agent_attempts",
+            request.agent_attempt_id.map(AgentAttemptId::as_str),
+            AgentEntityKind::Attempt,
+        ),
+    ] {
+        let Some(id) = id else { continue };
+        let sql = match table {
+            "agent_instances" => "SELECT team_id FROM agent_instances WHERE id = ?1",
+            "agent_tasks" => "SELECT team_id FROM agent_tasks WHERE id = ?1",
+            "agent_attempts" => "SELECT team_id FROM agent_attempts WHERE id = ?1",
+            _ => unreachable!(),
+        };
+        let actual_team_id = connection
+            .query_row(sql, params![id], |row| row.get::<_, String>(0))
+            .optional()
+            .map_err(|source| sqlite_error(database_path, source))?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("{kind} '{id}' was not found"),
+            })?;
+        if actual_team_id != team_id.as_str() {
+            return Err(WorkspaceDatabaseError::AgentDomain {
+                source: AgentDomainError::cross_team_reference(kind, id),
+            });
+        }
+    }
+    if let (Some(instance_id), Some(task_id)) = (request.agent_instance_id, request.agent_task_id) {
+        let owner_instance_id: String = connection
+            .query_row(
+                "SELECT owner_instance_id FROM agent_tasks WHERE id = ?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        if owner_instance_id != instance_id.as_str() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "LLM request Agent task does not belong to the referenced instance"
+                    .to_string(),
+            });
+        }
+    }
+    if let (Some(task_id), Some(attempt_id)) = (request.agent_task_id, request.agent_attempt_id) {
+        let attempt_task_id: String = connection
+            .query_row(
+                "SELECT task_id FROM agent_attempts WHERE id = ?1",
+                params![attempt_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        if attempt_task_id != task_id.as_str() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "LLM request Agent attempt does not belong to the referenced task"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn json_contains_secret_key(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| is_secret_audit_key(key) || json_contains_secret_key(value)),
+        Value::Array(items) => items.iter().any(json_contains_secret_key),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
 #[derive(Debug)]
 pub enum WorkspaceDatabaseError {
+    AgentDomain {
+        source: AgentDomainError,
+    },
+    AgentRuntimeJson {
+        field: &'static str,
+        source: serde_json::Error,
+    },
+    InvalidAgentRuntimeData {
+        message: String,
+    },
     InvalidCodeGraphInput {
         message: String,
     },
@@ -2892,6 +4506,13 @@ pub enum WorkspaceDatabaseError {
 impl fmt::Display for WorkspaceDatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AgentDomain { source } => write!(formatter, "agent domain error: {source}"),
+            Self::AgentRuntimeJson { field, source } => {
+                write!(formatter, "invalid Agent runtime JSON in {field}: {source}")
+            }
+            Self::InvalidAgentRuntimeData { message } => {
+                write!(formatter, "invalid Agent runtime data: {message}")
+            }
             Self::InvalidCodeGraphInput { message } => {
                 write!(formatter, "invalid code graph index data: {message}")
             }
@@ -2960,11 +4581,14 @@ impl fmt::Display for WorkspaceDatabaseError {
 impl std::error::Error for WorkspaceDatabaseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::AgentDomain { source } => Some(source),
+            Self::AgentRuntimeJson { source, .. } => Some(source),
             Self::InvalidAuditJson { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::Sqlite { source, .. } => Some(source),
             Self::TodoGraphJson { source } => Some(source),
-            Self::InvalidAuditTokens { .. }
+            Self::InvalidAgentRuntimeData { .. }
+            | Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
             | Self::InvalidMessageMetadata { .. }
             | Self::InvalidToolCall { .. }

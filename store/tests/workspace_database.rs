@@ -1,13 +1,20 @@
 use std::{fs, thread, time::Duration};
 
+use foco_agent::{
+    AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentInstanceId, AgentMessageId,
+    AgentMessageKind, AgentPermissions, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
+    AgentTaskWaitMode, AgentTeamId,
+};
 use foco_store::{
-    config::WorkspaceConfig,
+    config::{AgentDefinitionSettings, AgentModelOptions, WorkspaceConfig},
     memory::{
         MemoryDatabase, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact,
         NewMemorySource,
     },
     workspace::{
-        LlmRequestAuditFilters, LlmRequestRecord, NewCodeGraphEdge, NewCodeGraphFileIndex,
+        AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord, NewAgentContextEntry,
+        NewAgentContextSnapshot, NewAgentEvent, NewAgentMessage, NewAgentTask,
+        NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
         NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
@@ -64,6 +71,15 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "memory_profiles",
         "memory_extraction_jobs",
         "prompt_context_injections",
+        "agent_teams",
+        "agent_instances",
+        "agent_tasks",
+        "agent_task_dependencies",
+        "agent_messages",
+        "agent_attempts",
+        "agent_events",
+        "agent_context_entries",
+        "agent_context_snapshots",
     ] {
         assert!(
             table_exists(&connection, table),
@@ -211,6 +227,14 @@ fn migrates_v7_task_graphs_table_to_todo_graphs() {
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX task_graphs_updated_at_idx ON task_graphs (updated_at);
+            CREATE TABLE llm_requests (
+                id TEXT PRIMARY KEY NOT NULL,
+                chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                request_started_at TEXT NOT NULL,
+                final_state TEXT NOT NULL
+            );
             INSERT INTO chats (id, title, created_at, updated_at)
                 VALUES ('chat-1', 'Legacy todo graph', '2026-06-10T00:00:00Z', '2026-06-10T00:00:00Z');
             PRAGMA user_version = 7;",
@@ -654,6 +678,10 @@ fn repository_helpers_round_trip_core_records() {
             id: "request-1",
             workspace_id: "workspace-1",
             chat_id: Some("chat-1"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
             provider_id: "openai",
             model_id: "gpt-test",
             request_started_at: "2026-06-03T10:00:00.000Z",
@@ -788,6 +816,10 @@ fn repository_helpers_delete_chat_cascades_chat_state_and_preserves_audit() {
             id: "request-1",
             workspace_id: "workspace-1",
             chat_id: Some("chat-1"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
             provider_id: "openai",
             model_id: "gpt-test",
             request_started_at: "2026-06-03T10:00:00.000Z",
@@ -1448,6 +1480,10 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             id: "request-1",
             workspace_id: "workspace-1",
             chat_id: Some("chat-1"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
             provider_id: "openai-responses",
             model_id: "gpt-audit",
             request_started_at: "2026-06-03T10:00:00.000Z",
@@ -1567,6 +1603,10 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             id: "request-2",
             workspace_id: "workspace-1",
             chat_id: None,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
             provider_id: "openai-chat",
             model_id: "gpt-other",
             request_started_at: "2026-06-03T11:00:00.000Z",
@@ -1713,6 +1753,660 @@ fn stores_prompt_context_injections_for_chat_replay() {
     assert_eq!(injections[1].kind, "turn_memory");
     assert_eq!(injections[1].sequence, Some(0));
     assert_eq!(injections[1].memory_keys_json, r#"["chat:fact-2"]"#);
+}
+
+#[test]
+fn migrates_v9_without_creating_teams_for_existing_chats() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v9 database");
+    connection
+        .execute_batch(
+            "CREATE TABLE chats (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE llm_requests (
+                id TEXT PRIMARY KEY NOT NULL,
+                chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                request_started_at TEXT NOT NULL,
+                final_state TEXT NOT NULL
+             );
+             INSERT INTO chats (id, title, created_at, updated_at)
+                VALUES ('chat-existing', 'Existing', '2026-06-19T00:00:00Z', '2026-06-19T00:00:00Z');
+             PRAGMA user_version = 9;",
+        )
+        .expect("v9 schema");
+    for index in 0..500 {
+        connection
+            .execute(
+                "INSERT INTO chats (id, title, created_at, updated_at)
+                 VALUES (?1, ?2, '2026-06-19T00:00:00Z', '2026-06-19T00:00:00Z')",
+                params![format!("chat-bulk-{index}"), format!("Bulk {index}")],
+            )
+            .expect("bulk chat insert");
+    }
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let connection = Connection::open(database.database_path()).expect("open migrated database");
+    assert_eq!(table_count(&connection, "agent_teams"), 0);
+    assert_eq!(table_count(&connection, "chats"), 501);
+    let backups = fs::read_dir(workspace.path().join(".foco").join("backups"))
+        .expect("backup directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("backup entries");
+    assert_eq!(backups.len(), 1);
+}
+
+#[test]
+fn failed_agent_schema_migration_rolls_back_and_preserves_backup() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v9 database");
+    connection
+        .execute_batch(
+            "CREATE TABLE chats (id TEXT PRIMARY KEY NOT NULL);
+             CREATE TABLE llm_requests (
+                id TEXT PRIMARY KEY NOT NULL,
+                request_started_at TEXT NOT NULL
+             );
+             CREATE TABLE agent_teams (sentinel TEXT NOT NULL);
+             INSERT INTO agent_teams (sentinel) VALUES ('preserve-me');
+             PRAGMA user_version = 9;",
+        )
+        .expect("conflicting v9 schema");
+    drop(connection);
+
+    assert!(
+        WorkspaceDatabase::open_or_create(workspace.path()).is_err(),
+        "migration must fail"
+    );
+    let connection = Connection::open(&database_path).expect("preserved database");
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+            .expect("schema version"),
+        9
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT sentinel FROM agent_teams", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("sentinel row"),
+        "preserve-me"
+    );
+    assert!(!table_exists(&connection, "agent_instances"));
+    let backups = fs::read_dir(workspace.path().join(".foco").join("backups"))
+        .expect("backup directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("backup entries");
+    assert_eq!(backups.len(), 1);
+}
+
+#[test]
+fn agent_task_enqueue_sequences_are_unique_and_strictly_increasing() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let workspace_path = workspace.path().to_path_buf();
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_path).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-sequence", "seq");
+
+    let workers = (0..8)
+        .map(|index| {
+            let workspace_path = workspace_path.clone();
+            let team_id = team_id.clone();
+            let instance_id = instance_id.clone();
+            thread::spawn(move || {
+                let mut database =
+                    WorkspaceDatabase::open_or_create(workspace_path).expect("worker database");
+                let task_id =
+                    AgentTaskId::new(format!("agent-task-sequence-{index}")).expect("task id");
+                database
+                    .enqueue_agent_task(NewAgentTask {
+                        id: &task_id,
+                        team_id: &team_id,
+                        owner_instance_id: &instance_id,
+                        origin_instance_id: None,
+                        parent_task_id: None,
+                        input_json: "{}",
+                    })
+                    .expect("enqueue")
+                    .sequence
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut sequences = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("worker"))
+        .collect::<Vec<_>>();
+    sequences.sort_unstable();
+    assert_eq!(sequences, (0..8).collect::<Vec<_>>());
+}
+
+#[test]
+fn two_schedulers_cannot_claim_the_same_agent_task() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let workspace_path = workspace.path().to_path_buf();
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_path).expect("database");
+    let (team_id, instance_id) = create_test_agent_team(&mut database, "chat-agent-claim", "claim");
+    let task_id = AgentTaskId::new("agent-task-claim").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue");
+
+    let schedulers = (0..2)
+        .map(|index| {
+            let workspace_path = workspace_path.clone();
+            let team_id = team_id.clone();
+            let task_id = task_id.clone();
+            thread::spawn(move || {
+                let mut database =
+                    WorkspaceDatabase::open_or_create(workspace_path).expect("scheduler database");
+                let attempt_id = AgentAttemptId::new(format!("agent-attempt-claim-{index}"))
+                    .expect("attempt id");
+                database
+                    .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+                    .expect("claim")
+                    .is_some()
+            })
+        })
+        .collect::<Vec<_>>();
+    let claims = schedulers
+        .into_iter()
+        .map(|scheduler| scheduler.join().expect("scheduler"))
+        .filter(|claimed| *claimed)
+        .count();
+    assert_eq!(claims, 1);
+    assert_eq!(
+        database
+            .startup_agent_reconciliation()
+            .expect("reconcile")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn agent_task_state_updates_are_conditional_and_attempts_are_durable() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) = create_test_agent_team(&mut database, "chat-agent-state", "state");
+    let task_id = AgentTaskId::new("agent-task-state").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue");
+    let first_attempt = AgentAttemptId::new("agent-attempt-state-first").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &first_attempt)
+        .expect("claim")
+        .expect("claimed task");
+    assert!(
+        !database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Queued,
+                transition: AgentTaskTransition::Cancel,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("stale conditional update")
+    );
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Wait,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("wait")
+    );
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        AgentTaskStatus::Waiting
+    );
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Waiting,
+                transition: AgentTaskTransition::Resume,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("resume")
+    );
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Complete,
+                result_json: Some(r#"{"ok":true}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete")
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&task_id)
+            .expect("attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Completed
+    );
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Completed,
+                transition: AgentTaskTransition::Retry,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .is_err(),
+        "completed tasks are not retryable by the frozen state machine"
+    );
+    assert!(
+        database
+            .startup_agent_reconciliation()
+            .expect("reconcile")
+            .is_empty()
+    );
+}
+
+#[test]
+fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (first_team, first_instance) =
+        create_test_agent_team(&mut database, "chat-agent-first", "first");
+    let (second_team, second_instance) =
+        create_test_agent_team(&mut database, "chat-agent-second", "second");
+    let first_task = AgentTaskId::new("agent-task-first").expect("first task");
+    let second_task = AgentTaskId::new("agent-task-second").expect("second task");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &first_task,
+            team_id: &first_team,
+            owner_instance_id: &first_instance,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("first task enqueue");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &second_task,
+            team_id: &second_team,
+            owner_instance_id: &second_instance,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("second task enqueue");
+
+    let cross_parent_error = database
+        .enqueue_agent_task(NewAgentTask {
+            id: &AgentTaskId::new("agent-task-cross-parent").expect("cross-parent task id"),
+            team_id: &first_team,
+            owner_instance_id: &first_instance,
+            origin_instance_id: None,
+            parent_task_id: Some(&second_task),
+            input_json: "{}",
+        })
+        .expect_err("cross-team parent must fail");
+    assert!(matches!(
+        cross_parent_error,
+        WorkspaceDatabaseError::AgentDomain { ref source }
+            if source.code() == AgentDomainErrorCode::CrossTeamReference
+    ));
+    let cross_dependency_error = database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &first_team,
+            waiting_task_id: &first_task,
+            dependency_task_id: &second_task,
+            wait_mode: AgentTaskWaitMode::All,
+        })
+        .expect_err("cross-team dependency must fail");
+    assert!(matches!(
+        cross_dependency_error,
+        WorkspaceDatabaseError::AgentDomain { ref source }
+            if source.code() == AgentDomainErrorCode::CrossTeamReference
+    ));
+
+    let cross_team_error = database
+        .insert_agent_message(NewAgentMessage {
+            id: &AgentMessageId::new("agent-message-cross-team").expect("message id"),
+            team_id: &first_team,
+            sender_instance_id: Some(&first_instance),
+            receiver_instance_id: &second_instance,
+            related_task_id: None,
+            reply_to_message_id: None,
+            kind: AgentMessageKind::Information,
+            content: "cross-team",
+        })
+        .expect_err("cross-team receiver must fail");
+    assert!(matches!(
+        cross_team_error,
+        WorkspaceDatabaseError::AgentDomain { ref source }
+            if source.code() == AgentDomainErrorCode::CrossTeamReference
+    ));
+
+    let third_task = AgentTaskId::new("agent-task-third").expect("third task");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &third_task,
+            team_id: &first_team,
+            owner_instance_id: &first_instance,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("third task enqueue");
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &first_team,
+            waiting_task_id: &first_task,
+            dependency_task_id: &third_task,
+            wait_mode: AgentTaskWaitMode::All,
+        })
+        .expect("first dependency");
+    let cycle_error = database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &first_team,
+            waiting_task_id: &third_task,
+            dependency_task_id: &first_task,
+            wait_mode: AgentTaskWaitMode::All,
+        })
+        .expect_err("dependency cycle must fail");
+    assert!(matches!(
+        cycle_error,
+        WorkspaceDatabaseError::AgentDomain { ref source }
+            if source.code() == AgentDomainErrorCode::DependencyCycle
+    ));
+    assert!(
+        !database
+            .agent_task_dependencies_satisfied(&first_task)
+            .expect("dependency state")
+    );
+}
+
+#[test]
+fn agent_runtime_state_round_trips_and_chat_delete_preserves_llm_audit() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-runtime", "runtime");
+    let task_id = AgentTaskId::new("agent-task-runtime").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"goal":"verify persistence"}"#,
+        })
+        .expect("enqueue");
+    assert_eq!(
+        database
+            .agent_team_for_chat("chat-agent-runtime")
+            .expect("team for chat")
+            .expect("team")
+            .id,
+        team_id
+    );
+    assert_eq!(
+        database
+            .agent_instances_for_team(&team_id)
+            .expect("instances")
+            .len(),
+        1
+    );
+    assert_eq!(
+        database
+            .agent_tasks_for_team(&team_id)
+            .expect("tasks")
+            .len(),
+        1
+    );
+    assert_eq!(
+        database.runnable_agent_tasks(10).expect("runnable").len(),
+        1
+    );
+    let attempt_id = AgentAttemptId::new("agent-attempt-runtime").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .expect("claim")
+        .expect("runnable task");
+    assert_eq!(
+        database
+            .startup_agent_reconciliation()
+            .expect("reconcile")
+            .len(),
+        1
+    );
+
+    database
+        .insert_agent_context_entry(NewAgentContextEntry {
+            id: "context-entry-1",
+            team_id: &team_id,
+            instance_id: &instance_id,
+            generation: 0,
+            sequence: 0,
+            role: "assistant",
+            content_json: r#"{"text":"private"}"#,
+            source_task_id: Some(&task_id),
+            source_message_id: None,
+        })
+        .expect("context entry");
+    database
+        .insert_agent_context_snapshot(NewAgentContextSnapshot {
+            id: "context-snapshot-1",
+            team_id: &team_id,
+            instance_id: &instance_id,
+            generation: 0,
+            sequence: 0,
+            entries_json: r#"[{"text":"private"}]"#,
+            token_count: Some(2),
+        })
+        .expect("context snapshot");
+    assert_eq!(
+        database
+            .agent_context_entries(&instance_id, 0, -1)
+            .expect("context entries")
+            .len(),
+        1
+    );
+    assert!(
+        database
+            .latest_agent_context_snapshot(&instance_id, 0)
+            .expect("latest snapshot")
+            .is_some()
+    );
+
+    let message_id = AgentMessageId::new("agent-message-runtime").expect("message id");
+    let message = database
+        .insert_agent_message(NewAgentMessage {
+            id: &message_id,
+            team_id: &team_id,
+            sender_instance_id: Some(&instance_id),
+            receiver_instance_id: &instance_id,
+            related_task_id: Some(&task_id),
+            reply_to_message_id: None,
+            kind: AgentMessageKind::Information,
+            content: "persisted message",
+        })
+        .expect("message");
+    assert_eq!(message.sequence, 0);
+    assert!(
+        database
+            .mark_agent_message_consumed(&message_id)
+            .expect("consume message")
+    );
+
+    let event = database
+        .append_agent_event(NewAgentEvent {
+            team_id: &team_id,
+            event_type: "task_started",
+            instance_id: Some(&instance_id),
+            task_id: Some(&task_id),
+            attempt_id: Some(&attempt_id),
+            message_id: Some(&message_id),
+            payload_json: r#"{"authorization":"Bearer secret","safe":true}"#,
+        })
+        .expect("event");
+    assert!(event.payload_json.contains("[REDACTED]"));
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-agent-runtime",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-agent-runtime"),
+            agent_team_id: Some(&team_id),
+            agent_instance_id: Some(&instance_id),
+            agent_task_id: Some(&task_id),
+            agent_attempt_id: Some(&attempt_id),
+            provider_id: "openai",
+            model_id: "gpt-test",
+            request_started_at: "2026-06-19T00:00:00Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("llm request");
+
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Interrupt,
+            result_json: None,
+            error_json: Some(r#"{"code":"backend_restart"}"#),
+            interruption_reason: Some("backend_restart"),
+        })
+        .expect("interrupt task");
+    assert!(
+        database
+            .startup_agent_reconciliation()
+            .expect("reconcile after interrupt")
+            .is_empty()
+    );
+
+    assert!(
+        database
+            .delete_chat("chat-agent-runtime")
+            .expect("delete chat")
+    );
+    let connection = Connection::open(database.database_path()).expect("database connection");
+    for table in [
+        "agent_teams",
+        "agent_instances",
+        "agent_tasks",
+        "agent_messages",
+        "agent_attempts",
+        "agent_events",
+        "agent_context_entries",
+        "agent_context_snapshots",
+    ] {
+        assert_eq!(table_count(&connection, table), 0, "{table} should cascade");
+    }
+    let request = database
+        .llm_request("request-agent-runtime")
+        .expect("llm request read")
+        .expect("llm request preserved");
+    assert_eq!(request.chat_id, None);
+    assert_eq!(request.agent_team_id, None);
+    assert_eq!(request.agent_instance_id, None);
+    assert_eq!(request.agent_task_id, None);
+    assert_eq!(request.agent_attempt_id, None);
+}
+
+fn create_test_agent_team(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    suffix: &str,
+) -> (AgentTeamId, AgentInstanceId) {
+    database
+        .insert_chat(chat_id, &format!("Agent team {suffix}"))
+        .expect("chat insert");
+    let team_id = AgentTeamId::new(format!("agent-team-{suffix}")).expect("team id");
+    let instance_id =
+        AgentInstanceId::new(format!("agent-instance-{suffix}")).expect("instance id");
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new(format!("agent-definition-{suffix}")).expect("definition id"),
+        revision: 1,
+        name: format!("Agent {suffix}"),
+        description: String::new(),
+        provider_id: "provider-test".to_string(),
+        model_id: "model-test".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Be precise.".to_string(),
+        allowed_tools: vec!["read_file".to_string()],
+        max_instances: 1,
+        permissions: AgentPermissions::default(),
+    };
+    database
+        .create_agent_team(NewAgentTeam {
+            id: &team_id,
+            chat_id,
+            coordinator_instance_id: &instance_id,
+            coordinator_definition: &definition,
+            max_concurrent_runs: 1,
+        })
+        .expect("agent team create");
+    (team_id, instance_id)
 }
 
 fn assert_json_eq(actual: &str, expected: &str) {

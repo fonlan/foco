@@ -168,6 +168,62 @@ pub enum AgentRole {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AgentTeamStatus {
+    Active,
+    Paused,
+    Draining,
+    Stopped,
+    Failed,
+}
+
+impl AgentTeamStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Paused => "paused",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskWaitMode {
+    All,
+    Any,
+}
+
+impl AgentTaskWaitMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessageKind {
+    Information,
+    Request,
+    Response,
+}
+
+impl AgentMessageKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Information => "information",
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentInstanceStatus {
     Idle,
     Running,
@@ -179,6 +235,18 @@ pub enum AgentInstanceStatus {
 }
 
 impl AgentInstanceStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Paused => "paused",
+            Self::Draining => "draining",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+
     pub fn transition_to(self, target: Self) -> Result<Self, AgentDomainError> {
         let allowed = matches!(
             (self, target),
@@ -249,6 +317,18 @@ pub enum AgentTaskTransition {
 }
 
 impl AgentTaskStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
     pub fn apply(self, transition: AgentTaskTransition) -> Result<Self, AgentDomainError> {
         let target = match (self, transition) {
             (Self::Queued, AgentTaskTransition::Start) => Self::Running,
@@ -311,6 +391,17 @@ pub enum AgentAttemptTransition {
 }
 
 impl AgentAttemptStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Suspended => "suspended",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
     pub fn apply(self, transition: AgentAttemptTransition) -> Result<Self, AgentDomainError> {
         let target = match (self, transition) {
             (Self::Running, AgentAttemptTransition::Suspend) => Self::Suspended,
