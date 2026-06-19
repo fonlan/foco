@@ -497,27 +497,6 @@ impl TeamWorkload {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentRuntimeDeleteAction {
-    Cascade,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LlmRequestDeleteAction {
-    SetChatAndAgentReferencesNull,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChatAgentDeletionPolicy {
-    pub runtime: AgentRuntimeDeleteAction,
-    pub llm_requests: LlmRequestDeleteAction,
-}
-
-pub const CHAT_AGENT_DELETION_POLICY: ChatAgentDeletionPolicy = ChatAgentDeletionPolicy {
-    runtime: AgentRuntimeDeleteAction::Cascade,
-    llm_requests: LlmRequestDeleteAction::SetChatAndAgentReferencesNull,
-};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentDomainErrorCode {
@@ -2088,13 +2067,6 @@ mod tests {
         assert_eq!(busy.code(), AgentDomainErrorCode::TeamBusy);
         assert_eq!(busy.diagnostics().queued_tasks, Some(1));
 
-        assert_eq!(
-            CHAT_AGENT_DELETION_POLICY,
-            ChatAgentDeletionPolicy {
-                runtime: AgentRuntimeDeleteAction::Cascade,
-                llm_requests: LlmRequestDeleteAction::SetChatAndAgentReferencesNull,
-            }
-        );
     }
 
     #[test]

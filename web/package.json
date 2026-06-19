@@ -14,10 +14,10 @@
     "@xterm/xterm": "^6.0.0",
     "lucide-react": "latest",
     "mermaid": "^11.15.0",
+    "monaco-editor": "^0.55.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
-    "monaco-editor": "^0.55.1",
     "recharts": "^3.8.1",
     "remark-gfm": "^4.0.1"
   },
@@ -32,7 +32,6 @@
     "@vitejs/plugin-react": "latest",
     "jsdom": "^29.1.1",
     "tailwindcss": "latest",
-    "type-fest": "^4.41.0",
     "typescript": "latest",
     "vite": "latest",
     "vitest": "^4.1.8"

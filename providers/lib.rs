@@ -65,8 +65,6 @@ pub struct ProviderRequestOverride {
     pub value: Value,
 }
 
-impl Eq for ProviderRequestOverride {}
-
 impl ProviderRequestOverride {
     pub fn validate(&self) -> Result<(), ProviderConfigError> {
         self.normalized_target()?;
@@ -137,7 +135,7 @@ impl ProviderRequestOverride {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProviderConnectionConfig {
     pub kind: ProviderKind,
     pub base_url: Option<String>,

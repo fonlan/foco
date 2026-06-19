@@ -17426,11 +17426,6 @@ function workspaceRenamedFilePath(path: string, newName: string) {
     : `${path.slice(0, separatorIndex + 1)}${newName}`;
 }
 
-function workspaceParentFilePath(path: string) {
-  const separatorIndex = path.lastIndexOf("/");
-  return separatorIndex < 0 ? "" : path.slice(0, separatorIndex);
-}
-
 function replaceWorkspaceFileNodeChildren(
   node: WorkspaceFileTreeNode,
   path: string,
@@ -18837,44 +18832,6 @@ async function fileToComposerAttachment(file: File): Promise<ComposerAttachment>
   };
 }
 
-function nativeSelectedFileToComposerAttachment(
-  file: NativeSelectedFile,
-): ComposerAttachment {
-  const name = file.name.trim();
-  const contentType = file.contentType.trim();
-  const path = file.path.trim();
-
-  if (!name) {
-    throw new Error("attachment name must not be empty");
-  }
-
-  if (!contentType) {
-    throw new Error(`attachment ${name} content type is missing`);
-  }
-
-  if (!path) {
-    throw new Error(`attachment ${name} path is missing`);
-  }
-
-  const isImage = contentType.startsWith("image/");
-  const contentBase64 = isImage ? file.contentBase64?.trim() : undefined;
-  if (isImage && !contentBase64) {
-    throw new Error(`attachment ${name} image content is missing`);
-  }
-
-  return {
-    id: localChatAttachmentId(),
-    name,
-    contentBase64,
-    contentType,
-    path: isImage ? undefined : path,
-    previewDataUrl: isImage
-      ? `data:${contentType};base64,${contentBase64}`
-      : null,
-    sizeBytes: file.sizeBytes,
-  };
-}
-
 function fileContentType(file: File) {
   const explicitType = file.type.trim();
   if (explicitType) {
@@ -19749,16 +19706,6 @@ function normalizedJsonValue(value: JsonValue): JsonValue {
   return current;
 }
 
-function formatLimit(value: number | null, label: string, language: AppLanguageId = "en") {
-  return value === null
-    ? `${label} missing`
-    : `${label} ${formatNumber(value, language)}`;
-}
-
-
-
-
-
 function emptyAiStatisticsSummary(): AiStatisticsSummary {
   return {
     averageLatencyMs: null,
@@ -20561,16 +20508,6 @@ function formatNullableLatencySeconds(
 function formatLatencySeconds(value: number, language: AppLanguageId = "en") {
   return `${new Intl.NumberFormat(language, {
     maximumFractionDigits: 0,
-  }).format(value / 1000)} s`;
-}
-
-function formatDurationMs(value: number, language: AppLanguageId = "en") {
-  if (value < 1000) {
-    return `${formatNumber(value, language)} ms`;
-  }
-
-  return `${new Intl.NumberFormat(language, {
-    maximumFractionDigits: 1,
   }).format(value / 1000)} s`;
 }
 

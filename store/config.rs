@@ -145,7 +145,7 @@ fn user_profile_env_name() -> &'static str {
     if cfg!(windows) { "USERPROFILE" } else { "HOME" }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LoadedGlobalConfig {
     pub config: GlobalConfig,
     pub paths: FocoPaths,
@@ -288,7 +288,7 @@ pub fn save_global_config(
     Ok(())
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlobalConfig {
     pub schema_version: u32,
@@ -932,7 +932,7 @@ impl Default for WebServerSettings {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSettings {
     pub id: String,
