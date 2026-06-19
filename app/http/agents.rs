@@ -46,12 +46,15 @@ pub(crate) struct AgentRuntimeActionRequest {
 enum AgentTaskAction {
     Cancel,
     Retry,
+    Transfer,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AgentTaskActionRequest {
     action: AgentTaskAction,
+    target_instance_id: Option<AgentInstanceId>,
+    cascade: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -346,6 +349,61 @@ pub(crate) async fn agent_task_action(
         })?;
 
     match request.action {
+        AgentTaskAction::Transfer if task.status == AgentTaskStatus::Queued => {
+            let target_instance_id = request.target_instance_id.as_ref().ok_or_else(|| {
+                ApiError::bad_request("targetInstanceId is required for task transfer")
+            })?;
+            let target_instance = database
+                .agent_instance(target_instance_id)
+                .map_err(ApiError::from_workspace_error)?
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "Agent target instance '{target_instance_id}' was not found"
+                    ))
+                })?;
+            if target_instance.team_id != task.team_id {
+                return Err(ApiError::bad_request(format!(
+                    "Agent target instance '{target_instance_id}' does not belong to team '{}'",
+                    task.team_id
+                )));
+            }
+            let transferred = database
+                .transfer_queued_agent_task_with_limits(
+                    &task.team_id,
+                    &task.id,
+                    &target_instance.id,
+                    AGENT_MAX_QUEUED_TASKS_PER_TEAM,
+                    AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+                    AGENT_MAX_QUEUED_TASKS_PER_CHAT,
+                )
+                .map_err(ApiError::from_workspace_error)?
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "Agent task '{}' changed state before transfer",
+                        task.id
+                    ))
+                })?;
+            insert_agent_event(
+                &mut database,
+                &task.team_id,
+                "task_transferred",
+                Some(&task.owner_instance_id),
+                Some(&task.id),
+                None,
+                json!({
+                    "previousOwnerInstanceId": task.owner_instance_id,
+                    "targetInstanceId": transferred.owner_instance_id,
+                    "sequence": transferred.sequence,
+                }),
+            )?;
+        }
+        AgentTaskAction::Transfer => {
+            return Err(ApiError::bad_request(format!(
+                "Agent task '{}' cannot be transferred while {}",
+                task.id,
+                task.status.as_str()
+            )));
+        }
         AgentTaskAction::Cancel if task.status == AgentTaskStatus::Running => {
             state
                 .active_chat_runs
@@ -366,6 +424,39 @@ pub(crate) async fn agent_task_action(
                 AgentTaskStatus::Queued | AgentTaskStatus::Waiting
             ) =>
         {
+            let cascade = if task.status == AgentTaskStatus::Waiting {
+                request.cascade.ok_or_else(|| {
+                    ApiError::bad_request(
+                        "cascade is required when cancelling a waiting Agent task",
+                    )
+                })?
+            } else {
+                request.cascade.unwrap_or(false)
+            };
+            let queued_children = if cascade {
+                let children = database
+                    .agent_tasks_for_parent(&task.team_id, &task.id)
+                    .map_err(ApiError::from_workspace_error)?;
+                if let Some(active_child) = children.iter().find(|child| {
+                    matches!(
+                        child.status,
+                        AgentTaskStatus::Running | AgentTaskStatus::Waiting
+                    )
+                }) {
+                    return Err(ApiError::bad_request(format!(
+                        "Agent task '{}' cannot cascade-cancel active child task '{}' while {}",
+                        task.id,
+                        active_child.id,
+                        active_child.status.as_str()
+                    )));
+                }
+                children
+                    .into_iter()
+                    .filter(|child| child.status == AgentTaskStatus::Queued)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
             database
                 .update_agent_task_state(AgentTaskStateUpdate {
                     team_id: &task.team_id,
@@ -377,6 +468,26 @@ pub(crate) async fn agent_task_action(
                     interruption_reason: None,
                 })
                 .map_err(ApiError::from_workspace_error)?;
+            for child in queued_children {
+                if database
+                    .cancel_queued_agent_task(
+                        &child.team_id,
+                        &child.id,
+                        r#"{"message":"cancelled by parent cascade"}"#,
+                    )
+                    .map_err(ApiError::from_workspace_error)?
+                {
+                    insert_agent_event(
+                        &mut database,
+                        &child.team_id,
+                        "task_cancelled",
+                        Some(&child.owner_instance_id),
+                        Some(&child.id),
+                        None,
+                        json!({ "reason": "parent_cascade", "parentTaskId": task.id }),
+                    )?;
+                }
+            }
             insert_agent_event(
                 &mut database,
                 &task.team_id,
@@ -384,7 +495,7 @@ pub(crate) async fn agent_task_action(
                 Some(&task.owner_instance_id),
                 Some(&task.id),
                 None,
-                json!({ "reason": "explicit" }),
+                json!({ "reason": "explicit", "cascade": cascade }),
             )?;
         }
         AgentTaskAction::Cancel => {

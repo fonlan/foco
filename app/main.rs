@@ -119,7 +119,8 @@ use crate::runtime::{
     QuestionAnswerResponse, QuestionRegistry, QuestionRequest, ReadOnlyToolProgressAction,
     ReadOnlyToolProgressDetector, RepeatedToolCallDetector, ToolOutputDeltaEvent,
     ToolResourceLockRegistry, chat_run_subscription_stream, execute_tool_calls_parallel,
-    insert_agent_event, pending_tool_calls, validate_agent_snapshot_for_workspace,
+    insert_agent_event, is_agent_tool_name, pending_tool_calls,
+    validate_agent_snapshot_for_workspace,
 };
 
 #[cfg(all(windows, not(debug_assertions)))]
@@ -3302,6 +3303,14 @@ impl AgentRunTask<ChatSseEvent> for FocoAgentRunTask {
             let mut last_error = None;
 
             while let Some(event) = stream.next().await {
+                let suspend_control = match &event {
+                    ChatSseEvent::ToolResult {
+                        output,
+                        is_error: false,
+                        ..
+                    } => agent_suspend_control(output),
+                    _ => None,
+                };
                 match &event {
                     ChatSseEvent::Complete {
                         text,
@@ -3320,6 +3329,9 @@ impl AgentRunTask<ChatSseEvent> for FocoAgentRunTask {
                         message,
                         retryable: false,
                     };
+                }
+                if let Some(control) = suspend_control {
+                    return AgentRunOutcome::Suspended { control };
                 }
             }
 
@@ -3342,6 +3354,15 @@ impl AgentRunTask<ChatSseEvent> for FocoAgentRunTask {
                 }
             }
         })
+    }
+}
+
+fn agent_suspend_control(output: &Value) -> Option<Value> {
+    let control = output.get("suspend")?;
+    if control.get("kind").and_then(Value::as_str) == Some("agent_wait_tasks") {
+        Some(control.clone())
+    } else {
+        None
     }
 }
 
@@ -4515,6 +4536,7 @@ impl PreparedChatContext {
                                 .and_then(|allowed_tools| {
                                     tool_calls.iter().find(|tool_call| {
                                         !allowed_tools.contains(&tool_call.name)
+                                            && !is_agent_tool_name(&tool_call.name)
                                     })
                                 })
                             {

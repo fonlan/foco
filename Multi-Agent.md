@@ -599,70 +599,84 @@
 
 ## 阶段 7：持久等待、恢复、转移与死锁检测
 
+**阶段状态：已完成（2026-06-19）**
+
 ### 目标
 
 实现真正可恢复的 fan-out/fan-in，而不是在 Tokio 工具调用中长期阻塞等待。
 
 ### 7.1 `agent_wait_tasks` 控制结果
 
-- [ ] 为 AgentRunExecutor 增加可持久化的 `suspend` control outcome。
-- [ ] 实现 `agent_wait_tasks`，首版只支持等待全部指定 task 完成。
-- [ ] 工具调用校验目标 task 属于当前 team，且当前 task 有权限等待它们。
-- [ ] 持久化 wait dependency、deadline、pending tool call ID 和恢复所需上下文。
-- [ ] 将当前 task/attempt 更新为 waiting/suspended 后释放模型并发许可并结束 Tokio 执行任务。
-- [ ] 不在 `agent_wait_tasks` 内部通过 `recv().await` 持有长期运行的 worker task。
+- [x] 为 AgentRunExecutor 增加可持久化的 `suspend` control outcome。
+- [x] 实现 `agent_wait_tasks`，首版只支持等待全部指定 task 完成。
+- [x] 工具调用校验目标 task 属于当前 team，且当前 task 有权限等待它们。
+- [x] 持久化 wait dependency、deadline、pending tool call ID 和恢复所需上下文。
+- [x] 将当前 task/attempt 更新为 waiting/suspended 后释放模型并发许可并结束 Tokio 执行任务。
+- [x] 不在 `agent_wait_tasks` 内部通过 `recv().await` 持有长期运行的 worker task。
 
 ### 7.2 恢复协议
 
-- [ ] 所有 dependency 完成或 deadline 到期时，由事务将 waiting task 标记为可恢复。
-- [ ] Scheduler 为恢复创建新 attempt，但保持原 task ID 和实例队首所有权。
-- [ ] 恢复时生成与原 pending tool call 配对的 tool result，包含各 dependency 的状态、结果或错误。
-- [ ] 恢复后继续调用 AgentRunExecutor，而不是从头重新执行用户任务。
-- [ ] 等待超时时不自动取消子任务；将当前状态返回 Agent，由其显式决定。
-- [ ] 重启后可以从 SQLite 重建等待条件并在依赖满足时恢复。
+- [x] 所有 dependency 完成或 deadline 到期时，由事务将 waiting task 标记为可恢复。
+- [x] Scheduler 为恢复创建新 attempt，但保持原 task ID 和实例队首所有权。
+- [x] 恢复时生成与原 pending tool call 配对的 tool result，包含各 dependency 的状态、结果或错误。
+- [x] 恢复后继续调用 AgentRunExecutor，而不是从头重新执行用户任务。
+- [x] 等待超时时不自动取消子任务；将当前状态返回 Agent，由其显式决定。
+- [x] 重启后可以从 SQLite 重建等待条件并在依赖满足时恢复。
 
 ### 7.3 死锁检测
 
-- [ ] 在新增 wait dependency 前检查 task dependency cycle。
-- [ ] 将实例 FIFO 队首占用纳入 wait-for graph。
-- [ ] 检测 A 等待 B，而 B 又等待排在 A 当前任务之后的 A-instance task 等队列级死锁。
-- [ ] 检测失败时拒绝进入 waiting，并向 Agent 返回可诊断但不泄密的错误。
-- [ ] 为死锁图查询设置规模限制和 timeout，超时明确失败。
+- [x] 在新增 wait dependency 前检查 task dependency cycle。
+- [x] 将实例 FIFO 队首占用纳入 wait-for graph。
+- [x] 检测 A 等待 B，而 B 又等待排在 A 当前任务之后的 A-instance task 等队列级死锁。
+- [x] 检测失败时拒绝进入 waiting，并向 Agent 返回可诊断但不泄密的错误。
+- [x] 为死锁图查询设置规模限制和 timeout，超时明确失败。
 
 ### 7.4 Task 转移
 
-- [ ] 实现 `agent_transfer_task` 工具与 API。
-- [ ] 只允许转移 queued task。
-- [ ] 在一个事务中修改 owner、分配目标实例新 sequence、记录 transfer event 并唤醒 Scheduler。
-- [ ] running、waiting、completed、failed、cancelled、interrupted task 的转移请求明确失败。
-- [ ] 转移时重新校验目标实例工具权限、definition 状态和队列上限。
-- [ ] 保留 origin、parent 和历史 owner event，不重写审计历史。
+- [x] 实现 `agent_transfer_task` 工具与 API。
+- [x] 只允许转移 queued task。
+- [x] 在一个事务中修改 owner、分配目标实例新 sequence、记录 transfer event 并唤醒 Scheduler。
+- [x] running、waiting、completed、failed、cancelled、interrupted task 的转移请求明确失败。
+- [x] 转移时重新校验目标实例工具权限、definition 状态和队列上限。
+- [x] 保留 origin、parent 和历史 owner event，不重写审计历史。
 
 ### 7.5 取消与重试
 
-- [ ] queued task 取消后从可运行查询中排除。
-- [ ] running task 取消通过 attempt cancellation token 通知 AgentRunExecutor 和工具运行时。
-- [ ] waiting task 取消时删除/终止等待关系，并显式决定是否级联取消子任务。
-- [ ] 将 cascade 作为明确参数，不使用隐式默认。
-- [ ] failed/interrupted task 只有显式 retry 才重新进入队列。
-- [ ] retry 保留 task ID、增加 attempt，并在上下文中注入前次失败摘要，避免假装首次执行。
+- [x] queued task 取消后从可运行查询中排除。
+- [x] running task 取消通过 attempt cancellation token 通知 AgentRunExecutor 和工具运行时。
+- [x] waiting task 取消时删除/终止等待关系，并显式决定是否级联取消子任务。
+- [x] 将 cascade 作为明确参数，不使用隐式默认。
+- [x] failed/interrupted task 只有显式 retry 才重新进入队列。
+- [x] retry 保留 task ID、增加 attempt，并在上下文中注入前次失败摘要，避免假装首次执行。
 
 ### 7.6 测试
 
-- [ ] 覆盖一个 parent 并行委派多个 child 后等待全部完成并恢复。
-- [ ] 覆盖 child success、failure、cancel 和 timeout 的恢复结果。
-- [ ] 覆盖等待期间后续任务无法越过队首。
-- [ ] 覆盖后端重启后 waiting task 正确恢复。
-- [ ] 覆盖 task dependency cycle 和 queue-level deadlock。
-- [ ] 覆盖 queued transfer 的序号、权限、上限和审计。
-- [ ] 覆盖 running/waiting transfer 明确失败。
-- [ ] 覆盖取消与显式 retry 不重复执行已完成 attempt。
+- [x] 覆盖一个 parent 并行委派多个 child 后等待全部完成并恢复。
+- [x] 覆盖 child success、failure、cancel 和 timeout 的恢复结果。
+- [x] 覆盖等待期间后续任务无法越过队首。
+- [x] 覆盖后端重启后 waiting task 正确恢复。
+- [x] 覆盖 task dependency cycle 和 queue-level deadlock。
+- [x] 覆盖 queued transfer 的序号、权限、上限和审计。
+- [x] 覆盖 running/waiting transfer 明确失败。
+- [x] 覆盖取消与显式 retry 不重复执行已完成 attempt。
 
 ### 阶段 7 退出条件
 
-- [ ] Coordinator 能持久化地 fan-out 多个任务、暂停、等待并 fan-in 结果。
-- [ ] 等待不占用模型许可或长期 Tokio worker。
-- [ ] 进程重启不会丢失等待关系，也不会自动重放有副作用的 attempt。
+- [x] Coordinator 能持久化地 fan-out 多个任务、暂停、等待并 fan-in 结果。
+- [x] 等待不占用模型许可或长期 Tokio worker。
+- [x] 进程重启不会丢失等待关系，也不会自动重放有副作用的 attempt。
+
+### Phase 7 实现记录
+
+- `agent/executor.rs` 的 `AgentRunOutcome::Suspended` 作为持久 suspend control outcome；`app/main.rs` 在收到 `agent_wait_tasks` tool result 的 suspend control 后结束当前执行轮次，由 Scheduler 统一落库。
+- `tools/agent_tools.rs` 新增 `agent_wait_tasks` 和 `agent_transfer_task` strict schema；`app/runtime/tool_execution.rs` 执行时校验 team/task 可见性、权限、等待目标数量、deadline、dependency cycle 和同实例队首死锁，并持久化 wait dependency、pending tool call ID 与 deadline。
+- Workspace schema 升级到 v12：`agent_task_dependencies` 增加 `pending_tool_call_id` 与 `deadline_at`，`agent_attempts_one_active_per_task_idx` 收敛为仅限制 running attempt，使 suspended 历史 attempt 与恢复新 attempt 可以共存。
+- `store/workspace.rs` 的 runnable/claim/resume 查询将 dependency 的 completed/failed/cancelled/interrupted 视为可恢复终态，并支持 deadline 到期；`resume_satisfied_agent_tasks` 在事务内将 waiting task 恢复为 queued，并把实例从 waiting 释放回 idle/draining。
+- `app/runtime/agent_scheduler.rs` 增加 deadline 轮询、waiting task 恢复扫描和 `task_resumed` event；恢复时为原 pending tool call 生成 provider-neutral assistant tool-call 与 tool result 配对消息，同时在当前任务 JSON 中保留 resume 摘要。
+- 启动 reconciliation 只中断遗留 running task/attempt；waiting task 保留在 SQLite，后续 dependency 满足或 deadline 到期后由 Scheduler 恢复，不自动重放有副作用的 active attempt。
+- `agent_transfer_task` 和 task transfer API 只接受 queued task，在事务中更新 owner、分配目标实例 sequence、校验 team/instance 状态与队列上限，保留 origin/parent 和历史事件，不重写审计历史。
+- task action cancel/retry 保持显式状态转换：running 通过现有 active run cancellation 通知执行器和工具，waiting cancel 必须显式提供 `cascade`，并在事务中清理 wait dependency；retry 保留 task ID，恢复 queued，由下一次 claim 创建新 attempt，并在 prompt 中注入前次 result/error 摘要。
+- 新增 Phase 7 针对性 store 测试覆盖 wait dependency 持久化、dependency 完成恢复、deadline 恢复、新 attempt 创建、queued transfer、running transfer 拒绝、waiting cancel 清理 dependency 和 retry 保留前次错误；既有 dependency cycle 测试继续覆盖 cycle 拒绝。
 
 ---
 

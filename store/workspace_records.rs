@@ -110,6 +110,8 @@ pub struct NewAgentTaskDependency<'a> {
     pub waiting_task_id: &'a AgentTaskId,
     pub dependency_task_id: &'a AgentTaskId,
     pub wait_mode: AgentTaskWaitMode,
+    pub pending_tool_call_id: Option<&'a str>,
+    pub deadline_at: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +120,8 @@ pub struct AgentTaskDependencyRecord {
     pub waiting_task_id: AgentTaskId,
     pub dependency_task_id: AgentTaskId,
     pub wait_mode: AgentTaskWaitMode,
+    pub pending_tool_call_id: Option<String>,
+    pub deadline_at: Option<String>,
     pub created_at: String,
 }
 

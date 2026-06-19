@@ -1,26 +1,29 @@
 use std::{
+    collections::HashSet,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
+
 use foco_agent::{
     AgentCollaborationTool, AgentDefinitionId, AgentInstanceId, AgentMessageId, AgentMessageKind,
-    AgentPermissions, AgentRunAssociations, AgentTaskId, AgentTaskStatus, PendingToolCall,
-    ToolExecutionMode, ToolExecutionPlan, ToolResourceLock, tool_resource_locks,
+    AgentPermissions, AgentRunAssociations, AgentTaskId, AgentTaskStatus, AgentTaskWaitMode,
+    PendingToolCall, ToolExecutionMode, ToolExecutionPlan, ToolResourceLock, tool_resource_locks,
 };
 use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
 use foco_store::config::{HookConfig, WebSearchSettings};
 use foco_store::workspace::{
     AgentInstanceRecord, AgentTaskRecord, NewAgentEvent, NewAgentMessage, NewAgentTask,
-    WorkspaceDatabase,
+    NewAgentTaskDependency, WorkspaceDatabase,
 };
 use foco_tools::{
     AGENT_CANCEL_TASK_TOOL, AGENT_DELEGATE_TASK_TOOL, AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL,
-    AGENT_SEND_MESSAGE_TOOL, ASK_QUESTION_TOOL, RUN_COMMAND_TOOL, SLEEP_TOOL,
-    ToolCancellationToken, ToolExecution, ToolOutputSink, builtin_tool_timeout_ms,
-    execute_builtin_tool_for_chat_with_cancellation_and_output_sink,
+    AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL, AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL,
+    RUN_COMMAND_TOOL, SLEEP_TOOL, ToolCancellationToken, ToolExecution, ToolOutputSink,
+    builtin_tool_timeout_ms, execute_builtin_tool_for_chat_with_cancellation_and_output_sink,
 };
 use futures_util::future::join_all;
 use serde::Deserialize;
@@ -713,12 +716,14 @@ pub(crate) async fn execute_tool(
         set_tool_timeout_ms(&mut arguments, remaining_timeout);
         let tool_name = tool_name.to_string();
         let worker_tool_name = tool_name.clone();
+        let worker_tool_call_id = tool_call_id.to_string();
         let workspace_path = workspace_path.to_path_buf();
         let worker = tokio::task::spawn_blocking(move || {
             execute_agent_tool(
                 &agent_tool_context,
                 &workspace_path,
                 &worker_tool_name,
+                &worker_tool_call_id,
                 arguments,
             )
         });
@@ -910,7 +915,7 @@ pub(crate) async fn execute_tool(
     }
 }
 
-fn is_agent_tool_name(tool_name: &str) -> bool {
+pub(crate) fn is_agent_tool_name(tool_name: &str) -> bool {
     matches!(
         tool_name,
         AGENT_LIST_TOOL
@@ -918,6 +923,8 @@ fn is_agent_tool_name(tool_name: &str) -> bool {
             | AGENT_SEND_MESSAGE_TOOL
             | AGENT_DELEGATE_TASK_TOOL
             | AGENT_CANCEL_TASK_TOOL
+            | AGENT_WAIT_TASKS_TOOL
+            | AGENT_TRANSFER_TASK_TOOL
     )
 }
 
@@ -967,10 +974,30 @@ struct AgentCancelTaskInput {
     _timeout_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentWaitTasksInput {
+    task_ids: Vec<AgentTaskId>,
+    mode: AgentTaskWaitMode,
+    deadline_ms: Option<u64>,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentTransferTaskInput {
+    task_id: AgentTaskId,
+    target_instance_id: AgentInstanceId,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
+}
+
 fn execute_agent_tool(
     context: &AgentToolContext,
     workspace_path: &Path,
     tool_name: &str,
+    tool_call_id: &str,
     arguments: Value,
 ) -> Result<Value, String> {
     match tool_name {
@@ -979,6 +1006,10 @@ fn execute_agent_tool(
         AGENT_SEND_MESSAGE_TOOL => execute_agent_send_message(context, workspace_path, arguments),
         AGENT_DELEGATE_TASK_TOOL => execute_agent_delegate_task(context, workspace_path, arguments),
         AGENT_CANCEL_TASK_TOOL => execute_agent_cancel_task(context, workspace_path, arguments),
+        AGENT_WAIT_TASKS_TOOL => {
+            execute_agent_wait_tasks(context, workspace_path, tool_call_id, arguments)
+        }
+        AGENT_TRANSFER_TASK_TOOL => execute_agent_transfer_task(context, workspace_path, arguments),
         _ => Err(agent_tool_error(
             "unknown_tool",
             format!("unknown Agent tool '{tool_name}'"),
@@ -1340,6 +1371,264 @@ fn execute_agent_cancel_task(
         "taskId": task.id.to_string(),
         "status": AgentTaskStatus::Cancelled.as_str(),
     }))
+}
+
+fn execute_agent_wait_tasks(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    tool_call_id: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    let input = serde_json::from_value::<AgentWaitTasksInput>(arguments).map_err(|source| {
+        agent_tool_error(
+            "invalid_arguments",
+            format!("agent_wait_tasks arguments do not match schema: {source}"),
+        )
+    })?;
+    context
+        .permissions
+        .authorize_collaboration_tool(
+            AgentCollaborationTool::WaitTasks,
+            agent_tool_instance_id(context)?.clone(),
+        )
+        .map_err(|source| agent_tool_error("permission_denied", source.to_string()))?;
+    if input.mode != AgentTaskWaitMode::All {
+        return Err(agent_tool_error(
+            "invalid_arguments",
+            "agent_wait_tasks currently supports mode 'all' only",
+        ));
+    }
+    if input.task_ids.is_empty() {
+        return Err(agent_tool_error(
+            "invalid_arguments",
+            "agent_wait_tasks taskIds must not be empty",
+        ));
+    }
+    if input.task_ids.len() > AGENT_MAX_CHILD_TASKS_PER_TASK {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            format!("agent_wait_tasks taskIds exceeds {AGENT_MAX_CHILD_TASKS_PER_TASK} tasks"),
+        ));
+    }
+
+    let team_id = agent_tool_team_id(context)?;
+    let actor_instance_id = agent_tool_instance_id(context)?;
+    let current_task_id = agent_tool_task_id(context)?;
+    let deadline_at = input
+        .deadline_ms
+        .map(agent_wait_deadline_timestamp)
+        .transpose()?;
+    let mut seen = HashSet::new();
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    let current_task = database
+        .agent_task_for_team(team_id, current_task_id)
+        .map_err(agent_store_error)?
+        .ok_or_else(|| {
+            agent_tool_error(
+                "not_found",
+                format!("current Agent task '{current_task_id}' was not found"),
+            )
+        })?;
+    let mut dependencies = Vec::with_capacity(input.task_ids.len());
+    for dependency_task_id in &input.task_ids {
+        if dependency_task_id == current_task_id {
+            return Err(agent_tool_error(
+                "dependency_cycle",
+                format!("Agent task '{current_task_id}' cannot wait on itself"),
+            ));
+        }
+        if !seen.insert(dependency_task_id.as_str().to_string()) {
+            return Err(agent_tool_error(
+                "invalid_arguments",
+                format!("duplicate dependency task id '{dependency_task_id}'"),
+            ));
+        }
+        let dependency_task = database
+            .agent_task_for_team(team_id, dependency_task_id)
+            .map_err(agent_store_error)?
+            .ok_or_else(|| {
+                agent_tool_error(
+                    "not_found",
+                    format!(
+                        "Agent dependency task '{dependency_task_id}' was not found in team '{team_id}'"
+                    ),
+                )
+            })?;
+        authorize_agent_task_visibility(context, &dependency_task)?;
+        if dependency_task.owner_instance_id == *actor_instance_id
+            && dependency_task.sequence > current_task.sequence
+            && dependency_task.status.holds_queue_head()
+        {
+            return Err(agent_tool_error(
+                "queue_deadlock",
+                format!(
+                    "Agent task '{current_task_id}' cannot wait on later queued task '{}' in the same instance queue",
+                    dependency_task.id
+                ),
+            ));
+        }
+        dependencies.push(dependency_task);
+    }
+
+    for dependency_task in &dependencies {
+        database
+            .insert_agent_task_dependency(NewAgentTaskDependency {
+                team_id,
+                waiting_task_id: current_task_id,
+                dependency_task_id: &dependency_task.id,
+                wait_mode: AgentTaskWaitMode::All,
+                pending_tool_call_id: Some(tool_call_id),
+                deadline_at: deadline_at.as_deref(),
+            })
+            .map_err(agent_store_error)?;
+    }
+    append_agent_tool_event(
+        &mut database,
+        team_id,
+        "task_waiting_requested",
+        Some(actor_instance_id),
+        Some(current_task_id),
+        None,
+        json!({
+            "pendingToolCallId": tool_call_id,
+            "dependencyTaskIds": dependencies.iter().map(|task| task.id.to_string()).collect::<Vec<_>>(),
+            "mode": AgentTaskWaitMode::All.as_str(),
+            "deadlineAt": deadline_at,
+        }),
+    )?;
+    Ok(json!({
+        "waiting": true,
+        "taskId": current_task_id.to_string(),
+        "mode": AgentTaskWaitMode::All.as_str(),
+        "taskIds": dependencies.iter().map(|task| task.id.to_string()).collect::<Vec<_>>(),
+        "deadlineAt": deadline_at,
+        "suspend": {
+            "kind": "agent_wait_tasks",
+            "pendingToolCallId": tool_call_id,
+            "taskIds": dependencies.iter().map(|task| task.id.to_string()).collect::<Vec<_>>(),
+            "mode": AgentTaskWaitMode::All.as_str(),
+            "deadlineAt": deadline_at,
+        }
+    }))
+}
+
+fn execute_agent_transfer_task(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, String> {
+    let input = serde_json::from_value::<AgentTransferTaskInput>(arguments).map_err(|source| {
+        agent_tool_error(
+            "invalid_arguments",
+            format!("agent_transfer_task arguments do not match schema: {source}"),
+        )
+    })?;
+    context
+        .permissions
+        .authorize_collaboration_tool(
+            AgentCollaborationTool::TransferTask,
+            agent_tool_instance_id(context)?.clone(),
+        )
+        .map_err(|source| agent_tool_error("permission_denied", source.to_string()))?;
+    let team_id = agent_tool_team_id(context)?;
+    let actor_instance_id = agent_tool_instance_id(context)?;
+    let current_task_id = agent_tool_task_id(context)?;
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    let task = database
+        .agent_task_for_team(team_id, &input.task_id)
+        .map_err(agent_store_error)?
+        .ok_or_else(|| {
+            agent_tool_error(
+                "not_found",
+                format!(
+                    "Agent task '{}' was not found in team '{team_id}'",
+                    input.task_id
+                ),
+            )
+        })?;
+    authorize_agent_task_visibility(context, &task)?;
+    if task.status != AgentTaskStatus::Queued {
+        return Err(agent_tool_error(
+            "invalid_task_status",
+            format!(
+                "Agent task '{}' cannot be transferred while {}",
+                task.id,
+                task.status.as_str()
+            ),
+        ));
+    }
+    let target = database
+        .agent_instance(&input.target_instance_id)
+        .map_err(agent_store_error)?
+        .ok_or_else(|| {
+            agent_tool_error(
+                "not_found",
+                format!(
+                    "Agent target instance '{}' was not found",
+                    input.target_instance_id
+                ),
+            )
+        })?;
+    if target.team_id != *team_id {
+        return Err(agent_tool_error(
+            "cross_team_reference",
+            format!(
+                "Agent target instance '{}' does not belong to team '{team_id}'",
+                input.target_instance_id
+            ),
+        ));
+    }
+    let transferred = database
+        .transfer_queued_agent_task_with_limits(
+            team_id,
+            &task.id,
+            &target.id,
+            i64::from(AGENT_MAX_QUEUED_TASKS_PER_TEAM),
+            i64::from(AGENT_MAX_QUEUED_TASKS_PER_INSTANCE),
+            i64::from(AGENT_MAX_QUEUED_TASKS_PER_CHAT),
+        )
+        .map_err(agent_store_error)?
+        .ok_or_else(|| {
+            agent_tool_error(
+                "state_changed",
+                format!("Agent task '{}' changed state before transfer", task.id),
+            )
+        })?;
+    append_agent_tool_event(
+        &mut database,
+        team_id,
+        "task_transferred",
+        Some(actor_instance_id),
+        Some(current_task_id),
+        None,
+        json!({
+            "taskId": transferred.id.to_string(),
+            "previousOwnerInstanceId": task.owner_instance_id.to_string(),
+            "targetInstanceId": transferred.owner_instance_id.to_string(),
+            "sequence": transferred.sequence,
+        }),
+    )?;
+    context.scheduler.wake().map_err(|source| source.message)?;
+    Ok(json!({
+        "taskId": transferred.id.to_string(),
+        "previousOwnerInstanceId": task.owner_instance_id.to_string(),
+        "targetInstanceId": transferred.owner_instance_id.to_string(),
+        "status": transferred.status.as_str(),
+        "sequence": transferred.sequence,
+    }))
+}
+
+fn agent_wait_deadline_timestamp(deadline_ms: u64) -> Result<String, String> {
+    let millis = i64::try_from(deadline_ms).map_err(|_| {
+        agent_tool_error(
+            "invalid_arguments",
+            "agent_wait_tasks deadlineMs is too large",
+        )
+    })?;
+    Ok((Utc::now() + ChronoDuration::milliseconds(millis))
+        .to_rfc3339_opts(SecondsFormat::Millis, true))
 }
 
 fn agent_tool_team_id(context: &AgentToolContext) -> Result<&foco_agent::AgentTeamId, String> {

@@ -53,6 +53,8 @@ pub const AGENT_GET_TASK_TOOL: &str = "agent_get_task";
 pub const AGENT_SEND_MESSAGE_TOOL: &str = "agent_send_message";
 pub const AGENT_DELEGATE_TASK_TOOL: &str = "agent_delegate_task";
 pub const AGENT_CANCEL_TASK_TOOL: &str = "agent_cancel_task";
+pub const AGENT_WAIT_TASKS_TOOL: &str = "agent_wait_tasks";
+pub const AGENT_TRANSFER_TASK_TOOL: &str = "agent_transfer_task";
 
 const MAX_FULL_READ_BYTES: u64 = 1024 * 1024;
 const MAX_RANGED_READ_SOURCE_BYTES: u64 = 32 * 1024 * 1024;

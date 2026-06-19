@@ -2327,6 +2327,8 @@ fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
             waiting_task_id: &first_task,
             dependency_task_id: &second_task,
             wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: None,
+            deadline_at: None,
         })
         .expect_err("cross-team dependency must fail");
     assert!(matches!(
@@ -2370,6 +2372,8 @@ fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
             waiting_task_id: &first_task,
             dependency_task_id: &third_task,
             wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: None,
+            deadline_at: None,
         })
         .expect("first dependency");
     let cycle_error = database
@@ -2378,6 +2382,8 @@ fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
             waiting_task_id: &third_task,
             dependency_task_id: &first_task,
             wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: None,
+            deadline_at: None,
         })
         .expect_err("dependency cycle must fail");
     assert!(matches!(
@@ -2389,6 +2395,392 @@ fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
         !database
             .agent_task_dependencies_satisfied(&first_task)
             .expect("dependency state")
+    );
+}
+
+#[test]
+fn phase7_waiting_tasks_resume_after_dependency_finishes() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-agent-phase7-resume", "phase7-resume");
+    let worker_id = create_test_agent_worker(&database, &team_id, "phase7-resume-worker");
+
+    let waiting_task_id = AgentTaskId::new("agent-task-phase7-waiting").expect("task id");
+    let dependency_task_id = AgentTaskId::new("agent-task-phase7-dependency").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &waiting_task_id,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"goal":"wait"}"#,
+        })
+        .expect("waiting task enqueue");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &dependency_task_id,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&waiting_task_id),
+            input_json: r#"{"goal":"dependency"}"#,
+        })
+        .expect("dependency task enqueue");
+
+    let first_attempt_id =
+        AgentAttemptId::new("agent-attempt-phase7-waiting-first").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &waiting_task_id, &first_attempt_id)
+        .expect("claim waiting task")
+        .expect("waiting task claimed");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &waiting_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Wait,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend waiting task")
+    );
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &team_id,
+            waiting_task_id: &waiting_task_id,
+            dependency_task_id: &dependency_task_id,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("tool-call-phase7-wait"),
+            deadline_at: None,
+        })
+        .expect("wait dependency insert");
+    let dependency = database
+        .agent_task_dependencies(&waiting_task_id)
+        .expect("dependencies")
+        .pop()
+        .expect("dependency");
+    assert_eq!(
+        dependency.pending_tool_call_id.as_deref(),
+        Some("tool-call-phase7-wait")
+    );
+    assert!(
+        database
+            .resume_satisfied_agent_tasks(10)
+            .expect("resume before dependency completes")
+            .is_empty()
+    );
+
+    let dependency_attempt_id =
+        AgentAttemptId::new("agent-attempt-phase7-dependency").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &dependency_task_id, &dependency_attempt_id)
+        .expect("claim dependency")
+        .expect("dependency claimed");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &dependency_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Complete,
+                result_json: Some(r#"{"ok":true}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete dependency")
+    );
+
+    let resumed = database
+        .resume_satisfied_agent_tasks(10)
+        .expect("resume satisfied task");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].id, waiting_task_id);
+    assert_eq!(resumed[0].status, AgentTaskStatus::Queued);
+    assert_eq!(
+        database
+            .agent_instance(&coordinator_id)
+            .expect("coordinator")
+            .expect("coordinator")
+            .status,
+        AgentInstanceStatus::Idle
+    );
+
+    let second_attempt_id =
+        AgentAttemptId::new("agent-attempt-phase7-waiting-second").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &waiting_task_id, &second_attempt_id)
+        .expect("claim resumed task")
+        .expect("resumed task claimed");
+    let attempts = database
+        .agent_attempts_for_task(&waiting_task_id)
+        .expect("attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].status,
+        foco_agent::AgentAttemptStatus::Suspended
+    );
+    assert_eq!(attempts[1].status, foco_agent::AgentAttemptStatus::Running);
+}
+
+#[test]
+fn phase7_waiting_tasks_resume_after_deadline() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, coordinator_id) = create_test_agent_team(
+        &mut database,
+        "chat-agent-phase7-deadline",
+        "phase7-deadline",
+    );
+    let worker_id = create_test_agent_worker(&database, &team_id, "phase7-deadline-worker");
+    let waiting_task_id = AgentTaskId::new("agent-task-phase7-deadline-waiting").expect("task id");
+    let dependency_task_id = AgentTaskId::new("agent-task-phase7-deadline-dep").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &waiting_task_id,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("waiting task enqueue");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &dependency_task_id,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&waiting_task_id),
+            input_json: "{}",
+        })
+        .expect("dependency task enqueue");
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &waiting_task_id,
+            &AgentAttemptId::new("agent-attempt-phase7-deadline").expect("attempt id"),
+        )
+        .expect("claim waiting task")
+        .expect("waiting task claimed");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &waiting_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Wait,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend waiting task")
+    );
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &team_id,
+            waiting_task_id: &waiting_task_id,
+            dependency_task_id: &dependency_task_id,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("tool-call-phase7-deadline"),
+            deadline_at: Some("2000-01-01T00:00:00.000Z"),
+        })
+        .expect("deadline dependency insert");
+
+    assert!(
+        database
+            .agent_task_dependencies_satisfied(&waiting_task_id)
+            .expect("deadline dependency state")
+    );
+    let resumed = database
+        .resume_satisfied_agent_tasks(10)
+        .expect("deadline resume");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].id, waiting_task_id);
+    assert_eq!(resumed[0].status, AgentTaskStatus::Queued);
+}
+
+#[test]
+fn phase7_agent_task_transfer_accepts_only_queued_tasks() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, coordinator_id) = create_test_agent_team(
+        &mut database,
+        "chat-agent-phase7-transfer",
+        "phase7-transfer",
+    );
+    let worker_id = create_test_agent_worker(&database, &team_id, "phase7-transfer-worker");
+    let task_id = AgentTaskId::new("agent-task-phase7-transfer").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("task enqueue");
+
+    let transferred = database
+        .transfer_queued_agent_task_with_limits(&team_id, &task_id, &worker_id, 64, 64, 64)
+        .expect("transfer queued task")
+        .expect("transferred task");
+    assert_eq!(transferred.owner_instance_id, worker_id);
+    assert_eq!(transferred.status, AgentTaskStatus::Queued);
+    assert_eq!(transferred.sequence, 0);
+
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &task_id,
+            &AgentAttemptId::new("agent-attempt-phase7-transfer").expect("attempt id"),
+        )
+        .expect("claim transferred task")
+        .expect("transferred task claimed");
+    assert!(
+        database
+            .transfer_queued_agent_task_with_limits(&team_id, &task_id, &coordinator_id, 64, 64, 64)
+            .is_err(),
+        "running tasks cannot be transferred"
+    );
+}
+
+#[test]
+fn phase7_waiting_cancel_clears_dependencies_and_retry_preserves_previous_error() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, coordinator_id) = create_test_agent_team(
+        &mut database,
+        "chat-agent-phase7-cancel-retry",
+        "phase7-cancel-retry",
+    );
+    let worker_id = create_test_agent_worker(&database, &team_id, "phase7-cancel-retry-worker");
+    let waiting_task_id = AgentTaskId::new("agent-task-phase7-cancel-waiting").expect("task id");
+    let dependency_task_id = AgentTaskId::new("agent-task-phase7-cancel-dep").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &waiting_task_id,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("waiting task enqueue");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &dependency_task_id,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&waiting_task_id),
+            input_json: "{}",
+        })
+        .expect("dependency task enqueue");
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &waiting_task_id,
+            &AgentAttemptId::new("agent-attempt-phase7-cancel-first").expect("attempt id"),
+        )
+        .expect("claim waiting task")
+        .expect("waiting task claimed");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &waiting_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Wait,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend waiting task")
+    );
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &team_id,
+            waiting_task_id: &waiting_task_id,
+            dependency_task_id: &dependency_task_id,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("tool-call-phase7-cancel"),
+            deadline_at: None,
+        })
+        .expect("wait dependency insert");
+
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &waiting_task_id,
+                expected_status: AgentTaskStatus::Waiting,
+                transition: AgentTaskTransition::Cancel,
+                result_json: None,
+                error_json: Some(r#"{"message":"cancelled explicitly"}"#),
+                interruption_reason: None,
+            })
+            .expect("cancel waiting task")
+    );
+    assert!(
+        database
+            .agent_task_dependencies(&waiting_task_id)
+            .expect("dependencies")
+            .is_empty()
+    );
+    let cancelled = database
+        .agent_task(&waiting_task_id)
+        .expect("cancelled task")
+        .expect("cancelled task");
+    assert_eq!(cancelled.status, AgentTaskStatus::Cancelled);
+    assert_json_eq(
+        cancelled.error_json.as_deref().expect("cancel error"),
+        r#"{"message":"cancelled explicitly"}"#,
+    );
+
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &waiting_task_id,
+                expected_status: AgentTaskStatus::Cancelled,
+                transition: AgentTaskTransition::Retry,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("retry cancelled task")
+    );
+    let retried = database
+        .agent_task(&waiting_task_id)
+        .expect("retried task")
+        .expect("retried task");
+    assert_eq!(retried.status, AgentTaskStatus::Queued);
+    assert_eq!(retried.started_at, None);
+    assert!(retried.completed_at.is_some());
+    assert_json_eq(
+        retried.error_json.as_deref().expect("previous error"),
+        r#"{"message":"cancelled explicitly"}"#,
+    );
+
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &waiting_task_id,
+            &AgentAttemptId::new("agent-attempt-phase7-cancel-second").expect("attempt id"),
+        )
+        .expect("claim retried task")
+        .expect("retried task claimed");
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&waiting_task_id)
+            .expect("attempts")
+            .len(),
+        2
     );
 }
 
@@ -2830,6 +3222,43 @@ fn create_test_agent_team(
         })
         .expect("agent team create");
     (team_id, instance_id)
+}
+
+fn create_test_agent_worker(
+    database: &WorkspaceDatabase,
+    team_id: &AgentTeamId,
+    suffix: &str,
+) -> AgentInstanceId {
+    let coordinator = database
+        .agent_instances_for_team(team_id)
+        .expect("instances")
+        .into_iter()
+        .find(|instance| instance.role.as_str() == "coordinator")
+        .expect("coordinator instance");
+    let instance_id =
+        AgentInstanceId::new(format!("agent-instance-{suffix}")).expect("instance id");
+    let definition_snapshot_json =
+        serde_json::to_string(&coordinator.definition_snapshot).expect("definition snapshot json");
+    let connection = Connection::open(database.database_path()).expect("database connection");
+    connection
+        .execute(
+            "INSERT INTO agent_instances
+                (id, team_id, definition_id, definition_revision, definition_snapshot_json,
+                 role, status, next_task_sequence, next_message_sequence, context_generation,
+                 created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'worker', ?6, 0, 0, 0,
+                     '2026-06-19T00:00:00.000Z', '2026-06-19T00:00:00.000Z')",
+            params![
+                instance_id.as_str(),
+                team_id.as_str(),
+                coordinator.definition_id.as_str(),
+                coordinator.definition_revision as i64,
+                definition_snapshot_json,
+                AgentInstanceStatus::Idle.as_str(),
+            ],
+        )
+        .expect("worker instance insert");
+    instance_id
 }
 
 fn assert_json_eq(actual: &str, expected: &str) {

@@ -43,12 +43,12 @@ pub use workspace_records::{
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
-    MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, Migration,
+    MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 11;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 12;
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -97,6 +97,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 11,
         sql: MIGRATION_011,
+    },
+    Migration {
+        version: 12,
+        sql: MIGRATION_012,
     },
 ];
 
@@ -2653,6 +2657,245 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn transfer_queued_agent_task_with_limits(
+        &mut self,
+        team_id: &AgentTeamId,
+        task_id: &AgentTaskId,
+        target_instance_id: &AgentInstanceId,
+        max_team_queued: i64,
+        max_instance_queued: i64,
+        max_chat_queued: i64,
+    ) -> Result<Option<AgentTaskRecord>, WorkspaceDatabaseError> {
+        if max_team_queued <= 0 || max_instance_queued <= 0 || max_chat_queued <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Agent queued task limits must be greater than 0".to_string(),
+            });
+        }
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let task_state = transaction
+            .query_row(
+                "SELECT task.owner_instance_id, task.status, team.status, target.status
+                 FROM agent_tasks AS task
+                 JOIN agent_teams AS team ON team.id = task.team_id
+                 JOIN agent_instances AS target ON target.team_id = task.team_id
+                 WHERE task.team_id = ?1 AND task.id = ?2 AND target.id = ?3",
+                params![
+                    team_id.as_str(),
+                    task_id.as_str(),
+                    target_instance_id.as_str()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some((owner_instance_id, task_status, team_status, target_status)) = task_state else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(None);
+        };
+        if task_status != AgentTaskStatus::Queued.as_str() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent task '{task_id}' cannot be transferred while {task_status}"
+                ),
+            });
+        }
+        if !matches!(team_status.as_str(), "active" | "draining") {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent team '{team_id}' does not accept transfers while {team_status}"
+                ),
+            });
+        }
+        if !matches!(target_status.as_str(), "idle" | "running") {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent instance '{target_instance_id}' does not accept transferred tasks while {target_status}"
+                ),
+            });
+        }
+        if owner_instance_id == target_instance_id.as_str() {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return self.agent_task(task_id);
+        }
+        let target_queued: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tasks
+                 WHERE owner_instance_id = ?1 AND status = 'queued'",
+                params![target_instance_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if target_queued >= max_instance_queued {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent task queue is full for instance '{target_instance_id}' ({target_queued} queued)"
+                ),
+            });
+        }
+        let sequence: i64 = transaction
+            .query_row(
+                "SELECT next_task_sequence FROM agent_instances
+                 WHERE id = ?1 AND team_id = ?2",
+                params![target_instance_id.as_str(), team_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE agent_instances
+                 SET next_task_sequence = next_task_sequence + 1, updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2",
+                params![target_instance_id.as_str(), team_id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET owner_instance_id = ?3, sequence = ?4, updated_at = ?5
+                 WHERE team_id = ?1 AND id = ?2 AND status = 'queued'",
+                params![
+                    team_id.as_str(),
+                    task_id.as_str(),
+                    target_instance_id.as_str(),
+                    sequence,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated == 0 {
+            return Ok(None);
+        }
+        self.agent_task(task_id)
+    }
+
+    pub fn resume_satisfied_agent_tasks(
+        &mut self,
+        limit: i64,
+    ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
+        if limit <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "waiting Agent task resume limit must be greater than 0".to_string(),
+            });
+        }
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let task_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT task.id, task.team_id, task.owner_instance_id
+                     FROM agent_tasks AS task
+                     JOIN agent_instances AS instance ON instance.id = task.owner_instance_id
+                     JOIN agent_teams AS team ON team.id = task.team_id
+                     WHERE task.status = 'waiting'
+                       AND instance.status IN ('waiting', 'draining')
+                       AND team.status IN ('active', 'draining')
+                       AND EXISTS (
+                            SELECT 1 FROM agent_task_dependencies AS dependency
+                            WHERE dependency.waiting_task_id = task.id
+                       )
+                       AND (
+                            EXISTS (
+                                SELECT 1 FROM agent_task_dependencies AS dependency
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND dependency.deadline_at IS NOT NULL
+                                  AND dependency.deadline_at <= ?1
+                            )
+                            OR (
+                                EXISTS (
+                                    SELECT 1 FROM agent_task_dependencies AS dependency
+                                    WHERE dependency.waiting_task_id = task.id
+                                      AND dependency.wait_mode = 'all'
+                                )
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM agent_task_dependencies AS dependency
+                                    JOIN agent_tasks AS required_task
+                                      ON required_task.id = dependency.dependency_task_id
+                                    WHERE dependency.waiting_task_id = task.id
+                                      AND required_task.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
+                                )
+                            )
+                            OR EXISTS (
+                                SELECT 1
+                                FROM agent_task_dependencies AS dependency
+                                JOIN agent_tasks AS required_task
+                                  ON required_task.id = dependency.dependency_task_id
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND dependency.wait_mode = 'any'
+                                  AND required_task.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                            )
+                       )
+                     ORDER BY task.created_at, task.team_id, task.owner_instance_id, task.sequence
+                     LIMIT ?2",
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let rows = statement
+                .query_map(params![now.as_str(), limit], |row| {
+                    Ok((
+                        agent_id_from_row::<AgentTaskId>(row, 0)?,
+                        agent_id_from_row::<AgentTeamId>(row, 1)?,
+                        agent_id_from_row::<AgentInstanceId>(row, 2)?,
+                    ))
+                })
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            collect_rows(rows, &database_path)?
+        };
+
+        for (task_id, team_id, owner_instance_id) in &task_ids {
+            transaction
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'queued', updated_at = ?3
+                     WHERE id = ?1 AND team_id = ?2 AND status = 'waiting'",
+                    params![task_id.as_str(), team_id.as_str(), now.as_str()],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            transaction
+                .execute(
+                    "UPDATE agent_instances
+                     SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE 'idle' END,
+                         updated_at = ?3
+                     WHERE id = ?1 AND team_id = ?2 AND status IN ('waiting', 'draining')",
+                    params![owner_instance_id.as_str(), team_id.as_str(), now.as_str()],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let mut tasks = Vec::with_capacity(task_ids.len());
+        for (task_id, _, _) in task_ids {
+            if let Some(task) = self.agent_task(&task_id)? {
+                tasks.push(task);
+            }
+        }
+        Ok(tasks)
+    }
+
     pub fn runnable_agent_tasks(
         &self,
         limit: i64,
@@ -2662,6 +2905,7 @@ impl WorkspaceDatabase {
                 message: "runnable Agent task query limit must be greater than 0".to_string(),
             });
         }
+        let now = now_timestamp();
         let mut statement = self
             .connection
             .prepare(
@@ -2697,7 +2941,7 @@ impl WorkspaceDatabase {
                                 JOIN agent_tasks AS required_task
                                   ON required_task.id = dependency.dependency_task_id
                                 WHERE dependency.waiting_task_id = task.id
-                                  AND required_task.status <> 'completed'
+                                  AND required_task.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
                             )
                         )
                         OR EXISTS (
@@ -2707,15 +2951,21 @@ impl WorkspaceDatabase {
                               ON required_task.id = dependency.dependency_task_id
                             WHERE dependency.waiting_task_id = task.id
                               AND dependency.wait_mode = 'any'
-                              AND required_task.status = 'completed'
+                              AND required_task.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM agent_task_dependencies AS dependency
+                            WHERE dependency.waiting_task_id = task.id
+                              AND dependency.deadline_at IS NOT NULL
+                              AND dependency.deadline_at <= ?1
                         )
                    )
                  ORDER BY task.created_at, task.team_id, task.owner_instance_id, task.sequence
-                 LIMIT ?1",
+                 LIMIT ?2",
             )
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
-            .query_map(params![limit], agent_task_from_row)
+            .query_map(params![now, limit], agent_task_from_row)
             .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
     }
@@ -2764,7 +3014,7 @@ impl WorkspaceDatabase {
                                 JOIN agent_tasks AS required_task
                                   ON required_task.id = dependency.dependency_task_id
                                 WHERE dependency.waiting_task_id = task.id
-                                  AND required_task.status <> 'completed'
+                                  AND required_task.status NOT IN ('completed', 'failed', 'cancelled', 'interrupted')
                             )
                         )
                         OR EXISTS (
@@ -2774,10 +3024,16 @@ impl WorkspaceDatabase {
                               ON required_task.id = dependency.dependency_task_id
                             WHERE dependency.waiting_task_id = task.id
                               AND dependency.wait_mode = 'any'
-                              AND required_task.status = 'completed'
+                              AND required_task.status IN ('completed', 'failed', 'cancelled', 'interrupted')
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM agent_task_dependencies AS dependency
+                            WHERE dependency.waiting_task_id = task.id
+                              AND dependency.deadline_at IS NOT NULL
+                              AND dependency.deadline_at <= ?3
                         )
                    )",
-                params![task_id.as_str(), team_id.as_str()],
+                params![task_id.as_str(), team_id.as_str(), now],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -2894,15 +3150,14 @@ impl WorkspaceDatabase {
             return Ok(false);
         };
         let completed_at = target_status.is_terminal().then_some(now.as_str());
-        let clear_for_retry = update.transition == AgentTaskTransition::Retry;
         let updated = transaction
             .execute(
                 "UPDATE agent_tasks
                  SET status = ?4,
-                     result_json = CASE WHEN ?8 THEN NULL ELSE ?5 END,
-                     error_json = CASE WHEN ?8 THEN NULL ELSE ?6 END,
+                     result_json = CASE WHEN ?8 THEN result_json ELSE ?5 END,
+                     error_json = CASE WHEN ?8 THEN error_json ELSE ?6 END,
                      started_at = CASE WHEN ?8 THEN NULL ELSE started_at END,
-                     completed_at = CASE WHEN ?8 THEN NULL ELSE ?7 END,
+                     completed_at = CASE WHEN ?8 THEN completed_at ELSE ?7 END,
                      updated_at = ?9
                  WHERE id = ?1 AND team_id = ?2 AND status = ?3",
                 params![
@@ -2913,7 +3168,7 @@ impl WorkspaceDatabase {
                     update.result_json,
                     update.error_json,
                     completed_at,
-                    clear_for_retry,
+                    update.transition == AgentTaskTransition::Retry,
                     now
                 ],
             )
@@ -2945,18 +3200,23 @@ impl WorkspaceDatabase {
         };
         if let Some(attempt_target) = attempt_target {
             let attempt_completed_at = attempt_target.is_terminal().then_some(now.as_str());
+            let source_attempt_status = match update.expected_status {
+                AgentTaskStatus::Waiting => "suspended",
+                _ => "running",
+            };
             let attempt_updated = transaction
                 .execute(
                     "UPDATE agent_attempts
                      SET status = ?3, completed_at = ?4, interruption_reason = ?5
                      WHERE task_id = ?1 AND team_id = ?2
-                       AND status IN ('running', 'suspended')",
+                       AND status = ?6",
                     params![
                         update.task_id.as_str(),
                         update.team_id.as_str(),
                         attempt_target.as_str(),
                         attempt_completed_at,
-                        update.interruption_reason
+                        update.interruption_reason,
+                        source_attempt_status
                     ],
                 )
                 .map_err(|source| sqlite_error(&database_path, source))?;
@@ -2968,6 +3228,18 @@ impl WorkspaceDatabase {
                     ),
                 });
             }
+        }
+
+        if matches!(
+            update.transition,
+            AgentTaskTransition::Cancel | AgentTaskTransition::Retry
+        ) {
+            transaction
+                .execute(
+                    "DELETE FROM agent_task_dependencies WHERE waiting_task_id = ?1",
+                    params![update.task_id.as_str()],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
         }
 
         let instance_status = match (update.expected_status, target_status) {
@@ -3254,13 +3526,16 @@ impl WorkspaceDatabase {
         transaction
             .execute(
                 "INSERT INTO agent_task_dependencies
-                    (team_id, waiting_task_id, dependency_task_id, wait_mode, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (team_id, waiting_task_id, dependency_task_id, wait_mode,
+                     pending_tool_call_id, deadline_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     dependency.team_id.as_str(),
                     dependency.waiting_task_id.as_str(),
                     dependency.dependency_task_id.as_str(),
                     dependency.wait_mode.as_str(),
+                    dependency.pending_tool_call_id,
+                    dependency.deadline_at,
                     now_timestamp()
                 ],
             )
@@ -3277,7 +3552,8 @@ impl WorkspaceDatabase {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT team_id, waiting_task_id, dependency_task_id, wait_mode, created_at
+                "SELECT team_id, waiting_task_id, dependency_task_id, wait_mode,
+                        pending_tool_call_id, deadline_at, created_at
                  FROM agent_task_dependencies
                  WHERE waiting_task_id = ?1
                  ORDER BY dependency_task_id ASC",
@@ -3290,7 +3566,9 @@ impl WorkspaceDatabase {
                     waiting_task_id: agent_id_from_row(row, 1)?,
                     dependency_task_id: agent_id_from_row(row, 2)?,
                     wait_mode: agent_enum_from_row(row, 3)?,
-                    created_at: row.get(4)?,
+                    pending_tool_call_id: row.get(4)?,
+                    deadline_at: row.get(5)?,
+                    created_at: row.get(6)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -3301,25 +3579,30 @@ impl WorkspaceDatabase {
         &self,
         waiting_task_id: &AgentTaskId,
     ) -> Result<bool, WorkspaceDatabaseError> {
-        let (total, completed, wait_mode): (i64, i64, Option<String>) = self
+        let now = now_timestamp();
+        let (total, ready, expired, wait_mode): (i64, i64, i64, Option<String>) = self
             .connection
             .query_row(
                 "SELECT COUNT(*),
-                        COALESCE(SUM(CASE WHEN task.status = 'completed' THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN task.status IN ('completed', 'failed', 'cancelled', 'interrupted') THEN 1 ELSE 0 END), 0),
+                        COALESCE(MAX(CASE WHEN dependency.deadline_at IS NOT NULL AND dependency.deadline_at <= ?2 THEN 1 ELSE 0 END), 0),
                         MIN(dependency.wait_mode)
                  FROM agent_task_dependencies AS dependency
                  JOIN agent_tasks AS task ON task.id = dependency.dependency_task_id
                  WHERE dependency.waiting_task_id = ?1",
-                params![waiting_task_id.as_str()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                params![waiting_task_id.as_str(), now],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(|source| self.sqlite_error(source))?;
         if total == 0 {
             return Ok(true);
         }
+        if expired > 0 {
+            return Ok(true);
+        }
         Ok(match wait_mode.as_deref() {
-            Some("all") => completed == total,
-            Some("any") => completed > 0,
+            Some("all") => ready == total,
+            Some("any") => ready > 0,
             _ => false,
         })
     }

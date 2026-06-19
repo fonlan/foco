@@ -673,6 +673,20 @@ CREATE INDEX agent_context_entries_owner_idx
 PRAGMA legacy_alter_table = OFF;
 "#;
 
+pub(crate) const MIGRATION_012: &str = r#"
+ALTER TABLE agent_task_dependencies
+    ADD COLUMN pending_tool_call_id TEXT CHECK (pending_tool_call_id IS NULL OR length(pending_tool_call_id) > 0);
+
+ALTER TABLE agent_task_dependencies
+    ADD COLUMN deadline_at TEXT;
+
+DROP INDEX agent_attempts_one_active_per_task_idx;
+
+CREATE UNIQUE INDEX agent_attempts_one_active_per_task_idx
+    ON agent_attempts (task_id)
+    WHERE status = 'running';
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

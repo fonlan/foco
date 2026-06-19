@@ -2,7 +2,7 @@ use serde_json::json;
 
 use crate::{
     AGENT_CANCEL_TASK_TOOL, AGENT_DELEGATE_TASK_TOOL, AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL,
-    AGENT_SEND_MESSAGE_TOOL, ToolDefinition,
+    AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL, AGENT_WAIT_TASKS_TOOL, ToolDefinition,
 };
 
 pub(crate) fn agent_tool_definitions() -> Vec<ToolDefinition> {
@@ -12,6 +12,8 @@ pub(crate) fn agent_tool_definitions() -> Vec<ToolDefinition> {
         agent_send_message_definition(),
         agent_delegate_task_definition(),
         agent_cancel_task_definition(),
+        agent_wait_tasks_definition(),
+        agent_transfer_task_definition(),
     ]
 }
 
@@ -135,7 +137,7 @@ fn agent_delegate_task_definition() -> ToolDefinition {
 fn agent_cancel_task_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_CANCEL_TASK_TOOL,
-        description: "Cancel a queued child task in the current Agent team. Phase 6 supports queued tasks only.",
+        description: "Cancel a queued child task in the current Agent team. Running and waiting task cancellation must use the runtime API.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -150,6 +152,67 @@ fn agent_cancel_task_definition() -> ToolDefinition {
                 }
             },
             "required": ["taskId", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn agent_wait_tasks_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: AGENT_WAIT_TASKS_TOOL,
+        description: "Persistently wait for all specified Agent tasks in the current team, suspend the current run, and resume later with a paired tool result.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "taskIds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": { "type": "string" },
+                    "description": "Agent task ids to wait for. Every task must belong to the current team and be visible to this Agent."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["all"],
+                    "description": "Wait mode. Phase 7 supports all only."
+                },
+                "deadlineMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional relative deadline in milliseconds. Null means no deadline."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["taskIds", "mode", "deadlineMs", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn agent_transfer_task_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: AGENT_TRANSFER_TASK_TOOL,
+        description: "Transfer a queued Agent task to another existing instance in the current team. Running, waiting, and terminal tasks are rejected.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "taskId": {
+                    "type": "string",
+                    "description": "Queued Agent task id to transfer."
+                },
+                "targetInstanceId": {
+                    "type": "string",
+                    "description": "Existing target Agent instance id in the same team."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["taskId", "targetInstanceId", "timeoutMs"]
         }),
         strict: true,
     }

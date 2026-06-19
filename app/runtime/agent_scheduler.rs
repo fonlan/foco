@@ -5,13 +5,13 @@ use foco_agent::{
     AgentRunAssociations, AgentRunOutcome, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
     estimate_text_tokens,
 };
-use foco_providers::{NeutralChatMessage, NeutralChatRole};
+use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
 use foco_store::{
     config::AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS,
     workspace::{
-        AgentContextEntryRecord, AgentInstanceRecord, AgentMessageRecord, AgentTaskRecord,
-        AgentTaskStateUpdate, AgentTeamRecord, NewAgentContextEntry, NewAgentContextSnapshot,
-        NewAgentEvent, WorkspaceDatabase,
+        AgentContextEntryRecord, AgentInstanceRecord, AgentMessageRecord,
+        AgentTaskDependencyRecord, AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord,
+        NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, WorkspaceDatabase,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,7 @@ pub(crate) const AGENT_MAX_QUEUED_TASKS_PER_INSTANCE: i64 = 64;
 pub(crate) const AGENT_MAX_QUEUED_TASKS_PER_CHAT: i64 = 64;
 const AGENT_SCHEDULER_WAKE_CAPACITY: usize = 1;
 const AGENT_SCHEDULER_SCAN_LIMIT: i64 = 64;
+const AGENT_SCHEDULER_DEADLINE_POLL_MS: u64 = 1_000;
 const AGENT_GLOBAL_MAX_CONCURRENT_RUNS: usize = 4;
 const RESTART_INTERRUPTION_REASON: &str = "backend restarted while Agent attempt was active";
 const AGENT_TEAM_PROTOCOL_VERSION: u32 = 1;
@@ -87,6 +88,9 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
     let permits = Arc::new(Semaphore::new(AGENT_GLOBAL_MAX_CONCURRENT_RUNS));
     let mut runs = JoinSet::new();
     let mut shutdown_rx = state.app_shutdown_rx.clone();
+    let mut deadline_tick = tokio::time::interval(std::time::Duration::from_millis(
+        AGENT_SCHEDULER_DEADLINE_POLL_MS,
+    ));
     let mut scan = true;
 
     loop {
@@ -115,6 +119,9 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
                 }
                 scan = true;
             }
+            _ = deadline_tick.tick() => {
+                scan = true;
+            }
         }
     }
 
@@ -135,10 +142,7 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
             .map_err(ApiError::from_workspace_error)?
         {
             let expected_status = record.task.status;
-            if !matches!(
-                expected_status,
-                AgentTaskStatus::Running | AgentTaskStatus::Waiting
-            ) {
+            if expected_status != AgentTaskStatus::Running {
                 continue;
             }
             database
@@ -187,6 +191,20 @@ async fn schedule_runnable_tasks(
             };
             let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
                 .map_err(ApiError::from_workspace_error)?;
+            for resumed_task in database
+                .resume_satisfied_agent_tasks(AGENT_SCHEDULER_SCAN_LIMIT)
+                .map_err(ApiError::from_workspace_error)?
+            {
+                insert_agent_event(
+                    &mut database,
+                    &resumed_task.team_id,
+                    "task_resumed",
+                    Some(&resumed_task.owner_instance_id),
+                    Some(&resumed_task.id),
+                    None,
+                    json!({}),
+                )?;
+            }
             let Some(task) = database
                 .runnable_agent_tasks(AGENT_SCHEDULER_SCAN_LIMIT)
                 .map_err(ApiError::from_workspace_error)?
@@ -434,6 +452,23 @@ fn apply_agent_prompt_layers(
         .into_iter()
         .filter(|message| message.consumed_at.is_none())
         .collect::<Vec<_>>();
+    let wait_dependencies = database
+        .agent_task_dependencies(&task.id)
+        .map_err(ApiError::from_workspace_error)?;
+    let wait_dependency_tasks = wait_dependencies
+        .iter()
+        .map(|dependency| {
+            database
+                .agent_task_for_team(&dependency.team_id, &dependency.dependency_task_id)
+                .map_err(ApiError::from_workspace_error)?
+                .ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "Agent dependency task '{}' was not found",
+                        dependency.dependency_task_id
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     drop(database);
 
     let definition_index = agent_definition_insert_index(chat_context);
@@ -477,7 +512,8 @@ fn apply_agent_prompt_layers(
         );
     }
 
-    let current_task = agent_current_task_prompt(task, attempt_id)?;
+    let current_task =
+        agent_current_task_prompt(task, attempt_id, &wait_dependencies, &wait_dependency_tasks)?;
     let index = chat_context.active_tool_start_index;
     insert_agent_prompt_message(
         chat_context,
@@ -488,6 +524,19 @@ fn apply_agent_prompt_layers(
             sequence: task.sequence,
         },
     );
+
+    for message in agent_wait_resume_messages(&wait_dependencies, &wait_dependency_tasks)? {
+        let index = chat_context.active_tool_start_index;
+        insert_agent_prompt_message(
+            chat_context,
+            index,
+            message,
+            Some(task.sequence),
+            PromptContextSource::AgentCurrentTask {
+                sequence: task.sequence,
+            },
+        );
+    }
 
     let mut run_unread_messages = Vec::with_capacity(unread_messages.len());
     let mut consumed_message_ids = Vec::with_capacity(unread_messages.len());
@@ -605,7 +654,10 @@ fn append_agent_collaboration_tools(
             foco_tools::AGENT_LIST_TOOL
             | foco_tools::AGENT_GET_TASK_TOOL
             | foco_tools::AGENT_SEND_MESSAGE_TOOL => true,
-            foco_tools::AGENT_DELEGATE_TASK_TOOL | foco_tools::AGENT_CANCEL_TASK_TOOL => {
+            foco_tools::AGENT_DELEGATE_TASK_TOOL
+            | foco_tools::AGENT_CANCEL_TASK_TOOL
+            | foco_tools::AGENT_WAIT_TASKS_TOOL
+            | foco_tools::AGENT_TRANSFER_TASK_TOOL => {
                 permissions.collaboration_tool_allowed(AgentCollaborationTool::DelegateTask)
             }
             _ => false,
@@ -722,11 +774,13 @@ fn agent_context_entry_prompt_value(entry: &AgentContextEntryRecord) -> Result<V
 fn agent_current_task_prompt(
     task: &AgentTaskRecord,
     attempt_id: &AgentAttemptId,
+    wait_dependencies: &[AgentTaskDependencyRecord],
+    wait_dependency_tasks: &[AgentTaskRecord],
 ) -> Result<String, ApiError> {
     let input = serde_json::from_str::<Value>(&task.input_json).map_err(|source| {
         ApiError::internal(format!("failed to parse Agent task input: {source}"))
     })?;
-    let current_task = json!({
+    let mut current_task = json!({
         "taskId": task.id.to_string(),
         "teamId": task.team_id.to_string(),
         "ownerInstanceId": task.owner_instance_id.to_string(),
@@ -737,12 +791,170 @@ fn agent_current_task_prompt(
         "status": task.status.as_str(),
         "input": input,
     });
+    if task.result_json.is_some() || task.error_json.is_some() {
+        current_task["previousAttempt"] = agent_previous_attempt_payload(task)?;
+    }
+    if !wait_dependencies.is_empty() {
+        current_task["resume"] =
+            agent_wait_resume_payload(wait_dependencies, wait_dependency_tasks)?;
+    }
     Ok(format!(
         "Foco Agent current task:\n{}",
         serde_json::to_string_pretty(&current_task).map_err(|source| {
             ApiError::internal(format!("failed to serialize Agent current task: {source}"))
         })?
     ))
+}
+
+fn agent_previous_attempt_payload(task: &AgentTaskRecord) -> Result<Value, ApiError> {
+    let result = task
+        .result_json
+        .as_deref()
+        .map(|value| {
+            serde_json::from_str::<Value>(value).map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to parse Agent task previous result: {source}"
+                ))
+            })
+        })
+        .transpose()?;
+    let error = task
+        .error_json
+        .as_deref()
+        .map(|value| {
+            serde_json::from_str::<Value>(value).map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to parse Agent task previous error: {source}"
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(json!({
+        "result": result,
+        "error": error,
+        "completedAt": task.completed_at,
+    }))
+}
+
+fn agent_wait_resume_payload(
+    dependencies: &[AgentTaskDependencyRecord],
+    dependency_tasks: &[AgentTaskRecord],
+) -> Result<Value, ApiError> {
+    let pending_tool_call_id = dependencies
+        .iter()
+        .find_map(|dependency| dependency.pending_tool_call_id.clone());
+    Ok(json!({
+        "kind": "agent_wait_tasks",
+        "pendingToolCallId": pending_tool_call_id,
+        "toolResult": agent_wait_resume_tool_result(dependencies, dependency_tasks)?,
+    }))
+}
+
+fn agent_wait_resume_messages(
+    dependencies: &[AgentTaskDependencyRecord],
+    dependency_tasks: &[AgentTaskRecord],
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    if dependencies.is_empty() {
+        return Ok(Vec::new());
+    }
+    let pending_tool_call_id = dependencies
+        .iter()
+        .find_map(|dependency| dependency.pending_tool_call_id.clone())
+        .ok_or_else(|| {
+            ApiError::internal("Agent wait dependency is missing pending tool call id")
+        })?;
+    let mode = dependencies
+        .first()
+        .map(|dependency| dependency.wait_mode.as_str())
+        .ok_or_else(|| ApiError::internal("Agent wait dependency list is empty"))?;
+    let task_ids = dependencies
+        .iter()
+        .map(|dependency| dependency.dependency_task_id.to_string())
+        .collect::<Vec<_>>();
+    let tool_result = agent_wait_resume_tool_result(dependencies, dependency_tasks)?;
+    let tool_result_content = serde_json::to_string(&tool_result).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize Agent wait tool result: {source}"
+        ))
+    })?;
+    Ok(vec![
+        NeutralChatMessage {
+            role: NeutralChatRole::Assistant,
+            content: String::new(),
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: vec![NeutralToolCall {
+                call_id: pending_tool_call_id.clone(),
+                name: foco_tools::AGENT_WAIT_TASKS_TOOL.to_string(),
+                arguments: json!({
+                    "taskIds": task_ids,
+                    "mode": mode,
+                    "deadlineMs": null,
+                    "timeoutMs": null,
+                }),
+                thought_signatures: None,
+            }],
+            tool_call_id: None,
+            tool_name: None,
+        },
+        NeutralChatMessage {
+            role: NeutralChatRole::Tool,
+            content: tool_result_content,
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: Some(pending_tool_call_id),
+            tool_name: Some(foco_tools::AGENT_WAIT_TASKS_TOOL.to_string()),
+        },
+    ])
+}
+
+fn agent_wait_resume_tool_result(
+    dependencies: &[AgentTaskDependencyRecord],
+    dependency_tasks: &[AgentTaskRecord],
+) -> Result<Value, ApiError> {
+    let deadline_at = dependencies
+        .iter()
+        .find_map(|dependency| dependency.deadline_at.clone());
+    let dependency_values = dependencies
+        .iter()
+        .map(|dependency| {
+            let task = dependency_tasks
+                .iter()
+                .find(|task| task.id == dependency.dependency_task_id)
+                .ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "Agent dependency task '{}' was not found",
+                        dependency.dependency_task_id
+                    ))
+                })?;
+            Ok(json!({
+                "taskId": task.id.to_string(),
+                "status": task.status.as_str(),
+                "result": agent_optional_json(task.result_json.as_deref(), "Agent dependency task result")?,
+                "error": agent_optional_json(task.error_json.as_deref(), "Agent dependency task error")?,
+                "completedAt": task.completed_at,
+            }))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    Ok(json!({
+        "waiting": false,
+        "mode": dependencies.first().map(|dependency| dependency.wait_mode.as_str()),
+        "deadlineAt": deadline_at,
+        "dependencies": dependency_values,
+    }))
+}
+
+fn agent_optional_json(
+    value: Option<&str>,
+    label: &'static str,
+) -> Result<Option<Value>, ApiError> {
+    value
+        .map(|value| {
+            serde_json::from_str::<Value>(value)
+                .map_err(|source| ApiError::internal(format!("failed to parse {label}: {source}")))
+        })
+        .transpose()
 }
 
 fn agent_message_payload(message: &AgentMessageRecord) -> Value {
