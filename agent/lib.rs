@@ -1,6 +1,653 @@
-use std::fmt;
+use std::{fmt, str::FromStr};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+macro_rules! define_agent_id {
+    ($name:ident, $kind:expr, $prefix:literal) => {
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
+
+        impl $name {
+            pub const PREFIX: &'static str = $prefix;
+
+            pub fn new(value: impl Into<String>) -> Result<Self, AgentDomainError> {
+                let value = value.into();
+                validate_agent_id($kind, Self::PREFIX, &value)?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = AgentDomainError;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = AgentDomainError;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
+}
+
+define_agent_id!(
+    AgentDefinitionId,
+    AgentEntityKind::Definition,
+    "agent-definition-"
+);
+define_agent_id!(AgentTeamId, AgentEntityKind::Team, "agent-team-");
+define_agent_id!(
+    AgentInstanceId,
+    AgentEntityKind::Instance,
+    "agent-instance-"
+);
+define_agent_id!(AgentTaskId, AgentEntityKind::Task, "agent-task-");
+define_agent_id!(AgentMessageId, AgentEntityKind::Message, "agent-message-");
+define_agent_id!(AgentAttemptId, AgentEntityKind::Attempt, "agent-attempt-");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEntityKind {
+    Definition,
+    Team,
+    Instance,
+    Task,
+    Message,
+    Attempt,
+}
+
+impl fmt::Display for AgentEntityKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Definition => "agent_definition",
+            Self::Team => "agent_team",
+            Self::Instance => "agent_instance",
+            Self::Task => "agent_task",
+            Self::Message => "agent_message",
+            Self::Attempt => "agent_attempt",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentRole {
+    Coordinator,
+    Worker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentInstanceStatus {
+    Idle,
+    Running,
+    Waiting,
+    Paused,
+    Draining,
+    Stopped,
+    Failed,
+}
+
+impl AgentInstanceStatus {
+    pub fn transition_to(self, target: Self) -> Result<Self, AgentDomainError> {
+        let allowed = matches!(
+            (self, target),
+            (Self::Idle, Self::Running)
+                | (Self::Idle, Self::Paused)
+                | (Self::Idle, Self::Draining)
+                | (Self::Idle, Self::Stopped)
+                | (Self::Idle, Self::Failed)
+                | (Self::Running, Self::Idle)
+                | (Self::Running, Self::Waiting)
+                | (Self::Running, Self::Paused)
+                | (Self::Running, Self::Draining)
+                | (Self::Running, Self::Stopped)
+                | (Self::Running, Self::Failed)
+                | (Self::Waiting, Self::Running)
+                | (Self::Waiting, Self::Paused)
+                | (Self::Waiting, Self::Draining)
+                | (Self::Waiting, Self::Stopped)
+                | (Self::Waiting, Self::Failed)
+                | (Self::Paused, Self::Idle)
+                | (Self::Paused, Self::Draining)
+                | (Self::Paused, Self::Stopped)
+                | (Self::Paused, Self::Failed)
+                | (Self::Draining, Self::Stopped)
+                | (Self::Draining, Self::Failed)
+                | (Self::Failed, Self::Idle)
+                | (Self::Failed, Self::Stopped)
+        );
+
+        if allowed {
+            Ok(target)
+        } else {
+            Err(AgentDomainError::invalid_state_transition(
+                AgentEntityKind::Instance,
+                status_name(self),
+                status_name(target),
+            ))
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        self == Self::Stopped
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTaskStatus {
+    Queued,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTaskTransition {
+    Start,
+    Wait,
+    Resume,
+    Complete,
+    Fail,
+    Cancel,
+    Interrupt,
+    Retry,
+}
+
+impl AgentTaskStatus {
+    pub fn apply(self, transition: AgentTaskTransition) -> Result<Self, AgentDomainError> {
+        let target = match (self, transition) {
+            (Self::Queued, AgentTaskTransition::Start) => Self::Running,
+            (Self::Queued, AgentTaskTransition::Cancel) => Self::Cancelled,
+            (Self::Running, AgentTaskTransition::Wait) => Self::Waiting,
+            (Self::Running, AgentTaskTransition::Complete) => Self::Completed,
+            (Self::Running, AgentTaskTransition::Fail) => Self::Failed,
+            (Self::Running, AgentTaskTransition::Cancel) => Self::Cancelled,
+            (Self::Running, AgentTaskTransition::Interrupt) => Self::Interrupted,
+            (Self::Waiting, AgentTaskTransition::Resume) => Self::Running,
+            (Self::Waiting, AgentTaskTransition::Fail) => Self::Failed,
+            (Self::Waiting, AgentTaskTransition::Cancel) => Self::Cancelled,
+            (Self::Waiting, AgentTaskTransition::Interrupt) => Self::Interrupted,
+            (Self::Failed | Self::Cancelled | Self::Interrupted, AgentTaskTransition::Retry) => {
+                Self::Queued
+            }
+            _ => {
+                return Err(AgentDomainError::invalid_state_transition(
+                    AgentEntityKind::Task,
+                    status_name(self),
+                    task_transition_name(transition),
+                ));
+            }
+        };
+
+        Ok(target)
+    }
+
+    pub fn holds_queue_head(self) -> bool {
+        matches!(self, Self::Queued | Self::Running | Self::Waiting)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentAttemptStatus {
+    Running,
+    Suspended,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentAttemptTransition {
+    Suspend,
+    Resume,
+    Complete,
+    Fail,
+    Cancel,
+    Interrupt,
+}
+
+impl AgentAttemptStatus {
+    pub fn apply(self, transition: AgentAttemptTransition) -> Result<Self, AgentDomainError> {
+        let target = match (self, transition) {
+            (Self::Running, AgentAttemptTransition::Suspend) => Self::Suspended,
+            (Self::Running, AgentAttemptTransition::Complete) => Self::Completed,
+            (Self::Running, AgentAttemptTransition::Fail) => Self::Failed,
+            (Self::Running, AgentAttemptTransition::Cancel) => Self::Cancelled,
+            (Self::Running, AgentAttemptTransition::Interrupt) => Self::Interrupted,
+            (Self::Suspended, AgentAttemptTransition::Resume) => Self::Running,
+            (Self::Suspended, AgentAttemptTransition::Fail) => Self::Failed,
+            (Self::Suspended, AgentAttemptTransition::Cancel) => Self::Cancelled,
+            (Self::Suspended, AgentAttemptTransition::Interrupt) => Self::Interrupted,
+            _ => {
+                return Err(AgentDomainError::invalid_state_transition(
+                    AgentEntityKind::Attempt,
+                    status_name(self),
+                    attempt_transition_name(transition),
+                ));
+            }
+        };
+
+        Ok(target)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Interrupted
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ChatAgentMode {
+    #[default]
+    SingleAgent,
+    Team {
+        #[serde(rename = "teamId")]
+        team_id: AgentTeamId,
+        #[serde(rename = "coordinatorInstanceId")]
+        coordinator_instance_id: AgentInstanceId,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChatModelAuthority {
+    ChatSelection,
+    CoordinatorSnapshot,
+}
+
+impl ChatAgentMode {
+    pub fn model_authority(&self) -> ChatModelAuthority {
+        match self {
+            Self::SingleAgent => ChatModelAuthority::ChatSelection,
+            Self::Team { .. } => ChatModelAuthority::CoordinatorSnapshot,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TeamActivationRequest {
+    pub coordinator_definition_id: AgentDefinitionId,
+}
+
+impl TeamActivationRequest {
+    pub fn validate_definition(&self, definition_is_valid: bool) -> Result<(), AgentDomainError> {
+        if definition_is_valid {
+            Ok(())
+        } else {
+            Err(AgentDomainError::missing_coordinator_definition(
+                self.coordinator_definition_id.clone(),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamWorkload {
+    pub queued_tasks: u32,
+    pub running_tasks: u32,
+    pub waiting_tasks: u32,
+}
+
+impl TeamWorkload {
+    pub fn validate_deactivation(self) -> Result<(), AgentDomainError> {
+        if self.queued_tasks == 0 && self.running_tasks == 0 && self.waiting_tasks == 0 {
+            Ok(())
+        } else {
+            Err(AgentDomainError::team_busy(self))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentRuntimeDeleteAction {
+    Cascade,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LlmRequestDeleteAction {
+    SetChatAndAgentReferencesNull,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChatAgentDeletionPolicy {
+    pub runtime: AgentRuntimeDeleteAction,
+    pub llm_requests: LlmRequestDeleteAction,
+}
+
+pub const CHAT_AGENT_DELETION_POLICY: ChatAgentDeletionPolicy = ChatAgentDeletionPolicy {
+    runtime: AgentRuntimeDeleteAction::Cascade,
+    llm_requests: LlmRequestDeleteAction::SetChatAndAgentReferencesNull,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDomainErrorCode {
+    InvalidId,
+    InvalidStateTransition,
+    MissingCoordinatorDefinition,
+    TeamBusy,
+    QueueConflict,
+    InstanceLimitExceeded,
+    DependencyCycle,
+    MutationLeaseConflict,
+    CrossTeamReference,
+    PermissionDenied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDomainErrorPhase {
+    Contract,
+    Config,
+    Store,
+    Scheduler,
+    Execution,
+    Tool,
+    Api,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentErrorDiagnostics {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity: Option<AgentEntityKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entity_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_transition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued_tasks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub running_tasks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_tasks: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configured_limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentDomainError {
+    code: AgentDomainErrorCode,
+    phase: AgentDomainErrorPhase,
+    message: String,
+    retryable: bool,
+    diagnostics: Box<AgentErrorDiagnostics>,
+}
+
+impl AgentDomainError {
+    pub fn code(&self) -> AgentDomainErrorCode {
+        self.code
+    }
+
+    pub fn phase(&self) -> AgentDomainErrorPhase {
+        self.phase
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    pub fn diagnostics(&self) -> &AgentErrorDiagnostics {
+        &self.diagnostics
+    }
+
+    pub fn queue_conflict(instance_id: AgentInstanceId) -> Self {
+        Self {
+            code: AgentDomainErrorCode::QueueConflict,
+            phase: AgentDomainErrorPhase::Scheduler,
+            message: "agent instance already has an active queue-head task".to_string(),
+            retryable: true,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                entity: Some(AgentEntityKind::Instance),
+                entity_id: Some(instance_id.to_string()),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+
+    pub fn instance_limit_exceeded(configured_limit: u32) -> Self {
+        Self {
+            code: AgentDomainErrorCode::InstanceLimitExceeded,
+            phase: AgentDomainErrorPhase::Scheduler,
+            message: "agent instance limit exceeded".to_string(),
+            retryable: false,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                configured_limit: Some(configured_limit),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+
+    pub fn dependency_cycle(task_id: AgentTaskId) -> Self {
+        Self {
+            code: AgentDomainErrorCode::DependencyCycle,
+            phase: AgentDomainErrorPhase::Store,
+            message: "agent task dependency would create a cycle".to_string(),
+            retryable: false,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                entity: Some(AgentEntityKind::Task),
+                entity_id: Some(task_id.to_string()),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+
+    pub fn mutation_lease_conflict(instance_id: AgentInstanceId) -> Self {
+        Self {
+            code: AgentDomainErrorCode::MutationLeaseConflict,
+            phase: AgentDomainErrorPhase::Tool,
+            message: "workspace mutation lease is held by another agent instance".to_string(),
+            retryable: true,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                entity: Some(AgentEntityKind::Instance),
+                entity_id: Some(instance_id.to_string()),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+
+    pub fn cross_team_reference(entity: AgentEntityKind, entity_id: impl Into<String>) -> Self {
+        Self {
+            code: AgentDomainErrorCode::CrossTeamReference,
+            phase: AgentDomainErrorPhase::Store,
+            message: "agent entity belongs to a different team".to_string(),
+            retryable: false,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                entity: Some(entity),
+                entity_id: Some(entity_id.into()),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+
+    pub fn permission_denied(entity: AgentEntityKind, entity_id: impl Into<String>) -> Self {
+        Self {
+            code: AgentDomainErrorCode::PermissionDenied,
+            phase: AgentDomainErrorPhase::Execution,
+            message: "agent is not permitted to perform this operation".to_string(),
+            retryable: false,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                entity: Some(entity),
+                entity_id: Some(entity_id.into()),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+
+    fn invalid_id(entity: AgentEntityKind, expected_prefix: &str) -> Self {
+        Self {
+            code: AgentDomainErrorCode::InvalidId,
+            phase: AgentDomainErrorPhase::Contract,
+            message: format!(
+                "{entity} id must start with '{expected_prefix}' and contain only lowercase ASCII letters, digits, or hyphens"
+            ),
+            retryable: false,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                entity: Some(entity),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+
+    fn invalid_state_transition(
+        entity: AgentEntityKind,
+        from_state: impl Into<String>,
+        requested_transition: impl Into<String>,
+    ) -> Self {
+        Self {
+            code: AgentDomainErrorCode::InvalidStateTransition,
+            phase: AgentDomainErrorPhase::Contract,
+            message: format!("invalid {entity} state transition"),
+            retryable: false,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                entity: Some(entity),
+                from_state: Some(from_state.into()),
+                requested_transition: Some(requested_transition.into()),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+
+    fn missing_coordinator_definition(definition_id: AgentDefinitionId) -> Self {
+        Self {
+            code: AgentDomainErrorCode::MissingCoordinatorDefinition,
+            phase: AgentDomainErrorPhase::Config,
+            message: "team mode requires an existing valid coordinator agent definition"
+                .to_string(),
+            retryable: false,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                entity: Some(AgentEntityKind::Definition),
+                entity_id: Some(definition_id.to_string()),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+
+    fn team_busy(workload: TeamWorkload) -> Self {
+        Self {
+            code: AgentDomainErrorCode::TeamBusy,
+            phase: AgentDomainErrorPhase::Scheduler,
+            message: "team cannot be deactivated while queued, running, or waiting tasks exist"
+                .to_string(),
+            retryable: false,
+            diagnostics: Box::new(AgentErrorDiagnostics {
+                queued_tasks: Some(workload.queued_tasks),
+                running_tasks: Some(workload.running_tasks),
+                waiting_tasks: Some(workload.waiting_tasks),
+                ..AgentErrorDiagnostics::default()
+            }),
+        }
+    }
+}
+
+impl fmt::Display for AgentDomainError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AgentDomainError {}
+
+fn validate_agent_id(
+    entity: AgentEntityKind,
+    expected_prefix: &str,
+    value: &str,
+) -> Result<(), AgentDomainError> {
+    let suffix = value
+        .strip_prefix(expected_prefix)
+        .filter(|suffix| !suffix.is_empty());
+    let valid = value.len() <= 128
+        && suffix.is_some_and(|suffix| {
+            suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        });
+
+    if valid {
+        Ok(())
+    } else {
+        Err(AgentDomainError::invalid_id(entity, expected_prefix))
+    }
+}
+
+fn status_name<T: Serialize>(status: T) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn task_transition_name(transition: AgentTaskTransition) -> &'static str {
+    match transition {
+        AgentTaskTransition::Start => "start",
+        AgentTaskTransition::Wait => "wait",
+        AgentTaskTransition::Resume => "resume",
+        AgentTaskTransition::Complete => "complete",
+        AgentTaskTransition::Fail => "fail",
+        AgentTaskTransition::Cancel => "cancel",
+        AgentTaskTransition::Interrupt => "interrupt",
+        AgentTaskTransition::Retry => "retry",
+    }
+}
+
+fn attempt_transition_name(transition: AgentAttemptTransition) -> &'static str {
+    match transition {
+        AgentAttemptTransition::Suspend => "suspend",
+        AgentAttemptTransition::Resume => "resume",
+        AgentAttemptTransition::Complete => "complete",
+        AgentAttemptTransition::Fail => "fail",
+        AgentAttemptTransition::Cancel => "cancel",
+        AgentAttemptTransition::Interrupt => "interrupt",
+    }
+}
 
 const ESTIMATED_CHARS_PER_TOKEN: u64 = 4;
 const DEFAULT_CONTEXT_SAFETY_TOKENS: u64 = 256;
@@ -892,6 +1539,392 @@ impl fmt::Display for ToolResourceAccess {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn agent_ids_use_validated_prefixed_string_serialization() {
+        let definition = AgentDefinitionId::new("agent-definition-1700000000000-1")
+            .expect("valid definition id");
+        assert_eq!(
+            serde_json::to_value(&definition).expect("serialize definition id"),
+            json!("agent-definition-1700000000000-1")
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentDefinitionId>(json!("agent-definition-1700000000000-1"))
+                .expect("deserialize definition id"),
+            definition
+        );
+
+        for invalid in [
+            "definition-1",
+            "agent-definition-",
+            "agent-definition-UPPER",
+            "agent-definition-with_underscore",
+        ] {
+            let error = AgentDefinitionId::new(invalid).expect_err("invalid definition id");
+            assert_eq!(error.code(), AgentDomainErrorCode::InvalidId);
+            assert_eq!(error.phase(), AgentDomainErrorPhase::Contract);
+            assert!(!error.retryable());
+        }
+    }
+
+    #[test]
+    fn all_agent_id_types_have_distinct_stable_prefixes() {
+        assert_eq!(AgentDefinitionId::PREFIX, "agent-definition-");
+        assert_eq!(AgentTeamId::PREFIX, "agent-team-");
+        assert_eq!(AgentInstanceId::PREFIX, "agent-instance-");
+        assert_eq!(AgentTaskId::PREFIX, "agent-task-");
+        assert_eq!(AgentMessageId::PREFIX, "agent-message-");
+        assert_eq!(AgentAttemptId::PREFIX, "agent-attempt-");
+    }
+
+    #[test]
+    fn instance_state_transitions_match_the_frozen_matrix() {
+        let statuses = [
+            AgentInstanceStatus::Idle,
+            AgentInstanceStatus::Running,
+            AgentInstanceStatus::Waiting,
+            AgentInstanceStatus::Paused,
+            AgentInstanceStatus::Draining,
+            AgentInstanceStatus::Stopped,
+            AgentInstanceStatus::Failed,
+        ];
+        let allowed = [
+            (AgentInstanceStatus::Idle, AgentInstanceStatus::Running),
+            (AgentInstanceStatus::Idle, AgentInstanceStatus::Paused),
+            (AgentInstanceStatus::Idle, AgentInstanceStatus::Draining),
+            (AgentInstanceStatus::Idle, AgentInstanceStatus::Stopped),
+            (AgentInstanceStatus::Idle, AgentInstanceStatus::Failed),
+            (AgentInstanceStatus::Running, AgentInstanceStatus::Idle),
+            (AgentInstanceStatus::Running, AgentInstanceStatus::Waiting),
+            (AgentInstanceStatus::Running, AgentInstanceStatus::Paused),
+            (AgentInstanceStatus::Running, AgentInstanceStatus::Draining),
+            (AgentInstanceStatus::Running, AgentInstanceStatus::Stopped),
+            (AgentInstanceStatus::Running, AgentInstanceStatus::Failed),
+            (AgentInstanceStatus::Waiting, AgentInstanceStatus::Running),
+            (AgentInstanceStatus::Waiting, AgentInstanceStatus::Paused),
+            (AgentInstanceStatus::Waiting, AgentInstanceStatus::Draining),
+            (AgentInstanceStatus::Waiting, AgentInstanceStatus::Stopped),
+            (AgentInstanceStatus::Waiting, AgentInstanceStatus::Failed),
+            (AgentInstanceStatus::Paused, AgentInstanceStatus::Idle),
+            (AgentInstanceStatus::Paused, AgentInstanceStatus::Draining),
+            (AgentInstanceStatus::Paused, AgentInstanceStatus::Stopped),
+            (AgentInstanceStatus::Paused, AgentInstanceStatus::Failed),
+            (AgentInstanceStatus::Draining, AgentInstanceStatus::Stopped),
+            (AgentInstanceStatus::Draining, AgentInstanceStatus::Failed),
+            (AgentInstanceStatus::Failed, AgentInstanceStatus::Idle),
+            (AgentInstanceStatus::Failed, AgentInstanceStatus::Stopped),
+        ];
+
+        for from in statuses {
+            for to in statuses {
+                let result = from.transition_to(to);
+                assert_eq!(
+                    result.is_ok(),
+                    allowed.contains(&(from, to)),
+                    "unexpected instance transition {from:?} -> {to:?}"
+                );
+                if let Err(error) = result {
+                    assert_eq!(error.code(), AgentDomainErrorCode::InvalidStateTransition);
+                }
+            }
+        }
+
+        assert!(AgentInstanceStatus::Stopped.is_terminal());
+        assert!(!AgentInstanceStatus::Failed.is_terminal());
+    }
+
+    #[test]
+    fn task_state_transitions_require_explicit_retry() {
+        let transitions = [
+            AgentTaskTransition::Start,
+            AgentTaskTransition::Wait,
+            AgentTaskTransition::Resume,
+            AgentTaskTransition::Complete,
+            AgentTaskTransition::Fail,
+            AgentTaskTransition::Cancel,
+            AgentTaskTransition::Interrupt,
+            AgentTaskTransition::Retry,
+        ];
+        let cases = [
+            (
+                AgentTaskStatus::Queued,
+                AgentTaskTransition::Start,
+                AgentTaskStatus::Running,
+            ),
+            (
+                AgentTaskStatus::Queued,
+                AgentTaskTransition::Cancel,
+                AgentTaskStatus::Cancelled,
+            ),
+            (
+                AgentTaskStatus::Running,
+                AgentTaskTransition::Wait,
+                AgentTaskStatus::Waiting,
+            ),
+            (
+                AgentTaskStatus::Running,
+                AgentTaskTransition::Complete,
+                AgentTaskStatus::Completed,
+            ),
+            (
+                AgentTaskStatus::Running,
+                AgentTaskTransition::Fail,
+                AgentTaskStatus::Failed,
+            ),
+            (
+                AgentTaskStatus::Running,
+                AgentTaskTransition::Cancel,
+                AgentTaskStatus::Cancelled,
+            ),
+            (
+                AgentTaskStatus::Running,
+                AgentTaskTransition::Interrupt,
+                AgentTaskStatus::Interrupted,
+            ),
+            (
+                AgentTaskStatus::Waiting,
+                AgentTaskTransition::Resume,
+                AgentTaskStatus::Running,
+            ),
+            (
+                AgentTaskStatus::Waiting,
+                AgentTaskTransition::Fail,
+                AgentTaskStatus::Failed,
+            ),
+            (
+                AgentTaskStatus::Waiting,
+                AgentTaskTransition::Cancel,
+                AgentTaskStatus::Cancelled,
+            ),
+            (
+                AgentTaskStatus::Waiting,
+                AgentTaskTransition::Interrupt,
+                AgentTaskStatus::Interrupted,
+            ),
+            (
+                AgentTaskStatus::Failed,
+                AgentTaskTransition::Retry,
+                AgentTaskStatus::Queued,
+            ),
+            (
+                AgentTaskStatus::Cancelled,
+                AgentTaskTransition::Retry,
+                AgentTaskStatus::Queued,
+            ),
+            (
+                AgentTaskStatus::Interrupted,
+                AgentTaskTransition::Retry,
+                AgentTaskStatus::Queued,
+            ),
+        ];
+        let statuses = [
+            AgentTaskStatus::Queued,
+            AgentTaskStatus::Running,
+            AgentTaskStatus::Waiting,
+            AgentTaskStatus::Completed,
+            AgentTaskStatus::Failed,
+            AgentTaskStatus::Cancelled,
+            AgentTaskStatus::Interrupted,
+        ];
+
+        for status in statuses {
+            for transition in transitions {
+                let expected = cases.iter().find_map(|(from, action, to)| {
+                    (*from == status && *action == transition).then_some(*to)
+                });
+                let result = status.apply(transition);
+                assert_eq!(
+                    result.ok(),
+                    expected,
+                    "unexpected task transition {status:?} via {transition:?}"
+                );
+            }
+        }
+
+        assert!(AgentTaskStatus::Waiting.holds_queue_head());
+        assert!(AgentTaskStatus::Queued.holds_queue_head());
+        assert!(!AgentTaskStatus::Failed.holds_queue_head());
+        assert!(AgentTaskStatus::Interrupted.is_terminal());
+        assert!(
+            AgentTaskStatus::Interrupted
+                .apply(AgentTaskTransition::Start)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn attempt_state_transitions_match_the_frozen_matrix() {
+        let transitions = [
+            AgentAttemptTransition::Suspend,
+            AgentAttemptTransition::Resume,
+            AgentAttemptTransition::Complete,
+            AgentAttemptTransition::Fail,
+            AgentAttemptTransition::Cancel,
+            AgentAttemptTransition::Interrupt,
+        ];
+        let cases = [
+            (
+                AgentAttemptStatus::Running,
+                AgentAttemptTransition::Suspend,
+                AgentAttemptStatus::Suspended,
+            ),
+            (
+                AgentAttemptStatus::Running,
+                AgentAttemptTransition::Complete,
+                AgentAttemptStatus::Completed,
+            ),
+            (
+                AgentAttemptStatus::Running,
+                AgentAttemptTransition::Fail,
+                AgentAttemptStatus::Failed,
+            ),
+            (
+                AgentAttemptStatus::Running,
+                AgentAttemptTransition::Cancel,
+                AgentAttemptStatus::Cancelled,
+            ),
+            (
+                AgentAttemptStatus::Running,
+                AgentAttemptTransition::Interrupt,
+                AgentAttemptStatus::Interrupted,
+            ),
+            (
+                AgentAttemptStatus::Suspended,
+                AgentAttemptTransition::Resume,
+                AgentAttemptStatus::Running,
+            ),
+            (
+                AgentAttemptStatus::Suspended,
+                AgentAttemptTransition::Fail,
+                AgentAttemptStatus::Failed,
+            ),
+            (
+                AgentAttemptStatus::Suspended,
+                AgentAttemptTransition::Cancel,
+                AgentAttemptStatus::Cancelled,
+            ),
+            (
+                AgentAttemptStatus::Suspended,
+                AgentAttemptTransition::Interrupt,
+                AgentAttemptStatus::Interrupted,
+            ),
+        ];
+        let statuses = [
+            AgentAttemptStatus::Running,
+            AgentAttemptStatus::Suspended,
+            AgentAttemptStatus::Completed,
+            AgentAttemptStatus::Failed,
+            AgentAttemptStatus::Cancelled,
+            AgentAttemptStatus::Interrupted,
+        ];
+
+        for status in statuses {
+            for transition in transitions {
+                let expected = cases.iter().find_map(|(from, action, to)| {
+                    (*from == status && *action == transition).then_some(*to)
+                });
+                assert_eq!(
+                    status.apply(transition).ok(),
+                    expected,
+                    "unexpected attempt transition {status:?} via {transition:?}"
+                );
+            }
+        }
+
+        assert!(AgentAttemptStatus::Completed.is_terminal());
+        assert!(!AgentAttemptStatus::Suspended.is_terminal());
+    }
+
+    #[test]
+    fn chat_mode_contract_preserves_single_agent_compatibility() {
+        let mode = ChatAgentMode::default();
+        assert_eq!(mode, ChatAgentMode::SingleAgent);
+        assert_eq!(mode.model_authority(), ChatModelAuthority::ChatSelection);
+
+        let team_mode = ChatAgentMode::Team {
+            team_id: AgentTeamId::new("agent-team-1").expect("team id"),
+            coordinator_instance_id: AgentInstanceId::new("agent-instance-1").expect("instance id"),
+        };
+        assert_eq!(
+            team_mode.model_authority(),
+            ChatModelAuthority::CoordinatorSnapshot
+        );
+        assert_eq!(
+            serde_json::to_value(team_mode).expect("serialize team mode"),
+            json!({
+                "mode": "team",
+                "teamId": "agent-team-1",
+                "coordinatorInstanceId": "agent-instance-1"
+            })
+        );
+        assert_eq!(json!(AgentRole::Coordinator), json!("coordinator"));
+    }
+
+    #[test]
+    fn team_activation_deactivation_and_deletion_are_explicit() {
+        let activation = TeamActivationRequest {
+            coordinator_definition_id: AgentDefinitionId::new("agent-definition-1")
+                .expect("definition id"),
+        };
+        activation
+            .validate_definition(true)
+            .expect("valid coordinator definition");
+        let missing = activation
+            .validate_definition(false)
+            .expect_err("missing coordinator definition");
+        assert_eq!(
+            missing.code(),
+            AgentDomainErrorCode::MissingCoordinatorDefinition
+        );
+
+        TeamWorkload::default()
+            .validate_deactivation()
+            .expect("idle team can be deactivated");
+        let busy = TeamWorkload {
+            queued_tasks: 1,
+            running_tasks: 1,
+            waiting_tasks: 1,
+        }
+        .validate_deactivation()
+        .expect_err("busy team");
+        assert_eq!(busy.code(), AgentDomainErrorCode::TeamBusy);
+        assert_eq!(busy.diagnostics().queued_tasks, Some(1));
+
+        assert_eq!(
+            CHAT_AGENT_DELETION_POLICY,
+            ChatAgentDeletionPolicy {
+                runtime: AgentRuntimeDeleteAction::Cascade,
+                llm_requests: LlmRequestDeleteAction::SetChatAndAgentReferencesNull,
+            }
+        );
+    }
+
+    #[test]
+    fn domain_errors_have_structured_non_sensitive_fields() {
+        let error = AgentDomainError::mutation_lease_conflict(
+            AgentInstanceId::new("agent-instance-1").expect("instance id"),
+        );
+        assert_eq!(error.code(), AgentDomainErrorCode::MutationLeaseConflict);
+        assert_eq!(error.phase(), AgentDomainErrorPhase::Tool);
+        assert!(error.retryable());
+        assert_eq!(
+            error.message(),
+            "workspace mutation lease is held by another agent instance"
+        );
+        assert_eq!(
+            serde_json::to_value(error).expect("serialize domain error"),
+            json!({
+                "code": "mutation_lease_conflict",
+                "phase": "tool",
+                "message": "workspace mutation lease is held by another agent instance",
+                "retryable": true,
+                "diagnostics": {
+                    "entity": "instance",
+                    "entityId": "agent-instance-1"
+                }
+            })
+        );
+    }
 
     #[test]
     fn system_prompt_includes_static_agent_and_tool_rules_without_workspace_metadata() {
