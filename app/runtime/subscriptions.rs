@@ -78,7 +78,7 @@ impl ChatRunCancellation {
         let (tx, _rx) = watch::channel(false);
         Self {
             tx,
-            tool_token: ToolCancellationToken::new(),
+            tool_token: ToolCancellationToken::default(),
         }
     }
 

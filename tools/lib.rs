@@ -116,10 +116,6 @@ pub struct ToolCancellationToken {
 }
 
 impl ToolCancellationToken {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
     }
@@ -1744,7 +1740,7 @@ mod tests {
     #[test]
     fn sleep_tool_stops_when_cancelled() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let cancellation_token = ToolCancellationToken::new();
+        let cancellation_token = ToolCancellationToken::default();
         cancellation_token.cancel();
 
         let result = execute_builtin_tool_for_chat_with_cancellation(

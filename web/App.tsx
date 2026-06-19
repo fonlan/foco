@@ -1159,7 +1159,14 @@ export function App() {
     }
 
     let isCurrent = true;
-    const token = createNativeBrowserToken();
+    let token: string;
+    try {
+      token = createNativeBrowserToken();
+    } catch (error) {
+      console.error(error);
+      setNativeBrowserToken(null);
+      return;
+    }
     setNativeBrowserToken(null);
 
     void probeNativeBrowser(probePort, token).then((available) => {
@@ -4557,9 +4564,7 @@ export function App() {
   }
 
   async function runChatMessage(request: RetryRunRequest): Promise<string | null> {
-    const runKey =
-      globalThis.crypto?.randomUUID?.() ??
-      `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const runKey = localRandomId();
     const pendingUserMessageId = request.pendingUserMessageId ?? null;
     const localUserId = pendingUserMessageId ?? `local-user-${runKey}`;
     const localAssistantId = `local-assistant-${runKey}`;
@@ -18265,7 +18270,7 @@ function upsertHookHandlerInConfig(
   const nextConfig = cloneHookConfig(config);
   const event = form.event;
   const nextHandler = hookHandlerFromForm(form);
-  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const groups = hookGroupsForEvent(nextConfig, event);
   const existingGroupIndex =
     form.groupIndex !== null && form.event === event ? form.groupIndex : null;
   const groupIndex =
@@ -18350,7 +18355,7 @@ function deleteHookHandlerFromConfig(
   handlerIndex: number,
 ): HookConfig {
   const nextConfig = cloneHookConfig(config);
-  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const groups = hookGroupsForEvent(nextConfig, event);
   const group = groups[groupIndex];
   if (!group) {
     return nextConfig;
@@ -18371,7 +18376,7 @@ function updateHookGroupInConfig(
   patch: Partial<HookMatcherGroup>,
 ): HookConfig {
   const nextConfig = cloneHookConfig(config);
-  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const groups = hookGroupsForEvent(nextConfig, event);
   if (groups[groupIndex]) {
     groups[groupIndex] = { ...groups[groupIndex], ...patch };
   }
@@ -18387,7 +18392,7 @@ function updateHookHandlerInConfig(
   patch: Partial<HookHandler>,
 ): HookConfig {
   const nextConfig = cloneHookConfig(config);
-  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const groups = hookGroupsForEvent(nextConfig, event);
   const handler = groups[groupIndex]?.hooks[handlerIndex];
   if (handler) {
     groups[groupIndex].hooks[handlerIndex] = { ...handler, ...patch };
@@ -18403,7 +18408,7 @@ function moveHookGroupInConfig(
   direction: -1 | 1,
 ): HookConfig {
   const nextConfig = cloneHookConfig(config);
-  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const groups = hookGroupsForEvent(nextConfig, event);
   const targetIndex = groupIndex + direction;
   if (!groups[groupIndex] || targetIndex < 0 || targetIndex >= groups.length) {
     return nextConfig;
@@ -18424,7 +18429,7 @@ function moveHookHandlerInConfig(
   direction: -1 | 1,
 ): HookConfig {
   const nextConfig = cloneHookConfig(config);
-  const groups = hookGroupsForEvent(nextConfig, event).map(cloneHookGroup);
+  const groups = hookGroupsForEvent(nextConfig, event);
   const handlers = groups[groupIndex]?.hooks;
   const targetIndex = handlerIndex + direction;
   if (!handlers || !handlers[handlerIndex] || targetIndex < 0 || targetIndex >= handlers.length) {
@@ -18439,25 +18444,7 @@ function moveHookHandlerInConfig(
 }
 
 function cloneHookConfig(config: HookConfig): HookConfig {
-  const nextConfig: HookConfig = {
-    disableAllHooks: Boolean(config.disableAllHooks),
-  };
-
-  for (const [event, value] of Object.entries(config)) {
-    if (event === "disableAllHooks" || !Array.isArray(value)) {
-      continue;
-    }
-    nextConfig[event] = value.map(cloneHookGroup);
-  }
-
-  return nextConfig;
-}
-
-function cloneHookGroup(group: HookMatcherGroup): HookMatcherGroup {
-  return {
-    ...group,
-    hooks: group.hooks.map((handler) => ({ ...handler })),
-  };
+  return structuredClone(config);
 }
 
 function compactHookConfig(config: HookConfig): HookConfig {
@@ -18875,10 +18862,7 @@ function fileContentType(file: File) {
 }
 
 function localChatAttachmentId() {
-  return (
-    globalThis.crypto?.randomUUID?.() ??
-    `attachment-${Date.now()}-${Math.random().toString(36).slice(2)}`
-  );
+  return localRandomId("attachment");
 }
 
 function arrayBufferToBase64(buffer: ArrayBuffer) {
@@ -20632,10 +20616,7 @@ function chatTitleForDraft(
 }
 
 function localUiId(prefix: string) {
-  const suffix =
-    globalThis.crypto?.randomUUID?.() ??
-    `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  return `${prefix}-${suffix}`;
+  return `${prefix}-${localRandomId()}`;
 }
 
 function priceText(value: number | null) {
@@ -21841,11 +21822,28 @@ function nativePickerRequestInit(nativeBrowserToken: string): RequestInit {
   };
 }
 
+function localRandomId(fallbackPrefix?: string) {
+  const randomUUID = globalThis.crypto?.randomUUID;
+  if (randomUUID) {
+    return randomUUID.call(globalThis.crypto);
+  }
+
+  // ponytail: fallback is for local UI ids only; use requiredRandomUuid for tokens.
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return fallbackPrefix ? `${fallbackPrefix}-${suffix}` : suffix;
+}
+
+function requiredRandomUuid(label: string) {
+  const randomUUID = globalThis.crypto?.randomUUID;
+  if (!randomUUID) {
+    throw new Error(`${label} requires crypto.randomUUID`);
+  }
+
+  return randomUUID.call(globalThis.crypto);
+}
+
 function createNativeBrowserToken() {
-  const token =
-    globalThis.crypto?.randomUUID?.() ??
-    `native-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  return token.replace(/[^A-Za-z0-9_-]/g, "-");
+  return requiredRandomUuid("native browser token").replace(/[^A-Za-z0-9_-]/g, "-");
 }
 
 function probeNativeBrowser(port: number, token: string): Promise<boolean> {

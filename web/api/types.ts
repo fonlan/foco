@@ -463,14 +463,14 @@ export type LiveChatStatistics = {
 
 // Context types
 
-export type ContextTokenBreakdown = {
+type ContextTokenBreakdown = {
   requiredTokens: number;
   optionalTokens: number;
   compressibleTokens: number;
   bySource: ContextSourceTokenBreakdown[];
 };
 
-export type ContextSourceTokenBreakdown = {
+type ContextSourceTokenBreakdown = {
   source: string;
   tokens: number;
   requiredTokens: number;
@@ -571,7 +571,7 @@ export type WorkspaceIconDraft = {
 
 // Model types
 
-export type ModelPricing = {
+type ModelPricing = {
   input: number | null;
   output: number | null;
   reasoning: number | null;
@@ -642,18 +642,18 @@ export type ThinkingLevelSummary = {
 
 // Provider types
 
-export type ProviderKindSummary = {
+type ProviderKindSummary = {
   kind: string;
   label: string;
   defaultBaseUrl: string;
 };
 
-export type ApiProxyTypeSummary = {
+type ApiProxyTypeSummary = {
   proxyType: string;
   label: string;
 };
 
-export type ApiProxySettingsSummary = {
+type ApiProxySettingsSummary = {
   enabled: boolean;
   proxyType: string;
   supportedTypes: ApiProxyTypeSummary[];
@@ -718,19 +718,19 @@ export type ProviderTestState = {
 
 // Settings types
 
-export type WebServerSettingsSummary = {
+type WebServerSettingsSummary = {
   listenHost: string;
   listenPort: number;
   passwordEnabled: boolean;
 };
 
-export type RipgrepToolSummary = {
+type RipgrepToolSummary = {
   available: boolean;
   path: string | null;
   installDir: string;
 };
 
-export type NativeToolsSummary = {
+type NativeToolsSummary = {
   browserProbePort: number;
   ripgrep: RipgrepToolSummary;
 };
@@ -739,12 +739,12 @@ export type InstallRipgrepResponse = {
   ripgrep: RipgrepToolSummary;
 };
 
-export type AppLanguageSummary = {
+type AppLanguageSummary = {
   id: AppLanguageId;
   name: string;
 };
 
-export type AppThemeSummary = {
+type AppThemeSummary = {
   id: AppThemeId;
   name: string;
 };
@@ -772,13 +772,13 @@ export type GeneralFormState = {
   theme: AppThemeId;
 };
 
-export type WebSearchProviderSummary = {
+type WebSearchProviderSummary = {
   provider: string;
   label: string;
   hasApiKey: boolean;
 };
 
-export type WebSearchSettingsSummary = {
+type WebSearchSettingsSummary = {
   enabled: boolean;
   activeProvider: string;
   providers: WebSearchProviderSummary[];
@@ -831,12 +831,12 @@ export type AuthStatusResponse = {
 
 // Memory types
 
-export type MemoryExtractionModeSummary = {
+type MemoryExtractionModeSummary = {
   value: string;
   label: string;
 };
 
-export type MemorySettingsSummary = {
+type MemorySettingsSummary = {
   enabled: boolean;
   extractionMode: string;
   retrievalMode: string;
@@ -958,7 +958,7 @@ export type MemoryDialogMode = "create" | "edit";
 
 // MCP types
 
-export type McpTransportSummary = {
+type McpTransportSummary = {
   transport: string;
   label: string;
 };
@@ -990,7 +990,7 @@ export type McpServerFormState = {
 
 // Skills types
 
-export type SkillsSettingsSummary = {
+type SkillsSettingsSummary = {
   directories: string[];
   detected: ConfiguredSkillSummary[];
   errors: SkillDiscoveryErrorSummary[];
@@ -1010,7 +1010,7 @@ export type ConfiguredSkillSummary = {
   warnings: string[];
 };
 
-export type SkillDiscoveryErrorSummary = {
+type SkillDiscoveryErrorSummary = {
   path: string;
   message: string;
 };
@@ -1182,7 +1182,7 @@ export type AiRequestAuditDetail = AiRequestAuditSummary & {
   responseBody: JsonValue | null;
 };
 
-export type AiStatisticsTrendPoint = {
+type AiStatisticsTrendPoint = {
   bucket: string;
   requestCount: number;
   totalTokens: number;

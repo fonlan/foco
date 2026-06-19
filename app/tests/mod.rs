@@ -313,7 +313,7 @@ async fn tool_resource_lock_wait_respects_tool_timeout() {
         "read_file",
         Some(10),
         Some(started + Duration::from_millis(10)),
-        ToolCancellationToken::new(),
+        ToolCancellationToken::default(),
     )
     .await;
 
@@ -366,7 +366,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
             memory_settings: MemorySettings::default(),
         },
         registry,
-        ToolCancellationToken::new(),
+        ToolCancellationToken::default(),
         mpsc::unbounded_channel().0,
         "assistant-1",
         "workspace-1",
