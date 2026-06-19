@@ -6,6 +6,7 @@ use std::{
 };
 
 use axum::response::sse::Event;
+use foco_agent::AgentRunCancellation;
 use foco_providers::NeutralChatAttachment;
 use foco_store::workspace::{
     CodeChangeStats, NewMessage, NewRunEvent, NewToolCall, NewToolResult, WorkspaceDatabase,
@@ -71,6 +72,7 @@ impl StreamingAssistantStatus {
 pub(crate) struct ChatRunCancellation {
     tx: watch::Sender<bool>,
     tool_token: ToolCancellationToken,
+    agent_token: AgentRunCancellation,
 }
 
 impl ChatRunCancellation {
@@ -79,6 +81,7 @@ impl ChatRunCancellation {
         Self {
             tx,
             tool_token: ToolCancellationToken::default(),
+            agent_token: AgentRunCancellation::default(),
         }
     }
 
@@ -90,8 +93,13 @@ impl ChatRunCancellation {
         self.tool_token.clone()
     }
 
+    pub(crate) fn agent_token(&self) -> AgentRunCancellation {
+        self.agent_token.clone()
+    }
+
     pub(crate) fn cancel(&self) {
         self.tool_token.cancel();
+        self.agent_token.cancel();
         self.tx.send_replace(true);
     }
 }

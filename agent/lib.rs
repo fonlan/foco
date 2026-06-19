@@ -3,6 +3,14 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod executor;
+
+pub use executor::{
+    AgentRunAssociations, AgentRunCancellation, AgentRunContext, AgentRunEvent,
+    AgentRunEventEmitter, AgentRunEventKind, AgentRunEventSink, AgentRunExecutor, AgentRunFuture,
+    AgentRunInput, AgentRunOutcome, AgentRunRecovery, AgentRunTask,
+};
+
 macro_rules! define_agent_id {
     ($name:ident, $kind:expr, $prefix:literal) => {
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -2066,7 +2074,6 @@ mod tests {
         .expect_err("busy team");
         assert_eq!(busy.code(), AgentDomainErrorCode::TeamBusy);
         assert_eq!(busy.diagnostics().queued_tasks, Some(1));
-
     }
 
     #[test]

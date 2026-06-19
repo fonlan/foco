@@ -52,6 +52,109 @@ fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> Neutra
     }
 }
 
+struct FixtureAgentRunTask {
+    events: Vec<ChatSseEvent>,
+}
+
+impl AgentRunTask<ChatSseEvent> for FixtureAgentRunTask {
+    fn run(
+        self,
+        _context: AgentRunContext,
+        _input: AgentRunInput,
+        events: AgentRunEventEmitter<ChatSseEvent>,
+    ) -> AgentRunFuture {
+        Box::pin(async move {
+            for event in self.events {
+                let kind = agent_run_event_kind(&event);
+                events.emit(kind, event).expect("fixture event");
+            }
+            AgentRunOutcome::Completed {
+                text: "done".to_string(),
+                reasoning: None,
+                usage: None,
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn agent_run_executor_preserves_single_agent_sse_sequence() {
+    let fixture = vec![
+        ChatSseEvent::TextDelta {
+            assistant_message_id: "assistant-1".to_string(),
+            delta: "done".to_string(),
+        },
+        ChatSseEvent::ToolCall {
+            assistant_message_id: "assistant-1".to_string(),
+            tool_call: ChatToolCallSummary {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                status: "running".to_string(),
+                input: json!({ "path": "README.md" }),
+                output: None,
+                is_error: false,
+            },
+        },
+        ChatSseEvent::ToolResult {
+            assistant_message_id: "assistant-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            output: json!({ "content": "ok" }),
+            is_error: false,
+        },
+        ChatSseEvent::Complete {
+            chat_id: "chat-1".to_string(),
+            assistant_message_id: "assistant-1".to_string(),
+            text: "done".to_string(),
+            reasoning: None,
+            usage: None,
+            stop_reason: Some("stop".to_string()),
+            metrics: ChatReplyMetrics {
+                model_id: "model-1".to_string(),
+                provider_id: "provider-1".to_string(),
+                total_latency_ms: Some(1),
+                first_token_latency_ms: Some(1),
+                output_tokens: Some(1),
+            },
+            memories_used: Vec::new(),
+        },
+    ];
+    let expected = fixture
+        .iter()
+        .map(|event| serde_json::to_string(event).expect("fixture event json"))
+        .collect::<Vec<_>>();
+    let mut actual = Vec::new();
+
+    let outcome = AgentRunExecutor
+        .execute(
+            AgentRunContext {
+                chat_id: "chat-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+                workspace_path: PathBuf::from("workspace"),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+                associations: AgentRunAssociations::default(),
+                definition_snapshot: json!({}),
+                cancellation: foco_agent::AgentRunCancellation::default(),
+            },
+            AgentRunInput {
+                messages: Vec::new(),
+                current_task: None,
+                unread_messages: Vec::new(),
+                recovery: None,
+            },
+            FixtureAgentRunTask { events: fixture },
+            |event: AgentRunEvent<ChatSseEvent>| {
+                assert_eq!(event.associations, AgentRunAssociations::default());
+                actual.push(serde_json::to_string(&event.payload).expect("run event json"));
+                Ok(())
+            },
+        )
+        .await;
+
+    assert!(matches!(outcome, AgentRunOutcome::Completed { .. }));
+    assert_eq!(actual, expected);
+}
+
 fn test_file_resource_lock(path: &str, access: ToolResourceAccess) -> ToolResourceLock {
     ToolResourceLock {
         resource: ToolResource::File(path.to_string()),
@@ -80,6 +183,7 @@ fn test_prepared_chat_context(
         assistant_message_id: "assistant-1".to_string(),
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
+        agent_associations: AgentRunAssociations::default(),
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
             base_url: None,
@@ -2978,6 +3082,11 @@ fn workspace_logo_file_rejects_extension_type_mismatch() {
 fn persist_chat_result_writes_audit_status_code() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-audit-status-code-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let team_id = foco_agent::AgentTeamId::new("agent-team-audit").expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new("agent-instance-audit").expect("instance id");
+    let task_id = foco_agent::AgentTaskId::new("agent-task-audit").expect("task id");
+    let attempt_id = foco_agent::AgentAttemptId::new("agent-attempt-audit").expect("attempt id");
     {
         let mut database =
             WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
@@ -2994,6 +3103,42 @@ fn persist_chat_result_writes_audit_status_code() {
                 metadata_json: Some(r#"{"streamingState":"streaming"}"#),
             })
             .expect("streaming assistant draft insert");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-audit").expect("definition id"),
+            revision: 1,
+            name: "Audit agent".to_string(),
+            description: String::new(),
+            provider_id: "openai-responses".to_string(),
+            model_id: "gpt-5.4".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Be precise.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-1",
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                max_concurrent_runs: 1,
+            })
+            .expect("agent team create");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("agent task enqueue");
+        database
+            .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+            .expect("agent task claim")
+            .expect("claimed agent task");
     }
     let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
     let mcp_registry = Arc::new(McpRegistry::default());
@@ -3008,6 +3153,12 @@ fn persist_chat_result_writes_audit_status_code() {
         assistant_message_id: "assistant-1".to_string(),
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
+        agent_associations: AgentRunAssociations {
+            team_id: Some(team_id.clone()),
+            instance_id: Some(instance_id.clone()),
+            task_id: Some(task_id.clone()),
+            attempt_id: Some(attempt_id.clone()),
+        },
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
             base_url: None,
@@ -3097,6 +3248,8 @@ fn persist_chat_result_writes_audit_status_code() {
         memories_used: Vec::new(),
     });
 
+    persist_running_llm_request(&context, "request-1", "2026-06-06T09:00:00Z", "{}", &[])
+        .expect("persist running LLM request");
     persist_chat_result(
         &context,
         "2026-06-06T09:00:00Z",
@@ -3115,6 +3268,10 @@ fn persist_chat_result_writes_audit_status_code() {
         .expect("llm request");
 
     assert_eq!(request.status_code, Some(200));
+    assert_eq!(request.agent_team_id, Some(team_id));
+    assert_eq!(request.agent_instance_id, Some(instance_id));
+    assert_eq!(request.agent_task_id, Some(task_id));
+    assert_eq!(request.agent_attempt_id, Some(attempt_id));
     let assistant = database
         .messages_for_chat("chat-1")
         .expect("chat messages read")
@@ -3171,6 +3328,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         assistant_message_id: "assistant-1".to_string(),
         llm_request_id: "run-1".to_string(),
         assistant_sequence: 1,
+        agent_associations: AgentRunAssociations::default(),
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
             base_url: None,
@@ -3265,12 +3423,14 @@ fn persist_chat_result_writes_each_captured_llm_request() {
             .expect("run audit lookup")
             .is_none()
     );
-    assert!(
-        database
-            .llm_request("request-1")
-            .expect("first request lookup")
-            .is_some()
-    );
+    let single_agent_request = database
+        .llm_request("request-1")
+        .expect("first request lookup")
+        .expect("first request");
+    assert_eq!(single_agent_request.agent_team_id, None);
+    assert_eq!(single_agent_request.agent_instance_id, None);
+    assert_eq!(single_agent_request.agent_task_id, None);
+    assert_eq!(single_agent_request.agent_attempt_id, None);
     assert!(
         database
             .llm_request("request-2")
@@ -3415,6 +3575,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         assistant_message_id: "assistant-1".to_string(),
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
+        agent_associations: AgentRunAssociations::default(),
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
             base_url: None,

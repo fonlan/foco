@@ -20,7 +20,7 @@ pub(crate) const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillDiscoveryErrorSummary {
     path: String,
-    message: String,
+    pub(crate) message: String,
 }
 
 pub(crate) struct SkillDiscovery {
