@@ -9,6 +9,7 @@ path = "lib.rs"
 
 [dependencies]
 chrono.workspace = true
+foco-agent.workspace = true
 foco-mcp.workspace = true
 foco-providers.workspace = true
 rusqlite.workspace = true

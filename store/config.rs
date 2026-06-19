@@ -5,6 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use foco_agent::{AgentDefinitionId, AgentPermissions};
 use foco_mcp::{McpServerDefinition, McpTransportKind, validate_server_definitions};
 use foco_providers::{
     HTTP_PROXY_KIND, ProviderRequestOverride, SOCKS_PROXY_KIND, normalized_base_url,
@@ -36,6 +37,14 @@ pub const WEB_SEARCH_PROVIDER_BRAVE: &str = "brave";
 pub const SUPPORTED_WEB_SEARCH_PROVIDERS: &[&str] =
     &[WEB_SEARCH_PROVIDER_TAVILY, WEB_SEARCH_PROVIDER_BRAVE];
 pub const DEFAULT_SYSTEM_PROMPT_NAME: &str = "Default";
+pub const AGENT_DEFINITION_INITIAL_REVISION: u64 = 1;
+pub const AGENT_DEFINITION_NAME_MAX_CHARS: usize = 80;
+pub const AGENT_DEFINITION_DESCRIPTION_MAX_CHARS: usize = 500;
+pub const AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS: usize = 32_000;
+pub const AGENT_DEFINITION_MAX_INSTANCES: u32 = 32;
+pub const AGENT_DEFINITION_MAX_ALLOWED_TOOLS: usize = 128;
+pub const AGENT_DEFINITION_MAX_ALLOWED_DEFINITIONS: usize = 64;
+pub const SUPPORTED_AGENT_THINKING_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 pub const FOCO_CONFIG_DIR_ENV: &str = "FOCO_CONFIG_DIR";
 pub const WORKSPACE_HOOK_CONFIG_FILE: &str = "hooks.json";
 pub const SUPPORTED_HOOK_EVENTS: &[&str] = &[
@@ -294,6 +303,8 @@ pub struct GlobalConfig {
     pub web_search: WebSearchSettings,
     pub providers: Vec<ProviderSettings>,
     pub models: Vec<ModelSettings>,
+    #[serde(default, rename = "agentDefinitions")]
+    pub agent_definitions: Vec<AgentDefinitionSettings>,
     pub mcp: McpConfig,
     pub skills: SkillConfig,
     pub workspaces: Vec<WorkspaceConfig>,
@@ -317,6 +328,7 @@ impl GlobalConfig {
             web_search: WebSearchSettings::default(),
             providers: Vec::new(),
             models: Vec::new(),
+            agent_definitions: Vec::new(),
             mcp: McpConfig {
                 servers: Vec::new(),
             },
@@ -543,6 +555,13 @@ impl GlobalConfig {
                 }
             }
         }
+
+        validate_agent_definitions(
+            config_path,
+            &self.agent_definitions,
+            &self.providers,
+            &self.models,
+        )?;
 
         validate_unique_named_items(
             config_path,
@@ -952,6 +971,31 @@ pub struct ModelLimits {
     pub max_output_tokens: u64,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentModelOptions {
+    #[serde(default)]
+    pub thinking_level: Option<String>,
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentDefinitionSettings {
+    pub id: AgentDefinitionId,
+    pub revision: u64,
+    pub name: String,
+    pub description: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub model_options: AgentModelOptions,
+    pub system_prompt: String,
+    pub allowed_tools: Vec<String>,
+    pub max_instances: u32,
+    pub permissions: AgentPermissions,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpConfig {
@@ -1352,6 +1396,288 @@ fn validate_password_hash(
         return invalid_config(
             config_path,
             "app.web_server.password_hash digest must be 32 bytes of hex",
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_agent_definitions(
+    config_path: Option<&Path>,
+    definitions: &[AgentDefinitionSettings],
+    providers: &[ProviderSettings],
+    models: &[ModelSettings],
+) -> Result<(), ConfigError> {
+    let definition_ids = definitions
+        .iter()
+        .map(|definition| definition.id.as_str())
+        .collect::<HashSet<_>>();
+    if definition_ids.len() != definitions.len() {
+        return invalid_config(config_path, "agentDefinitions contains duplicate ids");
+    }
+
+    let mut normalized_names = HashSet::new();
+    for definition in definitions {
+        let field = format!("agentDefinitions['{}']", definition.id);
+
+        if definition.revision == 0 {
+            return invalid_config(
+                config_path,
+                format!("{field}.revision must be greater than 0"),
+            );
+        }
+        validate_bounded_agent_text(
+            config_path,
+            &format!("{field}.name"),
+            &definition.name,
+            AGENT_DEFINITION_NAME_MAX_CHARS,
+            true,
+        )?;
+        validate_bounded_agent_text(
+            config_path,
+            &format!("{field}.description"),
+            &definition.description,
+            AGENT_DEFINITION_DESCRIPTION_MAX_CHARS,
+            false,
+        )?;
+        validate_bounded_agent_text(
+            config_path,
+            &format!("{field}.systemPrompt"),
+            &definition.system_prompt,
+            AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS,
+            true,
+        )?;
+
+        let normalized_name = definition.name.to_lowercase();
+        if !normalized_names.insert(normalized_name) {
+            return invalid_config(
+                config_path,
+                format!(
+                    "agentDefinitions contains duplicate case-insensitive name '{}'",
+                    definition.name
+                ),
+            );
+        }
+
+        let provider = providers
+            .iter()
+            .find(|provider| provider.id == definition.provider_id)
+            .ok_or_else(|| ConfigError::Validation {
+                path: config_path.map(Path::to_path_buf),
+                message: format!(
+                    "{field}.providerId references missing provider '{}'",
+                    definition.provider_id
+                ),
+            })?;
+        if !provider.enabled {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.providerId references disabled provider '{}'",
+                    provider.id
+                ),
+            );
+        }
+
+        let model = models
+            .iter()
+            .find(|model| model.id == definition.model_id)
+            .ok_or_else(|| ConfigError::Validation {
+                path: config_path.map(Path::to_path_buf),
+                message: format!(
+                    "{field}.modelId references missing model '{}'",
+                    definition.model_id
+                ),
+            })?;
+        if !model.enabled {
+            return invalid_config(
+                config_path,
+                format!("{field}.modelId references disabled model '{}'", model.id),
+            );
+        }
+        if !model
+            .provider_ids
+            .iter()
+            .any(|provider_id| provider_id == &provider.id)
+        {
+            return invalid_config(
+                config_path,
+                format!(
+                    "provider '{}' is not associated with model '{}' for {field}",
+                    provider.id, model.id
+                ),
+            );
+        }
+        let limits = model
+            .limits
+            .as_ref()
+            .ok_or_else(|| ConfigError::Validation {
+                path: config_path.map(Path::to_path_buf),
+                message: format!(
+                    "{field}.modelId references model '{}' without limits",
+                    model.id
+                ),
+            })?;
+        if limits.context_window == 0 || limits.max_output_tokens == 0 {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.modelId references model '{}' with invalid limits",
+                    model.id
+                ),
+            );
+        }
+
+        if let Some(thinking_level) = &definition.model_options.thinking_level
+            && !SUPPORTED_AGENT_THINKING_LEVELS.contains(&thinking_level.as_str())
+        {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.modelOptions.thinkingLevel '{}' is unsupported; expected one of {}",
+                    thinking_level,
+                    SUPPORTED_AGENT_THINKING_LEVELS.join(", ")
+                ),
+            );
+        }
+        if let Some(max_output_tokens) = definition.model_options.max_output_tokens {
+            if max_output_tokens == 0 {
+                return invalid_config(
+                    config_path,
+                    format!("{field}.modelOptions.maxOutputTokens must be greater than 0"),
+                );
+            }
+            if u64::from(max_output_tokens) > limits.max_output_tokens {
+                return invalid_config(
+                    config_path,
+                    format!(
+                        "{field}.modelOptions.maxOutputTokens {max_output_tokens} exceeds model '{}' limit {}",
+                        model.id, limits.max_output_tokens
+                    ),
+                );
+            }
+        }
+
+        if definition.max_instances == 0
+            || definition.max_instances > AGENT_DEFINITION_MAX_INSTANCES
+        {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.maxInstances must be between 1 and {AGENT_DEFINITION_MAX_INSTANCES}"
+                ),
+            );
+        }
+        if definition.allowed_tools.len() > AGENT_DEFINITION_MAX_ALLOWED_TOOLS {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.allowedTools must contain no more than {AGENT_DEFINITION_MAX_ALLOWED_TOOLS} entries"
+                ),
+            );
+        }
+        let mut allowed_tools = HashSet::new();
+        for tool_name in &definition.allowed_tools {
+            require_non_empty(config_path, &format!("{field}.allowedTools"), tool_name)?;
+            if tool_name.trim() != tool_name {
+                return invalid_config(
+                    config_path,
+                    format!(
+                        "{field}.allowedTools entry '{tool_name}' must not have surrounding whitespace"
+                    ),
+                );
+            }
+            if !allowed_tools.insert(tool_name.as_str()) {
+                return invalid_config(
+                    config_path,
+                    format!("{field}.allowedTools contains duplicate tool '{tool_name}'"),
+                );
+            }
+        }
+
+        let allowed_definition_ids = &definition.permissions.allowed_agent_definition_ids;
+        if allowed_definition_ids.len() > AGENT_DEFINITION_MAX_ALLOWED_DEFINITIONS {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.permissions.allowedAgentDefinitionIds must contain no more than {AGENT_DEFINITION_MAX_ALLOWED_DEFINITIONS} entries"
+                ),
+            );
+        }
+        if !definition.permissions.can_create_instances && !allowed_definition_ids.is_empty() {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.permissions.allowedAgentDefinitionIds must be empty when canCreateInstances is false"
+                ),
+            );
+        }
+        let mut allowed_ids = HashSet::new();
+        for allowed_id in allowed_definition_ids {
+            if !allowed_ids.insert(allowed_id.as_str()) {
+                return invalid_config(
+                    config_path,
+                    format!(
+                        "{field}.permissions.allowedAgentDefinitionIds contains duplicate id '{allowed_id}'"
+                    ),
+                );
+            }
+            if !definition_ids.contains(allowed_id.as_str()) {
+                return invalid_config(
+                    config_path,
+                    format!(
+                        "{field}.permissions.allowedAgentDefinitionIds references missing definition '{allowed_id}'"
+                    ),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn validate_agent_definition_tool_references(
+    config_path: Option<&Path>,
+    definitions: &[AgentDefinitionSettings],
+    known_tools: &HashSet<String>,
+) -> Result<(), ConfigError> {
+    for definition in definitions {
+        for tool_name in &definition.allowed_tools {
+            if !known_tools.contains(tool_name) {
+                return invalid_config(
+                    config_path,
+                    format!(
+                        "agent definition '{}' references unknown runtime tool '{}'",
+                        definition.id, tool_name
+                    ),
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_bounded_agent_text(
+    config_path: Option<&Path>,
+    field: &str,
+    value: &str,
+    max_chars: usize,
+    required: bool,
+) -> Result<(), ConfigError> {
+    if required {
+        require_non_empty(config_path, field, value)?;
+    }
+    if value.chars().count() > max_chars {
+        return invalid_config(
+            config_path,
+            format!("{field} must contain no more than {max_chars} characters"),
+        );
+    }
+    if (required || !value.is_empty()) && value.trim() != value {
+        return invalid_config(
+            config_path,
+            format!("{field} must not have surrounding whitespace"),
         );
     }
 
@@ -2562,5 +2888,207 @@ mod tests {
             .expect_err("enabled model without limits should fail");
 
         assert!(error.to_string().contains("is missing limits"));
+    }
+
+    fn config_with_valid_agent_definition() -> GlobalConfig {
+        let mut config = GlobalConfig::first_run(std::env::temp_dir().join("foco-agent-config"));
+        config.providers.push(ProviderSettings {
+            id: "provider-1".to_string(),
+            name: "Provider 1".to_string(),
+            kind: foco_providers::OPENAI_RESPONSES_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: Some("secret-key".to_string()),
+            request_overrides: Vec::new(),
+            api_proxy: ApiProxySettings::default(),
+        });
+        config.models.push(ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 16_384,
+            }),
+        });
+        config.agent_definitions.push(AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-coordinator")
+                .expect("agent definition id"),
+            revision: AGENT_DEFINITION_INITIAL_REVISION,
+            name: "Coordinator".to_string(),
+            description: "Coordinates work.".to_string(),
+            provider_id: "provider-1".to_string(),
+            model_id: "model-1".to_string(),
+            model_options: AgentModelOptions {
+                thinking_level: Some("high".to_string()),
+                max_output_tokens: Some(8_192),
+            },
+            system_prompt: "Coordinate the team.".to_string(),
+            allowed_tools: vec!["read_file".to_string()],
+            max_instances: 1,
+            permissions: AgentPermissions::default(),
+        });
+        config
+    }
+
+    #[test]
+    fn agent_definition_round_trips_with_strict_schema() {
+        let config = config_with_valid_agent_definition();
+        config.validate(None).expect("valid agent definition");
+        let json = serde_json::to_string(&config.agent_definitions[0]).expect("serialize");
+        let round_trip: AgentDefinitionSettings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round_trip, config.agent_definitions[0]);
+
+        let mut value = serde_json::to_value(round_trip).expect("definition value");
+        value
+            .as_object_mut()
+            .expect("definition object")
+            .insert("unexpected".to_string(), Value::Bool(true));
+        let error = serde_json::from_value::<AgentDefinitionSettings>(value)
+            .expect_err("unknown definition field should fail");
+        assert!(error.to_string().contains("unknown field"));
+
+        let mut value =
+            serde_json::to_value(&config.agent_definitions[0]).expect("definition value");
+        value
+            .as_object_mut()
+            .expect("definition object")
+            .remove("providerId");
+        let error = serde_json::from_value::<AgentDefinitionSettings>(value)
+            .expect_err("missing definition field should fail");
+        assert!(error.to_string().contains("missing field"));
+    }
+
+    #[test]
+    fn agent_definition_rejects_invalid_provider_model_and_options() {
+        let mut config = config_with_valid_agent_definition();
+        config.agent_definitions[0].provider_id = "missing".to_string();
+        assert!(
+            config
+                .validate(None)
+                .expect_err("missing provider")
+                .to_string()
+                .contains("missing provider")
+        );
+
+        let mut config = config_with_valid_agent_definition();
+        config.agent_definitions[0].model_id = "missing".to_string();
+        assert!(
+            config
+                .validate(None)
+                .expect_err("missing model")
+                .to_string()
+                .contains("missing model")
+        );
+
+        let mut config = config_with_valid_agent_definition();
+        config.agent_definitions[0].model_options.max_output_tokens = Some(20_000);
+        assert!(
+            config
+                .validate(None)
+                .expect_err("output limit")
+                .to_string()
+                .contains("exceeds model")
+        );
+
+        let mut config = config_with_valid_agent_definition();
+        config.agent_definitions[0].model_options.thinking_level = Some("extreme".to_string());
+        assert!(
+            config
+                .validate(None)
+                .expect_err("thinking level")
+                .to_string()
+                .contains("is unsupported")
+        );
+    }
+
+    #[test]
+    fn agent_definition_rejects_duplicate_names_invalid_permissions_and_limits() {
+        let mut config = config_with_valid_agent_definition();
+        let mut duplicate = config.agent_definitions[0].clone();
+        duplicate.id =
+            AgentDefinitionId::new("agent-definition-worker").expect("agent definition id");
+        duplicate.name = "coordinator".to_string();
+        config.agent_definitions.push(duplicate);
+        assert!(
+            config
+                .validate(None)
+                .expect_err("duplicate name")
+                .to_string()
+                .contains("duplicate case-insensitive name")
+        );
+
+        let mut config = config_with_valid_agent_definition();
+        config.agent_definitions[0]
+            .permissions
+            .allowed_agent_definition_ids
+            .push(AgentDefinitionId::new("agent-definition-missing").expect("definition id"));
+        assert!(
+            config
+                .validate(None)
+                .expect_err("disabled instance creation")
+                .to_string()
+                .contains("must be empty")
+        );
+
+        let mut config = config_with_valid_agent_definition();
+        config.agent_definitions[0].max_instances = AGENT_DEFINITION_MAX_INSTANCES + 1;
+        assert!(
+            config
+                .validate(None)
+                .expect_err("instance limit")
+                .to_string()
+                .contains("maxInstances")
+        );
+
+        let mut config = config_with_valid_agent_definition();
+        config.agent_definitions[0].system_prompt =
+            "x".repeat(AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS + 1);
+        assert!(
+            config
+                .validate(None)
+                .expect_err("system prompt length")
+                .to_string()
+                .contains("systemPrompt")
+        );
+    }
+
+    #[test]
+    fn agent_definition_tool_references_require_runtime_catalog_entries() {
+        let config = config_with_valid_agent_definition();
+        let known_tools = HashSet::from(["read_file".to_string()]);
+        validate_agent_definition_tool_references(None, &config.agent_definitions, &known_tools)
+            .expect("known tool");
+
+        let error = validate_agent_definition_tool_references(
+            None,
+            &config.agent_definitions,
+            &HashSet::new(),
+        )
+        .expect_err("unknown tool should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown runtime tool 'read_file'")
+        );
+    }
+
+    #[test]
+    fn deleting_definition_does_not_mutate_existing_runtime_snapshot() {
+        let mut config = config_with_valid_agent_definition();
+        let snapshot = config.agent_definitions[0].clone();
+        config.agent_definitions.clear();
+
+        assert_eq!(snapshot.revision, AGENT_DEFINITION_INITIAL_REVISION);
+        assert_eq!(snapshot.provider_id, "provider-1");
+        assert_eq!(snapshot.model_id, "model-1");
+        assert!(config.agent_definitions.is_empty());
     }
 }

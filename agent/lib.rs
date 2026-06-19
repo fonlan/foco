@@ -70,6 +70,73 @@ define_agent_id!(AgentAttemptId, AgentEntityKind::Attempt, "agent-attempt-");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AgentCollaborationTool {
+    SendMessage,
+    DelegateTask,
+    WaitTasks,
+    TransferTask,
+    CreateInstance,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPermissions {
+    pub can_create_instances: bool,
+    pub can_delegate: bool,
+    #[serde(default)]
+    pub allowed_agent_definition_ids: Vec<AgentDefinitionId>,
+}
+
+impl AgentPermissions {
+    pub fn collaboration_tool_allowed(&self, tool: AgentCollaborationTool) -> bool {
+        match tool {
+            AgentCollaborationTool::SendMessage => true,
+            AgentCollaborationTool::DelegateTask
+            | AgentCollaborationTool::WaitTasks
+            | AgentCollaborationTool::TransferTask => self.can_delegate,
+            AgentCollaborationTool::CreateInstance => self.can_create_instances,
+        }
+    }
+
+    pub fn authorize_collaboration_tool(
+        &self,
+        tool: AgentCollaborationTool,
+        actor_id: AgentInstanceId,
+    ) -> Result<(), AgentDomainError> {
+        if self.collaboration_tool_allowed(tool) {
+            Ok(())
+        } else {
+            Err(AgentDomainError::permission_denied(
+                AgentEntityKind::Instance,
+                actor_id,
+            ))
+        }
+    }
+
+    pub fn authorize_instance_definition(
+        &self,
+        target_definition_id: &AgentDefinitionId,
+        actor_id: AgentInstanceId,
+    ) -> Result<(), AgentDomainError> {
+        self.authorize_collaboration_tool(AgentCollaborationTool::CreateInstance, actor_id)?;
+
+        if self
+            .allowed_agent_definition_ids
+            .iter()
+            .any(|allowed_id| allowed_id == target_definition_id)
+        {
+            Ok(())
+        } else {
+            Err(AgentDomainError::permission_denied(
+                AgentEntityKind::Definition,
+                target_definition_id.to_string(),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentEntityKind {
     Definition,
     Team,
@@ -1565,6 +1632,46 @@ mod tests {
             assert_eq!(error.phase(), AgentDomainErrorPhase::Contract);
             assert!(!error.retryable());
         }
+    }
+
+    #[test]
+    fn collaboration_permissions_are_separate_from_regular_tool_permissions() {
+        let actor_id = AgentInstanceId::new("agent-instance-1").expect("instance id");
+        let allowed_definition_id =
+            AgentDefinitionId::new("agent-definition-worker").expect("definition id");
+        let denied_definition_id =
+            AgentDefinitionId::new("agent-definition-admin").expect("definition id");
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            can_delegate: false,
+            allowed_agent_definition_ids: vec![allowed_definition_id.clone()],
+        };
+
+        assert!(permissions.collaboration_tool_allowed(AgentCollaborationTool::SendMessage));
+        assert!(!permissions.collaboration_tool_allowed(AgentCollaborationTool::DelegateTask));
+        assert!(!permissions.collaboration_tool_allowed(AgentCollaborationTool::WaitTasks));
+        assert!(!permissions.collaboration_tool_allowed(AgentCollaborationTool::TransferTask));
+        assert!(permissions.collaboration_tool_allowed(AgentCollaborationTool::CreateInstance));
+        assert_eq!(
+            permissions
+                .authorize_collaboration_tool(
+                    AgentCollaborationTool::DelegateTask,
+                    actor_id.clone(),
+                )
+                .expect_err("delegation should be denied")
+                .code(),
+            AgentDomainErrorCode::PermissionDenied
+        );
+        permissions
+            .authorize_instance_definition(&allowed_definition_id, actor_id.clone())
+            .expect("allowed definition");
+        assert_eq!(
+            permissions
+                .authorize_instance_definition(&denied_definition_id, actor_id)
+                .expect_err("definition should be denied")
+                .code(),
+            AgentDomainErrorCode::PermissionDenied
+        );
     }
 
     #[test]

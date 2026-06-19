@@ -875,6 +875,7 @@ name = "foco-store"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "foco-agent",
  "foco-mcp",
  "foco-providers",
  "rusqlite",

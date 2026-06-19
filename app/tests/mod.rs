@@ -1,7 +1,10 @@
 use super::*;
 use std::collections::BTreeSet;
 
-use axum::extract::{Path as AxumPath, State};
+use axum::{
+    Json,
+    extract::{Path as AxumPath, State},
+};
 use foco_agent::{
     ToolResource, ToolResourceAccess, ToolResourceLock, context_compression_trigger_tokens,
 };
@@ -1168,6 +1171,156 @@ fn new_provider_is_associated_with_matching_local_models() {
     assert_eq!(models[1].active_provider_id.as_deref(), Some("existing"));
     assert!(models[2].provider_ids.is_empty());
     assert_eq!(models[2].active_provider_id, None);
+}
+
+fn test_agent_definition_input() -> AgentDefinitionInput {
+    AgentDefinitionInput {
+        name: "Coordinator".to_string(),
+        description: "Coordinates work.".to_string(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions {
+            thinking_level: Some("high".to_string()),
+            max_output_tokens: Some(800),
+        },
+        system_prompt: "Coordinate the team.".to_string(),
+        allowed_tools: vec![READ_FILE_TOOL.to_string()],
+        max_instances: 2,
+        permissions: AgentPermissions::default(),
+    }
+}
+
+#[tokio::test]
+async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    let mut config = prompt_test_config(workspace_dir);
+    config.providers[0].api_key = Some("secret-agent-api-key".to_string());
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let created = crate::http::settings::create_agent_definition(
+        State(state.clone()),
+        Json(CreateAgentDefinitionRequest {
+            definition: test_agent_definition_input(),
+        }),
+    )
+    .await
+    .expect("create agent definition")
+    .0;
+    assert_eq!(created.agent_definitions.len(), 1);
+    let definition_id = created.agent_definitions[0].id.clone();
+    assert_eq!(
+        created.agent_definitions[0].revision,
+        AGENT_DEFINITION_INITIAL_REVISION
+    );
+    let response_json = serde_json::to_string(&created).expect("serialize response");
+    assert!(!response_json.contains("secret-agent-api-key"));
+    assert!(!response_json.contains("apiKey"));
+
+    let listed = crate::http::settings::agent_definitions(State(state.clone()))
+        .await
+        .expect("list agent definitions")
+        .0;
+    assert_eq!(listed.agent_definitions[0].id, definition_id);
+
+    let mut invalid_tool_input = test_agent_definition_input();
+    invalid_tool_input.allowed_tools = vec!["not_a_runtime_tool".to_string()];
+    let invalid_tool = match crate::http::settings::update_agent_definition(
+        State(state.clone()),
+        Json(UpdateAgentDefinitionRequest {
+            id: definition_id.clone(),
+            definition: invalid_tool_input,
+        }),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("unknown tool should fail"),
+    };
+    assert_eq!(invalid_tool.status, StatusCode::BAD_REQUEST);
+    assert!(invalid_tool.message.contains("unknown runtime tool"));
+
+    let mut updated_input = test_agent_definition_input();
+    updated_input.description = "Updated coordinator.".to_string();
+    let updated = crate::http::settings::update_agent_definition(
+        State(state.clone()),
+        Json(UpdateAgentDefinitionRequest {
+            id: definition_id.clone(),
+            definition: updated_input,
+        }),
+    )
+    .await
+    .expect("update agent definition")
+    .0;
+    assert_eq!(updated.agent_definitions[0].revision, 2);
+    assert_eq!(
+        updated.agent_definitions[0].description,
+        "Updated coordinator."
+    );
+
+    let provider_error = match crate::http::settings::delete_provider(
+        State(state.clone()),
+        Json(DeleteSettingsItemRequest {
+            id: "provider".to_string(),
+        }),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("referenced provider deletion should fail"),
+    };
+    assert!(
+        provider_error
+            .message
+            .contains("referenced by agent definition")
+    );
+    let model_error = match crate::http::settings::delete_model(
+        State(state.clone()),
+        Json(DeleteSettingsItemRequest {
+            id: "model".to_string(),
+        }),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("referenced model deletion should fail"),
+    };
+    assert!(
+        model_error
+            .message
+            .contains("referenced by agent definition")
+    );
+
+    let deleted = crate::http::settings::delete_agent_definition(
+        State(state),
+        Json(DeleteAgentDefinitionRequest { id: definition_id }),
+    )
+    .await
+    .expect("delete agent definition")
+    .0;
+    assert!(deleted.agent_definitions.is_empty());
+}
+
+#[test]
+fn agent_definition_tool_validation_rejects_unknown_ids() {
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-test").expect("definition id"),
+        revision: 1,
+        name: "Test".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Test.".to_string(),
+        allowed_tools: vec!["missing_tool".to_string()],
+        max_instances: 1,
+        permissions: AgentPermissions::default(),
+    };
+    let error = validate_agent_definition_tool_references(None, &[definition], &HashSet::new())
+        .expect_err("unknown tool");
+    assert!(error.to_string().contains("unknown runtime tool"));
 }
 
 #[test]

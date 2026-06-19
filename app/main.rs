@@ -27,8 +27,9 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    build_available_tools_prompt, calculate_context_budget, estimate_json_tokens,
-    estimate_text_tokens, pack_context, plan_context_compression, plan_tool_execution,
+    AgentDefinitionId, AgentPermissions, build_available_tools_prompt, calculate_context_budget,
+    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
+    plan_tool_execution,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};
@@ -40,12 +41,14 @@ use foco_providers::{
 };
 use foco_store::{
     config::{
+        AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
         ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL, GlobalConfig,
         HookConfig, McpServerConfig, MemorySettings, ModelLimits, ModelSettings, ProviderSettings,
         SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
         SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings,
         SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
         load_or_create_global_config, save_global_config,
+        validate_agent_definition_tool_references,
     },
     memory::{MemoryDatabase, MemoryDatabaseError, MemoryScope, MemorySourceType, MemoryStatus},
     model_metadata::{
@@ -599,6 +602,22 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/api/settings/prompts",
             post(crate::http::settings::save_prompt_settings),
+        )
+        .route(
+            "/api/agent-definitions",
+            get(crate::http::settings::agent_definitions),
+        )
+        .route(
+            "/api/agent-definitions/create",
+            post(crate::http::settings::create_agent_definition),
+        )
+        .route(
+            "/api/agent-definitions/update",
+            post(crate::http::settings::update_agent_definition),
+        )
+        .route(
+            "/api/agent-definitions/delete",
+            post(crate::http::settings::delete_agent_definition),
         )
         .route("/api/memory", get(crate::http::memory::memory_list))
         .route(
@@ -1442,6 +1461,39 @@ struct ManualApiProxySettingsRequest {
     url: String,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentDefinitionInput {
+    name: String,
+    description: String,
+    provider_id: String,
+    model_id: String,
+    model_options: AgentModelOptions,
+    system_prompt: String,
+    allowed_tools: Vec<String>,
+    max_instances: u32,
+    permissions: AgentPermissions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateAgentDefinitionRequest {
+    definition: AgentDefinitionInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateAgentDefinitionRequest {
+    id: AgentDefinitionId,
+    definition: AgentDefinitionInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeleteAgentDefinitionRequest {
+    id: AgentDefinitionId,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ManualModelRequest {
@@ -1771,6 +1823,12 @@ struct SettingsResponse {
     mcp_transports: Vec<McpTransportSummary>,
     mcp_servers: Vec<ConfiguredMcpServerSummary>,
     skills: SkillsSettingsSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentDefinitionsResponse {
+    agent_definitions: Vec<AgentDefinitionSettings>,
 }
 
 #[derive(Serialize)]

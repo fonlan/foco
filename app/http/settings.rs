@@ -26,6 +26,150 @@ pub(crate) async fn settings(
     settings_response(&state, &config).await
 }
 
+pub(crate) async fn agent_definitions(
+    State(state): State<AppState>,
+) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+
+    Ok(agent_definitions_response(&config))
+}
+
+pub(crate) async fn create_agent_definition(
+    State(state): State<AppState>,
+    Json(request): Json<CreateAgentDefinitionRequest>,
+) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let id = AgentDefinitionId::new(unique_id("agent-definition"))
+        .map_err(|error| ApiError::internal(error.message().to_string()))?;
+    config.agent_definitions.push(agent_definition_from_input(
+        id,
+        AGENT_DEFINITION_INITIAL_REVISION,
+        request.definition,
+    ));
+    validate_agent_definition_update(&state, &config).await?;
+    save_config(&state, config.clone())?;
+
+    Ok(agent_definitions_response(&config))
+}
+
+pub(crate) async fn update_agent_definition(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateAgentDefinitionRequest>,
+) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let stored = config
+        .agent_definitions
+        .iter_mut()
+        .find(|definition| definition.id == request.id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("agent definition was not found: {}", request.id))
+        })?;
+    let revision = stored
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("agent definition revision overflow"))?;
+    *stored = agent_definition_from_input(request.id, revision, request.definition);
+    validate_agent_definition_update(&state, &config).await?;
+    save_config(&state, config.clone())?;
+
+    Ok(agent_definitions_response(&config))
+}
+
+pub(crate) async fn delete_agent_definition(
+    State(state): State<AppState>,
+    Json(request): Json<DeleteAgentDefinitionRequest>,
+) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    if let Some(dependent) = config.agent_definitions.iter().find(|definition| {
+        definition
+            .permissions
+            .allowed_agent_definition_ids
+            .contains(&request.id)
+    }) {
+        return Err(ApiError::bad_request(format!(
+            "agent definition '{}' is referenced by agent definition '{}'",
+            request.id, dependent.id
+        )));
+    }
+    let definition_count = config.agent_definitions.len();
+    config
+        .agent_definitions
+        .retain(|definition| definition.id != request.id);
+    if config.agent_definitions.len() == definition_count {
+        return Err(ApiError::bad_request(format!(
+            "agent definition was not found: {}",
+            request.id
+        )));
+    }
+    validate_agent_definition_update(&state, &config).await?;
+    save_config(&state, config.clone())?;
+
+    Ok(agent_definitions_response(&config))
+}
+
+fn agent_definition_from_input(
+    id: AgentDefinitionId,
+    revision: u64,
+    input: AgentDefinitionInput,
+) -> AgentDefinitionSettings {
+    AgentDefinitionSettings {
+        id,
+        revision,
+        name: input.name,
+        description: input.description,
+        provider_id: input.provider_id,
+        model_id: input.model_id,
+        model_options: input.model_options,
+        system_prompt: input.system_prompt,
+        allowed_tools: input.allowed_tools,
+        max_instances: input.max_instances,
+        permissions: input.permissions,
+    }
+}
+
+async fn validate_agent_definition_update(
+    state: &AppState,
+    config: &GlobalConfig,
+) -> Result<(), ApiError> {
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let known_tools = known_agent_tool_names(state, config).await;
+    validate_agent_definition_tool_references(
+        Some(&state.config_file),
+        &config.agent_definitions,
+        &known_tools,
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
+async fn known_agent_tool_names(state: &AppState, config: &GlobalConfig) -> HashSet<String> {
+    let mut tools = foco_tools::builtin_tool_definitions()
+        .into_iter()
+        .map(|definition| definition.name.to_string())
+        .collect::<HashSet<_>>();
+    tools.extend(
+        memory_tool_definitions()
+            .into_iter()
+            .map(|definition| definition.name),
+    );
+    tools.extend(
+        state
+            .mcp_registry
+            .tool_definitions(&config.app.active_workspace_id)
+            .await
+            .into_iter()
+            .map(|definition| definition.name),
+    );
+    tools
+}
+
+fn agent_definitions_response(config: &GlobalConfig) -> Json<AgentDefinitionsResponse> {
+    Json(AgentDefinitionsResponse {
+        agent_definitions: config.agent_definitions.clone(),
+    })
+}
+
 pub(crate) async fn save_general_settings(
     State(state): State<AppState>,
     Json(request): Json<ManualGeneralSettingsRequest>,
@@ -287,6 +431,9 @@ pub(crate) async fn save_manual_provider(
         config.providers.push(provider);
     }
 
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     save_config(&state, config.clone())?;
 
     settings_response(&state, &config).await
@@ -325,6 +472,17 @@ pub(crate) async fn delete_provider(
 
     if id.is_empty() {
         return Err(ApiError::bad_request("provider id must not be empty"));
+    }
+
+    if let Some(definition) = config
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.provider_id == id)
+    {
+        return Err(ApiError::bad_request(format!(
+            "provider '{id}' is referenced by agent definition '{}'",
+            definition.id
+        )));
     }
 
     let provider_count = config.providers.len();
@@ -671,6 +829,9 @@ pub(crate) async fn save_manual_model(
         config.models.push(model);
     }
 
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     save_config(&state, config.clone())?;
 
     let cache = read_model_metadata_cache(&state.model_metadata_file)
@@ -692,6 +853,17 @@ pub(crate) async fn delete_model(
 
     if id.is_empty() {
         return Err(ApiError::bad_request("model id must not be empty"));
+    }
+
+    if let Some(definition) = config
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.model_id == id)
+    {
+        return Err(ApiError::bad_request(format!(
+            "model '{id}' is referenced by agent definition '{}'",
+            definition.id
+        )));
     }
 
     let model_count = config.models.len();
