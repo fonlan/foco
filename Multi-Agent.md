@@ -768,44 +768,53 @@
 
 ### 9.1 Tool effect 分类
 
-- [ ] 为运行时工具增加内部 `ToolEffect`：`read_only`、`workspace_mutation`、`external_or_unknown`。
-- [ ] file write/edit 工具标记为 workspace mutation。
-- [ ] command 工具默认标记为 external_or_unknown，不解析命令猜测只读性。
-- [ ] MCP 工具未声明可信 effect 时按 external_or_unknown 处理。
-- [ ] graph/query、web fetch 和明确只读工具标记为 read_only。
-- [ ] ToolEffect 只作为调度安全元数据，不改变对模型暴露的 strict schema。
+- [x] 为运行时工具增加内部 `ToolEffect`：`read_only`、`workspace_mutation`、`external_or_unknown`。
+- [x] file write/edit 工具标记为 workspace mutation。
+- [x] command 工具默认标记为 external_or_unknown，不解析命令猜测只读性。
+- [x] MCP 工具未声明可信 effect 时按 external_or_unknown 处理。
+- [x] graph/query、web fetch 和明确只读工具标记为 read_only。
+- [x] ToolEffect 只作为调度安全元数据，不改变对模型暴露的 strict schema。
 
 ### 9.2 Mutation lease
 
-- [ ] 为每个 workspace 实现 mutation lease，Coordinator 和所有 Worker 共用。
-- [ ] read-only 工具不获取 mutation lease，可跨实例并发。
-- [ ] mutation/unknown 工具在执行前获取 lease，结束、超时、取消或 panic 时可靠释放。
-- [ ] 不持有数据库事务等待 mutation lease。
-- [ ] lease 等待遵守工具 timeoutMs；超时返回明确错误。
-- [ ] 记录 lease owner instance/task/tool call 和等待时间，供诊断与 UI 展示。
+- [x] 为每个 workspace 实现 mutation lease，Coordinator 和所有 Worker 共用。
+- [x] read-only 工具不获取 mutation lease，可跨实例并发。
+- [x] mutation/unknown 工具在执行前获取 lease，结束、超时、取消或 panic 时可靠释放。
+- [x] 不持有数据库事务等待 mutation lease。
+- [x] lease 等待遵守工具 timeoutMs；超时返回明确错误。
+- [x] 记录 lease owner instance/task/tool call 和等待时间，供诊断与 UI 展示。
 
 ### 9.3 文件与命令安全
 
-- [ ] 保持文件工具 workspace-relative、canonicalize 后仍位于 workspace 内的约束。
-- [ ] 保持 edit_file 必须先读取最新内容、oldStr 精确匹配和默认唯一匹配。
-- [ ] 跨实例 stale edit 明确失败，不自动重新读取并套用修改。
-- [ ] 同一实例/turn 的 edit/write 冲突规则保持不变。
-- [ ] command timeout 继续终止进程树，并保持 Windows Job Object/KillOnDrop 行为。
-- [ ] mutation lease 不替代 Provider、MCP、hook 和文件工具原有安全校验。
+- [x] 保持文件工具 workspace-relative、canonicalize 后仍位于 workspace 内的约束。
+- [x] 保持 edit_file 必须先读取最新内容、oldStr 精确匹配和默认唯一匹配。
+- [x] 跨实例 stale edit 明确失败，不自动重新读取并套用修改。
+- [x] 同一实例/turn 的 edit/write 冲突规则保持不变。
+- [x] command timeout 继续终止进程树，并保持 Windows Job Object/KillOnDrop 行为。
+- [x] mutation lease 不替代 Provider、MCP、hook 和文件工具原有安全校验。
 
 ### 9.4 测试
 
-- [ ] 覆盖两个实例的 read-only 工具可并行。
-- [ ] 覆盖两个实例的 mutation 工具严格串行。
-- [ ] 覆盖 lease 等待 timeout、取消和 panic 后释放。
-- [ ] 覆盖 stale edit、命令超时和跨 workspace 路径逃逸仍明确失败。
-- [ ] 覆盖 MCP unknown effect 不绕过 mutation lease。
+- [x] 覆盖两个实例的 read-only 工具可并行。
+- [x] 覆盖两个实例的 mutation 工具严格串行。
+- [x] 覆盖 lease 等待 timeout、取消和 panic 后释放。
+- [x] 覆盖 stale edit、命令超时和跨 workspace 路径逃逸仍明确失败。
+- [x] 覆盖 MCP unknown effect 不绕过 mutation lease。
 
 ### 阶段 9 退出条件
 
-- [ ] 共享 workspace 中不存在两个并发运行的 mutation/unknown 工具。
-- [ ] 并行读取和模型推理不受不必要的全局串行限制。
-- [ ] 并发冲突以明确错误呈现，不产生静默覆盖或自动合并。
+- [x] 共享 workspace 中不存在两个并发运行的 mutation/unknown 工具。
+- [x] 并行读取和模型推理不受不必要的全局串行限制。
+- [x] 并发冲突以明确错误呈现，不产生静默覆盖或自动合并。
+
+### Phase 9 实现记录
+
+- `agent/lib.rs` 新增内部 `ToolEffect`、`ToolResource` 和 `ToolResourceLock` 分类；`tool_resource_locks` 只影响运行时调度计划，不改变对模型暴露的 tool strict schema。
+- file write/edit、todo/memory 写入等 workspace mutation 和 command/MCP/未知工具都会追加 `WorkspaceMutationLease`；graph、文件读取、搜索、web fetch/search、只读 Agent 协作工具和 memory search 保持 read-only，不获取 mutation lease。
+- `app/runtime/tool_locks.rs` 新增进程内 `ToolResourceLockRegistry`，按 workspace 维护 RAII lease；冲突等待不持有数据库事务，lease drop 会在正常完成、错误、取消或 panic unwind 时释放并唤醒等待者。
+- `execute_tool` 在 PreToolUse hook 更新入参后计算 `timeoutMs`、资源锁和 owner，工具实际分发前统一等待 lease；等待耗时计入工具 deadline，超时或取消返回明确错误，owner snapshot 包含 instance/task/tool call/tool name、activeMs 和 waitMs。
+- mutation lease 不替代原有安全边界：文件工具仍由既有 workspace-relative/canonicalize/oldStr 校验负责，command 仍由原 timeout/进程树终止路径负责，Provider、MCP 和 hook 校验保持独立。
+- Phase 9 覆盖测试位于 `agent/lib.rs` 的 `tool_*` 用例和 `app/tests/mod.rs` 的 `tool_resource_*` 用例，验证只读并发、mutation 串行、等待 timeout/取消/panic 释放、MCP unknown effect 串行，以及既有 stale edit、命令 timeout 和路径逃逸错误。
 
 ---
 

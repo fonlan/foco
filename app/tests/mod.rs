@@ -40,7 +40,8 @@ use crate::prompt::{
     context_token_breakdown,
 };
 use crate::runtime::{
-    QuestionItem, QuestionItemAnswer, QuestionOption, execute_tool, wait_for_tool_resource_lock,
+    QuestionItem, QuestionItemAnswer, QuestionOption, ToolResourceLockOwner, execute_tool,
+    wait_for_tool_resource_lock,
 };
 
 fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
@@ -159,6 +160,13 @@ fn test_file_resource_lock(path: &str, access: ToolResourceAccess) -> ToolResour
     ToolResourceLock {
         resource: ToolResource::File(path.to_string()),
         access,
+    }
+}
+
+fn test_workspace_mutation_lock() -> ToolResourceLock {
+    ToolResourceLock {
+        resource: ToolResource::WorkspaceMutationLease,
+        access: ToolResourceAccess::Exclusive,
     }
 }
 
@@ -343,30 +351,47 @@ async fn tool_resource_registry_blocks_same_file_read_write() {
 }
 
 #[tokio::test]
-async fn tool_resource_registry_allows_different_file_writes() {
+async fn tool_resource_registry_serializes_workspace_mutation_lease() {
     let registry = ToolResourceLockRegistry::default();
-    let _first_lease = registry
-        .acquire(
-            "workspace-1",
-            vec![test_file_resource_lock(
-                "src/a.rs",
-                ToolResourceAccess::Write,
-            )],
-        )
+    let mutation_lease = registry
+        .acquire("workspace-1", vec![test_workspace_mutation_lock()])
+        .await;
+    let waiting_registry = registry.clone();
+    let waiter = tokio::spawn(async move {
+        let _second_lease = waiting_registry
+            .acquire("workspace-1", vec![test_workspace_mutation_lock()])
+            .await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!waiter.is_finished());
+
+    drop(mutation_lease);
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("workspace mutation lease should be released")
+        .expect("mutation lease waiter should not panic");
+}
+
+#[tokio::test]
+async fn tool_resource_registry_allows_read_during_workspace_mutation_lease() {
+    let registry = ToolResourceLockRegistry::default();
+    let _mutation_lease = registry
+        .acquire("workspace-1", vec![test_workspace_mutation_lock()])
         .await;
 
-    let _second_lease = tokio::time::timeout(
+    let _read_lease = tokio::time::timeout(
         Duration::from_secs(1),
         registry.acquire(
             "workspace-1",
             vec![test_file_resource_lock(
-                "src/b.rs",
-                ToolResourceAccess::Write,
+                "src/main.rs",
+                ToolResourceAccess::Read,
             )],
         ),
     )
     .await
-    .expect("different file writes should not block each other");
+    .expect("read-only file lock should not wait on workspace mutation lease");
 }
 
 #[tokio::test]
@@ -470,12 +495,18 @@ async fn tool_resource_registry_keeps_memory_locks_global() {
 async fn tool_resource_lock_wait_respects_tool_timeout() {
     let registry = ToolResourceLockRegistry::default();
     let _workspace_lease = registry
-        .acquire(
+        .acquire_with_owner(
             "workspace-1",
             vec![ToolResourceLock {
                 resource: ToolResource::WorkspaceFiles,
                 access: ToolResourceAccess::Exclusive,
             }],
+            ToolResourceLockOwner {
+                instance_id: Some("agent-instance-1".to_string()),
+                task_id: Some("agent-task-1".to_string()),
+                tool_call_id: Some("call-blocker".to_string()),
+                tool_name: Some("write_file".to_string()),
+            },
         )
         .await;
     let started = Instant::now();
@@ -490,6 +521,11 @@ async fn tool_resource_lock_wait_respects_tool_timeout() {
         Some(10),
         Some(started + Duration::from_millis(10)),
         ToolCancellationToken::default(),
+        ToolResourceLockOwner {
+            tool_call_id: Some("call-waiter".to_string()),
+            tool_name: Some("read_file".to_string()),
+            ..ToolResourceLockOwner::default()
+        },
     )
     .await;
 
@@ -498,7 +534,34 @@ async fn tool_resource_lock_wait_respects_tool_timeout() {
         Err(error) => error,
     };
     assert!(error.contains("timed out waiting for resource lock"));
+    assert!(error.contains("call-blocker"));
+    assert!(error.contains("agent-instance-1"));
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn tool_resource_lease_releases_after_task_panic() {
+    let registry = ToolResourceLockRegistry::default();
+    let panic_registry = registry.clone();
+    let handle = tokio::spawn(async move {
+        let _lease = panic_registry
+            .acquire("workspace-1", vec![test_workspace_mutation_lock()])
+            .await;
+        panic!("fixture panic after acquiring mutation lease");
+    });
+    assert!(
+        handle
+            .await
+            .expect_err("fixture task should panic")
+            .is_panic()
+    );
+
+    let _lease = tokio::time::timeout(
+        Duration::from_secs(1),
+        registry.acquire("workspace-1", vec![test_workspace_mutation_lock()]),
+    )
+    .await
+    .expect("mutation lease should be released when panicking task drops it");
 }
 
 #[tokio::test]

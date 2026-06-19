@@ -37,8 +37,8 @@ use super::{
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, AskQuestionInput, QuestionAnswer,
     QuestionItem, QuestionItemAnswer, QuestionOption, QuestionRegistry, QuestionRequest,
-    ToolOutputDeltaSink, ToolResourceLease, ToolResourceLockRegistry, execute_web_tool,
-    is_web_tool_name, web_tool_timeout_ms,
+    ToolOutputDeltaSink, ToolResourceLease, ToolResourceLockOwner, ToolResourceLockRegistry,
+    execute_web_tool, is_web_tool_name, web_tool_timeout_ms,
 };
 use crate::*;
 
@@ -678,6 +678,8 @@ pub(crate) async fn execute_tool(
             };
         }
     };
+    let resource_lock_owner =
+        tool_resource_lock_owner(agent_tool_context.as_ref(), tool_call_id, tool_name);
     let _resource_lease = match wait_for_tool_resource_lock(
         &tool_resource_lock_registry,
         workspace_id,
@@ -686,6 +688,7 @@ pub(crate) async fn execute_tool(
         tool_timeout_ms,
         tool_deadline,
         cancellation_token.clone(),
+        resource_lock_owner,
     )
     .await
     {
@@ -2101,8 +2104,9 @@ pub(crate) async fn wait_for_tool_resource_lock(
     timeout_ms: Option<u64>,
     deadline: Option<Instant>,
     cancellation_token: ToolCancellationToken,
+    owner: ToolResourceLockOwner,
 ) -> Result<ToolResourceLease, String> {
-    let acquire = registry.acquire(workspace_id, resource_locks);
+    let acquire = registry.acquire_with_owner(workspace_id, resource_locks.clone(), owner);
     match (timeout_ms, deadline.and_then(remaining_duration_until)) {
         (Some(timeout_ms), Some(remaining)) => {
             tokio::select! {
@@ -2110,12 +2114,16 @@ pub(crate) async fn wait_for_tool_resource_lock(
                     Err("tool execution cancelled".to_string())
                 }
                 lease = timeout(remaining, acquire) => {
-                    lease.map_err(|_| format!("tool '{tool_name}' timed out waiting for resource lock after {timeout_ms} ms"))
+                    lease.map_err(|_| resource_lock_timeout_error(registry, workspace_id, &resource_locks, tool_name, timeout_ms))
                 }
             }
         }
-        (Some(timeout_ms), None) => Err(format!(
-            "tool '{tool_name}' timed out waiting for resource lock after {timeout_ms} ms"
+        (Some(timeout_ms), None) => Err(resource_lock_timeout_error(
+            registry,
+            workspace_id,
+            &resource_locks,
+            tool_name,
+            timeout_ms,
         )),
         (None, _) => {
             tokio::select! {
@@ -2126,6 +2134,60 @@ pub(crate) async fn wait_for_tool_resource_lock(
             }
         }
     }
+}
+
+fn tool_resource_lock_owner(
+    agent_tool_context: Option<&AgentToolContext>,
+    tool_call_id: &str,
+    tool_name: &str,
+) -> ToolResourceLockOwner {
+    let associations = agent_tool_context.map(|context| &context.associations);
+    ToolResourceLockOwner {
+        instance_id: associations
+            .and_then(|associations| associations.instance_id.as_ref())
+            .map(ToString::to_string),
+        task_id: associations
+            .and_then(|associations| associations.task_id.as_ref())
+            .map(ToString::to_string),
+        tool_call_id: Some(tool_call_id.to_string()),
+        tool_name: Some(tool_name.to_string()),
+    }
+}
+
+fn resource_lock_timeout_error(
+    registry: &ToolResourceLockRegistry,
+    workspace_id: &str,
+    resource_locks: &[ToolResourceLock],
+    tool_name: &str,
+    timeout_ms: u64,
+) -> String {
+    let blockers = registry.blocking_owners(workspace_id, resource_locks);
+    if blockers.is_empty() {
+        return format!(
+            "tool '{tool_name}' timed out waiting for resource lock after {timeout_ms} ms"
+        );
+    }
+
+    let blockers = blockers
+        .into_iter()
+        .map(|blocker| {
+            let owner = blocker.owner;
+            format!(
+                "toolCallId={}, toolName={}, instanceId={}, taskId={}, activeMs={}, waitedBeforeAcquireMs={}",
+                owner.tool_call_id.as_deref().unwrap_or("unknown"),
+                owner.tool_name.as_deref().unwrap_or("unknown"),
+                owner.instance_id.as_deref().unwrap_or("none"),
+                owner.task_id.as_deref().unwrap_or("none"),
+                blocker.active_ms,
+                blocker.wait_ms,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    format!(
+        "tool '{tool_name}' timed out waiting for resource lock after {timeout_ms} ms; blocked by {blockers}"
+    )
 }
 
 fn remaining_duration_until(deadline: Instant) -> Option<Duration> {
@@ -2803,6 +2865,7 @@ mod tests {
                 attempt_id: None,
             },
             permissions,
+            agent_definitions: Vec::new(),
             scheduler: _scheduler,
         };
         (workspace, context, team_id, instance_id, task_id)
@@ -2817,6 +2880,7 @@ mod tests {
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
+            "call-no-delegate",
             json!({
                 "targetInstanceId": instance_id.to_string(),
                 "targetDefinitionId": null,
@@ -2835,6 +2899,7 @@ mod tests {
             &context,
             workspace.path(),
             AGENT_SEND_MESSAGE_TOOL,
+            "call-oversized-message",
             json!({
                 "receiverInstanceId": instance_id.to_string(),
                 "kind": "notification",
@@ -2867,6 +2932,7 @@ mod tests {
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
+            "call-no-instance",
             json!({
                 "targetInstanceId": null,
                 "targetDefinitionId": missing_definition_id.to_string(),
@@ -2885,6 +2951,7 @@ mod tests {
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
+            "call-oversized-input",
             json!({
                 "targetInstanceId": instance_id.to_string(),
                 "targetDefinitionId": null,
@@ -2920,6 +2987,7 @@ mod tests {
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
+            "call-child-limit",
             json!({
                 "targetInstanceId": instance_id.to_string(),
                 "targetDefinitionId": null,

@@ -849,6 +849,9 @@ const AGENT_GET_TASK_TOOL_NAME: &str = "agent_get_task";
 const AGENT_SEND_MESSAGE_TOOL_NAME: &str = "agent_send_message";
 const AGENT_DELEGATE_TASK_TOOL_NAME: &str = "agent_delegate_task";
 const AGENT_CANCEL_TASK_TOOL_NAME: &str = "agent_cancel_task";
+const AGENT_WAIT_TASKS_TOOL_NAME: &str = "agent_wait_tasks";
+const AGENT_TRANSFER_TASK_TOOL_NAME: &str = "agent_transfer_task";
+const AGENT_CREATE_INSTANCES_TOOL_NAME: &str = "agent_create_instances";
 const ASK_QUESTION_TOOL_NAME: &str = "ask_question";
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 const MEMORY_WRITE_TOOL_NAME: &str = "memory_write";
@@ -918,6 +921,13 @@ pub enum ToolExecutionMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolEffect {
+    ReadOnly,
+    WorkspaceMutation,
+    ExternalOrUnknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolResourceAccess {
     Read,
     Write,
@@ -926,6 +936,7 @@ pub enum ToolResourceAccess {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ToolResource {
+    WorkspaceMutationLease,
     WorkspaceFiles,
     File(String),
     TodoGraph,
@@ -1342,66 +1353,109 @@ pub fn plan_tool_execution(
 pub fn tool_resource_locks(
     tool_call: &PendingToolCall,
 ) -> Result<Vec<ToolResourceLock>, ToolConflictError> {
-    match tool_call.name.as_str() {
-        READ_FILE_TOOL_NAME => Ok(vec![ToolResourceLock {
+    let effect = tool_effect(&tool_call.name);
+    let mut locks = match tool_call.name.as_str() {
+        READ_FILE_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::File(required_path(tool_call)?),
             access: ToolResourceAccess::Read,
-        }]),
-        WRITE_FILE_TOOL_NAME | EDIT_FILE_TOOL_NAME => Ok(vec![ToolResourceLock {
+        }],
+        WRITE_FILE_TOOL_NAME | EDIT_FILE_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::File(required_path(tool_call)?),
             access: ToolResourceAccess::Write,
-        }]),
+        }],
         FIND_FILES_TOOL_NAME
         | SEARCH_TEXT_TOOL_NAME
         | GRAPH_FIND_SYMBOLS_TOOL_NAME
         | GRAPH_FIND_CALLERS_TOOL_NAME
         | GRAPH_FIND_CALLEES_TOOL_NAME
         | GRAPH_FIND_REFERENCES_TOOL_NAME
-        | GRAPH_RELATED_FILES_TOOL_NAME => Ok(vec![ToolResourceLock {
+        | GRAPH_RELATED_FILES_TOOL_NAME
+        | GRAPH_EXPLORE_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::WorkspaceFiles,
             access: ToolResourceAccess::Read,
-        }]),
-        RUN_COMMAND_TOOL_NAME => Ok(vec![ToolResourceLock {
-            resource: ToolResource::WorkspaceFiles,
-            access: ToolResourceAccess::Exclusive,
-        }]),
-        CREATE_TODO_GRAPH_TOOL_NAME | UPDATE_TODO_GRAPH_TOOL_NAME => Ok(vec![ToolResourceLock {
+        }],
+        CREATE_TODO_GRAPH_TOOL_NAME | UPDATE_TODO_GRAPH_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::TodoGraph,
             access: ToolResourceAccess::Write,
-        }]),
-        GET_TODO_GRAPH_TOOL_NAME => Ok(vec![ToolResourceLock {
+        }],
+        GET_TODO_GRAPH_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::TodoGraph,
             access: ToolResourceAccess::Read,
-        }]),
+        }],
         AGENT_LIST_TOOL_NAME
         | AGENT_GET_TASK_TOOL_NAME
         | AGENT_SEND_MESSAGE_TOOL_NAME
         | AGENT_DELEGATE_TASK_TOOL_NAME
-        | AGENT_CANCEL_TASK_TOOL_NAME => Ok(Vec::new()),
-        MEMORY_SEARCH_TOOL_NAME => Ok(vec![ToolResourceLock {
+        | AGENT_CANCEL_TASK_TOOL_NAME
+        | AGENT_WAIT_TASKS_TOOL_NAME
+        | AGENT_TRANSFER_TASK_TOOL_NAME
+        | AGENT_CREATE_INSTANCES_TOOL_NAME => Vec::new(),
+        MEMORY_SEARCH_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::Memory(memory_scope_key(tool_call)?),
             access: ToolResourceAccess::Read,
-        }]),
-        MEMORY_WRITE_TOOL_NAME => Ok(vec![ToolResourceLock {
+        }],
+        MEMORY_WRITE_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::Memory(memory_scope_key(tool_call)?),
             access: ToolResourceAccess::Write,
-        }]),
-        WEB_SEARCH_TOOL_NAME | WEB_FETCH_TOOL_NAME => Ok(vec![ToolResourceLock {
+        }],
+        WEB_SEARCH_TOOL_NAME | WEB_FETCH_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::ExternalTool(tool_call.name.clone()),
             access: ToolResourceAccess::Exclusive,
-        }]),
-        ASK_QUESTION_TOOL_NAME | "sleep" => Ok(Vec::new()),
-        name if name.starts_with(MCP_TOOL_NAME_PREFIX) => Ok(vec![
-            ToolResourceLock {
-                resource: ToolResource::WorkspaceFiles,
+        }],
+        ASK_QUESTION_TOOL_NAME | "sleep" => Vec::new(),
+        name if name.starts_with(MCP_TOOL_NAME_PREFIX) => vec![ToolResourceLock {
+            resource: ToolResource::ExternalTool(name.to_string()),
+            access: ToolResourceAccess::Exclusive,
+        }],
+        _ => Vec::new(),
+    };
+
+    match effect {
+        ToolEffect::ReadOnly => {}
+        ToolEffect::WorkspaceMutation | ToolEffect::ExternalOrUnknown => {
+            locks.push(ToolResourceLock {
+                resource: ToolResource::WorkspaceMutationLease,
                 access: ToolResourceAccess::Exclusive,
-            },
-            ToolResourceLock {
-                resource: ToolResource::ExternalTool(name.to_string()),
-                access: ToolResourceAccess::Exclusive,
-            },
-        ]),
-        _ => Ok(Vec::new()),
+            });
+        }
+    }
+
+    Ok(locks)
+}
+
+pub fn tool_effect(tool_name: &str) -> ToolEffect {
+    match tool_name {
+        READ_FILE_TOOL_NAME
+        | FIND_FILES_TOOL_NAME
+        | SEARCH_TEXT_TOOL_NAME
+        | GRAPH_FIND_SYMBOLS_TOOL_NAME
+        | GRAPH_FIND_CALLERS_TOOL_NAME
+        | GRAPH_FIND_CALLEES_TOOL_NAME
+        | GRAPH_FIND_REFERENCES_TOOL_NAME
+        | GRAPH_RELATED_FILES_TOOL_NAME
+        | GRAPH_EXPLORE_TOOL_NAME
+        | GET_TODO_GRAPH_TOOL_NAME
+        | MEMORY_SEARCH_TOOL_NAME
+        | WEB_SEARCH_TOOL_NAME
+        | WEB_FETCH_TOOL_NAME
+        | AGENT_LIST_TOOL_NAME
+        | AGENT_GET_TASK_TOOL_NAME
+        | AGENT_SEND_MESSAGE_TOOL_NAME
+        | AGENT_DELEGATE_TASK_TOOL_NAME
+        | AGENT_CANCEL_TASK_TOOL_NAME
+        | AGENT_WAIT_TASKS_TOOL_NAME
+        | AGENT_TRANSFER_TASK_TOOL_NAME
+        | AGENT_CREATE_INSTANCES_TOOL_NAME
+        | ASK_QUESTION_TOOL_NAME
+        | "sleep" => ToolEffect::ReadOnly,
+        WRITE_FILE_TOOL_NAME
+        | EDIT_FILE_TOOL_NAME
+        | CREATE_TODO_GRAPH_TOOL_NAME
+        | UPDATE_TODO_GRAPH_TOOL_NAME
+        | MEMORY_WRITE_TOOL_NAME => ToolEffect::WorkspaceMutation,
+        RUN_COMMAND_TOOL_NAME => ToolEffect::ExternalOrUnknown,
+        name if name.starts_with(MCP_TOOL_NAME_PREFIX) => ToolEffect::ExternalOrUnknown,
+        _ => ToolEffect::ExternalOrUnknown,
     }
 }
 
@@ -1477,6 +1531,12 @@ fn reject_conflicting_parallel_tool_calls(
     for first_lock in &first_analysis.locks {
         for second_lock in &second_analysis.locks {
             if !tool_resource_locks_conflict(first_lock, second_lock) {
+                continue;
+            }
+
+            if matches!(first_lock.resource, ToolResource::WorkspaceMutationLease)
+                && matches!(second_lock.resource, ToolResource::WorkspaceMutationLease)
+            {
                 continue;
             }
 
@@ -1582,6 +1642,7 @@ fn memory_scope_key(tool_call: &PendingToolCall) -> Result<String, ToolConflictE
 
 fn resources_overlap(first: &ToolResource, second: &ToolResource) -> bool {
     match (first, second) {
+        (ToolResource::WorkspaceMutationLease, ToolResource::WorkspaceMutationLease) => true,
         (ToolResource::WorkspaceFiles, ToolResource::WorkspaceFiles) => true,
         (ToolResource::WorkspaceFiles, ToolResource::File(_))
         | (ToolResource::File(_), ToolResource::WorkspaceFiles) => true,
@@ -1702,6 +1763,7 @@ impl std::error::Error for ToolConflictError {}
 impl fmt::Display for ToolResource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::WorkspaceMutationLease => write!(formatter, "workspace mutation lease"),
             Self::WorkspaceFiles => write!(formatter, "workspace files"),
             Self::File(path) => write!(formatter, "file '{path}'"),
             Self::TodoGraph => write!(formatter, "current chat todo graph"),
@@ -1790,6 +1852,86 @@ mod tests {
                 .expect_err("definition should be denied")
                 .code(),
             AgentDomainErrorCode::PermissionDenied
+        );
+    }
+
+    fn test_tool_call(name: &str, arguments: Value) -> PendingToolCall {
+        PendingToolCall {
+            id: format!("call-{name}"),
+            name: name.to_string(),
+            arguments,
+        }
+    }
+
+    #[test]
+    fn tool_effect_classifies_phase9_workspace_mutation_boundary() {
+        assert_eq!(tool_effect(READ_FILE_TOOL_NAME), ToolEffect::ReadOnly);
+        assert_eq!(tool_effect(GRAPH_EXPLORE_TOOL_NAME), ToolEffect::ReadOnly);
+        assert_eq!(tool_effect(WEB_FETCH_TOOL_NAME), ToolEffect::ReadOnly);
+        assert_eq!(
+            tool_effect(WRITE_FILE_TOOL_NAME),
+            ToolEffect::WorkspaceMutation
+        );
+        assert_eq!(
+            tool_effect(EDIT_FILE_TOOL_NAME),
+            ToolEffect::WorkspaceMutation
+        );
+        assert_eq!(
+            tool_effect(RUN_COMMAND_TOOL_NAME),
+            ToolEffect::ExternalOrUnknown
+        );
+        assert_eq!(
+            tool_effect("mcp__server__tool"),
+            ToolEffect::ExternalOrUnknown
+        );
+        assert_eq!(tool_effect("future_tool"), ToolEffect::ExternalOrUnknown);
+    }
+
+    #[test]
+    fn mutation_and_unknown_tools_take_workspace_mutation_lease() {
+        let write_locks = tool_resource_locks(&test_tool_call(
+            WRITE_FILE_TOOL_NAME,
+            json!({ "path": "src/lib.rs" }),
+        ))
+        .expect("write locks");
+        assert!(write_locks.iter().any(|lock| {
+            lock.resource == ToolResource::WorkspaceMutationLease
+                && lock.access == ToolResourceAccess::Exclusive
+        }));
+        assert!(write_locks.iter().any(|lock| {
+            lock.resource == ToolResource::File("src/lib.rs".to_string())
+                && lock.access == ToolResourceAccess::Write
+        }));
+
+        let command_locks = tool_resource_locks(&test_tool_call(RUN_COMMAND_TOOL_NAME, json!({})))
+            .expect("command locks");
+        assert_eq!(
+            command_locks,
+            vec![ToolResourceLock {
+                resource: ToolResource::WorkspaceMutationLease,
+                access: ToolResourceAccess::Exclusive,
+            }]
+        );
+
+        let mcp_locks = tool_resource_locks(&test_tool_call("mcp__server__tool", json!({})))
+            .expect("mcp locks");
+        assert!(mcp_locks.iter().any(|lock| {
+            lock.resource == ToolResource::WorkspaceMutationLease
+                && lock.access == ToolResourceAccess::Exclusive
+        }));
+    }
+
+    #[test]
+    fn read_only_tools_do_not_take_workspace_mutation_lease() {
+        let locks = tool_resource_locks(&test_tool_call(
+            READ_FILE_TOOL_NAME,
+            json!({ "path": "src/lib.rs" }),
+        ))
+        .expect("read locks");
+        assert!(
+            !locks
+                .iter()
+                .any(|lock| lock.resource == ToolResource::WorkspaceMutationLease)
         );
     }
 
