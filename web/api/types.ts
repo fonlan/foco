@@ -395,6 +395,9 @@ export type ChatStreamEvent =
     type: "memoryResolved";
     assistantMessageId: string;
     memoriesUsed: ChatMemoryUsedSummary[];
+    agentTeamId?: string;
+    agentInstanceId?: string;
+    agentTaskId?: string;
   }
   | { type: "error"; message: string };
 

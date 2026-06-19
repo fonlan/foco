@@ -1428,7 +1428,9 @@ pub(crate) fn persist_chat_result(
         }
     }
 
-    let assistant_message_id = if let Some(assistant_text) = assistant_text {
+    let assistant_message_id = if !context.agent_primary_chat_output {
+        None
+    } else if let Some(assistant_text) = assistant_text {
         let tool_call_summaries = tool_calls
             .iter()
             .map(executed_tool_call_summary)
@@ -1529,7 +1531,11 @@ pub(crate) fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
-    let memory_extraction = queue_memory_extraction_job(context, final_state)?;
+    let memory_extraction = if context.agent_primary_chat_output {
+        queue_memory_extraction_job(context, final_state)?
+    } else {
+        None
+    };
 
     Ok(memory_extraction)
 }
@@ -1750,6 +1756,7 @@ pub(crate) fn context_message_groups(
 fn prompt_context_group_key(source: &PromptContextSource) -> Option<PromptContextGroupKey> {
     match source {
         PromptContextSource::StoredMessage { sequence }
+        | PromptContextSource::AgentCurrentTask { sequence }
         | PromptContextSource::TurnMemory { sequence } => {
             Some(PromptContextGroupKey::MessageSequence(*sequence))
         }
@@ -1765,12 +1772,17 @@ pub(crate) fn prompt_context_source_bucket(
 ) -> PromptContextSourceBucket {
     match source {
         PromptContextSource::ReservedPrompt => PromptContextSourceBucket::ReservedPrompt,
+        PromptContextSource::AgentDefinition => PromptContextSourceBucket::AgentDefinition,
+        PromptContextSource::AgentTeamProtocol => PromptContextSourceBucket::AgentTeamProtocol,
         PromptContextSource::StableInjection => PromptContextSourceBucket::StableInjection,
         PromptContextSource::TodoGraph => PromptContextSourceBucket::TodoGraph,
         PromptContextSource::CompressionSnapshot => PromptContextSourceBucket::CompressionSnapshot,
+        PromptContextSource::AgentPrivateContext => PromptContextSourceBucket::AgentPrivateContext,
         PromptContextSource::StoredMessage { .. } => PromptContextSourceBucket::PersistedHistory,
         PromptContextSource::TurnMemory { .. } => PromptContextSourceBucket::TurnMemory,
         PromptContextSource::CurrentUser { .. } => PromptContextSourceBucket::CurrentUser,
+        PromptContextSource::AgentCurrentTask { .. } => PromptContextSourceBucket::AgentCurrentTask,
+        PromptContextSource::AgentUnreadMessage => PromptContextSourceBucket::AgentUnreadMessage,
         PromptContextSource::AssistantDraft => PromptContextSourceBucket::AssistantDraft,
         PromptContextSource::HookContext => PromptContextSourceBucket::HookContext,
         PromptContextSource::Guidance => PromptContextSourceBucket::Guidance,
@@ -1787,6 +1799,7 @@ pub(crate) fn prompt_context_source_is_required(source: &PromptContextSource) ->
     !matches!(
         source,
         PromptContextSource::StoredMessage { .. }
+            | PromptContextSource::AgentPrivateContext
             | PromptContextSource::TurnMemory { .. }
             | PromptContextSource::RuntimeToolState { .. }
     )
@@ -1807,12 +1820,17 @@ fn pack_items_from_message_groups(groups: &[ContextMessageGroup]) -> Vec<Context
 pub(crate) fn context_token_breakdown(groups: &[ContextMessageGroup]) -> ContextTokenBreakdown {
     const SOURCES: &[PromptContextSourceBucket] = &[
         PromptContextSourceBucket::ReservedPrompt,
+        PromptContextSourceBucket::AgentDefinition,
+        PromptContextSourceBucket::AgentTeamProtocol,
         PromptContextSourceBucket::StableInjection,
         PromptContextSourceBucket::TodoGraph,
         PromptContextSourceBucket::CompressionSnapshot,
+        PromptContextSourceBucket::AgentPrivateContext,
         PromptContextSourceBucket::PersistedHistory,
         PromptContextSourceBucket::TurnMemory,
         PromptContextSourceBucket::CurrentUser,
+        PromptContextSourceBucket::AgentCurrentTask,
+        PromptContextSourceBucket::AgentUnreadMessage,
         PromptContextSourceBucket::AssistantDraft,
         PromptContextSourceBucket::HookContext,
         PromptContextSourceBucket::Guidance,
@@ -1881,6 +1899,7 @@ fn context_group_is_compressible(group: &ContextMessageGroup) -> bool {
         && matches!(
             group.source_bucket,
             PromptContextSourceBucket::PersistedHistory
+                | PromptContextSourceBucket::AgentPrivateContext
                 | PromptContextSourceBucket::TurnMemory
                 | PromptContextSourceBucket::RuntimeToolState
                 | PromptContextSourceBucket::CompressionSnapshot
@@ -1922,12 +1941,17 @@ pub(crate) fn prompt_context_source_bucket_label(
 ) -> &'static str {
     match source {
         PromptContextSourceBucket::ReservedPrompt => "reservedPrompt",
+        PromptContextSourceBucket::AgentDefinition => "agentDefinition",
+        PromptContextSourceBucket::AgentTeamProtocol => "agentTeamProtocol",
         PromptContextSourceBucket::StableInjection => "stableInjection",
         PromptContextSourceBucket::TodoGraph => "todoGraph",
         PromptContextSourceBucket::CompressionSnapshot => "compressionSnapshot",
+        PromptContextSourceBucket::AgentPrivateContext => "agentPrivateContext",
         PromptContextSourceBucket::PersistedHistory => "persistedHistory",
         PromptContextSourceBucket::TurnMemory => "turnMemory",
         PromptContextSourceBucket::CurrentUser => "currentUser",
+        PromptContextSourceBucket::AgentCurrentTask => "agentCurrentTask",
+        PromptContextSourceBucket::AgentUnreadMessage => "agentUnreadMessage",
         PromptContextSourceBucket::AssistantDraft => "assistantDraft",
         PromptContextSourceBucket::HookContext => "hookContext",
         PromptContextSourceBucket::Guidance => "guidance",

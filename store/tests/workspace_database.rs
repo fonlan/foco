@@ -2028,6 +2028,62 @@ fn agent_queue_limits_and_team_lifecycle_are_enforced() {
 }
 
 #[test]
+fn agent_instance_context_reset_creates_new_generation_without_deleting_history() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-context-reset", "context-reset");
+
+    database
+        .insert_agent_context_entry(NewAgentContextEntry {
+            id: "agent-context-entry-reset-old",
+            team_id: &team_id,
+            instance_id: &instance_id,
+            generation: 0,
+            sequence: 0,
+            role: "assistant",
+            content_json: r#"{"summary":"old context"}"#,
+            source_task_id: None,
+            source_message_id: None,
+        })
+        .expect("insert old context entry");
+
+    let reset_instance = database
+        .reset_agent_instance_context(&instance_id)
+        .expect("reset instance context");
+    assert_eq!(reset_instance.context_generation, 1);
+    assert_eq!(
+        database
+            .agent_context_entries(&instance_id, 0, -1)
+            .expect("old context entries")
+            .len(),
+        1
+    );
+    assert!(
+        database
+            .agent_context_entries(&instance_id, 1, -1)
+            .expect("new context entries")
+            .is_empty()
+    );
+
+    let task_id = AgentTaskId::new("agent-task-context-reset-blocker").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue blocker task");
+    assert!(
+        database.reset_agent_instance_context(&instance_id).is_err(),
+        "context reset must reject instances with queued work"
+    );
+}
+
+#[test]
 fn interrupted_queue_head_requires_explicit_retry_and_keeps_fifo() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");

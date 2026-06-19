@@ -2767,6 +2767,12 @@ enum ChatSseEvent {
     MemoryResolved {
         assistant_message_id: String,
         memories_used: Vec<ChatMemoryUsedSummary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_team_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_instance_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_task_id: Option<String>,
     },
     Usage {
         usage: NeutralUsage,
@@ -2802,7 +2808,9 @@ struct PreparedChatContext {
     agent_associations: AgentRunAssociations,
     agent_definition_snapshot: Option<Value>,
     agent_task_input: Option<Value>,
+    agent_unread_messages: Vec<Value>,
     agent_allowed_tools: Option<HashSet<String>>,
+    agent_primary_chat_output: bool,
     session_upload_paths: Option<Vec<String>>,
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
@@ -2942,12 +2950,17 @@ struct NormalizedAiStatisticsFilters {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PromptContextSource {
     ReservedPrompt,
+    AgentDefinition,
+    AgentTeamProtocol,
     StableInjection,
     TodoGraph,
     CompressionSnapshot,
+    AgentPrivateContext,
     StoredMessage { sequence: i64 },
     TurnMemory { sequence: i64 },
     CurrentUser { sequence: i64 },
+    AgentCurrentTask { sequence: i64 },
+    AgentUnreadMessage,
     AssistantDraft,
     HookContext,
     Guidance,
@@ -2967,12 +2980,17 @@ enum PromptContextGroupKey {
 #[serde(rename_all = "camelCase")]
 enum PromptContextSourceBucket {
     ReservedPrompt,
+    AgentDefinition,
+    AgentTeamProtocol,
     StableInjection,
     TodoGraph,
     CompressionSnapshot,
+    AgentPrivateContext,
     PersistedHistory,
     TurnMemory,
     CurrentUser,
+    AgentCurrentTask,
+    AgentUnreadMessage,
     AssistantDraft,
     HookContext,
     Guidance,
@@ -3194,6 +3212,7 @@ async fn run_chat_context_in_background(
             })
         });
     let current_task = chat_context.agent_task_input.clone();
+    let unread_messages = chat_context.agent_unread_messages.clone();
     let run_context = AgentRunContext {
         chat_id: chat_context.chat_id.clone(),
         workspace_id: chat_context.workspace_id.clone(),
@@ -3207,7 +3226,7 @@ async fn run_chat_context_in_background(
     let run_input = AgentRunInput {
         messages: chat_context.provider_request.messages.clone(),
         current_task,
-        unread_messages: Vec::new(),
+        unread_messages,
         recovery: None,
     };
     let task = FocoAgentRunTask {
@@ -3457,6 +3476,21 @@ impl PreparedChatContext {
                         let event = ChatSseEvent::MemoryResolved {
                             assistant_message_id,
                             memories_used,
+                            agent_team_id: self
+                                .agent_associations
+                                .team_id
+                                .as_ref()
+                                .map(ToString::to_string),
+                            agent_instance_id: self
+                                .agent_associations
+                                .instance_id
+                                .as_ref()
+                                .map(ToString::to_string),
+                            agent_task_id: self
+                                .agent_associations
+                                .task_id
+                                .as_ref()
+                                .map(ToString::to_string),
                         };
                         events.push(captured_event(&event));
                         yield event;
@@ -5204,7 +5238,9 @@ async fn prepare_chat_context(
         agent_associations: AgentRunAssociations::default(),
         agent_definition_snapshot: None,
         agent_task_input: None,
+        agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: prompt_context.provider_config,
         provider_request,

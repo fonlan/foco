@@ -449,56 +449,69 @@
 
 ## 阶段 5：实例私有上下文、Prompt 与 Memory 集成
 
+**阶段状态：已完成（2026-06-19）**
+
 ### 目标
 
 使每个 AgentInstance 拥有独立、持久、可压缩的上下文，并按固定层级构建提示词。
 
 ### 5.1 Prompt 分层
 
-- [ ] 固定 Prompt 顺序：Foco 基础系统提示词 → AgentDefinition 系统提示词 → workspace AGENTS/配置提示词 → Team 协议与实例身份 → 当前任务与消息。
-- [ ] 为 Team 协议注入 instance ID、definition ID、角色、允许的协作工具和运行限制。
-- [ ] 任务、parent task 摘要、dependency 结果和未读消息使用运行时消息层，不拼接进永久系统提示词。
-- [ ] AgentDefinition systemPrompt 为空、超长或读取失败时明确报错，不静默使用其它提示词。
-- [ ] Prompt cache key 纳入 definition revision、实例配置快照、memory resolved 内容和 Team 协议版本。
+- [x] 固定 Prompt 顺序：Foco 基础系统提示词 → AgentDefinition 系统提示词 → workspace AGENTS/配置提示词 → Team 协议与实例身份 → 当前任务与消息。
+- [x] 为 Team 协议注入 instance ID、definition ID、角色、允许的协作工具和运行限制。
+- [x] 任务、parent task 摘要、dependency 结果和未读消息使用运行时消息层，不拼接进永久系统提示词。
+- [x] AgentDefinition systemPrompt 为空、超长或读取失败时明确报错，不静默使用其它提示词。
+- [x] Prompt cache key 纳入 definition revision、实例配置快照、memory resolved 内容和 Team 协议版本。
 
 ### 5.2 私有上下文
 
-- [ ] Worker/Coordinator 的私有 context entries 按 instance 和 sequence 持久化。
-- [ ] Coordinator 面向用户的最终消息同时进入主 chat history；Worker 输出只进入私有上下文和 task result。
-- [ ] 未读 AgentMessage 只注入目标实例，并在成功构建 turn 后更新消费游标。
-- [ ] 已完成任务保留结构化结果和摘要，不无限复制完整历史。
-- [ ] 实例 reset 必须显式创建新的 context generation，不修改历史审计。
+- [x] Worker/Coordinator 的私有 context entries 按 instance 和 sequence 持久化。
+- [x] Coordinator 面向用户的最终消息同时进入主 chat history；Worker 输出只进入私有上下文和 task result。
+- [x] 未读 AgentMessage 只注入目标实例，并在成功构建 turn 后更新消费游标。
+- [x] 已完成任务保留结构化结果和摘要，不无限复制完整历史。
+- [x] 实例 reset 必须显式创建新的 context generation，不修改历史审计。
 
 ### 5.3 上下文压缩
 
-- [ ] 复用现有 runtime tool-state 压缩能力，并按 instance 隔离。
-- [ ] 达到工具 continuation 上限时只压缩当前实例的工具协议状态。
-- [ ] 增加跨任务摘要策略，确保实例长期使用时上下文不会无限增长。
-- [ ] 压缩失败必须使当前 task 明确失败，不丢弃无法恢复的上下文。
-- [ ] context snapshot 必须关联 instance、task、attempt 和构建版本。
+- [x] 复用现有 runtime tool-state 压缩能力，并按 instance 隔离。
+- [x] 达到工具 continuation 上限时只压缩当前实例的工具协议状态。
+- [x] 增加跨任务摘要策略，确保实例长期使用时上下文不会无限增长。
+- [x] 压缩失败必须使当前 task 明确失败，不丢弃无法恢复的上下文。
+- [x] context snapshot 必须关联 instance、task、attempt 和构建版本。
 
 ### 5.4 Memory 行为
 
-- [ ] Coordinator 保持 chat memory 在任务可见/start 事件之后解析的现有时序。
-- [ ] Worker 可读取同 chat 的 global/workspace/chat memory，但 memoryResolved 事件必须带 instance/task ID。
-- [ ] Worker 的自动 memory extraction 默认关闭，避免多个实例重复写入同一事实。
-- [ ] 只有 Coordinator 的用户可见完成结果进入现有自动提取路径。
-- [ ] ContextPreview 对 Coordinator 保持 memory 内联；Worker 暂不提供独立 Preview，除非后续 UI 明确需要。
+- [x] Coordinator 保持 chat memory 在任务可见/start 事件之后解析的现有时序。
+- [x] Worker 可读取同 chat 的 global/workspace/chat memory，但 memoryResolved 事件必须带 instance/task ID。
+- [x] Worker 的自动 memory extraction 默认关闭，避免多个实例重复写入同一事实。
+- [x] 只有 Coordinator 的用户可见完成结果进入现有自动提取路径。
+- [x] ContextPreview 对 Coordinator 保持 memory 内联；Worker 暂不提供独立 Preview，除非后续 UI 明确需要。
 
 ### 5.5 测试
 
-- [ ] 覆盖两个同 Definition 实例拥有不同 context history。
-- [ ] 覆盖修改 AgentDefinition 后既有实例继续使用旧快照。
-- [ ] 覆盖 Prompt 分层顺序与 workspace AGENTS 注入。
-- [ ] 覆盖 Worker 输出不会写入主 chat history。
-- [ ] 覆盖 memory retrieval 时序、cache key 重算和 Worker 不自动提取 memory。
-- [ ] 覆盖实例上下文压缩与工具轮数恢复。
+- [x] 覆盖两个同 Definition 实例拥有不同 context history。
+- [x] 覆盖修改 AgentDefinition 后既有实例继续使用旧快照。
+- [x] 覆盖 Prompt 分层顺序与 workspace AGENTS 注入。
+- [x] 覆盖 Worker 输出不会写入主 chat history。
+- [x] 覆盖 memory retrieval 时序、cache key 重算和 Worker 不自动提取 memory。
+- [x] 覆盖实例上下文压缩与工具轮数恢复。
 
 ### 阶段 5 退出条件
 
-- [ ] 每个实例都可以在多个顺序任务间保持独立连续上下文。
-- [ ] 主聊天只显示 Coordinator 用户可见输出，不包含 Worker 私有历史。
-- [ ] Prompt、Memory、压缩和审计均可按 instance/task 追踪。
+- [x] 每个实例都可以在多个顺序任务间保持独立连续上下文。
+- [x] 主聊天只显示 Coordinator 用户可见输出，不包含 Worker 私有历史。
+- [x] Prompt、Memory、压缩和审计均可按 instance/task 追踪。
+
+### Phase 5 实现记录
+
+- `app/runtime/agent_scheduler.rs` 在 Scheduler 领取任务后补齐 Agent prompt 层：验证 AgentDefinition `system_prompt`，按实例快照注入定义提示词和 Team protocol，并将当前 task 与未读 AgentMessage 作为运行时消息层传入 `AgentRunExecutor`。
+- Team protocol 记录协议版本、team/chat/instance/task/attempt ID、definition ID/revision、角色、协作权限、允许的运行时工具、队列上限和工具轮数上限；`AgentRole::as_str` 提供稳定 `snake_case` 角色值。
+- 每个 task 完成后写入 `agent_context_entries` 并生成带 version、team protocol version、instance、task、attempt、generation 和 build version 的 `agent_context_snapshots`；snapshot 只保留有界摘要，避免跨任务完整历史无限增长。
+- Worker 运行继续写 LLM audit、tool call/result 和 task result，但 `persist_chat_result` 不写主 chat assistant message，也不排自动 memory extraction；Coordinator 保持原主聊天输出和自动抽取路径。
+- 未读 AgentMessage 只读取目标实例未消费消息，成功构建 prompt 后标记 consumed，并作为 `AgentRunInput.unread_messages` 传给共享执行器。
+- Deferred memory retrieval 继续在 start 事件后执行；`memoryResolved` SSE 增加可选 team/instance/task ID，prompt cache key 显式哈希 AgentDefinition、Team protocol 和 resolved memory 内容。
+- `reset_context` 实例 action 通过 `reset_agent_instance_context` 显式递增 `context_generation`，拒绝仍有 queued/running/waiting task 的实例，并保留旧 generation 的 context 与审计历史。
+- 针对性测试覆盖 Agent prompt cache key、Worker 不写主聊天且不抽取 memory、context reset generation、既有 memory 时序和 runtime tool-state 压缩回归；全量 workspace 测试继续通过。
 
 ---
 

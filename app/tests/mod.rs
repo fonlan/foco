@@ -186,7 +186,9 @@ fn test_prepared_chat_context(
         agent_associations: AgentRunAssociations::default(),
         agent_definition_snapshot: None,
         agent_task_input: None,
+        agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
@@ -237,6 +239,71 @@ fn test_prepared_chat_context(
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval: None,
     }
+}
+
+#[test]
+fn prompt_cache_key_includes_agent_layers_and_resolved_memory() {
+    let mut request = NeutralChatRequest {
+        model_id: "gpt-5.4".to_string(),
+        messages: vec![
+            neutral_text_message(NeutralChatRole::System, "base".to_string()),
+            neutral_text_message(NeutralChatRole::System, "agent definition".to_string()),
+            neutral_text_message(NeutralChatRole::System, "team protocol".to_string()),
+            neutral_text_message(NeutralChatRole::User, "user turn".to_string()),
+            neutral_text_message(NeutralChatRole::User, "resolved memory A".to_string()),
+        ],
+        tools: Vec::new(),
+        thinking_level: None,
+        max_output_tokens: Some(16),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    };
+    let source_sequences = vec![None, None, None, Some(7), Some(7)];
+    let context_sources = vec![
+        PromptContextSource::ReservedPrompt,
+        PromptContextSource::AgentDefinition,
+        PromptContextSource::AgentTeamProtocol,
+        PromptContextSource::CurrentUser { sequence: 7 },
+        PromptContextSource::TurnMemory { sequence: 7 },
+    ];
+
+    let base_key = prompt_cache_key(
+        "workspace-1",
+        "chat-1",
+        "provider-1",
+        "model-1",
+        &request,
+        &source_sequences,
+        &context_sources,
+    )
+    .expect("base cache key");
+
+    request.messages[1].content = "agent definition changed".to_string();
+    let definition_key = prompt_cache_key(
+        "workspace-1",
+        "chat-1",
+        "provider-1",
+        "model-1",
+        &request,
+        &source_sequences,
+        &context_sources,
+    )
+    .expect("definition cache key");
+    assert_ne!(base_key, definition_key);
+
+    request.messages[1].content = "agent definition".to_string();
+    request.messages[4].content = "resolved memory B".to_string();
+    let memory_key = prompt_cache_key(
+        "workspace-1",
+        "chat-1",
+        "provider-1",
+        "model-1",
+        &request,
+        &source_sequences,
+        &context_sources,
+    )
+    .expect("memory cache key");
+    assert_ne!(base_key, memory_key);
 }
 
 #[tokio::test]
@@ -3456,7 +3523,9 @@ fn persist_chat_result_writes_audit_status_code() {
         },
         agent_definition_snapshot: None,
         agent_task_input: None,
+        agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
@@ -3630,7 +3699,9 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         agent_associations: AgentRunAssociations::default(),
         agent_definition_snapshot: None,
         agent_task_input: None,
+        agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
@@ -3742,6 +3813,89 @@ fn persist_chat_result_writes_each_captured_llm_request() {
     );
 
     drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn persist_chat_result_for_worker_skips_main_chat_and_memory_extraction() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-worker-private-output-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-1", "Worker private chat")
+            .expect("chat insert");
+    }
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Worker input".to_string(),
+        )],
+        vec![Some(0)],
+        vec![PromptContextSource::StoredMessage { sequence: 0 }],
+        984,
+    );
+    context.agent_primary_chat_output = false;
+    context.memory_settings = MemorySettings {
+        enabled: true,
+        extraction_mode: "pending_review".to_string(),
+        retrieval_mode: "fts".to_string(),
+        retention_days: None,
+        extraction_model_id: Some("extract-model".to_string()),
+        retrieval_model_id: None,
+    };
+    let outcome = ChatAuditOutcome {
+        first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
+        completed_at: "2026-06-06T09:00:01Z".to_string(),
+        first_token_latency_ms: Some(100),
+        total_latency_ms: 1_000,
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        cache_read_tokens: Some(0),
+        cache_write_tokens: Some(0),
+        status_code: Some(200),
+        final_state: "succeeded",
+        response_body_json: Some(r#"{"text":"Private result."}"#.to_string()),
+    };
+
+    persist_chat_result(
+        &context,
+        "2026-06-06T09:00:00Z",
+        outcome,
+        &[],
+        Some("Private result."),
+        None,
+        &[],
+    )
+    .expect("persist worker private chat result");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    assert!(
+        database
+            .messages_for_chat("chat-1")
+            .expect("chat messages read")
+            .is_empty()
+    );
+    assert!(
+        database
+            .llm_request("request-1")
+            .expect("llm request read")
+            .is_some()
+    );
+    let memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+    assert!(
+        memory_database
+            .extraction_jobs_for_scope(Some("chat-1"), Some(MemoryExtractionJobStatus::Queued), 10)
+            .expect("memory extraction jobs")
+            .is_empty()
+    );
+
+    drop(database);
+    drop(memory_database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
@@ -3881,7 +4035,9 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         agent_associations: AgentRunAssociations::default(),
         agent_definition_snapshot: None,
         agent_task_input: None,
+        agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
@@ -6917,7 +7073,8 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         second_context.message_source_sequences[latest_user_index],
         second_context.message_source_sequences[latest_user_index + 1]
     );
-    assert_eq!(
+    assert!(second_context.provider_request.prompt_cache_key.is_some());
+    assert_ne!(
         second_context.provider_request.prompt_cache_key.as_deref(),
         Some(first_cache_key.as_str())
     );

@@ -30,6 +30,7 @@ enum AgentRuntimeAction {
     Drain,
     Stop,
     Delete,
+    ResetContext,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +85,7 @@ struct AgentInstanceView {
     role: foco_agent::AgentRole,
     status: AgentInstanceStatus,
     next_task_sequence: i64,
+    context_generation: i64,
     last_scheduled_at: Option<String>,
     created_at: String,
     updated_at: String,
@@ -236,6 +238,11 @@ pub(crate) async fn agent_runtime_action(
                         "Agent teams are stopped, not directly deleted",
                     ));
                 }
+                AgentRuntimeAction::ResetContext => {
+                    return Err(ApiError::bad_request(
+                        "resetContext is only valid for Agent instances",
+                    ));
+                }
             };
             database
                 .transition_agent_team_status(&team.id, target)
@@ -270,6 +277,19 @@ pub(crate) async fn agent_runtime_action(
                 database
                     .delete_agent_instance(&instance_id)
                     .map_err(ApiError::from_workspace_error)?;
+            } else if matches!(request.action, AgentRuntimeAction::ResetContext) {
+                let reset_instance = database
+                    .reset_agent_instance_context(&instance_id)
+                    .map_err(ApiError::from_workspace_error)?;
+                insert_agent_event(
+                    &mut database,
+                    &team.id,
+                    "instance_context_reset",
+                    Some(&instance_id),
+                    None,
+                    None,
+                    json!({ "contextGeneration": reset_instance.context_generation }),
+                )?;
             } else {
                 let target = match request.action {
                     AgentRuntimeAction::Pause => AgentInstanceStatus::Paused,
@@ -277,6 +297,7 @@ pub(crate) async fn agent_runtime_action(
                     AgentRuntimeAction::Drain => AgentInstanceStatus::Draining,
                     AgentRuntimeAction::Stop => AgentInstanceStatus::Stopped,
                     AgentRuntimeAction::Delete => unreachable!(),
+                    AgentRuntimeAction::ResetContext => unreachable!(),
                 };
                 database
                     .transition_agent_instance_status(&instance_id, target)
@@ -494,6 +515,7 @@ impl From<AgentInstanceRecord> for AgentInstanceView {
             role: instance.role,
             status: instance.status,
             next_task_sequence: instance.next_task_sequence,
+            context_generation: instance.context_generation,
             last_scheduled_at: instance.last_scheduled_at,
             created_at: instance.created_at,
             updated_at: instance.updated_at,

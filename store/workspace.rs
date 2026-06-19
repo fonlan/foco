@@ -2230,6 +2230,68 @@ impl WorkspaceDatabase {
         Ok(updated == 1)
     }
 
+    pub fn reset_agent_instance_context(
+        &mut self,
+        instance_id: &AgentInstanceId,
+    ) -> Result<AgentInstanceRecord, WorkspaceDatabaseError> {
+        let instance = self.agent_instance(instance_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' was not found"),
+            }
+        })?;
+        if instance.context_generation == i64::MAX {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' context generation overflowed"),
+            });
+        }
+        let active_tasks: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tasks
+                 WHERE owner_instance_id = ?1 AND status IN ('queued', 'running', 'waiting')",
+                params![instance_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if active_tasks > 0 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent instance '{instance_id}' has {active_tasks} active or queued task(s)"
+                ),
+            });
+        }
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE agent_instances
+                 SET context_generation = context_generation + 1, updated_at = ?3
+                 WHERE id = ?1 AND context_generation = ?2
+                   AND NOT EXISTS (
+                        SELECT 1 FROM agent_tasks
+                        WHERE owner_instance_id = ?1
+                          AND status IN ('queued', 'running', 'waiting')
+                   )",
+                params![
+                    instance_id.as_str(),
+                    instance.context_generation,
+                    now_timestamp()
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent instance '{instance_id}' changed workload during context reset"
+                ),
+            });
+        }
+        self.agent_instance(instance_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' was not found after reset"),
+            }
+        })
+    }
+
     pub fn delete_agent_instance(
         &mut self,
         instance_id: &AgentInstanceId,

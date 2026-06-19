@@ -174,6 +174,15 @@ pub enum AgentRole {
     Worker,
 }
 
+impl AgentRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Coordinator => "coordinator",
+            Self::Worker => "worker",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentTeamStatus {

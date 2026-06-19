@@ -866,6 +866,17 @@ pub(crate) fn prompt_cache_key(
     message_source_sequences: &[Option<i64>],
     message_context_sources: &[PromptContextSource],
 ) -> Result<String, ApiError> {
+    if request.messages.len() != message_source_sequences.len() {
+        return Err(ApiError::internal(
+            "prompt cache source sequence count does not match prompt message count",
+        ));
+    }
+    if request.messages.len() != message_context_sources.len() {
+        return Err(ApiError::internal(
+            "prompt cache source classification count does not match prompt message count",
+        ));
+    }
+
     let mut hasher = Sha256::new();
     hasher.update(workspace_id.as_bytes());
     hasher.update(b"\0");
@@ -878,12 +889,9 @@ pub(crate) fn prompt_cache_key(
     let stable_messages = request
         .messages
         .iter()
-        .zip(message_source_sequences)
         .zip(message_context_sources)
-        .take_while(|((_, source_sequence), source)| {
-            source_sequence.is_none() && prompt_context_source_is_stable_for_cache(source)
-        })
-        .map(|((message, _), _)| message)
+        .filter(|(_, source)| prompt_context_source_is_stable_for_cache(source))
+        .map(|(message, _)| message)
         .collect::<Vec<_>>();
     let stable_messages_json = serde_json::to_string(&stable_messages).map_err(|source| {
         ApiError::internal(format!(
@@ -908,9 +916,12 @@ fn prompt_context_source_is_stable_for_cache(source: &PromptContextSource) -> bo
     matches!(
         source,
         PromptContextSource::ReservedPrompt
+            | PromptContextSource::AgentDefinition
+            | PromptContextSource::AgentTeamProtocol
             | PromptContextSource::StableInjection
             | PromptContextSource::TodoGraph
             | PromptContextSource::CompressionSnapshot
+            | PromptContextSource::TurnMemory { .. }
     )
 }
 

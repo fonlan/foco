@@ -1,10 +1,18 @@
 use std::{collections::HashSet, sync::Arc};
 
 use foco_agent::{
-    AgentAttemptId, AgentInstanceStatus, AgentRunAssociations, AgentRunOutcome, AgentTaskId,
-    AgentTaskStatus, AgentTaskTransition,
+    AgentAttemptId, AgentInstanceStatus, AgentRole, AgentRunAssociations, AgentRunOutcome,
+    AgentTaskId, AgentTaskStatus, AgentTaskTransition, estimate_text_tokens,
 };
-use foco_store::workspace::{AgentTaskStateUpdate, NewAgentEvent, WorkspaceDatabase};
+use foco_providers::{NeutralChatMessage, NeutralChatRole};
+use foco_store::{
+    config::AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS,
+    workspace::{
+        AgentContextEntryRecord, AgentInstanceRecord, AgentMessageRecord, AgentTaskRecord,
+        AgentTaskStateUpdate, AgentTeamRecord, NewAgentContextEntry, NewAgentContextSnapshot,
+        NewAgentEvent, WorkspaceDatabase,
+    },
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
@@ -23,6 +31,11 @@ const AGENT_SCHEDULER_WAKE_CAPACITY: usize = 1;
 const AGENT_SCHEDULER_SCAN_LIMIT: i64 = 64;
 const AGENT_GLOBAL_MAX_CONCURRENT_RUNS: usize = 4;
 const RESTART_INTERRUPTION_REASON: &str = "backend restarted while Agent attempt was active";
+const AGENT_TEAM_PROTOCOL_VERSION: u32 = 1;
+const AGENT_CONTEXT_SNAPSHOT_VERSION: u32 = 1;
+const AGENT_CONTEXT_RECENT_MESSAGE_LIMIT: usize = 8;
+const AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT: usize = 16;
+const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 320;
 
 #[derive(Clone)]
 pub(crate) struct AgentScheduler {
@@ -303,6 +316,17 @@ async fn run_coordinator_task_inner(
     if let Some(max_output_tokens) = instance.definition_snapshot.model_options.max_output_tokens {
         chat_context.provider_request.max_output_tokens = Some(max_output_tokens);
     }
+    let (agent_unread_messages, consumed_agent_message_ids) = apply_agent_prompt_layers(
+        &workspace.path,
+        &mut chat_context,
+        &team,
+        &instance,
+        &task,
+        attempt_id,
+        &allowed_tools,
+    )?;
+    chat_context.agent_primary_chat_output = instance.role == AgentRole::Coordinator;
+    chat_context.agent_unread_messages = agent_unread_messages;
     if chat_context.pending_memory_retrieval.is_none() {
         chat_context.provider_request.prompt_cache_key = Some(prompt_cache_key(
             &chat_context.workspace_id,
@@ -317,6 +341,7 @@ async fn run_coordinator_task_inner(
             Some(PROMPT_CACHE_RETENTION_24H.to_string());
     }
     chat_context.request_body_json = serialize_provider_request(&chat_context.provider_request)?;
+    consume_agent_messages(&workspace.path, &consumed_agent_message_ids)?;
     chat_context.agent_associations = AgentRunAssociations {
         team_id: Some(task.team_id.clone()),
         instance_id: Some(task.owner_instance_id.clone()),
@@ -347,7 +372,527 @@ async fn run_coordinator_task_inner(
         guidance_tx,
     )?;
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;
+    persist_agent_task_context(&workspace.path, &task, &instance, attempt_id, &outcome)?;
     finish_claimed_task(&workspace.path, &task, attempt_id, outcome)
+}
+
+fn apply_agent_prompt_layers(
+    workspace_path: &Path,
+    chat_context: &mut PreparedChatContext,
+    team: &AgentTeamRecord,
+    instance: &AgentInstanceRecord,
+    task: &AgentTaskRecord,
+    attempt_id: &AgentAttemptId,
+    allowed_tools: &HashSet<String>,
+) -> Result<(Vec<Value>, Vec<foco_agent::AgentMessageId>), ApiError> {
+    validate_agent_definition_system_prompt(instance)?;
+
+    let database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let context_snapshot = database
+        .latest_agent_context_snapshot(&instance.id, instance.context_generation)
+        .map_err(ApiError::from_workspace_error)?;
+    let after_context_sequence = context_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.sequence)
+        .unwrap_or(-1);
+    let context_entries = database
+        .agent_context_entries(
+            &instance.id,
+            instance.context_generation,
+            after_context_sequence,
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    let unread_messages = database
+        .agent_messages_after(&instance.id, -1)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .filter(|message| message.consumed_at.is_none())
+        .collect::<Vec<_>>();
+    drop(database);
+
+    let definition_index = agent_definition_insert_index(chat_context);
+    insert_agent_prompt_message(
+        chat_context,
+        definition_index,
+        neutral_agent_message(
+            NeutralChatRole::System,
+            instance
+                .definition_snapshot
+                .system_prompt
+                .trim()
+                .to_string(),
+        ),
+        None,
+        PromptContextSource::AgentDefinition,
+    );
+
+    let protocol_index = agent_team_protocol_insert_index(chat_context);
+    insert_agent_prompt_message(
+        chat_context,
+        protocol_index,
+        neutral_agent_message(
+            NeutralChatRole::System,
+            agent_team_protocol_prompt(team, instance, task, attempt_id, allowed_tools)?,
+        ),
+        None,
+        PromptContextSource::AgentTeamProtocol,
+    );
+
+    if let Some(private_context) =
+        agent_private_context_prompt(context_snapshot.as_ref(), &context_entries)?
+    {
+        let index = chat_context.active_tool_start_index;
+        insert_agent_prompt_message(
+            chat_context,
+            index,
+            neutral_agent_message(NeutralChatRole::System, private_context),
+            None,
+            PromptContextSource::AgentPrivateContext,
+        );
+    }
+
+    let current_task = agent_current_task_prompt(task, attempt_id)?;
+    let index = chat_context.active_tool_start_index;
+    insert_agent_prompt_message(
+        chat_context,
+        index,
+        neutral_agent_message(NeutralChatRole::User, current_task),
+        Some(task.sequence),
+        PromptContextSource::AgentCurrentTask {
+            sequence: task.sequence,
+        },
+    );
+
+    let mut run_unread_messages = Vec::with_capacity(unread_messages.len());
+    let mut consumed_message_ids = Vec::with_capacity(unread_messages.len());
+    for message in unread_messages {
+        let payload = agent_message_payload(&message);
+        let prompt = format!(
+            "Foco Agent unread message:\n{}",
+            serde_json::to_string_pretty(&payload).map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to serialize Agent message prompt: {source}"
+                ))
+            })?
+        );
+        let index = chat_context.active_tool_start_index;
+        insert_agent_prompt_message(
+            chat_context,
+            index,
+            neutral_agent_message(NeutralChatRole::User, prompt),
+            None,
+            PromptContextSource::AgentUnreadMessage,
+        );
+        consumed_message_ids.push(message.id.clone());
+        run_unread_messages.push(payload);
+    }
+
+    Ok((run_unread_messages, consumed_message_ids))
+}
+
+fn validate_agent_definition_system_prompt(instance: &AgentInstanceRecord) -> Result<(), ApiError> {
+    let system_prompt = instance.definition_snapshot.system_prompt.trim();
+    if system_prompt.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "Agent definition snapshot '{}' has an empty system prompt",
+            instance.definition_id
+        )));
+    }
+    if system_prompt.chars().count() > AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS {
+        return Err(ApiError::bad_request(format!(
+            "Agent definition snapshot '{}' system prompt exceeds {AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS} characters",
+            instance.definition_id
+        )));
+    }
+    Ok(())
+}
+
+fn agent_definition_insert_index(chat_context: &PreparedChatContext) -> usize {
+    chat_context
+        .message_context_sources
+        .iter()
+        .position(|source| !matches!(source, PromptContextSource::ReservedPrompt))
+        .unwrap_or(chat_context.active_tool_start_index)
+}
+
+fn agent_team_protocol_insert_index(chat_context: &PreparedChatContext) -> usize {
+    chat_context
+        .message_context_sources
+        .iter()
+        .position(|source| {
+            !matches!(
+                source,
+                PromptContextSource::ReservedPrompt
+                    | PromptContextSource::AgentDefinition
+                    | PromptContextSource::StableInjection
+            )
+        })
+        .unwrap_or(chat_context.active_tool_start_index)
+}
+
+fn insert_agent_prompt_message(
+    chat_context: &mut PreparedChatContext,
+    index: usize,
+    message: NeutralChatMessage,
+    source_sequence: Option<i64>,
+    source: PromptContextSource,
+) {
+    chat_context
+        .provider_request
+        .messages
+        .insert(index, message);
+    chat_context
+        .message_source_sequences
+        .insert(index, source_sequence);
+    chat_context.message_context_sources.insert(index, source);
+    if index <= chat_context.active_tool_start_index {
+        chat_context.active_tool_start_index += 1;
+    }
+    if let Some(pending) = &mut chat_context.pending_memory_retrieval {
+        if index <= pending.stable_insert_index {
+            pending.stable_insert_index += 1;
+        }
+        if index <= pending.turn_insert_index {
+            pending.turn_insert_index += 1;
+        }
+    }
+}
+
+fn neutral_agent_message(role: NeutralChatRole, content: String) -> NeutralChatMessage {
+    NeutralChatMessage {
+        role,
+        content,
+        attachments: Vec::new(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+        tool_name: None,
+    }
+}
+
+fn agent_team_protocol_prompt(
+    team: &AgentTeamRecord,
+    instance: &AgentInstanceRecord,
+    task: &AgentTaskRecord,
+    attempt_id: &AgentAttemptId,
+    allowed_tools: &HashSet<String>,
+) -> Result<String, ApiError> {
+    let mut tools = allowed_tools.iter().cloned().collect::<Vec<_>>();
+    tools.sort();
+    let protocol = json!({
+        "version": AGENT_TEAM_PROTOCOL_VERSION,
+        "teamId": team.id.to_string(),
+        "chatId": team.chat_id,
+        "instanceId": instance.id.to_string(),
+        "definitionId": instance.definition_id.to_string(),
+        "definitionRevision": instance.definition_revision,
+        "role": instance.role.as_str(),
+        "taskId": task.id.to_string(),
+        "attemptId": attempt_id.to_string(),
+        "contextGeneration": instance.context_generation,
+        "permissions": instance.definition_snapshot.permissions,
+        "allowedRuntimeTools": tools,
+        "runtimeLimits": {
+            "maxQueuedTasksPerTeam": AGENT_MAX_QUEUED_TASKS_PER_TEAM,
+            "maxQueuedTasksPerInstance": AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+            "maxQueuedTasksPerChat": AGENT_MAX_QUEUED_TASKS_PER_CHAT,
+            "maxAgentToolRounds": MAX_AGENT_TOOL_ROUNDS,
+        },
+        "outputPolicy": {
+            "coordinatorWritesMainChat": true,
+            "workerWritesMainChat": false,
+            "workerAutomaticMemoryExtraction": false,
+        },
+    });
+    Ok(format!(
+        "Foco Agent team protocol:\n{}",
+        serde_json::to_string_pretty(&protocol).map_err(|source| {
+            ApiError::internal(format!("failed to serialize Agent team protocol: {source}"))
+        })?
+    ))
+}
+
+fn agent_private_context_prompt(
+    snapshot: Option<&foco_store::workspace::AgentContextSnapshotRecord>,
+    entries: &[AgentContextEntryRecord],
+) -> Result<Option<String>, ApiError> {
+    if snapshot.is_none() && entries.is_empty() {
+        return Ok(None);
+    }
+    let recent_entries = entries
+        .iter()
+        .rev()
+        .take(AGENT_CONTEXT_RECENT_MESSAGE_LIMIT)
+        .map(agent_context_entry_prompt_value)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    let snapshot_value = snapshot
+        .map(|record| {
+            serde_json::from_str::<Value>(&record.entries_json).map_err(|source| {
+                ApiError::internal(format!("failed to parse Agent context snapshot: {source}"))
+            })
+        })
+        .transpose()?;
+    let context = json!({
+        "snapshot": snapshot_value,
+        "recentEntries": recent_entries,
+    });
+    Ok(Some(format!(
+        "Foco Agent private context:\n{}",
+        serde_json::to_string_pretty(&context).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to serialize Agent private context: {source}"
+            ))
+        })?
+    )))
+}
+
+fn agent_context_entry_prompt_value(entry: &AgentContextEntryRecord) -> Result<Value, ApiError> {
+    let content = serde_json::from_str::<Value>(&entry.content_json).map_err(|source| {
+        ApiError::internal(format!("failed to parse Agent context entry: {source}"))
+    })?;
+    Ok(json!({
+        "id": entry.id,
+        "sequence": entry.sequence,
+        "role": entry.role,
+        "sourceTaskId": entry.source_task_id.as_ref().map(ToString::to_string),
+        "sourceMessageId": entry.source_message_id.as_ref().map(ToString::to_string),
+        "createdAt": entry.created_at,
+        "content": content,
+    }))
+}
+
+fn agent_current_task_prompt(
+    task: &AgentTaskRecord,
+    attempt_id: &AgentAttemptId,
+) -> Result<String, ApiError> {
+    let input = serde_json::from_str::<Value>(&task.input_json).map_err(|source| {
+        ApiError::internal(format!("failed to parse Agent task input: {source}"))
+    })?;
+    let current_task = json!({
+        "taskId": task.id.to_string(),
+        "teamId": task.team_id.to_string(),
+        "ownerInstanceId": task.owner_instance_id.to_string(),
+        "originInstanceId": task.origin_instance_id.as_ref().map(ToString::to_string),
+        "parentTaskId": task.parent_task_id.as_ref().map(ToString::to_string),
+        "attemptId": attempt_id.to_string(),
+        "sequence": task.sequence,
+        "status": task.status.as_str(),
+        "input": input,
+    });
+    Ok(format!(
+        "Foco Agent current task:\n{}",
+        serde_json::to_string_pretty(&current_task).map_err(|source| {
+            ApiError::internal(format!("failed to serialize Agent current task: {source}"))
+        })?
+    ))
+}
+
+fn agent_message_payload(message: &AgentMessageRecord) -> Value {
+    json!({
+        "messageId": message.id.to_string(),
+        "teamId": message.team_id.to_string(),
+        "senderInstanceId": message.sender_instance_id.as_ref().map(ToString::to_string),
+        "receiverInstanceId": message.receiver_instance_id.to_string(),
+        "relatedTaskId": message.related_task_id.as_ref().map(ToString::to_string),
+        "replyToMessageId": message.reply_to_message_id.as_ref().map(ToString::to_string),
+        "kind": message.kind.as_str(),
+        "content": message.content,
+        "sequence": message.sequence,
+        "createdAt": message.created_at,
+    })
+}
+
+fn consume_agent_messages(
+    workspace_path: &Path,
+    message_ids: &[foco_agent::AgentMessageId],
+) -> Result<(), ApiError> {
+    if message_ids.is_empty() {
+        return Ok(());
+    }
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    for message_id in message_ids {
+        database
+            .mark_agent_message_consumed(message_id)
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    Ok(())
+}
+
+fn persist_agent_task_context(
+    workspace_path: &Path,
+    task: &AgentTaskRecord,
+    instance: &AgentInstanceRecord,
+    attempt_id: &AgentAttemptId,
+    outcome: &AgentRunOutcome,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let latest_snapshot = database
+        .latest_agent_context_snapshot(&instance.id, instance.context_generation)
+        .map_err(ApiError::from_workspace_error)?;
+    let after_context_sequence = latest_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.sequence)
+        .unwrap_or(-1);
+    let context_entries = database
+        .agent_context_entries(
+            &instance.id,
+            instance.context_generation,
+            after_context_sequence,
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    let previous_sequence = context_entries
+        .iter()
+        .map(|entry| entry.sequence)
+        .chain(latest_snapshot.as_ref().map(|snapshot| snapshot.sequence))
+        .max()
+        .unwrap_or(-1);
+    let sequence = previous_sequence
+        .checked_add(1)
+        .ok_or_else(|| ApiError::internal("Agent private context sequence overflowed"))?;
+    let content = agent_task_context_content(task, attempt_id, outcome);
+    let content_json = content.to_string();
+    let entry_id = unique_id("agent-context-entry");
+    let role = agent_task_context_role(outcome);
+    database
+        .insert_agent_context_entry(NewAgentContextEntry {
+            id: &entry_id,
+            team_id: &task.team_id,
+            instance_id: &instance.id,
+            generation: instance.context_generation,
+            sequence,
+            role,
+            content_json: &content_json,
+            source_task_id: Some(&task.id),
+            source_message_id: None,
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    let snapshot_entries = agent_context_snapshot_entries(&context_entries, sequence, &content)?;
+    let snapshot_value = json!({
+        "version": AGENT_CONTEXT_SNAPSHOT_VERSION,
+        "teamProtocolVersion": AGENT_TEAM_PROTOCOL_VERSION,
+        "buildVersion": "phase5",
+        "teamId": task.team_id.to_string(),
+        "instanceId": instance.id.to_string(),
+        "generation": instance.context_generation,
+        "taskId": task.id.to_string(),
+        "attemptId": attempt_id.to_string(),
+        "latestSequence": sequence,
+        "previousSnapshotId": latest_snapshot.as_ref().map(|snapshot| snapshot.id.clone()),
+        "entries": snapshot_entries,
+    });
+    let snapshot_json = snapshot_value.to_string();
+    let token_count = i64::try_from(estimate_text_tokens(&snapshot_json)).map_err(|_| {
+        ApiError::internal("Agent context snapshot token count exceeds SQLite integer range")
+    })?;
+    let snapshot_id = unique_id("agent-context-snapshot");
+    database
+        .insert_agent_context_snapshot(NewAgentContextSnapshot {
+            id: &snapshot_id,
+            team_id: &task.team_id,
+            instance_id: &instance.id,
+            generation: instance.context_generation,
+            sequence,
+            entries_json: &snapshot_json,
+            token_count: Some(token_count),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
+fn agent_task_context_content(
+    task: &AgentTaskRecord,
+    attempt_id: &AgentAttemptId,
+    outcome: &AgentRunOutcome,
+) -> Value {
+    match outcome {
+        AgentRunOutcome::Completed {
+            text,
+            reasoning,
+            usage,
+        } => json!({
+            "status": "completed",
+            "taskId": task.id.to_string(),
+            "attemptId": attempt_id.to_string(),
+            "summary": truncate_agent_context_text(text),
+            "reasoningSummary": reasoning.as_ref().map(|value| truncate_agent_context_text(value)),
+            "usage": usage,
+        }),
+        AgentRunOutcome::Failed { message, retryable } => json!({
+            "status": "failed",
+            "taskId": task.id.to_string(),
+            "attemptId": attempt_id.to_string(),
+            "message": truncate_agent_context_text(message),
+            "retryable": retryable,
+        }),
+        AgentRunOutcome::Cancelled { message } => json!({
+            "status": "cancelled",
+            "taskId": task.id.to_string(),
+            "attemptId": attempt_id.to_string(),
+            "message": truncate_agent_context_text(message),
+        }),
+        AgentRunOutcome::Suspended { control } => json!({
+            "status": "suspended",
+            "taskId": task.id.to_string(),
+            "attemptId": attempt_id.to_string(),
+            "control": control,
+        }),
+    }
+}
+
+fn agent_task_context_role(outcome: &AgentRunOutcome) -> &'static str {
+    match outcome {
+        AgentRunOutcome::Completed { .. } | AgentRunOutcome::Suspended { .. } => "assistant",
+        AgentRunOutcome::Failed { .. } | AgentRunOutcome::Cancelled { .. } => "system",
+    }
+}
+
+fn agent_context_snapshot_entries(
+    existing_entries: &[AgentContextEntryRecord],
+    new_sequence: i64,
+    new_content: &Value,
+) -> Result<Vec<Value>, ApiError> {
+    let keep_existing = AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT.saturating_sub(1);
+    let mut entries = existing_entries
+        .iter()
+        .rev()
+        .take(keep_existing)
+        .map(agent_context_snapshot_entry_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.reverse();
+    entries.push(json!({
+        "sequence": new_sequence,
+        "content": new_content,
+    }));
+    Ok(entries)
+}
+
+fn agent_context_snapshot_entry_value(entry: &AgentContextEntryRecord) -> Result<Value, ApiError> {
+    let content = serde_json::from_str::<Value>(&entry.content_json).map_err(|source| {
+        ApiError::internal(format!("failed to parse Agent context entry: {source}"))
+    })?;
+    Ok(json!({
+        "sequence": entry.sequence,
+        "role": entry.role,
+        "sourceTaskId": entry.source_task_id.as_ref().map(ToString::to_string),
+        "sourceMessageId": entry.source_message_id.as_ref().map(ToString::to_string),
+        "content": content,
+    }))
+}
+
+fn truncate_agent_context_text(text: &str) -> String {
+    if text.chars().count() <= AGENT_CONTEXT_SUMMARY_MAX_CHARS {
+        return text.to_string();
+    }
+    text.chars()
+        .take(AGENT_CONTEXT_SUMMARY_MAX_CHARS)
+        .collect::<String>()
 }
 
 fn finish_claimed_task(
