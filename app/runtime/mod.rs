@@ -9,6 +9,7 @@ mod web_tools;
 #[cfg(test)]
 pub(crate) use agent_scheduler::reconcile_agent_runtime;
 pub(crate) use agent_scheduler::{
+    AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, CoordinatorTaskInput, insert_agent_event,
     validate_agent_snapshot_for_workspace,

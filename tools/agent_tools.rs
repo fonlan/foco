@@ -1,8 +1,9 @@
 use serde_json::json;
 
 use crate::{
-    AGENT_CANCEL_TASK_TOOL, AGENT_DELEGATE_TASK_TOOL, AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL,
-    AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL, AGENT_WAIT_TASKS_TOOL, ToolDefinition,
+    AGENT_CANCEL_TASK_TOOL, AGENT_CREATE_INSTANCES_TOOL, AGENT_DELEGATE_TASK_TOOL,
+    AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL, AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL,
+    AGENT_WAIT_TASKS_TOOL, ToolDefinition,
 };
 
 pub(crate) fn agent_tool_definitions() -> Vec<ToolDefinition> {
@@ -14,6 +15,7 @@ pub(crate) fn agent_tool_definitions() -> Vec<ToolDefinition> {
         agent_cancel_task_definition(),
         agent_wait_tasks_definition(),
         agent_transfer_task_definition(),
+        agent_create_instances_definition(),
     ]
 }
 
@@ -213,6 +215,44 @@ fn agent_transfer_task_definition() -> ToolDefinition {
                 }
             },
             "required": ["taskId", "targetInstanceId", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn agent_create_instances_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: AGENT_CREATE_INSTANCES_TOOL,
+        description: "Create one or more worker Agent instances for an allowed definition in the current team. Creation is atomic and never routes work implicitly.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "definitionId": {
+                    "type": "string",
+                    "description": "Agent definition id to instantiate. Must be allowed by the caller permissions."
+                },
+                "count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of instances to create atomically."
+                },
+                "maxInstancesPerTeam": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Explicit per-team instance limit for this create request."
+                },
+                "maxInstancesForDefinition": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Explicit per-definition instance limit for this create request."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["definitionId", "count", "maxInstancesPerTeam", "maxInstancesForDefinition", "timeoutMs"]
         }),
         strict: true,
     }

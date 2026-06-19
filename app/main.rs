@@ -744,6 +744,10 @@ fn app_router(state: AppState) -> Router {
             get(crate::http::agents::agent_team_snapshot),
         )
         .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/agent-team/instances/create",
+            post(crate::http::agents::create_agent_instances),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/chats/{chat_id}/agent-team/action",
             post(crate::http::agents::agent_runtime_action),
         )

@@ -16,14 +16,15 @@ use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
 use foco_store::config::{HookConfig, WebSearchSettings};
 use foco_store::workspace::{
-    AgentInstanceRecord, AgentTaskRecord, NewAgentEvent, NewAgentMessage, NewAgentTask,
-    NewAgentTaskDependency, WorkspaceDatabase,
+    AgentInstanceRecord, AgentTaskRecord, NewAgentEvent, NewAgentInstance, NewAgentMessage,
+    NewAgentTask, NewAgentTaskDependency, WorkspaceDatabase,
 };
 use foco_tools::{
-    AGENT_CANCEL_TASK_TOOL, AGENT_DELEGATE_TASK_TOOL, AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL,
-    AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL, AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL,
-    RUN_COMMAND_TOOL, SLEEP_TOOL, ToolCancellationToken, ToolExecution, ToolOutputSink,
-    builtin_tool_timeout_ms, execute_builtin_tool_for_chat_with_cancellation_and_output_sink,
+    AGENT_CANCEL_TASK_TOOL, AGENT_CREATE_INSTANCES_TOOL, AGENT_DELEGATE_TASK_TOOL,
+    AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL, AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL,
+    AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL, RUN_COMMAND_TOOL, SLEEP_TOOL, ToolCancellationToken,
+    ToolExecution, ToolOutputSink, builtin_tool_timeout_ms,
+    execute_builtin_tool_for_chat_with_cancellation_and_output_sink,
 };
 use futures_util::future::join_all;
 use serde::Deserialize;
@@ -32,6 +33,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::{
+    AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, AskQuestionInput, QuestionAnswer,
     QuestionItem, QuestionItemAnswer, QuestionOption, QuestionRegistry, QuestionRequest,
@@ -51,6 +53,8 @@ use serde_json::Value;
 use crate::{
     MAX_REPEATED_TOOL_CALL_BATCHES, MEMORY_SEARCH_TOOL_NAME, READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD,
 };
+
+use foco_store::config::AgentDefinitionSettings;
 
 const AGENT_MAX_CHILD_TASKS_PER_TASK: usize = 64;
 const AGENT_MAX_DELEGATION_DEPTH: usize = 8;
@@ -183,6 +187,7 @@ pub(crate) fn pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingT
 pub(crate) struct AgentToolContext {
     pub(crate) associations: AgentRunAssociations,
     pub(crate) permissions: AgentPermissions,
+    pub(crate) agent_definitions: Vec<AgentDefinitionSettings>,
     pub(crate) scheduler: AgentScheduler,
 }
 
@@ -925,6 +930,7 @@ pub(crate) fn is_agent_tool_name(tool_name: &str) -> bool {
             | AGENT_CANCEL_TASK_TOOL
             | AGENT_WAIT_TASKS_TOOL
             | AGENT_TRANSFER_TASK_TOOL
+            | AGENT_CREATE_INSTANCES_TOOL
     )
 }
 
@@ -993,6 +999,17 @@ struct AgentTransferTaskInput {
     _timeout_ms: Option<u64>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentCreateInstancesInput {
+    definition_id: AgentDefinitionId,
+    count: u32,
+    max_instances_per_team: u32,
+    max_instances_for_definition: u32,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
+}
+
 fn execute_agent_tool(
     context: &AgentToolContext,
     workspace_path: &Path,
@@ -1010,6 +1027,9 @@ fn execute_agent_tool(
             execute_agent_wait_tasks(context, workspace_path, tool_call_id, arguments)
         }
         AGENT_TRANSFER_TASK_TOOL => execute_agent_transfer_task(context, workspace_path, arguments),
+        AGENT_CREATE_INSTANCES_TOOL => {
+            execute_agent_create_instances(context, workspace_path, arguments)
+        }
         _ => Err(agent_tool_error(
             "unknown_tool",
             format!("unknown Agent tool '{tool_name}'"),
@@ -1620,6 +1640,125 @@ fn execute_agent_transfer_task(
     }))
 }
 
+fn execute_agent_create_instances(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, String> {
+    let input =
+        serde_json::from_value::<AgentCreateInstancesInput>(arguments).map_err(|source| {
+            agent_tool_error(
+                "invalid_arguments",
+                format!("agent_create_instances arguments do not match schema: {source}"),
+            )
+        })?;
+    context
+        .permissions
+        .authorize_instance_definition(
+            &input.definition_id,
+            agent_tool_instance_id(context)?.clone(),
+        )
+        .map_err(|source| agent_tool_error("permission_denied", source.to_string()))?;
+    if input.count == 0 {
+        return Err(agent_tool_error(
+            "invalid_arguments",
+            "agent_create_instances count must be greater than 0",
+        ));
+    }
+    if input.count > AGENT_MAX_CREATE_INSTANCES_PER_REQUEST {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            format!(
+                "agent_create_instances count exceeds process limit {AGENT_MAX_CREATE_INSTANCES_PER_REQUEST}"
+            ),
+        ));
+    }
+    if i64::from(input.max_instances_per_team) > AGENT_MAX_INSTANCES_PER_TEAM {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            format!(
+                "agent_create_instances maxInstancesPerTeam exceeds process limit {AGENT_MAX_INSTANCES_PER_TEAM}"
+            ),
+        ));
+    }
+    if input.count > input.max_instances_per_team
+        || input.count > input.max_instances_for_definition
+    {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            "agent_create_instances count exceeds explicit request limits",
+        ));
+    }
+    let definition = context
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == input.definition_id)
+        .ok_or_else(|| {
+            agent_tool_error(
+                "not_found",
+                format!("Agent definition '{}' was not found", input.definition_id),
+            )
+        })?;
+    if input.max_instances_for_definition > definition.max_instances {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            format!(
+                "agent_create_instances maxInstancesForDefinition {} exceeds definition '{}' maxInstances {}",
+                input.max_instances_for_definition, definition.id, definition.max_instances
+            ),
+        ));
+    }
+    let team_id = agent_tool_team_id(context)?;
+    let actor_instance_id = agent_tool_instance_id(context)?;
+    let task_id = agent_tool_task_id(context)?;
+    let instance_ids = (0..input.count)
+        .map(|_| {
+            AgentInstanceId::new(unique_id("agent-instance")).map_err(|source| source.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let new_instances = instance_ids
+        .iter()
+        .map(|id| NewAgentInstance {
+            id,
+            team_id,
+            definition,
+            role: foco_agent::AgentRole::Worker,
+        })
+        .collect::<Vec<_>>();
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    let created = database
+        .create_agent_instances_with_limits(
+            &new_instances,
+            i64::from(input.max_instances_per_team),
+            i64::from(input.max_instances_for_definition),
+        )
+        .map_err(agent_store_error)?;
+    for instance in &created {
+        append_agent_tool_event(
+            &mut database,
+            team_id,
+            "instance_created",
+            Some(&instance.id),
+            Some(task_id),
+            None,
+            json!({
+                "createdByInstanceId": actor_instance_id.to_string(),
+                "definitionId": instance.definition_id.to_string(),
+                "definitionRevision": instance.definition_revision,
+                "role": instance.role.as_str(),
+                "status": instance.status.as_str(),
+            }),
+        )?;
+    }
+    Ok(json!({
+        "instances": created.iter().map(agent_instance_value).collect::<Vec<_>>(),
+        "definitionId": input.definition_id.to_string(),
+        "definitionRevision": definition.revision,
+        "count": created.len(),
+    }))
+}
+
 fn agent_wait_deadline_timestamp(deadline_ms: u64) -> Result<String, String> {
     let millis = i64::try_from(deadline_ms).map_err(|_| {
         agent_tool_error(
@@ -1706,13 +1845,10 @@ fn select_delegate_target_instance(
             }
             let database =
                 WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
-            let instances = database
-                .agent_instances_for_definition(agent_tool_team_id(context)?, definition_id)
+            let instance = database
+                .route_agent_instance_for_definition(agent_tool_team_id(context)?, definition_id)
                 .map_err(agent_store_error)?;
-            let instance = instances
-                .into_iter()
-                .find(|instance| matches!(instance.status.as_str(), "idle" | "running"))
-                .ok_or_else(|| {
+            let instance = instance.ok_or_else(|| {
                     agent_tool_error(
                         "not_found",
                         format!(

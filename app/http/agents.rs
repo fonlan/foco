@@ -3,16 +3,18 @@ use axum::{
     extract::{Path as AxumPath, State},
 };
 use foco_agent::{
-    AgentAttemptId, AgentInstanceId, AgentInstanceStatus, AgentTaskId, AgentTaskStatus,
-    AgentTaskTransition, AgentTeamId, AgentTeamStatus, TeamActivationRequest,
+    AgentAttemptId, AgentDefinitionId, AgentInstanceId, AgentInstanceStatus, AgentRole,
+    AgentTaskId, AgentTaskStatus, AgentTaskTransition, AgentTeamId, AgentTeamStatus,
+    TeamActivationRequest,
 };
 use foco_store::workspace::{
-    AgentInstanceRecord, AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, NewAgentTeam,
-    WorkspaceDatabase,
+    AgentInstanceRecord, AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, NewAgentInstance,
+    NewAgentTeam, WorkspaceDatabase,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::runtime::{AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM};
 use crate::*;
 
 #[derive(Deserialize)]
@@ -39,6 +41,15 @@ pub(crate) struct AgentRuntimeActionRequest {
     scope: AgentRuntimeScope,
     action: AgentRuntimeAction,
     instance_id: Option<AgentInstanceId>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentCreateInstancesRequest {
+    definition_id: AgentDefinitionId,
+    count: u32,
+    max_instances_per_team: u32,
+    max_instances_for_definition: u32,
 }
 
 #[derive(Deserialize)]
@@ -210,6 +221,103 @@ pub(crate) async fn agent_team_snapshot(
         .agent_team_for_chat(&chat_id)
         .map_err(ApiError::from_workspace_error)?
         .ok_or_else(|| ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")))?;
+    Ok(Json(agent_team_snapshot_from_database(
+        &database, &team.id,
+    )?))
+}
+
+pub(crate) async fn create_agent_instances(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
+    Json(request): Json<AgentCreateInstancesRequest>,
+) -> Result<Json<AgentTeamSnapshotResponse>, ApiError> {
+    if request.count == 0 {
+        return Err(ApiError::bad_request(
+            "count must be greater than 0 when creating Agent instances",
+        ));
+    }
+    if request.count > AGENT_MAX_CREATE_INSTANCES_PER_REQUEST {
+        return Err(ApiError::bad_request(format!(
+            "count exceeds Agent instance create limit {AGENT_MAX_CREATE_INSTANCES_PER_REQUEST}"
+        )));
+    }
+    if i64::from(request.max_instances_per_team) > AGENT_MAX_INSTANCES_PER_TEAM {
+        return Err(ApiError::bad_request(format!(
+            "maxInstancesPerTeam exceeds process limit {AGENT_MAX_INSTANCES_PER_TEAM}"
+        )));
+    }
+    if request.count > request.max_instances_per_team
+        || request.count > request.max_instances_for_definition
+    {
+        return Err(ApiError::bad_request(
+            "count exceeds the explicit Agent instance limits in the request",
+        ));
+    }
+
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let definition = config
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == request.definition_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "Agent definition '{}' was not found",
+                request.definition_id
+            ))
+        })?;
+    if request.max_instances_for_definition > definition.max_instances {
+        return Err(ApiError::bad_request(format!(
+            "maxInstancesForDefinition {} exceeds definition '{}' maxInstances {}",
+            request.max_instances_for_definition, definition.id, definition.max_instances
+        )));
+    }
+    validate_agent_snapshot_for_workspace(&config, workspace, definition)?;
+
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let team = database
+        .agent_team_for_chat(&chat_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")))?;
+    let instance_ids = (0..request.count)
+        .map(|_| AgentInstanceId::new(unique_id("agent-instance")))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let instances = instance_ids
+        .iter()
+        .map(|id| NewAgentInstance {
+            id,
+            team_id: &team.id,
+            definition,
+            role: AgentRole::Worker,
+        })
+        .collect::<Vec<_>>();
+    let created = database
+        .create_agent_instances_with_limits(
+            &instances,
+            i64::from(request.max_instances_per_team),
+            i64::from(request.max_instances_for_definition),
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    for instance in &created {
+        insert_agent_event(
+            &mut database,
+            &team.id,
+            "instance_created",
+            Some(&instance.id),
+            None,
+            None,
+            json!({
+                "createdBy": "user",
+                "definitionId": instance.definition_id,
+                "definitionRevision": instance.definition_revision,
+                "role": instance.role,
+                "status": instance.status,
+            }),
+        )?;
+    }
+    state.agent_scheduler.wake()?;
     Ok(Json(agent_team_snapshot_from_database(
         &database, &team.id,
     )?))

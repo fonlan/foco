@@ -28,6 +28,8 @@ use crate::*;
 pub(crate) const AGENT_MAX_QUEUED_TASKS_PER_TEAM: i64 = 64;
 pub(crate) const AGENT_MAX_QUEUED_TASKS_PER_INSTANCE: i64 = 64;
 pub(crate) const AGENT_MAX_QUEUED_TASKS_PER_CHAT: i64 = 64;
+pub(crate) const AGENT_MAX_INSTANCES_PER_TEAM: i64 = 16;
+pub(crate) const AGENT_MAX_CREATE_INSTANCES_PER_REQUEST: u32 = 16;
 const AGENT_SCHEDULER_WAKE_CAPACITY: usize = 1;
 const AGENT_SCHEDULER_SCAN_LIMIT: i64 = 64;
 const AGENT_SCHEDULER_DEADLINE_POLL_MS: u64 = 1_000;
@@ -243,7 +245,16 @@ async fn schedule_runnable_tasks(
                 Some(&claimed.owner_instance_id),
                 Some(&claimed.id),
                 Some(&attempt_id),
-                json!({}),
+                json!({
+                    "queueWaitMs": timestamp_delta_ms(
+                        Some(&claimed.created_at),
+                        claimed.started_at.as_deref()
+                    ),
+                    "schedulerLatencyMs": timestamp_delta_ms(
+                        Some(&task.updated_at),
+                        claimed.started_at.as_deref()
+                    ),
+                }),
             ) {
                 let _ = fail_claimed_task(&workspace.path, &claimed.id, &error.message);
                 drop(permit);
@@ -400,6 +411,7 @@ async fn run_coordinator_task_inner(
     chat_context.agent_tool_context = Some(AgentToolContext {
         associations: chat_context.agent_associations.clone(),
         permissions: instance.definition_snapshot.permissions.clone(),
+        agent_definitions: config.agent_definitions.clone(),
         scheduler: state.agent_scheduler.clone(),
     });
     chat_context.session_upload_paths = Some(session_upload_paths);
@@ -660,6 +672,9 @@ fn append_agent_collaboration_tools(
             | foco_tools::AGENT_TRANSFER_TASK_TOOL => {
                 permissions.collaboration_tool_allowed(AgentCollaborationTool::DelegateTask)
             }
+            foco_tools::AGENT_CREATE_INSTANCES_TOOL => {
+                permissions.collaboration_tool_allowed(AgentCollaborationTool::CreateInstance)
+            }
             _ => false,
         };
         if include
@@ -703,6 +718,8 @@ fn agent_team_protocol_prompt(
             "maxQueuedTasksPerTeam": AGENT_MAX_QUEUED_TASKS_PER_TEAM,
             "maxQueuedTasksPerInstance": AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
             "maxQueuedTasksPerChat": AGENT_MAX_QUEUED_TASKS_PER_CHAT,
+            "maxInstancesPerTeam": AGENT_MAX_INSTANCES_PER_TEAM,
+            "maxCreateInstancesPerRequest": AGENT_MAX_CREATE_INSTANCES_PER_REQUEST,
             "maxAgentToolRounds": MAX_AGENT_TOOL_ROUNDS,
         },
         "outputPolicy": {
@@ -1185,6 +1202,12 @@ fn truncate_agent_context_text(text: &str) -> String {
         .collect::<String>()
 }
 
+fn timestamp_delta_ms(start: Option<&str>, end: Option<&str>) -> Option<i64> {
+    let start = chrono::DateTime::parse_from_rfc3339(start?).ok()?;
+    let end = chrono::DateTime::parse_from_rfc3339(end?).ok()?;
+    Some((end - start).num_milliseconds())
+}
+
 fn finish_claimed_task(
     workspace_path: &Path,
     task: &foco_store::workspace::AgentTaskRecord,
@@ -1248,11 +1271,19 @@ fn finish_claimed_task(
             task.id
         )));
     }
+    let completed_task = database
+        .agent_task(&task.id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::internal(format!("Agent task '{}' was not found", task.id)))?;
     let payload = result.or(error).unwrap_or_else(|| json!({}));
     let payload = json!({
         "outcome": payload,
         "originInstanceId": task.origin_instance_id.as_ref().map(ToString::to_string),
         "parentTaskId": task.parent_task_id.as_ref().map(ToString::to_string),
+        "runTimeMs": completed_task
+            .completed_at
+            .as_ref()
+            .and_then(|completed_at| timestamp_delta_ms(task.started_at.as_deref(), Some(completed_at))),
     });
     insert_agent_event(
         &mut database,

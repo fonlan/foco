@@ -2,7 +2,7 @@ use std::{fs, thread, time::Duration};
 
 use foco_agent::{
     AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentInstanceId, AgentInstanceStatus,
-    AgentMessageId, AgentMessageKind, AgentPermissions, AgentTaskId, AgentTaskStatus,
+    AgentMessageId, AgentMessageKind, AgentPermissions, AgentRole, AgentTaskId, AgentTaskStatus,
     AgentTaskTransition, AgentTaskWaitMode, AgentTeamId, AgentTeamStatus,
 };
 use foco_store::{
@@ -13,7 +13,7 @@ use foco_store::{
     },
     workspace::{
         AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord, NewAgentContextEntry,
-        NewAgentContextSnapshot, NewAgentEvent, NewAgentMessage, NewAgentTask,
+        NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
         NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
@@ -2399,6 +2399,261 @@ fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
 }
 
 #[test]
+fn phase8_creates_multiple_agent_instances_atomically() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, _) =
+        create_test_agent_team(&mut database, "chat-agent-phase8-create", "phase8-create");
+    let definition = phase8_agent_definition("phase8-create-worker", 7, 4);
+    let first_id = AgentInstanceId::new("agent-instance-phase8-create-a").expect("instance id");
+    let second_id = AgentInstanceId::new("agent-instance-phase8-create-b").expect("instance id");
+    let instances = [
+        NewAgentInstance {
+            id: &first_id,
+            team_id: &team_id,
+            definition: &definition,
+            role: AgentRole::Worker,
+        },
+        NewAgentInstance {
+            id: &second_id,
+            team_id: &team_id,
+            definition: &definition,
+            role: AgentRole::Worker,
+        },
+    ];
+
+    let created = database
+        .create_agent_instances_with_limits(&instances, 3, 2)
+        .expect("create workers");
+
+    assert_eq!(created.len(), 2);
+    assert_eq!(created[0].definition_id, definition.id);
+    assert_eq!(created[0].definition_revision, definition.revision);
+    assert_eq!(
+        created[1].definition_snapshot,
+        created[0].definition_snapshot
+    );
+    assert_eq!(created[0].context_generation, 0);
+    assert_eq!(created[1].next_task_sequence, 0);
+    assert_eq!(created[0].status, AgentInstanceStatus::Idle);
+    assert_eq!(created[1].role, AgentRole::Worker);
+
+    let rejected_first =
+        AgentInstanceId::new("agent-instance-phase8-create-c").expect("instance id");
+    let rejected_second =
+        AgentInstanceId::new("agent-instance-phase8-create-d").expect("instance id");
+    let rejected = [
+        NewAgentInstance {
+            id: &rejected_first,
+            team_id: &team_id,
+            definition: &definition,
+            role: AgentRole::Worker,
+        },
+        NewAgentInstance {
+            id: &rejected_second,
+            team_id: &team_id,
+            definition: &definition,
+            role: AgentRole::Worker,
+        },
+    ];
+    database
+        .create_agent_instances_with_limits(&rejected, 4, 3)
+        .expect_err("limit failure must abort the whole create request");
+    assert!(
+        database
+            .agent_instance(&rejected_first)
+            .expect("rejected first lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .agent_instance(&rejected_second)
+            .expect("rejected second lookup")
+            .is_none()
+    );
+}
+
+#[test]
+fn phase8_routes_definition_by_least_pending_and_filters_unavailable_instances() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, _) =
+        create_test_agent_team(&mut database, "chat-agent-phase8-route", "phase8-route");
+    let definition = phase8_agent_definition("phase8-route-worker", 1, 4);
+    let first_id = AgentInstanceId::new("agent-instance-phase8-route-a").expect("instance id");
+    let second_id = AgentInstanceId::new("agent-instance-phase8-route-b").expect("instance id");
+    let instances = [
+        NewAgentInstance {
+            id: &first_id,
+            team_id: &team_id,
+            definition: &definition,
+            role: AgentRole::Worker,
+        },
+        NewAgentInstance {
+            id: &second_id,
+            team_id: &team_id,
+            definition: &definition,
+            role: AgentRole::Worker,
+        },
+    ];
+    database
+        .create_agent_instances_with_limits(&instances, 3, 2)
+        .expect("create workers");
+
+    assert_eq!(
+        database
+            .route_agent_instance_for_definition(&team_id, &definition.id)
+            .expect("initial route")
+            .expect("initial instance")
+            .id,
+        first_id
+    );
+
+    let task_id = AgentTaskId::new("agent-task-phase8-route-first").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &first_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue first task");
+    assert_eq!(
+        database
+            .route_agent_instance_for_definition(&team_id, &definition.id)
+            .expect("least pending route")
+            .expect("least pending instance")
+            .id,
+        second_id
+    );
+
+    database
+        .transition_agent_instance_status(&second_id, AgentInstanceStatus::Paused)
+        .expect("pause second");
+    assert_eq!(
+        database
+            .route_agent_instance_for_definition(&team_id, &definition.id)
+            .expect("paused filtered route")
+            .expect("first is only routable instance")
+            .id,
+        first_id
+    );
+
+    let attempt_id = AgentAttemptId::new("agent-attempt-phase8-route-first").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .expect("claim first task")
+        .expect("first task claimed");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Wait,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("wait first task")
+    );
+    assert!(
+        database
+            .route_agent_instance_for_definition(&team_id, &definition.id)
+            .expect("waiting filtered route")
+            .is_none(),
+        "waiting and paused instances must not accept new definition routes"
+    );
+}
+
+#[test]
+fn phase8_runnable_tasks_are_fair_and_keep_instance_fifo() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, _) =
+        create_test_agent_team(&mut database, "chat-agent-phase8-fair", "phase8-fair");
+    let definition = phase8_agent_definition("phase8-fair-worker", 1, 4);
+    let first_id = AgentInstanceId::new("agent-instance-phase8-fair-a").expect("instance id");
+    let second_id = AgentInstanceId::new("agent-instance-phase8-fair-b").expect("instance id");
+    let instances = [
+        NewAgentInstance {
+            id: &first_id,
+            team_id: &team_id,
+            definition: &definition,
+            role: AgentRole::Worker,
+        },
+        NewAgentInstance {
+            id: &second_id,
+            team_id: &team_id,
+            definition: &definition,
+            role: AgentRole::Worker,
+        },
+    ];
+    database
+        .create_agent_instances_with_limits(&instances, 3, 2)
+        .expect("create workers");
+    let first_task = AgentTaskId::new("agent-task-phase8-fair-a1").expect("task id");
+    let first_followup = AgentTaskId::new("agent-task-phase8-fair-a2").expect("task id");
+    let second_task = AgentTaskId::new("agent-task-phase8-fair-b1").expect("task id");
+    for (task_id, instance_id) in [
+        (&first_task, &first_id),
+        (&first_followup, &first_id),
+        (&second_task, &second_id),
+    ] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: task_id,
+                team_id: &team_id,
+                owner_instance_id: instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+    }
+
+    let runnable = database.runnable_agent_tasks(10).expect("initial runnable");
+    assert_eq!(
+        runnable.iter().map(|task| &task.id).collect::<Vec<_>>(),
+        vec![&first_task, &second_task]
+    );
+
+    let attempt_id = AgentAttemptId::new("agent-attempt-phase8-fair-a1").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &first_task, &attempt_id)
+        .expect("claim first")
+        .expect("first claimed");
+    let runnable = database.runnable_agent_tasks(10).expect("running runnable");
+    assert_eq!(
+        runnable.iter().map(|task| &task.id).collect::<Vec<_>>(),
+        vec![&second_task],
+        "one running task blocks the same instance's later queued task"
+    );
+
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &first_task,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Complete,
+                result_json: Some(r#"{"ok":true}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete first")
+    );
+    let runnable = database.runnable_agent_tasks(10).expect("fair runnable");
+    assert_eq!(
+        runnable.iter().map(|task| &task.id).collect::<Vec<_>>(),
+        vec![&second_task, &first_followup],
+        "an instance that has not run yet is scheduled before a long local queue"
+    );
+}
+
+#[test]
 fn phase7_waiting_tasks_resume_after_dependency_finishes() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
@@ -3222,6 +3477,26 @@ fn create_test_agent_team(
         })
         .expect("agent team create");
     (team_id, instance_id)
+}
+
+fn phase8_agent_definition(
+    suffix: &str,
+    revision: u64,
+    max_instances: u32,
+) -> AgentDefinitionSettings {
+    AgentDefinitionSettings {
+        id: AgentDefinitionId::new(format!("agent-definition-{suffix}")).expect("definition id"),
+        revision,
+        name: format!("Agent {suffix}"),
+        description: String::new(),
+        provider_id: "provider-test".to_string(),
+        model_id: "model-test".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Be precise.".to_string(),
+        allowed_tools: vec!["read_file".to_string()],
+        max_instances,
+        permissions: AgentPermissions::default(),
+    }
 }
 
 fn create_test_agent_worker(

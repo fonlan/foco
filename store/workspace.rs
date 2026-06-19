@@ -32,14 +32,14 @@ pub use workspace_records::{
     HookRunRecord, LlmRequestAuditFilters, LlmRequestAuditModelBreakdown,
     LlmRequestAuditProviderBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
     LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord,
-    MessageRecord, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentMessage,
-    NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
-    NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot,
-    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection,
-    NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult, PromptContextInjectionRecord,
-    RunEventRecord, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
-    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
-    UpdateLlmRequestOutcome,
+    MessageRecord, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
+    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
+    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
+    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+    NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
+    PromptContextInjectionRecord, RunEventRecord, TerminalSessionRecord, TodoGraphFilter,
+    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -1934,6 +1934,142 @@ impl WorkspaceDatabase {
         Ok((team_record, instance_record))
     }
 
+    pub fn create_agent_instances_with_limits(
+        &mut self,
+        instances: &[NewAgentInstance<'_>],
+        max_team_instances: i64,
+        max_definition_instances: i64,
+    ) -> Result<Vec<AgentInstanceRecord>, WorkspaceDatabaseError> {
+        if instances.is_empty() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "at least one Agent instance is required".to_string(),
+            });
+        }
+        if max_team_instances <= 0 || max_definition_instances <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Agent instance limits must be greater than 0".to_string(),
+            });
+        }
+        let first = &instances[0];
+        if instances.iter().any(|instance| {
+            instance.team_id != first.team_id
+                || instance.definition.id != first.definition.id
+                || instance.definition.revision != first.definition.revision
+        }) {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "all Agent instances in one create request must share team, definition, and revision".to_string(),
+            });
+        }
+        let count = i64::try_from(instances.len()).map_err(|_| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Agent instance count exceeds SQLite integer range".to_string(),
+            }
+        })?;
+        let snapshot_json = serde_json::to_string(first.definition).map_err(|source| {
+            WorkspaceDatabaseError::AgentRuntimeJson {
+                field: "definition_snapshot_json",
+                source,
+            }
+        })?;
+        validate_agent_definition_snapshot(&snapshot_json)?;
+        let definition_revision = i64::try_from(first.definition.revision).map_err(|_| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "agent definition revision exceeds SQLite integer range".to_string(),
+            }
+        })?;
+
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let team_status = transaction
+            .query_row(
+                "SELECT status FROM agent_teams WHERE id = ?1",
+                params![first.team_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent team '{}' was not found", first.team_id),
+            })?;
+        if team_status != AgentTeamStatus::Active.as_str() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent team '{}' does not accept new instances while {team_status}",
+                    first.team_id
+                ),
+            });
+        }
+        let team_instances: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_instances WHERE team_id = ?1",
+                params![first.team_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let definition_instances: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_instances
+                 WHERE team_id = ?1 AND definition_id = ?2",
+                params![first.team_id.as_str(), first.definition.id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if team_instances + count > max_team_instances {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent team '{}' would exceed instance limit {max_team_instances}",
+                    first.team_id
+                ),
+            });
+        }
+        if definition_instances + count > max_definition_instances {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent definition '{}' would exceed team instance limit {max_definition_instances}",
+                    first.definition.id
+                ),
+            });
+        }
+
+        for instance in instances {
+            transaction
+                .execute(
+                    "INSERT INTO agent_instances
+                        (id, team_id, definition_id, definition_revision,
+                         definition_snapshot_json, role, status, next_task_sequence,
+                         next_message_sequence, context_generation, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'idle', 0, 0, 0, ?7, ?7)",
+                    params![
+                        instance.id.as_str(),
+                        instance.team_id.as_str(),
+                        instance.definition.id.as_str(),
+                        definition_revision,
+                        snapshot_json,
+                        instance.role.as_str(),
+                        now
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let mut created = Vec::with_capacity(instances.len());
+        for instance in instances {
+            created.push(self.agent_instance(instance.id)?.ok_or_else(|| {
+                WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!("created Agent instance '{}' was not found", instance.id),
+                }
+            })?);
+        }
+        Ok(created)
+    }
+
     pub fn agent_team(
         &self,
         team_id: &AgentTeamId,
@@ -2019,7 +2155,7 @@ impl WorkspaceDatabase {
                         created_at, updated_at
                  FROM agent_instances
                  WHERE team_id = ?1 AND definition_id = ?2
-                 ORDER BY last_scheduled_at IS NOT NULL, last_scheduled_at, created_at, id",
+                 ORDER BY last_scheduled_at IS NULL DESC, last_scheduled_at, created_at, id",
             )
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
@@ -2029,6 +2165,36 @@ impl WorkspaceDatabase {
             )
             .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
+    }
+
+    pub fn route_agent_instance_for_definition(
+        &self,
+        team_id: &AgentTeamId,
+        definition_id: &foco_agent::AgentDefinitionId,
+    ) -> Result<Option<AgentInstanceRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT instance.id, instance.team_id, instance.definition_id,
+                        instance.definition_revision, instance.definition_snapshot_json,
+                        instance.role, instance.status, instance.next_task_sequence,
+                        instance.next_message_sequence, instance.context_generation,
+                        instance.last_scheduled_at, instance.created_at, instance.updated_at
+                 FROM agent_instances AS instance
+                 LEFT JOIN agent_tasks AS task
+                   ON task.owner_instance_id = instance.id
+                  AND task.status IN ('queued', 'running', 'waiting')
+                 WHERE instance.team_id = ?1
+                   AND instance.definition_id = ?2
+                   AND instance.status IN ('idle', 'running')
+                 GROUP BY instance.id
+                 ORDER BY COUNT(task.id), instance.last_scheduled_at IS NOT NULL,
+                          instance.last_scheduled_at, instance.created_at, instance.id
+                 LIMIT 1",
+                params![team_id.as_str(), definition_id.as_str()],
+                agent_instance_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn agent_team_workload(
@@ -2960,7 +3126,11 @@ impl WorkspaceDatabase {
                               AND dependency.deadline_at <= ?1
                         )
                    )
-                 ORDER BY task.created_at, task.team_id, task.owner_instance_id, task.sequence
+                 ORDER BY instance.last_scheduled_at IS NOT NULL,
+                          instance.last_scheduled_at,
+                          task.team_id,
+                          task.owner_instance_id,
+                          task.sequence
                  LIMIT ?2",
             )
             .map_err(|source| self.sqlite_error(source))?;

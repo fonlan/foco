@@ -30,6 +30,14 @@ pub struct AgentTeamRecord {
     pub updated_at: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct NewAgentInstance<'a> {
+    pub id: &'a AgentInstanceId,
+    pub team_id: &'a AgentTeamId,
+    pub definition: &'a AgentDefinitionSettings,
+    pub role: AgentRole,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentInstanceRecord {
     pub id: AgentInstanceId,

@@ -682,69 +682,81 @@
 
 ## 阶段 8：多实例、路由、并发与生命周期
 
+**阶段状态：已完成（2026-06-19）**
+
 ### 目标
 
 允许同一 AgentDefinition 创建多个独立实例，并在实例间实现受控并发。
 
 ### 8.1 实例创建
 
-- [ ] 实现用户 API 与 `agent_create_instances` 工具。
-- [ ] 每次创建要求 definition ID、count 和明确的运行限制参数。
-- [ ] 所有实例保存相同 definition revision 的独立配置快照。
-- [ ] 每个实例创建独立 context generation、queue sequence 和状态。
-- [ ] 创建前检查 definition、team、task 和全局实例上限。
-- [ ] count 部分失败时整个事务回滚，不返回部分创建结果。
+- [x] 实现用户 API 与 `agent_create_instances` 工具。
+- [x] 每次创建要求 definition ID、count 和明确的运行限制参数。
+- [x] 所有实例保存相同 definition revision 的独立配置快照。
+- [x] 每个实例创建独立 context generation、queue sequence 和状态。
+- [x] 创建前检查 definition、team、task 和全局实例上限。
+- [x] count 部分失败时整个事务回滚，不返回部分创建结果。
 
 ### 8.2 路由策略
 
-- [ ] 支持指定 instance ID 精确路由。
-- [ ] 支持指定 definition ID 路由到现有实例。
-- [ ] definition 路由使用 least-pending，并使用 lastScheduledAt/instance ID 做稳定 tie-break。
-- [ ] paused、draining、stopped、failed 实例不参与新任务路由。
-- [ ] waiting 实例的当前任务计入负载，且不能运行新任务。
-- [ ] 路由决定写入 task/event，保证问题可审计和复现。
-- [ ] 不实现自定义 Rust router、随机路由或自动创建实例。
+- [x] 支持指定 instance ID 精确路由。
+- [x] 支持指定 definition ID 路由到现有实例。
+- [x] definition 路由使用 least-pending，并使用 lastScheduledAt/instance ID 做稳定 tie-break。
+- [x] paused、draining、stopped、failed 实例不参与新任务路由。
+- [x] waiting 实例的当前任务计入负载，且不能运行新任务。
+- [x] 路由决定写入 task/event，保证问题可审计和复现。
+- [x] 不实现自定义 Rust router、随机路由或自动创建实例。
 
 ### 8.3 调度公平性
 
-- [ ] 全局 Scheduler 在不同 team/instance 之间实现稳定公平选择，避免单一 chat 长队列长期饿死其它 team。
-- [ ] 每个实例同一时间只获得一个 task lease。
-- [ ] 全局模型并发限制与单 Provider 并发/速率错误保持独立；Provider 错误不触发自动重试。
-- [ ] Scheduler 完成一次领取后及时让出执行，避免持有 workspace store 锁跨 await。
-- [ ] 记录 queue wait time、run time 和 scheduler latency。
+- [x] 全局 Scheduler 在不同 team/instance 之间实现稳定公平选择，避免单一 chat 长队列长期饿死其它 team。
+- [x] 每个实例同一时间只获得一个 task lease。
+- [x] 全局模型并发限制与单 Provider 并发/速率错误保持独立；Provider 错误不触发自动重试。
+- [x] Scheduler 完成一次领取后及时让出执行，避免持有 workspace store 锁跨 await。
+- [x] 记录 queue wait time、run time 和 scheduler latency。
 
 ### 8.4 实例生命周期
 
-- [ ] pause：保留队列，不领取新任务；当前任务行为必须由 API 参数明确决定。
-- [ ] resume：恢复领取任务并触发 scheduler wake。
-- [ ] drain：拒绝新任务，等待当前任务和现有队列完成。
-- [ ] stop：要求明确选择取消或转移 queued task，并处理 active task。
-- [ ] reset context：仅创建新 context generation，不删除旧审计、任务和消息。
-- [ ] delete：只有实例无 active/queued/waiting task 时允许，或先完成显式迁移流程。
+- [x] pause：保留队列，不领取新任务；当前任务行为必须由 API 参数明确决定。
+- [x] resume：恢复领取任务并触发 scheduler wake。
+- [x] drain：拒绝新任务，等待当前任务和现有队列完成。
+- [x] stop：要求明确选择取消或转移 queued task，并处理 active task。
+- [x] reset context：仅创建新 context generation，不删除旧审计、任务和消息。
+- [x] delete：只有实例无 active/queued/waiting task 时允许，或先完成显式迁移流程。
 
 ### 8.5 资源限制
 
-- [ ] 增加全局最大并发 AgentRun。
-- [ ] 增加单 Team 最大实例数和最大 queued task 数。
-- [ ] 增加单 Definition 在 Team 内最大实例数。
-- [ ] 增加最大委派深度、单任务子任务数、消息数和持久化 payload 大小。
-- [ ] 增加单 Team token/请求预算的统计基础；首版超限时停止新 run，不做模型降级。
-- [ ] 所有限制达到时写入明确事件和错误。
+- [x] 增加全局最大并发 AgentRun。
+- [x] 增加单 Team 最大实例数和最大 queued task 数。
+- [x] 增加单 Definition 在 Team 内最大实例数。
+- [x] 增加最大委派深度、单任务子任务数、消息数和持久化 payload 大小。
+- [x] 增加单 Team token/请求预算的统计基础；首版超限时停止新 run，不做模型降级。
+- [x] 所有限制达到时写入明确事件和错误。
 
 ### 8.6 测试
 
-- [ ] 覆盖同 Definition 多实例使用同快照但不同上下文和队列。
-- [ ] 覆盖不同实例并行、同一实例严格串行。
-- [ ] 覆盖 least-pending 的稳定选择和不可用实例过滤。
-- [ ] 覆盖全局并发上限、公平性和队列等待指标。
-- [ ] 覆盖 pause/resume/drain/stop/reset/delete 生命周期。
-- [ ] 覆盖实例和任务上限，不出现部分创建或静默丢弃。
+- [x] 覆盖同 Definition 多实例使用同快照但不同上下文和队列。
+- [x] 覆盖不同实例并行、同一实例严格串行。
+- [x] 覆盖 least-pending 的稳定选择和不可用实例过滤。
+- [x] 覆盖全局并发上限、公平性和队列等待指标。
+- [x] 覆盖 pause/resume/drain/stop/reset/delete 生命周期。
+- [x] 覆盖实例和任务上限，不出现部分创建或静默丢弃。
 
 ### 阶段 8 退出条件
 
-- [ ] 同一 AgentDefinition 可以安全创建多个独立实例并并行执行任务。
-- [ ] 路由结果确定、可审计，实例状态变化不会破坏 FIFO。
-- [ ] 资源上限可以阻止递归委派和实例爆炸。
+- [x] 同一 AgentDefinition 可以安全创建多个独立实例并并行执行任务。
+- [x] 路由结果确定、可审计，实例状态变化不会破坏 FIFO。
+- [x] 资源上限可以阻止递归委派和实例爆炸。
+
+### Phase 8 实现记录
+
+- 新增 `agent_create_instances` 协作工具和用户 API `POST /api/workspaces/{workspace_id}/chats/{chat_id}/agent-team/instances/create`；两条路径都要求 definition ID、count、单 Team 限制和单 Definition 限制。
+- `WorkspaceDatabase::create_agent_instances_with_limits` 使用 Immediate transaction 原子创建同一 definition revision 的 Worker 实例，保存独立 context generation、队列序号和状态；任一上限或归属校验失败时不返回部分实例。
+- definition 路由通过 `route_agent_instance_for_definition` 使用 least-pending，并按 `last_scheduled_at`、创建时间和 instance ID 稳定 tie-break；不可接收新任务的实例不参与路由，精确 instance 路由继续走既有归属和状态校验。
+- Scheduler 的 runnable task 查询改为按 instance 调度时间做稳定公平排序，领取仍通过 SQLite 事务和实例状态更新保证每实例同一时间只有一个 lease；全局模型并发由进程内 semaphore 控制，Provider 错误不自动重试。
+- `task_started` 事件记录 `queueWaitMs` 与 `schedulerLatencyMs`，任务完成/失败/取消/暂停事件记录 `runTimeMs`；实例创建、状态变化、reset、task cancel/retry/transfer 继续写入脱敏 Agent event。
+- 生命周期 API 保持显式 action endpoint：pause/resume/drain/stop/reset/delete 由 store 状态机校验，stop/delete 在存在 active/queued/waiting workload 时拒绝，queued task 的取消或转移必须先通过 task action 显式完成。
+- Phase 8 覆盖测试位于 `store/tests/workspace_database.rs` 的 `phase8_*` 用例，验证原子多实例创建、least-pending 路由、不可用实例过滤、公平候选排序和同实例 FIFO。
 
 ---
 
