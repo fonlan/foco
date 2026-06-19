@@ -2343,7 +2343,7 @@ fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
             receiver_instance_id: &second_instance,
             related_task_id: None,
             reply_to_message_id: None,
-            kind: AgentMessageKind::Information,
+            kind: AgentMessageKind::Notification,
             content: "cross-team",
         })
         .expect_err("cross-team receiver must fail");
@@ -2389,6 +2389,209 @@ fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
         !database
             .agent_task_dependencies_satisfied(&first_task)
             .expect("dependency state")
+    );
+}
+
+#[test]
+fn phase6_agent_messages_are_ordered_redacted_and_explicitly_consumed() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-messages", "messages");
+
+    let first_message_id = AgentMessageId::new("agent-message-phase6-first").expect("message id");
+    let first_message = database
+        .insert_agent_message(NewAgentMessage {
+            id: &first_message_id,
+            team_id: &team_id,
+            sender_instance_id: Some(&instance_id),
+            receiver_instance_id: &instance_id,
+            related_task_id: None,
+            reply_to_message_id: None,
+            kind: AgentMessageKind::Notification,
+            content: "Authorization: Bearer secret\nstatus ok password=hunter2 token:abc",
+        })
+        .expect("first message");
+    assert_eq!(first_message.sequence, 0);
+    assert_eq!(first_message.consumed_at, None);
+    assert!(first_message.content.contains("[REDACTED]"));
+    assert!(!first_message.content.contains("Bearer secret"));
+    assert!(!first_message.content.contains("hunter2"));
+    assert!(!first_message.content.contains("abc"));
+
+    let second_message_id = AgentMessageId::new("agent-message-phase6-second").expect("message id");
+    let second_message = database
+        .insert_agent_message(NewAgentMessage {
+            id: &second_message_id,
+            team_id: &team_id,
+            sender_instance_id: Some(&instance_id),
+            receiver_instance_id: &instance_id,
+            related_task_id: None,
+            reply_to_message_id: Some(&first_message_id),
+            kind: AgentMessageKind::Reply,
+            content: "plain reply",
+        })
+        .expect("second message");
+    assert_eq!(second_message.sequence, 1);
+
+    let messages = database
+        .agent_messages_after(&instance_id, -1)
+        .expect("messages after");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].id.as_str(), first_message_id.as_str());
+    assert_eq!(messages[1].id.as_str(), second_message_id.as_str());
+    assert_eq!(messages[0].consumed_at, None);
+    assert_eq!(messages[1].consumed_at, None);
+
+    assert!(
+        database
+            .mark_agent_message_consumed(&first_message_id)
+            .expect("consume first message")
+    );
+    assert!(
+        !database
+            .mark_agent_message_consumed(&first_message_id)
+            .expect("consume first message twice")
+    );
+    assert!(
+        database
+            .agent_message(&first_message_id)
+            .expect("first message read")
+            .expect("first message")
+            .consumed_at
+            .is_some()
+    );
+    assert_eq!(
+        database
+            .agent_message(&second_message_id)
+            .expect("second message read")
+            .expect("second message")
+            .consumed_at,
+        None
+    );
+}
+
+#[test]
+fn phase6_agent_child_tasks_are_team_scoped_and_queued_only_cancellable() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-phase6-tasks", "phase6-tasks");
+    let (other_team_id, other_instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-phase6-other", "phase6-other");
+
+    let parent_task_id = AgentTaskId::new("agent-task-phase6-parent").expect("parent task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &parent_task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"goal":"parent"}"#,
+        })
+        .expect("parent enqueue");
+    let child_task_id = AgentTaskId::new("agent-task-phase6-child").expect("child task id");
+    let child_task = database
+        .enqueue_agent_task(NewAgentTask {
+            id: &child_task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: Some(&instance_id),
+            parent_task_id: Some(&parent_task_id),
+            input_json: r#"{"correlationId":"phase6-correlation","delegatedInput":{"goal":"child"}}"#,
+        })
+        .expect("child enqueue");
+    assert_eq!(child_task.origin_instance_id.as_ref(), Some(&instance_id));
+    assert_eq!(child_task.parent_task_id.as_ref(), Some(&parent_task_id));
+
+    let child_tasks = database
+        .agent_tasks_for_parent(&team_id, &parent_task_id)
+        .expect("child tasks");
+    assert_eq!(child_tasks.len(), 1);
+    assert_eq!(child_tasks[0].id.as_str(), child_task_id.as_str());
+    assert!(
+        database
+            .agent_task_for_team(&team_id, &child_task_id)
+            .expect("own team task")
+            .is_some()
+    );
+    assert!(
+        database
+            .agent_task_for_team(&other_team_id, &child_task_id)
+            .expect("cross team task")
+            .is_none()
+    );
+
+    assert!(
+        database
+            .cancel_queued_agent_task(&team_id, &child_task_id, r#"{"code":"cancelled_by_agent"}"#,)
+            .expect("cancel queued child")
+    );
+    let cancelled_child = database
+        .agent_task(&child_task_id)
+        .expect("cancelled child read")
+        .expect("cancelled child");
+    assert_eq!(cancelled_child.status, AgentTaskStatus::Cancelled);
+    assert_json_eq(
+        cancelled_child.error_json.as_deref().expect("cancel error"),
+        r#"{"code":"cancelled_by_agent"}"#,
+    );
+
+    let running_task_id = AgentTaskId::new("agent-task-phase6-running").expect("running task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &running_task_id,
+            team_id: &other_team_id,
+            owner_instance_id: &other_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"goal":"running"}"#,
+        })
+        .expect("running enqueue");
+    let attempt_id = AgentAttemptId::new("agent-attempt-phase6-running").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&other_team_id, &running_task_id, &attempt_id)
+        .expect("claim running task")
+        .expect("running task");
+    assert!(
+        !database
+            .cancel_queued_agent_task(
+                &other_team_id,
+                &running_task_id,
+                r#"{"code":"cancelled_by_agent"}"#,
+            )
+            .expect("cancel running task")
+    );
+}
+
+#[test]
+fn phase6_agent_definition_lookup_returns_existing_instances_only() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-agent-definition-lookup",
+        "definition-lookup",
+    );
+    let instance = database
+        .agent_instance(&instance_id)
+        .expect("instance read")
+        .expect("instance");
+
+    let matches = database
+        .agent_instances_for_definition(&team_id, &instance.definition_id)
+        .expect("instances for definition");
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].id.as_str(), instance_id.as_str());
+
+    let missing_definition_id =
+        AgentDefinitionId::new("agent-definition-phase6-missing").expect("definition id");
+    assert!(
+        database
+            .agent_instances_for_definition(&team_id, &missing_definition_id)
+            .expect("missing instances for definition")
+            .is_empty()
     );
 }
 
@@ -2495,7 +2698,7 @@ fn agent_runtime_state_round_trips_and_chat_delete_preserves_llm_audit() {
             receiver_instance_id: &instance_id,
             related_task_id: Some(&task_id),
             reply_to_message_id: None,
-            kind: AgentMessageKind::Information,
+            kind: AgentMessageKind::Notification,
             content: "persisted message",
         })
         .expect("message");

@@ -188,6 +188,7 @@ fn test_prepared_chat_context(
         agent_task_input: None,
         agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_tool_context: None,
         agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
@@ -540,6 +541,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
             target_status: MemoryStatus::Pending,
             memory_settings: MemorySettings::default(),
         },
+        None,
         registry,
         ToolCancellationToken::default(),
         mpsc::unbounded_channel().0,
@@ -3525,6 +3527,7 @@ fn persist_chat_result_writes_audit_status_code() {
         agent_task_input: None,
         agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_tool_context: None,
         agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
@@ -3701,6 +3704,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         agent_task_input: None,
         agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_tool_context: None,
         agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
@@ -4037,6 +4041,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         agent_task_input: None,
         agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_tool_context: None,
         agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {

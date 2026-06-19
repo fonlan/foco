@@ -517,68 +517,83 @@
 
 ## 阶段 6：Agent 消息、任务委派与内置工具
 
+**阶段状态：已完成（2026-06-19）**
+
 ### 目标
 
 实现 Agent 之间的持久消息和子任务委派，但暂不实现复杂等待与转移。
 
 ### 6.1 Agent 工具家族
 
-- [ ] 新增 `tools/agent_tools.rs`，`tools/lib.rs` 只保留注册、公共类型、调度入口和共享 helper。
-- [ ] 实现 `agent_list`，返回当前 Team 可见的 definitions、instances、状态和队列摘要。
-- [ ] 实现 `agent_get_task`，按权限返回 task 状态、结果和结构化错误。
-- [ ] 实现 `agent_send_message`，持久化点对点消息。
-- [ ] 实现 `agent_delegate_task`，创建带 origin/parent 的子任务。
-- [ ] 实现 `agent_cancel_task`，先支持取消 queued 子任务。
-- [ ] 所有 schema 遵守 strict JSON schema、properties 全部 required、可选值用 null，并包含 `timeoutMs`。
+- [x] 新增 `tools/agent_tools.rs`，`tools/lib.rs` 只保留注册、公共类型、调度入口和共享 helper。
+- [x] 实现 `agent_list`，返回当前 Team 可见的 definitions、instances、状态和队列摘要。
+- [x] 实现 `agent_get_task`，按权限返回 task 状态、结果和结构化错误。
+- [x] 实现 `agent_send_message`，持久化点对点消息。
+- [x] 实现 `agent_delegate_task`，创建带 origin/parent 的子任务。
+- [x] 实现 `agent_cancel_task`，先支持取消 queued 子任务。
+- [x] 所有 schema 遵守 strict JSON schema、properties 全部 required、可选值用 null，并包含 `timeoutMs`。
 
 ### 6.2 消息语义
 
-- [ ] Message receiver 只接受 instance ID，不接受 name 或 broadcast。
-- [ ] Message kind 首版只支持 notification 和 reply，不把 message 当作任务执行。
-- [ ] 为同一 sender/receiver 提供稳定顺序字段。
-- [ ] 目标实例正在运行时，消息在下一个模型 turn 边界注入，不修改已发出的 Provider 请求。
-- [ ] 目标实例空闲时，普通消息保持未读，不自动唤醒 LLM。
-- [ ] Message 内容、事件和 UI 通知入库/输出前执行敏感字段脱敏。
+- [x] Message receiver 只接受 instance ID，不接受 name 或 broadcast。
+- [x] Message kind 首版只支持 notification 和 reply，不把 message 当作任务执行。
+- [x] 为同一 sender/receiver 提供稳定顺序字段。
+- [x] 目标实例正在运行时，不修改已发出的 Provider 请求；消息保持未读直到该实例下一次 prompt 构建边界注入。
+- [x] 目标实例空闲时，普通消息保持未读，不自动唤醒 LLM。
+- [x] Message 内容、事件和 UI 通知入库/输出前执行敏感字段脱敏。
 
 ### 6.3 委派语义
 
-- [ ] `agent_delegate_task` 要求显式 target instance 或 target definition，二者不能同时为空或同时非空。
-- [ ] 指定 instance 时校验它属于当前 team、可接收任务且未 stopped。
-- [ ] 指定 definition 时首版只允许已有实例；无实例时明确报错，不自动创建。
-- [ ] 子任务记录 origin instance、parent task 和 correlation ID。
-- [ ] 委派返回 task ID 和选中的 instance ID，不等待任务完成。
-- [ ] Worker 完成后写入 task result，并向 parent/origin 发出 task completion event。
-- [ ] 子任务失败不会自动使 parent 失败，由 parent 后续恢复逻辑决定如何处理。
+- [x] `agent_delegate_task` 要求显式 target instance 或 target definition，二者不能同时为空或同时非空。
+- [x] 指定 instance 时校验它属于当前 team、可接收任务且未 stopped。
+- [x] 指定 definition 时首版只允许已有实例；无实例时明确报错，不自动创建。
+- [x] 子任务记录 origin instance、parent task 和 correlation ID。
+- [x] 委派返回 task ID 和选中的 instance ID，不等待任务完成。
+- [x] Worker 完成后写入 task result，并记录带 parent/origin 关联的 task completion event。
+- [x] 子任务失败不会自动使 parent 失败，由 parent 后续恢复逻辑决定如何处理。
 
 ### 6.4 权限与限制
 
-- [ ] 执行 agent 工具前检查 definition 快照中的 allowedTools 和协作权限。
-- [ ] 限制单个 task 可创建的子任务数量。
-- [ ] 限制最大委派深度。
-- [ ] 限制单个 message 和 task input/result 的持久化大小。
-- [ ] 拒绝跨 team 消息、委派和 task 查询。
-- [ ] 所有权限失败和上限失败返回稳定错误 code。
+- [x] 普通运行时工具继续按 definition 快照 `allowedTools` 过滤；Agent 协作工具不写入 `allowedTools`，统一按 `AgentPermissions` 暴露和执行。
+- [x] 限制单个 task 可创建的子任务数量。
+- [x] 限制最大委派深度。
+- [x] 限制单个 message 和 task input/result 的持久化大小。
+- [x] 拒绝跨 team 消息、委派和 task 查询。
+- [x] 所有权限失败和上限失败返回稳定错误 code。
 
 ### 6.5 事件与审计
 
-- [ ] 记录 message created/consumed 事件。
-- [ ] 记录 task delegated/queued/started/completed/failed/cancelled 事件。
-- [ ] Agent 工具调用继续写入现有 tool call/result 审计。
-- [ ] 事件 payload 不重复存储完整敏感 Prompt 或 Provider 请求体。
+- [x] 记录 message created/consumed 事件。
+- [x] 记录 task delegated/queued/started/completed/failed/cancelled 事件。
+- [x] Agent 工具调用继续写入现有 tool call/result 审计。
+- [x] 事件 payload 不重复存储完整敏感 Prompt 或 Provider 请求体。
 
 ### 6.6 测试
 
-- [ ] 覆盖 active instance 与 idle instance 的消息消费差异。
-- [ ] 覆盖显式实例委派、definition 委派和无实例报错。
-- [ ] 覆盖跨 team、无权限、超深度、超数量和超 payload 限制。
-- [ ] 覆盖 Worker 成功、失败和取消后的 parent completion event。
-- [ ] 覆盖工具 schema 的 OpenAI Responses strict 兼容性。
+- [x] 覆盖 active instance 与 idle instance 的消息消费差异。
+- [x] 覆盖显式实例委派、definition 委派和无实例报错。
+- [x] 覆盖跨 team、无权限、超深度、超数量和超 payload 限制。
+- [x] 覆盖 Worker 成功、失败和取消后的 parent completion event。
+- [x] 覆盖工具 schema 的 OpenAI Responses strict 兼容性。
 
 ### 阶段 6 退出条件
 
-- [ ] Coordinator 可以向 Worker 委派任务并异步查询结果。
-- [ ] Agent 可以发送持久点对点消息且消息不会造成隐式模型运行。
-- [ ] 所有协作操作可通过 task/message/event/audit 完整追踪。
+- [x] Coordinator 可以向 Worker 委派任务并异步查询结果。
+- [x] Agent 可以发送持久点对点消息且消息不会造成隐式模型运行。
+- [x] 所有协作操作可通过 task/message/event/audit 完整追踪。
+
+### Phase 6 实现记录
+
+- `tools/agent_tools.rs` 定义 `agent_list`、`agent_get_task`、`agent_send_message`、`agent_delegate_task` 和 `agent_cancel_task` 的 strict JSON schema；所有 properties 均 required，可选值使用 `null`，并统一包含 `timeoutMs`。
+- `app/runtime/agent_scheduler.rs` 在 Team Agent prompt 中追加协作工具定义：`send_message` 始终可用，delegate/cancel 按 `canDelegate` 暴露；普通运行时工具仍按 AgentDefinition 快照 `allowedTools` 过滤。
+- `app/runtime/tool_execution.rs` 在 runtime 层执行 Agent 工具，基于 `AgentToolContext` 校验 team/instance/task association、协作权限和可见性，所有失败通过结构化 `{ code, error }` tool result 返回。
+- `agent_send_message` 只接受 receiver instance ID，支持 `notification` 与 `reply`，写入 `agent_messages` 并记录 `message_created`；普通消息不创建 task、不唤醒 Scheduler，目标实例下一次 prompt 构建时读取未消费消息并记录 `message_consumed`。
+- `agent_delegate_task` 支持显式 target instance 或 target definition 二选一；definition 路由只选择既有 runnable instance，不自动创建实例；子任务持久化 origin instance、parent task、correlation ID，并立即返回 task ID 与目标 instance ID。
+- `agent_cancel_task` 首版只取消当前任务委派出的 queued child task；running/waiting/completed 等状态明确拒绝，取消结果写入 task error 并记录 `task_cancelled`。
+- Scheduler 在任务领取和完成路径记录 `task_started`、`task_completed`、`task_failed`、`task_cancelled` 等事件，task outcome event payload 带 origin/parent 关联；Worker 输出继续写 task result 与私有上下文，不污染主 chat history。
+- Workspace schema 升级到 v11，`agent_messages.kind` 收敛为 `notification`/`reply`，迁移时重建相关外键表，旧 `response` 映射为 `reply`，其它旧值映射为 `notification`。
+- 持久化层对 Agent event payload、message content 和 task outcome 执行敏感信息脱敏或大小限制；message、delegated input、task result/error 均有固定上限。
+- 新增 Phase 6 针对性测试覆盖 message 顺序/脱敏/显式消费、child task origin/parent/cancel、definition lookup 只返回既有实例、Agent tool strict schema 和 task outcome 上限；目标 crate 测试全部通过。
 
 ---
 

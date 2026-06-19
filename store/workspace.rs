@@ -43,12 +43,12 @@ pub use workspace_records::{
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
-    MIGRATION_008, MIGRATION_009, MIGRATION_010, Migration,
+    MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 10;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 11;
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -93,6 +93,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 10,
         sql: MIGRATION_010,
+    },
+    Migration {
+        version: 11,
+        sql: MIGRATION_011,
     },
 ];
 
@@ -1997,6 +2001,32 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn agent_instances_for_definition(
+        &self,
+        team_id: &AgentTeamId,
+        definition_id: &foco_agent::AgentDefinitionId,
+    ) -> Result<Vec<AgentInstanceRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, team_id, definition_id, definition_revision,
+                        definition_snapshot_json, role, status, next_task_sequence,
+                        next_message_sequence, context_generation, last_scheduled_at,
+                        created_at, updated_at
+                 FROM agent_instances
+                 WHERE team_id = ?1 AND definition_id = ?2
+                 ORDER BY last_scheduled_at IS NOT NULL, last_scheduled_at, created_at, id",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(
+                params![team_id.as_str(), definition_id.as_str()],
+                agent_instance_from_row,
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn agent_team_workload(
         &self,
         team_id: &AgentTeamId,
@@ -2541,6 +2571,31 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn agent_tasks_for_parent(
+        &self,
+        team_id: &AgentTeamId,
+        parent_task_id: &AgentTaskId,
+    ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+                        sequence, status, input_json, result_json, error_json, created_at,
+                        updated_at, started_at, completed_at
+                 FROM agent_tasks
+                 WHERE team_id = ?1 AND parent_task_id = ?2
+                 ORDER BY created_at, id",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(
+                params![team_id.as_str(), parent_task_id.as_str()],
+                agent_task_from_row,
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn agent_task_for_queued_user_message(
         &self,
         team_id: &AgentTeamId,
@@ -2558,6 +2613,43 @@ impl WorkspaceDatabase {
                 agent_task_from_row,
             )
             .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn agent_task_for_team(
+        &self,
+        team_id: &AgentTeamId,
+        task_id: &AgentTaskId,
+    ) -> Result<Option<AgentTaskRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+                        sequence, status, input_json, result_json, error_json, created_at,
+                        updated_at, started_at, completed_at
+                 FROM agent_tasks WHERE team_id = ?1 AND id = ?2",
+                params![team_id.as_str(), task_id.as_str()],
+                agent_task_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn cancel_queued_agent_task(
+        &mut self,
+        team_id: &AgentTeamId,
+        task_id: &AgentTaskId,
+        error_json: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        validate_agent_json(error_json, "error_json")?;
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'cancelled', error_json = ?3, completed_at = ?4, updated_at = ?4
+                 WHERE team_id = ?1 AND id = ?2 AND status = 'queued'",
+                params![team_id.as_str(), task_id.as_str(), error_json, now],
+            )
+            .map(|updated| updated == 1)
             .map_err(|source| self.sqlite_error(source))
     }
 
@@ -3015,6 +3107,7 @@ impl WorkspaceDatabase {
                 ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
+        let content = redact_agent_text(message.content);
         transaction
             .execute(
                 "INSERT INTO agent_messages
@@ -3029,7 +3122,7 @@ impl WorkspaceDatabase {
                     message.related_task_id.map(AgentTaskId::as_str),
                     message.reply_to_message_id.map(AgentMessageId::as_str),
                     message.kind.as_str(),
-                    message.content,
+                    content,
                     sequence,
                     now
                 ],
@@ -4737,6 +4830,56 @@ fn redact_agent_json(value: &str, field: &'static str) -> Result<String, Workspa
     redact_json_value(&mut parsed);
     serde_json::to_string(&parsed)
         .map_err(|source| WorkspaceDatabaseError::AgentRuntimeJson { field, source })
+}
+
+fn redact_agent_text(value: &str) -> String {
+    const SENSITIVE_KEYS: &[&str] = &[
+        "authorization",
+        "api_key",
+        "apikey",
+        "api-key",
+        "cookie",
+        "password",
+        "token",
+        "secret",
+    ];
+
+    value
+        .lines()
+        .map(|line| redact_agent_text_line(line, SENSITIVE_KEYS))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn redact_agent_text_line(line: &str, sensitive_keys: &[&str]) -> String {
+    let trimmed = line.trim_start();
+    let indentation_len = line.len() - trimmed.len();
+    let lower = trimmed.to_ascii_lowercase();
+
+    for key in sensitive_keys {
+        for marker in [format!("{key}="), format!("{key}:"), format!("\"{key}\":")] {
+            if lower.starts_with(&marker) {
+                return format!("{}[REDACTED]", &line[..indentation_len + marker.len()]);
+            }
+        }
+    }
+
+    line.split_whitespace()
+        .map(|part| {
+            let lower = part.to_ascii_lowercase();
+            if sensitive_keys.iter().any(|key| {
+                lower.starts_with(&format!("{key}="))
+                    || lower.starts_with(&format!("{key}:"))
+                    || lower.starts_with(&format!("\"{key}\":"))
+            }) {
+                let separator = part.find(['=', ':']).expect("matched sensitive separator");
+                format!("{}[REDACTED]", &part[..=separator])
+            } else {
+                part.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn validate_agent_definition_snapshot(value: &str) -> Result<(), WorkspaceDatabaseError> {

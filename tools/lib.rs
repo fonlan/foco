@@ -1,3 +1,4 @@
+mod agent_tools;
 mod command_tools;
 mod definitions;
 mod errors;
@@ -47,6 +48,11 @@ pub const CREATE_TODO_GRAPH_TOOL: &str = "create_todo_graph";
 pub const UPDATE_TODO_GRAPH_TOOL: &str = "update_todo_graph";
 pub const GET_TODO_GRAPH_TOOL: &str = "get_todo_graph";
 pub const ASK_QUESTION_TOOL: &str = "ask_question";
+pub const AGENT_LIST_TOOL: &str = "agent_list";
+pub const AGENT_GET_TASK_TOOL: &str = "agent_get_task";
+pub const AGENT_SEND_MESSAGE_TOOL: &str = "agent_send_message";
+pub const AGENT_DELEGATE_TASK_TOOL: &str = "agent_delegate_task";
+pub const AGENT_CANCEL_TASK_TOOL: &str = "agent_cancel_task";
 
 const MAX_FULL_READ_BYTES: u64 = 1024 * 1024;
 const MAX_RANGED_READ_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
@@ -72,6 +78,7 @@ const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_TODO_GRAPH_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_AGENT_TOOL_TIMEOUT_MS: u64 = 10_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
 #[cfg(windows)]
@@ -127,6 +134,10 @@ impl ToolCancellationToken {
 
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     definitions::builtin_tool_definitions()
+}
+
+pub fn agent_tool_definitions() -> Vec<ToolDefinition> {
+    agent_tools::agent_tool_definitions()
 }
 
 pub fn builtin_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<u64, String> {

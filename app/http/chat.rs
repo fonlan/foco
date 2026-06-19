@@ -138,6 +138,8 @@ pub(crate) async fn queue_chat_message(
             message: task_message,
             attachments: task_attachments,
             skill_ids: requested_skill_ids.clone(),
+            delegated_input: None,
+            correlation_id: None,
         })
         .map_err(|source| {
             ApiError::internal(format!("failed to serialize Coordinator task: {source}"))

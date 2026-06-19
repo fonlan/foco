@@ -23,8 +23,8 @@ pub(crate) use subscriptions::{
 };
 pub(crate) use tool_events::{ToolOutputDeltaEvent, ToolOutputDeltaSink};
 pub(crate) use tool_execution::{
-    ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector, RepeatedToolCallDetector,
-    execute_tool_calls_parallel, pending_tool_calls,
+    AgentToolContext, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
+    RepeatedToolCallDetector, execute_tool_calls_parallel, pending_tool_calls,
 };
 #[cfg(test)]
 pub(crate) use tool_execution::{execute_tool, wait_for_tool_resource_lock};

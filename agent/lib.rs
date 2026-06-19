@@ -248,17 +248,15 @@ impl AgentTaskWaitMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentMessageKind {
-    Information,
-    Request,
-    Response,
+    Notification,
+    Reply,
 }
 
 impl AgentMessageKind {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Information => "information",
-            Self::Request => "request",
-            Self::Response => "response",
+            Self::Notification => "notification",
+            Self::Reply => "reply",
         }
     }
 }
@@ -846,6 +844,11 @@ const GRAPH_EXPLORE_TOOL_NAME: &str = "graph_explore";
 const CREATE_TODO_GRAPH_TOOL_NAME: &str = "create_todo_graph";
 const UPDATE_TODO_GRAPH_TOOL_NAME: &str = "update_todo_graph";
 const GET_TODO_GRAPH_TOOL_NAME: &str = "get_todo_graph";
+const AGENT_LIST_TOOL_NAME: &str = "agent_list";
+const AGENT_GET_TASK_TOOL_NAME: &str = "agent_get_task";
+const AGENT_SEND_MESSAGE_TOOL_NAME: &str = "agent_send_message";
+const AGENT_DELEGATE_TASK_TOOL_NAME: &str = "agent_delegate_task";
+const AGENT_CANCEL_TASK_TOOL_NAME: &str = "agent_cancel_task";
 const ASK_QUESTION_TOOL_NAME: &str = "ask_question";
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 const MEMORY_WRITE_TOOL_NAME: &str = "memory_write";
@@ -1370,6 +1373,11 @@ pub fn tool_resource_locks(
             resource: ToolResource::TodoGraph,
             access: ToolResourceAccess::Read,
         }]),
+        AGENT_LIST_TOOL_NAME
+        | AGENT_GET_TASK_TOOL_NAME
+        | AGENT_SEND_MESSAGE_TOOL_NAME
+        | AGENT_DELEGATE_TASK_TOOL_NAME
+        | AGENT_CANCEL_TASK_TOOL_NAME => Ok(Vec::new()),
         MEMORY_SEARCH_TOOL_NAME => Ok(vec![ToolResourceLock {
             resource: ToolResource::Memory(memory_scope_key(tool_call)?),
             access: ToolResourceAccess::Read,

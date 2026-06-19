@@ -5,25 +5,35 @@ use std::{
 };
 
 use foco_agent::{
-    PendingToolCall, ToolExecutionMode, ToolExecutionPlan, ToolResourceLock, tool_resource_locks,
+    AgentCollaborationTool, AgentDefinitionId, AgentInstanceId, AgentMessageId, AgentMessageKind,
+    AgentPermissions, AgentRunAssociations, AgentTaskId, AgentTaskStatus, PendingToolCall,
+    ToolExecutionMode, ToolExecutionPlan, ToolResourceLock, tool_resource_locks,
 };
 use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
 use foco_store::config::{HookConfig, WebSearchSettings};
+use foco_store::workspace::{
+    AgentInstanceRecord, AgentTaskRecord, NewAgentEvent, NewAgentMessage, NewAgentTask,
+    WorkspaceDatabase,
+};
 use foco_tools::{
-    ASK_QUESTION_TOOL, RUN_COMMAND_TOOL, SLEEP_TOOL, ToolCancellationToken, ToolExecution,
-    ToolOutputSink, builtin_tool_timeout_ms,
+    AGENT_CANCEL_TASK_TOOL, AGENT_DELEGATE_TASK_TOOL, AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL,
+    AGENT_SEND_MESSAGE_TOOL, ASK_QUESTION_TOOL, RUN_COMMAND_TOOL, SLEEP_TOOL,
+    ToolCancellationToken, ToolExecution, ToolOutputSink, builtin_tool_timeout_ms,
     execute_builtin_tool_for_chat_with_cancellation_and_output_sink,
 };
 use futures_util::future::join_all;
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use super::{
-    AskQuestionInput, QuestionAnswer, QuestionItem, QuestionItemAnswer, QuestionOption,
-    QuestionRegistry, QuestionRequest, ToolOutputDeltaSink, ToolResourceLease,
-    ToolResourceLockRegistry, execute_web_tool, is_web_tool_name, web_tool_timeout_ms,
+    AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+    AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, AskQuestionInput, QuestionAnswer,
+    QuestionItem, QuestionItemAnswer, QuestionOption, QuestionRegistry, QuestionRequest,
+    ToolOutputDeltaSink, ToolResourceLease, ToolResourceLockRegistry, execute_web_tool,
+    is_web_tool_name, web_tool_timeout_ms,
 };
 use crate::*;
 
@@ -38,6 +48,11 @@ use serde_json::Value;
 use crate::{
     MAX_REPEATED_TOOL_CALL_BATCHES, MEMORY_SEARCH_TOOL_NAME, READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD,
 };
+
+const AGENT_MAX_CHILD_TASKS_PER_TASK: usize = 64;
+const AGENT_MAX_DELEGATION_DEPTH: usize = 8;
+const AGENT_MAX_MESSAGE_CONTENT_CHARS: usize = 16_384;
+const AGENT_MAX_TASK_INPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 struct ToolCallLoopSignature {
@@ -161,6 +176,13 @@ pub(crate) fn pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingT
         .collect()
 }
 
+#[derive(Clone)]
+pub(crate) struct AgentToolContext {
+    pub(crate) associations: AgentRunAssociations,
+    pub(crate) permissions: AgentPermissions,
+    pub(crate) scheduler: AgentScheduler,
+}
+
 pub(crate) async fn execute_tool_calls_parallel(
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
@@ -170,6 +192,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     memory_tool_context: MemoryToolContext,
+    agent_tool_context: Option<AgentToolContext>,
     workspace_id: &str,
     workspace_path: &Path,
     chat_id: &str,
@@ -204,6 +227,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                         question_registry.clone(),
                         question_event_tx.clone(),
                         memory_tool_context.clone(),
+                        agent_tool_context.clone(),
                         tool_resource_lock_registry.clone(),
                         cancellation_token.clone(),
                         tool_output_delta_tx.clone(),
@@ -239,6 +263,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                     let question_registry = question_registry.clone();
                     let question_event_tx = question_event_tx.clone();
                     let memory_tool_context = memory_tool_context.clone();
+                    let agent_tool_context = agent_tool_context.clone();
                     let tool_resource_lock_registry = tool_resource_lock_registry.clone();
                     let cancellation_token = cancellation_token.clone();
                     let tool_output_delta_tx = tool_output_delta_tx.clone();
@@ -261,6 +286,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                                 question_registry,
                                 question_event_tx,
                                 memory_tool_context,
+                                agent_tool_context,
                                 tool_resource_lock_registry,
                                 cancellation_token,
                                 tool_output_delta_tx,
@@ -309,6 +335,7 @@ async fn execute_tool_call(
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     mut memory_tool_context: MemoryToolContext,
+    agent_tool_context: Option<AgentToolContext>,
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
@@ -333,6 +360,7 @@ async fn execute_tool_call(
         question_registry,
         question_event_tx,
         memory_tool_context,
+        agent_tool_context,
         tool_resource_lock_registry,
         cancellation_token.clone(),
         tool_output_delta_tx,
@@ -404,6 +432,7 @@ pub(crate) async fn execute_tool(
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     memory_tool_context: MemoryToolContext,
+    agent_tool_context: Option<AgentToolContext>,
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
@@ -667,6 +696,54 @@ pub(crate) async fn execute_tool(
         return cancelled_tool_execution_with_hooks(hook_summary);
     }
 
+    if is_agent_tool_name(tool_name) {
+        let Some(agent_tool_context) = agent_tool_context else {
+            return ToolExecutionWithHooks {
+                execution: ToolExecution {
+                    output: json!({ "error": format!("Agent tool '{tool_name}' requires an active Agent team run") }),
+                    is_error: true,
+                },
+                hook_summary,
+            };
+        };
+        let timeout_ms = tool_timeout_ms.expect("Agent tools must use timeoutMs");
+        let remaining_timeout = tool_deadline
+            .and_then(remaining_duration_until)
+            .unwrap_or(Duration::ZERO);
+        set_tool_timeout_ms(&mut arguments, remaining_timeout);
+        let tool_name = tool_name.to_string();
+        let worker_tool_name = tool_name.clone();
+        let workspace_path = workspace_path.to_path_buf();
+        let worker = tokio::task::spawn_blocking(move || {
+            execute_agent_tool(
+                &agent_tool_context,
+                &workspace_path,
+                &worker_tool_name,
+                arguments,
+            )
+        });
+        let execution = timeout(remaining_timeout, worker)
+            .await
+            .map_err(|_| format!("tool '{tool_name}' timed out after {timeout_ms} ms"))
+            .and_then(|result| {
+                result.map_err(|source| format!("tool execution worker failed: {source}"))
+            });
+        let execution = match execution {
+            Ok(Ok(output)) => ToolExecution {
+                output,
+                is_error: false,
+            },
+            Ok(Err(error)) | Err(error) => ToolExecution {
+                output: agent_tool_error_output(&error),
+                is_error: true,
+            },
+        };
+        return ToolExecutionWithHooks {
+            execution,
+            hook_summary,
+        };
+    }
+
     if tool_name == ASK_QUESTION_TOOL {
         let ask_question = execute_ask_question(
             hook_runtime,
@@ -831,6 +908,750 @@ pub(crate) async fn execute_tool(
         execution,
         hook_summary,
     }
+}
+
+fn is_agent_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        AGENT_LIST_TOOL
+            | AGENT_GET_TASK_TOOL
+            | AGENT_SEND_MESSAGE_TOOL
+            | AGENT_DELEGATE_TASK_TOOL
+            | AGENT_CANCEL_TASK_TOOL
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentListInput {
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentGetTaskInput {
+    task_id: AgentTaskId,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentSendMessageInput {
+    receiver_instance_id: AgentInstanceId,
+    kind: AgentMessageKind,
+    content: String,
+    reply_to_message_id: Option<AgentMessageId>,
+    related_task_id: Option<AgentTaskId>,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentDelegateTaskInput {
+    target_instance_id: Option<AgentInstanceId>,
+    target_definition_id: Option<AgentDefinitionId>,
+    input: Value,
+    correlation_id: Option<String>,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentCancelTaskInput {
+    task_id: AgentTaskId,
+    #[serde(rename = "timeoutMs")]
+    _timeout_ms: Option<u64>,
+}
+
+fn execute_agent_tool(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    tool_name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
+    match tool_name {
+        AGENT_LIST_TOOL => execute_agent_list(context, workspace_path, arguments),
+        AGENT_GET_TASK_TOOL => execute_agent_get_task(context, workspace_path, arguments),
+        AGENT_SEND_MESSAGE_TOOL => execute_agent_send_message(context, workspace_path, arguments),
+        AGENT_DELEGATE_TASK_TOOL => execute_agent_delegate_task(context, workspace_path, arguments),
+        AGENT_CANCEL_TASK_TOOL => execute_agent_cancel_task(context, workspace_path, arguments),
+        _ => Err(agent_tool_error(
+            "unknown_tool",
+            format!("unknown Agent tool '{tool_name}'"),
+        )),
+    }
+}
+
+fn execute_agent_list(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, String> {
+    let _input = serde_json::from_value::<AgentListInput>(arguments).map_err(|source| {
+        agent_tool_error(
+            "invalid_arguments",
+            format!("agent_list arguments do not match schema: {source}"),
+        )
+    })?;
+    let team_id = agent_tool_team_id(context)?;
+    let database = WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    let team = database
+        .agent_team(team_id)
+        .map_err(agent_store_error)?
+        .ok_or_else(|| {
+            agent_tool_error("not_found", format!("Agent team '{team_id}' was not found"))
+        })?;
+    let instances = database
+        .agent_instances_for_team(team_id)
+        .map_err(agent_store_error)?;
+    let tasks = database
+        .agent_tasks_for_team(team_id)
+        .map_err(agent_store_error)?;
+    let workload = database
+        .agent_team_workload(team_id)
+        .map_err(agent_store_error)?;
+    let definitions = instances
+        .iter()
+        .map(|instance| {
+            let definition = &instance.definition_snapshot;
+            json!({
+                "id": definition.id.to_string(),
+                "revision": definition.revision,
+                "name": definition.name,
+                "description": definition.description,
+                "providerId": definition.provider_id,
+                "modelId": definition.model_id,
+                "allowedTools": definition.allowed_tools,
+                "permissions": definition.permissions,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "team": {
+            "id": team.id.to_string(),
+            "chatId": team.chat_id,
+            "status": team.status.as_str(),
+            "coordinatorInstanceId": team.coordinator_instance_id.to_string(),
+            "maxConcurrentRuns": team.max_concurrent_runs,
+        },
+        "definitions": definitions,
+        "instances": instances.iter().map(agent_instance_value).collect::<Vec<_>>(),
+        "queue": {
+            "queued": workload.queued_tasks,
+            "running": workload.running_tasks,
+            "waiting": workload.waiting_tasks,
+            "byInstance": agent_queue_by_instance(&instances, &tasks),
+        }
+    }))
+}
+
+fn execute_agent_get_task(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, String> {
+    let input = serde_json::from_value::<AgentGetTaskInput>(arguments).map_err(|source| {
+        agent_tool_error(
+            "invalid_arguments",
+            format!("agent_get_task arguments do not match schema: {source}"),
+        )
+    })?;
+    let team_id = agent_tool_team_id(context)?;
+    let database = WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    let task = database
+        .agent_task_for_team(team_id, &input.task_id)
+        .map_err(agent_store_error)?
+        .ok_or_else(|| {
+            agent_tool_error(
+                "not_found",
+                format!(
+                    "Agent task '{}' was not found in team '{team_id}'",
+                    input.task_id
+                ),
+            )
+        })?;
+    authorize_agent_task_visibility(context, &task)?;
+    Ok(agent_task_value(&task))
+}
+
+fn execute_agent_send_message(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, String> {
+    let input = serde_json::from_value::<AgentSendMessageInput>(arguments).map_err(|source| {
+        agent_tool_error(
+            "invalid_arguments",
+            format!("agent_send_message arguments do not match schema: {source}"),
+        )
+    })?;
+    context
+        .permissions
+        .authorize_collaboration_tool(
+            AgentCollaborationTool::SendMessage,
+            agent_tool_instance_id(context)?.clone(),
+        )
+        .map_err(|source| agent_tool_error("permission_denied", source.to_string()))?;
+    if input.content.trim().is_empty() {
+        return Err(agent_tool_error(
+            "invalid_arguments",
+            "agent_send_message content must not be empty",
+        ));
+    }
+    if input.content.chars().count() > AGENT_MAX_MESSAGE_CONTENT_CHARS {
+        return Err(agent_tool_error(
+            "payload_too_large",
+            format!(
+                "agent_send_message content exceeds {AGENT_MAX_MESSAGE_CONTENT_CHARS} characters"
+            ),
+        ));
+    }
+    let team_id = agent_tool_team_id(context)?;
+    let sender_instance_id = agent_tool_instance_id(context)?;
+    let task_id = agent_tool_task_id(context)?;
+    if let Some(related_task_id) = &input.related_task_id {
+        let database =
+            WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+        let related = database
+            .agent_task_for_team(team_id, related_task_id)
+            .map_err(agent_store_error)?
+            .ok_or_else(|| {
+                agent_tool_error(
+                    "not_found",
+                    format!(
+                        "related Agent task '{related_task_id}' was not found in team '{team_id}'"
+                    ),
+                )
+            })?;
+        authorize_agent_task_visibility(context, &related)?;
+    }
+    let message_id =
+        AgentMessageId::new(unique_id("agent-message")).map_err(|source| source.to_string())?;
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    let message = database
+        .insert_agent_message(NewAgentMessage {
+            id: &message_id,
+            team_id,
+            sender_instance_id: Some(sender_instance_id),
+            receiver_instance_id: &input.receiver_instance_id,
+            related_task_id: input.related_task_id.as_ref(),
+            reply_to_message_id: input.reply_to_message_id.as_ref(),
+            kind: input.kind,
+            content: input.content.trim(),
+        })
+        .map_err(agent_store_error)?;
+    append_agent_tool_event(
+        &mut database,
+        team_id,
+        "message_created",
+        Some(sender_instance_id),
+        Some(task_id),
+        Some(&message.id),
+        json!({
+            "receiverInstanceId": message.receiver_instance_id.to_string(),
+            "kind": message.kind.as_str(),
+            "relatedTaskId": message.related_task_id.as_ref().map(ToString::to_string),
+            "replyToMessageId": message.reply_to_message_id.as_ref().map(ToString::to_string),
+        }),
+    )?;
+    Ok(json!({
+        "messageId": message.id.to_string(),
+        "receiverInstanceId": message.receiver_instance_id.to_string(),
+        "kind": message.kind.as_str(),
+        "sequence": message.sequence,
+        "createdAt": message.created_at,
+    }))
+}
+
+fn execute_agent_delegate_task(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, String> {
+    let input = serde_json::from_value::<AgentDelegateTaskInput>(arguments).map_err(|source| {
+        agent_tool_error(
+            "invalid_arguments",
+            format!("agent_delegate_task arguments do not match schema: {source}"),
+        )
+    })?;
+    context
+        .permissions
+        .authorize_collaboration_tool(
+            AgentCollaborationTool::DelegateTask,
+            agent_tool_instance_id(context)?.clone(),
+        )
+        .map_err(|source| agent_tool_error("permission_denied", source.to_string()))?;
+    let target_instance_id = select_delegate_target_instance(context, workspace_path, &input)?;
+    let team_id = agent_tool_team_id(context)?;
+    let origin_instance_id = agent_tool_instance_id(context)?;
+    let parent_task_id = agent_tool_task_id(context)?;
+    validate_agent_delegate_limits(workspace_path, team_id, parent_task_id, &input.input)?;
+    let child_task_id =
+        AgentTaskId::new(unique_id("agent-task")).map_err(|source| source.to_string())?;
+    let child_input = json!({
+        "queuedUserMessageId": format!("{}:{}", parent_task_id, child_task_id),
+        "message": agent_delegate_task_message(&input.input, input.correlation_id.as_deref())?,
+        "attachments": [],
+        "skillIds": [],
+        "delegatedInput": input.input,
+        "correlationId": input.correlation_id,
+    });
+    let input_json = child_input.to_string();
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    let child = database
+        .enqueue_agent_task_with_limits(
+            NewAgentTask {
+                id: &child_task_id,
+                team_id,
+                owner_instance_id: &target_instance_id,
+                origin_instance_id: Some(origin_instance_id),
+                parent_task_id: Some(parent_task_id),
+                input_json: &input_json,
+            },
+            i64::from(AGENT_MAX_QUEUED_TASKS_PER_TEAM),
+            i64::from(AGENT_MAX_QUEUED_TASKS_PER_INSTANCE),
+            i64::from(AGENT_MAX_QUEUED_TASKS_PER_CHAT),
+        )
+        .map_err(agent_store_error)?;
+    append_agent_tool_event(
+        &mut database,
+        team_id,
+        "task_delegated",
+        Some(origin_instance_id),
+        Some(parent_task_id),
+        None,
+        json!({
+            "childTaskId": child.id.to_string(),
+            "targetInstanceId": child.owner_instance_id.to_string(),
+            "targetDefinitionId": input.target_definition_id.as_ref().map(ToString::to_string),
+            "correlationId": input.correlation_id,
+        }),
+    )?;
+    append_agent_tool_event(
+        &mut database,
+        team_id,
+        "task_queued",
+        Some(&child.owner_instance_id),
+        Some(&child.id),
+        None,
+        json!({
+            "originInstanceId": child.origin_instance_id.as_ref().map(ToString::to_string),
+            "parentTaskId": child.parent_task_id.as_ref().map(ToString::to_string),
+            "correlationId": input.correlation_id,
+        }),
+    )?;
+    context.scheduler.wake().map_err(|source| source.message)?;
+    Ok(json!({
+        "taskId": child.id.to_string(),
+        "targetInstanceId": child.owner_instance_id.to_string(),
+        "status": child.status.as_str(),
+        "sequence": child.sequence,
+        "correlationId": input.correlation_id,
+    }))
+}
+
+fn execute_agent_cancel_task(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, String> {
+    let input = serde_json::from_value::<AgentCancelTaskInput>(arguments).map_err(|source| {
+        agent_tool_error(
+            "invalid_arguments",
+            format!("agent_cancel_task arguments do not match schema: {source}"),
+        )
+    })?;
+    context
+        .permissions
+        .authorize_collaboration_tool(
+            AgentCollaborationTool::DelegateTask,
+            agent_tool_instance_id(context)?.clone(),
+        )
+        .map_err(|source| agent_tool_error("permission_denied", source.to_string()))?;
+    let team_id = agent_tool_team_id(context)?;
+    let actor_instance_id = agent_tool_instance_id(context)?;
+    let parent_task_id = agent_tool_task_id(context)?;
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    let task = database
+        .agent_task_for_team(team_id, &input.task_id)
+        .map_err(agent_store_error)?
+        .ok_or_else(|| {
+            agent_tool_error(
+                "not_found",
+                format!(
+                    "Agent task '{}' was not found in team '{team_id}'",
+                    input.task_id
+                ),
+            )
+        })?;
+    if task.parent_task_id.as_ref() != Some(parent_task_id)
+        || task.origin_instance_id.as_ref() != Some(actor_instance_id)
+    {
+        return Err(agent_tool_error(
+            "permission_denied",
+            format!(
+                "Agent task '{}' is not a child task delegated by the current task",
+                task.id
+            ),
+        ));
+    }
+    if task.status != AgentTaskStatus::Queued {
+        return Err(agent_tool_error(
+            "invalid_task_status",
+            format!(
+                "Agent task '{}' cannot be cancelled by agent_cancel_task while {}",
+                task.id,
+                task.status.as_str()
+            ),
+        ));
+    }
+    let error = json!({
+        "message": "cancelled by delegating Agent task",
+        "cancelledByInstanceId": actor_instance_id.to_string(),
+        "cancelledByTaskId": parent_task_id.to_string(),
+    });
+    let updated = database
+        .cancel_queued_agent_task(team_id, &task.id, &error.to_string())
+        .map_err(agent_store_error)?;
+    if !updated {
+        return Err(agent_tool_error(
+            "state_changed",
+            format!("Agent task '{}' changed state before cancellation", task.id),
+        ));
+    }
+    append_agent_tool_event(
+        &mut database,
+        team_id,
+        "task_cancelled",
+        Some(actor_instance_id),
+        Some(&task.id),
+        None,
+        error,
+    )?;
+    context.scheduler.wake().map_err(|source| source.message)?;
+    Ok(json!({
+        "taskId": task.id.to_string(),
+        "status": AgentTaskStatus::Cancelled.as_str(),
+    }))
+}
+
+fn agent_tool_team_id(context: &AgentToolContext) -> Result<&foco_agent::AgentTeamId, String> {
+    context
+        .associations
+        .team_id
+        .as_ref()
+        .ok_or_else(|| "Agent tool requires a team association".to_string())
+}
+
+fn agent_tool_instance_id(context: &AgentToolContext) -> Result<&AgentInstanceId, String> {
+    context
+        .associations
+        .instance_id
+        .as_ref()
+        .ok_or_else(|| "Agent tool requires an instance association".to_string())
+}
+
+fn agent_tool_task_id(context: &AgentToolContext) -> Result<&AgentTaskId, String> {
+    context
+        .associations
+        .task_id
+        .as_ref()
+        .ok_or_else(|| "Agent tool requires a task association".to_string())
+}
+
+fn select_delegate_target_instance(
+    context: &AgentToolContext,
+    workspace_path: &Path,
+    input: &AgentDelegateTaskInput,
+) -> Result<AgentInstanceId, String> {
+    match (&input.target_instance_id, &input.target_definition_id) {
+        (Some(_), Some(_)) | (None, None) => {
+            return Err(agent_tool_error(
+                "invalid_arguments",
+                "provide exactly one of targetInstanceId or targetDefinitionId",
+            ));
+        }
+        (Some(instance_id), None) => {
+            let database =
+                WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+            let instance = database
+                .agent_instance(instance_id)
+                .map_err(agent_store_error)?
+                .ok_or_else(|| {
+                    agent_tool_error(
+                        "not_found",
+                        format!("Agent instance '{instance_id}' was not found"),
+                    )
+                })?;
+            if instance.team_id != *agent_tool_team_id(context)? {
+                return Err(agent_tool_error(
+                    "cross_team_reference",
+                    format!(
+                        "Agent instance '{instance_id}' does not belong to team '{}'",
+                        agent_tool_team_id(context)?
+                    ),
+                ));
+            }
+            Ok(instance.id)
+        }
+        (None, Some(definition_id)) => {
+            if !context
+                .permissions
+                .allowed_agent_definition_ids
+                .iter()
+                .any(|allowed_id| allowed_id == definition_id)
+            {
+                return Err(agent_tool_error(
+                    "permission_denied",
+                    format!(
+                        "Agent definition '{definition_id}' is not allowed for delegation by this Agent"
+                    ),
+                ));
+            }
+            let database =
+                WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+            let instances = database
+                .agent_instances_for_definition(agent_tool_team_id(context)?, definition_id)
+                .map_err(agent_store_error)?;
+            let instance = instances
+                .into_iter()
+                .find(|instance| matches!(instance.status.as_str(), "idle" | "running"))
+                .ok_or_else(|| {
+                    agent_tool_error(
+                        "not_found",
+                        format!(
+                            "Agent definition '{definition_id}' has no existing runnable instance in team '{}'",
+                            agent_tool_team_id(context).map(ToString::to_string).unwrap_or_default()
+                        ),
+                    )
+                })?;
+            Ok(instance.id)
+        }
+    }
+}
+
+fn authorize_agent_task_visibility(
+    context: &AgentToolContext,
+    task: &AgentTaskRecord,
+) -> Result<(), String> {
+    let instance_id = agent_tool_instance_id(context)?;
+    let current_task_id = agent_tool_task_id(context)?;
+    if &task.owner_instance_id == instance_id
+        || task.origin_instance_id.as_ref() == Some(instance_id)
+        || &task.id == current_task_id
+        || task.parent_task_id.as_ref() == Some(current_task_id)
+    {
+        Ok(())
+    } else {
+        Err(agent_tool_error(
+            "permission_denied",
+            format!(
+                "Agent task '{}' is not visible to instance '{}'",
+                task.id, instance_id
+            ),
+        ))
+    }
+}
+
+fn validate_agent_delegate_limits(
+    workspace_path: &Path,
+    team_id: &foco_agent::AgentTeamId,
+    parent_task_id: &AgentTaskId,
+    input: &Value,
+) -> Result<(), String> {
+    let input_json = serde_json::to_string(input).map_err(|source| {
+        agent_tool_error(
+            "invalid_arguments",
+            format!("failed to serialize delegated task input: {source}"),
+        )
+    })?;
+    if input_json.len() > AGENT_MAX_TASK_INPUT_BYTES {
+        return Err(agent_tool_error(
+            "payload_too_large",
+            format!("agent_delegate_task input exceeds {AGENT_MAX_TASK_INPUT_BYTES} bytes"),
+        ));
+    }
+    let database = WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    let child_count = database
+        .agent_tasks_for_parent(team_id, parent_task_id)
+        .map_err(agent_store_error)?
+        .len();
+    if child_count >= AGENT_MAX_CHILD_TASKS_PER_TASK {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            format!(
+                "Agent task '{parent_task_id}' already has {child_count} child tasks; limit is {AGENT_MAX_CHILD_TASKS_PER_TASK}"
+            ),
+        ));
+    }
+    let depth = agent_task_depth(&database, team_id, parent_task_id)?;
+    if depth >= AGENT_MAX_DELEGATION_DEPTH {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            format!(
+                "Agent task '{parent_task_id}' delegation depth {depth} reached limit {AGENT_MAX_DELEGATION_DEPTH}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn agent_task_depth(
+    database: &WorkspaceDatabase,
+    team_id: &foco_agent::AgentTeamId,
+    task_id: &AgentTaskId,
+) -> Result<usize, String> {
+    let mut depth = 0usize;
+    let mut current_task_id = task_id.clone();
+    loop {
+        let task = database
+            .agent_task_for_team(team_id, &current_task_id)
+            .map_err(agent_store_error)?
+            .ok_or_else(|| {
+                agent_tool_error(
+                    "not_found",
+                    format!("Agent task '{current_task_id}' was not found in team '{team_id}'"),
+                )
+            })?;
+        let Some(parent_task_id) = task.parent_task_id else {
+            return Ok(depth);
+        };
+        depth = depth.saturating_add(1);
+        if depth > AGENT_MAX_DELEGATION_DEPTH {
+            return Ok(depth);
+        }
+        current_task_id = parent_task_id;
+    }
+}
+
+fn agent_instance_value(instance: &AgentInstanceRecord) -> Value {
+    json!({
+        "id": instance.id.to_string(),
+        "definitionId": instance.definition_id.to_string(),
+        "definitionRevision": instance.definition_revision,
+        "role": instance.role.as_str(),
+        "status": instance.status.as_str(),
+        "nextTaskSequence": instance.next_task_sequence,
+        "nextMessageSequence": instance.next_message_sequence,
+        "contextGeneration": instance.context_generation,
+        "lastScheduledAt": instance.last_scheduled_at,
+    })
+}
+
+fn agent_task_value(task: &AgentTaskRecord) -> Value {
+    json!({
+        "id": task.id.to_string(),
+        "teamId": task.team_id.to_string(),
+        "ownerInstanceId": task.owner_instance_id.to_string(),
+        "originInstanceId": task.origin_instance_id.as_ref().map(ToString::to_string),
+        "parentTaskId": task.parent_task_id.as_ref().map(ToString::to_string),
+        "sequence": task.sequence,
+        "status": task.status.as_str(),
+        "result": task.result_json.as_deref().and_then(|value| serde_json::from_str::<Value>(value).ok()),
+        "error": task.error_json.as_deref().and_then(|value| serde_json::from_str::<Value>(value).ok()),
+        "createdAt": task.created_at,
+        "updatedAt": task.updated_at,
+        "startedAt": task.started_at,
+        "completedAt": task.completed_at,
+    })
+}
+
+fn agent_queue_by_instance(
+    instances: &[AgentInstanceRecord],
+    tasks: &[AgentTaskRecord],
+) -> Vec<Value> {
+    instances
+        .iter()
+        .map(|instance| {
+            let queued = tasks
+                .iter()
+                .filter(|task| {
+                    task.owner_instance_id == instance.id && task.status == AgentTaskStatus::Queued
+                })
+                .count();
+            let running = tasks
+                .iter()
+                .filter(|task| {
+                    task.owner_instance_id == instance.id && task.status == AgentTaskStatus::Running
+                })
+                .count();
+            let waiting = tasks
+                .iter()
+                .filter(|task| {
+                    task.owner_instance_id == instance.id && task.status == AgentTaskStatus::Waiting
+                })
+                .count();
+            json!({
+                "instanceId": instance.id.to_string(),
+                "queued": queued,
+                "running": running,
+                "waiting": waiting,
+            })
+        })
+        .collect()
+}
+
+fn agent_delegate_task_message(
+    input: &Value,
+    correlation_id: Option<&str>,
+) -> Result<String, String> {
+    if let Some(message) = input.get("message").and_then(Value::as_str) {
+        if !message.trim().is_empty() {
+            return Ok(message.trim().to_string());
+        }
+    }
+    let input_json = serde_json::to_string(input)
+        .map_err(|source| format!("failed to serialize delegated task input: {source}"))?;
+    Ok(match correlation_id {
+        Some(correlation_id) => format!("Delegated Agent task {correlation_id}: {input_json}"),
+        None => format!("Delegated Agent task: {input_json}"),
+    })
+}
+
+fn append_agent_tool_event(
+    database: &mut WorkspaceDatabase,
+    team_id: &foco_agent::AgentTeamId,
+    event_type: &'static str,
+    instance_id: Option<&AgentInstanceId>,
+    task_id: Option<&AgentTaskId>,
+    message_id: Option<&AgentMessageId>,
+    payload: Value,
+) -> Result<(), String> {
+    database
+        .append_agent_event(NewAgentEvent {
+            team_id,
+            event_type,
+            instance_id,
+            task_id,
+            attempt_id: None,
+            message_id,
+            payload_json: &payload.to_string(),
+        })
+        .map(|_| ())
+        .map_err(agent_store_error)
+}
+
+fn agent_store_error(error: foco_store::workspace::WorkspaceDatabaseError) -> String {
+    agent_tool_error("store_error", error.to_string())
+}
+
+fn agent_tool_error(code: &'static str, message: impl Into<String>) -> String {
+    format!("{code}: {}", message.into())
+}
+
+fn agent_tool_error_output(error: &str) -> Value {
+    let (code, message) = error
+        .split_once(": ")
+        .map(|(code, message)| (code, message))
+        .unwrap_or(("agent_tool_error", error));
+    json!({ "code": code, "error": message })
 }
 
 fn execution_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<Option<u64>, String> {
@@ -1480,4 +2301,212 @@ fn normalize_question_options(
     }
 
     Ok(normalized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use foco_agent::{AgentDefinitionId, AgentTeamId};
+    use foco_store::{
+        config::{AgentDefinitionSettings, AgentModelOptions},
+        workspace::{NewAgentTeam, WorkspaceDatabase},
+    };
+
+    fn test_agent_definition(
+        suffix: &str,
+        permissions: AgentPermissions,
+    ) -> AgentDefinitionSettings {
+        AgentDefinitionSettings {
+            id: AgentDefinitionId::new(format!("agent-definition-{suffix}"))
+                .expect("definition id"),
+            revision: 1,
+            name: format!("Agent {suffix}"),
+            description: String::new(),
+            provider_id: "provider-test".to_string(),
+            model_id: "model-test".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Be precise.".to_string(),
+            allowed_tools: vec![READ_FILE_TOOL.to_string()],
+            max_instances: 1,
+            permissions,
+        }
+    }
+
+    fn create_agent_tool_fixture(
+        permissions: AgentPermissions,
+    ) -> (
+        tempfile::TempDir,
+        AgentToolContext,
+        AgentTeamId,
+        AgentInstanceId,
+        AgentTaskId,
+    ) {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .insert_chat("chat-agent-tool-test", "Agent tool test")
+            .expect("chat insert");
+        let team_id = AgentTeamId::new("agent-team-tool-test").expect("team id");
+        let instance_id = AgentInstanceId::new("agent-instance-tool-test").expect("instance id");
+        let definition = test_agent_definition("tool-test", permissions.clone());
+        database
+            .create_agent_team(NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-agent-tool-test",
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                max_concurrent_runs: 1,
+            })
+            .expect("team create");
+        let task_id = AgentTaskId::new("agent-task-tool-test-parent").expect("task id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: r#"{"message":"parent"}"#,
+            })
+            .expect("parent task enqueue");
+        let (_scheduler, _wake_rx) = AgentScheduler::new();
+        let context = AgentToolContext {
+            associations: AgentRunAssociations {
+                team_id: Some(team_id.clone()),
+                instance_id: Some(instance_id.clone()),
+                task_id: Some(task_id.clone()),
+                attempt_id: None,
+            },
+            permissions,
+            scheduler: _scheduler,
+        };
+        (workspace, context, team_id, instance_id, task_id)
+    }
+
+    #[test]
+    fn phase6_agent_tool_permission_and_payload_errors_have_codes() {
+        let (workspace, context, _team_id, instance_id, _task_id) =
+            create_agent_tool_fixture(AgentPermissions::default());
+
+        let no_delegate_error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            json!({
+                "targetInstanceId": instance_id.to_string(),
+                "targetDefinitionId": null,
+                "input": { "message": "child" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("delegation must require canDelegate");
+        assert_eq!(
+            agent_tool_error_output(&no_delegate_error)["code"],
+            "permission_denied"
+        );
+
+        let oversized_message_error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_SEND_MESSAGE_TOOL,
+            json!({
+                "receiverInstanceId": instance_id.to_string(),
+                "kind": "notification",
+                "content": "x".repeat(AGENT_MAX_MESSAGE_CONTENT_CHARS + 1),
+                "replyToMessageId": null,
+                "relatedTaskId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("oversized message must fail");
+        assert_eq!(
+            agent_tool_error_output(&oversized_message_error)["code"],
+            "payload_too_large"
+        );
+    }
+
+    #[test]
+    fn phase6_agent_delegate_errors_cover_definition_and_limits() {
+        let missing_definition_id =
+            AgentDefinitionId::new("agent-definition-tool-test-missing").expect("definition id");
+        let permissions = AgentPermissions {
+            can_delegate: true,
+            allowed_agent_definition_ids: vec![missing_definition_id.clone()],
+            ..AgentPermissions::default()
+        };
+        let (workspace, context, team_id, instance_id, parent_task_id) =
+            create_agent_tool_fixture(permissions);
+
+        let no_instance_error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            json!({
+                "targetInstanceId": null,
+                "targetDefinitionId": missing_definition_id.to_string(),
+                "input": { "message": "child" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("definition without instance must fail");
+        assert_eq!(
+            agent_tool_error_output(&no_instance_error)["code"],
+            "not_found"
+        );
+
+        let oversized_input_error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            json!({
+                "targetInstanceId": instance_id.to_string(),
+                "targetDefinitionId": null,
+                "input": { "message": "x".repeat(AGENT_MAX_TASK_INPUT_BYTES + 1) },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("oversized child input must fail");
+        assert_eq!(
+            agent_tool_error_output(&oversized_input_error)["code"],
+            "payload_too_large"
+        );
+
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        for index in 0..AGENT_MAX_CHILD_TASKS_PER_TASK {
+            let child_task_id =
+                AgentTaskId::new(format!("agent-task-tool-test-child-{index}")).expect("task id");
+            database
+                .enqueue_agent_task(NewAgentTask {
+                    id: &child_task_id,
+                    team_id: &team_id,
+                    owner_instance_id: &instance_id,
+                    origin_instance_id: Some(&instance_id),
+                    parent_task_id: Some(&parent_task_id),
+                    input_json: r#"{"message":"child"}"#,
+                })
+                .expect("child task enqueue");
+        }
+        drop(database);
+
+        let child_limit_error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            json!({
+                "targetInstanceId": instance_id.to_string(),
+                "targetDefinitionId": null,
+                "input": { "message": "child" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("child limit must fail");
+        assert_eq!(
+            agent_tool_error_output(&child_limit_error)["code"],
+            "limit_exceeded"
+        );
+    }
 }

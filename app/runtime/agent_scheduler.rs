@@ -1,8 +1,9 @@
 use std::{collections::HashSet, sync::Arc};
 
 use foco_agent::{
-    AgentAttemptId, AgentInstanceStatus, AgentRole, AgentRunAssociations, AgentRunOutcome,
-    AgentTaskId, AgentTaskStatus, AgentTaskTransition, estimate_text_tokens,
+    AgentAttemptId, AgentCollaborationTool, AgentInstanceStatus, AgentPermissions, AgentRole,
+    AgentRunAssociations, AgentRunOutcome, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
+    estimate_text_tokens,
 };
 use foco_providers::{NeutralChatMessage, NeutralChatRole};
 use foco_store::{
@@ -36,6 +37,7 @@ const AGENT_CONTEXT_SNAPSHOT_VERSION: u32 = 1;
 const AGENT_CONTEXT_RECENT_MESSAGE_LIMIT: usize = 8;
 const AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT: usize = 16;
 const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 320;
+const AGENT_MAX_TASK_OUTCOME_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct AgentScheduler {
@@ -51,6 +53,10 @@ pub(crate) struct CoordinatorTaskInput {
     pub(crate) attachments: Vec<ChatAttachmentInput>,
     #[serde(default)]
     pub(crate) skill_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) delegated_input: Option<Value>,
+    #[serde(default)]
+    pub(crate) correlation_id: Option<String>,
 }
 
 impl AgentScheduler {
@@ -212,6 +218,19 @@ async fn schedule_runnable_tasks(
                 drop(permit);
                 continue;
             }
+            if let Err(error) = insert_agent_event(
+                &mut database,
+                &claimed.team_id,
+                "task_started",
+                Some(&claimed.owner_instance_id),
+                Some(&claimed.id),
+                Some(&attempt_id),
+                json!({}),
+            ) {
+                let _ = fail_claimed_task(&workspace.path, &claimed.id, &error.message);
+                drop(permit);
+                continue;
+            }
             let state = state.clone();
             let workspace = workspace.clone();
             runs.spawn(async move {
@@ -313,6 +332,7 @@ async fn run_coordinator_task_inner(
         .provider_request
         .tools
         .retain(|tool| allowed_tools.contains(&tool.name));
+    append_agent_collaboration_tools(&mut chat_context, &instance.definition_snapshot.permissions);
     if let Some(max_output_tokens) = instance.definition_snapshot.model_options.max_output_tokens {
         chat_context.provider_request.max_output_tokens = Some(max_output_tokens);
     }
@@ -359,6 +379,11 @@ async fn run_coordinator_task_inner(
         |source| ApiError::internal(format!("failed to parse Agent task input: {source}")),
     )?);
     chat_context.agent_allowed_tools = Some(allowed_tools);
+    chat_context.agent_tool_context = Some(AgentToolContext {
+        associations: chat_context.agent_associations.clone(),
+        permissions: instance.definition_snapshot.permissions.clone(),
+        scheduler: state.agent_scheduler.clone(),
+    });
     chat_context.session_upload_paths = Some(session_upload_paths);
 
     let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
@@ -571,6 +596,35 @@ fn neutral_agent_message(role: NeutralChatRole, content: String) -> NeutralChatM
     }
 }
 
+fn append_agent_collaboration_tools(
+    chat_context: &mut PreparedChatContext,
+    permissions: &AgentPermissions,
+) {
+    for definition in foco_tools::agent_tool_definitions() {
+        let include = match definition.name {
+            foco_tools::AGENT_LIST_TOOL
+            | foco_tools::AGENT_GET_TASK_TOOL
+            | foco_tools::AGENT_SEND_MESSAGE_TOOL => true,
+            foco_tools::AGENT_DELEGATE_TASK_TOOL | foco_tools::AGENT_CANCEL_TASK_TOOL => {
+                permissions.collaboration_tool_allowed(AgentCollaborationTool::DelegateTask)
+            }
+            _ => false,
+        };
+        if include
+            && !chat_context
+                .provider_request
+                .tools
+                .iter()
+                .any(|tool| tool.name == definition.name)
+        {
+            chat_context
+                .provider_request
+                .tools
+                .push(neutral_tool_definition(definition));
+        }
+    }
+}
+
 fn agent_team_protocol_prompt(
     team: &AgentTeamRecord,
     instance: &AgentInstanceRecord,
@@ -716,9 +770,33 @@ fn consume_agent_messages(
     let mut database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     for message_id in message_ids {
-        database
+        let message = database
+            .agent_message(message_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::internal(format!("Agent message '{message_id}' was not found"))
+            })?;
+        let consumed = database
             .mark_agent_message_consumed(message_id)
             .map_err(ApiError::from_workspace_error)?;
+        if consumed {
+            database
+                .append_agent_event(NewAgentEvent {
+                    team_id: &message.team_id,
+                    event_type: "message_consumed",
+                    instance_id: Some(&message.receiver_instance_id),
+                    task_id: message.related_task_id.as_ref(),
+                    attempt_id: None,
+                    message_id: Some(&message.id),
+                    payload_json: &json!({
+                        "senderInstanceId": message.sender_instance_id.as_ref().map(ToString::to_string),
+                        "receiverInstanceId": message.receiver_instance_id.to_string(),
+                        "kind": message.kind.as_str(),
+                    })
+                    .to_string(),
+                })
+                .map_err(ApiError::from_workspace_error)?;
+        }
     }
     Ok(())
 }
@@ -931,8 +1009,14 @@ fn finish_claimed_task(
             "task_suspended",
         ),
     };
-    let result_json = result.as_ref().map(Value::to_string);
-    let error_json = error.as_ref().map(Value::to_string);
+    let result_json = result
+        .as_ref()
+        .map(|value| agent_task_outcome_json(value, "result_json"))
+        .transpose()?;
+    let error_json = error
+        .as_ref()
+        .map(|value| agent_task_outcome_json(value, "error_json"))
+        .transpose()?;
     let mut database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let updated = database
@@ -952,6 +1036,12 @@ fn finish_claimed_task(
             task.id
         )));
     }
+    let payload = result.or(error).unwrap_or_else(|| json!({}));
+    let payload = json!({
+        "outcome": payload,
+        "originInstanceId": task.origin_instance_id.as_ref().map(ToString::to_string),
+        "parentTaskId": task.parent_task_id.as_ref().map(ToString::to_string),
+    });
     insert_agent_event(
         &mut database,
         &task.team_id,
@@ -959,7 +1049,7 @@ fn finish_claimed_task(
         Some(&task.owner_instance_id),
         Some(&task.id),
         Some(attempt_id),
-        result.or(error).unwrap_or_else(|| json!({})),
+        payload,
     )?;
     Ok(())
 }
@@ -980,7 +1070,16 @@ fn fail_claimed_task(
     if task.status != AgentTaskStatus::Running {
         return Ok(());
     }
-    let error_json = json!({ "message": message }).to_string();
+    let mut error = json!({ "message": message });
+    let mut error_json = error.to_string();
+    if error_json.len() > AGENT_MAX_TASK_OUTCOME_BYTES {
+        error = json!({
+            "message": format!(
+                "Agent task error_json exceeds {AGENT_MAX_TASK_OUTCOME_BYTES} bytes"
+            )
+        });
+        error_json = error.to_string();
+    }
     database
         .update_agent_task_state(AgentTaskStateUpdate {
             team_id: &task.team_id,
@@ -993,6 +1092,16 @@ fn fail_claimed_task(
         })
         .map_err(ApiError::from_workspace_error)?;
     Ok(())
+}
+
+fn agent_task_outcome_json(value: &Value, field: &'static str) -> Result<String, ApiError> {
+    let json = value.to_string();
+    if json.len() > AGENT_MAX_TASK_OUTCOME_BYTES {
+        return Err(ApiError::internal(format!(
+            "Agent task {field} exceeds {AGENT_MAX_TASK_OUTCOME_BYTES} bytes"
+        )));
+    }
+    Ok(json)
 }
 
 pub(crate) fn validate_agent_snapshot_for_workspace(
@@ -1101,5 +1210,13 @@ mod tests {
         assert!(permits.clone().try_acquire_owned().is_err());
         drop(held);
         assert!(permits.try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn agent_task_outcome_json_rejects_oversized_payload() {
+        assert!(agent_task_outcome_json(&json!({ "text": "ok" }), "result_json").is_ok());
+
+        let oversized = json!({ "text": "x".repeat(AGENT_MAX_TASK_OUTCOME_BYTES) });
+        assert!(agent_task_outcome_json(&oversized, "result_json").is_err());
     }
 }

@@ -415,7 +415,7 @@ CREATE TABLE agent_messages (
     receiver_instance_id TEXT NOT NULL,
     related_task_id TEXT,
     reply_to_message_id TEXT,
-    kind TEXT NOT NULL CHECK (kind IN ('information', 'request', 'response')),
+    kind TEXT NOT NULL CHECK (kind IN ('notification', 'reply')),
     content TEXT NOT NULL CHECK (length(content) > 0),
     sequence INTEGER NOT NULL CHECK (sequence >= 0),
     created_at TEXT NOT NULL,
@@ -539,6 +539,138 @@ CREATE INDEX llm_requests_agent_team_idx ON llm_requests (agent_team_id, request
 CREATE INDEX llm_requests_agent_instance_idx ON llm_requests (agent_instance_id, request_started_at);
 CREATE INDEX llm_requests_agent_task_idx ON llm_requests (agent_task_id, request_started_at);
 CREATE INDEX llm_requests_agent_attempt_idx ON llm_requests (agent_attempt_id);
+"#;
+
+pub const MIGRATION_011: &str = r#"
+PRAGMA legacy_alter_table = ON;
+
+ALTER TABLE agent_messages RENAME TO agent_messages_old;
+
+CREATE TABLE agent_messages (
+    id TEXT PRIMARY KEY NOT NULL CHECK (id GLOB 'agent-message-*'),
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    sender_instance_id TEXT,
+    receiver_instance_id TEXT NOT NULL,
+    related_task_id TEXT,
+    reply_to_message_id TEXT,
+    kind TEXT NOT NULL CHECK (kind IN ('notification', 'reply')),
+    content TEXT NOT NULL CHECK (length(content) > 0),
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    created_at TEXT NOT NULL,
+    consumed_at TEXT,
+    UNIQUE (team_id, id),
+    UNIQUE (receiver_instance_id, sequence),
+    FOREIGN KEY (team_id, sender_instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (team_id, receiver_instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id, related_task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, reply_to_message_id)
+        REFERENCES agent_messages(team_id, id) ON DELETE SET NULL
+);
+
+INSERT INTO agent_messages
+    (id, team_id, sender_instance_id, receiver_instance_id, related_task_id,
+     reply_to_message_id, kind, content, sequence, created_at, consumed_at)
+SELECT
+    id,
+    team_id,
+    sender_instance_id,
+    receiver_instance_id,
+    related_task_id,
+    reply_to_message_id,
+    CASE kind
+        WHEN 'response' THEN 'reply'
+        ELSE 'notification'
+    END,
+    content,
+    sequence,
+    created_at,
+    consumed_at
+FROM agent_messages_old;
+
+DROP TABLE agent_messages_old;
+
+CREATE INDEX agent_messages_unread_idx
+    ON agent_messages (receiver_instance_id, sequence)
+    WHERE consumed_at IS NULL;
+CREATE INDEX agent_messages_task_idx
+    ON agent_messages (team_id, related_task_id);
+
+ALTER TABLE agent_events RENAME TO agent_events_old;
+
+CREATE TABLE agent_events (
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    event_type TEXT NOT NULL CHECK (length(event_type) > 0),
+    instance_id TEXT,
+    task_id TEXT,
+    attempt_id TEXT,
+    message_id TEXT,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, sequence),
+    FOREIGN KEY (team_id, instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, attempt_id)
+        REFERENCES agent_attempts(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, message_id)
+        REFERENCES agent_messages(team_id, id) ON DELETE SET NULL
+);
+
+INSERT INTO agent_events
+    (team_id, sequence, event_type, instance_id, task_id, attempt_id,
+     message_id, payload_json, created_at)
+SELECT
+    team_id, sequence, event_type, instance_id, task_id, attempt_id,
+    message_id, payload_json, created_at
+FROM agent_events_old;
+
+DROP TABLE agent_events_old;
+
+CREATE INDEX agent_events_entity_idx
+    ON agent_events (team_id, instance_id, task_id, sequence);
+
+ALTER TABLE agent_context_entries RENAME TO agent_context_entries_old;
+
+CREATE TABLE agent_context_entries (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    instance_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+    content_json TEXT NOT NULL CHECK (json_valid(content_json)),
+    source_task_id TEXT,
+    source_message_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (team_id, id),
+    UNIQUE (instance_id, generation, sequence),
+    FOREIGN KEY (team_id, instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id, source_task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, source_message_id)
+        REFERENCES agent_messages(team_id, id) ON DELETE SET NULL
+);
+
+INSERT INTO agent_context_entries
+    (id, team_id, instance_id, generation, sequence, role, content_json,
+     source_task_id, source_message_id, created_at)
+SELECT
+    id, team_id, instance_id, generation, sequence, role, content_json,
+    source_task_id, source_message_id, created_at
+FROM agent_context_entries_old;
+
+DROP TABLE agent_context_entries_old;
+
+CREATE INDEX agent_context_entries_owner_idx
+    ON agent_context_entries (instance_id, generation, sequence);
+
+PRAGMA legacy_alter_table = OFF;
 "#;
 
 #[cfg(test)]

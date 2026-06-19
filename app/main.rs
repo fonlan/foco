@@ -114,12 +114,12 @@ use crate::runtime::reconcile_agent_runtime;
 use crate::runtime::{
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, ActiveChatRunRegistration, ActiveChatRunRegistry,
-    ActiveChatRunSubscription, ActiveChatRunSummary, AgentScheduler, ChatRunCancellation,
-    CoordinatorTaskInput, GuidanceMessage, QuestionAnswer, QuestionAnswerResponse,
-    QuestionRegistry, QuestionRequest, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
-    RepeatedToolCallDetector, ToolOutputDeltaEvent, ToolResourceLockRegistry,
-    chat_run_subscription_stream, execute_tool_calls_parallel, insert_agent_event,
-    pending_tool_calls, validate_agent_snapshot_for_workspace,
+    ActiveChatRunSubscription, ActiveChatRunSummary, AgentScheduler, AgentToolContext,
+    ChatRunCancellation, CoordinatorTaskInput, GuidanceMessage, QuestionAnswer,
+    QuestionAnswerResponse, QuestionRegistry, QuestionRequest, ReadOnlyToolProgressAction,
+    ReadOnlyToolProgressDetector, RepeatedToolCallDetector, ToolOutputDeltaEvent,
+    ToolResourceLockRegistry, chat_run_subscription_stream, execute_tool_calls_parallel,
+    insert_agent_event, pending_tool_calls, validate_agent_snapshot_for_workspace,
 };
 
 #[cfg(all(windows, not(debug_assertions)))]
@@ -2810,6 +2810,7 @@ struct PreparedChatContext {
     agent_task_input: Option<Value>,
     agent_unread_messages: Vec<Value>,
     agent_allowed_tools: Option<HashSet<String>>,
+    agent_tool_context: Option<AgentToolContext>,
     agent_primary_chat_output: bool,
     session_upload_paths: Option<Vec<String>>,
     provider_config: ProviderConnectionConfig,
@@ -4641,6 +4642,7 @@ impl PreparedChatContext {
                                         target_status: self.memory_target_status,
                                         memory_settings: self.memory_settings.clone(),
                                     },
+                                    self.agent_tool_context.clone(),
                                     &self.workspace_id,
                                     &self.workspace_path,
                                     &self.chat_id,
@@ -5240,6 +5242,7 @@ async fn prepare_chat_context(
         agent_task_input: None,
         agent_unread_messages: Vec::new(),
         agent_allowed_tools: None,
+        agent_tool_context: None,
         agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: prompt_context.provider_config,
