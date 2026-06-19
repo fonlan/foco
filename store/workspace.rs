@@ -692,6 +692,38 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn history_run_events_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<RunEventRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, chat_id, run_id, sequence, event_type, payload_json, created_at
+                 FROM run_events
+                 WHERE chat_id = ?1
+                   AND event_type IN
+                       ('reasoning_delta', 'text_delta', 'tool_call', 'stream_reset')
+                 ORDER BY created_at ASC, run_id ASC, sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(RunEventRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    sequence: row.get(3)?,
+                    event_type: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn insert_tool_call(
         &mut self,
         tool_call: NewToolCall<'_>,
@@ -1331,48 +1363,6 @@ impl WorkspaceDatabase {
                  INNER JOIN llm_requests
                     ON llm_requests.id = llm_request_events.llm_request_id
                  WHERE llm_requests.chat_id = ?1
-                 ORDER BY llm_requests.request_started_at ASC,
-                    llm_request_events.sequence ASC",
-            )
-            .map_err(|source| self.sqlite_error(source))?;
-        let rows = statement
-            .query_map(params![chat_id], |row| {
-                Ok(LlmRequestEventRecord {
-                    id: row.get(0)?,
-                    llm_request_id: row.get(1)?,
-                    sequence: row.get(2)?,
-                    event_at: row.get(3)?,
-                    event_type: row.get(4)?,
-                    raw_chunk_json: row.get(5)?,
-                    normalized_event_json: row.get(6)?,
-                })
-            })
-            .map_err(|source| self.sqlite_error(source))?;
-
-        collect_rows(rows, &self.database_path)
-    }
-
-    pub fn llm_request_history_events_for_chat(
-        &self,
-        chat_id: &str,
-    ) -> Result<Vec<LlmRequestEventRecord>, WorkspaceDatabaseError> {
-        let mut statement = self
-            .connection
-            .prepare(
-                "SELECT
-                    llm_request_events.id,
-                    llm_request_events.llm_request_id,
-                    llm_request_events.sequence,
-                    llm_request_events.event_at,
-                    llm_request_events.event_type,
-                    NULL,
-                    llm_request_events.normalized_event_json
-                 FROM llm_request_events
-                 INNER JOIN llm_requests
-                    ON llm_requests.id = llm_request_events.llm_request_id
-                 WHERE llm_requests.chat_id = ?1
-                   AND llm_request_events.event_type IN
-                       ('start', 'completion', 'text_delta', 'reasoning_delta', 'tool_call')
                  ORDER BY llm_requests.request_started_at ASC,
                     llm_request_events.sequence ASC",
             )

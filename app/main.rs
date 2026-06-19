@@ -2619,6 +2619,8 @@ enum StoredChatMessagePart {
     ToolCall { tool_call_id: String },
 }
 
+const STORED_CHAT_PARTS_VERSION: i64 = 2;
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatReplyMetrics {
@@ -8931,6 +8933,14 @@ fn assistant_message_metadata_json(
     }
     if let Some(parts) = parts {
         metadata.insert("parts".to_string(), json!(parts));
+        metadata.insert(
+            "partsVersion".to_string(),
+            Value::Number(STORED_CHAT_PARTS_VERSION.into()),
+        );
+        metadata.insert(
+            "partsSource".to_string(),
+            Value::String("live_sse".to_string()),
+        );
     }
 
     serde_json::to_string(&Value::Object(metadata)).map_err(|source| {
@@ -9374,7 +9384,9 @@ fn non_empty_string(value: &str) -> Option<String> {
 
 fn assistant_message_needs_part_materialization(metadata_json: &str) -> Result<bool, ApiError> {
     let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
-    if metadata.get("parts").is_some() {
+    if metadata.get("parts").is_some()
+        && metadata.get("partsVersion").and_then(Value::as_i64) == Some(STORED_CHAT_PARTS_VERSION)
+    {
         return Ok(false);
     }
 
@@ -9403,28 +9415,8 @@ fn materialize_missing_assistant_parts(
     }
 
     let events = database
-        .llm_request_history_events_for_chat(chat_id)
+        .history_run_events_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?;
-    let mut request_message_ids = HashMap::<String, String>::new();
-    let mut completed_request_ids = HashSet::new();
-    for event in &events {
-        match event.event_type.as_str() {
-            "start" => {
-                let value = parse_json_value(&event.normalized_event_json, "LLM start event")?;
-                if let Some(message_id) =
-                    string_json_field(&value, "assistantMessageId", "assistant_message_id")
-                {
-                    request_message_ids
-                        .insert(event.llm_request_id.clone(), message_id.to_string());
-                }
-            }
-            "completion" => {
-                completed_request_ids.insert(event.llm_request_id.clone());
-            }
-            _ => {}
-        }
-    }
-
     let tool_calls_by_id = tool_calls_by_message
         .values()
         .flatten()
@@ -9433,10 +9425,10 @@ fn materialize_missing_assistant_parts(
     let mut parts_by_message = HashMap::<String, Vec<ChatMessagePart>>::new();
     let mut seen_tool_call_ids_by_message = HashMap::<String, HashSet<String>>::new();
     for event in &events {
-        if !completed_request_ids.contains(&event.llm_request_id) {
-            continue;
-        }
-        let Some(message_id) = request_message_ids.get(&event.llm_request_id) else {
+        let value = parse_json_value(&event.payload_json, "chat run event")?;
+        let Some(message_id) =
+            string_json_field(&value, "assistantMessageId", "assistant_message_id")
+        else {
             continue;
         };
         if !missing_message_ids.contains(message_id) {
@@ -9445,32 +9437,22 @@ fn materialize_missing_assistant_parts(
 
         match event.event_type.as_str() {
             "text_delta" => {
-                let value = parse_json_value(&event.normalized_event_json, "LLM text event")?;
-                if event_matches_assistant_message(&value, message_id)
-                    && let Some(delta) = string_json_field(&value, "delta", "delta")
-                {
+                if let Some(delta) = string_json_field(&value, "delta", "delta") {
                     push_text_part(
-                        parts_by_message.entry(message_id.clone()).or_default(),
+                        parts_by_message.entry(message_id.to_string()).or_default(),
                         delta,
                     );
                 }
             }
             "reasoning_delta" => {
-                let value = parse_json_value(&event.normalized_event_json, "LLM reasoning event")?;
-                if event_matches_assistant_message(&value, message_id)
-                    && let Some(delta) = string_json_field(&value, "delta", "delta")
-                {
+                if let Some(delta) = string_json_field(&value, "delta", "delta") {
                     push_reasoning_part(
-                        parts_by_message.entry(message_id.clone()).or_default(),
+                        parts_by_message.entry(message_id.to_string()).or_default(),
                         delta,
                     );
                 }
             }
             "tool_call" => {
-                let value = parse_json_value(&event.normalized_event_json, "LLM tool call event")?;
-                if !event_matches_assistant_message(&value, message_id) {
-                    continue;
-                }
                 let Some(tool_call) = value.get("toolCall").or_else(|| value.get("tool_call"))
                 else {
                     continue;
@@ -9480,18 +9462,49 @@ fn materialize_missing_assistant_parts(
                 else {
                     continue;
                 };
-                if seen_tool_call_ids_by_message
-                    .entry(message_id.clone())
-                    .or_default()
-                    .insert(tool_call_id.to_string())
-                    && let Some(tool_call) = tool_calls_by_id.get(tool_call_id)
+                push_materialized_tool_call_part(
+                    &mut parts_by_message,
+                    &mut seen_tool_call_ids_by_message,
+                    &tool_calls_by_id,
+                    message_id,
+                    tool_call_id,
+                );
+            }
+            "stream_reset" => {
+                parts_by_message.remove(message_id);
+                seen_tool_call_ids_by_message.remove(message_id);
+                if let Some(reasoning) =
+                    nullable_string_json_field(&value, "reasoning", "reasoning")
                 {
-                    parts_by_message
-                        .entry(message_id.clone())
-                        .or_default()
-                        .push(ChatMessagePart::ToolCall {
-                            tool_call: (*tool_call).clone(),
-                        });
+                    push_reasoning_part(
+                        parts_by_message.entry(message_id.to_string()).or_default(),
+                        reasoning,
+                    );
+                }
+                if let Some(text) = string_json_field(&value, "text", "text") {
+                    push_text_part(
+                        parts_by_message.entry(message_id.to_string()).or_default(),
+                        text,
+                    );
+                }
+                if let Some(reset_tool_calls) = value
+                    .get("toolCalls")
+                    .or_else(|| value.get("tool_calls"))
+                    .and_then(Value::as_array)
+                {
+                    for tool_call in reset_tool_calls {
+                        if let Some(tool_call_id) = string_json_field(tool_call, "id", "callId")
+                            .or_else(|| string_json_field(tool_call, "call_id", "callId"))
+                        {
+                            push_materialized_tool_call_part(
+                                &mut parts_by_message,
+                                &mut seen_tool_call_ids_by_message,
+                                &tool_calls_by_id,
+                                message_id,
+                                tool_call_id,
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
@@ -9519,6 +9532,14 @@ fn materialize_missing_assistant_parts(
             ApiError::internal("assistant message metadata must be a JSON object")
         })?;
         metadata.insert("parts".to_string(), json!(stored_parts));
+        metadata.insert(
+            "partsVersion".to_string(),
+            Value::Number(STORED_CHAT_PARTS_VERSION.into()),
+        );
+        metadata.insert(
+            "partsSource".to_string(),
+            Value::String("run_events".to_string()),
+        );
         let metadata_json = serde_json::to_string(metadata).map_err(|source| {
             ApiError::internal(format!(
                 "failed to serialize assistant message metadata: {source}"
@@ -9531,6 +9552,30 @@ fn materialize_missing_assistant_parts(
     }
 
     Ok(())
+}
+
+fn push_materialized_tool_call_part(
+    parts_by_message: &mut HashMap<String, Vec<ChatMessagePart>>,
+    seen_tool_call_ids_by_message: &mut HashMap<String, HashSet<String>>,
+    tool_calls_by_id: &HashMap<&str, &ChatToolCallSummary>,
+    message_id: &str,
+    tool_call_id: &str,
+) {
+    if !seen_tool_call_ids_by_message
+        .entry(message_id.to_string())
+        .or_default()
+        .insert(tool_call_id.to_string())
+    {
+        return;
+    }
+    if let Some(tool_call) = tool_calls_by_id.get(tool_call_id) {
+        parts_by_message
+            .entry(message_id.to_string())
+            .or_default()
+            .push(ChatMessagePart::ToolCall {
+                tool_call: (*tool_call).clone(),
+            });
+    }
 }
 
 fn chat_message_summaries(

@@ -14,7 +14,7 @@ use foco_store::{
         MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, NewMemoryExtractionJob,
         NewMemoryFact, NewMemorySource,
     },
-    workspace::{LlmRequestAuditFilters, NewTerminalSession},
+    workspace::{LlmRequestAuditFilters, NewRunEvent, NewTerminalSession},
 };
 use foco_tools::{
     GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL, READ_FILE_TOOL, SEARCH_TEXT_TOOL,
@@ -2836,6 +2836,8 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
     )
     .expect("assistant metadata");
     assert!(!metadata_json.contains("large result"));
+    assert!(metadata_json.contains(r#""partsVersion":2"#));
+    assert!(metadata_json.contains(r#""partsSource":"live_sse""#));
 
     let parts = assistant_parts_from_metadata(&metadata_json, std::slice::from_ref(&tool_call))
         .expect("hydrate parts")
@@ -2848,7 +2850,7 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
 }
 
 #[test]
-fn historical_chat_materializes_interleaved_parts_once_from_audit_events() {
+fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-history-parts-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let mut database =
@@ -2863,7 +2865,9 @@ fn historical_chat_materializes_interleaved_parts_once_from_audit_events() {
             role: "assistant",
             content: "Before.After.",
             sequence: 0,
-            metadata_json: Some(r#"{"reasoning":"Think one.Think two."}"#),
+            metadata_json: Some(
+                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one.Think two."},{"type":"toolCall","tool_call_id":"tool-1"},{"type":"text","text":"Before.After."}]}"#,
+            ),
         })
         .expect("assistant insert");
     database
@@ -2892,46 +2896,54 @@ fn historical_chat_materializes_interleaved_parts_once_from_audit_events() {
             response_body_json: Some("{}"),
         })
         .expect("request insert");
+    database
+        .insert_llm_request_event(NewLlmRequestEvent {
+            id: "request-event-0",
+            llm_request_id: "request-1",
+            sequence: 0,
+            event_at: "2026-06-18T10:00:00Z",
+            event_type: "start",
+            raw_chunk_json: None,
+            normalized_event_json: r#"{"assistantMessageId":"assistant-1"}"#,
+        })
+        .expect("request start event insert");
     for (sequence, event_type, value) in [
-        (0, "start", json!({ "assistantMessageId": "assistant-1" })),
+        (
+            0,
+            "reasoning_delta",
+            json!({ "assistant_message_id": "assistant-1", "delta": "Think one." }),
+        ),
         (
             1,
-            "reasoning_delta",
-            json!({ "assistantMessageId": "assistant-1", "delta": "Think one." }),
+            "text_delta",
+            json!({ "assistant_message_id": "assistant-1", "delta": "Before." }),
         ),
         (
             2,
-            "text_delta",
-            json!({ "assistantMessageId": "assistant-1", "delta": "Before." }),
+            "tool_call",
+            json!({ "assistant_message_id": "assistant-1", "tool_call": { "id": "tool-1" } }),
         ),
         (
             3,
-            "tool_call",
-            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-1" } }),
+            "reasoning_delta",
+            json!({ "assistant_message_id": "assistant-1", "delta": "Think two." }),
         ),
         (
             4,
-            "reasoning_delta",
-            json!({ "assistantMessageId": "assistant-1", "delta": "Think two." }),
-        ),
-        (
-            5,
             "text_delta",
-            json!({ "assistantMessageId": "assistant-1", "delta": "After." }),
+            json!({ "assistant_message_id": "assistant-1", "delta": "After." }),
         ),
-        (6, "completion", json!({})),
     ] {
         database
-            .insert_llm_request_event(NewLlmRequestEvent {
-                id: &format!("event-{sequence}"),
-                llm_request_id: "request-1",
+            .insert_run_event(NewRunEvent {
+                id: &format!("run-event-{sequence}"),
+                chat_id: "chat-1",
+                run_id: "run-1",
                 sequence,
-                event_at: "2026-06-18T10:00:00Z",
                 event_type,
-                raw_chunk_json: None,
-                normalized_event_json: &value.to_string(),
+                payload_json: &value.to_string(),
             })
-            .expect("event insert");
+            .expect("run event insert");
     }
     database
         .insert_tool_call(NewToolCall {
@@ -2979,6 +2991,12 @@ fn historical_chat_materializes_interleaved_parts_once_from_audit_events() {
         .expect("saved message read")
         .expect("saved message");
     assert!(saved.metadata_json.contains(r#""tool_call_id":"tool-1""#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":2"#));
+    assert!(
+        saved
+            .metadata_json
+            .contains(r#""partsSource":"run_events""#)
+    );
     assert!(!saved.metadata_json.contains("large result"));
 
     drop(database);
