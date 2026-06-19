@@ -109,13 +109,17 @@ use crate::prompt::{
     persist_running_llm_request, prepare_prompt_context, recover_after_tool_round_cap,
     serialize_provider_request, system_prompt_summaries, tool_prompt_infos,
 };
+#[cfg(test)]
+use crate::runtime::reconcile_agent_runtime;
 use crate::runtime::{
-    ActiveChatRunRegistration, ActiveChatRunRegistry, ActiveChatRunSubscription,
-    ActiveChatRunSummary, ChatRunCancellation, GuidanceMessage, QuestionAnswer,
-    QuestionAnswerResponse, QuestionRegistry, QuestionRequest, ReadOnlyToolProgressAction,
-    ReadOnlyToolProgressDetector, RepeatedToolCallDetector, ToolOutputDeltaEvent,
-    ToolResourceLockRegistry, chat_run_subscription_stream, execute_tool_calls_parallel,
-    pending_tool_calls,
+    AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+    AGENT_MAX_QUEUED_TASKS_PER_TEAM, ActiveChatRunRegistration, ActiveChatRunRegistry,
+    ActiveChatRunSubscription, ActiveChatRunSummary, AgentScheduler, ChatRunCancellation,
+    CoordinatorTaskInput, GuidanceMessage, QuestionAnswer, QuestionAnswerResponse,
+    QuestionRegistry, QuestionRequest, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
+    RepeatedToolCallDetector, ToolOutputDeltaEvent, ToolResourceLockRegistry,
+    chat_run_subscription_stream, execute_tool_calls_parallel, insert_agent_event,
+    pending_tool_calls, validate_agent_snapshot_for_workspace,
 };
 
 #[cfg(all(windows, not(debug_assertions)))]
@@ -366,6 +370,7 @@ pub(crate) struct AppState {
     hook_runtime: HookRuntime,
     question_registry: QuestionRegistry,
     active_chat_runs: ActiveChatRunRegistry,
+    agent_scheduler: AgentScheduler,
     tool_resource_locks: ToolResourceLockRegistry,
     _code_graph_watchers: Arc<Mutex<Vec<CodeGraphWatcher>>>,
     #[cfg(all(windows, not(debug_assertions)))]
@@ -485,6 +490,7 @@ async fn run_server_until_shutdown(
             (Some(owned_shutdown_tx), owned_shutdown_rx)
         }
     };
+    let (agent_scheduler, agent_scheduler_wake_rx) = AgentScheduler::new();
     let state = AppState {
         config: Arc::new(Mutex::new(loaded_config.config)),
         config_file: loaded_config.paths.config_file,
@@ -502,11 +508,16 @@ async fn run_server_until_shutdown(
         hook_runtime,
         question_registry: QuestionRegistry::default(),
         active_chat_runs: ActiveChatRunRegistry::default(),
+        agent_scheduler: agent_scheduler.clone(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         _code_graph_watchers: code_graph_watchers.clone(),
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
     };
+    let agent_scheduler_task = agent_scheduler.spawn(state.clone(), agent_scheduler_wake_rx);
+    agent_scheduler
+        .wake()
+        .map_err(|error| std::io::Error::other(error.message))?;
     let app = app_router(state);
     let listener = TcpListener::bind(addr).await?;
     let _code_graph_index_thread =
@@ -514,7 +525,7 @@ async fn run_server_until_shutdown(
 
     tracing::info!(%addr, "starting local HTTP server");
     println!("Foco is running at http://{addr}");
-    axum::serve(
+    let server_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
@@ -524,7 +535,12 @@ async fn run_server_until_shutdown(
         terminal_shutdown_tx,
         mcp_registry,
     ))
-    .await?;
+    .await;
+    if server_result.is_err() {
+        agent_scheduler_task.abort();
+    }
+    let _ = agent_scheduler_task.await;
+    server_result?;
 
     Ok(())
 }
@@ -718,6 +734,22 @@ fn app_router(state: AppState) -> Router {
             post(crate::http::settings::refresh_skills),
         )
         .route("/api/ai-statistics", get(crate::http::chat::ai_statistics))
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/agent-team/enable",
+            post(crate::http::agents::enable_agent_team),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/agent-team",
+            get(crate::http::agents::agent_team_snapshot),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/chats/{chat_id}/agent-team/action",
+            post(crate::http::agents::agent_runtime_action),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/agent-tasks/{task_id}/action",
+            post(crate::http::agents::agent_task_action),
+        )
         .route(
             "/api/workspaces/{workspace_id}/chat/queue",
             post(crate::http::chat::queue_chat_message)
@@ -1641,6 +1673,8 @@ struct QueueChatMessageResponse {
     user_message_id: String,
     content: String,
     parts: Vec<ChatMessagePart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_task_id: Option<foco_agent::AgentTaskId>,
 }
 
 #[derive(Deserialize)]
@@ -2766,6 +2800,10 @@ struct PreparedChatContext {
     llm_request_id: String,
     assistant_sequence: i64,
     agent_associations: AgentRunAssociations,
+    agent_definition_snapshot: Option<Value>,
+    agent_task_input: Option<Value>,
+    agent_allowed_tools: Option<HashSet<String>>,
+    session_upload_paths: Option<Vec<String>>,
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
     mcp_registry: Arc<McpRegistry>,
@@ -3138,10 +3176,24 @@ async fn run_chat_context_in_background(
     chat_context: PreparedChatContext,
     mut active_run_registration: ActiveChatRunRegistration,
     guidance_rx: mpsc::UnboundedReceiver<GuidanceMessage>,
-) {
+) -> AgentRunOutcome {
     let workspace_path = chat_context.workspace_path.clone();
     let chat_id = chat_context.chat_id.clone();
+    let session_upload_paths = chat_context.session_upload_paths.clone();
     let cancellation = active_run_registration.cancellation().clone();
+    let definition_snapshot = chat_context
+        .agent_definition_snapshot
+        .clone()
+        .unwrap_or_else(|| {
+            json!({
+                "providerId": &chat_context.provider_id,
+                "modelId": &chat_context.model_id,
+                "thinkingLevel": &chat_context.provider_request.thinking_level,
+                "maxOutputTokens": chat_context.provider_request.max_output_tokens,
+                "allowedTools": chat_context.provider_request.tools.iter().map(|tool| &tool.name).collect::<Vec<_>>(),
+            })
+        });
+    let current_task = chat_context.agent_task_input.clone();
     let run_context = AgentRunContext {
         chat_id: chat_context.chat_id.clone(),
         workspace_id: chat_context.workspace_id.clone(),
@@ -3149,18 +3201,12 @@ async fn run_chat_context_in_background(
         provider_id: chat_context.provider_id.clone(),
         model_id: chat_context.model_id.clone(),
         associations: chat_context.agent_associations.clone(),
-        definition_snapshot: json!({
-            "providerId": &chat_context.provider_id,
-            "modelId": &chat_context.model_id,
-            "thinkingLevel": &chat_context.provider_request.thinking_level,
-            "maxOutputTokens": chat_context.provider_request.max_output_tokens,
-            "allowedTools": chat_context.provider_request.tools.iter().map(|tool| &tool.name).collect::<Vec<_>>(),
-        }),
+        definition_snapshot,
         cancellation: cancellation.agent_token(),
     };
     let run_input = AgentRunInput {
         messages: chat_context.provider_request.messages.clone(),
-        current_task: None,
+        current_task,
         unread_messages: Vec::new(),
         recovery: None,
     };
@@ -3170,7 +3216,7 @@ async fn run_chat_context_in_background(
         guidance_rx,
     };
     let mut delivery_error = None;
-    let _outcome = AgentRunExecutor
+    let outcome = AgentRunExecutor
         .execute(
             run_context,
             run_input,
@@ -3198,13 +3244,18 @@ async fn run_chat_context_in_background(
     }
 
     active_run_registration.finish();
-    if let Err(error) = cleanup_chat_session_uploads(&workspace_path, &chat_id) {
+    let cleanup_result = match session_upload_paths {
+        Some(paths) => cleanup_chat_session_upload_files(&workspace_path, &chat_id, &paths),
+        None => cleanup_chat_session_uploads(&workspace_path, &chat_id),
+    };
+    if let Err(error) = cleanup_result {
         tracing::warn!(
             error = %error.message,
             chat_id = %chat_id,
             "failed to clean up chat session uploads"
         );
     }
+    outcome
 }
 
 struct FocoAgentRunTask {
@@ -4423,6 +4474,49 @@ impl PreparedChatContext {
                                 return;
                             }
 
+                            if let Some(disallowed_tool) = self
+                                .agent_allowed_tools
+                                .as_ref()
+                                .and_then(|allowed_tools| {
+                                    tool_calls.iter().find(|tool_call| {
+                                        !allowed_tools.contains(&tool_call.name)
+                                    })
+                                })
+                            {
+                                let message = format!(
+                                    "Agent definition does not allow tool '{}'",
+                                    disallowed_tool.name
+                                );
+                                let event = ChatSseEvent::Error {
+                                    message: message.clone(),
+                                };
+                                events.push(captured_event(&event));
+                                let outcome = failed_chat_audit_outcome(
+                                    &self,
+                                    started_at,
+                                    &mut events,
+                                    &message,
+                                    None,
+                                )
+                                .await;
+                                if let Err(persist_error) = persist_chat_result(
+                                    &self,
+                                    &request_started_at,
+                                    outcome,
+                                    &events,
+                                    None,
+                                    None,
+                                    &executed_tool_calls,
+                                ) {
+                                    yield ChatSseEvent::Error {
+                                        message: persist_error.message,
+                                    };
+                                } else {
+                                    yield event;
+                                }
+                                return;
+                            }
+
                             let pending_tool_calls = pending_tool_calls(&tool_calls);
                             let execution_plan = match plan_tool_execution(&pending_tool_calls) {
                                 Ok(plan) => plan,
@@ -5108,6 +5202,10 @@ async fn prepare_chat_context(
         llm_request_id,
         assistant_sequence,
         agent_associations: AgentRunAssociations::default(),
+        agent_definition_snapshot: None,
+        agent_task_input: None,
+        agent_allowed_tools: None,
+        session_upload_paths: None,
         provider_config: prompt_context.provider_config,
         provider_request,
         mcp_registry: state.mcp_registry.clone(),
@@ -6557,7 +6655,10 @@ impl ApiError {
         error: foco_store::workspace::WorkspaceDatabaseError,
     ) -> Self {
         match error {
-            foco_store::workspace::WorkspaceDatabaseError::InvalidTodoGraph { .. }
+            foco_store::workspace::WorkspaceDatabaseError::AgentDomain { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::AgentRuntimeJson { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::InvalidAgentRuntimeData { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::InvalidTodoGraph { .. }
             | foco_store::workspace::WorkspaceDatabaseError::MissingTodoGraph { .. } => {
                 Self::bad_request(error.to_string())
             }
@@ -9157,7 +9258,12 @@ fn write_session_attachment_file(
             "failed to create chat session upload directory: {source}"
         ))
     })?;
-    let file_name = session_attachment_file_name(index, attachment_id, name)?;
+    let file_name = format!(
+        "{}{}{}",
+        unique_id("upload"),
+        TEMP_ATTACHMENT_FILENAME_SEPARATOR,
+        session_attachment_file_name(index, attachment_id, name)?
+    );
     let file_path = session_dir.join(file_name);
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -9237,6 +9343,46 @@ fn cleanup_chat_session_uploads(workspace_path: &Path, chat_id: &str) -> Result<
             "failed to remove chat session upload directory: {source}"
         ))),
     }
+}
+
+fn cleanup_chat_session_upload_files(
+    workspace_path: &Path,
+    chat_id: &str,
+    paths: &[String],
+) -> Result<(), ApiError> {
+    let session_dir = chat_session_upload_dir(workspace_path, chat_id)?;
+    for path in paths {
+        let path = PathBuf::from(path);
+        if path.parent() != Some(session_dir.as_path()) {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ApiError::internal(format!(
+                    "failed to remove chat run attachment: {source}"
+                )));
+            }
+        }
+    }
+    if session_dir.is_dir()
+        && fs::read_dir(&session_dir)
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to inspect chat session upload directory: {source}"
+                ))
+            })?
+            .next()
+            .is_none()
+    {
+        fs::remove_dir(&session_dir).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to remove empty chat session upload directory: {source}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_stored_chat_attachments(attachments: &[NeutralChatAttachment]) -> Result<(), ApiError> {

@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod assets;
 pub mod auth;
 pub mod chat;

@@ -184,6 +184,10 @@ fn test_prepared_chat_context(
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
         agent_associations: AgentRunAssociations::default(),
+        agent_definition_snapshot: None,
+        agent_task_input: None,
+        agent_allowed_tools: None,
+        session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
             base_url: None,
@@ -3097,6 +3101,279 @@ fn workspace_logo_file_rejects_extension_type_mismatch() {
 }
 
 #[test]
+fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_queue() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-reconcile-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let team_id = foco_agent::AgentTeamId::new("agent-team-reconcile").expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new("agent-instance-reconcile").expect("instance id");
+    let active_task = foco_agent::AgentTaskId::new("agent-task-reconcile-active").expect("task id");
+    let queued_task = foco_agent::AgentTaskId::new("agent-task-reconcile-queued").expect("task id");
+    let attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-reconcile").expect("attempt id");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+        database
+            .insert_chat("chat-reconcile", "Reconcile")
+            .expect("chat insert");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-reconcile").expect("definition id"),
+            revision: 1,
+            name: "Reconcile coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Be precise.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-reconcile",
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                max_concurrent_runs: 1,
+            })
+            .expect("team create");
+        for task_id in [&active_task, &queued_task] {
+            database
+                .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                    id: task_id,
+                    team_id: &team_id,
+                    owner_instance_id: &instance_id,
+                    origin_instance_id: None,
+                    parent_task_id: None,
+                    input_json: "{}",
+                })
+                .expect("enqueue");
+        }
+        database
+            .claim_runnable_agent_task(&team_id, &active_task, &attempt_id)
+            .expect("claim")
+            .expect("claimed");
+    }
+
+    let state = test_app_state(config, workspace_dir.clone());
+    reconcile_agent_runtime(&state).expect("reconcile");
+    let database = WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+    assert_eq!(
+        database
+            .agent_task(&active_task)
+            .expect("active task")
+            .expect("active task")
+            .status,
+        foco_agent::AgentTaskStatus::Interrupted
+    );
+    assert_eq!(
+        database
+            .agent_task(&queued_task)
+            .expect("queued task")
+            .expect("queued task")
+            .status,
+        foco_agent::AgentTaskStatus::Queued
+    );
+    assert_eq!(
+        database
+            .agent_instance(&instance_id)
+            .expect("instance")
+            .expect("instance")
+            .status,
+        foco_agent::AgentInstanceStatus::Paused
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&active_task)
+            .expect("attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Interrupted
+    );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn agent_scheduler_exits_when_app_shutdown_channel_closes() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-shutdown-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let state = test_app_state(
+        prompt_test_config(workspace_dir.clone()),
+        workspace_dir.clone(),
+    );
+    let (scheduler, wake_rx) = AgentScheduler::new();
+    let task = scheduler.spawn(state, wake_rx);
+    timeout(Duration::from_secs(1), task)
+        .await
+        .expect("scheduler shutdown timeout")
+        .expect("scheduler task");
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-team-api-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut config = prompt_test_config(workspace_dir.clone());
+    let definition_id =
+        AgentDefinitionId::new("agent-definition-api-coordinator").expect("definition id");
+    config.agent_definitions.push(AgentDefinitionSettings {
+        id: definition_id.clone(),
+        revision: 1,
+        name: "API coordinator".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Coordinate.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        permissions: AgentPermissions::default(),
+    });
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    database
+        .insert_chat("chat-agent-api", "Agent API")
+        .expect("chat insert");
+    drop(database);
+
+    let mut state = test_app_state(config, workspace_dir.clone());
+    let (scheduler, mut scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = scheduler;
+    let _response = crate::http::agents::enable_agent_team(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), "chat-agent-api".to_string())),
+        Json(foco_agent::TeamActivationRequest {
+            coordinator_definition_id: definition_id,
+        }),
+    )
+    .await
+    .expect("enable team");
+    assert_eq!(scheduler_rx.recv().await, Some(()));
+
+    let queued = crate::http::chat::queue_chat_message(
+        State(state.clone()),
+        AxumPath(workspace_id.clone()),
+        Json(QueueChatMessageRequest {
+            chat_id: Some("chat-agent-api".to_string()),
+            model_id: "client-selection-is-ignored".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: "First Coordinator task".to_string(),
+            attachments: Vec::new(),
+        }),
+    )
+    .await
+    .expect("queue Coordinator task")
+    .0;
+    let task_id = queued.agent_task_id.expect("Agent task id");
+    assert_eq!(scheduler_rx.recv().await, Some(()));
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Queued
+    );
+    drop(database);
+    let cancel_request =
+        serde_json::from_value(json!({ "action": "cancel" })).expect("task action request");
+    let _response = crate::http::agents::agent_task_action(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), task_id.to_string())),
+        Json(cancel_request),
+    )
+    .await
+    .expect("cancel queued Coordinator task");
+    assert_eq!(scheduler_rx.recv().await, Some(()));
+
+    for (action, expected) in [
+        ("pause", foco_agent::AgentTeamStatus::Paused),
+        ("resume", foco_agent::AgentTeamStatus::Active),
+        ("stop", foco_agent::AgentTeamStatus::Stopped),
+    ] {
+        let request = serde_json::from_value(json!({
+            "scope": "team",
+            "action": action,
+        }))
+        .expect("runtime action request");
+        let _response = crate::http::agents::agent_runtime_action(
+            State(state.clone()),
+            AxumPath((workspace_id.clone(), "chat-agent-api".to_string())),
+            Json(request),
+        )
+        .await
+        .expect("team action");
+        let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        assert_eq!(
+            database
+                .agent_team_for_chat("chat-agent-api")
+                .expect("team")
+                .expect("team")
+                .status,
+            expected
+        );
+        let _ = scheduler_rx.try_recv();
+    }
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn queued_team_runs_cleanup_only_their_own_uploaded_attachments() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-upload-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let first = write_session_attachment_file(
+        &workspace_dir,
+        "chat-agent-upload",
+        0,
+        "attachment",
+        "note.txt",
+        "aGVsbG8=",
+        5,
+    )
+    .expect("first upload");
+    let second = write_session_attachment_file(
+        &workspace_dir,
+        "chat-agent-upload",
+        0,
+        "attachment",
+        "note.txt",
+        "aGVsbG8=",
+        5,
+    )
+    .expect("second upload");
+    assert_ne!(first, second);
+    cleanup_chat_session_upload_files(
+        &workspace_dir,
+        "chat-agent-upload",
+        std::slice::from_ref(&first),
+    )
+    .expect("cleanup first upload");
+    assert!(!Path::new(&first).exists());
+    assert!(Path::new(&second).is_file());
+    cleanup_chat_session_upload_files(
+        &workspace_dir,
+        "chat-agent-upload",
+        std::slice::from_ref(&second),
+    )
+    .expect("cleanup second upload");
+    assert!(
+        !chat_session_upload_dir(&workspace_dir, "chat-agent-upload")
+            .expect("session dir")
+            .exists()
+    );
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn persist_chat_result_writes_audit_status_code() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-audit-status-code-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -3177,6 +3454,10 @@ fn persist_chat_result_writes_audit_status_code() {
             task_id: Some(task_id.clone()),
             attempt_id: Some(attempt_id.clone()),
         },
+        agent_definition_snapshot: None,
+        agent_task_input: None,
+        agent_allowed_tools: None,
+        session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
             base_url: None,
@@ -3347,6 +3628,10 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         llm_request_id: "run-1".to_string(),
         assistant_sequence: 1,
         agent_associations: AgentRunAssociations::default(),
+        agent_definition_snapshot: None,
+        agent_task_input: None,
+        agent_allowed_tools: None,
+        session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
             base_url: None,
@@ -3594,6 +3879,10 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
         agent_associations: AgentRunAssociations::default(),
+        agent_definition_snapshot: None,
+        agent_task_input: None,
+        agent_allowed_tools: None,
+        session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
             base_url: None,
@@ -7438,6 +7727,7 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
     let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
     let mcp_registry = Arc::new(McpRegistry::default());
     let foco_root_dir = user_profile_dir.join(".foco");
+    let (agent_scheduler, _agent_scheduler_rx) = AgentScheduler::new();
 
     AppState {
         config: Arc::new(Mutex::new(config)),
@@ -7458,6 +7748,7 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         mcp_registry,
         question_registry: QuestionRegistry::default(),
         active_chat_runs: ActiveChatRunRegistry::default(),
+        agent_scheduler,
         tool_resource_locks: ToolResourceLockRegistry::default(),
         _code_graph_watchers: Arc::new(Mutex::new(Vec::new())),
     }

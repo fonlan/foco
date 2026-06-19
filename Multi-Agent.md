@@ -372,67 +372,78 @@
 
 ## 阶段 4：单实例持久调度垂直切片
 
+**阶段状态：已完成（2026-06-19）**
+
 ### 目标
 
 完成一个显式启用的 AgentTeam、一个 Coordinator、一个 FIFO 队列和一个持久 Scheduler 的端到端路径。
 
 ### 4.1 Team 生命周期
 
-- [ ] 增加为 chat 启用 AgentTeam 的服务与 API，要求指定 Coordinator AgentDefinition ID。
-- [ ] 在一个事务中创建 team、Coordinator instance 和无敏感信息的配置快照。
-- [ ] 增加读取 team/instance/task snapshot 的 API。
-- [ ] 增加 pause、resume、drain、stop Team/Instance 的明确操作。
-- [ ] 阻止在存在 active/queued task 时直接删除实例或关闭 team。
-- [ ] Team 模式启用后，用户消息写入 chat 后创建 Coordinator task，而不是直接启动模型调用。
+- [x] 增加为 chat 启用 AgentTeam 的服务与 API，要求指定 Coordinator AgentDefinition ID。
+- [x] 在一个事务中创建 team、Coordinator instance 和无敏感信息的配置快照。
+- [x] 增加读取 team/instance/task snapshot 的 API。
+- [x] 增加 pause、resume、drain、stop Team/Instance 的明确操作。
+- [x] 阻止在存在 active/queued task 时直接删除实例或关闭 team。
+- [x] Team 模式启用后，用户消息写入 chat 后创建 Coordinator task，而不是直接启动模型调用。
 
 ### 4.2 Scheduler 基础
 
-- [ ] 实现全局 AgentScheduler 生命周期并随后端启动和优雅关闭。
-- [ ] 使用 bounded `tokio::sync::mpsc` 发送无 payload 或可合并的全局 wake 信号。
-- [ ] Scheduler 启动时扫描全部 workspace 中的 runnable task。
-- [ ] 每次入队、完成、取消、恢复和实例 resume 后触发 scheduler wake。
-- [ ] Scheduler 查询 SQLite 领取任务，而不是把任务 payload 放进 Channel。
-- [ ] 使用全局 Semaphore 限制同时运行的 AgentRun 数量。
-- [ ] 使用结构化并发跟踪活跃 attempt，后端关闭时显式 cancel/drain。
+- [x] 实现全局 AgentScheduler 生命周期并随后端启动和优雅关闭。
+- [x] 使用 bounded `tokio::sync::mpsc` 发送无 payload 或可合并的全局 wake 信号。
+- [x] Scheduler 启动时扫描全部 workspace 中的 runnable task。
+- [x] 每次入队、完成、取消、恢复和实例 resume 后触发 scheduler wake。
+- [x] Scheduler 查询 SQLite 领取任务，而不是把任务 payload 放进 Channel。
+- [x] 使用全局 Semaphore 限制同时运行的 AgentRun 数量。
+- [x] 使用结构化并发跟踪活跃 attempt，后端关闭时显式 cancel/drain。
 
 ### 4.3 Coordinator 执行
 
-- [ ] Scheduler 为 Coordinator task 创建 AgentAttempt。
-- [ ] 构建 AgentRunContext 并调用 AgentRunExecutor。
-- [ ] 将 Coordinator 文本和工具事件按现有顺序流向主聊天 SSE。
-- [ ] 成功时完成 task/attempt，并将最终 assistant output 写入主聊天历史。
-- [ ] 失败或取消时同步更新 task、attempt、instance 和 team event。
-- [ ] 当前任务结束后自动唤醒 Scheduler 领取同实例下一个 queued task。
+- [x] Scheduler 为 Coordinator task 创建 AgentAttempt。
+- [x] 构建 AgentRunContext 并调用 AgentRunExecutor。
+- [x] 将 Coordinator 文本和工具事件按现有顺序流向主聊天 SSE。
+- [x] 成功时完成 task/attempt，并将最终 assistant output 写入主聊天历史。
+- [x] 失败或取消时同步更新 task、attempt、instance 和 team event。
+- [x] 当前任务结束后自动唤醒 Scheduler 领取同实例下一个 queued task。
 
 ### 4.4 FIFO 与背压
 
-- [ ] 使用持久 sequence 保证单实例严格 FIFO。
-- [ ] 为每个 team、instance 和 chat 设置明确的最大 queued task 数。
-- [ ] 队列满时拒绝新任务并返回明确错误，不覆盖或丢弃旧任务。
-- [ ] 证明 Coordinator running 时提交的新用户消息只入队，不并行启动第二个 Coordinator run。
+- [x] 使用持久 sequence 保证单实例严格 FIFO。
+- [x] 为每个 team、instance 和 chat 设置明确的最大 queued task 数。
+- [x] 队列满时拒绝新任务并返回明确错误，不覆盖或丢弃旧任务。
+- [x] 证明 Coordinator running 时提交的新用户消息只入队，不并行启动第二个 Coordinator run。
 
 ### 4.5 重启与中断
 
-- [ ] 后端启动 reconciliation 将遗留 running attempt 标记为 interrupted。
-- [ ] 对应 task 进入 interrupted，而不是自动重新入队。
-- [ ] instance 从 running/waiting 恢复到可解释的 paused/failed 状态。
-- [ ] 提供显式 retry API：保留 task ID，创建新 attempt，并记录 retry event。
-- [ ] retry 前重新校验实例、定义快照和 workspace 是否仍有效。
+- [x] 后端启动 reconciliation 将遗留 running attempt 标记为 interrupted。
+- [x] 对应 task 进入 interrupted，而不是自动重新入队。
+- [x] instance 从 running/waiting 恢复到可解释的 paused/failed 状态。
+- [x] 提供显式 retry API：保留 task ID，创建新 attempt，并记录 retry event。
+- [x] retry 前重新校验实例、定义快照和 workspace 是否仍有效。
 
 ### 4.6 测试
 
-- [ ] 覆盖单 Coordinator 多任务 FIFO。
-- [ ] 覆盖并发 wake 信号不会重复执行任务。
-- [ ] 覆盖 Channel 满时 SQLite 任务仍被后续扫描执行。
-- [ ] 覆盖全局并发许可和优雅关闭。
-- [ ] 覆盖进程重启后的 interrupted 与显式 retry。
-- [ ] 覆盖 single-agent chat 与 team-agent chat 可以同时运行且互不污染。
+- [x] 覆盖单 Coordinator 多任务 FIFO。
+- [x] 覆盖并发 wake 信号不会重复执行任务。
+- [x] 覆盖 Channel 满时 SQLite 任务仍被后续扫描执行。
+- [x] 覆盖全局并发许可和优雅关闭。
+- [x] 覆盖进程重启后的 interrupted 与显式 retry。
+- [x] 覆盖 single-agent chat 与 team-agent chat 可以同时运行且互不污染。
 
 ### 阶段 4 退出条件
 
-- [ ] 用户可以显式启用一个只有 Coordinator 的 Team 并连续发送多条任务。
-- [ ] 后端重启后不丢失 queued task，也不会静默重放 active task。
-- [ ] single-agent 和 team-agent 共享 AgentRunExecutor，但各自入口行为明确。
+- [x] 用户可以显式启用一个只有 Coordinator 的 Team 并连续发送多条任务。
+- [x] 后端重启后不丢失 queued task，也不会静默重放 active task。
+- [x] single-agent 和 team-agent 共享 AgentRunExecutor，但各自入口行为明确。
+
+### Phase 4 实现记录
+
+- `app/runtime/agent_scheduler.rs` 提供随后端启动的全局持久 Scheduler：容量 1 的可合并 wake channel 只传唤醒信号，任务始终从各 workspace SQLite 扫描并事务领取；全局 Semaphore 与 `JoinSet` 分别限制并发和负责优雅收敛。
+- `app/http/agents.rs` 提供 Team 启用、team/instance/task snapshot、Team/Instance 生命周期和 task cancel/retry API；Team 与 Coordinator snapshot 继续由 Phase 2 的单事务 Store API 创建，不保存 Provider 凭据。
+- Team chat 的 queue 入口以 Coordinator snapshot 作为 model/provider 权威，持久化 user message 对应的 Coordinator task；同实例 sequence、队首查询和领取 CAS 保证严格 FIFO，team、instance、chat 的 queued 上限均为 64。
+- Coordinator task 继续通过 `FocoAgentRunTask` 和 `AgentRunExecutor` 运行，以 task ID 复用主聊天 SSE/run-event/assistant 历史路径，并把 team、instance、task、attempt ID 写入 LLM audit；single-agent 入口保持原有直接 ChatRun 行为。
+- 启动 reconciliation 将遗留 running/waiting task 与 attempt 标记为 interrupted、实例置为 paused，保留 queued task；显式 retry 保留 task ID，重新校验 workspace 与定义快照后由下一次领取创建新 attempt。
+- 针对性测试覆盖 Team API、queue/cancel、队列上限、严格 FIFO、竞争领取、wake 合并、重启中断和显式 retry；single-agent AgentRun/SSE 回归与 Agent 关联 audit 测试继续通过。
 
 ---
 
@@ -960,7 +971,7 @@
 - [x] 阶段 0 后评审状态机与 single-agent 兼容策略。
 - [x] 阶段 2 后评审 schema、删除语义、迁移和审计保留。
 - [x] 阶段 3 后评审 AgentRunExecutor 是否真正消除执行循环复制。
-- [ ] 阶段 4 后进行第一次端到端垂直切片演示。
+- [x] 阶段 4 后进行第一次端到端垂直切片演示。
 - [ ] 阶段 7 后专项评审等待恢复、Provider tool protocol 和死锁检测。
 - [ ] 阶段 9 后专项评审 command/MCP 副作用与 mutation lease。
 - [ ] 阶段 10 后进行桌面、移动端和 SSE 重连体验评审。

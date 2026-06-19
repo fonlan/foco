@@ -1,13 +1,14 @@
 use std::{
     collections::{BTreeMap, HashSet},
     convert::Infallible,
+    pin::Pin,
     time::Duration,
 };
 
 use axum::{
     Json,
     extract::{Path as AxumPath, Query, State},
-    response::sse::{Event, KeepAlive, Sse},
+    response::sse::{Event, KeepAlive, KeepAliveStream, Sse},
 };
 use foco_store::{
     memory::MemoryDatabase,
@@ -21,16 +22,50 @@ use tokio::sync::mpsc;
 
 use crate::*;
 
+type BoxedChatEventStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<Event, Infallible>> + Send>>;
+type BoxedChatSse = Sse<KeepAliveStream<BoxedChatEventStream>>;
+
 pub(crate) async fn queue_chat_message(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
-    Json(request): Json<QueueChatMessageRequest>,
+    Json(mut request): Json<QueueChatMessageRequest>,
 ) -> Result<Json<QueueChatMessageResponse>, ApiError> {
     let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let existing_team = if let Some(chat_id) = request.chat_id.as_deref() {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .agent_team_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?
+    } else {
+        None
+    };
+    let coordinator = if let Some(team) = existing_team.as_ref() {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        let instance = database
+            .agent_instance(&team.coordinator_instance_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| ApiError::internal("Agent team Coordinator instance was not found"))?;
+        validate_agent_snapshot_for_workspace(&config, workspace, &instance.definition_snapshot)?;
+        request.model_id = instance.definition_snapshot.model_id.clone();
+        request.provider_id = Some(instance.definition_snapshot.provider_id.clone());
+        request.thinking_level = instance
+            .definition_snapshot
+            .model_options
+            .thinking_level
+            .clone();
+        Some(instance)
+    } else {
+        None
+    };
     let requested_model_id = request.model_id.clone();
     let requested_provider_id = request.provider_id.clone();
     let requested_thinking_level = request.thinking_level.clone();
     let requested_skill_ids = request.skill_ids.clone().unwrap_or_default();
+    let task_message = request.message.clone();
     let prompt_context = prepare_prompt_context(
         &state,
         &config,
@@ -45,6 +80,18 @@ pub(crate) async fn queue_chat_message(
         .message
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("message must not be empty"))?;
+    let task_attachments = prompt_context
+        .attachments
+        .iter()
+        .map(|attachment| ChatAttachmentInput {
+            id: attachment.id.clone(),
+            name: attachment.name.clone(),
+            content_type: attachment.content_type.clone(),
+            content_base64: attachment.content_base64.clone(),
+            path: attachment.path.clone(),
+            size_bytes: attachment.size_bytes,
+        })
+        .collect::<Vec<_>>();
     let mut database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let user_message_id = unique_id("msg-user");
@@ -83,6 +130,47 @@ pub(crate) async fn queue_chat_message(
         (chat_id, chat.title)
     };
 
+    let agent_task_id = if let (Some(team), Some(coordinator)) = (&existing_team, &coordinator) {
+        let task_id = foco_agent::AgentTaskId::new(unique_id("agent-task"))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let input_json = serde_json::to_string(&CoordinatorTaskInput {
+            queued_user_message_id: user_message_id.clone(),
+            message: task_message,
+            attachments: task_attachments,
+            skill_ids: requested_skill_ids.clone(),
+        })
+        .map_err(|source| {
+            ApiError::internal(format!("failed to serialize Coordinator task: {source}"))
+        })?;
+        database
+            .enqueue_agent_task_with_limits(
+                foco_store::workspace::NewAgentTask {
+                    id: &task_id,
+                    team_id: &team.id,
+                    owner_instance_id: &coordinator.id,
+                    origin_instance_id: None,
+                    parent_task_id: None,
+                    input_json: &input_json,
+                },
+                AGENT_MAX_QUEUED_TASKS_PER_TEAM,
+                AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+                AGENT_MAX_QUEUED_TASKS_PER_CHAT,
+            )
+            .map_err(ApiError::from_workspace_error)?;
+        insert_agent_event(
+            &mut database,
+            &team.id,
+            "task_queued",
+            Some(&coordinator.id),
+            Some(&task_id),
+            None,
+            serde_json::json!({ "userMessageId": user_message_id }),
+        )?;
+        Some(task_id)
+    } else {
+        None
+    };
+
     database
         .insert_message(NewMessage {
             id: &user_message_id,
@@ -93,6 +181,9 @@ pub(crate) async fn queue_chat_message(
             metadata_json: Some(&user_metadata_json),
         })
         .map_err(ApiError::from_workspace_error)?;
+    if agent_task_id.is_some() {
+        state.agent_scheduler.wake()?;
+    }
     let chat = database
         .chat(&chat_id)
         .map_err(ApiError::from_workspace_error)?
@@ -106,6 +197,7 @@ pub(crate) async fn queue_chat_message(
         user_message_id,
         content: message.to_string(),
         parts: user_message_response_parts(message, &prompt_context.attachments),
+        agent_task_id,
     }))
 }
 
@@ -113,8 +205,32 @@ pub(crate) async fn stream_chat_response(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
     Json(request): Json<ChatStreamRequest>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<BoxedChatSse, ApiError> {
     let config = config_snapshot(&state)?;
+    if let (Some(chat_id), Some(user_message_id)) = (
+        request.chat_id.as_deref(),
+        request.queued_user_message_id.as_deref(),
+    ) {
+        let workspace = workspace_by_id(&config, &workspace_id)?;
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        if let Some(team) = database
+            .agent_team_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?
+        {
+            let task = database
+                .agent_task_for_queued_user_message(&team.id, user_message_id)
+                .map_err(ApiError::from_workspace_error)?
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "Coordinator task was not found for queued user message '{user_message_id}'"
+                    ))
+                })?;
+            drop(database);
+            state.agent_scheduler.wake()?;
+            return team_chat_task_sse(&state, workspace, &task.id).await;
+        }
+    }
     let chat_context = prepare_chat_context(&state, &config, &workspace_id, request).await?;
     let run_id = chat_context.llm_request_id.clone();
     let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
@@ -137,7 +253,64 @@ pub(crate) async fn stream_chat_response(
         guidance_rx,
     ));
 
-    Ok(chat_run_sse(subscription))
+    Ok(boxed_chat_run_sse(subscription))
+}
+
+fn boxed_chat_run_sse(subscription: ActiveChatRunSubscription) -> BoxedChatSse {
+    let stream: BoxedChatEventStream = Box::pin(chat_run_subscription_stream(subscription));
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(10))
+            .text("keep-alive"),
+    )
+}
+
+async fn team_chat_task_sse(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+    task_id: &foco_agent::AgentTaskId,
+) -> Result<BoxedChatSse, ApiError> {
+    for _ in 0..1_000 {
+        if let Ok(subscription) =
+            state
+                .active_chat_runs
+                .subscribe(&workspace.id, task_id.as_str(), Some(-1))
+        {
+            return Ok(boxed_chat_run_sse(subscription));
+        }
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        let task = database
+            .agent_task(task_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("Agent task '{task_id}' was not found"))
+            })?;
+        if task.status != foco_agent::AgentTaskStatus::Queued
+            && task.status != foco_agent::AgentTaskStatus::Running
+        {
+            let events = database
+                .run_events_for_run(task_id.as_str())
+                .map_err(ApiError::from_workspace_error)?;
+            let stream = async_stream::stream! {
+                for event in events {
+                    yield Ok(Event::default().data(event.payload_json));
+                }
+                yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+            };
+            let stream: BoxedChatEventStream = Box::pin(stream);
+            return Ok(Sse::new(stream).keep_alive(
+                KeepAlive::new()
+                    .interval(Duration::from_secs(10))
+                    .text("keep-alive"),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    Err(ApiError::internal(format!(
+        "Coordinator task '{task_id}' did not start within 10 seconds"
+    )))
 }
 
 pub(crate) async fn subscribe_chat_run(

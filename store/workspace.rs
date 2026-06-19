@@ -10,7 +10,7 @@ use chrono::{SecondsFormat, Utc};
 use foco_agent::{
     AgentAttemptId, AgentAttemptStatus, AgentDomainError, AgentEntityKind, AgentInstanceId,
     AgentInstanceStatus, AgentMessageId, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
-    AgentTeamId,
+    AgentTeamId, AgentTeamStatus, TeamWorkload,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -1997,10 +1997,317 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn agent_team_workload(
+        &self,
+        team_id: &AgentTeamId,
+    ) -> Result<TeamWorkload, WorkspaceDatabaseError> {
+        let (queued, running, waiting) = self
+            .connection
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'waiting' THEN 1 ELSE 0 END)
+                 FROM agent_tasks WHERE team_id = ?1",
+                params![team_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                        row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    ))
+                },
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(TeamWorkload {
+            queued_tasks: u32::try_from(queued).map_err(|_| {
+                WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: "queued Agent task count exceeds u32".to_string(),
+                }
+            })?,
+            running_tasks: u32::try_from(running).map_err(|_| {
+                WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: "running Agent task count exceeds u32".to_string(),
+                }
+            })?,
+            waiting_tasks: u32::try_from(waiting).map_err(|_| {
+                WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: "waiting Agent task count exceeds u32".to_string(),
+                }
+            })?,
+        })
+    }
+
+    pub fn transition_agent_team_status(
+        &mut self,
+        team_id: &AgentTeamId,
+        target: AgentTeamStatus,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let current = self.agent_team(team_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent team '{team_id}' was not found"),
+            }
+        })?;
+        current
+            .status
+            .transition_to(target)
+            .map_err(|source| WorkspaceDatabaseError::AgentDomain { source })?;
+        if target == AgentTeamStatus::Stopped {
+            self.agent_team_workload(team_id)?
+                .validate_deactivation()
+                .map_err(|source| WorkspaceDatabaseError::AgentDomain { source })?;
+        }
+
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let updated = transaction
+            .execute(
+                "UPDATE agent_teams SET status = ?2, updated_at = ?3
+                 WHERE id = ?1 AND status = ?4
+                   AND (NOT ?5 OR NOT EXISTS (
+                        SELECT 1 FROM agent_tasks
+                        WHERE team_id = ?1 AND status IN ('queued', 'running', 'waiting')
+                   ))",
+                params![
+                    team_id.as_str(),
+                    target.as_str(),
+                    now,
+                    current.status.as_str(),
+                    target == AgentTeamStatus::Stopped
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent team '{team_id}' changed state or workload during transition"
+                ),
+            });
+        }
+        if updated == 1 {
+            match target {
+                AgentTeamStatus::Active => {
+                    transaction
+                        .execute(
+                            "UPDATE agent_instances SET status = 'idle', updated_at = ?2
+                             WHERE team_id = ?1 AND status IN ('paused', 'failed')",
+                            params![team_id.as_str(), now],
+                        )
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                }
+                AgentTeamStatus::Paused => {
+                    transaction
+                        .execute(
+                            "UPDATE agent_instances SET status = 'paused', updated_at = ?2
+                             WHERE team_id = ?1 AND status = 'idle'",
+                            params![team_id.as_str(), now],
+                        )
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                }
+                AgentTeamStatus::Draining => {
+                    transaction
+                        .execute(
+                            "UPDATE agent_instances SET status = 'draining', updated_at = ?2
+                             WHERE team_id = ?1 AND status IN ('idle', 'paused')",
+                            params![team_id.as_str(), now],
+                        )
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                }
+                AgentTeamStatus::Stopped => {
+                    transaction
+                        .execute(
+                            "UPDATE agent_instances SET status = 'stopped', updated_at = ?2
+                             WHERE team_id = ?1",
+                            params![team_id.as_str(), now],
+                        )
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                }
+                AgentTeamStatus::Failed => {
+                    transaction
+                        .execute(
+                            "UPDATE agent_instances SET status = 'failed', updated_at = ?2
+                             WHERE team_id = ?1 AND status <> 'stopped'",
+                            params![team_id.as_str(), now],
+                        )
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                }
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(updated == 1)
+    }
+
+    pub fn transition_agent_instance_status(
+        &mut self,
+        instance_id: &AgentInstanceId,
+        target: AgentInstanceStatus,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let current = self.agent_instance(instance_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' was not found"),
+            }
+        })?;
+        current
+            .status
+            .transition_to(target)
+            .map_err(|source| WorkspaceDatabaseError::AgentDomain { source })?;
+        if matches!(
+            target,
+            AgentInstanceStatus::Paused
+                | AgentInstanceStatus::Draining
+                | AgentInstanceStatus::Stopped
+        ) {
+            let blocking_statuses = if matches!(
+                target,
+                AgentInstanceStatus::Paused | AgentInstanceStatus::Draining
+            ) {
+                "'running', 'waiting'"
+            } else {
+                "'queued', 'running', 'waiting'"
+            };
+            let active_tasks: i64 = self
+                .connection
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM agent_tasks
+                         WHERE owner_instance_id = ?1 AND status IN ({blocking_statuses})"
+                    ),
+                    params![instance_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            if active_tasks > 0 {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!(
+                        "Agent instance '{instance_id}' has {active_tasks} active or queued task(s)"
+                    ),
+                });
+            }
+        }
+        let requires_empty_queue = target == AgentInstanceStatus::Stopped;
+        let requires_no_running = matches!(
+            target,
+            AgentInstanceStatus::Paused | AgentInstanceStatus::Draining
+        );
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE agent_instances SET status = ?2, updated_at = ?3
+                 WHERE id = ?1 AND status = ?4
+                   AND (NOT ?5 OR NOT EXISTS (
+                        SELECT 1 FROM agent_tasks
+                        WHERE owner_instance_id = ?1
+                          AND status IN ('queued', 'running', 'waiting')
+                   ))
+                   AND (NOT ?6 OR NOT EXISTS (
+                        SELECT 1 FROM agent_tasks
+                        WHERE owner_instance_id = ?1
+                          AND status IN ('running', 'waiting')
+                   ))",
+                params![
+                    instance_id.as_str(),
+                    target.as_str(),
+                    now_timestamp(),
+                    current.status.as_str(),
+                    requires_empty_queue,
+                    requires_no_running
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent instance '{instance_id}' changed state or workload during transition"
+                ),
+            });
+        }
+        Ok(updated == 1)
+    }
+
+    pub fn delete_agent_instance(
+        &mut self,
+        instance_id: &AgentInstanceId,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let instance = self.agent_instance(instance_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' was not found"),
+            }
+        })?;
+        let team = self.agent_team(&instance.team_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent team '{}' was not found", instance.team_id),
+            }
+        })?;
+        if team.coordinator_instance_id == *instance_id {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "the Coordinator instance cannot be deleted while its team exists"
+                    .to_string(),
+            });
+        }
+        let active_tasks: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tasks
+                 WHERE owner_instance_id = ?1 AND status IN ('queued', 'running', 'waiting')",
+                params![instance_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if active_tasks > 0 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent instance '{instance_id}' has {active_tasks} active or queued task(s)"
+                ),
+            });
+        }
+        let deleted = self
+            .connection
+            .execute(
+                "DELETE FROM agent_instances
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                        SELECT 1 FROM agent_tasks
+                        WHERE owner_instance_id = ?1
+                          AND status IN ('queued', 'running', 'waiting')
+                   )",
+                params![instance_id.as_str()],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if deleted != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent instance '{instance_id}' changed state or workload during deletion"
+                ),
+            });
+        }
+        Ok(true)
+    }
+
     pub fn enqueue_agent_task(
         &mut self,
         task: NewAgentTask<'_>,
     ) -> Result<AgentTaskRecord, WorkspaceDatabaseError> {
+        self.enqueue_agent_task_with_limits(task, i64::MAX, i64::MAX, i64::MAX)
+    }
+
+    pub fn enqueue_agent_task_with_limits(
+        &mut self,
+        task: NewAgentTask<'_>,
+        max_team_queued: i64,
+        max_instance_queued: i64,
+        max_chat_queued: i64,
+    ) -> Result<AgentTaskRecord, WorkspaceDatabaseError> {
+        if max_team_queued <= 0 || max_instance_queued <= 0 || max_chat_queued <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Agent queued task limits must be greater than 0".to_string(),
+            });
+        }
         validate_agent_json(task.input_json, "input_json")?;
         let now = now_timestamp();
         let database_path = self.database_path.clone();
@@ -2035,6 +2342,64 @@ impl WorkspaceDatabase {
                 AgentEntityKind::Task,
                 &database_path,
             )?;
+        }
+
+        let (team_status, instance_status) = transaction
+            .query_row(
+                "SELECT team.status, instance.status
+                 FROM agent_teams AS team
+                 JOIN agent_instances AS instance ON instance.team_id = team.id
+                 WHERE team.id = ?1 AND instance.id = ?2",
+                params![task.team_id.as_str(), task.owner_instance_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if team_status != AgentTeamStatus::Active.as_str() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent team '{}' does not accept new tasks while {}",
+                    task.team_id, team_status
+                ),
+            });
+        }
+        if !matches!(instance_status.as_str(), "idle" | "running") {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent instance '{}' does not accept new tasks while {}",
+                    task.owner_instance_id, instance_status
+                ),
+            });
+        }
+        let team_queued: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tasks WHERE team_id = ?1 AND status = 'queued'",
+                params![task.team_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let instance_queued: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tasks
+                 WHERE owner_instance_id = ?1 AND status = 'queued'",
+                params![task.owner_instance_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if team_queued >= max_team_queued || team_queued >= max_chat_queued {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent task queue is full for team/chat '{}' ({} queued)",
+                    task.team_id, team_queued
+                ),
+            });
+        }
+        if instance_queued >= max_instance_queued {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent task queue is full for instance '{}' ({} queued)",
+                    task.owner_instance_id, instance_queued
+                ),
+            });
         }
 
         let sequence: i64 = transaction
@@ -2114,6 +2479,26 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn agent_task_for_queued_user_message(
+        &self,
+        team_id: &AgentTeamId,
+        user_message_id: &str,
+    ) -> Result<Option<AgentTaskRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+                        sequence, status, input_json, result_json, error_json, created_at,
+                        updated_at, started_at, completed_at
+                 FROM agent_tasks
+                 WHERE team_id = ?1
+                   AND json_extract(input_json, '$.queuedUserMessageId') = ?2",
+                params![team_id.as_str(), user_message_id],
+                agent_task_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn runnable_agent_tasks(
         &self,
         limit: i64,
@@ -2133,8 +2518,8 @@ impl WorkspaceDatabase {
                  FROM agent_tasks AS task
                  JOIN agent_instances AS instance ON instance.id = task.owner_instance_id
                  JOIN agent_teams AS team ON team.id = task.team_id
-                 WHERE task.status = 'queued' AND instance.status = 'idle'
-                   AND team.status = 'active'
+                 WHERE task.status = 'queued' AND instance.status IN ('idle', 'draining')
+                   AND team.status IN ('active', 'draining')
                    AND NOT EXISTS (
                         SELECT 1 FROM agent_tasks AS earlier_task
                         WHERE earlier_task.owner_instance_id = task.owner_instance_id
@@ -2200,7 +2585,8 @@ impl WorkspaceDatabase {
                  JOIN agent_instances AS instance ON instance.id = task.owner_instance_id
                  JOIN agent_teams AS team ON team.id = task.team_id
                  WHERE task.id = ?1 AND task.team_id = ?2 AND task.status = 'queued'
-                   AND instance.status = 'idle' AND team.status = 'active'
+                   AND instance.status IN ('idle', 'draining')
+                   AND team.status IN ('active', 'draining')
                    AND NOT EXISTS (
                         SELECT 1 FROM agent_tasks AS earlier_task
                         WHERE earlier_task.owner_instance_id = task.owner_instance_id
@@ -2287,8 +2673,9 @@ impl WorkspaceDatabase {
         let instance_updated = transaction
             .execute(
                 "UPDATE agent_instances
-                 SET status = 'running', last_scheduled_at = ?3, updated_at = ?3
-                 WHERE id = ?1 AND team_id = ?2 AND status = 'idle'",
+                 SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE 'running' END,
+                     last_scheduled_at = ?3, updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2 AND status IN ('idle', 'draining')",
                 params![owner_instance_id, team_id.as_str(), now],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
@@ -2439,8 +2826,13 @@ impl WorkspaceDatabase {
         if let Some(instance_status) = instance_status {
             transaction
                 .execute(
-                    "UPDATE agent_instances SET status = ?3, updated_at = ?4
-                     WHERE id = ?1 AND team_id = ?2",
+                    "UPDATE agent_instances
+                 SET status = CASE
+                         WHEN status = 'draining' AND ?3 = 'idle' THEN 'draining'
+                         ELSE ?3
+                     END,
+                     updated_at = ?4
+                 WHERE id = ?1 AND team_id = ?2",
                     params![
                         owner_instance_id,
                         update.team_id.as_str(),

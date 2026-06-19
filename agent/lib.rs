@@ -194,6 +194,30 @@ impl AgentTeamStatus {
             Self::Failed => "failed",
         }
     }
+
+    pub fn transition_to(self, target: Self) -> Result<Self, AgentDomainError> {
+        let allowed = matches!(
+            (self, target),
+            (
+                Self::Active,
+                Self::Paused | Self::Draining | Self::Stopped | Self::Failed
+            ) | (
+                Self::Paused,
+                Self::Active | Self::Draining | Self::Stopped | Self::Failed
+            ) | (Self::Draining, Self::Stopped | Self::Failed)
+                | (Self::Failed, Self::Active | Self::Stopped)
+        );
+
+        if allowed {
+            Ok(target)
+        } else {
+            Err(AgentDomainError::invalid_state_transition(
+                AgentEntityKind::Team,
+                status_name(self),
+                status_name(target),
+            ))
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

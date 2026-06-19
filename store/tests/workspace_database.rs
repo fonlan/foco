@@ -1,9 +1,9 @@
 use std::{fs, thread, time::Duration};
 
 use foco_agent::{
-    AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentInstanceId, AgentMessageId,
-    AgentMessageKind, AgentPermissions, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
-    AgentTaskWaitMode, AgentTeamId,
+    AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentInstanceId, AgentInstanceStatus,
+    AgentMessageId, AgentMessageKind, AgentPermissions, AgentTaskId, AgentTaskStatus,
+    AgentTaskTransition, AgentTaskWaitMode, AgentTeamId, AgentTeamStatus,
 };
 use foco_store::{
     config::{AgentDefinitionSettings, AgentModelOptions, WorkspaceConfig},
@@ -1942,6 +1942,170 @@ fn two_schedulers_cannot_claim_the_same_agent_task() {
             .expect("reconcile")
             .len(),
         1
+    );
+}
+
+#[test]
+fn agent_queue_limits_and_team_lifecycle_are_enforced() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-lifecycle", "lifecycle");
+    let first_task = AgentTaskId::new("agent-task-lifecycle-first").expect("task id");
+    database
+        .enqueue_agent_task_with_limits(
+            NewAgentTask {
+                id: &first_task,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: r#"{"queuedUserMessageId":"message-first"}"#,
+            },
+            1,
+            1,
+            1,
+        )
+        .expect("first enqueue");
+    let second_task = AgentTaskId::new("agent-task-lifecycle-second").expect("task id");
+    let full_error = database
+        .enqueue_agent_task_with_limits(
+            NewAgentTask {
+                id: &second_task,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: r#"{"queuedUserMessageId":"message-second"}"#,
+            },
+            1,
+            1,
+            1,
+        )
+        .expect_err("queue must reject overflow");
+    assert!(full_error.to_string().contains("queue is full"));
+    assert!(
+        database
+            .transition_agent_team_status(&team_id, AgentTeamStatus::Stopped)
+            .is_err(),
+        "a team with queued work must not stop"
+    );
+    database
+        .transition_agent_team_status(&team_id, AgentTeamStatus::Paused)
+        .expect("pause team");
+    assert_eq!(
+        database
+            .agent_instance(&instance_id)
+            .expect("instance")
+            .expect("instance")
+            .status,
+        AgentInstanceStatus::Paused
+    );
+    database
+        .transition_agent_team_status(&team_id, AgentTeamStatus::Active)
+        .expect("resume team");
+    database
+        .transition_agent_instance_status(&instance_id, AgentInstanceStatus::Draining)
+        .expect("drain queued instance");
+    assert_eq!(
+        database.runnable_agent_tasks(10).expect("draining queue")[0].id,
+        first_task
+    );
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &first_task,
+            expected_status: AgentTaskStatus::Queued,
+            transition: AgentTaskTransition::Cancel,
+            result_json: None,
+            error_json: Some(r#"{"message":"cancelled"}"#),
+            interruption_reason: None,
+        })
+        .expect("cancel queued task");
+    database
+        .transition_agent_team_status(&team_id, AgentTeamStatus::Stopped)
+        .expect("stop idle team");
+}
+
+#[test]
+fn interrupted_queue_head_requires_explicit_retry_and_keeps_fifo() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, instance_id) = create_test_agent_team(&mut database, "chat-agent-retry", "retry");
+    let first_task = AgentTaskId::new("agent-task-retry-first").expect("task id");
+    let second_task = AgentTaskId::new("agent-task-retry-second").expect("task id");
+    for task_id in [&first_task, &second_task] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+    let attempt_id = AgentAttemptId::new("agent-attempt-retry-first").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &first_task, &attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    assert!(
+        database
+            .runnable_agent_tasks(10)
+            .expect("runnable behind active queue head")
+            .is_empty(),
+        "a second Coordinator task must not run beside the active queue head"
+    );
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &first_task,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Interrupt,
+            result_json: None,
+            error_json: Some(r#"{"message":"restart"}"#),
+            interruption_reason: Some("restart"),
+        })
+        .expect("interrupt");
+    database
+        .transition_agent_instance_status(&instance_id, AgentInstanceStatus::Paused)
+        .expect("pause after interruption");
+    assert!(
+        database
+            .runnable_agent_tasks(10)
+            .expect("runnable while paused")
+            .is_empty()
+    );
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &first_task,
+            expected_status: AgentTaskStatus::Interrupted,
+            transition: AgentTaskTransition::Retry,
+            result_json: None,
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("retry");
+    database
+        .transition_agent_instance_status(&instance_id, AgentInstanceStatus::Idle)
+        .expect("resume instance");
+    let runnable = database.runnable_agent_tasks(10).expect("runnable");
+    assert_eq!(runnable.len(), 1);
+    assert_eq!(runnable[0].id, first_task);
+    let retry_attempt = AgentAttemptId::new("agent-attempt-retry-second").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &first_task, &retry_attempt)
+        .expect("retry claim")
+        .expect("retry claimed");
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&first_task)
+            .expect("attempts")
+            .len(),
+        2
     );
 }
 

@@ -1,3 +1,4 @@
+mod agent_scheduler;
 mod questions;
 mod subscriptions;
 mod tool_events;
@@ -5,6 +6,13 @@ mod tool_execution;
 mod tool_locks;
 mod web_tools;
 
+#[cfg(test)]
+pub(crate) use agent_scheduler::reconcile_agent_runtime;
+pub(crate) use agent_scheduler::{
+    AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+    AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, CoordinatorTaskInput, insert_agent_event,
+    validate_agent_snapshot_for_workspace,
+};
 pub(crate) use questions::{
     AskQuestionInput, QuestionAnswer, QuestionAnswerResponse, QuestionItem, QuestionItemAnswer,
     QuestionOption, QuestionRegistry, QuestionRequest,
