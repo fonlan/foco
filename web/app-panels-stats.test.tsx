@@ -441,28 +441,35 @@ describe("app-panels-stats verification surfaces", () => {
 
   it("loads API overview for the active workspace first", async () => {
     const fetchMock = vi.mocked(fetch);
-
-    renderApp();
-
-    expect(await screen.findByText("API overview")).toBeInTheDocument();
-    await waitFor(() =>
-      expect(
-        fetchMock.mock.calls.some((call) => {
+    const aiStatisticsCallUrls = () =>
+      fetchMock.mock.calls
+        .map((call) => {
           const rawPath =
             typeof call[0] === "string"
               ? call[0]
               : call[0] instanceof URL
                 ? call[0].toString()
                 : call[0].url;
-          const url = new URL(rawPath, "http://localhost");
 
-          return (
-            url.pathname === "/api/ai-statistics" &&
-            url.searchParams.get("workspaceId") === workspace.id
-          );
-        }),
+          return new URL(rawPath, "http://localhost");
+        })
+        .filter((url) => url.pathname === "/api/ai-statistics");
+
+    renderApp();
+
+    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        aiStatisticsCallUrls().some(
+          (url) => url.searchParams.get("workspaceId") === workspace.id,
+        ),
       ).toBe(true),
     );
+    expect(
+      aiStatisticsCallUrls().every(
+        (url) => url.searchParams.get("workspaceId") === workspace.id,
+      ),
+    ).toBe(true);
   });
 
   it("shows AI statistics and request details", async () => {

@@ -64,7 +64,7 @@ use foco_store::{
         NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewToolCall,
         NewToolResult, PromptContextInjectionRecord, TodoGraphRecord, TodoGraphTask,
         ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        initialize_workspace_databases, workspace_database_path,
+        WorkspaceDatabaseError, workspace_database_path,
     },
 };
 use foco_tools::{
@@ -440,46 +440,95 @@ async fn run_server_until_shutdown(
     shutdown_rx: Option<watch::Receiver<bool>>,
     #[cfg(all(windows, not(debug_assertions)))] tray_menu_update_notifier: TrayMenuUpdateNotifier,
 ) -> AppResult<()> {
+    let startup_started_at = Instant::now();
+    let load_config_started_at = Instant::now();
     let loaded_config = load_or_create_global_config()?;
+    let logging_started_at = Instant::now();
     logging::init(&loaded_config.paths.logs_dir)?;
-
     tracing::info!(
-        config = %loaded_config.config.to_redacted_log_json()?,
-        "loaded global config"
+        elapsed_ms = logging_started_at.elapsed().as_millis() as u64,
+        "initialized logging"
+    );
+    tracing::info!(
+        elapsed_ms = load_config_started_at.elapsed().as_millis() as u64,
+        workspace_count = loaded_config.config.workspaces.len(),
+        "loaded global config from disk"
     );
 
+    let prepare_config_log_started_at = Instant::now();
+    let redacted_config_json = loaded_config.config.to_redacted_log_json()?;
+    tracing::info!(
+        elapsed_ms = prepare_config_log_started_at.elapsed().as_millis() as u64,
+        bytes = redacted_config_json.len(),
+        "prepared redacted global config log"
+    );
+    let write_config_log_started_at = Instant::now();
+    tracing::info!(
+        config = %redacted_config_json,
+        "loaded global config"
+    );
+    tracing::info!(
+        elapsed_ms = write_config_log_started_at.elapsed().as_millis() as u64,
+        "wrote redacted global config log"
+    );
+
+    let global_memory_started_at = Instant::now();
+    tracing::info!(
+        path = %loaded_config.paths.memory_database_file.display(),
+        "global memory database initialization started"
+    );
     let global_memory_database =
         MemoryDatabase::open_or_create_global_at(&loaded_config.paths.memory_database_file)?;
     tracing::info!(
         path = %global_memory_database.database_path().display(),
+        elapsed_ms = global_memory_started_at.elapsed().as_millis() as u64,
         "initialized global memory database"
     );
     drop(global_memory_database);
 
-    let workspace_databases = initialize_workspace_databases(&loaded_config.config.workspaces)?;
+    let workspace_databases_started_at = Instant::now();
+    let workspace_database_count =
+        initialize_workspace_databases_for_startup(&loaded_config.config.workspaces)?;
     tracing::info!(
-        count = workspace_databases.len(),
+        count = workspace_database_count,
+        elapsed_ms = workspace_databases_started_at.elapsed().as_millis() as u64,
         "initialized workspace databases"
     );
     let mcp_registry = Arc::new(McpRegistry::default());
+    let mcp_sync_started_at = Instant::now();
+    tracing::info!("MCP workspace sync started");
     sync_all_mcp_workspaces(&mcp_registry, &loaded_config.config).await?;
+    tracing::info!(
+        elapsed_ms = mcp_sync_started_at.elapsed().as_millis() as u64,
+        "MCP workspace sync completed"
+    );
     let hook_runtime = HookRuntime::new(mcp_registry.clone());
+    let ripgrep_started_at = Instant::now();
+    tracing::info!("ripgrep detection started");
     let ripgrep_status = detect_ripgrep(&loaded_config.paths.root_dir);
     set_ripgrep_path(ripgrep_status.path.clone());
     if ripgrep_status.available {
         tracing::info!(
             path = ?ripgrep_status.path,
+            elapsed_ms = ripgrep_started_at.elapsed().as_millis() as u64,
             "ripgrep executable is available"
         );
     } else {
         tracing::warn!(
             install_dir = %ripgrep_status.install_dir.display(),
+            elapsed_ms = ripgrep_started_at.elapsed().as_millis() as u64,
             "ripgrep executable was not found"
         );
     }
 
     let addr = local_addr(&loaded_config.config)?;
+    let frontend_assets_started_at = Instant::now();
+    tracing::info!("frontend asset verification started");
     verify_frontend_assets()?;
+    tracing::info!(
+        elapsed_ms = frontend_assets_started_at.elapsed().as_millis() as u64,
+        "frontend asset verification completed"
+    );
     let code_graph_workspaces = loaded_config.config.workspaces.clone();
     let code_graph_watchers = Arc::new(Mutex::new(Vec::new()));
     let (terminal_shutdown_tx, _) = broadcast::channel(16);
@@ -520,11 +569,22 @@ async fn run_server_until_shutdown(
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
     let app = app_router(state);
+    let bind_started_at = Instant::now();
+    tracing::info!(%addr, "HTTP listener bind started");
     let listener = TcpListener::bind(addr).await?;
+    tracing::info!(
+        %addr,
+        elapsed_ms = bind_started_at.elapsed().as_millis() as u64,
+        "HTTP listener bound"
+    );
     let _code_graph_index_thread =
         spawn_code_graph_index_initialization(code_graph_workspaces, code_graph_watchers)?;
 
-    tracing::info!(%addr, "starting local HTTP server");
+    tracing::info!(
+        %addr,
+        elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
+        "starting local HTTP server"
+    );
     println!("Foco is running at http://{addr}");
     let server_result = axum::serve(
         listener,
@@ -544,6 +604,32 @@ async fn run_server_until_shutdown(
     server_result?;
 
     Ok(())
+}
+
+fn initialize_workspace_databases_for_startup(
+    workspaces: &[WorkspaceConfig],
+) -> Result<usize, WorkspaceDatabaseError> {
+    let mut count = 0;
+
+    for workspace in workspaces {
+        let started_at = Instant::now();
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            "workspace database initialization started"
+        );
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)?;
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            database_path = %database.database_path().display(),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "workspace database initialized"
+        );
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 fn app_router(state: AppState) -> Router {
@@ -860,7 +946,24 @@ fn app_router(state: AppState) -> Router {
             auth_state,
             crate::http::auth::require_auth,
         ))
+        .layer(middleware::from_fn(log_http_request))
         .with_state(state)
+}
+
+async fn log_http_request(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let started_at = Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    tracing::info!(%method, %path, "HTTP request started");
+    let response = next.run(request).await;
+    tracing::info!(
+        %method,
+        %path,
+        status = response.status().as_u16(),
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "HTTP request completed"
+    );
+    response
 }
 
 #[cfg(all(windows, not(debug_assertions)))]
@@ -911,7 +1014,19 @@ async fn sync_all_mcp_workspaces(
     config: &GlobalConfig,
 ) -> Result<(), foco_mcp::McpError> {
     for workspace in &config.workspaces {
+        let started_at = Instant::now();
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            "MCP workspace sync item started"
+        );
         sync_mcp_workspace(registry, workspace, config).await?;
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "MCP workspace sync item completed"
+        );
     }
 
     Ok(())
@@ -1085,27 +1200,50 @@ fn initialize_code_graph_indexes(
     workspaces: &[WorkspaceConfig],
     watchers: &Arc<Mutex<Vec<CodeGraphWatcher>>>,
 ) {
+    let all_started_at = Instant::now();
+    tracing::info!(
+        workspace_count = workspaces.len(),
+        "background code graph initialization started"
+    );
     for workspace in workspaces {
+        let started_at = Instant::now();
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            "background code graph workspace initialization started"
+        );
         match initialize_code_graph_workspace(workspace) {
             Ok(watcher) => {
                 watchers
                     .lock()
                     .expect("code graph watcher lock poisoned")
                     .push(watcher);
+                tracing::info!(
+                    workspace_id = %workspace.id,
+                    workspace_path = %workspace.path.display(),
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
+                    "background code graph workspace initialization completed"
+                );
             }
             Err(error) => {
                 tracing::error!(
                     workspace_id = %workspace.id,
                     workspace_path = %workspace.path.display(),
                     error = %error,
+                    elapsed_ms = started_at.elapsed().as_millis() as u64,
                     "failed to initialize code graph index"
                 );
             }
         }
     }
+    tracing::info!(
+        elapsed_ms = all_started_at.elapsed().as_millis() as u64,
+        "background code graph initialization completed"
+    );
 }
 
 fn initialize_code_graph_workspace(workspace: &WorkspaceConfig) -> AppResult<CodeGraphWatcher> {
+    let index_started_at = Instant::now();
     let report = index_workspace(&workspace.path)?;
     tracing::info!(
         workspace_id = %workspace.id,
@@ -1116,12 +1254,15 @@ fn initialize_code_graph_workspace(workspace: &WorkspaceConfig) -> AppResult<Cod
         skipped_files = report.skipped_files,
         deleted_files = report.deleted_files,
         parse_errors = report.parse_errors,
+        elapsed_ms = index_started_at.elapsed().as_millis() as u64,
         "initialized code graph index"
     );
+    let watcher_started_at = Instant::now();
     let watcher = start_code_graph_watcher(&workspace.path)?;
     tracing::info!(
         workspace_id = %workspace.id,
         workspace_path = %workspace.path.display(),
+        elapsed_ms = watcher_started_at.elapsed().as_millis() as u64,
         "started code graph filesystem watcher"
     );
 

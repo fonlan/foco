@@ -7645,7 +7645,7 @@ function ApiOverviewPanel({
   }));
 
   const loadOverview = useCallback(async () => {
-    if (!hasAppliedInitialWorkspace && settings !== null && workspaces.length > 0) {
+    if (settings === null || workspaces.length === 0 || !hasAppliedInitialWorkspace) {
       return;
     }
 

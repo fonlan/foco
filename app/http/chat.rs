@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     convert::Infallible,
     pin::Pin,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -517,9 +517,30 @@ pub(crate) async fn ai_statistics(
     State(state): State<AppState>,
     Query(query): Query<AiStatisticsQuery>,
 ) -> Result<Json<AiStatisticsResponse>, ApiError> {
+    let started_at = Instant::now();
+    tracing::info!("AI statistics request started");
+    let config_started_at = Instant::now();
     let config = config_snapshot(&state)?;
+    tracing::info!(
+        elapsed_ms = config_started_at.elapsed().as_millis() as u64,
+        workspace_count = config.workspaces.len(),
+        "AI statistics config snapshot loaded"
+    );
     let filters = normalized_ai_statistics_query(query)?;
+    let workspace_filter = filters.workspace_id.as_deref().unwrap_or("<all>");
     let workspaces = ai_statistics_workspaces(&config, filters.workspace_id.as_deref())?;
+    tracing::info!(
+        workspace_filter,
+        workspace_count = workspaces.len(),
+        chat_filter = filters.chat_id.as_deref().unwrap_or("<none>"),
+        provider_filter = filters.provider_id.as_deref().unwrap_or("<none>"),
+        model_filter = filters.model_id.as_deref().unwrap_or("<none>"),
+        status_filter = filters.status.as_deref().unwrap_or("<none>"),
+        page = filters.page,
+        page_size = filters.page_size,
+        offset = filters.offset,
+        "AI statistics filters normalized"
+    );
     let mut requests = Vec::new();
     let mut merged_summary: Option<LlmRequestAuditSummaryRow> = None;
     let mut merged_trend: BTreeMap<String, LlmRequestAuditTrendPoint> = BTreeMap::new();
@@ -532,9 +553,38 @@ pub(crate) async fn ai_statistics(
         .ok_or_else(|| ApiError::bad_request("AI statistics page limit is too large"))?;
 
     for workspace in workspaces {
+        let workspace_started_at = Instant::now();
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            "AI statistics workspace scan started"
+        );
+        let database_started_at = Instant::now();
+        tracing::info!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            "AI statistics workspace database open started"
+        );
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
+        tracing::info!(
+            workspace_id = %workspace.id,
+            database_path = %database.database_path().display(),
+            elapsed_ms = database_started_at.elapsed().as_millis() as u64,
+            "AI statistics workspace database opened"
+        );
+        let chat_titles_started_at = Instant::now();
+        tracing::info!(
+            workspace_id = %workspace.id,
+            "AI statistics chat title query started"
+        );
         let chat_titles = chat_title_map(&database)?;
+        tracing::info!(
+            workspace_id = %workspace.id,
+            chat_count = chat_titles.len(),
+            elapsed_ms = chat_titles_started_at.elapsed().as_millis() as u64,
+            "AI statistics chat title query completed"
+        );
         let audit_filters = LlmRequestAuditFilters {
             workspace_id: None,
             chat_id: filters.chat_id.as_deref(),
@@ -547,18 +597,50 @@ pub(crate) async fn ai_statistics(
             offset: Some(0),
         };
 
-        let workspace_count = database
+        let count_started_at = Instant::now();
+        tracing::info!(
+            workspace_id = %workspace.id,
+            "AI statistics audit count query started"
+        );
+        let workspace_request_count = database
             .llm_request_audit_count(audit_filters)
             .map_err(ApiError::from_workspace_error)?;
-        total_count += workspace_count;
-        if workspace_count > 0 {
+        tracing::info!(
+            workspace_id = %workspace.id,
+            request_count = workspace_request_count,
+            elapsed_ms = count_started_at.elapsed().as_millis() as u64,
+            "AI statistics audit count query completed"
+        );
+        total_count += workspace_request_count;
+        if workspace_request_count > 0 {
+            let summary_started_at = Instant::now();
+            tracing::info!(
+                workspace_id = %workspace.id,
+                "AI statistics summary query started"
+            );
             let workspace_summary = database
                 .llm_request_audit_summary(audit_filters)
                 .map_err(ApiError::from_workspace_error)?;
+            tracing::info!(
+                workspace_id = %workspace.id,
+                elapsed_ms = summary_started_at.elapsed().as_millis() as u64,
+                "AI statistics summary query completed"
+            );
             merge_llm_request_audit_summary(&mut merged_summary, &workspace_summary);
+            let trend_started_at = Instant::now();
+            tracing::info!(
+                workspace_id = %workspace.id,
+                "AI statistics trend query started"
+            );
             let trend = database
                 .llm_request_audit_trend_breakdown(audit_filters)
                 .map_err(ApiError::from_workspace_error)?;
+            tracing::info!(
+                workspace_id = %workspace.id,
+                trend_points = trend.len(),
+                elapsed_ms = trend_started_at.elapsed().as_millis() as u64,
+                "AI statistics trend query completed"
+            );
             for point in trend {
                 merged_trend
                     .entry(point.bucket.clone())
@@ -568,9 +650,20 @@ pub(crate) async fn ai_statistics(
                     })
                     .or_insert(point);
             }
+            let model_started_at = Instant::now();
+            tracing::info!(
+                workspace_id = %workspace.id,
+                "AI statistics model breakdown query started"
+            );
             let model_rows = database
                 .llm_request_audit_model_breakdown(audit_filters)
                 .map_err(ApiError::from_workspace_error)?;
+            tracing::info!(
+                workspace_id = %workspace.id,
+                model_count = model_rows.len(),
+                elapsed_ms = model_started_at.elapsed().as_millis() as u64,
+                "AI statistics model breakdown query completed"
+            );
             for row in model_rows {
                 merged_models
                     .entry(row.model_id.clone())
@@ -580,9 +673,20 @@ pub(crate) async fn ai_statistics(
                     })
                     .or_insert(row);
             }
+            let provider_started_at = Instant::now();
+            tracing::info!(
+                workspace_id = %workspace.id,
+                "AI statistics provider breakdown query started"
+            );
             let provider_rows = database
                 .llm_request_audit_provider_breakdown(audit_filters)
                 .map_err(ApiError::from_workspace_error)?;
+            tracing::info!(
+                workspace_id = %workspace.id,
+                provider_count = provider_rows.len(),
+                elapsed_ms = provider_started_at.elapsed().as_millis() as u64,
+                "AI statistics provider breakdown query completed"
+            );
             for row in provider_rows {
                 merged_providers
                     .entry(row.provider_id.clone())
@@ -596,36 +700,72 @@ pub(crate) async fn ai_statistics(
                     .or_insert(row);
             }
         }
+        let rows_started_at = Instant::now();
+        tracing::info!(
+            workspace_id = %workspace.id,
+            limit = page_limit,
+            "AI statistics rows query started"
+        );
         let rows = database
             .llm_request_audit_rows(audit_filters)
             .map_err(ApiError::from_workspace_error)?;
+        tracing::info!(
+            workspace_id = %workspace.id,
+            row_count = rows.len(),
+            elapsed_ms = rows_started_at.elapsed().as_millis() as u64,
+            "AI statistics rows query completed"
+        );
 
         requests.extend(
             rows.into_iter()
                 .map(|row| ai_request_audit_summary(row, workspace, &chat_titles)),
         );
+        tracing::info!(
+            workspace_id = %workspace.id,
+            elapsed_ms = workspace_started_at.elapsed().as_millis() as u64,
+            "AI statistics workspace scan completed"
+        );
     }
 
+    let sort_started_at = Instant::now();
     requests.sort_by(|left, right| {
         right
             .request_started_at
             .cmp(&left.request_started_at)
             .then_with(|| right.id.cmp(&left.id))
     });
+    tracing::info!(
+        request_count = requests.len(),
+        elapsed_ms = sort_started_at.elapsed().as_millis() as u64,
+        "AI statistics request rows sorted"
+    );
     let start = usize::try_from(filters.offset).expect("non-negative offset fits usize");
     let page_size = usize::try_from(filters.page_size).expect("positive page size fits usize");
-    let requests = requests.into_iter().skip(start).take(page_size).collect();
+    let requests: Vec<_> = requests.into_iter().skip(start).take(page_size).collect();
     let total_pages = if total_count == 0 {
         0
     } else {
         (total_count + filters.page_size - 1) / filters.page_size
     };
 
+    let summary_started_at = Instant::now();
     let summary = ai_statistics_summary_from_aggregates(
         merged_summary,
         merged_trend,
         merged_models,
         merged_providers,
+    );
+    tracing::info!(
+        elapsed_ms = summary_started_at.elapsed().as_millis() as u64,
+        total_count,
+        total_pages,
+        "AI statistics response summary built"
+    );
+    tracing::info!(
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        total_count,
+        returned_count = requests.len(),
+        "AI statistics request completed"
     );
 
     Ok(Json(AiStatisticsResponse {

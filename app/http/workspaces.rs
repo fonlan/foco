@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::Instant};
 
 const WORKSPACE_FILE_TREE_MAX_DEPTH: usize = 12;
 const WORKSPACE_FILE_TREE_MAX_NODES: usize = 8_000;
@@ -206,9 +206,23 @@ pub(crate) async fn rename_workspace_file(
 pub(crate) async fn workspaces(
     State(state): State<AppState>,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
+    let started_at = Instant::now();
+    tracing::info!("workspaces API request started");
+    let config_started_at = Instant::now();
     let config = config_snapshot(&state)?;
+    tracing::info!(
+        elapsed_ms = config_started_at.elapsed().as_millis() as u64,
+        workspace_count = config.workspaces.len(),
+        active_workspace_id = %config.app.active_workspace_id,
+        "workspaces API config snapshot loaded"
+    );
 
-    workspace_response_from_config(&config, &state.active_chat_runs)
+    let response = workspace_response_from_config(&config, &state.active_chat_runs)?;
+    tracing::info!(
+        elapsed_ms = started_at.elapsed().as_millis() as u64,
+        "workspaces API request completed"
+    );
+    Ok(response)
 }
 
 pub(crate) async fn add_workspace(
