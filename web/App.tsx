@@ -111,7 +111,6 @@ import type {
   AgentDefinitionInput,
   AgentDefinitionSettings,
   AgentDefinitionsResponse,
-  AgentExecutionWorkspaceMode,
   AgentTeamSnapshotResponse,
   AppLanguageId,
   AppThemeId,
@@ -360,7 +359,6 @@ type AiStatsColumn = {
 };
 
 const LIVE_REASONING_DURATION_REFRESH_MS = 250;
-const AGENT_MAX_INSTANCES_PER_TEAM = 16;
 
 export function App() {
   const [initialBrowserRoute] = useState(() => currentBrowserRoute());
@@ -426,7 +424,6 @@ export function App() {
   const [agentTeamSnapshot, setAgentTeamSnapshot] = useState<AgentTeamSnapshotResponse | null>(null);
   const [isLoadingAgentTeam, setIsLoadingAgentTeam] = useState(false);
   const [agentTeamError, setAgentTeamError] = useState<string | null>(null);
-  const [agentRuntimeOperationKey, setAgentRuntimeOperationKey] = useState<string | null>(null);
   const [nativeBrowserToken, setNativeBrowserToken] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedProviderId, setSelectedProviderId] = useState("");
@@ -1011,150 +1008,6 @@ export function App() {
       setAgentDefinitionsError(errorMessage(requestError));
     } finally {
       setAgentDefinitionOperationKey(null);
-    }
-  }
-
-  async function enableAgentTeam(coordinatorDefinitionId: string) {
-    if (!activeWorkspaceId || !activeChatId) {
-      setAgentTeamError(t("Open a chat to manage its Agent team."));
-      return;
-    }
-
-    setAgentRuntimeOperationKey("agent-team-enable");
-    setAgentTeamError(null);
-
-    try {
-      const data = await requestJson<AgentTeamSnapshotResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/chats/${encodeURIComponent(activeChatId)}/agent-team/enable`,
-        {
-          body: JSON.stringify({ coordinatorDefinitionId }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        },
-      );
-      setAgentTeamSnapshot(data);
-      setContextPanelTab("agents");
-      setIsContextPanelOpen(true);
-    } catch (requestError) {
-      setAgentTeamError(errorMessage(requestError));
-    } finally {
-      setAgentRuntimeOperationKey(null);
-    }
-  }
-
-  async function createAgentInstances(
-    definitionId: string,
-    count: number,
-    executionWorkspaceMode: AgentExecutionWorkspaceMode,
-  ) {
-    if (!activeWorkspaceId || !activeChatId) {
-      setAgentTeamError(t("Open a chat to manage its Agent team."));
-      return;
-    }
-    const definition = agentDefinitions.find((item) => item.id === definitionId);
-    if (!definition) {
-      setAgentTeamError(t("Select an agent definition."));
-      return;
-    }
-
-    setAgentRuntimeOperationKey("agent-instance-create");
-    setAgentTeamError(null);
-
-    try {
-      const data = await requestJson<AgentTeamSnapshotResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/chats/${encodeURIComponent(activeChatId)}/agent-team/instances/create`,
-        {
-          body: JSON.stringify({
-            count,
-            definitionId,
-            executionWorkspaceMode,
-            maxInstancesForDefinition: definition.maxInstances,
-            maxInstancesPerTeam: AGENT_MAX_INSTANCES_PER_TEAM,
-          }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        },
-      );
-      setAgentTeamSnapshot(data);
-    } catch (requestError) {
-      setAgentTeamError(errorMessage(requestError));
-    } finally {
-      setAgentRuntimeOperationKey(null);
-    }
-  }
-
-  async function runAgentRuntimeAction(
-    scope: "instance" | "team",
-    action:
-      | "delete"
-      | "drain"
-      | "pause"
-      | "reset_context"
-      | "resume"
-      | "stop"
-      | "worktree_archive"
-      | "worktree_delete"
-      | "worktree_diff"
-      | "worktree_keep"
-      | "worktree_merge"
-      | "worktree_status",
-    instanceId?: string,
-  ) {
-    if (!activeWorkspaceId || !activeChatId) {
-      setAgentTeamError(t("Open a chat to manage its Agent team."));
-      return;
-    }
-
-    setAgentRuntimeOperationKey(`agent-runtime-${action}`);
-    setAgentTeamError(null);
-
-    try {
-      const data = await requestJson<AgentTeamSnapshotResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/chats/${encodeURIComponent(activeChatId)}/agent-team/action`,
-        {
-          body: JSON.stringify({ action, instanceId: instanceId ?? null, scope }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        },
-      );
-      setAgentTeamSnapshot(data);
-      if (action === "worktree_merge") {
-        await loadGitDiff(activeWorkspaceId, selectedDiffPath);
-      }
-    } catch (requestError) {
-      setAgentTeamError(errorMessage(requestError));
-    } finally {
-      setAgentRuntimeOperationKey(null);
-    }
-  }
-
-  async function runAgentTaskAction(
-    taskId: string,
-    action: "cancel" | "retry" | "transfer",
-    targetInstanceId?: string,
-  ) {
-    if (!activeWorkspaceId) {
-      setAgentTeamError(t("Select a workspace first."));
-      return;
-    }
-
-    setAgentRuntimeOperationKey(`agent-task-${action}`);
-    setAgentTeamError(null);
-
-    try {
-      const data = await requestJson<AgentTeamSnapshotResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/agent-tasks/${encodeURIComponent(taskId)}/action`,
-        {
-          body: JSON.stringify({ action, targetInstanceId: targetInstanceId ?? null }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        },
-      );
-      setAgentTeamSnapshot(data);
-    } catch (requestError) {
-      setAgentTeamError(errorMessage(requestError));
-    } finally {
-      setAgentRuntimeOperationKey(null);
     }
   }
 
@@ -6657,19 +6510,13 @@ export function App() {
                             ? activeChatId
                             : null
                         }
-                        definitions={agentDefinitions}
                         error={agentTeamError}
                         isLoading={isLoadingAgentTeam}
-                        operationKey={agentRuntimeOperationKey}
-                        onCreateInstances={createAgentInstances}
-                        onEnableTeam={enableAgentTeam}
                         onRefresh={async () => {
                           if (activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)) {
                             await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
                           }
                         }}
-                        onRuntimeAction={runAgentRuntimeAction}
-                        onTaskAction={runAgentTaskAction}
                         snapshot={agentTeamSnapshot}
                       />
                     }

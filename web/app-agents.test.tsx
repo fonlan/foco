@@ -66,30 +66,26 @@ describe("app agents verification surfaces", () => {
     expect(screen.queryByText("技能设置")).not.toBeInTheDocument();
   });
 
-  it("opens the Agents panel and enables a Team", async () => {
+  it("opens the Agents panel and shows current chat Agent instances", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
     await userEvent.click(await screen.findByText("Tool run"));
     await userEvent.click(await screen.findByRole("button", { name: "Agents" }));
 
-    expect(await screen.findByText("Team is not enabled")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Enable" }));
-
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledWith(
-        "/api/workspaces/workspace-1/chats/chat-1/agent-team/enable",
-        expect.objectContaining({
-          body: expect.stringContaining("agent-definition-coordinator"),
-          method: "POST",
-        }),
-      );
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => url === "/api/workspaces/workspace-1/chats/chat-1/agent-team",
+        ),
+      ).toBe(true);
     });
-    expect(await screen.findByText("agent-team-1")).toBeInTheDocument();
-    expect(screen.getByText("team_created")).toBeInTheDocument();
-    expect(screen.getByText("Observability")).toBeInTheDocument();
-    expect(screen.getByText("Queue wait")).toBeInTheDocument();
-    expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(await screen.findByText("Current chat agent instances")).toBeInTheDocument();
+    expect(screen.getByText("agent-instance-coordinator")).toBeInTheDocument();
+    expect(screen.getByText("agent-instance-worker")).toBeInTheDocument();
+    expect(screen.getByText("foco/agent-instance-worker")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Enable" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Observability")).not.toBeInTheDocument();
   });
 
   it("queues the first message with Team tools disabled by default from the composer", async () => {

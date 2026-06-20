@@ -359,6 +359,8 @@ export const agentTeamSnapshot = {
         ...agentDefinitions.agentDefinitions[0],
         systemPrompt: undefined,
       },
+      executionRootPath: "C:\\Users\\fonla\\.foco\\workspace",
+      executionWorkspaceMode: "shared",
       id: "agent-instance-coordinator",
       lastScheduledAt: null,
       nextTaskSequence: 2,
@@ -366,6 +368,32 @@ export const agentTeamSnapshot = {
       status: "active",
       teamId: "agent-team-1",
       updatedAt: "2026-06-05T10:00:00Z",
+      worktreeBaseRevision: null,
+      worktreeBranch: null,
+      worktreeStatus: null,
+    },
+    {
+      contextGeneration: 0,
+      createdAt: "2026-06-05T10:00:03Z",
+      definitionId: "agent-definition-worker",
+      definitionRevision: 1,
+      definitionSnapshot: {
+        ...agentDefinitions.agentDefinitions[1],
+        systemPrompt: undefined,
+      },
+      executionRootPath:
+        "C:\\Users\\fonla\\.foco\\workspace\\.foco\\agent-worktrees\\agent-instance-worker",
+      executionWorkspaceMode: "isolated_worktree",
+      id: "agent-instance-worker",
+      lastScheduledAt: null,
+      nextTaskSequence: 1,
+      role: "worker",
+      status: "active",
+      teamId: "agent-team-1",
+      updatedAt: "2026-06-05T10:00:03Z",
+      worktreeBaseRevision: "base-revision",
+      worktreeBranch: "foco/agent-instance-worker",
+      worktreeStatus: "clean",
     },
   ],
   messages: [
@@ -1399,10 +1427,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
-    return jsonResponse(
-      { error: "chat 'chat-1' has no Agent team" },
-      { status: 400 },
-    );
+    return jsonResponse(agentTeamSnapshot);
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team/enable") {
