@@ -3025,6 +3025,7 @@ body,
     width: 2rem;
     min-width: 2rem;
     max-width: 2rem;
+    height: 2rem;
     flex: 0 0 2rem;
   }
 
@@ -3034,6 +3035,7 @@ body,
     width: 2rem;
     min-width: 2rem;
     max-width: 2rem;
+    height: 2rem;
     flex: 0 0 2rem;
     padding-inline: 0;
     justify-content: center;

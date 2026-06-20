@@ -1062,7 +1062,7 @@ function ComposerSelectMenu({
       <summary
         aria-disabled={disabled}
         aria-label={ariaLabel}
-        className={`composer-select-summary flex h-8 w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
+        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
           }`}
         title={selectedLabel}
       >
@@ -1123,7 +1123,7 @@ function BranchSelector({
     return (
       <div
         aria-label={t("Git branch")}
-        className="composer-branch-select inline-flex h-8 max-w-full items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-400"
+        className="composer-branch-select inline-flex h-[1.875rem] max-w-full items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-400"
       >
         <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
         <span className="composer-select-label min-w-0 flex-1 truncate" />
@@ -1138,11 +1138,11 @@ function BranchSelector({
 
   return (
     <details
-      className="composer-branch-select group relative max-w-full"
+      className="composer-branch-select group relative max-w-full rounded-lg"
       ref={detailsRef}
     >
       <summary
-        className={`composer-select-summary flex h-8 w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
+        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
           }`}
         title={t("Git branch")}
       >
