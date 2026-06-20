@@ -615,7 +615,6 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No prompt files": "暂无提示词文件",
     "Extra prompt": "额外提示词",
     "Save prompt settings": "保存提示词设置",
-    "Reload prompt settings": "重新加载提示词设置",
     "Reload settings": "重新加载设置",
     Reload: "重新加载",
     "Saved bind": "已保存绑定",
