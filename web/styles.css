@@ -2045,6 +2045,7 @@ body,
 }
 
 .context-panel-tabs {
+  container-type: inline-size;
   display: flex;
   flex: 0 0 auto;
   gap: 0.125rem;
@@ -2074,6 +2075,26 @@ body,
 
 .context-panel-tab-active {
   border-bottom-color: var(--foco-accent);
+}
+
+@container (max-width: 26rem) {
+  .context-panel-tab {
+    width: 2rem;
+    justify-content: center;
+    padding: 0;
+  }
+
+  .context-panel-tab span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    border: 0;
+    white-space: nowrap;
+  }
 }
 
 .context-empty-state {
