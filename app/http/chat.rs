@@ -32,7 +32,7 @@ const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. 
 pub(crate) async fn queue_chat_message(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
-    Json(mut request): Json<QueueChatMessageRequest>,
+    Json(request): Json<QueueChatMessageRequest>,
 ) -> Result<Json<QueueChatMessageResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
@@ -54,13 +54,6 @@ pub(crate) async fn queue_chat_message(
             .map_err(ApiError::from_workspace_error)?
             .ok_or_else(|| ApiError::internal("Agent team Coordinator instance was not found"))?;
         validate_agent_snapshot_for_workspace(&config, workspace, &instance.definition_snapshot)?;
-        request.model_id = instance.definition_snapshot.model_id.clone();
-        request.provider_id = Some(instance.definition_snapshot.provider_id.clone());
-        request.thinking_level = instance
-            .definition_snapshot
-            .model_options
-            .thinking_level
-            .clone();
         Some(instance)
     } else {
         None

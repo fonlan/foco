@@ -6,13 +6,10 @@ mod tools;
 pub(crate) use expiration::{apply_memory_expiration_to_fact, expire_due_memories};
 #[cfg(test)]
 pub(crate) use extraction::{
-    ExtractedMemoryEvidenceReference, ExtractedMemoryFact, ExtractedMemoryRelationCandidate,
-    MemoryExtractionEvidenceCandidate, MemoryExtractionOutput, MemoryExtractionTask,
-    MemoryRetrievalOutput, extraction_provider_for_model, memory_extraction_evidence_candidates,
+    MemoryExtractionEvidenceCandidate, MemoryExtractionTask,
     memory_extraction_existing_memory_candidates, memory_extraction_provider_request,
-    memory_extraction_target_status, parse_memory_extraction_output, run_memory_extraction_job,
-    run_memory_extraction_job_inner, should_queue_memory_extraction, store_extracted_memory_facts,
-    validate_extracted_memory_facts,
+    memory_extraction_target_status, parse_memory_extraction_output,
+    should_queue_memory_extraction, store_extracted_memory_facts, validate_extracted_memory_facts,
 };
 pub(crate) use extraction::{
     MemoryExtractionHandle, call_memory_retrieval_provider,
@@ -29,15 +26,14 @@ pub(crate) use retrieval::{
 };
 #[cfg(test)]
 pub(crate) use retrieval::{
-    RetrievedMemorySource, llm_memory_retrieval_candidates, memory_prompt_search,
-    memory_prompt_search_terms, resolve_prompt_context_memory,
+    llm_memory_retrieval_candidates, memory_prompt_search, memory_prompt_search_terms,
+    resolve_prompt_context_memory,
 };
 pub(crate) use tools::memory_retrieval_tool_definition;
 #[cfg(test)]
 pub(crate) use tools::{
-    MemorySearchMatch, MemorySearchToolInput, MemoryWriteToolInput, collect_memory_search_matches,
-    execute_memory_search_tool, execute_memory_write_tool, memory_extraction_tool_definition,
-    memory_search_fact_matches_scope, memory_tool_timeout_ms_from_input, push_memory_search_match,
+    MemorySearchToolInput, MemoryWriteToolInput, execute_memory_search_tool,
+    execute_memory_write_tool,
 };
 pub(crate) use tools::{
     MemoryToolContext, execute_memory_tool, is_memory_tool_name, memory_tool_definitions,

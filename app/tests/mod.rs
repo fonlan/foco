@@ -3529,6 +3529,22 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-team-api-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let mut config = prompt_test_config(workspace_dir.clone());
+    config.models.push(ModelSettings {
+        id: "client-selection".to_string(),
+        display_name: "Client selection".to_string(),
+        enabled: true,
+        provider_ids: vec!["provider".to_string()],
+        active_provider_id: Some("provider".to_string()),
+        thinking_level: None,
+        system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+        metadata_key: None,
+        metadata_source_url: None,
+        metadata_refreshed_at: None,
+        limits: Some(ModelLimits {
+            context_window: 20_000,
+            max_output_tokens: 1_000,
+        }),
+    });
     let definition_id =
         AgentDefinitionId::new("agent-definition-api-coordinator").expect("definition id");
     config.agent_definitions.push(AgentDefinitionSettings {
@@ -3570,8 +3586,8 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
         AxumPath(workspace_id.clone()),
         Json(QueueChatMessageRequest {
             chat_id: Some("chat-agent-api".to_string()),
-            model_id: "client-selection-is-ignored".to_string(),
-            provider_id: None,
+            model_id: "client-selection".to_string(),
+            provider_id: Some("provider".to_string()),
             thinking_level: None,
             skill_ids: None,
             message: "First Coordinator task".to_string(),
@@ -3590,6 +3606,16 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
     let input = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json)
         .expect("Coordinator task input");
     assert!(!input.collaboration_tools_enabled);
+    let user_message = database
+        .message(&queued.user_message_id)
+        .expect("user message")
+        .expect("user message");
+    let user_metadata =
+        parse_json_value(&user_message.metadata_json, "user metadata").expect("user metadata");
+    assert_eq!(
+        user_metadata["queuedRun"]["modelId"],
+        json!("client-selection")
+    );
     drop(database);
     let cancel_request =
         serde_json::from_value(json!({ "action": "cancel" })).expect("task action request");

@@ -119,7 +119,15 @@ fn agent_delegate_task_definition() -> ToolDefinition {
                 },
                 "input": {
                     "type": "object",
-                    "description": "JSON task input for the child Agent task."
+                    "additionalProperties": false,
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "Task message for the child Agent."
+                        }
+                    },
+                    "required": ["message"],
+                    "description": "Task input for the child Agent."
                 },
                 "correlationId": {
                     "type": ["string", "null"],
@@ -266,6 +274,7 @@ fn agent_create_instances_definition() -> ToolDefinition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn agent_tool_schemas_are_openai_responses_strict_compatible() {
@@ -322,6 +331,56 @@ mod tests {
                     property
                 );
             }
+            assert_strict_schema_children(&definition.name, &definition.input_schema);
+        }
+    }
+
+    fn assert_strict_schema_object(tool_name: &str, schema: &serde_json::Value) {
+        let schema_object = schema.as_object().expect("schema object");
+        if schema_object.get("type").and_then(|value| value.as_str()) == Some("object") {
+            assert_eq!(
+                schema_object.get("additionalProperties"),
+                Some(&serde_json::Value::Bool(false)),
+                "{tool_name} object schema must reject unknown properties"
+            );
+            let properties = schema_object
+                .get("properties")
+                .and_then(|value| value.as_object())
+                .expect("properties object");
+            let required = schema_object
+                .get("required")
+                .and_then(|value| value.as_array())
+                .expect("required array");
+            let property_names = properties
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let required_names = required
+                .iter()
+                .map(|name| name.as_str().expect("required name"))
+                .collect::<BTreeSet<_>>();
+
+            assert_eq!(
+                required_names, property_names,
+                "{tool_name} required keys must match object properties"
+            );
+        }
+    }
+
+    fn assert_strict_schema_children(tool_name: &str, schema: &serde_json::Value) {
+        if schema.get("type").and_then(|value| value.as_str()) == Some("object") {
+            assert_strict_schema_object(tool_name, schema);
+        }
+        if let Some(properties) = schema
+            .as_object()
+            .and_then(|object| object.get("properties"))
+        {
+            for value in properties.as_object().expect("properties object").values() {
+                assert_strict_schema_children(tool_name, value);
+            }
+        }
+        if let Some(items) = schema.get("items") {
+            assert_strict_schema_children(tool_name, items);
         }
     }
 }

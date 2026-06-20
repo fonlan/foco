@@ -65,6 +65,12 @@ pub(crate) struct CoordinatorTaskInput {
     pub(crate) correlation_id: Option<String>,
 }
 
+struct AgentTaskModelSelection {
+    model_id: String,
+    provider_id: Option<String>,
+    thinking_level: Option<String>,
+}
+
 fn default_collaboration_tools_enabled() -> bool {
     true
 }
@@ -364,6 +370,7 @@ async fn run_coordinator_task_inner(
         .iter()
         .filter_map(|attachment| attachment.path.clone())
         .collect::<Vec<_>>();
+    let model_selection = agent_task_model_selection(&database, &team, &instance, &task_input)?;
     drop(database);
 
     let config = config_snapshot(state)?;
@@ -376,13 +383,9 @@ async fn run_coordinator_task_inner(
             chat_id: Some(team.chat_id.clone()),
             queued_user_message_id: Some(task_input.queued_user_message_id.clone()),
             run_id_override: Some(task.id.to_string()),
-            model_id: instance.definition_snapshot.model_id.clone(),
-            provider_id: Some(instance.definition_snapshot.provider_id.clone()),
-            thinking_level: instance
-                .definition_snapshot
-                .model_options
-                .thinking_level
-                .clone(),
+            model_id: model_selection.model_id,
+            provider_id: model_selection.provider_id,
+            thinking_level: model_selection.thinking_level,
             skill_ids: Some(task_input.skill_ids.clone()),
             message: task_input.message.clone(),
             attachments: task_input.attachments.clone(),
@@ -489,6 +492,46 @@ async fn run_coordinator_task_inner(
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;
     persist_agent_task_context(&workspace.path, &task, &instance, attempt_id, &outcome)?;
     finish_claimed_task(&workspace.path, &task, attempt_id, outcome)
+}
+
+fn agent_task_model_selection(
+    database: &WorkspaceDatabase,
+    team: &AgentTeamRecord,
+    instance: &AgentInstanceRecord,
+    task_input: &CoordinatorTaskInput,
+) -> Result<AgentTaskModelSelection, ApiError> {
+    let queued_run = match database
+        .message(&task_input.queued_user_message_id)
+        .map_err(ApiError::from_workspace_error)?
+    {
+        Some(message) if message.chat_id == team.chat_id => {
+            queued_run_summary_from_message_metadata(&message.metadata_json)?
+        }
+        Some(message) => {
+            return Err(ApiError::internal(format!(
+                "Queued user message '{}' belongs to chat '{}' instead of Agent team chat '{}'",
+                task_input.queued_user_message_id, message.chat_id, team.chat_id
+            )));
+        }
+        None => None,
+    };
+
+    Ok(match queued_run {
+        Some(queued_run) => AgentTaskModelSelection {
+            model_id: queued_run.model_id,
+            provider_id: queued_run.provider_id,
+            thinking_level: queued_run.thinking_level,
+        },
+        None => AgentTaskModelSelection {
+            model_id: instance.definition_snapshot.model_id.clone(),
+            provider_id: Some(instance.definition_snapshot.provider_id.clone()),
+            thinking_level: instance
+                .definition_snapshot
+                .model_options
+                .thinking_level
+                .clone(),
+        },
+    })
 }
 
 fn apply_agent_prompt_layers(
@@ -1784,6 +1827,69 @@ mod tests {
             creatable[0]["agentCreateInstancesSchema"]["maxInstancesForDefinition"]["const"],
             json!(3)
         );
+    }
+
+    #[test]
+    fn agent_task_model_selection_uses_queued_user_message_override() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let team_id = foco_agent::AgentTeamId::new("agent-team-model-selection").expect("team id");
+        let coordinator_id = foco_agent::AgentInstanceId::new("agent-instance-model-selection")
+            .expect("instance id");
+        let now = "2026-01-01T00:00:00Z".to_string();
+        let team = AgentTeamRecord {
+            id: team_id.clone(),
+            chat_id: "chat-model-selection".to_string(),
+            coordinator_instance_id: coordinator_id.clone(),
+            status: foco_agent::AgentTeamStatus::Active,
+            max_concurrent_runs: 1,
+            next_event_sequence: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let mut definition = test_agent_definition("coordinator", 1);
+        definition.model_id = "snapshot-model".to_string();
+        definition.provider_id = "snapshot-provider".to_string();
+        definition.model_options.thinking_level = Some("snapshot-thinking".to_string());
+        let instance = test_agent_instance(
+            &team_id,
+            &coordinator_id,
+            definition,
+            AgentRole::Coordinator,
+            &now,
+        );
+        let task_input = CoordinatorTaskInput {
+            queued_user_message_id: "user-model-selection".to_string(),
+            message: "Use override".to_string(),
+            attachments: Vec::new(),
+            skill_ids: Vec::new(),
+            collaboration_tools_enabled: false,
+            delegated_input: None,
+            correlation_id: None,
+        };
+
+        database
+            .insert_chat(&team.chat_id, "Model selection")
+            .expect("chat insert");
+        database
+            .insert_message(foco_store::workspace::NewMessage {
+                id: &task_input.queued_user_message_id,
+                chat_id: &team.chat_id,
+                role: "user",
+                content: "Use override",
+                sequence: 0,
+                metadata_json: Some(
+                    r#"{"queuedRun":{"status":"queued","modelId":"queued-model","providerId":"queued-provider","thinkingLevel":"queued-thinking","skillIds":[]}}"#,
+                ),
+            })
+            .expect("message insert");
+
+        let selection = agent_task_model_selection(&database, &team, &instance, &task_input)
+            .expect("selection");
+
+        assert_eq!(selection.model_id, "queued-model");
+        assert_eq!(selection.provider_id.as_deref(), Some("queued-provider"));
+        assert_eq!(selection.thinking_level.as_deref(), Some("queued-thinking"));
     }
 
     fn test_agent_definition(suffix: &str, max_instances: u32) -> AgentDefinitionSettings {
