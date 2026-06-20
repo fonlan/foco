@@ -111,6 +111,7 @@ import type {
   AgentDefinitionInput,
   AgentDefinitionSettings,
   AgentDefinitionsResponse,
+  AgentInstanceView,
   AgentTeamSnapshotResponse,
   AppLanguageId,
   AppThemeId,
@@ -292,6 +293,7 @@ import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
 import { AgentsRuntimePanel } from "./features/agents/AgentsRuntimePanel";
+import { AgentTranscriptPanel } from "./features/agents/AgentTranscriptPanel";
 import { AgentsSettingsPanel } from "./features/agents/AgentsSettingsPanel";
 import { errorMessage, requestJson, responseErrorMessage } from "./shared/api-client";
 import {
@@ -320,13 +322,35 @@ type OpenFileTab = {
   workspaceLogoUrl: string | null;
 };
 
+type OpenAgentTab = {
+  workspaceId: string;
+  chatId: string;
+  teamId: string;
+  instanceId: string;
+  fallbackTitle: string;
+  fallbackWorkspaceName: string;
+};
+
 type ActiveMainTab =
   | { type: "chat"; workspaceId: string; chatId: string | null }
-  | { type: "file"; workspaceId: string; path: string };
+  | { type: "file"; workspaceId: string; path: string }
+  | {
+      type: "agent";
+      workspaceId: string;
+      chatId: string;
+      teamId: string;
+      instanceId: string;
+    };
 
 type MainTabSummary =
   | (ChatTabSummary & { type: "chat" })
-  | (OpenFileTab & { type: "file"; title: string });
+  | (OpenFileTab & { type: "file"; title: string })
+  | (OpenAgentTab & {
+      type: "agent";
+      title: string;
+      workspaceName: string;
+      workspaceLogoUrl: string | null;
+    });
 
 type WorkspaceFileEditorState = {
   content: string;
@@ -401,6 +425,7 @@ export function App() {
     workspaceId: "",
   });
   const [openChatTabs, setOpenChatTabs] = useState<OpenChatTab[]>([]);
+  const [openAgentTabs, setOpenAgentTabs] = useState<OpenAgentTab[]>([]);
   const [loadingChatKeys, setLoadingChatKeys] = useState<Set<string>>(() => new Set());
   const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
   const [workspaceFileEditors, setWorkspaceFileEditors] = useState<
@@ -629,13 +654,17 @@ export function App() {
         ...hydrateChatTab(tab, workspaces),
         type: "chat" as const,
       })),
+      ...openAgentTabs.map((tab) => ({
+        ...hydrateAgentTab(tab, workspaces),
+        type: "agent" as const,
+      })),
       ...openFileTabs.map((tab) => ({
         ...tab,
         title: tab.name,
         type: "file" as const,
       })),
     ],
-    [openChatTabs, openFileTabs, workspaces],
+    [openAgentTabs, openChatTabs, openFileTabs, workspaces],
   );
   const activeFileEditorKey =
     activeMainTab.type === "file"
@@ -647,6 +676,16 @@ export function App() {
         (tab) =>
           tab.workspaceId === activeMainTab.workspaceId &&
           tab.path === activeMainTab.path,
+      ) ?? null
+      : null;
+  const activeAgentTab =
+    activeMainTab.type === "agent"
+      ? mainTabs.find(
+        (tab): tab is Extract<MainTabSummary, { type: "agent" }> =>
+          tab.type === "agent" &&
+          tab.workspaceId === activeMainTab.workspaceId &&
+          tab.chatId === activeMainTab.chatId &&
+          tab.instanceId === activeMainTab.instanceId,
       ) ?? null
       : null;
   const activeFileEditor = activeFileEditorKey
@@ -928,7 +967,7 @@ export function App() {
   useEffect(() => {
     if (
       !canUseApp ||
-      activeMainTab.type !== "chat" ||
+      (activeMainTab.type !== "chat" && activeMainTab.type !== "agent") ||
       !activeWorkspaceId ||
       !activeChatId ||
       isPendingChatId(activeChatId)
@@ -1531,6 +1570,11 @@ export function App() {
       const next = current.filter((tab) =>
         workspaces.some((workspace) => workspace.id === tab.workspaceId),
       );
+      return next.length === current.length ? current : next;
+    });
+
+    setOpenAgentTabs((current) => {
+      const next = current.filter((tab) => workspaceHasChatTab(workspaces, tab));
       return next.length === current.length ? current : next;
     });
 
@@ -2548,6 +2592,60 @@ export function App() {
     );
   }
 
+  function selectAgentTab(tab: OpenAgentTab) {
+    const chatKey = chatRunKey(tab.workspaceId, tab.chatId);
+    const cachedMessages = chatMessagesByKey[chatKey];
+
+    setActiveWorkspaceId(tab.workspaceId);
+    setActiveChatId(tab.chatId);
+    setActiveMainTab({
+      chatId: tab.chatId,
+      instanceId: tab.instanceId,
+      teamId: tab.teamId,
+      type: "agent",
+      workspaceId: tab.workspaceId,
+    });
+    setExpandedWorkspaceId(tab.workspaceId);
+    setActiveWorkspaceChatRefs(tab.workspaceId, tab.chatId);
+    setMessages(cachedMessages ?? []);
+    setSelectedDiffPath(null);
+    setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
+    updateBrowserRoute({
+      chatId: tab.chatId,
+      viewMode: "chat",
+      workspaceId: tab.workspaceId,
+    });
+
+    if (!cachedMessages) {
+      void loadChatMessages(tab.workspaceId, tab.chatId);
+    }
+  }
+
+  function openAgentInstanceTab(instance: AgentInstanceView) {
+    if (!agentTeamSnapshot || !activeWorkspaceId || !activeChatId) {
+      return;
+    }
+
+    if (instance.id === agentTeamSnapshot.team.coordinatorInstanceId) {
+      selectWorkspaceChat(activeWorkspaceId, activeChatId);
+      return;
+    }
+
+    const workspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
+    const nextTab: OpenAgentTab = {
+      chatId: activeChatId,
+      fallbackTitle: instance.definitionSnapshot.name,
+      fallbackWorkspaceName: workspace?.name ?? t("Workspace"),
+      instanceId: instance.id,
+      teamId: agentTeamSnapshot.team.id,
+      workspaceId: activeWorkspaceId,
+    };
+
+    setOpenAgentTabs((current) => upsertOpenAgentTab(current, nextTab));
+    selectAgentTab(nextTab);
+  }
+
   async function openWorkspaceFileTab(node: WorkspaceFileTreeNode) {
     if (!activeWorkspace) {
       setWorkspaceFilesError(t("Select a workspace before using file actions."));
@@ -2777,6 +2875,11 @@ export function App() {
       return;
     }
 
+    if (tab.type === "agent") {
+      selectAgentTab(tab);
+      return;
+    }
+
     setActiveWorkspaceId(tab.workspaceId);
     setExpandedWorkspaceId(tab.workspaceId);
     setActiveMainTab({ path: tab.path, type: "file", workspaceId: tab.workspaceId });
@@ -2787,6 +2890,11 @@ export function App() {
   function closeMainTab(tab: MainTabSummary) {
     if (tab.type === "chat") {
       closeChatTab(tab.workspaceId, tab.chatId);
+      return;
+    }
+
+    if (tab.type === "agent") {
+      closeAgentTab(tab);
       return;
     }
 
@@ -2822,6 +2930,50 @@ export function App() {
     }
 
     setActiveMainTab({ chatId: null, type: "chat", workspaceId: activeWorkspaceId || tab.workspaceId });
+  }
+
+  function closeAgentTab(tab: OpenAgentTab) {
+    const tabIndex = mainTabs.findIndex(
+      (current) =>
+        current.type === "agent" &&
+        current.workspaceId === tab.workspaceId &&
+        current.chatId === tab.chatId &&
+        current.instanceId === tab.instanceId,
+    );
+    setOpenAgentTabs((current) =>
+      current.filter(
+        (current) =>
+          current.workspaceId !== tab.workspaceId ||
+          current.chatId !== tab.chatId ||
+          current.instanceId !== tab.instanceId,
+      ),
+    );
+
+    if (
+      activeMainTab.type !== "agent" ||
+      activeMainTab.workspaceId !== tab.workspaceId ||
+      activeMainTab.chatId !== tab.chatId ||
+      activeMainTab.instanceId !== tab.instanceId
+    ) {
+      return;
+    }
+
+    const nextTabs = mainTabs.filter(
+      (current) =>
+        !(
+          current.type === "agent" &&
+          current.workspaceId === tab.workspaceId &&
+          current.chatId === tab.chatId &&
+          current.instanceId === tab.instanceId
+        ),
+    );
+    const nextTab = nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    if (nextTab) {
+      selectMainTab(nextTab);
+      return;
+    }
+
+    setActiveMainTab({ chatId: tab.chatId, type: "chat", workspaceId: tab.workspaceId });
   }
 
   function closeChatTab(workspaceId: string, chatId: string) {
@@ -6344,6 +6496,22 @@ export function App() {
                   onChangeContent={updateWorkspaceFileEditorContent}
                   onSave={saveWorkspaceFileEditor}
                 />
+              ) : activeMainTab.type === "agent" && activeAgentTab ? (
+                <AgentTranscriptPanel
+                  error={agentTeamError}
+                  instanceId={activeAgentTab.instanceId}
+                  isLoading={isLoadingAgentTeam}
+                  onOpenMainChat={() =>
+                    selectWorkspaceChat(activeAgentTab.workspaceId, activeAgentTab.chatId)
+                  }
+                  onRefresh={async () => {
+                    await loadAgentTeamSnapshot(
+                      activeAgentTab.workspaceId,
+                      activeAgentTab.chatId,
+                    );
+                  }}
+                  snapshot={agentTeamSnapshot}
+                />
               ) : (
                 <ChatPanel
                   activeWorkspaceName={activeWorkspace?.name ?? null}
@@ -6517,6 +6685,12 @@ export function App() {
                             await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
                           }
                         }}
+                        onSelectInstance={openAgentInstanceTab}
+                        selectedInstanceId={
+                          activeMainTab.type === "agent"
+                            ? activeMainTab.instanceId
+                            : agentTeamSnapshot?.team.coordinatorInstanceId ?? null
+                        }
                         snapshot={agentTeamSnapshot}
                       />
                     }
@@ -7183,7 +7357,7 @@ function MainTabBar({
             const isRunning =
               tab.type === "chat" &&
               runningChatKeys.has(chatRunKey(tab.workspaceId, tab.chatId));
-            const title = tab.title || t(tab.type === "chat" ? "Chat" : "Files");
+            const title = tab.title || t(tab.type === "chat" ? "Chat" : tab.type === "agent" ? "Agent" : "Files");
             const key = mainTabKey(tab);
 
             return (
@@ -7205,6 +7379,9 @@ function MainTabBar({
                   <span className="flex min-w-0 items-center gap-1.5 truncate text-sm font-semibold leading-5">
                     {tab.type === "file" ? (
                       <FileText aria-hidden="true" className="size-3.5 shrink-0 text-slate-500" />
+                    ) : null}
+                    {tab.type === "agent" ? (
+                      <Bot aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
                     ) : null}
                     <span className="min-w-0 truncate">{title}</span>
                   </span>
@@ -17709,11 +17886,44 @@ function hydrateChatTab(
   };
 }
 
+function hydrateAgentTab(
+  tab: OpenAgentTab,
+  workspaces: WorkspaceSummary[],
+): OpenAgentTab & {
+  title: string;
+  workspaceName: string;
+  workspaceLogoUrl: string | null;
+} {
+  const workspace = workspaces.find((workspace) => workspace.id === tab.workspaceId);
+
+  return {
+    ...tab,
+    title: tab.fallbackTitle,
+    workspaceLogoUrl: workspace?.logoUrl ?? null,
+    workspaceName: workspace?.name ?? tab.fallbackWorkspaceName,
+  };
+}
+
 function upsertOpenChatTab(tabs: OpenChatTab[], nextTab: OpenChatTab) {
   if (
     tabs.some(
       (tab) =>
         tab.workspaceId === nextTab.workspaceId && tab.chatId === nextTab.chatId,
+    )
+  ) {
+    return tabs;
+  }
+
+  return [...tabs, nextTab];
+}
+
+function upsertOpenAgentTab(tabs: OpenAgentTab[], nextTab: OpenAgentTab) {
+  if (
+    tabs.some(
+      (tab) =>
+        tab.workspaceId === nextTab.workspaceId &&
+        tab.chatId === nextTab.chatId &&
+        tab.instanceId === nextTab.instanceId,
     )
   ) {
     return tabs;
@@ -17735,9 +17945,15 @@ function upsertOpenFileTab(tabs: OpenFileTab[], nextTab: OpenFileTab) {
 }
 
 function mainTabKey(tab: MainTabSummary) {
-  return tab.type === "chat"
-    ? `chat:${chatRunKey(tab.workspaceId, tab.chatId)}`
-    : workspaceFileEditorKey(tab.workspaceId, tab.path);
+  if (tab.type === "chat") {
+    return `chat:${chatRunKey(tab.workspaceId, tab.chatId)}`;
+  }
+
+  if (tab.type === "agent") {
+    return `agent:${tab.workspaceId}:${tab.chatId}:${tab.instanceId}`;
+  }
+
+  return workspaceFileEditorKey(tab.workspaceId, tab.path);
 }
 
 function mainTabMatches(activeTab: ActiveMainTab, tab: MainTabSummary) {
@@ -17747,6 +17963,14 @@ function mainTabMatches(activeTab: ActiveMainTab, tab: MainTabSummary) {
 
   if (tab.type === "chat") {
     return activeTab.type === "chat" && activeTab.chatId === tab.chatId;
+  }
+
+  if (tab.type === "agent") {
+    return (
+      activeTab.type === "agent" &&
+      activeTab.chatId === tab.chatId &&
+      activeTab.instanceId === tab.instanceId
+    );
   }
 
   return activeTab.type === "file" && activeTab.path === tab.path;

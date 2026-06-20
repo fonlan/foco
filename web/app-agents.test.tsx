@@ -86,6 +86,23 @@ describe("app agents verification surfaces", () => {
     expect(screen.getByText("foco/agent-instance-worker")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Enable" })).not.toBeInTheDocument();
     expect(screen.queryByText("Observability")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Open agent Worker" }));
+
+    expect(await screen.findByRole("tab", { name: /Worker/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
+    expect(screen.getByText("Found the issue in the workspace notes.")).toBeInTheDocument();
+    expect(screen.getByText("Inspection complete.")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Open agent Coordinator" }));
+
+    expect(await screen.findByRole("tab", { name: /Tool run/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   it("queues the first message with Team tools disabled by default from the composer", async () => {

@@ -11,12 +11,16 @@ export function AgentsRuntimePanel({
   error,
   isLoading,
   onRefresh,
+  onSelectInstance,
+  selectedInstanceId,
   snapshot,
 }: {
   activeChatId: string | null;
   error: string | null;
   isLoading: boolean;
   onRefresh: () => Promise<void>;
+  onSelectInstance: (instance: AgentInstanceView) => void;
+  selectedInstanceId: string | null;
   snapshot: AgentTeamSnapshotResponse | null;
 }) {
   const { t } = useI18n();
@@ -73,7 +77,11 @@ export function AgentsRuntimePanel({
 
       {activeChatId && snapshot ? (
         instances.length ? (
-          <AgentInstancesList instances={instances} />
+          <AgentInstancesList
+            instances={instances}
+            onSelectInstance={onSelectInstance}
+            selectedInstanceId={selectedInstanceId}
+          />
         ) : (
           <AgentEmptyState text={t("No agent instances in this chat yet.")} />
         )
@@ -82,22 +90,54 @@ export function AgentsRuntimePanel({
   );
 }
 
-function AgentInstancesList({ instances }: { instances: AgentInstanceView[] }) {
+function AgentInstancesList({
+  instances,
+  onSelectInstance,
+  selectedInstanceId,
+}: {
+  instances: AgentInstanceView[];
+  onSelectInstance: (instance: AgentInstanceView) => void;
+  selectedInstanceId: string | null;
+}) {
   return (
     <div className="grid gap-2">
       {instances.map((instance) => (
-        <AgentInstanceCard instance={instance} key={instance.id} />
+        <AgentInstanceCard
+          instance={instance}
+          isSelected={instance.id === selectedInstanceId}
+          key={instance.id}
+          onSelect={() => onSelectInstance(instance)}
+        />
       ))}
     </div>
   );
 }
 
-function AgentInstanceCard({ instance }: { instance: AgentInstanceView }) {
+function AgentInstanceCard({
+  instance,
+  isSelected,
+  onSelect,
+}: {
+  instance: AgentInstanceView;
+  isSelected: boolean;
+  onSelect: () => void;
+}) {
   const { t } = useI18n();
   const isIsolated = instance.executionWorkspaceMode === "isolated_worktree";
 
   return (
-    <article className="rounded-lg border border-stone-200 bg-white px-3 py-3">
+    <button
+      aria-label={t("Open agent {name}", {
+        name: instance.definitionSnapshot.name,
+      })}
+      aria-pressed={isSelected}
+      className={`w-full rounded-lg border px-3 py-3 text-left transition ${isSelected
+          ? "border-teal-300 bg-teal-50 text-stone-950 shadow-sm"
+          : "border-stone-200 bg-white hover:border-teal-200 hover:bg-teal-50"
+        }`}
+      onClick={onSelect}
+      type="button"
+    >
       <div className="flex min-w-0 items-start gap-2">
         <User aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-teal-700" />
         <div className="min-w-0 flex-1">
@@ -131,7 +171,7 @@ function AgentInstanceCard({ instance }: { instance: AgentInstanceView }) {
         <AgentKeyValue label={t("Definition")} value={instance.definitionId} />
         <AgentKeyValue label={t("Created")} value={formatAgentTimestamp(instance.createdAt)} />
       </dl>
-    </article>
+    </button>
   );
 }
 
