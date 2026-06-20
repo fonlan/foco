@@ -92,6 +92,15 @@ export const secondaryWorkspace = {
 };
 
 export const settings = {
+  agentTools: [
+    "ask_question",
+    "edit_file",
+    "find_files",
+    "read_file",
+    "run_command",
+    "search_text",
+    "write_file",
+  ],
   configuredModels: [
     {
       activeProviderId: "openai",

@@ -1665,6 +1665,8 @@ struct QueueChatMessageRequest {
     skill_ids: Option<Vec<String>>,
     message: String,
     #[serde(default)]
+    team_mode_enabled: bool,
+    #[serde(default)]
     attachments: Vec<ChatAttachmentInput>,
 }
 
@@ -1851,6 +1853,7 @@ struct TodoGraphQuery {
 #[serde(rename_all = "camelCase")]
 struct SettingsResponse {
     general: GeneralSettingsSummary,
+    agent_tools: Vec<String>,
     native_tools: NativeToolsSummary,
     web_search: WebSearchSettingsSummary,
     memory: MemorySettingsSummary,

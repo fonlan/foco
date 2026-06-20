@@ -13,6 +13,7 @@ use foco_store::{
     workspace::WorkspaceDatabase,
 };
 
+use crate::http::settings::known_agent_tool_names;
 use crate::*;
 
 pub(crate) async fn settings_response(
@@ -50,6 +51,14 @@ pub(crate) async fn settings_response(
                     name: app_theme_name(*theme),
                 })
                 .collect(),
+        },
+        agent_tools: {
+            let mut tools = known_agent_tool_names(state, config)
+                .await
+                .into_iter()
+                .collect::<Vec<_>>();
+            tools.sort();
+            tools
         },
         native_tools: NativeToolsSummary {
             browser_probe_port: state.listen_addr.port(),

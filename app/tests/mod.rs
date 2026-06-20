@@ -1465,7 +1465,20 @@ async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets
         .await
         .expect("list agent definitions")
         .0;
-    assert_eq!(listed.agent_definitions[0].id, definition_id);
+    let default_definition_id =
+        AgentDefinitionId::new("agent-definition-default").expect("default definition id");
+    assert!(
+        listed
+            .agent_definitions
+            .iter()
+            .any(|definition| definition.id == default_definition_id)
+    );
+    assert!(
+        listed
+            .agent_definitions
+            .iter()
+            .any(|definition| definition.id == definition_id)
+    );
 
     let mut invalid_tool_input = test_agent_definition_input();
     invalid_tool_input.allowed_tools = vec!["not_a_runtime_tool".to_string()];
@@ -1496,11 +1509,13 @@ async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets
     .await
     .expect("update agent definition")
     .0;
-    assert_eq!(updated.agent_definitions[0].revision, 2);
-    assert_eq!(
-        updated.agent_definitions[0].description,
-        "Updated coordinator."
-    );
+    let updated_definition = updated
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == definition_id)
+        .expect("updated definition");
+    assert_eq!(updated_definition.revision, 2);
+    assert_eq!(updated_definition.description, "Updated coordinator.");
 
     let provider_error = match crate::http::settings::delete_provider(
         State(state.clone()),
@@ -1542,7 +1557,48 @@ async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets
     .await
     .expect("delete agent definition")
     .0;
-    assert!(deleted.agent_definitions.is_empty());
+    assert_eq!(deleted.agent_definitions.len(), 1);
+    assert_eq!(deleted.agent_definitions[0].id, default_definition_id);
+}
+
+#[tokio::test]
+async fn agent_definitions_api_creates_default_agent_when_empty() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    let state = test_app_state(
+        prompt_test_config(workspace_dir),
+        profile.path().to_path_buf(),
+    );
+
+    let listed = crate::http::settings::agent_definitions(State(state.clone()))
+        .await
+        .expect("list agent definitions")
+        .0;
+    let default_definition_id =
+        AgentDefinitionId::new("agent-definition-default").expect("default definition id");
+
+    assert_eq!(listed.agent_definitions.len(), 1);
+    let default_definition = &listed.agent_definitions[0];
+    assert_eq!(default_definition.id, default_definition_id);
+    assert_eq!(default_definition.name, "Default agent");
+    assert_eq!(default_definition.provider_id, "provider");
+    assert_eq!(default_definition.model_id, "model");
+    assert!(default_definition.permissions.can_create_instances);
+    assert!(default_definition.permissions.can_delegate);
+    assert!(
+        default_definition
+            .permissions
+            .allowed_agent_definition_ids
+            .is_empty()
+    );
+
+    let listed_again = crate::http::settings::agent_definitions(State(state))
+        .await
+        .expect("list agent definitions again")
+        .0;
+    assert_eq!(listed_again.agent_definitions.len(), 1);
 }
 
 #[test]
@@ -3399,6 +3455,7 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
             thinking_level: None,
             skill_ids: None,
             message: "First Coordinator task".to_string(),
+            team_mode_enabled: false,
             attachments: Vec::new(),
         }),
     )

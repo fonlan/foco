@@ -103,6 +103,7 @@ export function ChatPanel({
   isLoadingSettings,
   isSendingMessage,
   isSelectingAttachments,
+  isTeamModeEnabled,
   messages,
   onAddPastedImageAttachments,
   overviewRenderer,
@@ -119,6 +120,7 @@ export function ChatPanel({
   onRetryRun,
   onSelectAttachments,
   onSubmit,
+  onTeamModeEnabledChange,
   onThinkingLevelChange,
   onToggleSkill,
   onWithdrawQueuedMessage,
@@ -128,6 +130,7 @@ export function ChatPanel({
   selectedSkillIds,
   selectedThinkingLevel,
   settings,
+  showTeamModeToggle,
   providers,
   skills,
   queuedMessageIds,
@@ -153,6 +156,7 @@ export function ChatPanel({
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
   isSelectingAttachments: boolean;
+  isTeamModeEnabled: boolean;
   messages: ShellMessage[];
   onAddPastedImageAttachments: (files: File[]) => void;
   overviewRenderer: () => ReactNode;
@@ -172,6 +176,7 @@ export function ChatPanel({
     event: FormEvent<HTMLFormElement>,
     options?: { schedule?: boolean },
   ) => void;
+  onTeamModeEnabledChange: (value: boolean) => void;
   onThinkingLevelChange: (value: string) => void;
   onToggleSkill: (skillId: string) => void;
   onWithdrawQueuedMessage: (messageId: string) => void;
@@ -181,6 +186,7 @@ export function ChatPanel({
   selectedSkillIds: string[];
   selectedThinkingLevel: string;
   settings: SettingsResponse | null;
+  showTeamModeToggle: boolean;
   providers: ConfiguredProviderSummary[];
   skills: ConfiguredSkillSummary[];
   queuedMessageIds: ReadonlySet<string>;
@@ -823,6 +829,22 @@ export function ChatPanel({
                   <Plus aria-hidden="true" className="size-4" />
                 )}
               </button>
+              {showTeamModeToggle ? (
+                <button
+                  aria-label={t("Team mode")}
+                  aria-pressed={isTeamModeEnabled}
+                  className={`inline-flex h-8 items-center gap-1.5 rounded-full border px-2.5 text-xs font-semibold transition ${isTeamModeEnabled
+                    ? "border-teal-700 bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.18)]"
+                    : "border-stone-200 bg-stone-50/80 text-stone-700 hover:border-stone-300 hover:bg-white"
+                    }`}
+                  onClick={() => onTeamModeEnabledChange(!isTeamModeEnabled)}
+                  title={t("Team mode")}
+                  type="button"
+                >
+                  <Bot aria-hidden="true" className="size-3.5 shrink-0" />
+                  <span>{t("Team")}</span>
+                </button>
+              ) : null}
               <ComposerSelectMenu
                 ariaLabel={t("Model")}
                 className="composer-model-select max-w-full"
@@ -1610,4 +1632,3 @@ function ToolCallBlock({
     </details>
   );
 }
-

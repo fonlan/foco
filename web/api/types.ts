@@ -1531,6 +1531,7 @@ export type RetryRunRequest = {
   providerId: string;
   thinkingLevel: string;
   skillIds: string[];
+  teamModeEnabled?: boolean;
   localChatKey?: string;
   pendingUserMessageId?: string;
   queuedUserMessageId?: string;
@@ -1563,6 +1564,7 @@ export type ActiveRunInfo = {
 
 export type SettingsResponse = {
   general: GeneralSettingsSummary;
+  agentTools: string[];
   nativeTools: NativeToolsSummary;
   webSearch: WebSearchSettingsSummary;
   memory: MemorySettingsSummary;

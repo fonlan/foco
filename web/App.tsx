@@ -419,6 +419,7 @@ export function App() {
   >({});
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionSettings[]>([]);
+  const [isTeamModeEnabled, setIsTeamModeEnabled] = useState(false);
   const [isLoadingAgentDefinitions, setIsLoadingAgentDefinitions] = useState(false);
   const [agentDefinitionsError, setAgentDefinitionsError] = useState<string | null>(null);
   const [agentDefinitionOperationKey, setAgentDefinitionOperationKey] = useState<string | null>(null);
@@ -612,6 +613,7 @@ export function App() {
   const activeRunInfo = activeChatKey
     ? activeRunInfoByChatKey[activeChatKey] ?? null
     : null;
+  const canUseTeamMode = agentDefinitions.length > 1;
   const isSendingMessage =
     activeChatKey !== null && runningChatKeys.has(activeChatKey);
   const queuedRunRequests = activeChatKey
@@ -956,8 +958,10 @@ export function App() {
         },
       );
       setAgentDefinitions(data.agentDefinitions);
+      return true;
     } catch (requestError) {
       setAgentDefinitionsError(errorMessage(requestError));
+      return false;
     } finally {
       setAgentDefinitionOperationKey(null);
     }
@@ -980,8 +984,10 @@ export function App() {
         },
       );
       setAgentDefinitions(data.agentDefinitions);
+      return true;
     } catch (requestError) {
       setAgentDefinitionsError(errorMessage(requestError));
+      return false;
     } finally {
       setAgentDefinitionOperationKey(null);
     }
@@ -3616,6 +3622,7 @@ export function App() {
       modelId: selectedModelId,
       providerId: selectedProviderId,
       skillIds,
+      teamModeEnabled: canUseTeamMode && isTeamModeEnabled,
       thinkingLevel: selectedThinkingLevel,
       workspaceId: currentWorkspace.id,
     };
@@ -3670,6 +3677,7 @@ export function App() {
           modelId: request.modelId,
           providerId: request.providerId,
           skillIds: request.skillIds.length ? request.skillIds : null,
+          teamModeEnabled: request.teamModeEnabled ?? false,
           thinkingLevel: request.thinkingLevel || null,
         }),
         headers: { "Content-Type": "application/json" },
@@ -4888,7 +4896,43 @@ export function App() {
     }
   }
 
-  async function runChatMessage(request: RetryRunRequest): Promise<string | null> {
+  async function runChatMessage(initialRequest: RetryRunRequest): Promise<string | null> {
+    let request = initialRequest;
+    if ((request.teamModeEnabled ?? false) && !request.queuedUserMessageId) {
+      try {
+        const queued = await persistQueuedRunRequest(request);
+        request = {
+          ...request,
+          chatId: queued.chatId,
+          pendingUserMessageId: queued.userMessageId,
+          queuedUserMessageId: queued.userMessageId,
+        };
+        const queuedChatKey = chatRunKey(request.workspaceId, queued.chatId);
+        setActiveWorkspaceId(request.workspaceId);
+        setActiveChatId(queued.chatId);
+        setActiveMainTab({
+          chatId: queued.chatId,
+          type: "chat",
+          workspaceId: request.workspaceId,
+        });
+        openPendingChatTab(request.workspaceId, queued.chatId, queued.chatTitle);
+        setExpandedWorkspaceId(request.workspaceId);
+        activeWorkspaceIdRef.current = request.workspaceId;
+        activeChatIdRef.current = queued.chatId;
+        activeChatKeyRef.current = queuedChatKey;
+        setSelectedDiffPath(null);
+        setViewMode("chat");
+        setIsMobileWorkspaceOpen(false);
+        updateBrowserRoute({
+          chatId: queued.chatId,
+          viewMode: "chat",
+          workspaceId: request.workspaceId,
+        });
+      } catch (requestError) {
+        setError(errorMessage(requestError));
+        return null;
+      }
+    }
     const runKey = localRandomId();
     const pendingUserMessageId = request.pendingUserMessageId ?? null;
     const localUserId = pendingUserMessageId ?? `local-user-${runKey}`;
@@ -5899,7 +5943,6 @@ export function App() {
                   onActiveSectionChange={openSettingsSection}
                   onCreateAgentDefinition={createAgentDefinition}
                   onDeleteAgentDefinition={deleteAgentDefinition}
-                  onRefreshAgentDefinitions={loadAgentDefinitions}
                   onUpdateAgentDefinition={updateAgentDefinition}
                   onLogout={handleLogout}
                   onSettingsChange={setSettings}
@@ -6462,6 +6505,7 @@ export function App() {
                   isLoadingMessages={isLoadingActiveChatMessages}
                   isSendingMessage={isSendingMessage}
                   isSelectingAttachments={isSelectingAttachments}
+                  isTeamModeEnabled={canUseTeamMode && isTeamModeEnabled}
                   messages={messages}
                   overviewRenderer={() => (
                     <ApiOverviewPanel
@@ -6492,6 +6536,7 @@ export function App() {
                   onSubmit={(event, options) =>
                     void handleSendMessage(event, options)
                   }
+                  onTeamModeEnabledChange={setIsTeamModeEnabled}
                   onThinkingLevelChange={setSelectedThinkingLevel}
                   onToggleSkill={toggleSelectedSkill}
                   onWithdrawQueuedMessage={handleWithdrawQueuedMessage}
@@ -6504,6 +6549,7 @@ export function App() {
                   selectedSkillIds={selectedSkillIds}
                   selectedThinkingLevel={selectedThinkingLevel}
                   settings={settings}
+                  showTeamModeToggle={canUseTeamMode}
                   providers={settings?.providers ?? []}
                   skills={detectedSkills}
                   thinkingLevels={thinkingLevels}
@@ -10603,7 +10649,6 @@ function SettingsPanel({
   onActiveSectionChange,
   onCreateAgentDefinition,
   onDeleteAgentDefinition,
-  onRefreshAgentDefinitions,
   onUpdateAgentDefinition,
   onLogout,
   onSettingsChange,
@@ -10620,10 +10665,12 @@ function SettingsPanel({
   nativeBrowserToken: string | null;
   onAddWorkspace: () => void;
   onActiveSectionChange: (section: SettingsSection) => void;
-  onCreateAgentDefinition: (definition: AgentDefinitionInput) => Promise<void>;
+  onCreateAgentDefinition: (definition: AgentDefinitionInput) => Promise<boolean>;
   onDeleteAgentDefinition: (id: string) => Promise<void>;
-  onRefreshAgentDefinitions: () => Promise<AgentDefinitionSettings[] | null>;
-  onUpdateAgentDefinition: (id: string, definition: AgentDefinitionInput) => Promise<void>;
+  onUpdateAgentDefinition: (
+    id: string,
+    definition: AgentDefinitionInput,
+  ) => Promise<boolean>;
   onLogout: () => Promise<void>;
   onSettingsChange: (settings: SettingsResponse) => void;
   onWorkspacesChange: () => Promise<void>;
@@ -13791,16 +13838,17 @@ function SettingsPanel({
 
           {activeSection === "agents" ? (
             <AgentsSettingsPanel
+              agentTools={settings?.agentTools ?? []}
               definitions={agentDefinitions}
               error={agentDefinitionsError}
               isLoading={isLoadingAgentDefinitions}
               models={configuredModelsByName}
               onCreateDefinition={onCreateAgentDefinition}
               onDeleteDefinition={onDeleteAgentDefinition}
-              onRefreshDefinitions={onRefreshAgentDefinitions}
               onUpdateDefinition={onUpdateAgentDefinition}
               operationKey={agentDefinitionOperationKey}
               providers={providers}
+              systemPrompts={savedSystemPrompts}
               thinkingLevels={thinkingLevels}
             />
           ) : null}
@@ -18041,6 +18089,10 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
     return t("Prompt settings");
   }
 
+  if (section === "agents") {
+    return t("Agent settings");
+  }
+
   if (section === "web-search") {
     return t("Web search settings");
   }
@@ -18079,6 +18131,10 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
 
   if (section === "prompts") {
     return t("System prompt, prompt files, and extra instructions");
+  }
+
+  if (section === "agents") {
+    return t("Agent definitions, models, tools, and permissions");
   }
 
   if (section === "web-search") {

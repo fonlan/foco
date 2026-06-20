@@ -26,6 +26,9 @@ type BoxedChatEventStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Event, Infallible>> + Send>>;
 type BoxedChatSse = Sse<KeepAliveStream<BoxedChatEventStream>>;
 
+const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
+const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete the user's task directly. When Agent team tools are available, coordinate or create worker agents only when that materially reduces the work.";
+
 pub(crate) async fn queue_chat_message(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
@@ -33,7 +36,8 @@ pub(crate) async fn queue_chat_message(
 ) -> Result<Json<QueueChatMessageResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let existing_team = if let Some(chat_id) = request.chat_id.as_deref() {
+    let team_mode_enabled = request.team_mode_enabled;
+    let mut team = if let Some(chat_id) = request.chat_id.as_deref() {
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         database
@@ -42,7 +46,7 @@ pub(crate) async fn queue_chat_message(
     } else {
         None
     };
-    let coordinator = if let Some(team) = existing_team.as_ref() {
+    let mut coordinator = if let Some(team) = team.as_ref() {
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         let instance = database
@@ -130,7 +134,36 @@ pub(crate) async fn queue_chat_message(
         (chat_id, chat.title)
     };
 
-    let agent_task_id = if let (Some(team), Some(coordinator)) = (&existing_team, &coordinator) {
+    if team_mode_enabled && team.is_none() {
+        let definition = default_agent_definition(&state, &config, &prompt_context).await?;
+        validate_agent_snapshot_for_workspace(&config, workspace, &definition)?;
+        let team_id = foco_agent::AgentTeamId::new(unique_id("agent-team"))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let instance_id = foco_agent::AgentInstanceId::new(unique_id("agent-instance"))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        let (created_team, created_coordinator) = database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: &chat_id,
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                max_concurrent_runs: 1,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        insert_agent_event(
+            &mut database,
+            &team_id,
+            "team_created",
+            Some(&instance_id),
+            None,
+            None,
+            serde_json::json!({ "coordinatorDefinitionId": definition.id, "defaultAgent": true }),
+        )?;
+        team = Some(created_team);
+        coordinator = Some(created_coordinator);
+    }
+
+    let agent_task_id = if let (Some(team), Some(coordinator)) = (&team, &coordinator) {
         let task_id = foco_agent::AgentTaskId::new(unique_id("agent-task"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
         let input_json = serde_json::to_string(&CoordinatorTaskInput {
@@ -201,6 +234,84 @@ pub(crate) async fn queue_chat_message(
         parts: user_message_response_parts(message, &prompt_context.attachments),
         agent_task_id,
     }))
+}
+
+async fn default_agent_definition(
+    state: &AppState,
+    config: &GlobalConfig,
+    prompt_context: &PreparedPromptContext,
+) -> Result<foco_store::config::AgentDefinitionSettings, ApiError> {
+    let allowed_tools = default_agent_allowed_tools(state, config, prompt_context).await?;
+    let default_id = foco_agent::AgentDefinitionId::new(DEFAULT_AGENT_DEFINITION_ID)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let allowed_agent_definition_ids = config
+        .agent_definitions
+        .iter()
+        .filter(|definition| definition.id != default_id)
+        .map(|definition| definition.id.clone())
+        .collect::<Vec<_>>();
+
+    Ok(foco_store::config::AgentDefinitionSettings {
+        id: default_id,
+        revision: foco_store::config::AGENT_DEFINITION_INITIAL_REVISION,
+        name: "Default agent".to_string(),
+        description: "Default runtime agent for chat and Team mode.".to_string(),
+        provider_id: prompt_context.provider_id.clone(),
+        model_id: prompt_context.model_id.clone(),
+        model_options: foco_store::config::AgentModelOptions {
+            thinking_level: prompt_context.provider_request.thinking_level.clone(),
+            max_output_tokens: None,
+        },
+        system_prompt: DEFAULT_AGENT_SYSTEM_PROMPT.to_string(),
+        allowed_tools,
+        max_instances: 1,
+        permissions: foco_agent::AgentPermissions {
+            can_create_instances: true,
+            can_delegate: true,
+            allowed_agent_definition_ids,
+        },
+    })
+}
+
+async fn default_agent_allowed_tools(
+    state: &AppState,
+    config: &GlobalConfig,
+    prompt_context: &PreparedPromptContext,
+) -> Result<Vec<String>, ApiError> {
+    let ripgrep_available = {
+        let status = state
+            .ripgrep_status
+            .lock()
+            .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
+        status.available
+    };
+    let mut tools = builtin_tool_definitions_for_runtime(
+        ripgrep_available,
+        crate::runtime::web_search_enabled(&config.web_search),
+    )
+    .into_iter()
+    .map(|definition| definition.name.to_string())
+    .collect::<Vec<_>>();
+
+    if config.memory.enabled {
+        tools.extend(
+            memory_tool_definitions()
+                .into_iter()
+                .map(|definition| definition.name),
+        );
+    }
+
+    tools.extend(
+        state
+            .mcp_registry
+            .tool_definitions(&prompt_context.workspace_id)
+            .await
+            .into_iter()
+            .map(|definition| definition.name),
+    );
+    tools.sort();
+    tools.dedup();
+    Ok(tools)
 }
 
 pub(crate) async fn stream_chat_response(

@@ -18,6 +18,9 @@ use foco_store::{
 
 use crate::*;
 
+const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
+const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete the user's task directly. When Agent team tools are available, coordinate or create worker agents only when that materially reduces the work.";
+
 pub(crate) async fn settings(
     State(state): State<AppState>,
 ) -> Result<Json<SettingsResponse>, ApiError> {
@@ -29,9 +32,126 @@ pub(crate) async fn settings(
 pub(crate) async fn agent_definitions(
     State(state): State<AppState>,
 ) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
+    let config = ensure_default_agent_definition(&state).await?;
 
     Ok(agent_definitions_response(&config))
+}
+
+async fn ensure_default_agent_definition(state: &AppState) -> Result<GlobalConfig, ApiError> {
+    let mut config = config_snapshot(state)?;
+    let default_id = default_agent_definition_id()?;
+    if config
+        .agent_definitions
+        .iter()
+        .any(|definition| definition.id == default_id)
+    {
+        if refresh_default_agent_permissions(&mut config)? {
+            validate_agent_definition_update(state, &config).await?;
+            save_config(state, config.clone())?;
+        }
+        return Ok(config);
+    }
+
+    let Some(definition) = default_agent_definition_for_config(&config, default_id) else {
+        return Ok(config);
+    };
+    config.agent_definitions.insert(0, definition);
+    validate_agent_definition_update(state, &config).await?;
+    save_config(state, config.clone())?;
+    Ok(config)
+}
+
+fn default_agent_definition_id() -> Result<AgentDefinitionId, ApiError> {
+    AgentDefinitionId::new(DEFAULT_AGENT_DEFINITION_ID)
+        .map_err(|error| ApiError::internal(error.message().to_string()))
+}
+
+fn refresh_default_agent_permissions(config: &mut GlobalConfig) -> Result<bool, ApiError> {
+    let default_id = default_agent_definition_id()?;
+    let allowed_agent_definition_ids = default_agent_allowed_definition_ids(config, &default_id);
+    let Some(default_definition) = config
+        .agent_definitions
+        .iter_mut()
+        .find(|definition| definition.id == default_id)
+    else {
+        return Ok(false);
+    };
+
+    let mut changed = false;
+    if default_definition.permissions.allowed_agent_definition_ids != allowed_agent_definition_ids {
+        default_definition.permissions.allowed_agent_definition_ids = allowed_agent_definition_ids;
+        changed = true;
+    }
+    if !default_definition.permissions.can_create_instances {
+        default_definition.permissions.can_create_instances = true;
+        changed = true;
+    }
+    if !default_definition.permissions.can_delegate {
+        default_definition.permissions.can_delegate = true;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn default_agent_allowed_definition_ids(
+    config: &GlobalConfig,
+    default_id: &AgentDefinitionId,
+) -> Vec<AgentDefinitionId> {
+    config
+        .agent_definitions
+        .iter()
+        .filter(|definition| definition.id != *default_id)
+        .map(|definition| definition.id.clone())
+        .collect()
+}
+
+fn default_agent_definition_for_config(
+    config: &GlobalConfig,
+    id: AgentDefinitionId,
+) -> Option<AgentDefinitionSettings> {
+    let model = config.models.iter().find(|model| {
+        model.enabled
+            && model.limits.is_some()
+            && model
+                .active_provider_id
+                .as_ref()
+                .is_some_and(|provider_id| {
+                    model.provider_ids.iter().any(|id| id == provider_id)
+                        && config
+                            .providers
+                            .iter()
+                            .any(|provider| provider.enabled && provider.id == *provider_id)
+                })
+    })?;
+    let provider_id = model.active_provider_id.clone()?;
+    let mut allowed_tools = foco_tools::builtin_tool_definitions()
+        .into_iter()
+        .map(|definition| definition.name.to_string())
+        .collect::<Vec<_>>();
+    allowed_tools.sort();
+    allowed_tools.dedup();
+    let allowed_agent_definition_ids = default_agent_allowed_definition_ids(config, &id);
+
+    Some(AgentDefinitionSettings {
+        id,
+        revision: AGENT_DEFINITION_INITIAL_REVISION,
+        name: "Default agent".to_string(),
+        description: "Built-in default agent for chat and Team coordination.".to_string(),
+        provider_id,
+        model_id: model.id.clone(),
+        model_options: AgentModelOptions {
+            thinking_level: model.thinking_level.clone(),
+            max_output_tokens: None,
+        },
+        system_prompt: DEFAULT_AGENT_SYSTEM_PROMPT.to_string(),
+        allowed_tools,
+        max_instances: 1,
+        permissions: AgentPermissions {
+            can_create_instances: true,
+            can_delegate: true,
+            allowed_agent_definition_ids,
+        },
+    })
 }
 
 pub(crate) async fn create_agent_definition(
@@ -46,6 +166,7 @@ pub(crate) async fn create_agent_definition(
         AGENT_DEFINITION_INITIAL_REVISION,
         request.definition,
     ));
+    refresh_default_agent_permissions(&mut config)?;
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -69,6 +190,7 @@ pub(crate) async fn update_agent_definition(
         .checked_add(1)
         .ok_or_else(|| ApiError::internal("agent definition revision overflow"))?;
     *stored = agent_definition_from_input(request.id, revision, request.definition);
+    refresh_default_agent_permissions(&mut config)?;
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -80,11 +202,13 @@ pub(crate) async fn delete_agent_definition(
     Json(request): Json<DeleteAgentDefinitionRequest>,
 ) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
+    let default_id = default_agent_definition_id()?;
     if let Some(dependent) = config.agent_definitions.iter().find(|definition| {
-        definition
-            .permissions
-            .allowed_agent_definition_ids
-            .contains(&request.id)
+        definition.id != default_id
+            && definition
+                .permissions
+                .allowed_agent_definition_ids
+                .contains(&request.id)
     }) {
         return Err(ApiError::bad_request(format!(
             "agent definition '{}' is referenced by agent definition '{}'",
@@ -101,6 +225,16 @@ pub(crate) async fn delete_agent_definition(
             request.id
         )));
     }
+    if !config
+        .agent_definitions
+        .iter()
+        .any(|definition| definition.id == default_id)
+    {
+        if let Some(definition) = default_agent_definition_for_config(&config, default_id) {
+            config.agent_definitions.insert(0, definition);
+        }
+    }
+    refresh_default_agent_permissions(&mut config)?;
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -143,7 +277,10 @@ async fn validate_agent_definition_update(
     .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
-async fn known_agent_tool_names(state: &AppState, config: &GlobalConfig) -> HashSet<String> {
+pub(crate) async fn known_agent_tool_names(
+    state: &AppState,
+    config: &GlobalConfig,
+) -> HashSet<String> {
     let mut tools = foco_tools::builtin_tool_definitions()
         .into_iter()
         .map(|definition| definition.name.to_string())
