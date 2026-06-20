@@ -10,14 +10,17 @@ if (process.platform !== "win32") {
 }
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
-const releaseExe = path.join(repoRoot, "target", "release", "foco.exe");
+const buildTargetDir = await mkdtemp(path.join(tmpdir(), "foco-release-target-"));
+const releaseExe = path.join(buildTargetDir, "release", "foco.exe");
 const profileDir = await mkdtemp(path.join(tmpdir(), "foco-release-smoke-"));
 const port = String(await freePort());
 let appProcess = null;
 let isStopping = false;
 
 try {
-  await run("cmd.exe", ["/d", "/s", "/c", "npm.cmd", "run", "build:release"]);
+  await run("cmd.exe", ["/d", "/s", "/c", "npm.cmd", "run", "build:release"], {
+    CARGO_TARGET_DIR: buildTargetDir,
+  });
 
   if (!existsSync(releaseExe)) {
     throw new Error(`release executable was not created: ${releaseExe}`);
@@ -58,6 +61,7 @@ try {
   }
 
   await rm(profileDir, { force: true, recursive: true });
+  await rm(buildTargetDir, { force: true, recursive: true });
 }
 
 async function assertFirstRunFiles(userProfileDir) {
@@ -168,10 +172,14 @@ async function freePort() {
   });
 }
 
-async function run(command, args) {
+async function run(command, args, extraEnv = {}) {
   await new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: repoRoot,
+      env: {
+        ...process.env,
+        ...extraEnv,
+      },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });

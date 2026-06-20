@@ -14,6 +14,18 @@ use foco_store::workspace::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::LazyLock;
+
+static AGENT_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"https?://[^\s<>\"']+"#).expect("valid Agent URL redaction regex")
+});
+static AGENT_SECRET_ASSIGNMENT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(?P<key>\b(?:authorization|api[-_ ]?key|password|cookie|access[-_ ]?token|refresh[-_ ]?token|client[-_ ]?secret)\b)\s*[:=]\s*(?:bearer\s+)?[^,\s;]+"#,
+    )
+    .expect("valid Agent secret redaction regex")
+});
+const AGENT_REDACTED_VALUE: &str = "<redacted>";
 
 use crate::runtime::{
     AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
@@ -77,12 +89,42 @@ pub(crate) struct AgentTaskActionRequest {
 pub(crate) struct AgentTeamSnapshotResponse {
     team: AgentTeamView,
     workload: TeamWorkload,
+    observability: AgentObservabilityView,
     instances: Vec<AgentInstanceView>,
     tasks: Vec<AgentTaskView>,
     dependencies: Vec<AgentTaskDependencyView>,
     messages: Vec<AgentMessageView>,
     events: Vec<AgentEventView>,
     mutation_lease_owners: Vec<AgentMutationLeaseOwnerView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentObservabilityView {
+    queue_length: i64,
+    queue_wait_ms: AgentMetricSummaryView,
+    run_duration_ms: AgentMetricSummaryView,
+    scheduler_latency_ms: AgentMetricSummaryView,
+    mutation_lease_wait_ms: AgentMetricSummaryView,
+    failed_tasks: usize,
+    cancelled_tasks: usize,
+    interrupted_tasks: usize,
+    failures_by_type: Vec<AgentFailureClassView>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMetricSummaryView {
+    count: usize,
+    max: Option<i64>,
+    average: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentFailureClassView {
+    kind: &'static str,
+    count: usize,
 }
 
 #[derive(Serialize)]
@@ -286,7 +328,8 @@ pub(crate) async fn enable_agent_team(
     Ok(Json(agent_team_snapshot_from_database(
         &state,
         &workspace_id,
-        &database, &team_id,
+        &database,
+        &team_id,
     )?))
 }
 
@@ -305,7 +348,8 @@ pub(crate) async fn agent_team_snapshot(
     Ok(Json(agent_team_snapshot_from_database(
         &state,
         &workspace_id,
-        &database, &team.id,
+        &database,
+        &team.id,
     )?))
 }
 
@@ -404,7 +448,8 @@ pub(crate) async fn create_agent_instances(
     Ok(Json(agent_team_snapshot_from_database(
         &state,
         &workspace_id,
-        &database, &team.id,
+        &database,
+        &team.id,
     )?))
 }
 
@@ -514,7 +559,8 @@ pub(crate) async fn agent_runtime_action(
     Ok(Json(agent_team_snapshot_from_database(
         &state,
         &workspace_id,
-        &database, &team.id,
+        &database,
+        &team.id,
     )?))
 }
 
@@ -821,7 +867,11 @@ fn agent_team_snapshot_from_database(
     messages.sort_by(|left, right| {
         left.created_at
             .cmp(&right.created_at)
-            .then(left.receiver_instance_id.as_str().cmp(right.receiver_instance_id.as_str()))
+            .then(
+                left.receiver_instance_id
+                    .as_str()
+                    .cmp(right.receiver_instance_id.as_str()),
+            )
             .then(left.sequence.cmp(&right.sequence))
     });
     let events = database
@@ -835,10 +885,13 @@ fn agent_team_snapshot_from_database(
         .blocking_owners(workspace_id, &[workspace_mutation_lock()])
         .into_iter()
         .map(AgentMutationLeaseOwnerView::from)
-        .collect();
+        .collect::<Vec<_>>();
+    let observability =
+        AgentObservabilityView::from_parts(&workload, &tasks, &events, &mutation_lease_owners);
     Ok(AgentTeamSnapshotResponse {
         team: AgentTeamView::from(team),
         workload,
+        observability,
         instances: instance_views,
         tasks,
         dependencies,
@@ -929,7 +982,7 @@ impl From<AgentMessageRecord> for AgentMessageView {
             related_task_id: message.related_task_id,
             reply_to_message_id: message.reply_to_message_id,
             kind: message.kind,
-            content: message.content,
+            content: redact_agent_text_or_json(&message.content),
             sequence: message.sequence,
             created_at: message.created_at,
             consumed_at: message.consumed_at,
@@ -949,12 +1002,99 @@ impl TryFrom<AgentEventRecord> for AgentEventView {
             task_id: event.task_id,
             attempt_id: event.attempt_id,
             message_id: event.message_id,
-            payload: serde_json::from_str(&event.payload_json).map_err(|source| {
-                ApiError::internal(format!("invalid persisted Agent event payload: {source}"))
-            })?,
+            payload: redact_agent_json(serde_json::from_str(&event.payload_json).map_err(
+                |source| {
+                    ApiError::internal(format!("invalid persisted Agent event payload: {source}"))
+                },
+            )?),
             created_at: event.created_at,
         })
     }
+}
+
+impl AgentObservabilityView {
+    fn from_parts(
+        workload: &TeamWorkload,
+        tasks: &[AgentTaskView],
+        events: &[AgentEventView],
+        mutation_lease_owners: &[AgentMutationLeaseOwnerView],
+    ) -> Self {
+        let failed_tasks = tasks
+            .iter()
+            .filter(|task| task.status == AgentTaskStatus::Failed)
+            .count();
+        let cancelled_tasks = tasks
+            .iter()
+            .filter(|task| task.status == AgentTaskStatus::Cancelled)
+            .count();
+        let interrupted_tasks = tasks
+            .iter()
+            .filter(|task| task.status == AgentTaskStatus::Interrupted)
+            .count();
+        let failures_by_type = [
+            ("failed", failed_tasks),
+            ("cancelled", cancelled_tasks),
+            ("interrupted", interrupted_tasks),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(kind, count)| AgentFailureClassView { kind, count })
+        .collect();
+
+        Self {
+            queue_length: i64::from(workload.queued_tasks),
+            queue_wait_ms: AgentMetricSummaryView::from_values(
+                events
+                    .iter()
+                    .filter_map(|event| agent_event_i64(event, "queueWaitMs")),
+            ),
+            run_duration_ms: AgentMetricSummaryView::from_values(
+                events
+                    .iter()
+                    .filter_map(|event| agent_event_i64(event, "runTimeMs")),
+            ),
+            scheduler_latency_ms: AgentMetricSummaryView::from_values(
+                events
+                    .iter()
+                    .filter_map(|event| agent_event_i64(event, "schedulerLatencyMs")),
+            ),
+            mutation_lease_wait_ms: AgentMetricSummaryView::from_values(
+                mutation_lease_owners
+                    .iter()
+                    .map(|owner| i64::try_from(owner.wait_ms).unwrap_or(i64::MAX)),
+            ),
+            failed_tasks,
+            cancelled_tasks,
+            interrupted_tasks,
+            failures_by_type,
+        }
+    }
+}
+
+impl AgentMetricSummaryView {
+    fn from_values(values: impl Iterator<Item = i64>) -> Self {
+        let mut count = 0usize;
+        let mut sum = 0i64;
+        let mut max = None;
+        for value in values {
+            count += 1;
+            sum = sum.saturating_add(value);
+            max = Some(max.map_or(value, |current: i64| current.max(value)));
+        }
+        Self {
+            count,
+            max,
+            average: if count == 0 {
+                None
+            } else {
+                Some(sum / i64::try_from(count).unwrap_or(i64::MAX))
+            },
+        }
+    }
+}
+
+fn agent_event_i64(event: &AgentEventView, key: &str) -> Option<i64> {
+    event.payload.get(key)?.as_i64()
 }
 
 impl From<ToolResourceLockOwnerSnapshot> for AgentMutationLeaseOwnerView {
@@ -983,28 +1123,147 @@ impl AgentTaskView {
             parent_task_id: task.parent_task_id,
             sequence: task.sequence,
             status: task.status,
-            input: serde_json::from_str(&task.input_json).map_err(|source| {
+            input: redact_agent_json(serde_json::from_str(&task.input_json).map_err(|source| {
                 ApiError::internal(format!("invalid persisted Agent task input: {source}"))
-            })?,
+            })?),
             result: task
                 .result_json
                 .map(|value| serde_json::from_str(&value))
                 .transpose()
                 .map_err(|source| {
                     ApiError::internal(format!("invalid persisted Agent task result: {source}"))
-                })?,
+                })?
+                .map(redact_agent_json),
             error: task
                 .error_json
                 .map(|value| serde_json::from_str(&value))
                 .transpose()
                 .map_err(|source| {
                     ApiError::internal(format!("invalid persisted Agent task error: {source}"))
-                })?,
+                })?
+                .map(redact_agent_json),
             attempts,
             created_at: task.created_at,
             updated_at: task.updated_at,
             started_at: task.started_at,
             completed_at: task.completed_at,
         })
+    }
+}
+
+fn redact_agent_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    if is_agent_sensitive_key(&key) {
+                        (
+                            key,
+                            serde_json::Value::String(AGENT_REDACTED_VALUE.to_string()),
+                        )
+                    } else {
+                        (key, redact_agent_json(value))
+                    }
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(redact_agent_json).collect())
+        }
+        serde_json::Value::String(value) => serde_json::Value::String(redact_agent_text(&value)),
+        value => value,
+    }
+}
+
+fn redact_agent_text_or_json(value: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(value)
+        .map(redact_agent_json)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| redact_agent_text(value))
+}
+
+fn redact_agent_text(value: &str) -> String {
+    let value = AGENT_URL_RE.replace_all(value, |captures: &regex::Captures<'_>| {
+        redact_agent_url(
+            captures
+                .get(0)
+                .map(|capture| capture.as_str())
+                .unwrap_or_default(),
+        )
+    });
+    AGENT_SECRET_ASSIGNMENT_RE
+        .replace_all(&value, "${key}=<redacted>")
+        .into_owned()
+}
+
+fn redact_agent_url(value: &str) -> String {
+    let Ok(mut url) = reqwest::Url::parse(value) else {
+        return value.to_string();
+    };
+    let has_sensitive_parts = !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some();
+    if !has_sensitive_parts {
+        return value.to_string();
+    }
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
+fn is_agent_sensitive_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(|character| character.to_lowercase())
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "authorization"
+            | "apikey"
+            | "password"
+            | "passwordhash"
+            | "cookie"
+            | "setcookie"
+            | "proxyauthorization"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "secret"
+            | "clientsecret"
+            | "credential"
+            | "credentials"
+            | "privatekey"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_snapshot_redaction_removes_secrets_and_url_sensitive_parts() {
+        let value = redact_agent_json(json!({
+            "apiKey": "key-123",
+            "inputTokens": 42,
+            "nested": {
+                "cookie": "session=secret",
+                "baseUrl": "https://user:pass@example.test/v1?api_key=secret#frag"
+            },
+            "message": "authorization: Bearer secret https://example.test/path?token=secret#fragment"
+        }));
+
+        assert_eq!(value["apiKey"], AGENT_REDACTED_VALUE);
+        assert_eq!(value["inputTokens"], 42);
+        assert_eq!(value["nested"]["cookie"], AGENT_REDACTED_VALUE);
+        assert_eq!(value["nested"]["baseUrl"], "https://example.test/v1");
+        let message = value["message"].as_str().expect("redacted message");
+        assert!(message.contains("authorization=<redacted>"));
+        assert!(message.contains("https://example.test/path"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("fragment"));
     }
 }

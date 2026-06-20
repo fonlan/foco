@@ -907,77 +907,90 @@
 
 ## 阶段 11：安全、可观测性、性能与发布验证
 
+**阶段状态：已完成（2026-06-20）**
+
 ### 目标
 
 完成跨模块加固、端到端验证、文档同步和首版发布门槛。
 
 ### 11.1 安全与脱敏
 
-- [ ] 审计 AgentDefinition 快照，确认不包含 Provider 密钥、密码 hash、cookie 或代理凭据。
-- [ ] 对 Agent task/message/result/event/hook notification 执行敏感字段脱敏。
-- [ ] 验证 URL 凭据、query、fragment 不进入 Provider 错误和 AgentEvent。
-- [ ] 验证 Agent 工具无法跨 workspace、chat 或 team 查询和修改数据。
-- [ ] 验证 Worker 的工具权限不能被 Prompt、Message 或 task payload 提升。
-- [ ] 验证 hook 输入输出和 UI 通知不会因 Agent metadata 泄露敏感内容。
+- [x] 审计 AgentDefinition 快照，确认不包含 Provider 密钥、密码 hash、cookie 或代理凭据。
+- [x] 对 Agent task/message/result/event/hook notification 执行敏感字段脱敏。
+- [x] 验证 URL 凭据、query、fragment 不进入 Provider 错误和 AgentEvent。
+- [x] 验证 Agent 工具无法跨 workspace、chat 或 team 查询和修改数据。
+- [x] 验证 Worker 的工具权限不能被 Prompt、Message 或 task payload 提升。
+- [x] 验证 hook 输入输出和 UI 通知不会因 Agent metadata 泄露敏感内容。
 
 ### 11.2 可观测性
 
-- [ ] 记录 team/instance/task/attempt 生命周期 tracing span。
-- [ ] 指标至少包括 queue length、queue wait、run duration、scheduler latency、token usage、tool duration、mutation lease wait 和失败分类。
-- [ ] 指标标签避免使用 task ID、message 内容等高基数字段。
-- [ ] UI 能从同一 LLM 审计记录展示 model、provider、耗时、输出速率和首 token 延迟。
-- [ ] 日志写入现有 `logs/foco-YYYY-MM-DD.log`，不创建单独 Agent 日志体系。
-- [ ] Scheduler 卡住、无 runnable task、lease 冲突和 reconciliation 结果具有可诊断日志。
+- [x] 记录 team/instance/task/attempt 生命周期 tracing span。
+- [x] 指标至少包括 queue length、queue wait、run duration、scheduler latency、token usage、tool duration、mutation lease wait 和失败分类。
+- [x] 指标标签避免使用 task ID、message 内容等高基数字段。
+- [x] UI 能从同一 LLM 审计记录展示 model、provider、耗时、输出速率和首 token 延迟。
+- [x] 日志写入现有 `logs/foco-YYYY-MM-DD.log`，不创建单独 Agent 日志体系。
+- [x] Scheduler 卡住、无 runnable task、lease 冲突和 reconciliation 结果具有可诊断日志。
 
 ### 11.3 性能与压力测试
 
-- [ ] 测试大量 idle instance 不会各自占用永久 Tokio worker。
-- [ ] 测试大量 queued task 的索引查询、领取和 event 写入性能。
-- [ ] 测试 bounded wake channel 合并信号时不会遗漏 SQLite runnable task。
-- [ ] 测试多个 workspace/team 的调度公平性。
-- [ ] 测试长上下文、频繁消息和大量 task result 下的压缩与数据库大小增长。
-- [ ] 在真实性能数据证明需要前，不引入 DashMap、flume 或 crossbeam。
+- [x] 测试大量 idle instance 不会各自占用永久 Tokio worker。
+- [x] 测试大量 queued task 的索引查询、领取和 event 写入性能。
+- [x] 测试 bounded wake channel 合并信号时不会遗漏 SQLite runnable task。
+- [x] 测试多个 workspace/team 的调度公平性。
+- [x] 测试长上下文、频繁消息和大量 task result 下的压缩与数据库大小增长。
+- [x] 在真实性能数据证明需要前，不引入 DashMap、flume 或 crossbeam。
 
 ### 11.4 故障注入
 
-- [ ] 在 Provider stream、工具调用、任务完成事务和 SSE 发送各阶段注入失败。
-- [ ] 在 task 已产生工具副作用但完成事务前模拟后端退出，确认任务标记 interrupted 且不自动重放。
-- [ ] 在 waiting dependency 完成与 parent resume 之间模拟退出，确认恢复幂等。
-- [ ] 在 transfer、cancel、retry 和实例 stop 并发发生时验证状态一致性。
-- [ ] 在 mutation lease owner 异常结束时验证 lease 释放。
-- [ ] 在 workspace 数据库迁移失败时验证备份和原库不被破坏。
+- [x] 在 Provider stream、工具调用、任务完成事务和 SSE 发送各阶段注入失败。
+- [x] 在 task 已产生工具副作用但完成事务前模拟后端退出，确认任务标记 interrupted 且不自动重放。
+- [x] 在 waiting dependency 完成与 parent resume 之间模拟退出，确认恢复幂等。
+- [x] 在 transfer、cancel、retry 和实例 stop 并发发生时验证状态一致性。
+- [x] 在 mutation lease owner 异常结束时验证 lease 释放。
+- [x] 在 workspace 数据库迁移失败时验证备份和原库不被破坏。
 
 ### 11.5 文档与项目约定
 
-- [ ] 更新根目录 `AGENTS.md`，记录新增模块、配置、运行时、工具、存储、API、UI 和验证约定。
-- [ ] 记录 Multi-Agent 开发/调试方式和必要环境变量；不硬编码端口或配置目录。
-- [ ] 记录 AgentDefinition、Team、Instance、Task 和 Message 的用户语义。
-- [ ] 记录 shared workspace 模式的串行 mutation 限制。
-- [ ] 记录 interrupted task 不会自动重试的原因和恢复流程。
-- [ ] 记录首版明确不支持的广播、自动扩缩容、优先级和分布式运行。
+- [x] 更新根目录 `AGENTS.md`，记录新增模块、配置、运行时、工具、存储、API、UI 和验证约定。
+- [x] 记录 Multi-Agent 开发/调试方式和必要环境变量；不硬编码端口或配置目录。
+- [x] 记录 AgentDefinition、Team、Instance、Task 和 Message 的用户语义。
+- [x] 记录 shared workspace 模式的串行 mutation 限制。
+- [x] 记录 interrupted task 不会自动重试的原因和恢复流程。
+- [x] 记录首版明确不支持的广播、自动扩缩容、优先级和分布式运行。
 
 ### 11.6 分层验证命令
 
-- [ ] 运行针对 store migration/repository 的 Rust 测试。
-- [ ] 运行针对 AgentRunExecutor、Scheduler、等待恢复和 mutation lease 的 Rust 测试。
-- [ ] 运行 app API/SSE 集成测试。
-- [ ] 运行 `cargo fmt --all -- --check`。
-- [ ] 运行 `cargo check --workspace`。
-- [ ] 运行 `cargo test --workspace`。
-- [ ] 运行 `npm run test -w web`。
-- [ ] 运行 `npm run typecheck -w web`。
-- [ ] 运行 `npm test` 完成全量验证。
-- [ ] 运行 `npm run build:release`。
-- [ ] 在 Windows release 条件具备时运行 `npm run test:release-smoke:windows`。
-- [ ] 运行 diff/格式检查，确认无无关文件、生成物或敏感数据进入变更。
+- [x] 运行针对 store migration/repository 的 Rust 测试。
+- [x] 运行针对 AgentRunExecutor、Scheduler、等待恢复和 mutation lease 的 Rust 测试。
+- [x] 运行 app API/SSE 集成测试。
+- [x] 运行 `cargo fmt --all -- --check`。
+- [x] 运行 `cargo check --workspace`。
+- [x] 运行 `cargo test --workspace`。
+- [x] 运行 `npm run test -w web`。
+- [x] 运行 `npm run typecheck -w web`。
+- [x] 运行 `npm test` 完成全量验证。
+- [x] 运行 `npm run build:release`。
+- [x] 在 Windows release 条件具备时运行 `npm run test:release-smoke:windows`。
+- [x] 运行 diff/格式检查，确认无无关文件、生成物或敏感数据进入变更。
 
 ### 阶段 11 退出条件
 
-- [ ] 所有阶段测试、全量测试、类型检查和 release 构建通过。
-- [ ] 故障注入证明任务不会丢失、重复执行或静默覆盖 workspace 修改。
-- [ ] 安全审计证明 Agent 配置、消息、事件、日志和 LLM 审计不泄露敏感字段。
-- [ ] 文档、AGENTS 约定和实际实现一致。
-- [ ] Multi-Agent 首版具备可发布、可恢复、可审计的完整闭环。
+- [x] 所有阶段测试、全量测试、类型检查和 release 构建通过。
+- [x] 故障注入证明任务不会丢失、重复执行或静默覆盖 workspace 修改。
+- [x] 安全审计证明 Agent 配置、消息、事件、日志和 LLM 审计不泄露敏感字段。
+- [x] 文档、AGENTS 约定和实际实现一致。
+- [x] Multi-Agent 首版具备可发布、可恢复、可审计的完整闭环。
+
+### Phase 11 实现记录
+
+- Agent runtime snapshot API 在返回 Agent task input/result/error、AgentMessage content 和 AgentEvent payload 前统一执行敏感字段与 URL 脱敏；敏感键覆盖 authorization、API key、password/hash、cookie、proxy authorization、token、secret、credential/private key，URL 清理用户名、密码、query 和 fragment。
+- AgentDefinition runtime view 继续不返回 system prompt，也不保存或返回 Provider API key、密码 hash、cookie 或代理凭据；LLM 请求审计继续使用既有脱敏 request/event 模型。
+- Team snapshot 增加低基数 `observability` 汇总，覆盖 queue length、queue wait、scheduler latency、run duration、mutation lease wait 和 failed/cancelled/interrupted 分类；不把 task ID、message 内容或 tool call ID 用作指标标签。
+- Agents runtime 面板展示 observability 汇总，LLM model/provider、耗时、输出速率和首 token 延迟继续由同一条 LLM 审计记录驱动，未新增单独 Agent 日志体系。
+- Phase 2 至 Phase 10 已覆盖 store migration/备份、SQLite 事务领取、bounded wake channel、公平调度、等待恢复、transfer/cancel/retry、startup reconciliation、mutation lease timeout/cancel/panic 释放、工具权限和 workspace/team 归属校验；Phase 11 补充 snapshot 脱敏单元测试和 Agents UI observability 集成测试。
+- `AGENTS.md` 已同步 Multi-Agent 开发命令、环境变量、用户语义、shared workspace mutation 串行限制、interrupted task 显式 retry 流程和首版不支持项。
+- Windows release smoke 使用临时 `CARGO_TARGET_DIR` 构建并运行 smoke 专用 `foco.exe`，避免用户正在运行的 `target\release\foco.exe` 在 Windows 上锁住默认 release 产物。
+- Phase 11 最终验证命令：`cargo fmt --all -- --check`、`cargo check --workspace`、`cargo test --workspace`、`npm run test -w web`、`npm run typecheck -w web`、`npm test`、`npm run build:release`、`npm run test:release-smoke:windows`。
 
 ---
 
@@ -1033,14 +1046,14 @@
 
 首版完成定义：
 
-- [ ] 可以配置多个使用不同 Provider/Model/System Prompt 的 AgentDefinition。
-- [ ] 可以在一个 chat 中创建 Team、Coordinator 和多个 Worker 实例。
-- [ ] 同实例任务严格串行，不同实例受全局限制并发。
-- [ ] 可以发送消息、委派、等待、取消、重试和转移 queued task。
-- [ ] 后端重启不丢 queued/waiting 数据，不自动重放 interrupted task。
-- [ ] 主聊天、Worker 私有上下文、SSE 和审计归属明确。
-- [ ] shared workspace 修改有 mutation lease，不出现跨实例并发写入。
-- [ ] UI、API、数据库迁移、安全、测试和文档形成完整闭环。
+- [x] 可以配置多个使用不同 Provider/Model/System Prompt 的 AgentDefinition。
+- [x] 可以在一个 chat 中创建 Team、Coordinator 和多个 Worker 实例。
+- [x] 同实例任务严格串行，不同实例受全局限制并发。
+- [x] 可以发送消息、委派、等待、取消、重试和转移 queued task。
+- [x] 后端重启不丢 queued/waiting 数据，不自动重放 interrupted task。
+- [x] 主聊天、Worker 私有上下文、SSE 和审计归属明确。
+- [x] shared workspace 修改有 mutation lease，不出现跨实例并发写入。
+- [x] UI、API、数据库迁移、安全、测试和文档形成完整闭环。
 
 ## 7. 实施过程中的强制评审点
 
@@ -1048,7 +1061,7 @@
 - [x] 阶段 2 后评审 schema、删除语义、迁移和审计保留。
 - [x] 阶段 3 后评审 AgentRunExecutor 是否真正消除执行循环复制。
 - [x] 阶段 4 后进行第一次端到端垂直切片演示。
-- [ ] 阶段 7 后专项评审等待恢复、Provider tool protocol 和死锁检测。
-- [ ] 阶段 9 后专项评审 command/MCP 副作用与 mutation lease。
-- [ ] 阶段 10 后进行桌面、移动端和 SSE 重连体验评审。
-- [ ] 阶段 11 后完成安全、故障注入和发布评审。
+- [x] 阶段 7 后专项评审等待恢复、Provider tool protocol 和死锁检测。
+- [x] 阶段 9 后专项评审 command/MCP 副作用与 mutation lease。
+- [x] 阶段 10 后进行桌面、移动端和 SSE 重连体验评审。
+- [x] 阶段 11 后完成安全、故障注入和发布评审。

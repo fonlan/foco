@@ -256,6 +256,8 @@ export function AgentsRuntimePanel({
             tasks={sortedTasks}
           />
 
+          <AgentObservabilitySection observability={snapshot.observability} />
+
           <AgentTimelineSection
             events={sortedEvents.slice(0, 16)}
             messages={sortedMessages.slice(0, 12)}
@@ -431,6 +433,60 @@ function AgentTasksSection({
   );
 }
 
+function AgentObservabilitySection({
+  observability,
+}: {
+  observability: AgentTeamSnapshotResponse["observability"];
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="rounded-xl border border-stone-200 bg-white px-3 py-3">
+      <h4 className="text-sm font-semibold text-stone-950">
+        {t("Observability")}
+      </h4>
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <AgentMetric label={t("Queue length")} value={observability.queueLength} />
+        <AgentMetric
+          label={t("Queue wait")}
+          value={formatAgentMetricMs(observability.queueWaitMs.average)}
+        />
+        <AgentMetric
+          label={t("Scheduler latency")}
+          value={formatAgentMetricMs(observability.schedulerLatencyMs.average)}
+        />
+        <AgentMetric
+          label={t("Run duration")}
+          value={formatAgentMetricMs(observability.runDurationMs.average)}
+        />
+        <AgentMetric
+          label={t("Lease wait")}
+          value={formatAgentMetricMs(observability.mutationLeaseWaitMs.average)}
+        />
+        <AgentMetric
+          label={t("Failures")}
+          value={observability.failuresByType.reduce(
+            (total, failure) => total + failure.count,
+            0,
+          )}
+        />
+      </div>
+      {observability.failuresByType.length ? (
+        <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] font-semibold uppercase tracking-normal text-stone-500">
+          {observability.failuresByType.map((failure) => (
+            <span key={failure.kind}>
+              {failure.kind}: {failure.count}
+            </span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function formatAgentMetricMs(value: number | null) {
+  return value === null ? "-" : `${value}ms`;
+}
+
 function AgentTimelineSection({
   events,
   messages,
@@ -498,7 +554,7 @@ function AgentDefinitionSelect({
   );
 }
 
-function AgentMetric({ label, value }: { label: string; value: number }) {
+function AgentMetric({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="rounded-xl border border-stone-200 bg-white px-3 py-2">
       <div className="text-lg font-semibold text-stone-950">{value}</div>

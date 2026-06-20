@@ -787,9 +787,33 @@ export type AgentMutationLeaseOwnerView = {
   waitMs: number;
 };
 
+export type AgentMetricSummaryView = {
+  count: number;
+  max: number | null;
+  average: number | null;
+};
+
+export type AgentFailureClassView = {
+  kind: string;
+  count: number;
+};
+
+export type AgentObservabilityView = {
+  queueLength: number;
+  queueWaitMs: AgentMetricSummaryView;
+  runDurationMs: AgentMetricSummaryView;
+  schedulerLatencyMs: AgentMetricSummaryView;
+  mutationLeaseWaitMs: AgentMetricSummaryView;
+  failedTasks: number;
+  cancelledTasks: number;
+  interruptedTasks: number;
+  failuresByType: AgentFailureClassView[];
+};
+
 export type AgentTeamSnapshotResponse = {
   team: AgentTeamView;
   workload: AgentWorkload;
+  observability: AgentObservabilityView;
   instances: AgentInstanceView[];
   tasks: AgentTaskView[];
   dependencies: AgentTaskDependencyView[];

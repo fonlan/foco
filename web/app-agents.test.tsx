@@ -44,6 +44,8 @@ describe("app agents verification surfaces", () => {
     });
     expect(await screen.findByText("agent-team-1")).toBeInTheDocument();
     expect(screen.getByText("team_created")).toBeInTheDocument();
+    expect(screen.getByText("Observability")).toBeInTheDocument();
+    expect(screen.getByText("Queue wait")).toBeInTheDocument();
     expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
   });
 });

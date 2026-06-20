@@ -375,6 +375,17 @@ export const agentTeamSnapshot = {
     },
   ],
   mutationLeaseOwners: [],
+  observability: {
+    cancelledTasks: 0,
+    failedTasks: 0,
+    failuresByType: [],
+    interruptedTasks: 0,
+    mutationLeaseWaitMs: { average: null, count: 0, max: null },
+    queueLength: 0,
+    queueWaitMs: { average: 1000, count: 1, max: 1000 },
+    runDurationMs: { average: null, count: 0, max: null },
+    schedulerLatencyMs: { average: 500, count: 1, max: 500 },
+  },
   tasks: [
     {
       attempts: [],
