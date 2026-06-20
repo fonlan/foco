@@ -332,6 +332,9 @@ pub(crate) async fn save_general_settings(
         apply_auto_start_setting(auto_start_enabled)?;
         config.app.auto_start_enabled = auto_start_enabled;
     }
+    if let Some(default_team_mode_enabled) = request.default_team_mode_enabled {
+        config.app.default_team_mode_enabled = default_team_mode_enabled;
+    }
     validate_tray_menu_language(&config.app.language)?;
 
     save_config(&state, config.clone())?;

@@ -123,6 +123,7 @@ export const settings = {
   ],
   general: {
     autoStartEnabled: false,
+    defaultTeamModeEnabled: false,
     hookAuditEnabled: false,
     language: "en",
     llmRequestRetryCount: 3,
@@ -1249,6 +1250,10 @@ export function savedGeneralSettings(init?: RequestInit) {
         typeof body.hookAuditEnabled === "boolean"
           ? body.hookAuditEnabled
           : settings.general.hookAuditEnabled,
+      defaultTeamModeEnabled:
+        typeof body.defaultTeamModeEnabled === "boolean"
+          ? body.defaultTeamModeEnabled
+          : settings.general.defaultTeamModeEnabled,
       language:
         body.language === "zh-CN" || body.language === "en"
           ? body.language

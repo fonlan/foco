@@ -36,12 +36,15 @@ type AgentDefinitionDraft = {
 
 export function AgentsSettingsPanel({
   agentTools,
+  defaultTeamModeEnabled,
   definitions,
   error,
   isLoading,
+  isSavingDefaultTeamMode,
   operationKey,
   models,
   onCreateDefinition,
+  onDefaultTeamModeEnabledChange,
   onDeleteDefinition,
   onUpdateDefinition,
   providers,
@@ -49,12 +52,15 @@ export function AgentsSettingsPanel({
   thinkingLevels,
 }: {
   agentTools: string[];
+  defaultTeamModeEnabled: boolean;
   definitions: AgentDefinitionSettings[];
   error: string | null;
   isLoading: boolean;
+  isSavingDefaultTeamMode: boolean;
   operationKey: string | null;
   models: ConfiguredModelSummary[];
   onCreateDefinition: (definition: AgentDefinitionInput) => Promise<boolean>;
+  onDefaultTeamModeEnabledChange: (enabled: boolean) => Promise<void>;
   onDeleteDefinition: (id: string) => Promise<void>;
   onUpdateDefinition: (
     id: string,
@@ -211,6 +217,21 @@ export function AgentsSettingsPanel({
           <Plus aria-hidden="true" className="size-4" />
         </button>
       </div>
+
+      <label className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+        <span className="text-sm font-semibold text-stone-700">
+          {t("Default Team mode for new chats")}
+        </span>
+        <input
+          checked={defaultTeamModeEnabled}
+          className="size-4 accent-teal-700"
+          disabled={isSavingDefaultTeamMode}
+          onChange={(event) =>
+            void onDefaultTeamModeEnabledChange(event.target.checked)
+          }
+          type="checkbox"
+        />
+      </label>
 
       {error ? (
         <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">

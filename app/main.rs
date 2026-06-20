@@ -1584,6 +1584,7 @@ struct WorkspaceLogoFile {
 #[serde(rename_all = "camelCase")]
 struct ManualGeneralSettingsRequest {
     auto_start_enabled: Option<bool>,
+    default_team_mode_enabled: Option<bool>,
     listen_host: String,
     listen_port: u32,
     llm_request_retry_count: Option<u32>,
@@ -2054,6 +2055,7 @@ struct GithubReleaseAsset {
 #[serde(rename_all = "camelCase")]
 struct GeneralSettingsSummary {
     auto_start_enabled: bool,
+    default_team_mode_enabled: bool,
     web_server: WebServerSettingsSummary,
     llm_request_retry_count: u32,
     max_llm_request_retry_count: u32,

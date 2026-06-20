@@ -27,6 +27,7 @@ pub(crate) async fn settings_response(
     Ok(Json(SettingsResponse {
         general: GeneralSettingsSummary {
             auto_start_enabled: config.app.auto_start_enabled,
+            default_team_mode_enabled: config.app.default_team_mode_enabled,
             web_server: WebServerSettingsSummary {
                 listen_host: config.app.web_server.listen_host.clone(),
                 listen_port: config.app.web_server.listen_port,

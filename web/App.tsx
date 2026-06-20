@@ -904,6 +904,7 @@ export function App() {
     try {
       const data = await requestJson<SettingsResponse>("/api/settings");
       setSettings(data);
+      setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -2546,6 +2547,7 @@ export function App() {
     setActiveWorkspaceId(workspaceId);
     setActiveChatId(null);
     setActiveMainTab({ chatId: null, type: "chat", workspaceId });
+    setIsTeamModeEnabled(settings?.general.defaultTeamModeEnabled ?? false);
     setMessages([]);
     setSelectedDiffPath(null);
     setViewMode("chat");
@@ -5936,7 +5938,10 @@ export function App() {
                   onDeleteAgentDefinition={deleteAgentDefinition}
                   onUpdateAgentDefinition={updateAgentDefinition}
                   onLogout={handleLogout}
-                  onSettingsChange={setSettings}
+                  onSettingsChange={(data) => {
+                    setSettings(data);
+                    setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
+                  }}
                   onWorkspacesChange={refreshWorkspaces}
                   workspaceDialogRevision={workspaceDialogRevision}
                 />
@@ -12833,6 +12838,38 @@ function SettingsPanel({
     }
   }
 
+  async function saveDefaultTeamModeEnabled(defaultTeamModeEnabled: boolean) {
+    if (!settings) {
+      return;
+    }
+
+    setIsSavingGeneral(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings/general", {
+        body: JSON.stringify({
+          clearPassword: false,
+          defaultTeamModeEnabled,
+          hookAuditEnabled: settings.general.hookAuditEnabled,
+          listenHost: settings.general.webServer.listenHost,
+          listenPort: settings.general.webServer.listenPort,
+          language: settings.general.language,
+          password: null,
+          theme: settings.general.theme,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingGeneral(false);
+    }
+  }
+
   async function refreshHookRuns() {
     const workspaceId = selectedHookWorkspace?.id;
     if (!workspaceId) {
@@ -13849,11 +13886,14 @@ function SettingsPanel({
           {activeSection === "agents" ? (
             <AgentsSettingsPanel
               agentTools={settings?.agentTools ?? []}
+              defaultTeamModeEnabled={settings?.general.defaultTeamModeEnabled ?? false}
               definitions={agentDefinitions}
               error={agentDefinitionsError}
               isLoading={isLoadingAgentDefinitions}
+              isSavingDefaultTeamMode={isSavingGeneral}
               models={configuredModelsByName}
               onCreateDefinition={onCreateAgentDefinition}
+              onDefaultTeamModeEnabledChange={saveDefaultTeamModeEnabled}
               onDeleteDefinition={onDeleteAgentDefinition}
               onUpdateDefinition={onUpdateAgentDefinition}
               operationKey={agentDefinitionOperationKey}

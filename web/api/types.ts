@@ -941,6 +941,7 @@ type AppThemeSummary = {
 
 export type GeneralSettingsSummary = {
   autoStartEnabled: boolean;
+  defaultTeamModeEnabled: boolean;
   hookAuditEnabled: boolean;
   language: AppLanguageId;
   llmRequestRetryCount: number;

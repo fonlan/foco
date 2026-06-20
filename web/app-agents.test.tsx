@@ -26,6 +26,9 @@ describe("app agents verification surfaces", () => {
     expect(screen.getAllByText("Coordinator").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Worker").length).toBeGreaterThan(0);
     expect(screen.getByText("Coordinates the Agent team.")).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: "Default Team mode for new chats" }),
+    ).not.toBeChecked();
     expect(screen.getByRole("button", { name: "Edit agent Coordinator" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Delete agent Coordinator" })).toBeInTheDocument();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -36,6 +39,30 @@ describe("app agents verification surfaces", () => {
     await userEvent.click(within(dialog).getByText("Allowed tools"));
     await userEvent.click(within(dialog).getByRole("checkbox", { name: "read_file" }));
     expect(within(dialog).getByText("1 selected")).toBeInTheDocument();
+  });
+
+  it("saves the default Team mode setting from the Agents panel", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Agents" }));
+    await userEvent.click(
+      await screen.findByRole("checkbox", {
+        name: "Default Team mode for new chats",
+      }),
+    );
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/settings/general",
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(saveCall![1]?.body as string)).toMatchObject({
+        defaultTeamModeEnabled: true,
+      });
+    });
   });
 
   it("localizes the Agents settings surface", async () => {
@@ -154,6 +181,49 @@ describe("app agents verification surfaces", () => {
       const [, init] = queueCall!;
       expect(JSON.parse(init?.body as string)).toMatchObject({
         message: "coordinate this",
+        teamModeEnabled: true,
+      });
+    });
+  });
+
+  it("uses the configured Team mode default for a new composer", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        return path === "/api/settings"
+          ? jsonResponse({
+            ...settings,
+            general: {
+              ...settings.general,
+              defaultTeamModeEnabled: true,
+            },
+          })
+          : mockFetch(input, init);
+      }),
+    );
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    const teamToggle = await screen.findByRole("button", { name: "Team mode" });
+    expect(teamToggle).toHaveAttribute("aria-pressed", "true");
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "use the default",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const queueCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
+      );
+      expect(queueCall).toBeDefined();
+      expect(JSON.parse(queueCall![1]?.body as string)).toMatchObject({
+        message: "use the default",
         teamModeEnabled: true,
       });
     });

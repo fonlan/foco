@@ -377,6 +377,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Close agent dialog backdrop": "关闭智能体弹窗背景",
     "Loading agent definitions...": "正在加载智能体定义...",
     "No agent definitions": "暂无智能体定义",
+    "Default Team mode for new chats": "新会话默认团队模式",
     Description: "描述",
     Edit: "编辑",
     Create: "创建",

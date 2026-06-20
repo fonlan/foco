@@ -932,6 +932,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
         &ManualGeneralSettingsRequest {
             auto_start_enabled: None,
             clear_password: None,
+            default_team_mode_enabled: None,
             hook_audit_enabled: None,
             language: "en".to_string(),
             llm_request_retry_count: None,
@@ -949,6 +950,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
         &ManualGeneralSettingsRequest {
             auto_start_enabled: None,
             clear_password: None,
+            default_team_mode_enabled: None,
             hook_audit_enabled: None,
             language: "en".to_string(),
             llm_request_retry_count: None,
@@ -972,6 +974,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
         &ManualGeneralSettingsRequest {
             auto_start_enabled: None,
             clear_password: Some(true),
+            default_team_mode_enabled: None,
             hook_audit_enabled: None,
             language: "en".to_string(),
             llm_request_retry_count: None,
