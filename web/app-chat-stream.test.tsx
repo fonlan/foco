@@ -595,8 +595,8 @@ describe("app-chat-stream verification surfaces", () => {
       screen.getByPlaceholderText(defaultComposerPlaceholder),
       "next task",
     );
-    await userEvent.click(screen.getByLabelText("Provider"));
-    await userEvent.click(screen.getByRole("button", { name: "Provider: Anthropic" }));
+    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: "Anthropic: GPT Test" }));
     await userEvent.click(screen.getByLabelText("Thinking"));
     await userEvent.click(screen.getByRole("button", { name: "Thinking: High" }));
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
@@ -1396,8 +1396,8 @@ describe("app-chat-stream verification surfaces", () => {
     );
     expect(await screen.findByText("note.txt")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByLabelText("Provider"));
-    await userEvent.click(screen.getByRole("button", { name: "Provider: Anthropic" }));
+    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: "Anthropic: GPT Test" }));
     await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "Review it");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 

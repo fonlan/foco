@@ -232,20 +232,27 @@ export function ChatPanel({
   const composerPlaceholder = workspaceName
     ? t("Ask Foco anything about {name}...", { name: workspaceName })
     : t("Ask Foco anything...");
-  const modelOptions = availableModels.map((model) => ({
-    label: model.displayName,
-    value: model.id,
-  }));
-  const selectedModel =
-    availableModels.find((model) => model.id === selectedModelId) ?? null;
   const providersById = new Map(providers.map((provider) => [provider.id, provider]));
-  const providerOptions = (selectedModel?.providerIds ?? []).map((providerId) => {
-    const provider = providersById.get(providerId);
-    return {
-      label: provider?.name ?? providerId,
-      value: providerId,
-    };
-  });
+  const providerIdsForAvailableModels = Array.from(
+    new Set(availableModels.flatMap((model) => model.providerIds)),
+  );
+  const modelProviderGroups = [
+    ...providers
+      .map((provider) => provider.id)
+      .filter((providerId) => providerIdsForAvailableModels.includes(providerId)),
+    ...providerIdsForAvailableModels.filter(
+      (providerId) => !providersById.has(providerId),
+    ),
+  ].map((providerId) => ({
+    providerId,
+    providerLabel: providersById.get(providerId)?.name ?? providerId,
+    models: availableModels
+      .filter((model) => model.providerIds.includes(providerId))
+      .map((model) => ({
+        label: model.displayName,
+        value: model.id,
+      })),
+  }));
   const thinkingOptions = [
     { label: t("Model default"), value: "" },
     ...thinkingLevels.map((level) => ({
@@ -416,6 +423,15 @@ export function ChatPanel({
     }
 
     onGuideActiveRun();
+  }
+
+  function handleModelProviderChange(providerId: string, modelId: string) {
+    if (modelId !== selectedModelId) {
+      onModelChange(modelId);
+    }
+    if (providerId !== selectedProviderId) {
+      onProviderChange(providerId);
+    }
   }
 
   function handlePaste(event: ReactClipboardEvent<HTMLTextAreaElement>) {
@@ -845,29 +861,15 @@ export function ChatPanel({
                   <span className="composer-team-toggle-label">{t("Team")}</span>
                 </button>
               ) : null}
-              <ComposerSelectMenu
+              <ComposerModelProviderMenu
                 ariaLabel={t("Model")}
-                className="composer-model-select max-w-full"
-                disabled={isLoadingSettings || !modelOptions.length}
+                className="composer-model-provider-select max-w-full"
+                disabled={isLoadingSettings || !modelProviderGroups.length}
                 emptyLabel={t("No enabled models")}
-                icon={Bot}
-                onChange={onModelChange}
-                options={modelOptions}
-                selectedValue={selectedModelId}
-              />
-              <ComposerSelectMenu
-                ariaLabel={t("Provider")}
-                className="composer-provider-select max-w-full"
-                disabled={
-                  isLoadingSettings ||
-                  !selectedModelId ||
-                  !providerOptions.length
-                }
-                emptyLabel={t("Provider")}
-                icon={Server}
-                onChange={onProviderChange}
-                options={providerOptions}
-                selectedValue={selectedProviderId}
+                groups={modelProviderGroups}
+                onChange={handleModelProviderChange}
+                selectedModelId={selectedModelId}
+                selectedProviderId={selectedProviderId}
               />
               <ComposerSelectMenu
                 ariaLabel={t("Thinking")}
@@ -1024,6 +1026,127 @@ type ComposerSelectOption = {
   label: string;
   value: string;
 };
+
+type ComposerModelProviderGroup = {
+  providerId: string;
+  providerLabel: string;
+  models: ComposerSelectOption[];
+};
+
+function ComposerModelProviderMenu({
+  ariaLabel,
+  className,
+  disabled,
+  emptyLabel,
+  groups,
+  onChange,
+  selectedModelId,
+  selectedProviderId,
+}: {
+  ariaLabel: string;
+  className: string;
+  disabled: boolean;
+  emptyLabel: string;
+  groups: ComposerModelProviderGroup[];
+  onChange: (providerId: string, modelId: string) => void;
+  selectedModelId: string;
+  selectedProviderId: string;
+}) {
+  const selectedProvider =
+    groups.find((group) => group.providerId === selectedProviderId) ?? null;
+  const selectedModel =
+    selectedProvider?.models.find((model) => model.value === selectedModelId) ??
+    groups.flatMap((group) => group.models).find((model) => model.value === selectedModelId) ??
+    null;
+  const selectedLabel =
+    selectedProvider && selectedModel
+      ? `${selectedProvider.providerLabel} / ${selectedModel.label}`
+      : selectedModel?.label ?? emptyLabel;
+  const detailsRef = useCloseDetailsOnOutsidePointerDown();
+
+  function handleSelect(
+    providerId: string,
+    modelId: string,
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) {
+    event.currentTarget.closest("details")?.removeAttribute("open");
+    detailsRef.current?.removeAttribute("open");
+    onChange(providerId, modelId);
+  }
+
+  return (
+    <details
+      className={`composer-select-menu group relative ${className}`}
+      ref={detailsRef}
+    >
+      <summary
+        aria-disabled={disabled}
+        aria-label={ariaLabel}
+        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
+          }`}
+        title={selectedLabel}
+      >
+        <Server aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <span className="composer-select-label min-w-0 flex-1 truncate">
+          {selectedLabel}
+        </span>
+        <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
+      </summary>
+      <div className="composer-select-popover absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
+        <div className="panel-scroll max-h-64 overflow-y-auto py-1">
+          {groups.length ? (
+            groups.map((group) => (
+              <details
+                className="composer-model-provider-group"
+                key={group.providerId}
+                open={group.providerId === selectedProviderId}
+              >
+                <summary
+                  className={`composer-model-provider-summary flex min-h-9 w-full cursor-pointer list-none items-center gap-2 px-3 py-2 text-left text-sm font-semibold marker:hidden hover:bg-stone-50 ${group.providerId === selectedProviderId
+                      ? "text-teal-900"
+                      : "text-stone-700"
+                    }`}
+                  title={group.providerLabel}
+                >
+                  <Server aria-hidden="true" className="size-3.5 shrink-0" />
+                  <span className="min-w-0 flex-1 truncate">
+                    {group.providerLabel}
+                  </span>
+                  <ChevronRight aria-hidden="true" className="size-3.5 shrink-0" />
+                </summary>
+                <div className="composer-model-provider-models border-l border-stone-100 py-1">
+                  {group.models.map((model) => (
+                    <button
+                      aria-label={`${group.providerLabel}: ${model.label}`}
+                      className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 pl-8 text-left text-sm hover:bg-stone-50 ${group.providerId === selectedProviderId && model.value === selectedModelId
+                          ? "font-semibold text-teal-900"
+                          : "text-stone-700"
+                        }`}
+                      key={model.value}
+                      onClick={(event) =>
+                        handleSelect(group.providerId, model.value, event)
+                      }
+                      type="button"
+                    >
+                      <Bot aria-hidden="true" className="size-3.5 shrink-0" />
+                      <span className="min-w-0 flex-1 truncate">{model.label}</span>
+                      {group.providerId === selectedProviderId &&
+                        model.value === selectedModelId ? (
+                        <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
+                      ) : null}
+                    </button>
+                  ))}
+                </div>
+              </details>
+            ))
+          ) : (
+            <div className="px-3 py-3 text-sm text-stone-500">{emptyLabel}</div>
+          )}
+        </div>
+      </div>
+    </details>
+  );
+}
 
 function ComposerSelectMenu({
   ariaLabel,

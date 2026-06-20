@@ -554,6 +554,10 @@ summary:focus-visible {
   color: var(--foco-accent-strong);
 }
 
+.composer-model-provider-select {
+  width: 15rem;
+}
+
 .composer-model-select {
   width: 12rem;
 }
@@ -909,8 +913,9 @@ summary:focus-visible {
     flex-wrap: wrap;
   }
 
+  .composer-model-provider-select,
   .composer-model-select {
-    flex: 1 1 5.5rem;
+    flex: 1 1 7.5rem;
     min-width: 0;
     width: auto;
   }

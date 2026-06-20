@@ -14131,21 +14131,6 @@ function SettingsPanel({
                     )}
                     {t("Save")}
                   </button>
-                  <button
-                    aria-label={t("Reload prompt settings")}
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-                    disabled={isLoadingSettings}
-                    onClick={() => void loadSettings()}
-                    title={t("Reload settings")}
-                    type="button"
-                  >
-                    {isLoadingSettings ? (
-                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                    ) : (
-                      <RefreshCw aria-hidden="true" className="size-4" />
-                    )}
-                    {t("Reload")}
-                  </button>
                 </div>
               </form>
             </section>
