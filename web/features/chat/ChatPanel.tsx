@@ -833,16 +833,16 @@ export function ChatPanel({
                 <button
                   aria-label={t("Team mode")}
                   aria-pressed={isTeamModeEnabled}
-                  className={`inline-flex h-8 items-center gap-1.5 rounded-full border px-2.5 text-xs font-semibold transition ${isTeamModeEnabled
-                    ? "border-teal-700 bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.18)]"
-                    : "border-stone-200 bg-stone-50/80 text-stone-700 hover:border-stone-300 hover:bg-white"
+                  className={`composer-team-toggle ${isTeamModeEnabled
+                    ? "composer-team-toggle-enabled"
+                    : ""
                     }`}
                   onClick={() => onTeamModeEnabledChange(!isTeamModeEnabled)}
                   title={t("Team mode")}
                   type="button"
                 >
                   <Bot aria-hidden="true" className="size-3.5 shrink-0" />
-                  <span>{t("Team")}</span>
+                  <span className="composer-team-toggle-label">{t("Team")}</span>
                 </button>
               ) : null}
               <ComposerSelectMenu
