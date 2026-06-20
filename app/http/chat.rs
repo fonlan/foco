@@ -134,7 +134,7 @@ pub(crate) async fn queue_chat_message(
         (chat_id, chat.title)
     };
 
-    if team_mode_enabled && team.is_none() {
+    if team.is_none() {
         let definition = default_agent_definition(&state, &config, &prompt_context).await?;
         validate_agent_snapshot_for_workspace(&config, workspace, &definition)?;
         let team_id = foco_agent::AgentTeamId::new(unique_id("agent-team"))
@@ -171,6 +171,7 @@ pub(crate) async fn queue_chat_message(
             message: task_message,
             attachments: task_attachments,
             skill_ids: requested_skill_ids.clone(),
+            collaboration_tools_enabled: team_mode_enabled,
             delegated_input: None,
             correlation_id: None,
         })

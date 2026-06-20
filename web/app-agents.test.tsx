@@ -92,7 +92,33 @@ describe("app agents verification surfaces", () => {
     expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
   });
 
-  it("queues the first message with Team mode enabled from the composer", async () => {
+  it("queues the first message with Team tools disabled by default from the composer", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    const teamToggle = await screen.findByRole("button", { name: "Team mode" });
+    expect(teamToggle).toHaveAttribute("aria-pressed", "false");
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "handle this",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const queueCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
+      );
+      expect(queueCall).toBeDefined();
+      const [, init] = queueCall!;
+      expect(JSON.parse(init?.body as string)).toMatchObject({
+        message: "handle this",
+        teamModeEnabled: false,
+      });
+    });
+  });
+
+  it("queues the first message with Team tools enabled from the composer", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 

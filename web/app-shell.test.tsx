@@ -676,16 +676,28 @@ describe("app-shell verification surfaces", () => {
         ),
       ).toBe(true);
     });
+    const chatQueueCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/queue",
+    );
     const chatStreamCall = fetchMock.mock.calls.find(
       ([url]) =>
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/chat/stream",
     );
 
-    expect(JSON.parse(String(chatStreamCall?.[1]?.body))).toEqual(
+    expect(JSON.parse(String(chatQueueCall?.[1]?.body))).toEqual(
       expect.objectContaining({
         chatId: null,
         message: "Fresh task",
+      }),
+    );
+    expect(JSON.parse(String(chatStreamCall?.[1]?.body))).toEqual(
+      expect.objectContaining({
+        chatId: "queued-chat-1",
+        message: "Fresh task",
+        queuedUserMessageId: "queued-user-1",
       }),
     );
 

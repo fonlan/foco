@@ -707,6 +707,80 @@ CREATE INDEX agent_instances_execution_workspace_idx
     ON agent_instances (team_id, execution_workspace_mode, worktree_status);
 "#;
 
+pub(crate) const MIGRATION_014: &str = r#"
+ALTER TABLE agent_events RENAME TO agent_events_old;
+
+CREATE TABLE agent_events (
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    event_type TEXT NOT NULL CHECK (length(event_type) > 0),
+    instance_id TEXT,
+    task_id TEXT,
+    attempt_id TEXT,
+    message_id TEXT,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, sequence),
+    FOREIGN KEY (team_id, instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, attempt_id)
+        REFERENCES agent_attempts(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, message_id)
+        REFERENCES agent_messages(team_id, id) ON DELETE SET NULL
+);
+
+INSERT INTO agent_events
+    (team_id, sequence, event_type, instance_id, task_id, attempt_id,
+     message_id, payload_json, created_at)
+SELECT
+    team_id, sequence, event_type, instance_id, task_id, attempt_id,
+    message_id, payload_json, created_at
+FROM agent_events_old;
+
+DROP TABLE agent_events_old;
+
+CREATE INDEX agent_events_entity_idx
+    ON agent_events (team_id, instance_id, task_id, sequence);
+
+ALTER TABLE agent_context_entries RENAME TO agent_context_entries_old;
+
+CREATE TABLE agent_context_entries (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    instance_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+    content_json TEXT NOT NULL CHECK (json_valid(content_json)),
+    source_task_id TEXT,
+    source_message_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (team_id, id),
+    UNIQUE (instance_id, generation, sequence),
+    FOREIGN KEY (team_id, instance_id)
+        REFERENCES agent_instances(team_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (team_id, source_task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (team_id, source_message_id)
+        REFERENCES agent_messages(team_id, id) ON DELETE SET NULL
+);
+
+INSERT INTO agent_context_entries
+    (id, team_id, instance_id, generation, sequence, role, content_json,
+     source_task_id, source_message_id, created_at)
+SELECT
+    id, team_id, instance_id, generation, sequence, role, content_json,
+    source_task_id, source_message_id, created_at
+FROM agent_context_entries_old;
+
+DROP TABLE agent_context_entries_old;
+
+CREATE INDEX agent_context_entries_owner_idx
+    ON agent_context_entries (instance_id, generation, sequence);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

@@ -1716,7 +1716,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         : {};
     return chatStreamResponse(body.chatId ?? "chat-1");
   }
-  if (path === "/api/workspaces/workspace-1/chat/queue") {
+  if (
+    path === "/api/workspaces/workspace-1/chat/queue" ||
+    path === "/api/workspaces/workspace-2/chat/queue"
+  ) {
     const body =
       typeof init?.body === "string"
         ? (JSON.parse(init.body) as { chatId?: string | null; message?: string })
@@ -1756,7 +1759,11 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/workspaces/workspace-2/chat/stream") {
-    return chatStreamResponse("side-chat-stream");
+    const body =
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as { chatId?: string | null })
+        : {};
+    return chatStreamResponse(body.chatId ?? "side-chat-stream");
   }
 
   return jsonResponse({ error: `Unhandled test route: ${url}` }, { status: 404 });

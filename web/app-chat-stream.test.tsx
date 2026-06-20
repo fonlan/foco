@@ -936,8 +936,9 @@ describe("app-chat-stream verification surfaces", () => {
         url === "/api/workspaces/workspace-1/chat/stream",
     )[1];
     expect(JSON.parse(String(secondStreamCall[1]?.body))).toMatchObject({
-      chatId: null,
+      chatId: "queued-chat-2",
       message: "new chat task",
+      queuedUserMessageId: "queued-user-2",
     });
 
     await act(async () => {
@@ -997,8 +998,9 @@ describe("app-chat-stream verification surfaces", () => {
         url === "/api/workspaces/workspace-1/chat/stream",
     );
     expect(JSON.parse(String(streamCall?.[1]?.body))).toMatchObject({
-      chatId: null,
+      chatId: "queued-chat-1",
       message: "memory-gated chat",
+      queuedUserMessageId: "queued-user-1",
     });
 
     await act(async () => {
@@ -1019,14 +1021,14 @@ describe("app-chat-stream verification surfaces", () => {
           typeof init?.body === "string"
             ? (JSON.parse(init.body) as { chatId?: string | null; message?: string })
             : {};
-        if (body.chatId === null && body.message === "Scheduled task") {
+        if (body.chatId && body.message === "Scheduled task") {
           appTestState.workspaceResponseWorkspaces = [
             {
               ...workspace,
               chats: [
                 ...workspace.chats,
                 chatSummary(
-                  "chat-scheduled",
+                  body.chatId,
                   "Scheduled task",
                   "2026-06-05T12:00:00Z",
                   "2026-06-05T12:00:00Z",
@@ -1035,7 +1037,7 @@ describe("app-chat-stream verification surfaces", () => {
             },
             secondaryWorkspace,
           ];
-          return chatStreamResponse("chat-scheduled");
+          return chatStreamResponse(body.chatId);
         }
       }
 
@@ -1136,8 +1138,9 @@ describe("app-chat-stream verification surfaces", () => {
         url === "/api/workspaces/workspace-1/chat/stream",
     )[1];
     expect(JSON.parse(String(secondStreamCall[1]?.body))).toMatchObject({
-      chatId: "queued-chat-1",
+      chatId: "queued-chat-2",
       message: "Scheduled task",
+      queuedUserMessageId: "queued-user-2",
     });
 
     await act(async () => {

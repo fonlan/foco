@@ -4898,7 +4898,7 @@ export function App() {
 
   async function runChatMessage(initialRequest: RetryRunRequest): Promise<string | null> {
     let request = initialRequest;
-    if ((request.teamModeEnabled ?? false) && !request.queuedUserMessageId) {
+    if (!request.queuedUserMessageId) {
       try {
         const queued = await persistQueuedRunRequest(request);
         request = {
@@ -5081,6 +5081,15 @@ export function App() {
     setError(null);
     if (request.chatId) {
       cancelContextUsageRequestForChatKey(currentRunningChatKey);
+    }
+    if (request.queuedUserMessageId) {
+      updateQueuedRunRequestsForChatKey(currentRunningChatKey, (current) =>
+        current.filter(
+          (queuedRequest) =>
+            queuedRequest.queuedUserMessageId !== request.queuedUserMessageId &&
+            queuedRequest.pendingUserMessageId !== request.queuedUserMessageId,
+        ),
+      );
     }
     activeRunAbortByChatKeyRef.current.set(
       currentRunningChatKey,

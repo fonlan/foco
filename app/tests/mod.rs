@@ -189,6 +189,7 @@ fn test_prepared_chat_context(
         provider_id: "openai-responses".to_string(),
         model_id: "gpt-5.4".to_string(),
         user_message_id: "user-1".to_string(),
+        queued_user_message_id: None,
         assistant_message_id: "assistant-1".to_string(),
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
@@ -2752,6 +2753,122 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
+#[tokio::test]
+async fn team_run_id_override_keeps_tool_finalization_idempotent() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-team-tool-run-id-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-team-tool-run-id-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    let task_run_id = "agent-task-tool-run";
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: Some(task_run_id.to_string()),
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: "Use a tool".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("chat context");
+    assert_eq!(context.llm_request_id, task_run_id);
+
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            task_run_id.to_string(),
+            workspace_id,
+            context.chat_id.clone(),
+            context.assistant_message_id.clone(),
+            context.assistant_sequence,
+            Vec::new(),
+            guidance_tx,
+        )
+        .expect("register active run");
+    let tool_call_event = ChatSseEvent::ToolCall {
+        assistant_message_id: context.assistant_message_id.clone(),
+        tool_call: ChatToolCallSummary {
+            id: "call-team-tool".to_string(),
+            name: "read_file".to_string(),
+            status: "running".to_string(),
+            input: json!({ "path": "README.md" }),
+            output: None,
+            is_error: false,
+        },
+    };
+    let tool_result_event = ChatSseEvent::ToolResult {
+        assistant_message_id: context.assistant_message_id.clone(),
+        tool_call_id: "call-team-tool".to_string(),
+        output: json!({ "content": "hello" }),
+        is_error: false,
+    };
+    for event in [&tool_call_event, &tool_result_event] {
+        registration
+            .record_event(&workspace_dir, &context.chat_id, event)
+            .expect("record tool event");
+    }
+
+    persist_chat_result(
+        &context,
+        "2026-06-20T08:00:00Z",
+        ChatAuditOutcome {
+            first_token_at: Some("2026-06-20T08:00:00Z".to_string()),
+            completed_at: "2026-06-20T08:00:01Z".to_string(),
+            first_token_latency_ms: Some(100),
+            total_latency_ms: 1_000,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            status_code: Some(200),
+            final_state: "succeeded",
+            response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+        },
+        &[
+            captured_event(&tool_call_event),
+            captured_event(&tool_result_event),
+        ],
+        Some("Done."),
+        None,
+        &[ExecutedToolCall {
+            id: "call-team-tool".to_string(),
+            name: "read_file".to_string(),
+            input: json!({ "path": "README.md" }),
+            output: json!({ "content": "hello" }),
+            is_error: false,
+            started_at: "2026-06-20T08:00:00Z".to_string(),
+            completed_at: "2026-06-20T08:00:01Z".to_string(),
+        }],
+    )
+    .expect("final persistence should reuse the task run id");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let tool_calls = database
+        .tool_calls_for_chat(&context.chat_id)
+        .expect("tool calls for chat");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].run_id, task_run_id);
+    assert_eq!(tool_calls[0].status, "completed");
+    assert!(tool_calls[0].result.is_some());
+
+    drop(database);
+    registration.finish();
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
 #[test]
 fn active_chat_run_registry_rejects_stale_guidance_run() {
     let registry = ActiveChatRunRegistry::default();
@@ -3465,14 +3582,11 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
     let task_id = queued.agent_task_id.expect("Agent task id");
     assert_eq!(scheduler_rx.recv().await, Some(()));
     let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
-    assert_eq!(
-        database
-            .agent_task(&task_id)
-            .expect("task")
-            .expect("task")
-            .status,
-        foco_agent::AgentTaskStatus::Queued
-    );
+    let task = database.agent_task(&task_id).expect("task").expect("task");
+    assert_eq!(task.status, foco_agent::AgentTaskStatus::Queued);
+    let input = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json)
+        .expect("Coordinator task input");
+    assert!(!input.collaboration_tools_enabled);
     drop(database);
     let cancel_request =
         serde_json::from_value(json!({ "action": "cancel" })).expect("task action request");
@@ -3515,6 +3629,59 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
     }
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn queue_chat_message_creates_default_team_for_normal_send() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-normal-queue-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-agent-normal-queue-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (scheduler, mut scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = scheduler;
+
+    let queued = crate::http::chat::queue_chat_message(
+        State(state),
+        AxumPath(workspace_id.clone()),
+        Json(QueueChatMessageRequest {
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            message: "Normal send".to_string(),
+            team_mode_enabled: false,
+            attachments: Vec::new(),
+        }),
+    )
+    .await
+    .expect("queue normal message")
+    .0;
+    let task_id = queued.agent_task_id.expect("Agent task id");
+    assert_eq!(scheduler_rx.recv().await, Some(()));
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let team = database
+        .agent_team_for_chat(&queued.chat_id)
+        .expect("team lookup")
+        .expect("default team");
+    let task = database
+        .agent_task(&task_id)
+        .expect("task lookup")
+        .expect("Coordinator task");
+    assert_eq!(task.team_id, team.id);
+    let input = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json)
+        .expect("Coordinator task input");
+    assert_eq!(input.queued_user_message_id, queued.user_message_id);
+    assert_eq!(input.message, "Normal send");
+    assert!(!input.collaboration_tools_enabled);
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
 }
 
 #[test]
@@ -3637,6 +3804,7 @@ fn persist_chat_result_writes_audit_status_code() {
         provider_id: "openai-responses".to_string(),
         model_id: "gpt-5.4".to_string(),
         user_message_id: "user-1".to_string(),
+        queued_user_message_id: None,
         assistant_message_id: "assistant-1".to_string(),
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
@@ -3799,6 +3967,185 @@ fn persist_chat_result_writes_audit_status_code() {
 }
 
 #[test]
+fn persist_chat_result_clears_completed_queued_run_metadata() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-queued-run-clear-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat_with_metadata(
+                "chat-1",
+                "Queued chat",
+                r#"{"queuedRun":{"status":"running","userMessageId":"user-1","assistantMessageId":"assistant-1","modelId":"gpt-5.4","providerId":"openai-responses","content":"Hello"}}"#,
+            )
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: "user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "Hello",
+                sequence: 0,
+                metadata_json: Some(
+                    r#"{"queuedRun":{"status":"running","assistantMessageId":"assistant-1","modelId":"gpt-5.4","providerId":"openai-responses"}}"#,
+                ),
+            })
+            .expect("message insert");
+    }
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Hello".to_string(),
+        )],
+        vec![Some(0)],
+        vec![PromptContextSource::StoredMessage { sequence: 0 }],
+        984,
+    );
+    context.queued_user_message_id = Some("user-1".to_string());
+    let outcome = ChatAuditOutcome {
+        first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
+        completed_at: "2026-06-06T09:00:01Z".to_string(),
+        first_token_latency_ms: Some(100),
+        total_latency_ms: 1_000,
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        cache_read_tokens: Some(0),
+        cache_write_tokens: Some(0),
+        status_code: Some(200),
+        final_state: "succeeded",
+        response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+    };
+
+    persist_chat_result(
+        &context,
+        "2026-06-06T09:00:00Z",
+        outcome,
+        &[],
+        Some("Done."),
+        None,
+        &[],
+    )
+    .expect("persist chat result");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let chat_metadata = parse_json_value(
+        &database
+            .chat("chat-1")
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+        "chat metadata",
+    )
+    .expect("chat metadata json");
+    let message_metadata = parse_json_value(
+        &database
+            .message("user-1")
+            .expect("message read")
+            .expect("message")
+            .metadata_json,
+        "message metadata",
+    )
+    .expect("message metadata json");
+
+    assert!(chat_metadata.get("queuedRun").is_none());
+    assert!(message_metadata.get("queuedRun").is_none());
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn chat_summary_clears_stale_pending_run_without_resumable_agent_task() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-stale-chat-queue-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+
+    for status in ["queued", "running"] {
+        let chat_id = format!("chat-{status}");
+        let user_message_id = format!("user-{status}");
+        let chat_metadata_json = format!(
+            r#"{{"queuedRun":{{"status":"{status}","userMessageId":"{user_message_id}","modelId":"gpt-5.4","providerId":"openai-responses","content":"Hello"}}}}"#
+        );
+        database
+            .insert_chat_with_metadata(&chat_id, "Stale queued chat", &chat_metadata_json)
+            .expect("chat insert");
+
+        let chat = database.chat(&chat_id).expect("chat read").expect("chat");
+        let summary = chat_summary(&mut database, chat, CodeChangeStats::default(), None)
+            .expect("chat summary");
+        let chat_metadata = parse_json_value(
+            &database
+                .chat(&chat_id)
+                .expect("chat read")
+                .expect("chat")
+                .metadata_json,
+            "chat metadata",
+        )
+        .expect("chat metadata json");
+
+        assert!(summary.queued_run.is_none());
+        assert!(chat_metadata.get("queuedRun").is_none());
+    }
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn chat_message_summaries_clear_stale_pending_message_without_resumable_agent_task() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-stale-message-queue-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+
+    for status in ["queued", "running"] {
+        let chat_id = format!("chat-{status}");
+        let user_message_id = format!("user-{status}");
+        let message_metadata_json = format!(
+            r#"{{"queuedRun":{{"status":"{status}","modelId":"gpt-5.4","providerId":"openai-responses"}}}}"#
+        );
+        database
+            .insert_chat(&chat_id, "Stale queued message")
+            .expect("chat insert");
+        database
+            .insert_message(NewMessage {
+                id: &user_message_id,
+                chat_id: &chat_id,
+                role: "user",
+                content: "Hello",
+                sequence: 0,
+                metadata_json: Some(&message_metadata_json),
+            })
+            .expect("message insert");
+
+        let messages = database
+            .messages_for_chat(&chat_id)
+            .expect("messages for chat");
+        let summaries =
+            chat_message_summaries(&mut database, &workspace_dir, None, &chat_id, messages)
+                .expect("message summaries");
+        let message_metadata = parse_json_value(
+            &database
+                .message(&user_message_id)
+                .expect("message read")
+                .expect("message")
+                .metadata_json,
+            "message metadata",
+        )
+        .expect("message metadata json");
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].pending_mode, None);
+        assert!(summaries[0].queued_run.is_none());
+        assert!(message_metadata.get("queuedRun").is_none());
+    }
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn persist_chat_result_writes_each_captured_llm_request() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-multi-audit-request-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -3820,6 +4167,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         provider_id: "openai-responses".to_string(),
         model_id: "gpt-5.4".to_string(),
         user_message_id: "user-1".to_string(),
+        queued_user_message_id: None,
         assistant_message_id: "assistant-1".to_string(),
         llm_request_id: "run-1".to_string(),
         assistant_sequence: 1,
@@ -4158,6 +4506,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         provider_id: "openai-responses".to_string(),
         model_id: "gpt-5.4".to_string(),
         user_message_id: "user-1".to_string(),
+        queued_user_message_id: None,
         assistant_message_id: "assistant-1".to_string(),
         llm_request_id: "request-1".to_string(),
         assistant_sequence: 1,
@@ -5691,6 +6040,7 @@ Search memory before repo work.
         &config.workspaces[0].id,
         ChatStreamRequest {
             queued_user_message_id: None,
+            run_id_override: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -5815,6 +6165,7 @@ Search memory before repo work.
         &config.workspaces[0].id,
         ChatStreamRequest {
             queued_user_message_id: None,
+            run_id_override: None,
             chat_id: Some(new_context.chat_id.clone()),
             model_id: "model".to_string(),
             provider_id: None,
@@ -5938,6 +6289,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         &config.workspaces[0].id,
         ChatStreamRequest {
             queued_user_message_id: None,
+            run_id_override: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -6050,6 +6402,7 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
         &config.workspaces[0].id,
         ChatStreamRequest {
             queued_user_message_id: None,
+            run_id_override: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -6144,6 +6497,7 @@ Use the existing product UI conventions.
         &config.workspaces[0].id,
         ChatStreamRequest {
             queued_user_message_id: None,
+            run_id_override: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -6620,6 +6974,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         &config.workspaces[0].id,
         ChatStreamRequest {
             queued_user_message_id: None,
+            run_id_override: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -6647,6 +7002,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         &config.workspaces[0].id,
         ChatStreamRequest {
             queued_user_message_id: None,
+            run_id_override: None,
             chat_id: Some(first_context.chat_id.clone()),
             model_id: "review-model".to_string(),
             provider_id: None,
@@ -7068,6 +7424,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         &config.workspaces[0].id,
         ChatStreamRequest {
             queued_user_message_id: None,
+            run_id_override: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -7149,6 +7506,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         &config.workspaces[0].id,
         ChatStreamRequest {
             queued_user_message_id: None,
+            run_id_override: None,
             chat_id: Some(first_context.chat_id.clone()),
             model_id: "model".to_string(),
             provider_id: None,

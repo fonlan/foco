@@ -460,7 +460,7 @@ pub(crate) fn workspace_response_from_config(
     let mut workspaces = Vec::with_capacity(config.workspaces.len());
 
     for workspace in &config.workspaces {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         let code_change_stats_by_chat = database
             .chat_code_change_stats()
@@ -475,7 +475,7 @@ pub(crate) fn workspace_response_from_config(
                     .get(&chat.id)
                     .cloned()
                     .unwrap_or_default();
-                chat_summary(chat, code_change_stats, active_run)
+                chat_summary(&mut database, chat, code_change_stats, active_run)
             })
             .collect::<Result<Vec<_>, ApiError>>()?;
 

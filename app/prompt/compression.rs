@@ -1531,6 +1531,12 @@ pub(crate) fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
+    if let Some(queued_user_message_id) = &context.queued_user_message_id {
+        database
+            .clear_chat_queued_run(&context.chat_id, queued_user_message_id)
+            .map_err(ApiError::from_workspace_error)?;
+    }
+
     let memory_extraction = if context.agent_primary_chat_output {
         queue_memory_extraction_job(context, final_state)?
     } else {

@@ -44,12 +44,12 @@ pub use workspace_records::{
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
-    Migration,
+    MIGRATION_014, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 13;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 14;
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -106,6 +106,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 13,
         sql: MIGRATION_013,
+    },
+    Migration {
+        version: 14,
+        sql: MIGRATION_014,
     },
 ];
 
@@ -520,6 +524,68 @@ impl WorkspaceDatabase {
                 params![message_metadata_json, user_message_id, chat_id],
             )
             .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(())
+    }
+
+    pub fn clear_chat_queued_run(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let chat =
+            self.chat(chat_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat was not found: {chat_id}"),
+                })?;
+        let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+        let should_clear_chat = chat_metadata
+            .get(QUEUED_CHAT_METADATA_KEY)
+            .and_then(Value::as_object)
+            .and_then(|queued_run| {
+                queued_run
+                    .get("userMessageId")
+                    .or_else(|| queued_run.get("user_message_id"))
+            })
+            .and_then(Value::as_str)
+            == Some(user_message_id);
+        if should_clear_chat {
+            chat_metadata.remove(QUEUED_CHAT_METADATA_KEY);
+            let chat_metadata_json = serde_json::to_string(&chat_metadata).map_err(|source| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat metadata is invalid JSON: {source}"),
+                }
+            })?;
+            self.connection
+                .execute(
+                    "UPDATE chats SET metadata_json = ?1 WHERE id = ?2",
+                    params![chat_metadata_json, chat_id],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+        }
+
+        let Some(message) = self.message(user_message_id)? else {
+            return Ok(());
+        };
+        let mut message_metadata =
+            parse_json_object(&message.metadata_json, "user message metadata")?;
+        if message_metadata
+            .remove(QUEUED_MESSAGE_METADATA_KEY)
+            .is_some()
+        {
+            let message_metadata_json =
+                serde_json::to_string(&message_metadata).map_err(|source| {
+                    WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: format!("user message metadata is invalid JSON: {source}"),
+                    }
+                })?;
+            self.connection
+                .execute(
+                    "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                    params![message_metadata_json, user_message_id, chat_id],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+        }
 
         Ok(())
     }

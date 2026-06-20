@@ -1646,6 +1646,8 @@ struct DeleteSettingsItemRequest {
 struct ChatStreamRequest {
     chat_id: Option<String>,
     queued_user_message_id: Option<String>,
+    #[serde(skip)]
+    run_id_override: Option<String>,
     model_id: String,
     provider_id: Option<String>,
     thinking_level: Option<String>,
@@ -2811,6 +2813,7 @@ struct PreparedChatContext {
     provider_id: String,
     model_id: String,
     user_message_id: String,
+    queued_user_message_id: Option<String>,
     assistant_message_id: String,
     llm_request_id: String,
     assistant_sequence: i64,
@@ -5079,6 +5082,12 @@ async fn prepare_chat_context(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let run_id_override = request
+        .run_id_override
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let preallocated_chat_id = if request
         .chat_id
         .as_deref()
@@ -5110,7 +5119,7 @@ async fn prepare_chat_context(
         .clone()
         .unwrap_or_else(|| unique_id("msg-user"));
     let assistant_message_id = unique_id("msg-assistant");
-    let llm_request_id = unique_id("llm");
+    let llm_request_id = run_id_override.unwrap_or_else(|| unique_id("llm"));
     let user_prompt_summary = state
         .hook_runtime
         .run_hooks(HookRunRequest {
@@ -5266,6 +5275,7 @@ async fn prepare_chat_context(
         provider_id: prompt_context.provider_id,
         model_id: prompt_context.model_id,
         user_message_id,
+        queued_user_message_id,
         assistant_message_id,
         llm_request_id,
         assistant_sequence,
@@ -8385,10 +8395,12 @@ fn utc_timestamp() -> String {
 }
 
 fn chat_summary(
+    database: &mut WorkspaceDatabase,
     chat: ChatRecord,
     code_change_stats: CodeChangeStats,
     active_run: Option<ActiveChatRunSummary>,
 ) -> Result<ChatSummary, ApiError> {
+    let queued_run = queued_run_summary_for_chat(database, &chat.id, &chat.metadata_json)?;
     Ok(ChatSummary {
         id: chat.id,
         title: chat.title,
@@ -8396,7 +8408,7 @@ fn chat_summary(
         updated_at: chat.updated_at,
         code_change_stats,
         active_run,
-        queued_run: queued_run_summary_from_chat_metadata(&chat.metadata_json)?,
+        queued_run,
     })
 }
 
@@ -9927,7 +9939,12 @@ fn chat_message_summaries(
                 parts
             };
             let queued_run = if message.role == "user" {
-                queued_run_summary_from_message_metadata(&message.metadata_json)?
+                queued_run_summary_for_message(
+                    database,
+                    chat_id,
+                    &message.id,
+                    &message.metadata_json,
+                )?
             } else {
                 None
             };
@@ -10085,6 +10102,74 @@ fn chat_message_parts(
     } else {
         Ok(parts)
     }
+}
+
+fn queued_run_summary_for_chat(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    metadata_json: &str,
+) -> Result<Option<QueuedRunSummary>, ApiError> {
+    let queued_run = queued_run_summary_from_chat_metadata(metadata_json)?;
+    let Some(summary) = queued_run.as_ref() else {
+        return Ok(None);
+    };
+    if summary.status != "queued" && summary.status != "running" {
+        return Ok(queued_run);
+    }
+    if queued_run_has_resumable_task(database, chat_id, &summary.user_message_id)? {
+        return Ok(queued_run);
+    }
+
+    database
+        .clear_chat_queued_run(chat_id, &summary.user_message_id)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(None)
+}
+
+fn queued_run_summary_for_message(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    user_message_id: &str,
+    metadata_json: &str,
+) -> Result<Option<QueuedMessageRunSummary>, ApiError> {
+    let queued_run = queued_run_summary_from_message_metadata(metadata_json)?;
+    let Some(summary) = queued_run.as_ref() else {
+        return Ok(None);
+    };
+    if summary.status != "queued" && summary.status != "running" {
+        return Ok(queued_run);
+    }
+    if queued_run_has_resumable_task(database, chat_id, user_message_id)? {
+        return Ok(queued_run);
+    }
+
+    database
+        .clear_chat_queued_run(chat_id, user_message_id)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(None)
+}
+
+fn queued_run_has_resumable_task(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    user_message_id: &str,
+) -> Result<bool, ApiError> {
+    let Some(team) = database
+        .agent_team_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(false);
+    };
+
+    Ok(database
+        .agent_task_for_queued_user_message(&team.id, user_message_id)
+        .map_err(ApiError::from_workspace_error)?
+        .is_some_and(|task| {
+            matches!(
+                task.status,
+                foco_agent::AgentTaskStatus::Queued | foco_agent::AgentTaskStatus::Running
+            )
+        }))
 }
 
 fn queued_run_summary_from_chat_metadata(

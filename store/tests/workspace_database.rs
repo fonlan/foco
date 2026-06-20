@@ -436,6 +436,69 @@ fn chat_statistics_memory_sources_follow_message_and_tool_references() {
 }
 
 #[test]
+fn clears_completed_queued_run_metadata_from_chat_and_user_message() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat_with_metadata(
+            "chat-queued",
+            "Queued chat",
+            r#"{"queuedRun":{"status":"queued","userMessageId":"user-queued","modelId":"model","providerId":"provider","content":"hello"}}"#,
+        )
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-queued",
+            chat_id: "chat-queued",
+            role: "user",
+            content: "hello",
+            sequence: 0,
+            metadata_json: Some(
+                r#"{"queuedRun":{"status":"queued","modelId":"model","providerId":"provider"}}"#,
+            ),
+        })
+        .expect("message insert");
+
+    database
+        .mark_chat_queued_run_started("chat-queued", "user-queued", "assistant-queued")
+        .expect("queued run started");
+    let running_chat_metadata: Value = serde_json::from_str(
+        &database
+            .chat("chat-queued")
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+    )
+    .expect("chat metadata json");
+    assert_eq!(running_chat_metadata["queuedRun"]["status"], "running");
+
+    database
+        .clear_chat_queued_run("chat-queued", "user-queued")
+        .expect("clear queued run");
+    let chat_metadata: Value = serde_json::from_str(
+        &database
+            .chat("chat-queued")
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+    )
+    .expect("chat metadata json");
+    let message_metadata: Value = serde_json::from_str(
+        &database
+            .message("user-queued")
+            .expect("message read")
+            .expect("message")
+            .metadata_json,
+    )
+    .expect("message metadata json");
+
+    assert!(chat_metadata.get("queuedRun").is_none());
+    assert!(message_metadata.get("queuedRun").is_none());
+}
+
+#[test]
 fn repository_helpers_round_trip_todo_graphs() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
@@ -1802,11 +1865,91 @@ fn migrates_v9_without_creating_teams_for_existing_chats() {
     let connection = Connection::open(database.database_path()).expect("open migrated database");
     assert_eq!(table_count(&connection, "agent_teams"), 0);
     assert_eq!(table_count(&connection, "chats"), 501);
+    assert_no_agent_messages_old_references(&connection);
     let backups = fs::read_dir(workspace.path().join(".foco").join("backups"))
         .expect("backup directory")
         .collect::<Result<Vec<_>, _>>()
         .expect("backup entries");
     assert_eq!(backups.len(), 1);
+}
+
+#[test]
+fn migrates_v13_agent_message_foreign_keys_to_current_table() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v13 database");
+    connection
+        .execute_batch(
+            r#"CREATE TABLE agent_messages (
+                id TEXT PRIMARY KEY NOT NULL CHECK (id GLOB 'agent-message-*'),
+                team_id TEXT NOT NULL,
+                UNIQUE (team_id, id)
+             );
+             CREATE TABLE agent_teams (
+                id TEXT PRIMARY KEY NOT NULL
+             );
+             CREATE TABLE agent_instances (
+                id TEXT PRIMARY KEY NOT NULL,
+                team_id TEXT NOT NULL,
+                UNIQUE (team_id, id)
+             );
+             CREATE TABLE agent_tasks (
+                id TEXT PRIMARY KEY NOT NULL,
+                team_id TEXT NOT NULL,
+                UNIQUE (team_id, id)
+             );
+             CREATE TABLE agent_attempts (
+                id TEXT PRIMARY KEY NOT NULL,
+                team_id TEXT NOT NULL,
+                UNIQUE (team_id, id)
+             );
+             CREATE TABLE agent_events (
+                team_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                event_type TEXT NOT NULL CHECK (length(event_type) > 0),
+                instance_id TEXT,
+                task_id TEXT,
+                attempt_id TEXT,
+                message_id TEXT,
+                payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (team_id, sequence),
+                FOREIGN KEY (team_id, message_id)
+                    REFERENCES "agent_messages_old"(team_id, id) ON DELETE SET NULL
+             );
+             CREATE INDEX agent_events_entity_idx
+                ON agent_events (team_id, instance_id, task_id, sequence);
+             CREATE TABLE agent_context_entries (
+                id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+                team_id TEXT NOT NULL,
+                instance_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 0),
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+                content_json TEXT NOT NULL CHECK (json_valid(content_json)),
+                source_task_id TEXT,
+                source_message_id TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE (team_id, id),
+                UNIQUE (instance_id, generation, sequence),
+                FOREIGN KEY (team_id, source_message_id)
+                    REFERENCES "agent_messages_old"(team_id, id) ON DELETE SET NULL
+             );
+             CREATE INDEX agent_context_entries_owner_idx
+                ON agent_context_entries (instance_id, generation, sequence);
+             PRAGMA user_version = 13;"#,
+        )
+        .expect("v13 stale agent schema");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    let connection = Connection::open(database.database_path()).expect("open migrated database");
+    assert_no_agent_messages_old_references(&connection);
 }
 
 #[test]
@@ -3725,4 +3868,34 @@ fn table_count(connection: &Connection, table: &str) -> i64 {
             row.get(0)
         })
         .expect("table count query")
+}
+
+fn assert_no_agent_messages_old_references(connection: &Connection) {
+    let stale_schema_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_schema
+             WHERE sql LIKE '%agent_messages_old%'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("stale schema query");
+    assert_eq!(stale_schema_count, 0);
+
+    for table in ["agent_events", "agent_context_entries"] {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA foreign_key_list({table})"))
+            .expect("foreign key list statement");
+        let referenced_tables = statement
+            .query_map([], |row| row.get::<_, String>(2))
+            .expect("foreign key list rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("foreign key list collect");
+        assert!(
+            !referenced_tables
+                .iter()
+                .any(|referenced_table| referenced_table == "agent_messages_old"),
+            "{table} must not reference agent_messages_old"
+        );
+    }
 }

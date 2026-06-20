@@ -57,10 +57,16 @@ pub(crate) struct CoordinatorTaskInput {
     pub(crate) attachments: Vec<ChatAttachmentInput>,
     #[serde(default)]
     pub(crate) skill_ids: Vec<String>,
+    #[serde(default = "default_collaboration_tools_enabled")]
+    pub(crate) collaboration_tools_enabled: bool,
     #[serde(default)]
     pub(crate) delegated_input: Option<Value>,
     #[serde(default)]
     pub(crate) correlation_id: Option<String>,
+}
+
+fn default_collaboration_tools_enabled() -> bool {
+    true
 }
 
 impl AgentScheduler {
@@ -369,6 +375,7 @@ async fn run_coordinator_task_inner(
         ChatStreamRequest {
             chat_id: Some(team.chat_id.clone()),
             queued_user_message_id: Some(task_input.queued_user_message_id.clone()),
+            run_id_override: Some(task.id.to_string()),
             model_id: instance.definition_snapshot.model_id.clone(),
             provider_id: Some(instance.definition_snapshot.provider_id.clone()),
             thinking_level: instance
@@ -403,7 +410,14 @@ async fn run_coordinator_task_inner(
         .provider_request
         .tools
         .retain(|tool| allowed_tools.contains(&tool.name));
-    append_agent_collaboration_tools(&mut chat_context, &instance.definition_snapshot.permissions);
+    let collaboration_permissions = if task_input.collaboration_tools_enabled {
+        instance.definition_snapshot.permissions.clone()
+    } else {
+        AgentPermissions::default()
+    };
+    if task_input.collaboration_tools_enabled {
+        append_agent_collaboration_tools(&mut chat_context, &collaboration_permissions);
+    }
     if let Some(max_output_tokens) = instance.definition_snapshot.model_options.max_output_tokens {
         chat_context.provider_request.max_output_tokens = Some(max_output_tokens);
     }
@@ -415,6 +429,7 @@ async fn run_coordinator_task_inner(
         &task,
         attempt_id,
         &allowed_tools,
+        &collaboration_permissions,
     )?;
     chat_context.agent_primary_chat_output = instance.role == AgentRole::Coordinator;
     chat_context.agent_unread_messages = agent_unread_messages;
@@ -453,7 +468,8 @@ async fn run_coordinator_task_inner(
     chat_context.agent_tool_context = Some(AgentToolContext {
         workspace_path: workspace.path.clone(),
         associations: chat_context.agent_associations.clone(),
-        permissions: instance.definition_snapshot.permissions.clone(),
+        collaboration_tools_enabled: task_input.collaboration_tools_enabled,
+        permissions: collaboration_permissions,
         agent_definitions: config.agent_definitions.clone(),
         scheduler: state.agent_scheduler.clone(),
     });
@@ -482,6 +498,7 @@ fn apply_agent_prompt_layers(
     task: &AgentTaskRecord,
     attempt_id: &AgentAttemptId,
     allowed_tools: &HashSet<String>,
+    collaboration_permissions: &AgentPermissions,
 ) -> Result<(Vec<Value>, Vec<foco_agent::AgentMessageId>), ApiError> {
     validate_agent_definition_system_prompt(instance)?;
 
@@ -548,7 +565,14 @@ fn apply_agent_prompt_layers(
         protocol_index,
         neutral_agent_message(
             NeutralChatRole::System,
-            agent_team_protocol_prompt(team, instance, task, attempt_id, allowed_tools)?,
+            agent_team_protocol_prompt(
+                team,
+                instance,
+                task,
+                attempt_id,
+                allowed_tools,
+                collaboration_permissions,
+            )?,
         ),
         None,
         PromptContextSource::AgentTeamProtocol,
@@ -741,6 +765,7 @@ fn agent_team_protocol_prompt(
     task: &AgentTaskRecord,
     attempt_id: &AgentAttemptId,
     allowed_tools: &HashSet<String>,
+    collaboration_permissions: &AgentPermissions,
 ) -> Result<String, ApiError> {
     let mut tools = allowed_tools.iter().cloned().collect::<Vec<_>>();
     tools.sort();
@@ -762,7 +787,7 @@ fn agent_team_protocol_prompt(
             "branch": instance.worktree_branch,
             "status": instance.worktree_status,
         },
-        "permissions": instance.definition_snapshot.permissions,
+        "permissions": collaboration_permissions,
         "allowedRuntimeTools": tools,
         "runtimeLimits": {
             "maxQueuedTasksPerTeam": AGENT_MAX_QUEUED_TASKS_PER_TEAM,

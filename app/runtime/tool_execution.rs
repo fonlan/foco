@@ -189,6 +189,7 @@ pub(crate) fn pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingT
 pub(crate) struct AgentToolContext {
     pub(crate) workspace_path: PathBuf,
     pub(crate) associations: AgentRunAssociations,
+    pub(crate) collaboration_tools_enabled: bool,
     pub(crate) permissions: AgentPermissions,
     pub(crate) agent_definitions: Vec<AgentDefinitionSettings>,
     pub(crate) scheduler: AgentScheduler,
@@ -1031,6 +1032,12 @@ fn execute_agent_tool(
     tool_call_id: &str,
     arguments: Value,
 ) -> Result<Value, String> {
+    if !context.collaboration_tools_enabled {
+        return Err(agent_tool_error(
+            "permission_denied",
+            format!("Agent tool '{tool_name}' is not enabled for this run"),
+        ));
+    }
     let workspace_path = context.workspace_path.as_path();
     match tool_name {
         AGENT_LIST_TOOL => execute_agent_list(context, workspace_path, arguments),
@@ -1264,6 +1271,7 @@ fn execute_agent_delegate_task(
         "message": agent_delegate_task_message(&input.input, input.correlation_id.as_deref())?,
         "attachments": [],
         "skillIds": [],
+        "collaborationToolsEnabled": true,
         "delegatedInput": input.input,
         "correlationId": input.correlation_id,
     });
@@ -2912,6 +2920,7 @@ mod tests {
                 task_id: Some(task_id.clone()),
                 attempt_id: None,
             },
+            collaboration_tools_enabled: true,
             permissions,
             agent_definitions: Vec::new(),
             scheduler: _scheduler,
@@ -2961,6 +2970,42 @@ mod tests {
         assert_eq!(
             agent_tool_error_output(&oversized_message_error)["code"],
             "payload_too_large"
+        );
+    }
+
+    #[test]
+    fn agent_tool_run_gate_disables_collaboration_tools() {
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            can_delegate: true,
+            allowed_agent_definition_ids: Vec::new(),
+        };
+        let (workspace, mut context, _team_id, instance_id, _task_id) =
+            create_agent_tool_fixture(permissions);
+        context.collaboration_tools_enabled = false;
+
+        let error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_SEND_MESSAGE_TOOL,
+            "call-disabled-agent-tool",
+            json!({
+                "receiverInstanceId": instance_id.to_string(),
+                "kind": "notification",
+                "content": "hello",
+                "replyToMessageId": null,
+                "relatedTaskId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("run gate should disable Agent tools");
+        let output = agent_tool_error_output(&error);
+        assert_eq!(output["code"], "permission_denied");
+        assert!(
+            output["error"]
+                .as_str()
+                .expect("error text")
+                .contains("is not enabled for this run")
         );
     }
 
