@@ -29,7 +29,10 @@ pub(crate) use tool_execution::{
 };
 #[cfg(test)]
 pub(crate) use tool_execution::{execute_tool, wait_for_tool_resource_lock};
-pub(crate) use tool_locks::{ToolResourceLease, ToolResourceLockOwner, ToolResourceLockRegistry};
+pub(crate) use tool_locks::{
+    ToolResourceLease, ToolResourceLockOwner, ToolResourceLockOwnerSnapshot,
+    ToolResourceLockRegistry,
+};
 pub(crate) use web_tools::{
     execute_web_tool, is_web_tool_name, web_search_enabled, web_tool_timeout_ms,
 };

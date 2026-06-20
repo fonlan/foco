@@ -4,6 +4,7 @@ export type AppThemeId = "light" | "dark";
 
 export type SettingsSection =
   | "general"
+  | "agents"
   | "prompts"
   | "web-search"
   | "hooks"
@@ -255,6 +256,7 @@ export type QueueChatMessageResponse = {
   userMessageId: string;
   content: string;
   parts: ChatMessagePart[];
+  agentTaskId?: string;
 };
 
 export type ChatMessagesResponse = {
@@ -641,6 +643,159 @@ export type ModelFormState = {
 export type ThinkingLevelSummary = {
   value: string;
   label: string;
+};
+
+// Agent types
+
+export type AgentModelOptions = {
+  thinkingLevel?: string | null;
+  maxOutputTokens?: number | null;
+};
+
+export type AgentPermissions = {
+  canCreateInstances: boolean;
+  canDelegate: boolean;
+  allowedAgentDefinitionIds: string[];
+};
+
+export type AgentDefinitionInput = {
+  name: string;
+  description: string;
+  providerId: string;
+  modelId: string;
+  modelOptions: AgentModelOptions;
+  systemPrompt: string;
+  allowedTools: string[];
+  maxInstances: number;
+  permissions: AgentPermissions;
+};
+
+export type AgentDefinitionSettings = AgentDefinitionInput & {
+  id: string;
+  revision: number;
+};
+
+export type AgentDefinitionsResponse = {
+  agentDefinitions: AgentDefinitionSettings[];
+};
+
+export type AgentDefinitionRuntimeView = Omit<
+  AgentDefinitionSettings,
+  "systemPrompt"
+>;
+
+export type AgentTeamView = {
+  id: string;
+  chatId: string;
+  coordinatorInstanceId: string;
+  status: string;
+  maxConcurrentRuns: number;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AgentWorkload = {
+  queuedTasks: number;
+  runningTasks: number;
+  waitingTasks: number;
+};
+
+export type AgentInstanceView = {
+  id: string;
+  teamId: string;
+  definitionId: string;
+  definitionRevision: number;
+  definitionSnapshot: AgentDefinitionRuntimeView;
+  role: string;
+  status: string;
+  nextTaskSequence: number;
+  contextGeneration: number;
+  lastScheduledAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type AgentAttemptView = {
+  id: string;
+  sequence: number;
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+  interruptionReason: string | null;
+};
+
+export type AgentTaskView = {
+  id: string;
+  teamId: string;
+  ownerInstanceId: string;
+  originInstanceId: string | null;
+  parentTaskId: string | null;
+  sequence: number;
+  status: string;
+  input: JsonValue;
+  result: JsonValue | null;
+  error: JsonValue | null;
+  attempts: AgentAttemptView[];
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+};
+
+export type AgentTaskDependencyView = {
+  teamId: string;
+  waitingTaskId: string;
+  dependencyTaskId: string;
+  waitMode: string;
+  pendingToolCallId: string | null;
+  deadlineAt: string | null;
+  createdAt: string;
+};
+
+export type AgentMessageView = {
+  id: string;
+  teamId: string;
+  senderInstanceId: string | null;
+  receiverInstanceId: string;
+  relatedTaskId: string | null;
+  replyToMessageId: string | null;
+  kind: string;
+  content: string;
+  sequence: number;
+  createdAt: string;
+  consumedAt: string | null;
+};
+
+export type AgentEventView = {
+  teamId: string;
+  sequence: number;
+  eventType: string;
+  instanceId: string | null;
+  taskId: string | null;
+  attemptId: string | null;
+  messageId: string | null;
+  payload: JsonValue;
+  createdAt: string;
+};
+
+export type AgentMutationLeaseOwnerView = {
+  instanceId: string | null;
+  taskId: string | null;
+  toolCallId: string | null;
+  toolName: string | null;
+  activeMs: number;
+  waitMs: number;
+};
+
+export type AgentTeamSnapshotResponse = {
+  team: AgentTeamView;
+  workload: AgentWorkload;
+  instances: AgentInstanceView[];
+  tasks: AgentTaskView[];
+  dependencies: AgentTaskDependencyView[];
+  messages: AgentMessageView[];
+  events: AgentEventView[];
+  mutationLeaseOwners: AgentMutationLeaseOwnerView[];
 };
 
 // Provider types

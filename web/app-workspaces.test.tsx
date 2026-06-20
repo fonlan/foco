@@ -357,9 +357,19 @@ describe("app-workspaces verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
-    await screen.findByText("Tool run");
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyTitle = await within(workspaceList).findByText("Tool run");
+    const historyButton = historyTitle.closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+
+    fireEvent.contextMenu(historyButton);
+    const chatMenu = await screen.findByRole("menu", { name: "Tool run" });
     await userEvent.click(
-      screen.getByRole("button", { name: "Delete chat Tool run" }),
+      within(chatMenu).getByRole("menuitem", { name: "Delete chat" }),
     );
 
     const dialog = await screen.findByRole("dialog", {

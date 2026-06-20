@@ -108,7 +108,10 @@ import type {
   AiStatisticsProviderBreakdown,
   AiStatisticsResponse,
   AiStatisticsSummary,
-
+  AgentDefinitionInput,
+  AgentDefinitionSettings,
+  AgentDefinitionsResponse,
+  AgentTeamSnapshotResponse,
   AppLanguageId,
   AppThemeId,
   AuthStatusResponse,
@@ -288,6 +291,8 @@ import { WorkspaceDialog } from "./features/workspaces/WorkspaceDialog";
 import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
+import { AgentsRuntimePanel } from "./features/agents/AgentsRuntimePanel";
+import { AgentsSettingsPanel } from "./features/agents/AgentsSettingsPanel";
 import { errorMessage, requestJson, responseErrorMessage } from "./shared/api-client";
 import {
   readAiStatsVisibleColumnIds,
@@ -299,7 +304,7 @@ import {
 } from "./features/stats/use-ai-statistics-data";
 
 type ViewMode = "chat" | "settings" | "stats";
-type ContextPanelTab = "todo" | "files" | "git" | "memory" | "stats";
+type ContextPanelTab = "todo" | "files" | "git" | "memory" | "stats" | "agents";
 type WorkspaceChatContextMenuState = {
   chat: WorkspaceChatListItem;
   left: number;
@@ -354,6 +359,7 @@ type AiStatsColumn = {
 };
 
 const LIVE_REASONING_DURATION_REFRESH_MS = 250;
+const AGENT_MAX_INSTANCES_PER_TEAM = 16;
 
 export function App() {
   const [initialBrowserRoute] = useState(() => currentBrowserRoute());
@@ -411,6 +417,14 @@ export function App() {
     Record<string, ShellMessage[]>
   >({});
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionSettings[]>([]);
+  const [isLoadingAgentDefinitions, setIsLoadingAgentDefinitions] = useState(false);
+  const [agentDefinitionsError, setAgentDefinitionsError] = useState<string | null>(null);
+  const [agentDefinitionOperationKey, setAgentDefinitionOperationKey] = useState<string | null>(null);
+  const [agentTeamSnapshot, setAgentTeamSnapshot] = useState<AgentTeamSnapshotResponse | null>(null);
+  const [isLoadingAgentTeam, setIsLoadingAgentTeam] = useState(false);
+  const [agentTeamError, setAgentTeamError] = useState<string | null>(null);
+  const [agentRuntimeOperationKey, setAgentRuntimeOperationKey] = useState<string | null>(null);
   const [nativeBrowserToken, setNativeBrowserToken] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedProviderId, setSelectedProviderId] = useState("");
@@ -858,6 +872,265 @@ export function App() {
     }
   }, []);
 
+  const loadAgentDefinitions = useCallback(async () => {
+    setIsLoadingAgentDefinitions(true);
+    setAgentDefinitionsError(null);
+
+    try {
+      const data = await requestJson<AgentDefinitionsResponse>(
+        "/api/agent-definitions",
+      );
+      setAgentDefinitions(data.agentDefinitions);
+      return data.agentDefinitions;
+    } catch (requestError) {
+      setAgentDefinitionsError(errorMessage(requestError));
+      return null;
+    } finally {
+      setIsLoadingAgentDefinitions(false);
+    }
+  }, []);
+
+  const loadAgentTeamSnapshot = useCallback(
+    async (workspaceId: string, chatId: string) => {
+      setIsLoadingAgentTeam(true);
+      setAgentTeamError(null);
+
+      try {
+        const data = await requestJson<AgentTeamSnapshotResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/agent-team`,
+        );
+        setAgentTeamSnapshot(data);
+        return data;
+      } catch (requestError) {
+        const message = errorMessage(requestError);
+        if (message.includes("has no Agent team")) {
+          setAgentTeamSnapshot(null);
+          return null;
+        }
+        setAgentTeamSnapshot(null);
+        setAgentTeamError(message);
+        return null;
+      } finally {
+        setIsLoadingAgentTeam(false);
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!canUseApp) {
+      return;
+    }
+
+    void loadAgentDefinitions();
+  }, [canUseApp, loadAgentDefinitions]);
+
+  useEffect(() => {
+    if (
+      !canUseApp ||
+      activeMainTab.type !== "chat" ||
+      !activeWorkspaceId ||
+      !activeChatId ||
+      isPendingChatId(activeChatId)
+    ) {
+      setAgentTeamSnapshot(null);
+      setAgentTeamError(null);
+      return;
+    }
+
+    void loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
+  }, [activeChatId, activeMainTab.type, activeWorkspaceId, canUseApp, loadAgentTeamSnapshot]);
+
+  async function createAgentDefinition(definition: AgentDefinitionInput) {
+    setAgentDefinitionOperationKey("agent-definition-save");
+    setAgentDefinitionsError(null);
+
+    try {
+      const data = await requestJson<AgentDefinitionsResponse>(
+        "/api/agent-definitions/create",
+        {
+          body: JSON.stringify({ definition }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setAgentDefinitions(data.agentDefinitions);
+    } catch (requestError) {
+      setAgentDefinitionsError(errorMessage(requestError));
+    } finally {
+      setAgentDefinitionOperationKey(null);
+    }
+  }
+
+  async function updateAgentDefinition(
+    id: string,
+    definition: AgentDefinitionInput,
+  ) {
+    setAgentDefinitionOperationKey("agent-definition-save");
+    setAgentDefinitionsError(null);
+
+    try {
+      const data = await requestJson<AgentDefinitionsResponse>(
+        "/api/agent-definitions/update",
+        {
+          body: JSON.stringify({ definition, id }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setAgentDefinitions(data.agentDefinitions);
+    } catch (requestError) {
+      setAgentDefinitionsError(errorMessage(requestError));
+    } finally {
+      setAgentDefinitionOperationKey(null);
+    }
+  }
+
+  async function deleteAgentDefinition(id: string) {
+    setAgentDefinitionOperationKey("agent-definition-delete");
+    setAgentDefinitionsError(null);
+
+    try {
+      const data = await requestJson<AgentDefinitionsResponse>(
+        "/api/agent-definitions/delete",
+        {
+          body: JSON.stringify({ id }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setAgentDefinitions(data.agentDefinitions);
+    } catch (requestError) {
+      setAgentDefinitionsError(errorMessage(requestError));
+    } finally {
+      setAgentDefinitionOperationKey(null);
+    }
+  }
+
+  async function enableAgentTeam(coordinatorDefinitionId: string) {
+    if (!activeWorkspaceId || !activeChatId) {
+      setAgentTeamError(t("Open a chat to manage its Agent team."));
+      return;
+    }
+
+    setAgentRuntimeOperationKey("agent-team-enable");
+    setAgentTeamError(null);
+
+    try {
+      const data = await requestJson<AgentTeamSnapshotResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/chats/${encodeURIComponent(activeChatId)}/agent-team/enable`,
+        {
+          body: JSON.stringify({ coordinatorDefinitionId }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setAgentTeamSnapshot(data);
+      setContextPanelTab("agents");
+      setIsContextPanelOpen(true);
+    } catch (requestError) {
+      setAgentTeamError(errorMessage(requestError));
+    } finally {
+      setAgentRuntimeOperationKey(null);
+    }
+  }
+
+  async function createAgentInstances(definitionId: string, count: number) {
+    if (!activeWorkspaceId || !activeChatId) {
+      setAgentTeamError(t("Open a chat to manage its Agent team."));
+      return;
+    }
+    const definition = agentDefinitions.find((item) => item.id === definitionId);
+    if (!definition) {
+      setAgentTeamError(t("Select an agent definition."));
+      return;
+    }
+
+    setAgentRuntimeOperationKey("agent-instance-create");
+    setAgentTeamError(null);
+
+    try {
+      const data = await requestJson<AgentTeamSnapshotResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/chats/${encodeURIComponent(activeChatId)}/agent-team/instances/create`,
+        {
+          body: JSON.stringify({
+            count,
+            definitionId,
+            maxInstancesForDefinition: definition.maxInstances,
+            maxInstancesPerTeam: AGENT_MAX_INSTANCES_PER_TEAM,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setAgentTeamSnapshot(data);
+    } catch (requestError) {
+      setAgentTeamError(errorMessage(requestError));
+    } finally {
+      setAgentRuntimeOperationKey(null);
+    }
+  }
+
+  async function runAgentRuntimeAction(
+    scope: "instance" | "team",
+    action: "delete" | "drain" | "pause" | "reset_context" | "resume" | "stop",
+    instanceId?: string,
+  ) {
+    if (!activeWorkspaceId || !activeChatId) {
+      setAgentTeamError(t("Open a chat to manage its Agent team."));
+      return;
+    }
+
+    setAgentRuntimeOperationKey(`agent-runtime-${action}`);
+    setAgentTeamError(null);
+
+    try {
+      const data = await requestJson<AgentTeamSnapshotResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/chats/${encodeURIComponent(activeChatId)}/agent-team/action`,
+        {
+          body: JSON.stringify({ action, instanceId: instanceId ?? null, scope }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setAgentTeamSnapshot(data);
+    } catch (requestError) {
+      setAgentTeamError(errorMessage(requestError));
+    } finally {
+      setAgentRuntimeOperationKey(null);
+    }
+  }
+
+  async function runAgentTaskAction(
+    taskId: string,
+    action: "cancel" | "retry" | "transfer",
+    targetInstanceId?: string,
+  ) {
+    if (!activeWorkspaceId) {
+      setAgentTeamError(t("Select a workspace first."));
+      return;
+    }
+
+    setAgentRuntimeOperationKey(`agent-task-${action}`);
+    setAgentTeamError(null);
+
+    try {
+      const data = await requestJson<AgentTeamSnapshotResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/agent-tasks/${encodeURIComponent(taskId)}/action`,
+        {
+          body: JSON.stringify({ action, targetInstanceId: targetInstanceId ?? null }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setAgentTeamSnapshot(data);
+    } catch (requestError) {
+      setAgentTeamError(errorMessage(requestError));
+    } finally {
+      setAgentRuntimeOperationKey(null);
+    }
+  }
+
   const handleInstallRipgrep = useCallback(async () => {
     setIsInstallingRipgrep(true);
     setRipgrepInstallError(null);
@@ -1272,7 +1545,35 @@ export function App() {
     }
 
     void loadChatStatistics(activeWorkspace.id, activeChatId);
-  }, [activeChatId, activeWorkspace?.id, contextPanelTab, loadChatStatistics]);
+    const chatKey = chatRunKey(activeWorkspace.id, activeChatId);
+    if (!contextUsageByChatKey[chatKey] && !contextUsageLoadingByChatKey[chatKey]) {
+      void refreshContextUsage({
+        chatId: activeChatId,
+        latestResponseUsage: {
+          cacheReadTokens: null,
+          cacheWriteTokens: null,
+          inputTokens: null,
+          outputTokens: null,
+        },
+        modelId: selectedModelId,
+        providerId: selectedProviderId,
+        skillIds: selectedSkillIds,
+        thinkingLevel: selectedThinkingLevel,
+        workspaceId: activeWorkspace.id,
+      });
+    }
+  }, [
+    activeChatId,
+    activeWorkspace?.id,
+    contextPanelTab,
+    contextUsageByChatKey,
+    contextUsageLoadingByChatKey,
+    loadChatStatistics,
+    selectedModelId,
+    selectedProviderId,
+    selectedSkillIds,
+    selectedThinkingLevel,
+  ]);
 
   useEffect(() => {
     if (contextPanelTab !== "memory" || !activeWorkspace?.id) {
@@ -1336,6 +1637,8 @@ export function App() {
     setOpenChatTabs((current) => {
       const next = current.filter(
         (tab) =>
+          (isPendingChatId(tab.chatId) &&
+            workspaces.some((workspace) => workspace.id === tab.workspaceId)) ||
           workspaceHasChatTab(workspaces, tab) ||
           scheduledWorkspaceRunsRef.current.some(
             (run) => run.workspaceId === tab.workspaceId && run.chatId === tab.chatId,
@@ -2280,6 +2583,7 @@ export function App() {
       const cachedMessages = chatMessagesByKey[chatKey] ?? [];
       setActiveWorkspaceId(workspaceId);
       setActiveChatId(chatId);
+      setActiveMainTab({ chatId, type: "chat", workspaceId });
       setExpandedWorkspaceId(workspaceId);
       setActiveWorkspaceChatRefs(workspaceId, chatId);
       setMessages(cachedMessages);
@@ -4622,6 +4926,11 @@ export function App() {
     if (pendingChatId) {
       setActiveWorkspaceId(request.workspaceId);
       setActiveChatId(pendingChatId);
+      setActiveMainTab({
+        chatId: pendingChatId,
+        type: "chat",
+        workspaceId: request.workspaceId,
+      });
       setExpandedWorkspaceId(request.workspaceId);
       activeWorkspaceIdRef.current = request.workspaceId;
       activeChatIdRef.current = pendingChatId;
@@ -5557,12 +5866,20 @@ export function App() {
             <section className="global-main-panel min-w-0">
               {viewMode === "settings" ? (
                 <SettingsPanel
+                  agentDefinitionOperationKey={agentDefinitionOperationKey}
+                  agentDefinitions={agentDefinitions}
+                  agentDefinitionsError={agentDefinitionsError}
                   canLogout={canLogout}
                   canUseNativePicker={canUseNativePicker}
                   activeSection={settingsSection}
+                  isLoadingAgentDefinitions={isLoadingAgentDefinitions}
                   nativeBrowserToken={nativeBrowserToken}
                   onAddWorkspace={openWorkspaceDialog}
                   onActiveSectionChange={openSettingsSection}
+                  onCreateAgentDefinition={createAgentDefinition}
+                  onDeleteAgentDefinition={deleteAgentDefinition}
+                  onRefreshAgentDefinitions={loadAgentDefinitions}
+                  onUpdateAgentDefinition={updateAgentDefinition}
                   onLogout={handleLogout}
                   onSettingsChange={setSettings}
                   onWorkspacesChange={refreshWorkspaces}
@@ -6074,7 +6391,24 @@ export function App() {
                     runningChatKeys={runningChatKeys}
                     tabs={mainTabs}
                   />
-                  <div className="chat-header-actions" />
+                  <div className="chat-header-actions">
+                    <button
+                      aria-label={t("Agents")}
+                      className={`inline-flex size-9 items-center justify-center rounded-lg border text-stone-700 shadow-sm ${
+                        contextPanelTab === "agents" && isContextPanelOpen
+                          ? "border-teal-200 bg-teal-50 text-teal-800"
+                          : "border-stone-200 bg-white hover:border-teal-200 hover:bg-teal-50"
+                      }`}
+                      onClick={() => {
+                        setContextPanelTab("agents");
+                        setIsContextPanelOpen(true);
+                      }}
+                      title={t("Agents")}
+                      type="button"
+                    >
+                      <Bot aria-hidden="true" className="size-4" />
+                    </button>
+                  </div>
                 </div>
               </header>
               {activeMainTab.type === "file" && activeFileTab ? (
@@ -6240,6 +6574,29 @@ export function App() {
                   />
                   <ContextPanel
                     activeTab={contextPanelTab}
+                    agentsPanel={
+                      <AgentsRuntimePanel
+                        activeChatId={
+                          activeChatId && !isPendingChatId(activeChatId)
+                            ? activeChatId
+                            : null
+                        }
+                        definitions={agentDefinitions}
+                        error={agentTeamError}
+                        isLoading={isLoadingAgentTeam}
+                        operationKey={agentRuntimeOperationKey}
+                        onCreateInstances={createAgentInstances}
+                        onEnableTeam={enableAgentTeam}
+                        onRefresh={async () => {
+                          if (activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)) {
+                            await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
+                          }
+                        }}
+                        onRuntimeAction={runAgentRuntimeAction}
+                        onTaskAction={runAgentTaskAction}
+                        snapshot={agentTeamSnapshot}
+                      />
+                    }
                     chatStatistics={displayedChatStatistics}
                     chatStatisticsError={chatStatisticsError}
                     contextMemories={contextMemories}
@@ -8515,6 +8872,7 @@ function StatsCard({
 
 function ContextPanel({
   activeTab,
+  agentsPanel,
   chatStatistics,
   chatStatisticsError,
   contextMemories,
@@ -8556,6 +8914,7 @@ function ContextPanel({
   workspaceFilesError,
 }: {
   activeTab: ContextPanelTab;
+  agentsPanel: ReactNode;
   chatStatistics: ChatStatisticsResponse | null;
   chatStatisticsError: string | null;
   contextMemories: ContextMemoryState;
@@ -8601,6 +8960,7 @@ function ContextPanel({
     { id: "todo", label: "ToDo", icon: ListChecks },
     { id: "files", label: "Files", icon: Files },
     { id: "git", label: "Git", icon: GitCompare },
+    { id: "agents", label: "Agents", icon: Bot },
     { id: "memory", label: "Memory", icon: Brain },
     { id: "stats", label: "Stats", icon: BarChart3 },
   ];
@@ -8673,6 +9033,8 @@ function ContextPanel({
             />
           </div>
         ) : null}
+
+        {activeTab === "agents" ? agentsPanel : null}
 
         {activeTab === "memory" ? (
           <ContextMemoryTab
@@ -9600,6 +9962,13 @@ function ContextStatsTab({
               emptyLabel={t("No context usage yet.")}
               valueFormatter={(value) => formatNumber(value, language)}
             />
+            <ContextStatsRows
+              emptyLabel={t("No context usage yet.")}
+              rows={contextChart.map((item) => ({
+                label: item.label,
+                value: formatNumber(item.value, language),
+              }))}
+            />
           </>
         ) : (
           <div className="context-empty-inline">{t("Context usage unavailable.")}</div>
@@ -10202,22 +10571,38 @@ function InlineGitDiffNotice({ children }: { children: ReactNode }) {
 
 function SettingsPanel({
   activeSection,
+  agentDefinitionOperationKey,
+  agentDefinitions,
+  agentDefinitionsError,
   canLogout,
   canUseNativePicker,
+  isLoadingAgentDefinitions,
   nativeBrowserToken,
   onAddWorkspace,
   onActiveSectionChange,
+  onCreateAgentDefinition,
+  onDeleteAgentDefinition,
+  onRefreshAgentDefinitions,
+  onUpdateAgentDefinition,
   onLogout,
   onSettingsChange,
   onWorkspacesChange,
   workspaceDialogRevision,
 }: {
   activeSection: SettingsSection;
+  agentDefinitionOperationKey: string | null;
+  agentDefinitions: AgentDefinitionSettings[];
+  agentDefinitionsError: string | null;
   canLogout: boolean;
   canUseNativePicker: boolean;
+  isLoadingAgentDefinitions: boolean;
   nativeBrowserToken: string | null;
   onAddWorkspace: () => void;
   onActiveSectionChange: (section: SettingsSection) => void;
+  onCreateAgentDefinition: (definition: AgentDefinitionInput) => Promise<void>;
+  onDeleteAgentDefinition: (id: string) => Promise<void>;
+  onRefreshAgentDefinitions: () => Promise<AgentDefinitionSettings[] | null>;
+  onUpdateAgentDefinition: (id: string, definition: AgentDefinitionInput) => Promise<void>;
   onLogout: () => Promise<void>;
   onSettingsChange: (settings: SettingsResponse) => void;
   onWorkspacesChange: () => Promise<void>;
@@ -12716,6 +13101,12 @@ function SettingsPanel({
               onClick={() => onActiveSectionChange("general")}
             />
             <SettingsNavButton
+              active={activeSection === "agents"}
+              icon={Bot}
+              label={t("Agents")}
+              onClick={() => onActiveSectionChange("agents")}
+            />
+            <SettingsNavButton
               active={activeSection === "prompts"}
               icon={ScrollText}
               label={t("Prompts")}
@@ -13375,6 +13766,22 @@ function SettingsPanel({
                 </div>
               </form>
             </section>
+          ) : null}
+
+          {activeSection === "agents" ? (
+            <AgentsSettingsPanel
+              definitions={agentDefinitions}
+              error={agentDefinitionsError}
+              isLoading={isLoadingAgentDefinitions}
+              models={configuredModelsByName}
+              onCreateDefinition={onCreateAgentDefinition}
+              onDeleteDefinition={onDeleteAgentDefinition}
+              onRefreshDefinitions={onRefreshAgentDefinitions}
+              onUpdateDefinition={onUpdateAgentDefinition}
+              operationKey={agentDefinitionOperationKey}
+              providers={providers}
+              thinkingLevels={thinkingLevels}
+            />
           ) : null}
 
           {activeSection === "prompts" ? (
@@ -21911,5 +22318,3 @@ function loadNativeProbeImage(url: string): Promise<boolean> {
     image.src = url;
   });
 }
-
-

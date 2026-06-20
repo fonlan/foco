@@ -286,6 +286,126 @@ export const settings = {
   ],
 };
 
+export const agentDefinitions = {
+  agentDefinitions: [
+    {
+      allowedTools: ["read_file", "send_message", "delegate_task"],
+      description: "Coordinates the Agent team.",
+      id: "agent-definition-coordinator",
+      maxInstances: 1,
+      modelId: "gpt-test",
+      modelOptions: { maxOutputTokens: null, thinkingLevel: null },
+      name: "Coordinator",
+      permissions: {
+        allowedAgentDefinitionIds: ["agent-definition-worker"],
+        canCreateInstances: true,
+        canDelegate: true,
+      },
+      providerId: "openai",
+      revision: 1,
+      systemPrompt: "Coordinate the team.",
+    },
+    {
+      allowedTools: ["read_file"],
+      description: "Handles delegated implementation tasks.",
+      id: "agent-definition-worker",
+      maxInstances: 4,
+      modelId: "gpt-test",
+      modelOptions: { maxOutputTokens: null, thinkingLevel: null },
+      name: "Worker",
+      permissions: {
+        allowedAgentDefinitionIds: [],
+        canCreateInstances: false,
+        canDelegate: false,
+      },
+      providerId: "openai",
+      revision: 1,
+      systemPrompt: "Do focused implementation work.",
+    },
+  ],
+};
+
+export const agentTeamSnapshot = {
+  dependencies: [],
+  events: [
+    {
+      attemptId: null,
+      createdAt: "2026-06-05T10:00:00Z",
+      eventType: "team_created",
+      instanceId: "agent-instance-coordinator",
+      messageId: null,
+      payload: { coordinatorDefinitionId: "agent-definition-coordinator" },
+      sequence: 1,
+      taskId: null,
+      teamId: "agent-team-1",
+    },
+  ],
+  instances: [
+    {
+      contextGeneration: 0,
+      createdAt: "2026-06-05T10:00:00Z",
+      definitionId: "agent-definition-coordinator",
+      definitionRevision: 1,
+      definitionSnapshot: {
+        ...agentDefinitions.agentDefinitions[0],
+        systemPrompt: undefined,
+      },
+      id: "agent-instance-coordinator",
+      lastScheduledAt: null,
+      nextTaskSequence: 2,
+      role: "coordinator",
+      status: "active",
+      teamId: "agent-team-1",
+      updatedAt: "2026-06-05T10:00:00Z",
+    },
+  ],
+  messages: [
+    {
+      consumedAt: null,
+      content: "Worker, inspect the current task.",
+      createdAt: "2026-06-05T10:00:01Z",
+      id: "agent-message-1",
+      kind: "delegate",
+      receiverInstanceId: "agent-instance-coordinator",
+      relatedTaskId: "agent-task-1",
+      replyToMessageId: null,
+      senderInstanceId: null,
+      sequence: 1,
+      teamId: "agent-team-1",
+    },
+  ],
+  mutationLeaseOwners: [],
+  tasks: [
+    {
+      attempts: [],
+      completedAt: null,
+      createdAt: "2026-06-05T10:00:01Z",
+      error: null,
+      id: "agent-task-1",
+      input: { prompt: "Inspect current task" },
+      originInstanceId: null,
+      ownerInstanceId: "agent-instance-coordinator",
+      parentTaskId: null,
+      result: null,
+      sequence: 1,
+      startedAt: "2026-06-05T10:00:02Z",
+      status: "running",
+      teamId: "agent-team-1",
+      updatedAt: "2026-06-05T10:00:02Z",
+    },
+  ],
+  team: {
+    chatId: "chat-1",
+    coordinatorInstanceId: "agent-instance-coordinator",
+    createdAt: "2026-06-05T10:00:00Z",
+    id: "agent-team-1",
+    maxConcurrentRuns: 1,
+    status: "active",
+    updatedAt: "2026-06-05T10:00:00Z",
+  },
+  workload: { queuedTasks: 0, runningTasks: 1, waitingTasks: 0 },
+};
+
 export const activeMemory = {
   chatId: null,
   confidence: null,
@@ -1244,6 +1364,37 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/settings") {
     return jsonResponse(settings);
+  }
+
+  if (path === "/api/agent-definitions") {
+    return jsonResponse(agentDefinitions);
+  }
+
+  if (
+    path === "/api/agent-definitions/create" ||
+    path === "/api/agent-definitions/update" ||
+    path === "/api/agent-definitions/delete"
+  ) {
+    return jsonResponse(agentDefinitions);
+  }
+
+  if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+    return jsonResponse(
+      { error: "chat 'chat-1' has no Agent team" },
+      { status: 400 },
+    );
+  }
+
+  if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team/enable") {
+    return jsonResponse(agentTeamSnapshot);
+  }
+
+  if (
+    path === "/api/workspaces/workspace-1/chats/chat-1/agent-team/action" ||
+    path === "/api/workspaces/workspace-1/chats/chat-1/agent-team/instances/create" ||
+    path === "/api/workspaces/workspace-1/agent-tasks/agent-task-1/action"
+  ) {
+    return jsonResponse(agentTeamSnapshot);
   }
 
   if (path === "/api/settings/general") {

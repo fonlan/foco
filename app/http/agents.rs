@@ -3,18 +3,22 @@ use axum::{
     extract::{Path as AxumPath, State},
 };
 use foco_agent::{
-    AgentAttemptId, AgentDefinitionId, AgentInstanceId, AgentInstanceStatus, AgentRole,
-    AgentTaskId, AgentTaskStatus, AgentTaskTransition, AgentTeamId, AgentTeamStatus,
-    TeamActivationRequest,
+    AgentAttemptId, AgentDefinitionId, AgentInstanceId, AgentInstanceStatus, AgentMessageId,
+    AgentRole, AgentTaskId, AgentTaskStatus, AgentTaskTransition, AgentTeamId, AgentTeamStatus,
+    TeamActivationRequest, TeamWorkload, ToolResource, ToolResourceAccess, ToolResourceLock,
 };
 use foco_store::workspace::{
-    AgentInstanceRecord, AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, NewAgentInstance,
-    NewAgentTeam, WorkspaceDatabase,
+    AgentEventRecord, AgentInstanceRecord, AgentMessageRecord, AgentTaskDependencyRecord,
+    AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, NewAgentInstance, NewAgentTeam,
+    WorkspaceDatabase,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::runtime::{AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM};
+use crate::runtime::{
+    AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
+    ToolResourceLockOwnerSnapshot,
+};
 use crate::*;
 
 #[derive(Deserialize)]
@@ -72,8 +76,13 @@ pub(crate) struct AgentTaskActionRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentTeamSnapshotResponse {
     team: AgentTeamView,
+    workload: TeamWorkload,
     instances: Vec<AgentInstanceView>,
     tasks: Vec<AgentTaskView>,
+    dependencies: Vec<AgentTaskDependencyView>,
+    messages: Vec<AgentMessageView>,
+    events: Vec<AgentEventView>,
+    mutation_lease_owners: Vec<AgentMutationLeaseOwnerView>,
 }
 
 #[derive(Serialize)]
@@ -95,7 +104,7 @@ struct AgentInstanceView {
     team_id: AgentTeamId,
     definition_id: AgentDefinitionId,
     definition_revision: u64,
-    definition_snapshot: AgentDefinitionSettings,
+    definition_snapshot: AgentDefinitionRuntimeView,
     role: foco_agent::AgentRole,
     status: AgentInstanceStatus,
     next_task_sequence: i64,
@@ -111,6 +120,8 @@ struct AgentTaskView {
     id: AgentTaskId,
     team_id: AgentTeamId,
     owner_instance_id: AgentInstanceId,
+    origin_instance_id: Option<AgentInstanceId>,
+    parent_task_id: Option<AgentTaskId>,
     sequence: i64,
     status: AgentTaskStatus,
     input: serde_json::Value,
@@ -132,6 +143,74 @@ struct AgentAttemptView {
     started_at: String,
     completed_at: Option<String>,
     interruption_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentDefinitionRuntimeView {
+    id: AgentDefinitionId,
+    revision: u64,
+    name: String,
+    description: String,
+    provider_id: String,
+    model_id: String,
+    model_options: AgentModelOptions,
+    allowed_tools: Vec<String>,
+    max_instances: u32,
+    permissions: foco_agent::AgentPermissions,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentTaskDependencyView {
+    team_id: AgentTeamId,
+    waiting_task_id: AgentTaskId,
+    dependency_task_id: AgentTaskId,
+    wait_mode: foco_agent::AgentTaskWaitMode,
+    pending_tool_call_id: Option<String>,
+    deadline_at: Option<String>,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMessageView {
+    id: AgentMessageId,
+    team_id: AgentTeamId,
+    sender_instance_id: Option<AgentInstanceId>,
+    receiver_instance_id: AgentInstanceId,
+    related_task_id: Option<AgentTaskId>,
+    reply_to_message_id: Option<AgentMessageId>,
+    kind: foco_agent::AgentMessageKind,
+    content: String,
+    sequence: i64,
+    created_at: String,
+    consumed_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentEventView {
+    team_id: AgentTeamId,
+    sequence: i64,
+    event_type: String,
+    instance_id: Option<AgentInstanceId>,
+    task_id: Option<AgentTaskId>,
+    attempt_id: Option<AgentAttemptId>,
+    message_id: Option<AgentMessageId>,
+    payload: serde_json::Value,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentMutationLeaseOwnerView {
+    instance_id: Option<String>,
+    task_id: Option<String>,
+    tool_call_id: Option<String>,
+    tool_name: Option<String>,
+    active_ms: u64,
+    wait_ms: u64,
 }
 
 pub(crate) async fn enable_agent_team(
@@ -205,6 +284,8 @@ pub(crate) async fn enable_agent_team(
     )?;
     state.agent_scheduler.wake()?;
     Ok(Json(agent_team_snapshot_from_database(
+        &state,
+        &workspace_id,
         &database, &team_id,
     )?))
 }
@@ -222,6 +303,8 @@ pub(crate) async fn agent_team_snapshot(
         .map_err(ApiError::from_workspace_error)?
         .ok_or_else(|| ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")))?;
     Ok(Json(agent_team_snapshot_from_database(
+        &state,
+        &workspace_id,
         &database, &team.id,
     )?))
 }
@@ -319,6 +402,8 @@ pub(crate) async fn create_agent_instances(
     }
     state.agent_scheduler.wake()?;
     Ok(Json(agent_team_snapshot_from_database(
+        &state,
+        &workspace_id,
         &database, &team.id,
     )?))
 }
@@ -427,6 +512,8 @@ pub(crate) async fn agent_runtime_action(
     }
     state.agent_scheduler.wake()?;
     Ok(Json(agent_team_snapshot_from_database(
+        &state,
+        &workspace_id,
         &database, &team.id,
     )?))
 }
@@ -663,12 +750,16 @@ pub(crate) async fn agent_task_action(
     }
     state.agent_scheduler.wake()?;
     Ok(Json(agent_team_snapshot_from_database(
+        &state,
+        &workspace_id,
         &database,
         &task.team_id,
     )?))
 }
 
 fn agent_team_snapshot_from_database(
+    state: &AppState,
+    workspace_id: &str,
     database: &WorkspaceDatabase,
     team_id: &AgentTeamId,
 ) -> Result<AgentTeamSnapshotResponse, ApiError> {
@@ -676,13 +767,21 @@ fn agent_team_snapshot_from_database(
         .agent_team(team_id)
         .map_err(ApiError::from_workspace_error)?
         .ok_or_else(|| ApiError::bad_request(format!("Agent team '{team_id}' was not found")))?;
+    let workload = database
+        .agent_team_workload(team_id)
+        .map_err(ApiError::from_workspace_error)?;
     let instances = database
         .agent_instances_for_team(team_id)
         .map_err(ApiError::from_workspace_error)?
         .into_iter()
+        .collect::<Vec<_>>();
+    let instance_views = instances
+        .iter()
+        .cloned()
         .map(AgentInstanceView::from)
         .collect();
     let mut tasks = Vec::new();
+    let mut dependencies = Vec::new();
     for task in database
         .agent_tasks_for_team(team_id)
         .map_err(ApiError::from_workspace_error)?
@@ -700,13 +799,60 @@ fn agent_team_snapshot_from_database(
                 interruption_reason: attempt.interruption_reason,
             })
             .collect();
+        dependencies.extend(
+            database
+                .agent_task_dependencies(&task.id)
+                .map_err(ApiError::from_workspace_error)?
+                .into_iter()
+                .map(AgentTaskDependencyView::from),
+        );
         tasks.push(AgentTaskView::from_record(task, attempts)?);
     }
+    let mut messages = Vec::new();
+    for instance in &instances {
+        messages.extend(
+            database
+                .agent_messages_after(&instance.id, -1)
+                .map_err(ApiError::from_workspace_error)?
+                .into_iter()
+                .map(AgentMessageView::from),
+        );
+    }
+    messages.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then(left.receiver_instance_id.as_str().cmp(right.receiver_instance_id.as_str()))
+            .then(left.sequence.cmp(&right.sequence))
+    });
+    let events = database
+        .agent_events_after(team_id, -1)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .map(AgentEventView::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mutation_lease_owners = state
+        .tool_resource_locks
+        .blocking_owners(workspace_id, &[workspace_mutation_lock()])
+        .into_iter()
+        .map(AgentMutationLeaseOwnerView::from)
+        .collect();
     Ok(AgentTeamSnapshotResponse {
         team: AgentTeamView::from(team),
-        instances,
+        workload,
+        instances: instance_views,
         tasks,
+        dependencies,
+        messages,
+        events,
+        mutation_lease_owners,
     })
+}
+
+fn workspace_mutation_lock() -> ToolResourceLock {
+    ToolResourceLock {
+        resource: ToolResource::WorkspaceMutationLease,
+        access: ToolResourceAccess::Exclusive,
+    }
 }
 
 impl From<AgentTeamRecord> for AgentTeamView {
@@ -730,7 +876,7 @@ impl From<AgentInstanceRecord> for AgentInstanceView {
             team_id: instance.team_id,
             definition_id: instance.definition_id,
             definition_revision: instance.definition_revision,
-            definition_snapshot: instance.definition_snapshot,
+            definition_snapshot: AgentDefinitionRuntimeView::from(instance.definition_snapshot),
             role: instance.role,
             status: instance.status,
             next_task_sequence: instance.next_task_sequence,
@@ -738,6 +884,88 @@ impl From<AgentInstanceRecord> for AgentInstanceView {
             last_scheduled_at: instance.last_scheduled_at,
             created_at: instance.created_at,
             updated_at: instance.updated_at,
+        }
+    }
+}
+
+impl From<AgentDefinitionSettings> for AgentDefinitionRuntimeView {
+    fn from(definition: AgentDefinitionSettings) -> Self {
+        Self {
+            id: definition.id,
+            revision: definition.revision,
+            name: definition.name,
+            description: definition.description,
+            provider_id: definition.provider_id,
+            model_id: definition.model_id,
+            model_options: definition.model_options,
+            allowed_tools: definition.allowed_tools,
+            max_instances: definition.max_instances,
+            permissions: definition.permissions,
+        }
+    }
+}
+
+impl From<AgentTaskDependencyRecord> for AgentTaskDependencyView {
+    fn from(dependency: AgentTaskDependencyRecord) -> Self {
+        Self {
+            team_id: dependency.team_id,
+            waiting_task_id: dependency.waiting_task_id,
+            dependency_task_id: dependency.dependency_task_id,
+            wait_mode: dependency.wait_mode,
+            pending_tool_call_id: dependency.pending_tool_call_id,
+            deadline_at: dependency.deadline_at,
+            created_at: dependency.created_at,
+        }
+    }
+}
+
+impl From<AgentMessageRecord> for AgentMessageView {
+    fn from(message: AgentMessageRecord) -> Self {
+        Self {
+            id: message.id,
+            team_id: message.team_id,
+            sender_instance_id: message.sender_instance_id,
+            receiver_instance_id: message.receiver_instance_id,
+            related_task_id: message.related_task_id,
+            reply_to_message_id: message.reply_to_message_id,
+            kind: message.kind,
+            content: message.content,
+            sequence: message.sequence,
+            created_at: message.created_at,
+            consumed_at: message.consumed_at,
+        }
+    }
+}
+
+impl TryFrom<AgentEventRecord> for AgentEventView {
+    type Error = ApiError;
+
+    fn try_from(event: AgentEventRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            team_id: event.team_id,
+            sequence: event.sequence,
+            event_type: event.event_type,
+            instance_id: event.instance_id,
+            task_id: event.task_id,
+            attempt_id: event.attempt_id,
+            message_id: event.message_id,
+            payload: serde_json::from_str(&event.payload_json).map_err(|source| {
+                ApiError::internal(format!("invalid persisted Agent event payload: {source}"))
+            })?,
+            created_at: event.created_at,
+        })
+    }
+}
+
+impl From<ToolResourceLockOwnerSnapshot> for AgentMutationLeaseOwnerView {
+    fn from(snapshot: ToolResourceLockOwnerSnapshot) -> Self {
+        Self {
+            instance_id: snapshot.owner.instance_id,
+            task_id: snapshot.owner.task_id,
+            tool_call_id: snapshot.owner.tool_call_id,
+            tool_name: snapshot.owner.tool_name,
+            active_ms: u64::try_from(snapshot.active_ms).unwrap_or(u64::MAX),
+            wait_ms: u64::try_from(snapshot.wait_ms).unwrap_or(u64::MAX),
         }
     }
 }
@@ -751,6 +979,8 @@ impl AgentTaskView {
             id: task.id,
             team_id: task.team_id,
             owner_instance_id: task.owner_instance_id,
+            origin_instance_id: task.origin_instance_id,
+            parent_task_id: task.parent_task_id,
             sequence: task.sequence,
             status: task.status,
             input: serde_json::from_str(&task.input_json).map_err(|source| {

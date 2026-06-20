@@ -325,7 +325,7 @@ describe("app-panels-stats verification surfaces", () => {
       within(screen.getByText("Tools and compression").parentElement!)
         .getByText("read_file"),
     ).toBeInTheDocument();
-    expect(screen.getAllByText("History").length).toBeGreaterThan(0);
+    expect((await screen.findAllByText("History")).length).toBeGreaterThan(0);
   });
 
   it("updates active chat code change statistics from git diff refresh events", async () => {

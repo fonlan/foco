@@ -820,75 +820,88 @@
 
 ## 阶段 10：SSE、API 与前端 UI
 
+**阶段状态：已完成（2026-06-19）**
+
 ### 目标
 
 让用户可以配置 Agent、启用 Team、查看执行过程并安全管理实例和任务。
 
 ### 10.1 SSE 协议
 
-- [ ] 定义 teamCreated/teamStateChanged 事件。
-- [ ] 定义 instanceCreated/instanceStateChanged/instanceDeleted 事件。
-- [ ] 定义 taskQueued/taskStarted/taskWaiting/taskResumed/taskCompleted/taskFailed/taskCancelled/taskTransferred 事件。
-- [ ] 定义 messageCreated/messageConsumed 事件。
-- [ ] 所有 Agent 事件携带 team event sequence、instance/task/attempt ID 和脱敏 payload。
-- [ ] Coordinator 原有 reasoning/text/tool/usage 事件继续按到达顺序进入 assistant bubble。
-- [ ] Worker stream 事件进入 Agent 面板，不混入主 assistant bubble。
-- [ ] SSE 重连后通过 snapshot + event sequence 恢复，不重复展示已消费事件。
+- [x] 定义 teamCreated/teamStateChanged 事件。
+- [x] 定义 instanceCreated/instanceStateChanged/instanceDeleted 事件。
+- [x] 定义 taskQueued/taskStarted/taskWaiting/taskResumed/taskCompleted/taskFailed/taskCancelled/taskTransferred 事件。
+- [x] 定义 messageCreated/messageConsumed 事件。
+- [x] 所有 Agent 事件携带 team event sequence、instance/task/attempt ID 和脱敏 payload。
+- [x] Coordinator 原有 reasoning/text/tool/usage 事件继续按到达顺序进入 assistant bubble。
+- [x] Worker stream 事件进入 Agent 面板，不混入主 assistant bubble。
+- [x] SSE 重连后通过 snapshot + event sequence 恢复，不重复展示已消费事件。
 
 ### 10.2 Runtime API
 
-- [ ] 增加 chat Team 启用、读取、停止 API。
-- [ ] 增加实例创建、暂停、恢复、drain、stop、reset 和删除 API。
-- [ ] 增加 task 列表、详情、取消、重试和转移 API。
-- [ ] 增加 message 列表和任务依赖查询 API。
-- [ ] 所有 mutation API 使用明确 action endpoint 或严格 request enum，不使用含糊 patch。
-- [ ] 所有 API 验证 workspace/chat/team 归属和操作时状态。
-- [ ] API 返回 Provider/model 标签但不返回凭据或完整敏感 Prompt。
+- [x] 增加 chat Team 启用、读取、停止 API。
+- [x] 增加实例创建、暂停、恢复、drain、stop、reset 和删除 API。
+- [x] 增加 task 列表、详情、取消、重试和转移 API。
+- [x] 增加 message 列表和任务依赖查询 API。
+- [x] 所有 mutation API 使用明确 action endpoint 或严格 request enum，不使用含糊 patch。
+- [x] 所有 API 验证 workspace/chat/team 归属和操作时状态。
+- [x] API 返回 Provider/model 标签但不返回凭据或完整敏感 Prompt。
 
 ### 10.3 AgentDefinition 设置页
 
-- [ ] 在全局设置中增加 Agents 页面。
-- [ ] 支持创建、编辑、复制和删除 AgentDefinition。
-- [ ] 支持选择 Provider、Model、模型参数、系统提示词和 allowed tools。
-- [ ] 显示 definition ID、revision、maxInstances 和权限限制。
-- [ ] 修改定义时明确提示不会影响既有实例。
-- [ ] 删除仍被运行实例快照引用的定义时显示影响说明，但不伪造外键阻止。
-- [ ] 使用 `lucide-react` 作为唯一图标来源。
+- [x] 在全局设置中增加 Agents 页面。
+- [x] 支持创建、编辑、复制和删除 AgentDefinition。
+- [x] 支持选择 Provider、Model、模型参数、系统提示词和 allowed tools。
+- [x] 显示 definition ID、revision、maxInstances 和权限限制。
+- [x] 修改定义时明确提示不会影响既有实例。
+- [x] 删除仍被运行实例快照引用的定义时显示影响说明，但不伪造外键阻止。
+- [x] 使用 `lucide-react` 作为唯一图标来源。
 
 ### 10.4 Chat Team 入口
 
-- [ ] 在 chat 中增加显式启用 Multi-Agent 的入口，并要求选择 Coordinator definition。
-- [ ] Team 模式下模型选择器显示 Coordinator 模型来源，不允许静默覆盖。
-- [ ] 用户发送消息后立即显示 queued/running 状态，即使 Coordinator 正忙。
-- [ ] 保留原有附件、发送、停止生成和聊天标签交互。
-- [ ] 全局设置、统计等全局视图不显示 Team runtime 面板。
+- [x] 在 chat 中增加显式启用 Multi-Agent 的入口，并要求选择 Coordinator definition。
+- [x] Team 模式下模型选择器显示 Coordinator 模型来源，不允许静默覆盖。
+- [x] 用户发送消息后立即显示 queued/running 状态，即使 Coordinator 正忙。
+- [x] 保留原有附件、发送、停止生成和聊天标签交互。
+- [x] 全局设置、统计等全局视图不显示 Team runtime 面板。
 
 ### 10.5 Agent 面板
 
-- [ ] 在现有右侧 Git/ToDo 交互模型中增加 Agents tab，避免破坏性布局漂移。
-- [ ] 移动端通过底部覆盖面板展示 Agents，不常驻 workspace 侧边栏。
-- [ ] 显示 Team 状态、全局并发使用量和 mutation lease owner。
-- [ ] 按 Definition 分组显示实例、模型、状态、当前任务、队列长度和上下文 generation。
-- [ ] 显示 task parent/dependency、result/error、attempt 和审计摘要。
-- [ ] 显示 Agent 间消息与关联 task，但默认折叠完整私有上下文。
-- [ ] 提供创建实例、暂停、恢复、取消、重试、转移、drain 和 stop 控件。
-- [ ] 危险操作显示准确影响范围，不使用含糊的确认文案。
+- [x] 在现有右侧 Git/ToDo 交互模型中增加 Agents tab，避免破坏性布局漂移。
+- [x] 移动端通过底部覆盖面板展示 Agents，不常驻 workspace 侧边栏。
+- [x] 显示 Team 状态、全局并发使用量和 mutation lease owner。
+- [x] 按 Definition 分组显示实例、模型、状态、当前任务、队列长度和上下文 generation。
+- [x] 显示 task parent/dependency、result/error、attempt 和审计摘要。
+- [x] 显示 Agent 间消息与关联 task，但默认折叠完整私有上下文。
+- [x] 提供创建实例、暂停、恢复、取消、重试、转移、drain 和 stop 控件。
+- [x] 危险操作显示准确影响范围，不使用含糊的确认文案。
 
 ### 10.6 前端测试
 
-- [ ] 将 AgentDefinition 设置测试放入独立 feature 级 `web/app-*.test.tsx` 文件。
-- [ ] 将 Team 启用、实例列表、任务队列和控制操作测试拆成独立 feature 测试。
-- [ ] 复用 `web/test-utils/app-test-harness.tsx` 的 fixture、mock fetch、stream controller 和 renderApp。
-- [ ] 覆盖 SSE 乱序/重连、重复 event sequence 和 Worker 事件不进入主 bubble。
-- [ ] 覆盖桌面右侧 tab 与移动端底部覆盖行为。
-- [ ] 覆盖键盘操作、焦点、ARIA label、错误提示和 loading 状态。
-- [ ] 避免把纯函数或单组件行为追加回巨型 App 测试文件。
+- [x] 将 AgentDefinition 设置测试放入独立 feature 级 `web/app-*.test.tsx` 文件。
+- [x] 将 Team 启用、实例列表、任务队列和控制操作测试拆成独立 feature 测试。
+- [x] 复用 `web/test-utils/app-test-harness.tsx` 的 fixture、mock fetch、stream controller 和 renderApp。
+- [x] 覆盖 SSE 乱序/重连、重复 event sequence 和 Worker 事件不进入主 bubble。
+- [x] 覆盖桌面右侧 tab 与移动端底部覆盖行为。
+- [x] 覆盖键盘操作、焦点、ARIA label、错误提示和 loading 状态。
+- [x] 避免把纯函数或单组件行为追加回巨型 App 测试文件。
 
 ### 阶段 10 退出条件
 
-- [ ] 用户无需直接调用 API 即可完成 Agent 配置和 Team 日常管理。
-- [ ] Coordinator、Worker、任务、消息和错误在 UI 中归属清晰。
-- [ ] 新 UI 不破坏 workspace 侧边栏、聊天、Git/ToDo 和移动端现有交互。
+- [x] 用户无需直接调用 API 即可完成 Agent 配置和 Team 日常管理。
+- [x] Coordinator、Worker、任务、消息和错误在 UI 中归属清晰。
+- [x] 新 UI 不破坏 workspace 侧边栏、聊天、Git/ToDo 和移动端现有交互。
+
+### Phase 10 实现记录
+
+- `app/http/agents.rs` 的 Team snapshot API 返回 team workload、实例、任务、attempt、dependency、message、event sequence 和 workspace mutation lease owner；运行时 snapshot 中的 AgentDefinition 只暴露 provider/model/options/tools/permissions 等安全字段，不返回完整 system prompt 或 Provider 凭据。
+- Runtime mutation API 保持明确 action endpoint：Team enable/read/action、instances/create 和 task/action 均使用严格 request enum，并在后端继续校验 workspace/chat/team/instance/task 归属和操作时状态。
+- Team chat 仍复用既有 SSE 主通道：Coordinator 的 reasoning/text/tool/usage 按到达顺序进入主 assistant bubble；Worker、任务、消息和 Team lifecycle 通过 Agents 面板的 snapshot + event sequence 展示和恢复，避免混入主聊天气泡。
+- `web/api/types.ts` 增加 AgentDefinition CRUD 和 Agent Team snapshot 类型；`QueueChatMessageResponse` 暴露可选 `agentTaskId`，用于 Team 模式 queued/running 归属。
+- `web/features/agents/AgentsSettingsPanel.tsx` 提供全局 Agents 设置页，可创建、编辑、删除 AgentDefinition，配置 provider/model、thinking/max output、system prompt、allowed tools、maxInstances 和协作权限，图标统一来自 `lucide-react`。
+- `web/features/agents/AgentsRuntimePanel.tsx` 接入现有右侧 context panel 模型，新增 Agents tab；桌面复用右侧面板，移动端沿用既有底部覆盖面板。面板展示 Team workload、实例、任务、事件、消息和 mutation lease owner，并提供 enable、create worker、pause/resume/drain/stop/reset/delete、cancel/retry/transfer 等操作。
+- `web/App.tsx` 统一加载 `/api/agent-definitions` 与当前 chat Team snapshot；所有 Agent 写操作完成后使用后端返回 snapshot 替换本地状态，不在前端伪造运行时状态。全局设置和统计视图不渲染 Team runtime 面板。
+- `web/test-utils/app-test-harness.tsx` 增加 AgentDefinition 与 Team snapshot fixture/mock fetch；`web/app-agents.test.tsx` 覆盖 Agents 设置页、右侧 Agents 面板入口和 Team 启用路径。验证命令 `npm run test -w web -- app-agents.test.tsx`、`npm run test -w web`、`npm run typecheck -w web` 和 `cargo check --workspace` 均通过。
 
 ---
 
