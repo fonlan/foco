@@ -3,9 +3,10 @@ use axum::{
     extract::{Path as AxumPath, State},
 };
 use foco_agent::{
-    AgentAttemptId, AgentDefinitionId, AgentInstanceId, AgentInstanceStatus, AgentMessageId,
-    AgentRole, AgentTaskId, AgentTaskStatus, AgentTaskTransition, AgentTeamId, AgentTeamStatus,
-    TeamActivationRequest, TeamWorkload, ToolResource, ToolResourceAccess, ToolResourceLock,
+    AgentAttemptId, AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceId,
+    AgentInstanceStatus, AgentMessageId, AgentRole, AgentTaskId, AgentTaskStatus,
+    AgentTaskTransition, AgentTeamId, AgentTeamStatus, TeamActivationRequest, TeamWorkload,
+    ToolResource, ToolResourceAccess, ToolResourceLock,
 };
 use foco_store::workspace::{
     AgentEventRecord, AgentInstanceRecord, AgentMessageRecord, AgentTaskDependencyRecord,
@@ -14,7 +15,10 @@ use foco_store::workspace::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::LazyLock;
+use std::{
+    path::{Path, PathBuf},
+    sync::LazyLock,
+};
 
 static AGENT_URL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r#"https?://[^\s<>\"']+"#).expect("valid Agent URL redaction regex")
@@ -27,6 +31,10 @@ static AGENT_SECRET_ASSIGNMENT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
 });
 const AGENT_REDACTED_VALUE: &str = "<redacted>";
 
+use crate::git_backend::{
+    agent_worktree_diff_id, create_agent_worktree, delete_agent_worktree, git_diff_response,
+    git_status_response, merge_agent_worktree,
+};
 use crate::runtime::{
     AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
     ToolResourceLockOwnerSnapshot,
@@ -35,6 +43,7 @@ use crate::*;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy)]
 enum AgentRuntimeScope {
     Team,
     Instance,
@@ -42,6 +51,7 @@ enum AgentRuntimeScope {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy)]
 enum AgentRuntimeAction {
     Pause,
     Resume,
@@ -49,6 +59,12 @@ enum AgentRuntimeAction {
     Stop,
     Delete,
     ResetContext,
+    WorktreeStatus,
+    WorktreeDiff,
+    WorktreeKeep,
+    WorktreeArchive,
+    WorktreeDelete,
+    WorktreeMerge,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +82,8 @@ pub(crate) struct AgentCreateInstancesRequest {
     count: u32,
     max_instances_per_team: u32,
     max_instances_for_definition: u32,
+    #[serde(default)]
+    execution_workspace_mode: AgentExecutionWorkspaceMode,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +114,8 @@ pub(crate) struct AgentTeamSnapshotResponse {
     messages: Vec<AgentMessageView>,
     events: Vec<AgentEventView>,
     mutation_lease_owners: Vec<AgentMutationLeaseOwnerView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worktree_action: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -152,8 +172,19 @@ struct AgentInstanceView {
     next_task_sequence: i64,
     context_generation: i64,
     last_scheduled_at: Option<String>,
+    execution_workspace_mode: AgentExecutionWorkspaceMode,
+    execution_root_path: Option<String>,
+    worktree_base_revision: Option<String>,
+    worktree_branch: Option<String>,
+    worktree_status: Option<String>,
     created_at: String,
     updated_at: String,
+}
+
+struct CreatedAgentWorktree {
+    root_path: String,
+    base_revision: String,
+    branch: String,
 }
 
 #[derive(Serialize)]
@@ -411,22 +442,52 @@ pub(crate) async fn create_agent_instances(
         .map(|_| AgentInstanceId::new(unique_id("agent-instance")))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    let worktrees = match request.execution_workspace_mode {
+        AgentExecutionWorkspaceMode::Shared => Vec::new(),
+        AgentExecutionWorkspaceMode::IsolatedWorktree => instance_ids
+            .iter()
+            .map(|id| {
+                let info = create_agent_worktree(&workspace.path, id.as_str())?;
+                Ok(CreatedAgentWorktree {
+                    root_path: display_path(&info.root_path),
+                    base_revision: info.base_revision,
+                    branch: info.branch,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?,
+    };
     let instances = instance_ids
         .iter()
-        .map(|id| NewAgentInstance {
-            id,
-            team_id: &team.id,
-            definition,
-            role: AgentRole::Worker,
+        .enumerate()
+        .map(|(index, id)| {
+            let worktree = worktrees.get(index);
+            NewAgentInstance {
+                id,
+                team_id: &team.id,
+                definition,
+                role: AgentRole::Worker,
+                execution_workspace_mode: request.execution_workspace_mode,
+                execution_root_path: worktree.map(|worktree| worktree.root_path.as_str()),
+                worktree_base_revision: worktree.map(|worktree| worktree.base_revision.as_str()),
+                worktree_branch: worktree.map(|worktree| worktree.branch.as_str()),
+                worktree_status: worktree.map(|_| "active"),
+            }
         })
         .collect::<Vec<_>>();
-    let created = database
-        .create_agent_instances_with_limits(
-            &instances,
-            i64::from(request.max_instances_per_team),
-            i64::from(request.max_instances_for_definition),
-        )
-        .map_err(ApiError::from_workspace_error)?;
+    let created = match database.create_agent_instances_with_limits(
+        &instances,
+        i64::from(request.max_instances_per_team),
+        i64::from(request.max_instances_for_definition),
+    ) {
+        Ok(created) => created,
+        Err(error) => {
+            for worktree in &worktrees {
+                let _ =
+                    delete_agent_worktree(&workspace.path, Path::new(&worktree.root_path), true);
+            }
+            return Err(ApiError::from_workspace_error(error));
+        }
+    };
     for instance in &created {
         insert_agent_event(
             &mut database,
@@ -441,6 +502,11 @@ pub(crate) async fn create_agent_instances(
                 "definitionRevision": instance.definition_revision,
                 "role": instance.role,
                 "status": instance.status,
+                "executionWorkspaceMode": instance.execution_workspace_mode,
+                "executionRootPath": instance.execution_root_path,
+                "worktreeBaseRevision": instance.worktree_base_revision,
+                "worktreeBranch": instance.worktree_branch,
+                "worktreeStatus": instance.worktree_status,
             }),
         )?;
     }
@@ -466,6 +532,7 @@ pub(crate) async fn agent_runtime_action(
         .agent_team_for_chat(&chat_id)
         .map_err(ApiError::from_workspace_error)?
         .ok_or_else(|| ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")))?;
+    let mut worktree_action = None;
 
     match request.scope {
         AgentRuntimeScope::Team => {
@@ -482,6 +549,16 @@ pub(crate) async fn agent_runtime_action(
                 AgentRuntimeAction::ResetContext => {
                     return Err(ApiError::bad_request(
                         "resetContext is only valid for Agent instances",
+                    ));
+                }
+                AgentRuntimeAction::WorktreeStatus
+                | AgentRuntimeAction::WorktreeDiff
+                | AgentRuntimeAction::WorktreeKeep
+                | AgentRuntimeAction::WorktreeArchive
+                | AgentRuntimeAction::WorktreeDelete
+                | AgentRuntimeAction::WorktreeMerge => {
+                    return Err(ApiError::bad_request(
+                        "worktree actions are only valid for Agent instances",
                     ));
                 }
             };
@@ -514,7 +591,31 @@ pub(crate) async fn agent_runtime_action(
                     team.id
                 )));
             }
-            if matches!(request.action, AgentRuntimeAction::Delete) {
+            if matches!(
+                request.action,
+                AgentRuntimeAction::WorktreeStatus
+                    | AgentRuntimeAction::WorktreeDiff
+                    | AgentRuntimeAction::WorktreeKeep
+                    | AgentRuntimeAction::WorktreeArchive
+                    | AgentRuntimeAction::WorktreeDelete
+                    | AgentRuntimeAction::WorktreeMerge
+            ) {
+                worktree_action = Some(execute_agent_worktree_action(
+                    &workspace.path,
+                    &mut database,
+                    &team.id,
+                    &instance,
+                    request.action,
+                )?);
+            } else if matches!(request.action, AgentRuntimeAction::Delete) {
+                if instance.execution_workspace_mode
+                    == AgentExecutionWorkspaceMode::IsolatedWorktree
+                    && instance.worktree_status.as_deref() != Some("deleted")
+                {
+                    return Err(ApiError::bad_request(
+                        "delete Agent instance with isolated worktree requires explicit worktree_delete first",
+                    ));
+                }
                 database
                     .delete_agent_instance(&instance_id)
                     .map_err(ApiError::from_workspace_error)?;
@@ -539,6 +640,12 @@ pub(crate) async fn agent_runtime_action(
                     AgentRuntimeAction::Stop => AgentInstanceStatus::Stopped,
                     AgentRuntimeAction::Delete => unreachable!(),
                     AgentRuntimeAction::ResetContext => unreachable!(),
+                    AgentRuntimeAction::WorktreeStatus
+                    | AgentRuntimeAction::WorktreeDiff
+                    | AgentRuntimeAction::WorktreeKeep
+                    | AgentRuntimeAction::WorktreeArchive
+                    | AgentRuntimeAction::WorktreeDelete
+                    | AgentRuntimeAction::WorktreeMerge => unreachable!(),
                 };
                 database
                     .transition_agent_instance_status(&instance_id, target)
@@ -556,12 +663,145 @@ pub(crate) async fn agent_runtime_action(
         }
     }
     state.agent_scheduler.wake()?;
-    Ok(Json(agent_team_snapshot_from_database(
-        &state,
-        &workspace_id,
-        &database,
-        &team.id,
-    )?))
+    let mut snapshot =
+        agent_team_snapshot_from_database(&state, &workspace_id, &database, &team.id)?;
+    snapshot.worktree_action = worktree_action;
+    Ok(Json(snapshot))
+}
+
+fn execute_agent_worktree_action(
+    workspace_path: &Path,
+    database: &mut WorkspaceDatabase,
+    team_id: &AgentTeamId,
+    instance: &AgentInstanceRecord,
+    action: AgentRuntimeAction,
+) -> Result<serde_json::Value, ApiError> {
+    let worktree_path = agent_instance_worktree_path(instance)?;
+    let action_name = match action {
+        AgentRuntimeAction::WorktreeStatus => "worktree_status",
+        AgentRuntimeAction::WorktreeDiff => "worktree_diff",
+        AgentRuntimeAction::WorktreeKeep => "worktree_keep",
+        AgentRuntimeAction::WorktreeArchive => "worktree_archive",
+        AgentRuntimeAction::WorktreeDelete => "worktree_delete",
+        AgentRuntimeAction::WorktreeMerge => "worktree_merge",
+        _ => return Err(ApiError::bad_request("invalid Agent worktree action")),
+    };
+    let result = match action {
+        AgentRuntimeAction::WorktreeStatus => {
+            let status = git_status_response(&worktree_path)?;
+            json!({
+                "action": action_name,
+                "instanceId": instance.id.to_string(),
+                "executionRootPath": display_path(&worktree_path),
+                "status": status,
+            })
+        }
+        AgentRuntimeAction::WorktreeDiff => {
+            let diff = git_diff_response(&worktree_path, None)?;
+            let diff_id = agent_worktree_diff_id(&diff);
+            json!({
+                "action": action_name,
+                "instanceId": instance.id.to_string(),
+                "executionRootPath": display_path(&worktree_path),
+                "diffId": diff_id,
+                "diff": diff,
+            })
+        }
+        AgentRuntimeAction::WorktreeKeep => {
+            let updated = database
+                .update_agent_instance_worktree_status(&instance.id, "kept")
+                .map_err(ApiError::from_workspace_error)?;
+            json!({
+                "action": action_name,
+                "instanceId": updated.id.to_string(),
+                "worktreeStatus": updated.worktree_status,
+            })
+        }
+        AgentRuntimeAction::WorktreeArchive => {
+            let updated = database
+                .update_agent_instance_worktree_status(&instance.id, "archived")
+                .map_err(ApiError::from_workspace_error)?;
+            json!({
+                "action": action_name,
+                "instanceId": updated.id.to_string(),
+                "worktreeStatus": updated.worktree_status,
+            })
+        }
+        AgentRuntimeAction::WorktreeDelete => {
+            delete_agent_worktree(workspace_path, &worktree_path, false)?;
+            let updated = database
+                .update_agent_instance_worktree_status(&instance.id, "deleted")
+                .map_err(ApiError::from_workspace_error)?;
+            json!({
+                "action": action_name,
+                "instanceId": updated.id.to_string(),
+                "worktreeStatus": updated.worktree_status,
+            })
+        }
+        AgentRuntimeAction::WorktreeMerge => {
+            let base_revision = instance.worktree_base_revision.as_deref().ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "Agent instance '{}' has no worktree base revision",
+                    instance.id
+                ))
+            })?;
+            let merge = merge_agent_worktree(workspace_path, &worktree_path, base_revision)?;
+            let updated = database
+                .update_agent_instance_worktree_status(&instance.id, "kept")
+                .map_err(ApiError::from_workspace_error)?;
+            json!({
+                "action": action_name,
+                "instanceId": updated.id.to_string(),
+                "worktreeStatus": updated.worktree_status,
+                "baseRevision": merge.base_revision,
+                "changedPaths": merge.changed_paths,
+                "diffId": merge.diff_id,
+            })
+        }
+        _ => unreachable!(),
+    };
+    insert_agent_event(
+        database,
+        team_id,
+        action_name,
+        Some(&instance.id),
+        None,
+        None,
+        redact_worktree_action_event_payload(&result),
+    )?;
+    Ok(result)
+}
+
+fn agent_instance_worktree_path(instance: &AgentInstanceRecord) -> Result<PathBuf, ApiError> {
+    if instance.execution_workspace_mode != AgentExecutionWorkspaceMode::IsolatedWorktree {
+        return Err(ApiError::bad_request(format!(
+            "Agent instance '{}' does not use an isolated worktree",
+            instance.id
+        )));
+    }
+    let path = instance.execution_root_path.as_deref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "Agent instance '{}' has no execution root path",
+            instance.id
+        ))
+    })?;
+    Ok(PathBuf::from(path))
+}
+
+fn display_path(path: &Path) -> String {
+    let path = path.display().to_string();
+    path.strip_prefix(r"\\?\UNC\")
+        .map(|tail| format!(r"\\{tail}"))
+        .or_else(|| path.strip_prefix(r"\\?\").map(ToString::to_string))
+        .unwrap_or(path)
+}
+
+fn redact_worktree_action_event_payload(result: &serde_json::Value) -> serde_json::Value {
+    let mut payload = result.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("diff");
+    }
+    payload
 }
 
 pub(crate) async fn agent_task_action(
@@ -898,6 +1138,7 @@ fn agent_team_snapshot_from_database(
         messages,
         events,
         mutation_lease_owners,
+        worktree_action: None,
     })
 }
 
@@ -935,6 +1176,13 @@ impl From<AgentInstanceRecord> for AgentInstanceView {
             next_task_sequence: instance.next_task_sequence,
             context_generation: instance.context_generation,
             last_scheduled_at: instance.last_scheduled_at,
+            execution_workspace_mode: instance.execution_workspace_mode,
+            execution_root_path: instance
+                .execution_root_path
+                .map(|path| display_path(Path::new(&path))),
+            worktree_base_revision: instance.worktree_base_revision,
+            worktree_branch: instance.worktree_branch,
+            worktree_status: instance.worktree_status,
             created_at: instance.created_at,
             updated_at: instance.updated_at,
         }

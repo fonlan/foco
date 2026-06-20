@@ -1,9 +1,9 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use foco_agent::{
-    AgentAttemptId, AgentCollaborationTool, AgentInstanceStatus, AgentPermissions, AgentRole,
-    AgentRunAssociations, AgentRunOutcome, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
-    estimate_text_tokens,
+    AgentAttemptId, AgentCollaborationTool, AgentExecutionWorkspaceMode, AgentInstanceStatus,
+    AgentPermissions, AgentRole, AgentRunAssociations, AgentRunOutcome, AgentTaskId,
+    AgentTaskStatus, AgentTaskTransition, estimate_text_tokens,
 };
 use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
 use foco_store::{
@@ -21,6 +21,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 
+use crate::git_backend::{agent_worktree_diff_id, git_diff_response};
 use crate::*;
 
 // ponytail: fixed first-slice limits avoid new config surface; make them configurable when
@@ -174,6 +175,36 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
                 Some(&record.task.id),
                 Some(&record.attempt.id),
                 json!({ "reason": RESTART_INTERRUPTION_REASON }),
+            )?;
+        }
+        for instance in database
+            .isolated_agent_instances()
+            .map_err(ApiError::from_workspace_error)?
+        {
+            if instance.worktree_status.as_deref() == Some("deleted") {
+                continue;
+            }
+            let Some(root_path) = instance.execution_root_path.as_deref() else {
+                continue;
+            };
+            if PathBuf::from(root_path).exists() {
+                continue;
+            }
+            let updated = database
+                .update_agent_instance_worktree_status(&instance.id, "deleted")
+                .map_err(ApiError::from_workspace_error)?;
+            insert_agent_event(
+                &mut database,
+                &instance.team_id,
+                "worktree_reconciled",
+                Some(&instance.id),
+                None,
+                None,
+                json!({
+                    "reason": "isolated worktree path was not found during startup reconciliation",
+                    "executionRootPath": root_path,
+                    "worktreeStatus": updated.worktree_status,
+                }),
             )?;
         }
     }
@@ -351,6 +382,17 @@ async fn run_coordinator_task_inner(
         },
     )
     .await?;
+    chat_context.tool_workspace_path = match instance.execution_workspace_mode {
+        AgentExecutionWorkspaceMode::Shared => workspace.path.clone(),
+        AgentExecutionWorkspaceMode::IsolatedWorktree => {
+            PathBuf::from(instance.execution_root_path.as_deref().ok_or_else(|| {
+                ApiError::internal(format!(
+                    "Agent instance '{}' is missing isolated execution root",
+                    instance.id
+                ))
+            })?)
+        }
+    };
     let allowed_tools = instance
         .definition_snapshot
         .allowed_tools
@@ -409,6 +451,7 @@ async fn run_coordinator_task_inner(
     )?);
     chat_context.agent_allowed_tools = Some(allowed_tools);
     chat_context.agent_tool_context = Some(AgentToolContext {
+        workspace_path: workspace.path.clone(),
         associations: chat_context.agent_associations.clone(),
         permissions: instance.definition_snapshot.permissions.clone(),
         agent_definitions: config.agent_definitions.clone(),
@@ -712,6 +755,13 @@ fn agent_team_protocol_prompt(
         "taskId": task.id.to_string(),
         "attemptId": attempt_id.to_string(),
         "contextGeneration": instance.context_generation,
+        "executionWorkspace": {
+            "mode": instance.execution_workspace_mode.as_str(),
+            "rootPath": instance.execution_root_path,
+            "baseRevision": instance.worktree_base_revision,
+            "branch": instance.worktree_branch,
+            "status": instance.worktree_status,
+        },
         "permissions": instance.definition_snapshot.permissions,
         "allowedRuntimeTools": tools,
         "runtimeLimits": {
@@ -1214,17 +1264,33 @@ fn finish_claimed_task(
     attempt_id: &AgentAttemptId,
     outcome: AgentRunOutcome,
 ) -> Result<(), ApiError> {
+    let instance = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?
+        .agent_instance(&task.owner_instance_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "Agent instance '{}' was not found",
+                task.owner_instance_id
+            ))
+        })?;
     let (transition, result, error, event_type) = match outcome {
         AgentRunOutcome::Completed {
             text,
             reasoning,
             usage,
-        } => (
-            AgentTaskTransition::Complete,
-            Some(json!({ "text": text, "reasoning": reasoning, "usage": usage })),
-            None,
-            "task_completed",
-        ),
+        } => {
+            let mut result = json!({ "text": text, "reasoning": reasoning, "usage": usage });
+            if let Some(worktree) = agent_task_worktree_result(&instance)? {
+                result["worktree"] = worktree;
+            }
+            (
+                AgentTaskTransition::Complete,
+                Some(result),
+                None,
+                "task_completed",
+            )
+        }
         AgentRunOutcome::Failed { message, retryable } => (
             AgentTaskTransition::Fail,
             None,
@@ -1295,6 +1361,35 @@ fn finish_claimed_task(
         payload,
     )?;
     Ok(())
+}
+
+fn agent_task_worktree_result(instance: &AgentInstanceRecord) -> Result<Option<Value>, ApiError> {
+    if instance.execution_workspace_mode != AgentExecutionWorkspaceMode::IsolatedWorktree {
+        return Ok(None);
+    }
+    let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
+        ApiError::internal(format!(
+            "Agent instance '{}' is missing isolated execution root",
+            instance.id
+        ))
+    })?;
+    let diff = git_diff_response(Path::new(root_path), None)?;
+    Ok(Some(json!({
+        "mode": instance.execution_workspace_mode.as_str(),
+        "rootPath": root_path,
+        "baseRevision": instance.worktree_base_revision,
+        "branch": instance.worktree_branch,
+        "status": instance.worktree_status,
+        "diffId": agent_worktree_diff_id(&diff),
+        "changedPaths": diff
+            .files
+            .iter()
+            .chain(diff.staged_files.iter())
+            .map(|file| file.path.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+    })))
 }
 
 fn fail_claimed_task(

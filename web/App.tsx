@@ -111,6 +111,7 @@ import type {
   AgentDefinitionInput,
   AgentDefinitionSettings,
   AgentDefinitionsResponse,
+  AgentExecutionWorkspaceMode,
   AgentTeamSnapshotResponse,
   AppLanguageId,
   AppThemeId,
@@ -1035,7 +1036,11 @@ export function App() {
     }
   }
 
-  async function createAgentInstances(definitionId: string, count: number) {
+  async function createAgentInstances(
+    definitionId: string,
+    count: number,
+    executionWorkspaceMode: AgentExecutionWorkspaceMode,
+  ) {
     if (!activeWorkspaceId || !activeChatId) {
       setAgentTeamError(t("Open a chat to manage its Agent team."));
       return;
@@ -1056,6 +1061,7 @@ export function App() {
           body: JSON.stringify({
             count,
             definitionId,
+            executionWorkspaceMode,
             maxInstancesForDefinition: definition.maxInstances,
             maxInstancesPerTeam: AGENT_MAX_INSTANCES_PER_TEAM,
           }),
@@ -1073,7 +1079,19 @@ export function App() {
 
   async function runAgentRuntimeAction(
     scope: "instance" | "team",
-    action: "delete" | "drain" | "pause" | "reset_context" | "resume" | "stop",
+    action:
+      | "delete"
+      | "drain"
+      | "pause"
+      | "reset_context"
+      | "resume"
+      | "stop"
+      | "worktree_archive"
+      | "worktree_delete"
+      | "worktree_diff"
+      | "worktree_keep"
+      | "worktree_merge"
+      | "worktree_status",
     instanceId?: string,
   ) {
     if (!activeWorkspaceId || !activeChatId) {
@@ -1094,6 +1112,9 @@ export function App() {
         },
       );
       setAgentTeamSnapshot(data);
+      if (action === "worktree_merge") {
+        await loadGitDiff(activeWorkspaceId, selectedDiffPath);
+      }
     } catch (requestError) {
       setAgentTeamError(errorMessage(requestError));
     } finally {

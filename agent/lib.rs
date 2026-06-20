@@ -185,6 +185,28 @@ impl AgentRole {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum AgentExecutionWorkspaceMode {
+    Shared,
+    IsolatedWorktree,
+}
+
+impl AgentExecutionWorkspaceMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::IsolatedWorktree => "isolated_worktree",
+        }
+    }
+}
+
+impl Default for AgentExecutionWorkspaceMode {
+    fn default() -> Self {
+        Self::Shared
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AgentTeamStatus {
     Active,
     Paused,

@@ -700,6 +700,8 @@ export type AgentWorkload = {
   waitingTasks: number;
 };
 
+export type AgentExecutionWorkspaceMode = "shared" | "isolated_worktree";
+
 export type AgentInstanceView = {
   id: string;
   teamId: string;
@@ -710,6 +712,11 @@ export type AgentInstanceView = {
   status: string;
   nextTaskSequence: number;
   contextGeneration: number;
+  executionWorkspaceMode: AgentExecutionWorkspaceMode;
+  executionRootPath: string | null;
+  worktreeBaseRevision: string | null;
+  worktreeBranch: string | null;
+  worktreeStatus: string | null;
   lastScheduledAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -820,6 +827,7 @@ export type AgentTeamSnapshotResponse = {
   messages: AgentMessageView[];
   events: AgentEventView[];
   mutationLeaseOwners: AgentMutationLeaseOwnerView[];
+  worktreeAction?: JsonValue | null;
 };
 
 // Provider types

@@ -996,47 +996,59 @@
 
 ## 阶段 12：实例隔离 worktree（后续增强）
 
+**阶段状态：已完成（2026-06-20）**
+
 ### 目标
 
 在 shared workspace mutation 串行模式稳定后，支持多个 Agent 真正并行修改代码。
 
 ### 12.1 Execution workspace 抽象
 
-- [ ] 为 AgentInstance 增加 execution workspace mode：shared 或 isolated worktree。
-- [ ] 通过 Foco 内部 Git 能力管理 worktree，不依赖外部 git 命令。
-- [ ] 创建实例时显式选择隔离模式，不自动从 shared 切换。
-- [ ] 隔离 workspace 路径不得暴露 Windows `\\?\` verbatim 前缀给配置或 UI。
-- [ ] code graph、文件工具、命令和 Git API 全部绑定实例 execution root。
+- [x] 为 AgentInstance 增加 execution workspace mode：shared 或 isolated worktree。
+- [x] 通过 Foco 内部 Git 能力管理 worktree，不依赖外部 git 命令。
+- [x] 创建实例时显式选择隔离模式，不自动从 shared 切换。
+- [x] 隔离 workspace 路径不得暴露 Windows `\\?\` verbatim 前缀给配置或 UI。
+- [x] code graph、文件工具、命令和 Git API 全部绑定实例 execution root。
 
 ### 12.2 Worktree 生命周期
 
-- [ ] 创建隔离 worktree 时记录 base revision、分支和实例关联。
-- [ ] 实例停止时不得静默删除存在未合并变更的 worktree。
-- [ ] 提供状态、diff、保留、归档和显式删除操作。
-- [ ] 删除前验证路径位于 Foco 管理目录，避免递归删除越界。
-- [ ] 后端异常退出后能够发现并恢复孤立 worktree 元数据。
+- [x] 创建隔离 worktree 时记录 base revision、分支和实例关联。
+- [x] 实例停止时不得静默删除存在未合并变更的 worktree。
+- [x] 提供状态、diff、保留、归档和显式删除操作。
+- [x] 删除前验证路径位于 Foco 管理目录，避免递归删除越界。
+- [x] 后端异常退出后能够发现并恢复孤立 worktree 元数据。
 
 ### 12.3 结果合并
 
-- [ ] Worker 完成实现任务时返回结构化变更摘要、base revision 和 diff 标识。
-- [ ] Coordinator 或用户显式发起合并。
-- [ ] 合并冲突明确返回，不自动选择一方或覆盖 shared workspace。
-- [ ] 合并前验证 shared workspace 当前 revision 与 Worker base revision 的关系。
-- [ ] 合并后的 code graph、Git diff 和 UI 状态及时刷新。
+- [x] Worker 完成实现任务时返回结构化变更摘要、base revision 和 diff 标识。
+- [x] Coordinator 或用户显式发起合并。
+- [x] 合并冲突明确返回，不自动选择一方或覆盖 shared workspace。
+- [x] 合并前验证 shared workspace 当前 revision 与 Worker base revision 的关系。
+- [x] 合并后的 code graph、Git diff 和 UI 状态及时刷新。
 
 ### 12.4 安全与测试
 
-- [ ] 覆盖两个 isolated instance 真正并行写入不同 worktree。
-- [ ] 覆盖冲突、shared workspace 已变化、实例中断和 orphan recovery。
-- [ ] 覆盖路径校验、Windows 路径规范化和内部目录 ignore 规则。
-- [ ] 覆盖未合并变更不会被 stop/delete 静默清理。
-- [ ] 更新 `AGENTS.md`、运行命令和 release smoke 验证说明。
+- [x] 覆盖两个 isolated instance 真正并行写入不同 worktree。
+- [x] 覆盖冲突、shared workspace 已变化、实例中断和 orphan recovery。
+- [x] 覆盖路径校验、Windows 路径规范化和内部目录 ignore 规则。
+- [x] 覆盖未合并变更不会被 stop/delete 静默清理。
+- [x] 更新 `AGENTS.md`、运行命令和 release smoke 验证说明。
 
 ### 阶段 12 退出条件
 
-- [ ] 多实例可以在物理隔离的工作目录中并行修改代码。
-- [ ] 所有合并和删除操作均由用户或 Agent 显式发起且可审计。
-- [ ] shared workspace 模式继续可用，并保持其原有安全语义。
+- [x] 多实例可以在物理隔离的工作目录中并行修改代码。
+- [x] 所有合并和删除操作均由用户或 Agent 显式发起且可审计。
+- [x] shared workspace 模式继续可用，并保持其原有安全语义。
+
+### Phase 12 实现记录
+
+- `AgentExecutionWorkspaceMode` 位于 `agent/lib.rs`，实例创建 API 和 `agent_create_instances` 工具均要求显式选择 `shared` 或 `isolated_worktree`；省略时 API 保持 `shared` 兼容。
+- Workspace schema v13 为 `agent_instances` 增加 execution root、base revision、branch 和 worktree status；启动 reconciliation 会把缺失物理路径的 isolated worktree 标记为 `deleted` 并写入 Agent event。
+- `app/git_backend.rs` 使用 `gix` 创建 Foco 管理的 linked worktree，路径固定在 `<workspace>/.foco/agent-worktrees/<instance-id>`；删除前做 managed-root 校验，未合并变更会明确拒绝。
+- Chat runtime 保留原 workspace 用于 Team/Task/Message/审计持久化，同时将文件、命令、Git 和 code graph 工具绑定到实例 execution root；Worker 完成结果包含 changed paths、base revision、branch、status 和 diff id。
+- Team runtime action 支持 worktree status、diff、keep、archive、delete 和 merge；merge 要求 shared HEAD 等于 worker base revision 且 shared workspace 干净，成功后前端刷新 Git diff 和 Agent snapshot。
+- 前端 Agent runtime 面板支持创建 worker 时选择 workspace mode，实例卡片展示 isolated worktree 元数据并提供显式 worktree 操作按钮。
+- 验证覆盖：`cargo test -p foco-app phase12_agent_worktrees_isolate_delete_and_merge_changes`、`cargo test -p foco-store phase12 --test workspace_database`、`cargo check -p foco-app`、`npm run typecheck -w web`。
 
 ---
 

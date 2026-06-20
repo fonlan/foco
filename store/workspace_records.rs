@@ -2,9 +2,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use foco_agent::{
-    AgentAttemptId, AgentAttemptStatus, AgentDefinitionId, AgentInstanceId, AgentInstanceStatus,
-    AgentMessageId, AgentMessageKind, AgentRole, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
-    AgentTaskWaitMode, AgentTeamId, AgentTeamStatus,
+    AgentAttemptId, AgentAttemptStatus, AgentDefinitionId, AgentExecutionWorkspaceMode,
+    AgentInstanceId, AgentInstanceStatus, AgentMessageId, AgentMessageKind, AgentRole, AgentTaskId,
+    AgentTaskStatus, AgentTaskTransition, AgentTaskWaitMode, AgentTeamId, AgentTeamStatus,
 };
 
 use crate::{config::AgentDefinitionSettings, workspace::WorkspaceDatabaseError};
@@ -36,6 +36,11 @@ pub struct NewAgentInstance<'a> {
     pub team_id: &'a AgentTeamId,
     pub definition: &'a AgentDefinitionSettings,
     pub role: AgentRole,
+    pub execution_workspace_mode: AgentExecutionWorkspaceMode,
+    pub execution_root_path: Option<&'a str>,
+    pub worktree_base_revision: Option<&'a str>,
+    pub worktree_branch: Option<&'a str>,
+    pub worktree_status: Option<&'a str>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +56,11 @@ pub struct AgentInstanceRecord {
     pub next_message_sequence: i64,
     pub context_generation: i64,
     pub last_scheduled_at: Option<String>,
+    pub execution_workspace_mode: AgentExecutionWorkspaceMode,
+    pub execution_root_path: Option<String>,
+    pub worktree_base_revision: Option<String>,
+    pub worktree_branch: Option<String>,
+    pub worktree_status: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }

@@ -183,6 +183,7 @@ fn test_prepared_chat_context(
     PreparedChatContext {
         workspace_id: "workspace-1".to_string(),
         workspace_path: workspace_dir.clone(),
+        tool_workspace_path: workspace_dir.clone(),
         memory_database_file: workspace_dir.join("global-memory.sqlite"),
         chat_id: "chat-1".to_string(),
         provider_id: "openai-responses".to_string(),
@@ -610,6 +611,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
         mpsc::unbounded_channel().0,
         "assistant-1",
         "workspace-1",
+        workspace.path(),
         workspace.path(),
         "chat-1",
         "run-1",
@@ -3572,6 +3574,7 @@ fn persist_chat_result_writes_audit_status_code() {
     let context = PreparedChatContext {
         workspace_id: "workspace-1".to_string(),
         workspace_path: workspace_dir.clone(),
+        tool_workspace_path: workspace_dir.clone(),
         memory_database_file: workspace_dir.join("global-memory.sqlite"),
         chat_id: "chat-1".to_string(),
         provider_id: "openai-responses".to_string(),
@@ -3754,6 +3757,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
     let context = PreparedChatContext {
         workspace_id: "workspace-1".to_string(),
         workspace_path: workspace_dir.clone(),
+        tool_workspace_path: workspace_dir.clone(),
         memory_database_file: workspace_dir.join("global-memory.sqlite"),
         chat_id: "chat-1".to_string(),
         provider_id: "openai-responses".to_string(),
@@ -4091,6 +4095,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
     let context = PreparedChatContext {
         workspace_id: "workspace-1".to_string(),
         workspace_path: workspace_dir.clone(),
+        tool_workspace_path: workspace_dir.clone(),
         memory_database_file: workspace_dir.join("global-memory.sqlite"),
         chat_id: "chat-1".to_string(),
         provider_id: "openai-responses".to_string(),

@@ -1,7 +1,11 @@
 import {
+  Archive,
   Bot,
   CheckCircle2,
   CircleAlert,
+  FileDiff,
+  GitBranch,
+  GitMerge,
   LoaderCircle,
   MessageSquare,
   Pause,
@@ -17,6 +21,7 @@ import { useMemo, useState } from "react";
 
 import type {
   AgentDefinitionSettings,
+  AgentExecutionWorkspaceMode,
   AgentInstanceView,
   AgentTaskView,
   AgentTeamSnapshotResponse,
@@ -29,7 +34,13 @@ type AgentRuntimeAction =
   | "pause"
   | "reset_context"
   | "resume"
-  | "stop";
+  | "stop"
+  | "worktree_archive"
+  | "worktree_delete"
+  | "worktree_diff"
+  | "worktree_keep"
+  | "worktree_merge"
+  | "worktree_status";
 type AgentRuntimeScope = "instance" | "team";
 type AgentTaskAction = "cancel" | "retry" | "transfer";
 
@@ -51,7 +62,11 @@ export function AgentsRuntimePanel({
   error: string | null;
   isLoading: boolean;
   operationKey: string | null;
-  onCreateInstances: (definitionId: string, count: number) => Promise<void>;
+  onCreateInstances: (
+    definitionId: string,
+    count: number,
+    executionWorkspaceMode: AgentExecutionWorkspaceMode,
+  ) => Promise<void>;
   onEnableTeam: (coordinatorDefinitionId: string) => Promise<void>;
   onRefresh: () => Promise<void>;
   onRuntimeAction: (
@@ -70,6 +85,8 @@ export function AgentsRuntimePanel({
   const [coordinatorDefinitionId, setCoordinatorDefinitionId] = useState("");
   const [workerDefinitionId, setWorkerDefinitionId] = useState("");
   const [workerCount, setWorkerCount] = useState("1");
+  const [workerExecutionWorkspaceMode, setWorkerExecutionWorkspaceMode] =
+    useState<AgentExecutionWorkspaceMode>("shared");
   const sortedTasks = useMemo(
     () => [...(snapshot?.tasks ?? [])].sort((left, right) => right.sequence - left.sequence),
     [snapshot?.tasks],
@@ -226,6 +243,23 @@ export function AgentsRuntimePanel({
                   value={workerCount}
                 />
               </label>
+              <label className="block">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  {t("Workspace")}
+                </span>
+                <select
+                  className="h-9 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm outline-none focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) =>
+                    setWorkerExecutionWorkspaceMode(
+                      event.target.value as AgentExecutionWorkspaceMode,
+                    )
+                  }
+                  value={workerExecutionWorkspaceMode}
+                >
+                  <option value="shared">{t("Shared")}</option>
+                  <option value="isolated_worktree">{t("Isolated worktree")}</option>
+                </select>
+              </label>
               <button
                 className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-800 hover:border-teal-200 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-300"
                 disabled={!canCreateWorker}
@@ -233,6 +267,7 @@ export function AgentsRuntimePanel({
                   void onCreateInstances(
                     effectiveWorkerDefinitionId,
                     Math.max(1, Number.parseInt(workerCount, 10) || 1),
+                    workerExecutionWorkspaceMode,
                   )
                 }
                 type="button"
@@ -307,6 +342,10 @@ function AgentInstancesSection({
       <div className="mt-3 grid gap-2">
         {instances.map((instance) => (
           <div className="rounded-lg border border-stone-200 bg-stone-50/70 px-3 py-2" key={instance.id}>
+            {(() => {
+              const isIsolated = instance.executionWorkspaceMode === "isolated_worktree";
+              return (
+                <>
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
                 <div className="flex min-w-0 items-center gap-2">
@@ -318,6 +357,8 @@ function AgentInstancesSection({
                 <div className="mt-1 flex flex-wrap gap-1.5 text-[11px] font-semibold uppercase tracking-normal text-stone-500">
                   <span>{instance.role}</span>
                   <span>{instance.status}</span>
+                  <span>{isIsolated ? t("isolated") : t("shared")}</span>
+                  {instance.worktreeStatus ? <span>{instance.worktreeStatus}</span> : null}
                 </div>
               </div>
               <div className="flex shrink-0 gap-1">
@@ -348,7 +389,64 @@ function AgentInstancesSection({
                 />
               </div>
             </div>
+            {isIsolated ? (
+              <div className="mt-2 grid gap-1.5 text-xs text-stone-500">
+                {instance.worktreeBranch ? (
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
+                    <span className="truncate">{instance.worktreeBranch}</span>
+                  </div>
+                ) : null}
+                {instance.executionRootPath ? (
+                  <div className="truncate font-mono text-[11px] text-stone-500">
+                    {instance.executionRootPath}
+                  </div>
+                ) : null}
+                <div className="flex flex-wrap gap-1">
+                  <AgentIconButton
+                    disabled={operationKey !== null}
+                    icon={RefreshCw}
+                    label={t("Worktree status")}
+                    onClick={() => void onRuntimeAction("instance", "worktree_status", instance.id)}
+                  />
+                  <AgentIconButton
+                    disabled={operationKey !== null}
+                    icon={FileDiff}
+                    label={t("Worktree diff")}
+                    onClick={() => void onRuntimeAction("instance", "worktree_diff", instance.id)}
+                  />
+                  <AgentIconButton
+                    disabled={operationKey !== null}
+                    icon={GitMerge}
+                    label={t("Merge worktree")}
+                    onClick={() => void onRuntimeAction("instance", "worktree_merge", instance.id)}
+                  />
+                  <AgentIconButton
+                    disabled={operationKey !== null}
+                    icon={Archive}
+                    label={t("Archive worktree")}
+                    onClick={() => void onRuntimeAction("instance", "worktree_archive", instance.id)}
+                  />
+                  <AgentIconButton
+                    disabled={operationKey !== null}
+                    icon={CheckCircle2}
+                    label={t("Keep worktree")}
+                    onClick={() => void onRuntimeAction("instance", "worktree_keep", instance.id)}
+                  />
+                  <AgentIconButton
+                    danger
+                    disabled={operationKey !== null}
+                    icon={Trash2}
+                    label={t("Delete worktree")}
+                    onClick={() => void onRuntimeAction("instance", "worktree_delete", instance.id)}
+                  />
+                </div>
+              </div>
+            ) : null}
             <div className="mt-2 truncate text-xs text-stone-500">{instance.id}</div>
+                </>
+              );
+            })()}
           </div>
         ))}
       </div>

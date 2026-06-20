@@ -247,12 +247,17 @@ fn agent_create_instances_definition() -> ToolDefinition {
                     "minimum": 1,
                     "description": "Explicit per-definition instance limit for this create request."
                 },
+                "executionWorkspaceMode": {
+                    "type": "string",
+                    "enum": ["shared", "isolated_worktree"],
+                    "description": "Execution workspace mode for created workers. Use shared for the main workspace or isolated_worktree for an explicit Foco-managed Git worktree."
+                },
                 "timeoutMs": {
                     "type": ["integer", "null"],
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["definitionId", "count", "maxInstancesPerTeam", "maxInstancesForDefinition", "timeoutMs"]
+            "required": ["definitionId", "count", "maxInstancesPerTeam", "maxInstancesForDefinition", "executionWorkspaceMode", "timeoutMs"]
         }),
         strict: true,
     }

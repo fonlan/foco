@@ -43,12 +43,13 @@ pub use workspace_records::{
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
-    MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, Migration,
+    MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
+    Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 12;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 13;
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -101,6 +102,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 12,
         sql: MIGRATION_012,
+    },
+    Migration {
+        version: 13,
+        sql: MIGRATION_013,
     },
 ];
 
@@ -1900,8 +1905,9 @@ impl WorkspaceDatabase {
                 "INSERT INTO agent_instances
                     (id, team_id, definition_id, definition_revision,
                      definition_snapshot_json, role, status, next_task_sequence,
-                     next_message_sequence, context_generation, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'coordinator', 'idle', 0, 0, 0, ?6, ?6)",
+                     next_message_sequence, context_generation, execution_workspace_mode,
+                     created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'coordinator', 'idle', 0, 0, 0, 'shared', ?6, ?6)",
                 params![
                     team.coordinator_instance_id.as_str(),
                     team.id.as_str(),
@@ -2041,8 +2047,10 @@ impl WorkspaceDatabase {
                     "INSERT INTO agent_instances
                         (id, team_id, definition_id, definition_revision,
                          definition_snapshot_json, role, status, next_task_sequence,
-                         next_message_sequence, context_generation, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'idle', 0, 0, 0, ?7, ?7)",
+                         next_message_sequence, context_generation, execution_workspace_mode,
+                         execution_root_path, worktree_base_revision, worktree_branch,
+                         worktree_status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'idle', 0, 0, 0, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
                     params![
                         instance.id.as_str(),
                         instance.team_id.as_str(),
@@ -2050,6 +2058,11 @@ impl WorkspaceDatabase {
                         definition_revision,
                         snapshot_json,
                         instance.role.as_str(),
+                        instance.execution_workspace_mode.as_str(),
+                        instance.execution_root_path,
+                        instance.worktree_base_revision,
+                        instance.worktree_branch,
+                        instance.worktree_status,
                         now
                     ],
                 )
@@ -2111,6 +2124,8 @@ impl WorkspaceDatabase {
                 "SELECT id, team_id, definition_id, definition_revision,
                         definition_snapshot_json, role, status, next_task_sequence,
                         next_message_sequence, context_generation, last_scheduled_at,
+                        execution_workspace_mode, execution_root_path, worktree_base_revision,
+                        worktree_branch, worktree_status,
                         created_at, updated_at
                  FROM agent_instances WHERE id = ?1",
                 params![instance_id.as_str()],
@@ -2130,6 +2145,8 @@ impl WorkspaceDatabase {
                 "SELECT id, team_id, definition_id, definition_revision,
                         definition_snapshot_json, role, status, next_task_sequence,
                         next_message_sequence, context_generation, last_scheduled_at,
+                        execution_workspace_mode, execution_root_path, worktree_base_revision,
+                        worktree_branch, worktree_status,
                         created_at, updated_at
                  FROM agent_instances WHERE team_id = ?1
                  ORDER BY CASE role WHEN 'coordinator' THEN 0 ELSE 1 END, created_at, id",
@@ -2137,6 +2154,29 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
             .query_map(params![team_id.as_str()], agent_instance_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn isolated_agent_instances(
+        &self,
+    ) -> Result<Vec<AgentInstanceRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, team_id, definition_id, definition_revision,
+                        definition_snapshot_json, role, status, next_task_sequence,
+                        next_message_sequence, context_generation, last_scheduled_at,
+                        execution_workspace_mode, execution_root_path, worktree_base_revision,
+                        worktree_branch, worktree_status,
+                        created_at, updated_at
+                 FROM agent_instances
+                 WHERE execution_workspace_mode = 'isolated_worktree'
+                 ORDER BY team_id, created_at, id",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], agent_instance_from_row)
             .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
     }
@@ -2152,6 +2192,8 @@ impl WorkspaceDatabase {
                 "SELECT id, team_id, definition_id, definition_revision,
                         definition_snapshot_json, role, status, next_task_sequence,
                         next_message_sequence, context_generation, last_scheduled_at,
+                        execution_workspace_mode, execution_root_path, worktree_base_revision,
+                        worktree_branch, worktree_status,
                         created_at, updated_at
                  FROM agent_instances
                  WHERE team_id = ?1 AND definition_id = ?2
@@ -2178,7 +2220,10 @@ impl WorkspaceDatabase {
                         instance.definition_revision, instance.definition_snapshot_json,
                         instance.role, instance.status, instance.next_task_sequence,
                         instance.next_message_sequence, instance.context_generation,
-                        instance.last_scheduled_at, instance.created_at, instance.updated_at
+                        instance.last_scheduled_at, instance.execution_workspace_mode,
+                        instance.execution_root_path, instance.worktree_base_revision,
+                        instance.worktree_branch, instance.worktree_status,
+                        instance.created_at, instance.updated_at
                  FROM agent_instances AS instance
                  LEFT JOIN agent_tasks AS task
                    ON task.owner_instance_id = instance.id
@@ -2488,6 +2533,51 @@ impl WorkspaceDatabase {
         self.agent_instance(instance_id)?.ok_or_else(|| {
             WorkspaceDatabaseError::InvalidAgentRuntimeData {
                 message: format!("Agent instance '{instance_id}' was not found after reset"),
+            }
+        })
+    }
+
+    pub fn update_agent_instance_worktree_status(
+        &mut self,
+        instance_id: &AgentInstanceId,
+        status: &str,
+    ) -> Result<AgentInstanceRecord, WorkspaceDatabaseError> {
+        if !matches!(status, "active" | "kept" | "archived" | "deleted") {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("invalid Agent worktree status '{status}'"),
+            });
+        }
+        let instance = self.agent_instance(instance_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' was not found"),
+            }
+        })?;
+        if instance.execution_root_path.is_none() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent instance '{instance_id}' does not use an isolated worktree"
+                ),
+            });
+        }
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE agent_instances
+                 SET worktree_status = ?2, updated_at = ?3
+                 WHERE id = ?1 AND execution_workspace_mode = 'isolated_worktree'",
+                params![instance_id.as_str(), status, now_timestamp()],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("Agent instance '{instance_id}' worktree status was not updated"),
+            });
+        }
+        self.agent_instance(instance_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent instance '{instance_id}' was not found after worktree update"
+                ),
             }
         })
     }
@@ -5122,8 +5212,13 @@ fn agent_instance_from_row(row: &Row<'_>) -> rusqlite::Result<AgentInstanceRecor
         next_message_sequence: row.get(8)?,
         context_generation: row.get(9)?,
         last_scheduled_at: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        execution_workspace_mode: agent_enum_from_row(row, 11)?,
+        execution_root_path: row.get(12)?,
+        worktree_base_revision: row.get(13)?,
+        worktree_branch: row.get(14)?,
+        worktree_status: row.get(15)?,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
     })
 }
 

@@ -1,9 +1,10 @@
 use std::{fs, thread, time::Duration};
 
 use foco_agent::{
-    AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentInstanceId, AgentInstanceStatus,
-    AgentMessageId, AgentMessageKind, AgentPermissions, AgentRole, AgentTaskId, AgentTaskStatus,
-    AgentTaskTransition, AgentTaskWaitMode, AgentTeamId, AgentTeamStatus,
+    AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentExecutionWorkspaceMode,
+    AgentInstanceId, AgentInstanceStatus, AgentMessageId, AgentMessageKind, AgentPermissions,
+    AgentRole, AgentTaskId, AgentTaskStatus, AgentTaskTransition, AgentTaskWaitMode, AgentTeamId,
+    AgentTeamStatus,
 };
 use foco_store::{
     config::{AgentDefinitionSettings, AgentModelOptions, WorkspaceConfig},
@@ -2413,12 +2414,22 @@ fn phase8_creates_multiple_agent_instances_atomically() {
             team_id: &team_id,
             definition: &definition,
             role: AgentRole::Worker,
+            execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            execution_root_path: None,
+            worktree_base_revision: None,
+            worktree_branch: None,
+            worktree_status: None,
         },
         NewAgentInstance {
             id: &second_id,
             team_id: &team_id,
             definition: &definition,
             role: AgentRole::Worker,
+            execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            execution_root_path: None,
+            worktree_base_revision: None,
+            worktree_branch: None,
+            worktree_status: None,
         },
     ];
 
@@ -2448,12 +2459,22 @@ fn phase8_creates_multiple_agent_instances_atomically() {
             team_id: &team_id,
             definition: &definition,
             role: AgentRole::Worker,
+            execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            execution_root_path: None,
+            worktree_base_revision: None,
+            worktree_branch: None,
+            worktree_status: None,
         },
         NewAgentInstance {
             id: &rejected_second,
             team_id: &team_id,
             definition: &definition,
             role: AgentRole::Worker,
+            execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            execution_root_path: None,
+            worktree_base_revision: None,
+            worktree_branch: None,
+            worktree_status: None,
         },
     ];
     database
@@ -2474,6 +2495,101 @@ fn phase8_creates_multiple_agent_instances_atomically() {
 }
 
 #[test]
+fn phase12_persists_isolated_agent_instance_worktree_metadata() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, _) = create_test_agent_team(
+        &mut database,
+        "chat-agent-phase12-worktree",
+        "phase12-worktree",
+    );
+    let definition = phase8_agent_definition("phase12-worktree-worker", 1, 2);
+    let instance_id =
+        AgentInstanceId::new("agent-instance-phase12-worktree-worker").expect("instance id");
+    let root_path = workspace
+        .path()
+        .join(".foco")
+        .join("agent-worktrees")
+        .join(instance_id.as_str())
+        .display()
+        .to_string();
+
+    let created = database
+        .create_agent_instances_with_limits(
+            &[NewAgentInstance {
+                id: &instance_id,
+                team_id: &team_id,
+                definition: &definition,
+                role: AgentRole::Worker,
+                execution_workspace_mode: AgentExecutionWorkspaceMode::IsolatedWorktree,
+                execution_root_path: Some(&root_path),
+                worktree_base_revision: Some("0123456789abcdef0123456789abcdef01234567"),
+                worktree_branch: Some(
+                    "foco/agent-worktrees/agent-instance-phase12-worktree-worker",
+                ),
+                worktree_status: Some("active"),
+            }],
+            2,
+            2,
+        )
+        .expect("create isolated worker");
+
+    assert_eq!(created.len(), 1);
+    assert_eq!(
+        created[0].execution_workspace_mode,
+        AgentExecutionWorkspaceMode::IsolatedWorktree
+    );
+    assert_eq!(
+        created[0].execution_root_path.as_deref(),
+        Some(root_path.as_str())
+    );
+    assert_eq!(created[0].worktree_status.as_deref(), Some("active"));
+
+    let updated = database
+        .update_agent_instance_worktree_status(&instance_id, "archived")
+        .expect("archive worktree");
+    assert_eq!(updated.worktree_status.as_deref(), Some("archived"));
+}
+
+#[test]
+fn phase12_rejects_worktree_status_update_for_shared_instance() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, _) =
+        create_test_agent_team(&mut database, "chat-agent-phase12-shared", "phase12-shared");
+    let definition = phase8_agent_definition("phase12-shared-worker", 1, 2);
+    let instance_id =
+        AgentInstanceId::new("agent-instance-phase12-shared-worker").expect("instance id");
+
+    database
+        .create_agent_instances_with_limits(
+            &[NewAgentInstance {
+                id: &instance_id,
+                team_id: &team_id,
+                definition: &definition,
+                role: AgentRole::Worker,
+                execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                execution_root_path: None,
+                worktree_base_revision: None,
+                worktree_branch: None,
+                worktree_status: None,
+            }],
+            2,
+            2,
+        )
+        .expect("create shared worker");
+
+    let error = database
+        .update_agent_instance_worktree_status(&instance_id, "archived")
+        .expect_err("shared instance must reject worktree status updates");
+    assert!(matches!(
+        error,
+        WorkspaceDatabaseError::InvalidAgentRuntimeData { ref message }
+            if message.contains("does not use an isolated worktree")
+    ));
+}
+
+#[test]
 fn phase8_routes_definition_by_least_pending_and_filters_unavailable_instances() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
@@ -2488,12 +2604,22 @@ fn phase8_routes_definition_by_least_pending_and_filters_unavailable_instances()
             team_id: &team_id,
             definition: &definition,
             role: AgentRole::Worker,
+            execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+            execution_root_path: None,
+            worktree_base_revision: None,
+            worktree_branch: None,
+            worktree_status: None,
         },
         NewAgentInstance {
             id: &second_id,
             team_id: &team_id,
             definition: &definition,
             role: AgentRole::Worker,
+            execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+            execution_root_path: None,
+            worktree_base_revision: None,
+            worktree_branch: None,
+            worktree_status: None,
         },
     ];
     database
@@ -2583,12 +2709,22 @@ fn phase8_runnable_tasks_are_fair_and_keep_instance_fifo() {
             team_id: &team_id,
             definition: &definition,
             role: AgentRole::Worker,
+            execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+            execution_root_path: None,
+            worktree_base_revision: None,
+            worktree_branch: None,
+            worktree_status: None,
         },
         NewAgentInstance {
             id: &second_id,
             team_id: &team_id,
             definition: &definition,
             role: AgentRole::Worker,
+            execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+            execution_root_path: None,
+            worktree_base_revision: None,
+            worktree_branch: None,
+            worktree_status: None,
         },
     ];
     database

@@ -2802,6 +2802,7 @@ enum ChatSseEvent {
 struct PreparedChatContext {
     workspace_id: String,
     workspace_path: PathBuf,
+    tool_workspace_path: PathBuf,
     memory_database_file: PathBuf,
     chat_id: String,
     provider_id: String,
@@ -4671,6 +4672,7 @@ impl PreparedChatContext {
                                     self.agent_tool_context.clone(),
                                     &self.workspace_id,
                                     &self.workspace_path,
+                                    &self.tool_workspace_path,
                                     &self.chat_id,
                                     &self.llm_request_id,
                                     &self.model_id,
@@ -5254,7 +5256,8 @@ async fn prepare_chat_context(
 
     Ok(PreparedChatContext {
         workspace_id: prompt_context.workspace_id,
-        workspace_path: prompt_context.workspace_path,
+        workspace_path: prompt_context.workspace_path.clone(),
+        tool_workspace_path: prompt_context.workspace_path,
         memory_database_file: state.memory_database_file.clone(),
         chat_id,
         provider_id: prompt_context.provider_id,

@@ -687,6 +687,26 @@ CREATE UNIQUE INDEX agent_attempts_one_active_per_task_idx
     WHERE status = 'running';
 "#;
 
+pub(crate) const MIGRATION_013: &str = r#"
+ALTER TABLE agent_instances
+    ADD COLUMN execution_workspace_mode TEXT NOT NULL DEFAULT 'shared' CHECK (execution_workspace_mode IN ('shared', 'isolated_worktree'));
+
+ALTER TABLE agent_instances
+    ADD COLUMN execution_root_path TEXT CHECK (execution_root_path IS NULL OR length(execution_root_path) > 0);
+
+ALTER TABLE agent_instances
+    ADD COLUMN worktree_base_revision TEXT CHECK (worktree_base_revision IS NULL OR length(worktree_base_revision) > 0);
+
+ALTER TABLE agent_instances
+    ADD COLUMN worktree_branch TEXT CHECK (worktree_branch IS NULL OR length(worktree_branch) > 0);
+
+ALTER TABLE agent_instances
+    ADD COLUMN worktree_status TEXT CHECK (worktree_status IS NULL OR worktree_status IN ('active', 'kept', 'archived', 'deleted'));
+
+CREATE INDEX agent_instances_execution_workspace_idx
+    ON agent_instances (team_id, execution_workspace_mode, worktree_status);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

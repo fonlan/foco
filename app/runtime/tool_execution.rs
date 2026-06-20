@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -8,9 +8,10 @@ use std::{
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 
 use foco_agent::{
-    AgentCollaborationTool, AgentDefinitionId, AgentInstanceId, AgentMessageId, AgentMessageKind,
-    AgentPermissions, AgentRunAssociations, AgentTaskId, AgentTaskStatus, AgentTaskWaitMode,
-    PendingToolCall, ToolExecutionMode, ToolExecutionPlan, ToolResourceLock, tool_resource_locks,
+    AgentCollaborationTool, AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceId,
+    AgentMessageId, AgentMessageKind, AgentPermissions, AgentRunAssociations, AgentTaskId,
+    AgentTaskStatus, AgentTaskWaitMode, PendingToolCall, ToolExecutionMode, ToolExecutionPlan,
+    ToolResourceLock, tool_resource_locks,
 };
 use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
@@ -50,6 +51,7 @@ use foco_tools::{
 };
 use serde_json::Value;
 
+use crate::git_backend::{create_agent_worktree, delete_agent_worktree};
 use crate::{
     MAX_REPEATED_TOOL_CALL_BATCHES, MEMORY_SEARCH_TOOL_NAME, READ_ONLY_TOOL_BATCH_WARNING_THRESHOLD,
 };
@@ -185,6 +187,7 @@ pub(crate) fn pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingT
 
 #[derive(Clone)]
 pub(crate) struct AgentToolContext {
+    pub(crate) workspace_path: PathBuf,
     pub(crate) associations: AgentRunAssociations,
     pub(crate) permissions: AgentPermissions,
     pub(crate) agent_definitions: Vec<AgentDefinitionSettings>,
@@ -203,6 +206,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     agent_tool_context: Option<AgentToolContext>,
     workspace_id: &str,
     workspace_path: &Path,
+    tool_workspace_path: &Path,
     chat_id: &str,
     run_id: &str,
     model_id: &str,
@@ -242,6 +246,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                         assistant_message_id,
                         workspace_id,
                         workspace_path,
+                        tool_workspace_path,
                         chat_id,
                         run_id,
                         model_id,
@@ -256,6 +261,7 @@ pub(crate) async fn execute_tool_calls_parallel(
             ToolExecutionMode::Parallel => {
                 let tasks = group.call_indices.into_iter().map(|tool_index| {
                     let workspace_path = workspace_path.to_path_buf();
+                    let tool_workspace_path = tool_workspace_path.to_path_buf();
                     let workspace_id = workspace_id.to_string();
                     let chat_id = chat_id.to_string();
                     let run_id = run_id.to_string();
@@ -301,6 +307,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                                 &assistant_message_id,
                                 &workspace_id,
                                 &workspace_path,
+                                &tool_workspace_path,
                                 &chat_id,
                                 &run_id,
                                 &model_id,
@@ -350,6 +357,7 @@ async fn execute_tool_call(
     assistant_message_id: &str,
     workspace_id: &str,
     workspace_path: &Path,
+    tool_workspace_path: &Path,
     chat_id: &str,
     run_id: &str,
     model_id: &str,
@@ -375,6 +383,7 @@ async fn execute_tool_call(
         assistant_message_id,
         workspace_id,
         workspace_path,
+        tool_workspace_path,
         chat_id,
         run_id,
         model_id,
@@ -447,6 +456,7 @@ pub(crate) async fn execute_tool(
     assistant_message_id: &str,
     workspace_id: &str,
     workspace_path: &Path,
+    tool_workspace_path: &Path,
     chat_id: &str,
     run_id: &str,
     model_id: &str,
@@ -876,7 +886,7 @@ pub(crate) async fn execute_tool(
         set_tool_timeout_ms(&mut arguments, remaining_timeout);
         let tool_name = tool_name.to_string();
         let worker = tokio::task::spawn_blocking({
-            let workspace_path = workspace_path.to_path_buf();
+            let workspace_path = tool_workspace_path.to_path_buf();
             let chat_id = chat_id.to_string();
             let assistant_message_id = assistant_message_id.to_string();
             let tool_call_id = tool_call_id.to_string();
@@ -1009,17 +1019,19 @@ struct AgentCreateInstancesInput {
     count: u32,
     max_instances_per_team: u32,
     max_instances_for_definition: u32,
+    execution_workspace_mode: AgentExecutionWorkspaceMode,
     #[serde(rename = "timeoutMs")]
     _timeout_ms: Option<u64>,
 }
 
 fn execute_agent_tool(
     context: &AgentToolContext,
-    workspace_path: &Path,
+    _workspace_path: &Path,
     tool_name: &str,
     tool_call_id: &str,
     arguments: Value,
 ) -> Result<Value, String> {
+    let workspace_path = context.workspace_path.as_path();
     match tool_name {
         AGENT_LIST_TOOL => execute_agent_list(context, workspace_path, arguments),
         AGENT_GET_TASK_TOOL => execute_agent_get_task(context, workspace_path, arguments),
@@ -1719,24 +1731,54 @@ fn execute_agent_create_instances(
             AgentInstanceId::new(unique_id("agent-instance")).map_err(|source| source.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let worktrees = match input.execution_workspace_mode {
+        AgentExecutionWorkspaceMode::Shared => Vec::new(),
+        AgentExecutionWorkspaceMode::IsolatedWorktree => instance_ids
+            .iter()
+            .map(|id| {
+                create_agent_worktree(workspace_path, id.as_str())
+                    .map_err(|source| agent_tool_error("worktree_error", source.message))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let worktree_root_paths = worktrees
+        .iter()
+        .map(|worktree| worktree.root_path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
     let new_instances = instance_ids
         .iter()
-        .map(|id| NewAgentInstance {
-            id,
-            team_id,
-            definition,
-            role: foco_agent::AgentRole::Worker,
+        .enumerate()
+        .map(|(index, id)| {
+            let worktree = worktrees.get(index);
+            let worktree_root_path = worktree_root_paths.get(index);
+            NewAgentInstance {
+                id,
+                team_id,
+                definition,
+                role: foco_agent::AgentRole::Worker,
+                execution_workspace_mode: input.execution_workspace_mode,
+                execution_root_path: worktree_root_path.map(String::as_str),
+                worktree_base_revision: worktree.map(|worktree| worktree.base_revision.as_str()),
+                worktree_branch: worktree.map(|worktree| worktree.branch.as_str()),
+                worktree_status: worktree.map(|_| "active"),
+            }
         })
         .collect::<Vec<_>>();
     let mut database =
         WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
-    let created = database
-        .create_agent_instances_with_limits(
-            &new_instances,
-            i64::from(input.max_instances_per_team),
-            i64::from(input.max_instances_for_definition),
-        )
-        .map_err(agent_store_error)?;
+    let created = match database.create_agent_instances_with_limits(
+        &new_instances,
+        i64::from(input.max_instances_per_team),
+        i64::from(input.max_instances_for_definition),
+    ) {
+        Ok(created) => created,
+        Err(error) => {
+            for worktree in &worktrees {
+                let _ = delete_agent_worktree(workspace_path, &worktree.root_path, true);
+            }
+            return Err(agent_store_error(error));
+        }
+    };
     for instance in &created {
         append_agent_tool_event(
             &mut database,
@@ -1751,6 +1793,11 @@ fn execute_agent_create_instances(
                 "definitionRevision": instance.definition_revision,
                 "role": instance.role.as_str(),
                 "status": instance.status.as_str(),
+                "executionWorkspaceMode": instance.execution_workspace_mode.as_str(),
+                "executionRootPath": instance.execution_root_path,
+                "worktreeBaseRevision": instance.worktree_base_revision,
+                "worktreeBranch": instance.worktree_branch,
+                "worktreeStatus": instance.worktree_status,
             }),
         )?;
     }
@@ -2858,6 +2905,7 @@ mod tests {
             .expect("parent task enqueue");
         let (_scheduler, _wake_rx) = AgentScheduler::new();
         let context = AgentToolContext {
+            workspace_path: workspace.path().to_path_buf(),
             associations: AgentRunAssociations {
                 team_id: Some(team_id.clone()),
                 instance_id: Some(instance_id.clone()),
