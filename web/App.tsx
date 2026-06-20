@@ -5796,6 +5796,11 @@ export function App() {
     }
   }
 
+  const handleSettingsPanelSettingsChange = useCallback((data: SettingsResponse) => {
+    setSettings(data);
+    setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
+  }, []);
+
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsLoggingIn(true);
@@ -5938,10 +5943,7 @@ export function App() {
                   onDeleteAgentDefinition={deleteAgentDefinition}
                   onUpdateAgentDefinition={updateAgentDefinition}
                   onLogout={handleLogout}
-                  onSettingsChange={(data) => {
-                    setSettings(data);
-                    setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
-                  }}
+                  onSettingsChange={handleSettingsPanelSettingsChange}
                   onWorkspacesChange={refreshWorkspaces}
                   workspaceDialogRevision={workspaceDialogRevision}
                 />
