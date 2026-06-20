@@ -7,7 +7,7 @@ use foco_agent::{
 };
 use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
 use foco_store::{
-    config::AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS,
+    config::{AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS, AgentDefinitionSettings},
     workspace::{
         AgentContextEntryRecord, AgentInstanceRecord, AgentMessageRecord,
         AgentTaskDependencyRecord, AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord,
@@ -36,7 +36,7 @@ const AGENT_SCHEDULER_SCAN_LIMIT: i64 = 64;
 const AGENT_SCHEDULER_DEADLINE_POLL_MS: u64 = 1_000;
 const AGENT_GLOBAL_MAX_CONCURRENT_RUNS: usize = 4;
 const RESTART_INTERRUPTION_REASON: &str = "backend restarted while Agent attempt was active";
-const AGENT_TEAM_PROTOCOL_VERSION: u32 = 1;
+const AGENT_TEAM_PROTOCOL_VERSION: u32 = 2;
 const AGENT_CONTEXT_SNAPSHOT_VERSION: u32 = 1;
 const AGENT_CONTEXT_RECENT_MESSAGE_LIMIT: usize = 8;
 const AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT: usize = 16;
@@ -430,6 +430,7 @@ async fn run_coordinator_task_inner(
         attempt_id,
         &allowed_tools,
         &collaboration_permissions,
+        &config.agent_definitions,
     )?;
     chat_context.agent_primary_chat_output = instance.role == AgentRole::Coordinator;
     chat_context.agent_unread_messages = agent_unread_messages;
@@ -499,6 +500,7 @@ fn apply_agent_prompt_layers(
     attempt_id: &AgentAttemptId,
     allowed_tools: &HashSet<String>,
     collaboration_permissions: &AgentPermissions,
+    agent_definitions: &[AgentDefinitionSettings],
 ) -> Result<(Vec<Value>, Vec<foco_agent::AgentMessageId>), ApiError> {
     validate_agent_definition_system_prompt(instance)?;
 
@@ -524,6 +526,9 @@ fn apply_agent_prompt_layers(
         .into_iter()
         .filter(|message| message.consumed_at.is_none())
         .collect::<Vec<_>>();
+    let team_instances = database
+        .agent_instances_for_team(&team.id)
+        .map_err(ApiError::from_workspace_error)?;
     let wait_dependencies = database
         .agent_task_dependencies(&task.id)
         .map_err(ApiError::from_workspace_error)?;
@@ -572,6 +577,8 @@ fn apply_agent_prompt_layers(
                 attempt_id,
                 allowed_tools,
                 collaboration_permissions,
+                agent_definitions,
+                &team_instances,
             )?,
         ),
         None,
@@ -766,9 +773,17 @@ fn agent_team_protocol_prompt(
     attempt_id: &AgentAttemptId,
     allowed_tools: &HashSet<String>,
     collaboration_permissions: &AgentPermissions,
+    agent_definitions: &[AgentDefinitionSettings],
+    team_instances: &[AgentInstanceRecord],
 ) -> Result<String, ApiError> {
     let mut tools = allowed_tools.iter().cloned().collect::<Vec<_>>();
     tools.sort();
+    let creatable_agent_definitions = creatable_agent_definitions_prompt(
+        team,
+        collaboration_permissions,
+        agent_definitions,
+        team_instances,
+    )?;
     let protocol = json!({
         "version": AGENT_TEAM_PROTOCOL_VERSION,
         "teamId": team.id.to_string(),
@@ -788,6 +803,7 @@ fn agent_team_protocol_prompt(
             "status": instance.worktree_status,
         },
         "permissions": collaboration_permissions,
+        "creatableAgentDefinitions": creatable_agent_definitions,
         "allowedRuntimeTools": tools,
         "runtimeLimits": {
             "maxQueuedTasksPerTeam": AGENT_MAX_QUEUED_TASKS_PER_TEAM,
@@ -809,6 +825,88 @@ fn agent_team_protocol_prompt(
             ApiError::internal(format!("failed to serialize Agent team protocol: {source}"))
         })?
     ))
+}
+
+fn creatable_agent_definitions_prompt(
+    team: &AgentTeamRecord,
+    permissions: &AgentPermissions,
+    agent_definitions: &[AgentDefinitionSettings],
+    team_instances: &[AgentInstanceRecord],
+) -> Result<Vec<Value>, ApiError> {
+    if !permissions.can_create_instances {
+        return Ok(Vec::new());
+    }
+
+    let max_instances_per_team = u32::try_from(AGENT_MAX_INSTANCES_PER_TEAM)
+        .map_err(|_| ApiError::internal("Agent max instances per team exceeds u32"))?;
+    let current_team_instances = u32::try_from(
+        team_instances
+            .iter()
+            .filter(|instance| instance.team_id == team.id)
+            .count(),
+    )
+    .map_err(|_| ApiError::internal("Agent team instance count exceeds u32"))?;
+    let remaining_team_slots = max_instances_per_team.saturating_sub(current_team_instances);
+    let mut definitions = Vec::with_capacity(permissions.allowed_agent_definition_ids.len());
+
+    for allowed_id in &permissions.allowed_agent_definition_ids {
+        let definition = agent_definitions
+            .iter()
+            .find(|definition| definition.id == *allowed_id)
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "Agent team protocol references missing creatable definition '{allowed_id}'"
+                ))
+            })?;
+        let current_definition_instances = u32::try_from(
+            team_instances
+                .iter()
+                .filter(|instance| {
+                    instance.team_id == team.id && instance.definition_id == *allowed_id
+                })
+                .count(),
+        )
+        .map_err(|_| ApiError::internal("Agent definition instance count exceeds u32"))?;
+        let remaining_definition_slots = definition
+            .max_instances
+            .saturating_sub(current_definition_instances);
+        let max_create_count = AGENT_MAX_CREATE_INSTANCES_PER_REQUEST
+            .min(remaining_team_slots)
+            .min(remaining_definition_slots);
+        let count_schema = if max_create_count == 0 {
+            Value::Null
+        } else {
+            json!({
+                "minimum": 1,
+                "maximum": max_create_count,
+            })
+        };
+
+        definitions.push(json!({
+            "definitionId": definition.id.to_string(),
+            "revision": definition.revision,
+            "name": definition.name,
+            "description": definition.description,
+            "maxInstances": definition.max_instances,
+            "currentTeamInstances": current_team_instances,
+            "remainingTeamSlots": remaining_team_slots,
+            "currentTeamDefinitionInstances": current_definition_instances,
+            "remainingTeamDefinitionSlots": remaining_definition_slots,
+            "maxCreateCount": max_create_count,
+            "canCreateMore": max_create_count > 0,
+            "agentCreateInstancesSchema": {
+                "tool": "agent_create_instances",
+                "definitionId": { "const": definition.id.to_string() },
+                "count": count_schema,
+                "maxInstancesPerTeam": { "const": max_instances_per_team },
+                "maxInstancesForDefinition": { "const": definition.max_instances },
+                "executionWorkspaceMode": { "enum": ["shared", "isolated_worktree"] },
+                "timeoutMs": { "const": null },
+            },
+        }));
+    }
+
+    Ok(definitions)
 }
 
 fn agent_private_context_prompt(
@@ -1581,5 +1679,156 @@ mod tests {
 
         let oversized = json!({ "text": "x".repeat(AGENT_MAX_TASK_OUTCOME_BYTES) });
         assert!(agent_task_outcome_json(&oversized, "result_json").is_err());
+    }
+
+    #[test]
+    fn team_protocol_expands_creatable_definition_schema() {
+        let coordinator_definition = test_agent_definition("coordinator", 1);
+        let worker_definition = test_agent_definition("worker", 3);
+        let team_id = foco_agent::AgentTeamId::new("agent-team-protocol").expect("team id");
+        let coordinator_id =
+            foco_agent::AgentInstanceId::new("agent-instance-coordinator").expect("instance id");
+        let worker_id =
+            foco_agent::AgentInstanceId::new("agent-instance-worker").expect("instance id");
+        let task_id = AgentTaskId::new("agent-task-protocol").expect("task id");
+        let attempt_id = AgentAttemptId::new("agent-attempt-protocol").expect("attempt id");
+        let now = "2026-01-01T00:00:00Z".to_string();
+        let team = AgentTeamRecord {
+            id: team_id.clone(),
+            chat_id: "chat-protocol".to_string(),
+            coordinator_instance_id: coordinator_id.clone(),
+            status: foco_agent::AgentTeamStatus::Active,
+            max_concurrent_runs: 1,
+            next_event_sequence: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let coordinator = test_agent_instance(
+            &team_id,
+            &coordinator_id,
+            coordinator_definition.clone(),
+            AgentRole::Coordinator,
+            &now,
+        );
+        let worker = test_agent_instance(
+            &team_id,
+            &worker_id,
+            worker_definition.clone(),
+            AgentRole::Worker,
+            &now,
+        );
+        let task = AgentTaskRecord {
+            id: task_id,
+            team_id: team_id.clone(),
+            owner_instance_id: coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            sequence: 0,
+            status: AgentTaskStatus::Running,
+            input_json: "{}".to_string(),
+            result_json: None,
+            error_json: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            started_at: Some(now.clone()),
+            completed_at: None,
+        };
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            can_delegate: false,
+            allowed_agent_definition_ids: vec![worker_definition.id.clone()],
+        };
+
+        let prompt = agent_team_protocol_prompt(
+            &team,
+            &coordinator,
+            &task,
+            &attempt_id,
+            &HashSet::new(),
+            &permissions,
+            &[coordinator_definition, worker_definition],
+            &[coordinator.clone(), worker],
+        )
+        .expect("protocol prompt");
+        let protocol: Value = serde_json::from_str(
+            prompt
+                .strip_prefix("Foco Agent team protocol:\n")
+                .expect("protocol prefix"),
+        )
+        .expect("protocol json");
+        let creatable = protocol["creatableAgentDefinitions"]
+            .as_array()
+            .expect("creatable definitions");
+
+        assert_eq!(protocol["version"], json!(2));
+        assert_eq!(creatable.len(), 1);
+        assert_eq!(
+            creatable[0]["definitionId"],
+            json!("agent-definition-worker")
+        );
+        assert_eq!(creatable[0]["maxInstances"], json!(3));
+        assert_eq!(creatable[0]["currentTeamInstances"], json!(2));
+        assert_eq!(creatable[0]["currentTeamDefinitionInstances"], json!(1));
+        assert_eq!(creatable[0]["remainingTeamDefinitionSlots"], json!(2));
+        assert_eq!(creatable[0]["maxCreateCount"], json!(2));
+        assert_eq!(creatable[0]["canCreateMore"], json!(true));
+        assert_eq!(
+            creatable[0]["agentCreateInstancesSchema"]["count"]["maximum"],
+            json!(2)
+        );
+        assert_eq!(
+            creatable[0]["agentCreateInstancesSchema"]["maxInstancesPerTeam"]["const"],
+            json!(16)
+        );
+        assert_eq!(
+            creatable[0]["agentCreateInstancesSchema"]["maxInstancesForDefinition"]["const"],
+            json!(3)
+        );
+    }
+
+    fn test_agent_definition(suffix: &str, max_instances: u32) -> AgentDefinitionSettings {
+        AgentDefinitionSettings {
+            id: foco_agent::AgentDefinitionId::new(format!("agent-definition-{suffix}"))
+                .expect("definition id"),
+            revision: 1,
+            name: suffix.to_string(),
+            description: format!("{suffix} definition"),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: foco_store::config::AgentModelOptions::default(),
+            system_prompt: "Do the task.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances,
+            permissions: AgentPermissions::default(),
+        }
+    }
+
+    fn test_agent_instance(
+        team_id: &foco_agent::AgentTeamId,
+        instance_id: &foco_agent::AgentInstanceId,
+        definition: AgentDefinitionSettings,
+        role: AgentRole,
+        now: &str,
+    ) -> AgentInstanceRecord {
+        AgentInstanceRecord {
+            id: instance_id.clone(),
+            team_id: team_id.clone(),
+            definition_id: definition.id.clone(),
+            definition_revision: definition.revision,
+            definition_snapshot: definition,
+            role,
+            status: AgentInstanceStatus::Idle,
+            next_task_sequence: 0,
+            next_message_sequence: 0,
+            context_generation: 0,
+            last_scheduled_at: None,
+            execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+            execution_root_path: None,
+            worktree_base_revision: None,
+            worktree_branch: None,
+            worktree_status: None,
+            created_at: now.to_string(),
+            updated_at: now.to_string(),
+        }
     }
 }
