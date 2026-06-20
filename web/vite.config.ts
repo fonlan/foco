@@ -10,6 +10,45 @@ const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), focoIconPlugin(), backendReloadPlugin()],
+  build: {
+    chunkSizeWarningLimit: 600,
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: "vendor-charts",
+              test: /node_modules[\\/]recharts[\\/]/,
+            },
+            {
+              name: "vendor-markdown",
+              test: isMarkdownVendorModule,
+            },
+            {
+              maxSize: 450 * 1024,
+              name: (moduleId) => {
+                const normalized = moduleId.replaceAll("\\", "/");
+                if (normalized.includes("/node_modules/monaco-editor/")) {
+                  return "vendor-monaco";
+                }
+                if (normalized.includes("/node_modules/@xterm/")) {
+                  return "vendor-terminal";
+                }
+                if (
+                  normalized.includes("/node_modules/react/") ||
+                  normalized.includes("/node_modules/react-dom/")
+                ) {
+                  return "vendor-react";
+                }
+                return null;
+              },
+              test: /node_modules[\\/]/,
+            },
+          ],
+        },
+      },
+    },
+  },
   server: {
     proxy: {
       "^/api(?:/|$|\\?)": {
@@ -155,6 +194,14 @@ function formatHostForUrl(host: string) {
   }
 
   return host;
+}
+
+function isMarkdownVendorModule(moduleId: string) {
+  const normalized = moduleId.replaceAll("\\", "/");
+
+  return /\/node_modules\/(?:react-markdown|remark-(?:gfm|parse|rehype)|rehype-raw|unified|bail|trough|vfile(?:-message)?|unist-util-[^/]+|mdast-util-[^/]+|micromark[^/]*|hast-util-[^/]+|html-url-attributes|property-information|space-separated-tokens|comma-separated-tokens|style-to-js|style-to-object|inline-style-parser|decode-named-character-reference|character-entities|devlop|estree-util-[^/]+|markdown-table|zwitch|trim-lines|ccount|is-plain-obj|fault)\//.test(
+    normalized,
+  );
 }
 
 function connectHostForListenHost(host: string) {

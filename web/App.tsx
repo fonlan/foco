@@ -83,7 +83,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import * as monaco from "monaco-editor";
+import type * as Monaco from "monaco-editor";
 import {
   Bar,
   BarChart,
@@ -6451,24 +6451,6 @@ export function App() {
                     runningChatKeys={runningChatKeys}
                     tabs={mainTabs}
                   />
-                  <div className="chat-header-actions">
-                    <button
-                      aria-label={t("Agents")}
-                      className={`inline-flex size-9 items-center justify-center rounded-lg border text-stone-700 shadow-sm ${
-                        contextPanelTab === "agents" && isContextPanelOpen
-                          ? "border-teal-200 bg-teal-50 text-teal-800"
-                          : "border-stone-200 bg-white hover:border-teal-200 hover:bg-teal-50"
-                      }`}
-                      onClick={() => {
-                        setContextPanelTab("agents");
-                        setIsContextPanelOpen(true);
-                      }}
-                      title={t("Agents")}
-                      type="button"
-                    >
-                      <Bot aria-hidden="true" className="size-4" />
-                    </button>
-                  </div>
                 </div>
               </header>
               {activeMainTab.type === "file" && activeFileTab ? (
@@ -9219,10 +9201,15 @@ function MonacoFileEditor({
 }) {
   const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement | null>(null);
-  const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
-  const modelRef = useRef<monaco.editor.ITextModel | null>(null);
+  const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
+  const modelRef = useRef<Monaco.editor.ITextModel | null>(null);
   const ignoreModelChangeRef = useRef(false);
+  const valueRef = useRef(value);
   const [wordWrapEnabled, setWordWrapEnabled] = useState(false);
+
+  useEffect(() => {
+    valueRef.current = value;
+  }, [value]);
 
   const focusEditor = useCallback(() => {
     editorRef.current?.focus();
@@ -9271,42 +9258,55 @@ function MonacoFileEditor({
       return undefined;
     }
 
-    registerTomlMonacoLanguage();
+    let disposed = false;
+    let cleanupEditor: (() => void) | null = null;
 
-    const model = monaco.editor.createModel(
-      value,
-      language,
-      monaco.Uri.parse(`file:///${path}`),
-    );
-    const editor = monaco.editor.create(container, {
-      automaticLayout: true,
-      fontSize: 13,
-      language,
-      minimap: { enabled: true },
-      model,
-      readOnly: false,
-      scrollBeyondLastLine: false,
-      theme: "vs",
-      wordWrap: wordWrapEnabled ? "on" : "off",
-    });
-    const changeDisposable = model.onDidChangeContent(() => {
-      if (!ignoreModelChangeRef.current) {
-        onChange(model.getValue());
+    void import("monaco-editor").then((monaco) => {
+      if (disposed) {
+        return;
       }
+
+      registerTomlMonacoLanguage(monaco);
+
+      const model = monaco.editor.createModel(
+        valueRef.current,
+        language,
+        monaco.Uri.parse(`file:///${path}`),
+      );
+      const editor = monaco.editor.create(container, {
+        automaticLayout: true,
+        fontSize: 13,
+        language,
+        minimap: { enabled: true },
+        model,
+        readOnly: false,
+        scrollBeyondLastLine: false,
+        theme: "vs",
+        wordWrap: wordWrapEnabled ? "on" : "off",
+      });
+      const changeDisposable = model.onDidChangeContent(() => {
+        if (!ignoreModelChangeRef.current) {
+          onChange(model.getValue());
+        }
+      });
+      editor.addCommand(
+        monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
+        () => {
+          onSave(editor.getValue());
+        },
+      );
+      editorRef.current = editor;
+      modelRef.current = model;
+      cleanupEditor = () => {
+        changeDisposable.dispose();
+        editor.dispose();
+        model.dispose();
+      };
     });
-    editor.addCommand(
-      monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
-      () => {
-        onSave(editor.getValue());
-      },
-    );
-    editorRef.current = editor;
-    modelRef.current = model;
 
     return () => {
-      changeDisposable.dispose();
-      editor.dispose();
-      model.dispose();
+      disposed = true;
+      cleanupEditor?.();
       editorRef.current = null;
       modelRef.current = null;
     };
@@ -18030,7 +18030,7 @@ function replaceWorkspaceFileNodeChildren(
   };
 }
 
-function registerTomlMonacoLanguage() {
+function registerTomlMonacoLanguage(monaco: typeof Monaco) {
   if (monaco.languages.getLanguages().some((language) => language.id === "toml")) {
     return;
   }

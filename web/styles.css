@@ -892,10 +892,6 @@ summary:focus-visible {
     padding-bottom: 0.125rem;
   }
 
-  .chat-header-actions {
-    flex-wrap: nowrap;
-  }
-
   .message-composer-textarea {
     min-height: 4.5rem;
   }
@@ -1723,12 +1719,6 @@ body,
   height: 2px;
   border-radius: 999px;
   background: var(--foco-accent);
-}
-
-.chat-header-actions {
-  display: flex;
-  align-items: center;
-  gap: 0.25rem;
 }
 
 .chat-toolbar-button,
@@ -2631,8 +2621,7 @@ body,
 
 .app-toolbar > div,
 .chat-tabs,
-.chat-tab-list,
-.chat-header-actions {
+.chat-tab-list {
   height: 100%;
   min-height: 100%;
   align-items: center;
@@ -2682,13 +2671,6 @@ body,
   left: 0;
   height: 2px;
   border-radius: 0;
-}
-
-.chat-header-actions {
-  height: 100%;
-  margin-left: auto;
-  padding-right: 0.5rem;
-  border-left: 0;
 }
 
 .app-main-panel,

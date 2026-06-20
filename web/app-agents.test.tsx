@@ -98,7 +98,7 @@ describe("app agents verification surfaces", () => {
     renderApp();
 
     await userEvent.click(await screen.findByText("Tool run"));
-    await userEvent.click(await screen.findByRole("button", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
 
     await waitFor(() => {
       expect(
