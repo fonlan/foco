@@ -302,6 +302,7 @@ describe("app-panels-stats verification surfaces", () => {
   });
 
   it("shows active chat statistics in the right panel", async () => {
+    const fetchMock = vi.mocked(fetch);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
@@ -325,7 +326,10 @@ describe("app-panels-stats verification surfaces", () => {
       within(screen.getByText("Tools and compression").parentElement!)
         .getByText("read_file"),
     ).toBeInTheDocument();
-    expect((await screen.findAllByText("History")).length).toBeGreaterThan(0);
+    expect(screen.getByText("Context usage unavailable.")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/workspaces/workspace-1/context-usage"),
+    ).toBe(false);
   });
 
   it("updates active chat code change statistics from git diff refresh events", async () => {

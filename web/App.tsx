@@ -1464,34 +1464,11 @@ export function App() {
     }
 
     void loadChatStatistics(activeWorkspace.id, activeChatId);
-    const chatKey = chatRunKey(activeWorkspace.id, activeChatId);
-    if (!contextUsageByChatKey[chatKey] && !contextUsageLoadingByChatKey[chatKey]) {
-      void refreshContextUsage({
-        chatId: activeChatId,
-        latestResponseUsage: {
-          cacheReadTokens: null,
-          cacheWriteTokens: null,
-          inputTokens: null,
-          outputTokens: null,
-        },
-        modelId: selectedModelId,
-        providerId: selectedProviderId,
-        skillIds: selectedSkillIds,
-        thinkingLevel: selectedThinkingLevel,
-        workspaceId: activeWorkspace.id,
-      });
-    }
   }, [
     activeChatId,
     activeWorkspace?.id,
     contextPanelTab,
-    contextUsageByChatKey,
-    contextUsageLoadingByChatKey,
     loadChatStatistics,
-    selectedModelId,
-    selectedProviderId,
-    selectedSkillIds,
-    selectedThinkingLevel,
   ]);
 
   useEffect(() => {
