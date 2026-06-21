@@ -383,6 +383,13 @@ type AiStatsColumn = {
 };
 
 const LIVE_REASONING_DURATION_REFRESH_MS = 250;
+const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
+
+type ComposerDefaultSelection = {
+  modelId: string;
+  providerId: string;
+  thinkingLevel: string;
+};
 
 export function App() {
   const [initialBrowserRoute] = useState(() => currentBrowserRoute());
@@ -594,6 +601,7 @@ export function App() {
   const applyBrowserRouteRef = useRef<(route: BrowserRoute) => void>(() => { });
   const hasAppliedInitialBrowserRouteRef = useRef(false);
   const hasManuallySelectedModelRef = useRef(false);
+  const hasManuallySelectedThinkingLevelRef = useRef(false);
   const workspaceSidebarRef = useRef<HTMLElement | null>(null);
   const workspaceChatLongPressTimeoutRef = useRef<number | null>(null);
   const suppressNextWorkspaceChatClickRef = useRef(false);
@@ -716,6 +724,46 @@ export function App() {
       ),
     [configuredModelsByName],
   );
+  const defaultAgentDefinition = useMemo(
+    () =>
+      agentDefinitions.find(
+        (definition) => definition.id === DEFAULT_AGENT_DEFINITION_ID,
+      ) ?? null,
+    [agentDefinitions],
+  );
+  const defaultComposerSelection = useMemo<ComposerDefaultSelection>(() => {
+    if (defaultAgentDefinition) {
+      const agentModel = availableModels.find(
+        (model) =>
+          model.id === defaultAgentDefinition.modelId &&
+          model.providerIds.includes(defaultAgentDefinition.providerId),
+      );
+      if (agentModel) {
+        return {
+          modelId: agentModel.id,
+          providerId: defaultAgentDefinition.providerId,
+          thinkingLevel:
+            defaultAgentDefinition.modelOptions.thinkingLevel ?? "",
+        };
+      }
+    }
+
+    const model = availableModels[0];
+    if (!model) {
+      return { modelId: "", providerId: "", thinkingLevel: "" };
+    }
+
+    const providerId =
+      model.activeProviderId && model.providerIds.includes(model.activeProviderId)
+        ? model.activeProviderId
+        : model.providerIds[0] ?? "";
+
+    return {
+      modelId: model.id,
+      providerId,
+      thinkingLevel: model.thinkingLevel ?? "",
+    };
+  }, [availableModels, defaultAgentDefinition]);
   const detectedSkills = useMemo(
     () => settings?.skills.detected ?? [],
     [settings],
@@ -1729,15 +1777,13 @@ export function App() {
 
   useEffect(() => {
     setSelectedModelId((current) => {
-      const highestPriorityModelId = availableModels[0]?.id ?? "";
-
-      if (!highestPriorityModelId) {
+      if (!defaultComposerSelection.modelId) {
         hasManuallySelectedModelRef.current = false;
         return "";
       }
 
       if (!hasManuallySelectedModelRef.current) {
-        return highestPriorityModelId;
+        return defaultComposerSelection.modelId;
       }
 
       if (availableModels.some((model) => model.id === current)) {
@@ -1745,16 +1791,49 @@ export function App() {
       }
 
       hasManuallySelectedModelRef.current = false;
-      return highestPriorityModelId;
+      return defaultComposerSelection.modelId;
     });
-  }, [availableModels]);
+  }, [availableModels, defaultComposerSelection.modelId]);
 
   useEffect(() => {
     const selectedModel = availableModels.find(
       (model) => model.id === selectedModelId,
     );
-    setSelectedThinkingLevel(selectedModel?.thinkingLevel ?? "");
-  }, [availableModels, selectedModelId]);
+    const supportedThinkingValues = new Set([
+      "",
+      ...thinkingLevels.map((level) => level.value),
+    ]);
+
+    setSelectedThinkingLevel((current) => {
+      if (!selectedModel) {
+        hasManuallySelectedThinkingLevelRef.current = false;
+        return "";
+      }
+
+      const defaultThinkingLevel =
+        !hasManuallySelectedModelRef.current &&
+          selectedModel.id === defaultComposerSelection.modelId
+          ? defaultComposerSelection.thinkingLevel
+          : selectedModel.thinkingLevel ?? "";
+
+      if (!hasManuallySelectedThinkingLevelRef.current) {
+        return defaultThinkingLevel;
+      }
+
+      if (supportedThinkingValues.has(current)) {
+        return current;
+      }
+
+      hasManuallySelectedThinkingLevelRef.current = false;
+      return defaultThinkingLevel;
+    });
+  }, [
+    availableModels,
+    defaultComposerSelection.modelId,
+    defaultComposerSelection.thinkingLevel,
+    selectedModelId,
+    thinkingLevels,
+  ]);
 
   useEffect(() => {
     const selectedModel = availableModels.find(
@@ -1764,6 +1843,15 @@ export function App() {
     setSelectedProviderId((current) => {
       if (!selectedModel?.providerIds.length) {
         return "";
+      }
+
+      if (
+        !hasManuallySelectedModelRef.current &&
+        selectedModel.id === defaultComposerSelection.modelId &&
+        defaultComposerSelection.providerId &&
+        selectedModel.providerIds.includes(defaultComposerSelection.providerId)
+      ) {
+        return defaultComposerSelection.providerId;
       }
 
       if (current && selectedModel.providerIds.includes(current)) {
@@ -1779,7 +1867,12 @@ export function App() {
 
       return selectedModel.providerIds[0] ?? "";
     });
-  }, [availableModels, selectedModelId]);
+  }, [
+    availableModels,
+    defaultComposerSelection.modelId,
+    defaultComposerSelection.providerId,
+    selectedModelId,
+  ]);
 
   useEffect(() => {
     const enabledSkillIds = new Set(
@@ -2542,6 +2635,7 @@ export function App() {
     workspaceId: string,
     options: { updateUrl?: boolean } = {},
   ) {
+    resetComposerDefaultsForNewChat();
     setExpandedWorkspaceId(workspaceId);
     setActiveWorkspaceChatRefs(workspaceId, null);
     setActiveWorkspaceId(workspaceId);
@@ -2555,6 +2649,14 @@ export function App() {
     if (options.updateUrl !== false) {
       updateBrowserRoute({ chatId: null, viewMode: "chat", workspaceId });
     }
+  }
+
+  function resetComposerDefaultsForNewChat() {
+    hasManuallySelectedModelRef.current = false;
+    hasManuallySelectedThinkingLevelRef.current = false;
+    setSelectedModelId(defaultComposerSelection.modelId);
+    setSelectedProviderId(defaultComposerSelection.providerId);
+    setSelectedThinkingLevel(defaultComposerSelection.thinkingLevel);
   }
 
   function openChatTab(workspaceId: string, chatId: string) {
@@ -3982,6 +4084,7 @@ export function App() {
       workspaceId: retryRequest.workspaceId,
     });
     hasManuallySelectedModelRef.current = true;
+    hasManuallySelectedThinkingLevelRef.current = true;
     setSelectedModelId(retryRequest.modelId);
     setSelectedProviderId(retryRequest.providerId);
     setSelectedSkillIds(retryRequest.skillIds);
@@ -3991,7 +4094,18 @@ export function App() {
 
   function handleChatModelChange(modelId: string) {
     hasManuallySelectedModelRef.current = true;
+    hasManuallySelectedThinkingLevelRef.current = false;
     setSelectedModelId(modelId);
+  }
+
+  function handleChatProviderChange(providerId: string) {
+    hasManuallySelectedModelRef.current = true;
+    setSelectedProviderId(providerId);
+  }
+
+  function handleChatThinkingLevelChange(thinkingLevel: string) {
+    hasManuallySelectedThinkingLevelRef.current = true;
+    setSelectedThinkingLevel(thinkingLevel);
   }
   const {
     applyBrowserRoute,
@@ -6525,7 +6639,7 @@ export function App() {
                   onGuideActiveRun={() => void handleGuideActiveRun()}
                   onQueueActiveRun={handleQueueActiveRun}
                   onModelChange={handleChatModelChange}
-                  onProviderChange={setSelectedProviderId}
+                  onProviderChange={handleChatProviderChange}
                   onRemoveAttachment={handleRemoveDraftAttachment}
                   onRemoveSkill={removeSelectedSkill}
                   onRetryRun={() => void handleRetryRun()}
@@ -6533,7 +6647,7 @@ export function App() {
                     void handleSendMessage(event, options)
                   }
                   onTeamModeEnabledChange={setIsTeamModeEnabled}
-                  onThinkingLevelChange={setSelectedThinkingLevel}
+                  onThinkingLevelChange={handleChatThinkingLevelChange}
                   onToggleSkill={toggleSelectedSkill}
                   onWithdrawQueuedMessage={handleWithdrawQueuedMessage}
                   canRetryRun={retryRunRequest !== null && !isSendingMessage}

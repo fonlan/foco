@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  agentDefinitions as agentDefinitionFixtures,
   defaultComposerPlaceholder,
   jsonResponse,
   mockFetch,
@@ -10,6 +11,54 @@ import {
   resetAppTestEnvironment,
   settings,
 } from "./test-utils/app-test-harness";
+
+function stubDefaultAgentComposerDefaults() {
+  const baseModel = settings.configuredModels[0]!;
+  const settingsWithAltModel = {
+    ...settings,
+    configuredModels: [
+      baseModel,
+      {
+        ...baseModel,
+        activeProviderId: "anthropic",
+        displayName: "GPT Alt",
+        id: "gpt-alt",
+        providerIds: ["anthropic"],
+        thinkingLevel: null,
+      },
+    ],
+  };
+  const definitionsWithDefaultAgent = {
+    agentDefinitions: [
+      {
+        ...agentDefinitionFixtures.agentDefinitions[0],
+        id: "agent-definition-default",
+        modelId: "gpt-alt",
+        modelOptions: { maxOutputTokens: null, thinkingLevel: "high" },
+        name: "Default agent",
+        providerId: "anthropic",
+      },
+      ...agentDefinitionFixtures.agentDefinitions,
+    ],
+  };
+
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+      if (path === "/api/settings") {
+        return jsonResponse(settingsWithAltModel);
+      }
+      if (path === "/api/agent-definitions") {
+        return jsonResponse(definitionsWithDefaultAgent);
+      }
+      return mockFetch(input, init);
+    }),
+  );
+}
 
 describe("app agents verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
@@ -225,6 +274,88 @@ describe("app agents verification surfaces", () => {
       expect(JSON.parse(queueCall![1]?.body as string)).toMatchObject({
         message: "use the default",
         teamModeEnabled: true,
+      });
+    });
+  });
+
+  it("uses the default agent model provider and thinking level for a new composer", async () => {
+    stubDefaultAgentComposerDefaults();
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent(
+        "Anthropic / GPT Alt",
+      );
+    });
+    expect(screen.getByLabelText("Thinking")).toHaveTextContent("High");
+
+    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: "OpenAI: GPT Test" }));
+    await userEvent.click(screen.getByLabelText("Thinking"));
+    await userEvent.click(screen.getByRole("button", { name: "Thinking: Low" }));
+    expect(screen.getByLabelText("Model")).toHaveTextContent("OpenAI / GPT Test");
+    expect(screen.getByLabelText("Thinking")).toHaveTextContent("Low");
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "New chat in Default" }),
+    );
+    expect(screen.getByLabelText("Model")).toHaveTextContent(
+      "Anthropic / GPT Alt",
+    );
+    expect(screen.getByLabelText("Thinking")).toHaveTextContent("High");
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "use default agent defaults",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const queueCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
+      );
+      expect(queueCall).toBeDefined();
+      expect(JSON.parse(queueCall![1]?.body as string)).toMatchObject({
+        message: "use default agent defaults",
+        modelId: "gpt-alt",
+        providerId: "anthropic",
+        thinkingLevel: "high",
+      });
+    });
+  });
+
+  it("lets composer model provider and thinking selections override the default agent", async () => {
+    stubDefaultAgentComposerDefaults();
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent(
+        "Anthropic / GPT Alt",
+      );
+    });
+    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: "OpenAI: GPT Test" }));
+    await userEvent.click(screen.getByLabelText("Thinking"));
+    await userEvent.click(screen.getByRole("button", { name: "Thinking: Low" }));
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "override defaults",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const queueCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
+      );
+      expect(queueCall).toBeDefined();
+      expect(JSON.parse(queueCall![1]?.body as string)).toMatchObject({
+        message: "override defaults",
+        modelId: "gpt-test",
+        providerId: "openai",
+        thinkingLevel: "low",
       });
     });
   });
