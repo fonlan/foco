@@ -245,16 +245,6 @@ fn agent_create_instances_definition() -> ToolDefinition {
                     "minimum": 1,
                     "description": "Number of instances to create atomically."
                 },
-                "maxInstancesPerTeam": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Explicit per-team instance limit for this create request."
-                },
-                "maxInstancesForDefinition": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Explicit per-definition instance limit for this create request."
-                },
                 "executionWorkspaceMode": {
                     "type": "string",
                     "enum": ["shared", "isolated_worktree"],
@@ -265,7 +255,7 @@ fn agent_create_instances_definition() -> ToolDefinition {
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["definitionId", "count", "maxInstancesPerTeam", "maxInstancesForDefinition", "executionWorkspaceMode", "timeoutMs"]
+            "required": ["definitionId", "count", "executionWorkspaceMode", "timeoutMs"]
         }),
         strict: true,
     }

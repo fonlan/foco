@@ -1018,8 +1018,6 @@ struct AgentTransferTaskInput {
 struct AgentCreateInstancesInput {
     definition_id: AgentDefinitionId,
     count: u32,
-    max_instances_per_team: u32,
-    max_instances_for_definition: u32,
     execution_workspace_mode: AgentExecutionWorkspaceMode,
     #[serde(rename = "timeoutMs")]
     _timeout_ms: Option<u64>,
@@ -1696,22 +1694,6 @@ fn execute_agent_create_instances(
             ),
         ));
     }
-    if i64::from(input.max_instances_per_team) > AGENT_MAX_INSTANCES_PER_TEAM {
-        return Err(agent_tool_error(
-            "limit_exceeded",
-            format!(
-                "agent_create_instances maxInstancesPerTeam exceeds process limit {AGENT_MAX_INSTANCES_PER_TEAM}"
-            ),
-        ));
-    }
-    if input.count > input.max_instances_per_team
-        || input.count > input.max_instances_for_definition
-    {
-        return Err(agent_tool_error(
-            "limit_exceeded",
-            "agent_create_instances count exceeds explicit request limits",
-        ));
-    }
     let definition = context
         .agent_definitions
         .iter()
@@ -1722,18 +1704,12 @@ fn execute_agent_create_instances(
                 format!("Agent definition '{}' was not found", input.definition_id),
             )
         })?;
-    if input.max_instances_for_definition > definition.max_instances {
-        return Err(agent_tool_error(
-            "limit_exceeded",
-            format!(
-                "agent_create_instances maxInstancesForDefinition {} exceeds definition '{}' maxInstances {}",
-                input.max_instances_for_definition, definition.id, definition.max_instances
-            ),
-        ));
-    }
     let team_id = agent_tool_team_id(context)?;
     let actor_instance_id = agent_tool_instance_id(context)?;
     let task_id = agent_tool_task_id(context)?;
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
+    validate_agent_create_instance_capacity(&database, team_id, definition, input.count)?;
     let instance_ids = (0..input.count)
         .map(|_| {
             AgentInstanceId::new(unique_id("agent-instance")).map_err(|source| source.to_string())
@@ -1772,12 +1748,10 @@ fn execute_agent_create_instances(
             }
         })
         .collect::<Vec<_>>();
-    let mut database =
-        WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
     let created = match database.create_agent_instances_with_limits(
         &new_instances,
-        i64::from(input.max_instances_per_team),
-        i64::from(input.max_instances_for_definition),
+        AGENT_MAX_INSTANCES_PER_TEAM,
+        i64::from(definition.max_instances),
     ) {
         Ok(created) => created,
         Err(error) => {
@@ -1815,6 +1789,58 @@ fn execute_agent_create_instances(
         "definitionRevision": definition.revision,
         "count": created.len(),
     }))
+}
+
+fn validate_agent_create_instance_capacity(
+    database: &WorkspaceDatabase,
+    team_id: &foco_agent::AgentTeamId,
+    definition: &AgentDefinitionSettings,
+    count: u32,
+) -> Result<(), String> {
+    let instances = database
+        .agent_instances_for_team(team_id)
+        .map_err(agent_store_error)?;
+    let current_team_instances = i64::try_from(instances.len()).map_err(|_| {
+        agent_tool_error(
+            "limit_exceeded",
+            "agent_create_instances team instance count exceeds integer range",
+        )
+    })?;
+    let current_definition_instances = i64::try_from(
+        instances
+            .iter()
+            .filter(|instance| instance.definition_id == definition.id)
+            .count(),
+    )
+    .map_err(|_| {
+        agent_tool_error(
+            "limit_exceeded",
+            "agent_create_instances definition instance count exceeds integer range",
+        )
+    })?;
+    let requested = i64::from(count);
+    let remaining_team_slots = (AGENT_MAX_INSTANCES_PER_TEAM - current_team_instances).max(0);
+    if requested > remaining_team_slots {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            format!(
+                "agent_create_instances count {count} exceeds team capacity: currentTeamInstances={current_team_instances}, maxInstancesPerTeam={AGENT_MAX_INSTANCES_PER_TEAM}, remainingTeamSlots={remaining_team_slots}"
+            ),
+        ));
+    }
+    let max_definition_instances = i64::from(definition.max_instances);
+    let remaining_definition_slots =
+        (max_definition_instances - current_definition_instances).max(0);
+    if requested > remaining_definition_slots {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            format!(
+                "agent_create_instances count {count} exceeds definition capacity: definitionId={}, currentTeamDefinitionInstances={current_definition_instances}, maxInstancesForDefinition={max_definition_instances}, remainingTeamDefinitionSlots={remaining_definition_slots}",
+                definition.id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn agent_wait_deadline_timestamp(deadline_ms: u64) -> Result<String, String> {
@@ -3006,6 +3032,66 @@ mod tests {
                 .as_str()
                 .expect("error text")
                 .contains("is not enabled for this run")
+        );
+    }
+
+    #[test]
+    fn agent_create_instances_uses_runtime_capacity_limits() {
+        let mut worker_definition =
+            test_agent_definition("tool-test-worker", AgentPermissions::default());
+        worker_definition.max_instances = 2;
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            allowed_agent_definition_ids: vec![worker_definition.id.clone()],
+            ..AgentPermissions::default()
+        };
+        let (workspace, mut context, team_id, _instance_id, _task_id) =
+            create_agent_tool_fixture(permissions);
+        context.agent_definitions = vec![worker_definition.clone()];
+
+        let created = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_CREATE_INSTANCES_TOOL,
+            "call-create-worker",
+            json!({
+                "definitionId": worker_definition.id.to_string(),
+                "count": 1,
+                "executionWorkspaceMode": "shared",
+                "timeoutMs": null,
+            }),
+        )
+        .expect("create should use runtime limits");
+        assert_eq!(created["count"], json!(1));
+
+        let limit_error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_CREATE_INSTANCES_TOOL,
+            "call-create-worker-limit",
+            json!({
+                "definitionId": worker_definition.id.to_string(),
+                "count": 2,
+                "executionWorkspaceMode": "shared",
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("create should reject over definition capacity");
+        let output = agent_tool_error_output(&limit_error);
+        assert_eq!(output["code"], "limit_exceeded");
+        assert!(
+            output["error"]
+                .as_str()
+                .expect("error text")
+                .contains("remainingTeamDefinitionSlots=1")
+        );
+        assert_eq!(
+            WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("database")
+                .agent_instances_for_team(&team_id)
+                .expect("instances")
+                .len(),
+            2
         );
     }
 

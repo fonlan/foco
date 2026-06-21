@@ -29,7 +29,7 @@ use crate::*;
 pub(crate) const AGENT_MAX_QUEUED_TASKS_PER_TEAM: i64 = 64;
 pub(crate) const AGENT_MAX_QUEUED_TASKS_PER_INSTANCE: i64 = 64;
 pub(crate) const AGENT_MAX_QUEUED_TASKS_PER_CHAT: i64 = 64;
-pub(crate) const AGENT_MAX_INSTANCES_PER_TEAM: i64 = 16;
+pub(crate) const AGENT_MAX_INSTANCES_PER_TEAM: i64 = 10;
 pub(crate) const AGENT_MAX_CREATE_INSTANCES_PER_REQUEST: u32 = 16;
 const AGENT_SCHEDULER_WAKE_CAPACITY: usize = 1;
 const AGENT_SCHEDULER_SCAN_LIMIT: i64 = 64;
@@ -953,8 +953,6 @@ fn creatable_agent_definitions_prompt(
                 "tool": "agent_create_instances",
                 "definitionId": { "const": definition.id.to_string() },
                 "count": count_schema,
-                "maxInstancesPerTeam": { "const": max_instances_per_team },
-                "maxInstancesForDefinition": { "const": definition.max_instances },
                 "executionWorkspaceMode": { "enum": ["shared", "isolated_worktree"] },
                 "timeoutMs": { "const": null },
             },
@@ -1851,14 +1849,8 @@ mod tests {
             creatable[0]["agentCreateInstancesSchema"]["count"]["maximum"],
             json!(2)
         );
-        assert_eq!(
-            creatable[0]["agentCreateInstancesSchema"]["maxInstancesPerTeam"]["const"],
-            json!(16)
-        );
-        assert_eq!(
-            creatable[0]["agentCreateInstancesSchema"]["maxInstancesForDefinition"]["const"],
-            json!(3)
-        );
+        assert!(creatable[0]["agentCreateInstancesSchema"]["maxInstancesPerTeam"].is_null());
+        assert!(creatable[0]["agentCreateInstancesSchema"]["maxInstancesForDefinition"].is_null());
     }
 
     #[test]
