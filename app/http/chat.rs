@@ -454,6 +454,7 @@ fn team_chat_task_event_stream(
 ) -> BoxedChatEventStream {
     let stream = async_stream::stream! {
         // ponytail: polling avoids a new task-status broadcast; switch to notifications if queued streams become numerous.
+        let mut last_agent_event_sequence: Option<i64> = None;
         loop {
             let mut streamed_active_run = false;
             if let Ok(subscription) =
@@ -535,7 +536,55 @@ fn team_chat_task_event_stream(
                     return;
                 }
             };
+            let team = match database
+                .agent_team(&task.team_id)
+                .map_err(ApiError::from_workspace_error)
+            {
+                Ok(Some(team)) => team,
+                Ok(None) => {
+                    yield Ok(sse_event(&ChatSseEvent::Error {
+                        message: format!("Agent team '{}' was not found", task.team_id),
+                    }));
+                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                    return;
+                }
+                Err(error) => {
+                    yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
+                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                    return;
+                }
+            };
+            let new_agent_events = match database
+                .agent_events_after(&task.team_id, last_agent_event_sequence.unwrap_or(-1))
+                .map_err(ApiError::from_workspace_error)
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
+                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                    return;
+                }
+            };
+            if let Some(event) = new_agent_events.last() {
+                let should_emit = last_agent_event_sequence.is_some() || streamed_active_run;
+                last_agent_event_sequence = Some(event.sequence);
+                if should_emit {
+                    yield Ok(sse_event(&agent_team_refresh_event_from_agent_event(
+                        &workspace.id,
+                        &team.chat_id,
+                        &task,
+                        event,
+                    )));
+                }
+            }
             if !agent_task_keeps_team_stream_open(task.status) {
+                yield Ok(sse_event(&agent_team_refresh_event_for_task(
+                    &workspace.id,
+                    &team.chat_id,
+                    &task,
+                    "agent_task_settled",
+                    false,
+                )));
                 if streamed_active_run {
                     yield Ok(sse_event(&ChatSseEvent::StreamEnd));
                     return;
@@ -561,6 +610,39 @@ fn team_chat_task_event_stream(
         }
     };
     Box::pin(stream)
+}
+
+fn agent_team_refresh_event_from_agent_event(
+    workspace_id: &str,
+    chat_id: &str,
+    task: &foco_store::workspace::AgentTaskRecord,
+    event: &foco_store::workspace::AgentEventRecord,
+) -> ChatSseEvent {
+    ChatSseEvent::AgentTeamRefresh {
+        workspace_id: workspace_id.to_string(),
+        chat_id: chat_id.to_string(),
+        team_id: task.team_id.to_string(),
+        instance_id: event.instance_id.as_ref().map(ToString::to_string),
+        reason: event.event_type.clone(),
+        reveal_panel: event.event_type == "instance_created",
+    }
+}
+
+fn agent_team_refresh_event_for_task(
+    workspace_id: &str,
+    chat_id: &str,
+    task: &foco_store::workspace::AgentTaskRecord,
+    reason: &str,
+    reveal_panel: bool,
+) -> ChatSseEvent {
+    ChatSseEvent::AgentTeamRefresh {
+        workspace_id: workspace_id.to_string(),
+        chat_id: chat_id.to_string(),
+        team_id: task.team_id.to_string(),
+        instance_id: Some(task.owner_instance_id.to_string()),
+        reason: reason.to_string(),
+        reveal_panel,
+    }
 }
 
 fn agent_task_keeps_team_stream_open(status: foco_agent::AgentTaskStatus) -> bool {

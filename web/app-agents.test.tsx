@@ -1,10 +1,12 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   agentDefinitions as agentDefinitionFixtures,
+  appTestState,
   defaultComposerPlaceholder,
+  enqueueChatStreamEvent,
   jsonResponse,
   mockFetch,
   renderApp,
@@ -179,6 +181,43 @@ describe("app agents verification surfaces", () => {
       "aria-selected",
       "true",
     );
+  });
+
+  it("reveals the Agents panel and refreshes when an Agent instance is created", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "create a worker",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    const snapshotCallsBefore = fetchMock.mock.calls.filter(
+      ([url]) => url === "/api/workspaces/workspace-1/chats/chat-1/agent-team",
+    ).length;
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        chatId: "chat-1",
+        instanceId: "agent-instance-worker",
+        reason: "instance_created",
+        revealPanel: true,
+        teamId: "agent-team-1",
+        type: "agentTeamRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
+
+    await waitFor(() => {
+      const snapshotCallsAfter = fetchMock.mock.calls.filter(
+        ([url]) => url === "/api/workspaces/workspace-1/chats/chat-1/agent-team",
+      ).length;
+      expect(snapshotCallsAfter).toBeGreaterThan(snapshotCallsBefore);
+    });
+    expect(await screen.findByText("Current chat agent instances")).toBeInTheDocument();
+    expect(screen.getAllByLabelText("Agent status active").length).toBeGreaterThan(0);
   });
 
   it("queues the first message with Team tools disabled by default from the composer", async () => {

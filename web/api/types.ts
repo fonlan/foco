@@ -392,6 +392,15 @@ export type ChatStreamEvent =
     chatId: string;
   }
   | {
+    type: "agentTeamRefresh";
+    workspaceId: string;
+    chatId: string;
+    teamId: string;
+    instanceId?: string;
+    reason: string;
+    revealPanel: boolean;
+  }
+  | {
     type: "memoryExtractionComplete";
     assistantMessageId: string;
     extractedMemories: ChatExtractedMemorySummary[];

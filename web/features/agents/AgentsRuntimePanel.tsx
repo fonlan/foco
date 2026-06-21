@@ -1,4 +1,18 @@
-import { Bot, GitBranch, RefreshCw, User } from "lucide-react";
+import {
+  Activity,
+  Bot,
+  CheckCircle2,
+  CircleAlert,
+  CircleDashed,
+  CirclePause,
+  CircleStop,
+  GitBranch,
+  Hourglass,
+  LoaderCircle,
+  RefreshCw,
+  User,
+  type LucideIcon,
+} from "lucide-react";
 
 import type {
   AgentInstanceView,
@@ -124,6 +138,8 @@ function AgentInstanceCard({
 }) {
   const { t } = useI18n();
   const isIsolated = instance.executionWorkspaceMode === "isolated_worktree";
+  const status = agentStatusPresentation(instance.status);
+  const StatusIcon = status.icon;
 
   return (
     <button
@@ -139,14 +155,26 @@ function AgentInstanceCard({
       type="button"
     >
       <div className="flex min-w-0 items-start gap-2">
-        <User aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-teal-700" />
+        <span
+          aria-label={t("Agent status {status}", { status: instance.status })}
+          className={`mt-0.5 inline-flex size-9 shrink-0 items-center justify-center rounded-lg border ${status.className}`}
+          title={t("Agent status {status}", { status: instance.status })}
+        >
+          <StatusIcon
+            aria-hidden="true"
+            className={`size-5 ${status.animate ? "animate-spin" : ""}`}
+          />
+        </span>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-semibold text-stone-950">
-            {instance.definitionSnapshot.name}
+          <div className="flex min-w-0 items-center gap-1.5">
+            <User aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+            <div className="truncate text-sm font-semibold text-stone-950">
+              {instance.definitionSnapshot.name}
+            </div>
           </div>
           <div className="mt-1 flex flex-wrap gap-1.5 text-[11px] font-semibold uppercase tracking-normal text-stone-500">
             <span>{instance.role}</span>
-            <span>{instance.status}</span>
+            <span className={status.textClassName}>{instance.status}</span>
             <span>{isIsolated ? t("isolated") : t("shared")}</span>
             {instance.worktreeStatus ? <span>{instance.worktreeStatus}</span> : null}
           </div>
@@ -190,6 +218,73 @@ function AgentEmptyState({ text }: { text: string }) {
       {text}
     </div>
   );
+}
+
+function agentStatusPresentation(status: string): {
+  animate: boolean;
+  className: string;
+  icon: LucideIcon;
+  textClassName: string;
+} {
+  switch (status) {
+    case "running":
+      return {
+        animate: true,
+        className: "border-sky-200 bg-sky-100 text-sky-700",
+        icon: LoaderCircle,
+        textClassName: "text-sky-700",
+      };
+    case "waiting":
+      return {
+        animate: false,
+        className: "border-violet-200 bg-violet-100 text-violet-700",
+        icon: Hourglass,
+        textClassName: "text-violet-700",
+      };
+    case "paused":
+      return {
+        animate: false,
+        className: "border-amber-200 bg-amber-100 text-amber-700",
+        icon: CirclePause,
+        textClassName: "text-amber-700",
+      };
+    case "draining":
+      return {
+        animate: false,
+        className: "border-orange-200 bg-orange-100 text-orange-700",
+        icon: Activity,
+        textClassName: "text-orange-700",
+      };
+    case "stopped":
+      return {
+        animate: false,
+        className: "border-stone-200 bg-stone-100 text-stone-600",
+        icon: CircleStop,
+        textClassName: "text-stone-600",
+      };
+    case "failed":
+      return {
+        animate: false,
+        className: "border-rose-200 bg-rose-100 text-rose-700",
+        icon: CircleAlert,
+        textClassName: "text-rose-700",
+      };
+    case "idle":
+    case "active":
+      return {
+        animate: false,
+        className: "border-emerald-200 bg-emerald-100 text-emerald-700",
+        icon: CheckCircle2,
+        textClassName: "text-emerald-700",
+      };
+    default:
+      return {
+        animate: false,
+        className: "border-stone-200 bg-stone-100 text-stone-600",
+        icon: CircleDashed,
+        textClassName: "text-stone-600",
+      };
+  }
 }
 
 function formatAgentTimestamp(value: string) {

@@ -1016,6 +1016,21 @@ export function App() {
     [],
   );
 
+  const handleAgentTeamRefresh = useCallback(
+    (event: Extract<ChatStreamEvent, { type: "agentTeamRefresh" }>) => {
+      if (activeChatKeyRef.current !== chatRunKey(event.workspaceId, event.chatId)) {
+        return;
+      }
+
+      if (event.revealPanel) {
+        setContextPanelTab("agents");
+        setIsContextPanelOpen(true);
+      }
+      void loadAgentTeamSnapshot(event.workspaceId, event.chatId);
+    },
+    [loadAgentTeamSnapshot],
+  );
+
   useEffect(() => {
     if (!canUseApp) {
       return;
@@ -4961,6 +4976,11 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "agentTeamRefresh") {
+          handleAgentTeamRefresh(streamEvent);
+          return;
+        }
+
         if (streamEvent.type === "memoryExtractionComplete") {
           void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           setMessagesForChatKey(chatKey, (current) =>
@@ -5853,6 +5873,11 @@ export function App() {
             setIsContextPanelOpen(true);
             void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId);
           }
+          return;
+        }
+
+        if (streamEvent.type === "agentTeamRefresh") {
+          handleAgentTeamRefresh(streamEvent);
           return;
         }
 
@@ -22245,6 +22270,39 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     }
 
     return { type: "todoGraphRefresh", workspaceId, chatId };
+  }
+
+  if (
+    value.type === "agentTeamRefresh" ||
+    value.type === "agent_team_refresh"
+  ) {
+    const workspaceId = stringField(value, "workspaceId", "workspace_id");
+    const chatId = stringField(value, "chatId", "chat_id");
+    const teamId = stringField(value, "teamId", "team_id");
+    const instanceId = optionalStringField(value, "instanceId", "instance_id");
+    const reason = stringField(value, "reason");
+    const revealPanel = fieldValue(value, "revealPanel", "reveal_panel");
+
+    if (
+      !workspaceId ||
+      !chatId ||
+      !teamId ||
+      instanceId === null ||
+      !reason ||
+      typeof revealPanel !== "boolean"
+    ) {
+      return null;
+    }
+
+    return {
+      type: "agentTeamRefresh",
+      workspaceId,
+      chatId,
+      teamId,
+      instanceId,
+      reason,
+      revealPanel,
+    };
   }
 
   if (

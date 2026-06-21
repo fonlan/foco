@@ -68,8 +68,8 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, RUN_COMMAND_TOOL, ToolExecution, ToolOutputStream,
-    UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL, set_ripgrep_path,
+    AGENT_CREATE_INSTANCES_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, RUN_COMMAND_TOOL,
+    ToolExecution, ToolOutputStream, UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL, set_ripgrep_path,
 };
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -2942,6 +2942,15 @@ enum ChatSseEvent {
         workspace_id: String,
         chat_id: String,
     },
+    AgentTeamRefresh {
+        workspace_id: String,
+        chat_id: String,
+        team_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
+        reason: String,
+        reveal_panel: bool,
+    },
     MemoryExtractionComplete {
         assistant_message_id: String,
         extracted_memories: Vec<ChatExtractedMemorySummary>,
@@ -3578,6 +3587,7 @@ fn agent_run_event_kind(event: &ChatSseEvent) -> AgentRunEventKind {
         | ChatSseEvent::GuidanceApplied { .. }
         | ChatSseEvent::GitDiffRefresh { .. }
         | ChatSseEvent::TodoGraphRefresh { .. }
+        | ChatSseEvent::AgentTeamRefresh { .. }
         | ChatSseEvent::MemoryExtractionComplete { .. }
         | ChatSseEvent::MemoryResolved { .. }
         | ChatSseEvent::StreamEnd => AgentRunEventKind::ControlOutcome,
@@ -3656,6 +3666,15 @@ impl PreparedChatContext {
             let mut app_shutdown_rx = self.app_shutdown_rx.clone();
 
             yield start_event;
+            if let Some(event) = agent_team_refresh_event_for_context(
+                &self,
+                "agent_run_started",
+                None,
+                false,
+            ) {
+                events.push(captured_event(&event));
+                yield event;
+            }
             for event in self
                 .hook_notifications
                 .iter()
@@ -5041,6 +5060,13 @@ impl PreparedChatContext {
                                     workspace_id: self.workspace_id.clone(),
                                     chat_id: self.chat_id.clone(),
                                 };
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
+                            if let Some(event) = agent_team_refresh_event_for_tool_results(
+                                &self,
+                                &next_executed_tool_calls,
+                            ) {
                                 events.push(captured_event(&event));
                                 yield event;
                             }
@@ -6559,6 +6585,64 @@ fn tool_results_affect_todo_graph(tool_results: &[ExecutedToolCall]) -> bool {
     })
 }
 
+fn agent_team_refresh_event_for_context(
+    context: &PreparedChatContext,
+    reason: &str,
+    instance_id: Option<String>,
+    reveal_panel: bool,
+) -> Option<ChatSseEvent> {
+    let team_id = context.agent_associations.team_id.as_ref()?;
+    Some(ChatSseEvent::AgentTeamRefresh {
+        workspace_id: context.workspace_id.clone(),
+        chat_id: context.chat_id.clone(),
+        team_id: team_id.to_string(),
+        instance_id: instance_id.or_else(|| {
+            context
+                .agent_associations
+                .instance_id
+                .as_ref()
+                .map(ToString::to_string)
+        }),
+        reason: reason.to_string(),
+        reveal_panel,
+    })
+}
+
+fn agent_team_refresh_event_for_tool_results(
+    context: &PreparedChatContext,
+    tool_results: &[ExecutedToolCall],
+) -> Option<ChatSseEvent> {
+    let mut reason = None;
+    let mut instance_id = None;
+    let mut reveal_panel = false;
+
+    for tool_result in tool_results {
+        if tool_result.is_error || !is_agent_tool_name(&tool_result.name) {
+            continue;
+        }
+
+        reason = Some("agent_tool_result");
+        if tool_result.name == AGENT_CREATE_INSTANCES_TOOL {
+            reason = Some("instance_created");
+            instance_id = first_created_agent_instance_id(&tool_result.output);
+            reveal_panel = true;
+            break;
+        }
+    }
+
+    agent_team_refresh_event_for_context(context, reason?, instance_id, reveal_panel)
+}
+
+fn first_created_agent_instance_id(output: &Value) -> Option<String> {
+    output
+        .get("instances")?
+        .as_array()?
+        .first()?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+}
+
 fn tool_written_memory_summaries(
     tool_results: &[ExecutedToolCall],
 ) -> Vec<ChatExtractedMemorySummary> {
@@ -6827,6 +6911,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::GuidanceApplied { .. } => "guidance_applied",
         ChatSseEvent::GitDiffRefresh { .. } => "git_diff_refresh",
         ChatSseEvent::TodoGraphRefresh { .. } => "todo_graph_refresh",
+        ChatSseEvent::AgentTeamRefresh { .. } => "agent_team_refresh",
         ChatSseEvent::MemoryExtractionComplete { .. } => "memory_extraction_complete",
         ChatSseEvent::MemoryResolved { .. } => "memory_resolved",
         ChatSseEvent::Usage { .. } => "usage",
