@@ -8364,6 +8364,141 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
 }
 
 #[tokio::test]
+async fn prepare_prompt_context_allocates_after_hidden_worker_messages() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-hidden-worker-sequence-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-hidden-worker-sequence-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-hidden-worker-sequence", "Hidden worker sequence")
+            .expect("chat insert");
+        let team_id =
+            foco_agent::AgentTeamId::new("agent-team-hidden-worker-sequence").expect("team id");
+        let coordinator_id =
+            foco_agent::AgentInstanceId::new("agent-instance-hidden-worker-sequence-coordinator")
+                .expect("coordinator id");
+        let worker_id =
+            foco_agent::AgentInstanceId::new("agent-instance-hidden-worker-sequence-worker")
+                .expect("worker id");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-hidden-worker-sequence")
+                .expect("definition id"),
+            revision: 1,
+            name: "Hidden worker coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Coordinate.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 2,
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-hidden-worker-sequence",
+                coordinator_instance_id: &coordinator_id,
+                coordinator_definition: &definition,
+                max_concurrent_runs: 1,
+            })
+            .expect("team create");
+        database
+            .create_agent_instances_with_limits(
+                &[foco_store::workspace::NewAgentInstance {
+                    id: &worker_id,
+                    team_id: &team_id,
+                    definition: &definition,
+                    role: foco_agent::AgentRole::Worker,
+                    execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                    execution_root_path: None,
+                    worktree_base_revision: None,
+                    worktree_branch: None,
+                    worktree_status: None,
+                }],
+                2,
+                2,
+            )
+            .expect("worker create");
+        let worker_task_id =
+            foco_agent::AgentTaskId::new("agent-task-hidden-worker-sequence").expect("task id");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &worker_task_id,
+                team_id: &team_id,
+                owner_instance_id: &worker_id,
+                origin_instance_id: Some(&coordinator_id),
+                parent_task_id: None,
+                input_json: r#"{"queuedUserMessageId":"user-worker"}"#,
+            })
+            .expect("worker task enqueue");
+        for (id, role, content, sequence) in [
+            ("user-main", "user", "Main request", 0),
+            ("assistant-main", "assistant", "Main answer", 1),
+            ("user-worker", "user", "Worker-only prompt", 2),
+        ] {
+            database
+                .insert_message(NewMessage {
+                    id,
+                    chat_id: "chat-hidden-worker-sequence",
+                    role,
+                    content,
+                    sequence,
+                    metadata_json: None,
+                })
+                .expect("message insert");
+        }
+    }
+
+    let context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: Some("chat-hidden-worker-sequence".to_string()),
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: Some("Follow up".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ChatRun,
+    )
+    .await
+    .expect("prompt context");
+
+    assert_eq!(context.next_message_sequence, 3);
+    assert!(
+        context
+            .provider_request
+            .messages
+            .iter()
+            .any(|message| message.content == "Main request")
+    );
+    assert!(
+        context
+            .provider_request
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("Worker-only prompt"))
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-memory-cache-layout-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-memory-cache-profile-test"));

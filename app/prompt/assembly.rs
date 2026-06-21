@@ -192,7 +192,29 @@ pub(crate) async fn prepare_prompt_context(
             None => None,
         }
     };
-    let user_sequence = next_message_sequence(&existing_messages);
+    let user_sequence = if is_new_chat {
+        0
+    } else {
+        match chat_id.as_deref() {
+            Some(chat_id) => match queued_user_message_id.as_deref() {
+                Some(queued_user_message_id) => database
+                    .message(queued_user_message_id)
+                    .map_err(ApiError::from_workspace_error)?
+                    .filter(|message| message.chat_id == chat_id)
+                    .map(|message| message.sequence),
+                None => None,
+            }
+            .map_or_else(
+                || {
+                    database
+                        .next_message_sequence_for_chat(chat_id)
+                        .map_err(ApiError::from_workspace_error)
+                },
+                Ok,
+            )?,
+            None => next_message_sequence(&existing_messages),
+        }
+    };
     drop(database);
 
     let ripgrep_available = {

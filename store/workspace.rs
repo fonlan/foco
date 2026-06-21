@@ -761,6 +761,29 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn next_message_sequence_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        let max_sequence = self
+            .connection
+            .query_row(
+                "SELECT MAX(sequence) FROM messages WHERE chat_id = ?1",
+                params![chat_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        match max_sequence {
+            Some(sequence) => sequence.checked_add(1).ok_or_else(|| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("message sequence overflowed for chat '{chat_id}'"),
+                }
+            }),
+            None => Ok(0),
+        }
+    }
+
     pub fn insert_run_event(
         &mut self,
         event: NewRunEvent<'_>,

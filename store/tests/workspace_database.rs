@@ -2180,6 +2180,12 @@ fn messages_for_chat_filters_worker_agent_assistant_messages() {
         .collect::<Vec<_>>();
 
     assert_eq!(message_ids, vec!["user-main", "assistant-main"]);
+    assert_eq!(
+        database
+            .next_message_sequence_for_chat("chat-agent-message-filter")
+            .expect("next message sequence"),
+        4
+    );
 }
 
 #[test]
