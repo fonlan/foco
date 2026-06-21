@@ -936,6 +936,11 @@ fn creatable_agent_definitions_prompt(
                 "maximum": max_create_count,
             })
         };
+        let allowed_execution_workspace_modes = definition
+            .allowed_execution_workspace_modes
+            .iter()
+            .map(|mode| mode.as_str())
+            .collect::<Vec<_>>();
 
         definitions.push(json!({
             "definitionId": definition.id.to_string(),
@@ -949,11 +954,12 @@ fn creatable_agent_definitions_prompt(
             "remainingTeamDefinitionSlots": remaining_definition_slots,
             "maxCreateCount": max_create_count,
             "canCreateMore": max_create_count > 0,
+            "allowedExecutionWorkspaceModes": allowed_execution_workspace_modes.clone(),
             "agentCreateInstancesSchema": {
                 "tool": "agent_create_instances",
                 "definitionId": { "const": definition.id.to_string() },
                 "count": count_schema,
-                "executionWorkspaceMode": { "enum": ["shared", "isolated_worktree"] },
+                "executionWorkspaceMode": { "enum": allowed_execution_workspace_modes },
                 "timeoutMs": { "const": null },
             },
         }));
@@ -1757,7 +1763,9 @@ mod tests {
     #[test]
     fn team_protocol_expands_creatable_definition_schema() {
         let coordinator_definition = test_agent_definition("coordinator", 1);
-        let worker_definition = test_agent_definition("worker", 3);
+        let mut worker_definition = test_agent_definition("worker", 3);
+        worker_definition.allowed_execution_workspace_modes =
+            vec![AgentExecutionWorkspaceMode::Shared];
         let team_id = foco_agent::AgentTeamId::new("agent-team-protocol").expect("team id");
         let coordinator_id =
             foco_agent::AgentInstanceId::new("agent-instance-coordinator").expect("instance id");
@@ -1848,6 +1856,14 @@ mod tests {
         assert_eq!(
             creatable[0]["agentCreateInstancesSchema"]["count"]["maximum"],
             json!(2)
+        );
+        assert_eq!(
+            creatable[0]["allowedExecutionWorkspaceModes"],
+            json!(["shared"])
+        );
+        assert_eq!(
+            creatable[0]["agentCreateInstancesSchema"]["executionWorkspaceMode"]["enum"],
+            json!(["shared"])
         );
         assert!(creatable[0]["agentCreateInstancesSchema"]["maxInstancesPerTeam"].is_null());
         assert!(creatable[0]["agentCreateInstancesSchema"]["maxInstancesForDefinition"].is_null());
@@ -2069,6 +2085,7 @@ mod tests {
             system_prompt: "Do the task.".to_string(),
             allowed_tools: Vec::new(),
             max_instances,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
             permissions: AgentPermissions::default(),
         }
     }

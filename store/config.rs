@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use foco_agent::{AgentDefinitionId, AgentPermissions};
+use foco_agent::{AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions};
 use foco_mcp::{McpServerDefinition, McpTransportKind, validate_server_definitions};
 use foco_providers::{
     HTTP_PROXY_KIND, ProviderRequestOverride, SOCKS_PROXY_KIND, normalized_base_url,
@@ -996,7 +996,13 @@ pub struct AgentDefinitionSettings {
     pub system_prompt: String,
     pub allowed_tools: Vec<String>,
     pub max_instances: u32,
+    #[serde(default = "default_agent_execution_workspace_modes")]
+    pub allowed_execution_workspace_modes: Vec<AgentExecutionWorkspaceMode>,
     pub permissions: AgentPermissions,
+}
+
+pub fn default_agent_execution_workspace_modes() -> Vec<AgentExecutionWorkspaceMode> {
+    AgentExecutionWorkspaceMode::all()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1570,6 +1576,24 @@ fn validate_agent_definitions(
                     "{field}.maxInstances must be between 1 and {AGENT_DEFINITION_MAX_INSTANCES}"
                 ),
             );
+        }
+        if definition.allowed_execution_workspace_modes.is_empty() {
+            return invalid_config(
+                config_path,
+                format!("{field}.allowedExecutionWorkspaceModes must not be empty"),
+            );
+        }
+        let mut allowed_workspace_modes = HashSet::new();
+        for mode in &definition.allowed_execution_workspace_modes {
+            if !allowed_workspace_modes.insert(*mode) {
+                return invalid_config(
+                    config_path,
+                    format!(
+                        "{field}.allowedExecutionWorkspaceModes contains duplicate mode '{}'",
+                        mode.as_str()
+                    ),
+                );
+            }
         }
         if definition.allowed_tools.len() > AGENT_DEFINITION_MAX_ALLOWED_TOOLS {
             return invalid_config(
@@ -2937,6 +2961,7 @@ mod tests {
             system_prompt: "Coordinate the team.".to_string(),
             allowed_tools: vec!["read_file".to_string()],
             max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
             permissions: AgentPermissions::default(),
         });
         config
@@ -2968,6 +2993,21 @@ mod tests {
         let error = serde_json::from_value::<AgentDefinitionSettings>(value)
             .expect_err("missing definition field should fail");
         assert!(error.to_string().contains("missing field"));
+    }
+
+    #[test]
+    fn agent_definition_requires_at_least_one_execution_workspace_mode() {
+        let mut config = config_with_valid_agent_definition();
+        config.agent_definitions[0]
+            .allowed_execution_workspace_modes
+            .clear();
+
+        let error = config.validate(None).expect_err("empty modes should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("allowedExecutionWorkspaceModes must not be empty")
+        );
     }
 
     #[test]

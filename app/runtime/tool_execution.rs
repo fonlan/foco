@@ -1710,6 +1710,19 @@ fn execute_agent_create_instances(
     let mut database =
         WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
     validate_agent_create_instance_capacity(&database, team_id, definition, input.count)?;
+    if !definition
+        .allowed_execution_workspace_modes
+        .contains(&input.execution_workspace_mode)
+    {
+        return Err(agent_tool_error(
+            "permission_denied",
+            format!(
+                "executionWorkspaceMode '{}' is not allowed for Agent definition '{}'",
+                input.execution_workspace_mode.as_str(),
+                definition.id
+            ),
+        ));
+    }
     let instance_ids = (0..input.count)
         .map(|_| {
             AgentInstanceId::new(unique_id("agent-instance")).map_err(|source| source.to_string())
@@ -2896,6 +2909,7 @@ mod tests {
             system_prompt: "Be precise.".to_string(),
             allowed_tools: vec![READ_FILE_TOOL.to_string()],
             max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
             permissions,
         }
     }
@@ -3092,6 +3106,44 @@ mod tests {
                 .expect("instances")
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn agent_create_instances_rejects_disallowed_workspace_mode() {
+        let mut worker_definition =
+            test_agent_definition("tool-test-shared-worker", AgentPermissions::default());
+        worker_definition.allowed_execution_workspace_modes =
+            vec![AgentExecutionWorkspaceMode::Shared];
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            allowed_agent_definition_ids: vec![worker_definition.id.clone()],
+            ..AgentPermissions::default()
+        };
+        let (workspace, mut context, _team_id, _instance_id, _task_id) =
+            create_agent_tool_fixture(permissions);
+        context.agent_definitions = vec![worker_definition.clone()];
+
+        let error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_CREATE_INSTANCES_TOOL,
+            "call-create-worker-worktree",
+            json!({
+                "definitionId": worker_definition.id.to_string(),
+                "count": 1,
+                "executionWorkspaceMode": "isolated_worktree",
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("create should reject a disallowed workspace mode");
+        let output = agent_tool_error_output(&error);
+        assert_eq!(output["code"], "permission_denied");
+        assert!(
+            output["error"]
+                .as_str()
+                .expect("error text")
+                .contains("is not allowed")
         );
     }
 

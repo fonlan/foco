@@ -273,6 +273,7 @@ async fn default_agent_definition(
         system_prompt: DEFAULT_AGENT_SYSTEM_PROMPT.to_string(),
         allowed_tools,
         max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
         permissions: foco_agent::AgentPermissions {
             can_create_instances: true,
             can_delegate: true,

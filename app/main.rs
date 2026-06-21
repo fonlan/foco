@@ -27,11 +27,11 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    AgentDefinitionId, AgentPermissions, AgentRunAssociations, AgentRunContext, AgentRunEvent,
-    AgentRunEventEmitter, AgentRunEventKind, AgentRunExecutor, AgentRunFuture, AgentRunInput,
-    AgentRunOutcome, AgentRunTask, build_available_tools_prompt, calculate_context_budget,
-    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
-    plan_tool_execution,
+    AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions, AgentRunAssociations,
+    AgentRunContext, AgentRunEvent, AgentRunEventEmitter, AgentRunEventKind, AgentRunExecutor,
+    AgentRunFuture, AgentRunInput, AgentRunOutcome, AgentRunTask, build_available_tools_prompt,
+    calculate_context_budget, estimate_json_tokens, estimate_text_tokens, pack_context,
+    plan_context_compression, plan_tool_execution,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};
@@ -49,7 +49,7 @@ use foco_store::{
         SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
         SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings,
         SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
-        load_or_create_global_config, save_global_config,
+        default_agent_execution_workspace_modes, load_or_create_global_config, save_global_config,
         validate_agent_definition_tool_references,
     },
     memory::{MemoryDatabase, MemoryDatabaseError, MemoryScope, MemorySourceType, MemoryStatus},
@@ -1661,6 +1661,8 @@ struct AgentDefinitionInput {
     system_prompt: String,
     allowed_tools: Vec<String>,
     max_instances: u32,
+    #[serde(default = "default_agent_execution_workspace_modes")]
+    allowed_execution_workspace_modes: Vec<AgentExecutionWorkspaceMode>,
     permissions: AgentPermissions,
 }
 

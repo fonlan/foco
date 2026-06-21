@@ -679,6 +679,7 @@ export type AgentDefinitionInput = {
   systemPrompt: string;
   allowedTools: string[];
   maxInstances: number;
+  allowedExecutionWorkspaceModes: AgentExecutionWorkspaceMode[];
   permissions: AgentPermissions;
 };
 

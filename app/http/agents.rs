@@ -230,6 +230,7 @@ struct AgentDefinitionRuntimeView {
     model_options: AgentModelOptions,
     allowed_tools: Vec<String>,
     max_instances: u32,
+    allowed_execution_workspace_modes: Vec<AgentExecutionWorkspaceMode>,
     permissions: foco_agent::AgentPermissions,
 }
 
@@ -428,6 +429,16 @@ pub(crate) async fn create_agent_instances(
         return Err(ApiError::bad_request(format!(
             "maxInstancesForDefinition {} exceeds definition '{}' maxInstances {}",
             request.max_instances_for_definition, definition.id, definition.max_instances
+        )));
+    }
+    if !definition
+        .allowed_execution_workspace_modes
+        .contains(&request.execution_workspace_mode)
+    {
+        return Err(ApiError::bad_request(format!(
+            "executionWorkspaceMode '{}' is not allowed for Agent definition '{}'",
+            request.execution_workspace_mode.as_str(),
+            definition.id
         )));
     }
     validate_agent_snapshot_for_workspace(&config, workspace, definition)?;
@@ -1201,6 +1212,7 @@ impl From<AgentDefinitionSettings> for AgentDefinitionRuntimeView {
             model_options: definition.model_options,
             allowed_tools: definition.allowed_tools,
             max_instances: definition.max_instances,
+            allowed_execution_workspace_modes: definition.allowed_execution_workspace_modes,
             permissions: definition.permissions,
         }
     }

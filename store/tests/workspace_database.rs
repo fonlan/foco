@@ -3932,6 +3932,7 @@ fn create_test_agent_team(
         system_prompt: "Be precise.".to_string(),
         allowed_tools: vec!["read_file".to_string()],
         max_instances: 1,
+        allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
         permissions: AgentPermissions::default(),
     };
     database
@@ -3962,6 +3963,7 @@ fn phase8_agent_definition(
         system_prompt: "Be precise.".to_string(),
         allowed_tools: vec!["read_file".to_string()],
         max_instances,
+        allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
         permissions: AgentPermissions::default(),
     }
 }

@@ -183,7 +183,7 @@ impl AgentRole {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentExecutionWorkspaceMode {
     Shared,
@@ -191,6 +191,12 @@ pub enum AgentExecutionWorkspaceMode {
 }
 
 impl AgentExecutionWorkspaceMode {
+    pub const ALL: [Self; 2] = [Self::Shared, Self::IsolatedWorktree];
+
+    pub fn all() -> Vec<Self> {
+        Self::ALL.to_vec()
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Shared => "shared",

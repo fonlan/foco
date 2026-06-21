@@ -301,6 +301,7 @@ export const settings = {
 export const agentDefinitions = {
   agentDefinitions: [
     {
+      allowedExecutionWorkspaceModes: ["shared", "isolated_worktree"],
       allowedTools: ["read_file", "send_message", "delegate_task"],
       description: "Coordinates the Agent team.",
       id: "agent-definition-coordinator",
@@ -318,6 +319,7 @@ export const agentDefinitions = {
       systemPrompt: "Coordinate the team.",
     },
     {
+      allowedExecutionWorkspaceModes: ["shared", "isolated_worktree"],
       allowedTools: ["read_file"],
       description: "Handles delegated implementation tasks.",
       id: "agent-definition-worker",

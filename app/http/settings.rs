@@ -146,6 +146,7 @@ fn default_agent_definition_for_config(
         system_prompt: DEFAULT_AGENT_SYSTEM_PROMPT.to_string(),
         allowed_tools,
         max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
         permissions: AgentPermissions {
             can_create_instances: true,
             can_delegate: true,
@@ -257,6 +258,7 @@ fn agent_definition_from_input(
         system_prompt: input.system_prompt,
         allowed_tools: input.allowed_tools,
         max_instances: input.max_instances,
+        allowed_execution_workspace_modes: input.allowed_execution_workspace_modes,
         permissions: input.permissions,
     }
 }

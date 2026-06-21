@@ -12,6 +12,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import type {
   AgentDefinitionInput,
   AgentDefinitionSettings,
+  AgentExecutionWorkspaceMode,
   ConfiguredModelSummary,
   ConfiguredProviderSummary,
   SystemPromptSummary,
@@ -19,8 +20,14 @@ import type {
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
 
+const AGENT_EXECUTION_WORKSPACE_MODES: AgentExecutionWorkspaceMode[] = [
+  "shared",
+  "isolated_worktree",
+];
+
 type AgentDefinitionDraft = {
   allowedTools: string[];
+  allowedExecutionWorkspaceModes: AgentExecutionWorkspaceMode[];
   canCreateInstances: boolean;
   canDelegate: boolean;
   description: string;
@@ -113,7 +120,8 @@ export function AgentsSettingsPanel({
     draft.modelId.trim().length > 0 &&
     draft.providerId.trim().length > 0 &&
     draft.systemPrompt.trim().length > 0 &&
-    Number.parseInt(draft.maxInstances, 10) > 0;
+    Number.parseInt(draft.maxInstances, 10) > 0 &&
+    draft.allowedExecutionWorkspaceModes.length > 0;
 
   useEffect(() => {
     if (!dialogMode) {
@@ -175,6 +183,18 @@ export function AgentsSettingsPanel({
       allowedAgentDefinitionIds: checked
         ? [...current.allowedAgentDefinitionIds, id].filter(uniqueString)
         : current.allowedAgentDefinitionIds.filter((item) => item !== id),
+    }));
+  }
+
+  function toggleAllowedExecutionWorkspaceMode(
+    mode: AgentExecutionWorkspaceMode,
+    checked: boolean,
+  ) {
+    setDraft((current) => ({
+      ...current,
+      allowedExecutionWorkspaceModes: checked
+        ? [...current.allowedExecutionWorkspaceModes, mode].filter(uniqueString)
+        : current.allowedExecutionWorkspaceModes.filter((item) => item !== mode),
     }));
   }
 
@@ -463,6 +483,26 @@ export function AgentsSettingsPanel({
 
             <fieldset className="mt-4 rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
               <legend className="px-1 text-xs font-semibold text-stone-600">
+                {t("Workspace isolation mode")}
+              </legend>
+              <div className="grid gap-3 md:grid-cols-2">
+                <AgentCheckbox
+                  checked={draft.allowedExecutionWorkspaceModes.includes("shared")}
+                  label={t("Shared workspace")}
+                  onChange={(checked) => toggleAllowedExecutionWorkspaceMode("shared", checked)}
+                />
+                <AgentCheckbox
+                  checked={draft.allowedExecutionWorkspaceModes.includes("isolated_worktree")}
+                  label={t("Isolated workspace")}
+                  onChange={(checked) =>
+                    toggleAllowedExecutionWorkspaceMode("isolated_worktree", checked)
+                  }
+                />
+              </div>
+            </fieldset>
+
+            <fieldset className="mt-4 rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
+              <legend className="px-1 text-xs font-semibold text-stone-600">
                 {t("Permissions")}
               </legend>
               <div className="grid gap-3 md:grid-cols-2">
@@ -608,6 +648,7 @@ function emptyAgentDefinitionDraft(
 ): AgentDefinitionDraft {
   return {
     allowedAgentDefinitionIds: [],
+    allowedExecutionWorkspaceModes: [...AGENT_EXECUTION_WORKSPACE_MODES],
     allowedTools: [],
     canCreateInstances: false,
     canDelegate: false,
@@ -627,6 +668,8 @@ function agentDefinitionToDraft(
 ): AgentDefinitionDraft {
   return {
     allowedAgentDefinitionIds: definition.permissions.allowedAgentDefinitionIds,
+    allowedExecutionWorkspaceModes:
+      definition.allowedExecutionWorkspaceModes ?? [...AGENT_EXECUTION_WORKSPACE_MODES],
     allowedTools: definition.allowedTools,
     canCreateInstances: definition.permissions.canCreateInstances,
     canDelegate: definition.permissions.canDelegate,
@@ -647,6 +690,7 @@ function draftToAgentDefinitionInput(
   draft: AgentDefinitionDraft,
 ): AgentDefinitionInput {
   return {
+    allowedExecutionWorkspaceModes: draft.allowedExecutionWorkspaceModes,
     allowedTools: draft.allowedTools,
     description: draft.description.trim(),
     maxInstances: Number.parseInt(draft.maxInstances, 10),
@@ -668,6 +712,6 @@ function draftToAgentDefinitionInput(
   };
 }
 
-function uniqueString(value: string, index: number, values: string[]) {
+function uniqueString<T extends string>(value: T, index: number, values: T[]) {
   return values.indexOf(value) === index;
 }

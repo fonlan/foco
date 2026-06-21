@@ -78,6 +78,7 @@ fn insert_waiting_coordinator_task(
         system_prompt: "Coordinate.".to_string(),
         allowed_tools: Vec::new(),
         max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
         permissions: AgentPermissions::default(),
     };
     database
@@ -1534,6 +1535,7 @@ fn test_agent_definition_input() -> AgentDefinitionInput {
         system_prompt: "Coordinate the team.".to_string(),
         allowed_tools: vec![READ_FILE_TOOL.to_string()],
         max_instances: 2,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
         permissions: AgentPermissions::default(),
     }
 }
@@ -1720,6 +1722,7 @@ fn agent_definition_tool_validation_rejects_unknown_ids() {
         system_prompt: "Test.".to_string(),
         allowed_tools: vec!["missing_tool".to_string()],
         max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
         permissions: AgentPermissions::default(),
     };
     let error = validate_agent_definition_tool_references(None, &[definition], &HashSet::new())
@@ -3948,6 +3951,7 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
             system_prompt: "Be precise.".to_string(),
             allowed_tools: Vec::new(),
             max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
             permissions: AgentPermissions::default(),
         };
         database
@@ -4066,6 +4070,7 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
         system_prompt: "Coordinate.".to_string(),
         allowed_tools: Vec::new(),
         max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
         permissions: AgentPermissions::default(),
     });
     let workspace_id = config.workspaces[0].id.clone();
@@ -4204,6 +4209,7 @@ async fn team_chat_task_sse_returns_while_coordinator_task_is_still_queued() {
             system_prompt: "Coordinate.".to_string(),
             allowed_tools: Vec::new(),
             max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
             permissions: AgentPermissions::default(),
         };
         database
@@ -4380,6 +4386,7 @@ async fn queue_chat_message_resumes_paused_coordinator_without_active_work() {
             system_prompt: "Continue chats.".to_string(),
             allowed_tools: Vec::new(),
             max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
             permissions: AgentPermissions::default(),
         };
         database
@@ -4555,6 +4562,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
             system_prompt: "Be precise.".to_string(),
             allowed_tools: Vec::new(),
             max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
             permissions: AgentPermissions::default(),
         };
         database
@@ -8398,6 +8406,7 @@ async fn prepare_prompt_context_allocates_after_hidden_worker_messages() {
             system_prompt: "Coordinate.".to_string(),
             allowed_tools: Vec::new(),
             max_instances: 2,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
             permissions: AgentPermissions::default(),
         };
         database
