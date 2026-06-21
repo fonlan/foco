@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "katex/dist/katex.min.css";
 
 :root {
   color: var(--foco-text, #172033);
@@ -453,6 +454,20 @@ summary:focus-visible {
   max-width: 100%;
   overflow-x: auto;
   border-collapse: collapse;
+}
+
+.markdown-content img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0.55rem 0;
+  border-radius: 0.5rem;
+}
+
+.markdown-content .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.2rem 0;
 }
 
 .markdown-content th,
@@ -1674,6 +1689,34 @@ body,
   min-height: 0;
   width: 100%;
   flex: 1 1 auto;
+}
+
+.workspace-file-monaco-hidden {
+  display: none;
+}
+
+.workspace-file-markdown-preview {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 1.25rem 1.5rem;
+}
+
+.workspace-file-markdown-preview .markdown-content {
+  max-width: 56rem;
+}
+
+.workspace-file-markdown-preview .markdown-content h1 {
+  font-size: 1.45rem;
+}
+
+.workspace-file-markdown-preview .markdown-content h2 {
+  font-size: 1.2rem;
+}
+
+.workspace-file-markdown-preview .markdown-content h3,
+.workspace-file-markdown-preview .markdown-content h4 {
+  font-size: 1.02rem;
 }
 
 .workspace-file-editor .monaco-editor,

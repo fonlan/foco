@@ -1162,6 +1162,15 @@ export const workspaceFilesResponse = {
   root: {
     children: [
       {
+        children: [],
+        childrenLoaded: true,
+        hasChildren: false,
+        kind: "file",
+        name: "README.md",
+        path: "README.md",
+        sizeBytes: 512,
+      },
+      {
         children: [
           {
             children: [],
@@ -1207,6 +1216,23 @@ export const workspaceFilesResponse = {
     sizeBytes: 0,
   },
 };
+
+export const markdownFileContent = [
+  "# Preview title",
+  "",
+  "![Remote asset](https://example.com/asset.png)",
+  "",
+  "![Inline asset](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=)",
+  "",
+  "Inline math $E=mc^2$.",
+  "",
+  "$$\\int_0^1 x^2 dx$$",
+  "",
+  "```mermaid",
+  "flowchart TD",
+  "  A --> B",
+  "```",
+].join("\n");
 
 export const importedHooks = {
   config: { disableAllHooks: false },
@@ -1399,6 +1425,32 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     }
 
     return jsonResponse({ children: [], path: childPath ?? "" });
+  }
+
+  if (path === "/api/workspaces/workspace-1/files/content") {
+    const body =
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as { path?: string })
+        : {};
+    const filePath = body.path ?? "";
+    return jsonResponse({
+      content:
+        filePath === "README.md"
+          ? markdownFileContent
+          : `// ${filePath || "untitled"}`,
+      path: filePath,
+    });
+  }
+
+  if (path === "/api/workspaces/workspace-1/files/save") {
+    const body =
+      typeof init?.body === "string"
+        ? (JSON.parse(init.body) as { content?: string; path?: string })
+        : {};
+    return jsonResponse({
+      content: body.content ?? "",
+      path: body.path ?? "",
+    });
   }
 
   if (path === "/api/native/install-ripgrep") {

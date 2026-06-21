@@ -7,9 +7,11 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import ReactMarkdown from "react-markdown";
-import type { Components } from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
+import type { Components, UrlTransform } from "react-markdown";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 
 import { useI18n } from "../../shared/i18n";
 
@@ -60,6 +62,9 @@ const MERMAID_CONFIG: Record<string, unknown> = {
 let mermaidRuntimePromise: Promise<MermaidRuntime> | null = null;
 
 const MARKDOWN_COMPONENTS: Components = {
+  img({ alt, ...props }) {
+    return <img alt={alt ?? ""} loading="lazy" {...props} />;
+  },
   pre({ children, node: _node, ...props }) {
     const mermaidDefinition = mermaidDefinitionFromPreChildren(children);
     if (mermaidDefinition !== null) {
@@ -111,7 +116,12 @@ export function MarkdownContent({
         </div>
       ) : null}
       {markdownContent ? (
-        <ReactMarkdown components={MARKDOWN_COMPONENTS} remarkPlugins={[remarkGfm]}>
+        <ReactMarkdown
+          components={MARKDOWN_COMPONENTS}
+          rehypePlugins={[rehypeKatex]}
+          remarkPlugins={[remarkGfm, remarkMath]}
+          urlTransform={markdownUrlTransform}
+        >
           {markdownContent}
         </ReactMarkdown>
       ) : null}
@@ -198,6 +208,20 @@ async function loadMermaidRuntime() {
   });
 
   return mermaidRuntimePromise;
+}
+
+const markdownUrlTransform: UrlTransform = (url, key, node) => {
+  if (key === "src" && node.tagName === "img" && safeBase64ImageUrl(url)) {
+    return url;
+  }
+
+  return defaultUrlTransform(url);
+};
+
+function safeBase64ImageUrl(url: string) {
+  return /^data:image\/(?:avif|bmp|gif|jpe?g|png|webp);base64,[a-z0-9+/=\s]+$/i.test(
+    url,
+  );
 }
 
 function mermaidDefinitionFromPreChildren(children: ReactNode) {

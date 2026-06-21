@@ -294,6 +294,7 @@ import { WorkspaceDialog } from "./features/workspaces/WorkspaceDialog";
 import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
+import { MarkdownContent } from "./features/chat/MarkdownContent";
 import { AgentsRuntimePanel } from "./features/agents/AgentsRuntimePanel";
 import { AgentTranscriptPanel } from "./features/agents/AgentTranscriptPanel";
 import { AgentsSettingsPanel } from "./features/agents/AgentsSettingsPanel";
@@ -9277,6 +9278,7 @@ function WorkspaceFileEditorPanel({
 }) {
   const { t } = useI18n();
   const language = monacoLanguageForPath(file.path);
+  const isMarkdown = isMarkdownFilePath(file.path);
   const editorPath = `${file.workspaceId}/${file.path}`;
   const handleChange = useCallback(
     (content: string) => onChangeContent(file.workspaceId, file.path, content),
@@ -9298,6 +9300,7 @@ function WorkspaceFileEditorPanel({
         <MonacoFileEditor
           canSave={!editor?.isLoading && !editor?.isSaving}
           isDirty={editor?.isDirty ?? false}
+          isMarkdown={isMarkdown}
           isSaving={editor?.isSaving ?? false}
           language={language}
           onChange={handleChange}
@@ -9323,6 +9326,7 @@ type MonacoFileEditorCommand =
 function MonacoFileEditor({
   canSave,
   isDirty,
+  isMarkdown,
   isSaving,
   language,
   onChange,
@@ -9332,6 +9336,7 @@ function MonacoFileEditor({
 }: {
   canSave: boolean;
   isDirty: boolean;
+  isMarkdown: boolean;
   isSaving: boolean;
   language: string;
   onChange: (value: string) => void;
@@ -9345,11 +9350,22 @@ function MonacoFileEditor({
   const modelRef = useRef<Monaco.editor.ITextModel | null>(null);
   const ignoreModelChangeRef = useRef(false);
   const valueRef = useRef(value);
+  const [previewEnabled, setPreviewEnabled] = useState(false);
   const [wordWrapEnabled, setWordWrapEnabled] = useState(false);
 
   useEffect(() => {
     valueRef.current = value;
   }, [value]);
+
+  useEffect(() => {
+    setPreviewEnabled(false);
+  }, [path]);
+
+  useEffect(() => {
+    if (!previewEnabled) {
+      window.setTimeout(() => editorRef.current?.layout(), 0);
+    }
+  }, [previewEnabled]);
 
   const focusEditor = useCallback(() => {
     editorRef.current?.focus();
@@ -9357,16 +9373,16 @@ function MonacoFileEditor({
 
   const runEditorCommand = useCallback(
     (command: MonacoFileEditorCommand) => {
-      const editor = editorRef.current;
-      if (!editor) {
+      if (command === "save") {
+        if (canSave) {
+          onSave(editorRef.current?.getValue() ?? valueRef.current);
+        }
+        editorRef.current?.focus();
         return;
       }
 
-      if (command === "save") {
-        if (canSave) {
-          onSave(editor.getValue());
-        }
-        editor.focus();
+      const editor = editorRef.current;
+      if (!editor) {
         return;
       }
 
@@ -9474,49 +9490,77 @@ function MonacoFileEditor({
         />
         <span className="workspace-file-editor-toolbar-separator" />
         <EditorToolbarButton
+          disabled={previewEnabled}
           icon={Scissors}
           label={t("Cut")}
           onClick={() => runEditorCommand("cut")}
         />
         <EditorToolbarButton
+          disabled={previewEnabled}
           icon={Copy}
           label={t("Copy")}
           onClick={() => runEditorCommand("copy")}
         />
         <EditorToolbarButton
+          disabled={previewEnabled}
           icon={ClipboardPaste}
           label={t("Paste")}
           onClick={() => runEditorCommand("paste")}
         />
         <span className="workspace-file-editor-toolbar-separator" />
         <EditorToolbarButton
+          disabled={previewEnabled}
           icon={Undo2}
           label={t("Undo")}
           onClick={() => runEditorCommand("undo")}
         />
         <EditorToolbarButton
+          disabled={previewEnabled}
           icon={Redo2}
           label={t("Redo")}
           onClick={() => runEditorCommand("redo")}
         />
         <span className="workspace-file-editor-toolbar-separator" />
         <EditorToolbarButton
+          disabled={previewEnabled}
           icon={Search}
           label={t("Find")}
           onClick={() => runEditorCommand("find")}
         />
         <EditorToolbarButton
+          disabled={previewEnabled}
           icon={WrapText}
           isActive={wordWrapEnabled}
           label={t("Word wrap")}
           onClick={() => runEditorCommand("toggleWordWrap")}
         />
+        {isMarkdown ? (
+          <>
+            <span className="workspace-file-editor-toolbar-separator" />
+            <EditorToolbarButton
+              icon={Eye}
+              isActive={previewEnabled}
+              label={previewEnabled ? t("Edit markdown") : t("Preview markdown")}
+              onClick={() => setPreviewEnabled((current) => !current)}
+            />
+          </>
+        ) : null}
       </div>
       <div
-        className="workspace-file-monaco"
+        aria-hidden={previewEnabled || undefined}
+        className={`workspace-file-monaco ${previewEnabled ? "workspace-file-monaco-hidden" : ""}`}
         onMouseDown={focusEditor}
         ref={containerRef}
       />
+      {isMarkdown && previewEnabled ? (
+        <div className="workspace-file-markdown-preview">
+          <MarkdownContent
+            content={value}
+            isUser={false}
+            selectedSkillPrefix={selectedSkillPrefix}
+          />
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -18341,6 +18385,11 @@ function workspaceFileEditorKey(workspaceId: string, path: string) {
   return `${workspaceId}:${path}`;
 }
 
+function isMarkdownFilePath(path: string) {
+  const extension = path.split(".").pop()?.toLowerCase();
+  return extension === "md" || extension === "markdown";
+}
+
 function workspaceRenamedFilePath(path: string, newName: string) {
   const separatorIndex = path.lastIndexOf("/");
   return separatorIndex < 0
@@ -18454,6 +18503,7 @@ function monacoLanguageForPath(path: string) {
     kt: "kotlin",
     less: "less",
     lua: "lua",
+    markdown: "markdown",
     md: "markdown",
     php: "php",
     py: "python",

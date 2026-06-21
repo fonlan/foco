@@ -291,6 +291,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Redo: "恢复",
     Find: "查找",
     "Word wrap": "自动换行",
+    "Preview markdown": "预览 Markdown",
+    "Edit markdown": "编辑 Markdown",
     "Editor toolbar": "编辑器工具栏",
     "Saving...": "正在保存...",
     Copied: "已复制",

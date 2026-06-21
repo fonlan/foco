@@ -663,4 +663,44 @@ describe("app-panels-stats verification surfaces", () => {
     expect(await screen.findByText("index.tsx")).toBeInTheDocument();
   });
 
+  it("toggles markdown file preview from the editor toolbar", async () => {
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+    await userEvent.dblClick(await screen.findByText("README.md"));
+
+    const previewButton = await screen.findByRole("button", {
+      name: "Preview markdown",
+    });
+    expect(previewButton).not.toHaveAttribute("aria-pressed");
+    expect(
+      screen.queryByRole("heading", { name: "Preview title" }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(previewButton);
+
+    expect(
+      await screen.findByRole("heading", { name: "Preview title" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Remote asset" })).toHaveAttribute(
+      "src",
+      "https://example.com/asset.png",
+    );
+    expect(
+      screen.getByRole("img", { name: "Inline asset" }).getAttribute("src"),
+    ).toMatch(/^data:image\/png;base64,/);
+    expect(document.querySelector(".katex")).not.toBeNull();
+    expect(await screen.findByTestId("mermaid-svg")).toBeInTheDocument();
+    expect(mermaidMock.render).toHaveBeenCalledWith(
+      expect.stringMatching(/^foco-mermaid-/),
+      "flowchart TD\n  A --> B",
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit markdown" }));
+    expect(
+      screen.queryByRole("heading", { name: "Preview title" }),
+    ).not.toBeInTheDocument();
+  });
+
 });

@@ -200,7 +200,7 @@ function formatHostForUrl(host: string) {
 function isMarkdownVendorModule(moduleId: string) {
   const normalized = moduleId.replaceAll("\\", "/");
 
-  return /\/node_modules\/(?:react-markdown|remark-(?:gfm|parse|rehype)|rehype-raw|unified|bail|trough|vfile(?:-message)?|unist-util-[^/]+|mdast-util-[^/]+|micromark[^/]*|hast-util-[^/]+|html-url-attributes|property-information|space-separated-tokens|comma-separated-tokens|style-to-js|style-to-object|inline-style-parser|decode-named-character-reference|character-entities|devlop|estree-util-[^/]+|markdown-table|zwitch|trim-lines|ccount|is-plain-obj|fault)\//.test(
+  return /\/node_modules\/(?:react-markdown|remark-(?:gfm|math|parse|rehype)|rehype-(?:katex|raw)|katex|unified|bail|trough|vfile(?:-message)?|unist-util-[^/]+|mdast-util-[^/]+|micromark[^/]*|hast-util-[^/]+|html-url-attributes|property-information|space-separated-tokens|comma-separated-tokens|style-to-js|style-to-object|inline-style-parser|decode-named-character-reference|character-entities|devlop|estree-util-[^/]+|markdown-table|zwitch|trim-lines|ccount|is-plain-obj|fault)\//.test(
     normalized,
   );
 }
