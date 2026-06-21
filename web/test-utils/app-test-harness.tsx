@@ -237,6 +237,7 @@ export const settings = {
       kind: "openai-chat",
       kindLabel: "OpenAI Chat",
       name: "OpenAI",
+      requestOverrides: [],
       warnings: [],
     },
     {
@@ -256,6 +257,7 @@ export const settings = {
       kind: "openai-chat",
       kindLabel: "OpenAI Chat",
       name: "Anthropic",
+      requestOverrides: [],
       warnings: [],
     },
   ],
@@ -667,6 +669,7 @@ export const savedSettings = {
         kind: "openai-chat",
         kindLabel: "OpenAI Chat",
         name: "Test Provider",
+        requestOverrides: [],
         warnings: [],
       },
     ],
@@ -1598,6 +1601,13 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/providers/manual") {
     return jsonResponse(savedSettings.provider);
+  }
+
+  if (path === "/api/providers/models") {
+    return jsonResponse({
+      providerId: "openai",
+      models: ["gpt-4.1", "gpt-4.1-mini"],
+    });
   }
 
   if (path === "/api/models/manual") {

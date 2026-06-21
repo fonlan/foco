@@ -789,6 +789,29 @@ pub(crate) async fn test_provider(
     }))
 }
 
+pub(crate) async fn provider_models(
+    State(state): State<AppState>,
+    Json(request): Json<TestProviderRequest>,
+) -> Result<Json<ProviderModelsResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let provider_id = request.provider_id.trim();
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| ApiError::bad_request(format!("provider was not found: {provider_id}")))?;
+
+    let connection_config = provider_connection_config(provider)?;
+    let models = fetch_provider_model_ids(&connection_config)
+        .await
+        .map_err(ApiError::from_provider_config_error)?;
+
+    Ok(Json(ProviderModelsResponse {
+        provider_id: provider.id.clone(),
+        models,
+    }))
+}
+
 pub(crate) async fn model_metadata(
     State(state): State<AppState>,
 ) -> Result<Json<ModelMetadataResponse>, ApiError> {

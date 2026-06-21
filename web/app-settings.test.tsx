@@ -52,6 +52,13 @@ describe("app-settings verification surfaces", () => {
     const providersSection = screen.getByText("Configured providers").closest("section");
     expect(providersSection).not.toBeNull();
     expect(within(providersSection as HTMLElement).getByText("OpenAI")).toBeInTheDocument();
+    await userEvent.click(
+      within(providersSection as HTMLElement).getByRole("button", {
+        name: "Load provider models for OpenAI",
+      }),
+    );
+    expect(await within(providersSection as HTMLElement).findByText("gpt-4.1")).toBeInTheDocument();
+    expect(within(providersSection as HTMLElement).getByText("gpt-4.1-mini")).toBeInTheDocument();
 
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
     expect(screen.getByText("Model settings")).toBeInTheDocument();
@@ -640,7 +647,23 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
 
     await userEvent.click(screen.getByRole("button", { name: "Providers" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit provider OpenAI" }));
+    const providerApiKeyInput = screen.getByLabelText("API key");
+    await userEvent.type(providerApiKeyInput, "sk-visible");
+    const showApiKeyButton = screen.getByRole("button", { name: "Show API key" });
+    const clearApiKeyButton = screen.getByRole("button", { name: "Clear saved API key" });
+    expect(
+      Boolean(
+        showApiKeyButton.compareDocumentPosition(clearApiKeyButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      ),
+    ).toBe(true);
+    await userEvent.click(showApiKeyButton);
+    expect(providerApiKeyInput).toHaveAttribute("type", "text");
+    await userEvent.click(screen.getByRole("button", { name: "Close provider configuration" }));
+
     await userEvent.click(screen.getByRole("button", { name: "Add provider" }));
+    expect(screen.getByLabelText("Protocol")).toHaveValue("openai-responses");
     await userEvent.type(screen.getByLabelText("Name"), "Test Provider");
     await userEvent.click(screen.getByRole("checkbox", { name: "Enable AI API proxy" }));
     await userEvent.selectOptions(screen.getByLabelText("Proxy type"), "socks");
@@ -662,6 +685,13 @@ describe("app-settings verification surfaces", () => {
         body: expect.stringContaining(
           '"apiProxy":{"enabled":true,"proxyType":"socks","url":"127.0.0.1:7891"}',
         ),
+        method: "POST",
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/providers/manual",
+      expect.objectContaining({
+        body: expect.stringContaining('"kind":"openai-responses"'),
         method: "POST",
       }),
     );

@@ -785,6 +785,10 @@ fn app_router(state: AppState) -> Router {
             post(crate::http::settings::test_provider),
         )
         .route(
+            "/api/providers/models",
+            post(crate::http::settings::provider_models),
+        )
+        .route(
             "/api/model-metadata",
             get(crate::http::settings::model_metadata),
         )
@@ -2352,6 +2356,13 @@ struct ProviderTestResponse {
     ok: bool,
     message: String,
     model_count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderModelsResponse {
+    provider_id: String,
+    models: Vec<String>,
 }
 
 #[derive(Serialize)]

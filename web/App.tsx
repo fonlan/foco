@@ -195,6 +195,7 @@ import type {
   PromptSettingsFormState,
   PromptSettingsSummary,
   ProviderFormState,
+  ProviderModelsResponse,
   ProviderRequestOverrideFormState,
   ProviderRequestOverrideTarget,
   ProviderRequestOverrideValueType,
@@ -307,12 +308,19 @@ import {
 
 type ViewMode = "chat" | "settings" | "stats";
 type ContextPanelTab = "todo" | "files" | "git" | "memory" | "stats" | "agents";
+type ProviderModelListState = {
+  message: string | null;
+  models: string[];
+  status: "error" | "loading" | "ok";
+};
 type WorkspaceChatContextMenuState = {
   chat: WorkspaceChatListItem;
   left: number;
   top: number;
   workspace: WorkspaceSummary;
 };
+
+const OPENAI_RESPONSES_PROVIDER_KIND = "openai-responses";
 
 type OpenFileTab = {
   workspaceId: string;
@@ -10928,8 +10936,15 @@ function SettingsPanel({
   const [providerTests, setProviderTests] = useState<
     Record<string, ProviderTestState>
   >({});
+  const [expandedProviderIds, setExpandedProviderIds] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [providerModelLists, setProviderModelLists] = useState<
+    Record<string, ProviderModelListState>
+  >({});
   const [error, setError] = useState<string | null>(null);
   const [isGeneralPasswordVisible, setIsGeneralPasswordVisible] = useState(false);
+  const [isProviderApiKeyVisible, setIsProviderApiKeyVisible] = useState(false);
   const [isEditingGeneralPassword, setIsEditingGeneralPassword] = useState(false);
 
   const selectedMetadata = useMemo(
@@ -11082,6 +11097,7 @@ function SettingsPanel({
       { label: "SOCKS", proxyType: "socks" },
     ];
   const hasSavedProviderKey = editingProvider?.hasApiKey ?? false;
+  const hasProviderKeyClearButton = hasSavedProviderKey || providerForm.clearApiKey;
   const selectedProviderIds = new Set(form.providerIds);
   const systemPrompts = promptSettingsForm.systemPrompts.length
     ? promptSettingsForm.systemPrompts
@@ -11211,7 +11227,7 @@ function SettingsPanel({
       syncMemorySettingsForm(data);
       setProviderForm((current) => ({
         ...current,
-        kind: current.kind || data.providerKinds[0]?.kind || "openai-responses",
+        kind: current.kind || defaultProviderKind(data.providerKinds),
       }));
       setMcpForm((current) => ({
         ...current,
@@ -11487,14 +11503,16 @@ function SettingsPanel({
             : String(overrideRule.value),
       })),
     });
+    setIsProviderApiKeyVisible(false);
     setIsProviderDialogOpen(true);
   }
 
   function startAddingProvider() {
     setProviderForm({
       ...emptyProviderForm(),
-      kind: providerKinds[0]?.kind || "openai-responses",
+      kind: defaultProviderKind(providerKinds),
     });
+    setIsProviderApiKeyVisible(false);
     setIsProviderDialogOpen(true);
   }
 
@@ -12707,6 +12725,9 @@ function SettingsPanel({
     setError(null);
 
     try {
+      const providerId =
+        providerForm.id ||
+        nextProviderId(providerForm.name, providerForm.kind, providers);
       const data = await requestJson<SettingsResponse>(
         "/api/providers/manual",
         {
@@ -12720,9 +12741,7 @@ function SettingsPanel({
             baseUrl: providerForm.baseUrl || null,
             clearApiKey: providerForm.clearApiKey,
             enabled: providerForm.enabled,
-            id:
-              providerForm.id ||
-              nextProviderId(providerForm.name, providerForm.kind, providers),
+            id: providerId,
             kind: providerForm.kind,
             name: providerForm.name,
             requestOverrides: providerForm.requestOverrides.map((overrideRule) => ({
@@ -12739,11 +12758,22 @@ function SettingsPanel({
       );
       setSettings(data);
       onSettingsChange(data);
+      setExpandedProviderIds((current) => {
+        const next = new Set(current);
+        next.delete(providerId);
+        return next;
+      });
+      setProviderModelLists((current) => {
+        const next = { ...current };
+        delete next[providerId];
+        return next;
+      });
       setProviderForm((current) => ({
         ...current,
         apiKey: "",
         clearApiKey: false,
       }));
+      setIsProviderApiKeyVisible(false);
       setIsProviderDialogOpen(false);
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -12801,10 +12831,21 @@ function SettingsPanel({
       });
       setSettings(data);
       onSettingsChange(data);
+      setExpandedProviderIds((current) => {
+        const next = new Set(current);
+        next.delete(providerId);
+        return next;
+      });
+      setProviderModelLists((current) => {
+        const next = { ...current };
+        delete next[providerId];
+        return next;
+      });
       setProviderForm({
         ...emptyProviderForm(),
-        kind: data.providerKinds[0]?.kind || "openai-responses",
+        kind: defaultProviderKind(data.providerKinds),
       });
+      setIsProviderApiKeyVisible(false);
       setIsProviderDialogOpen(false);
       setForm((current) => ({
         ...current,
@@ -13231,6 +13272,59 @@ function SettingsPanel({
           status: "error",
         },
       }));
+    }
+  }
+
+  async function loadProviderModels(providerId: string) {
+    setProviderModelLists((current) => ({
+      ...current,
+      [providerId]: { message: null, models: [], status: "loading" },
+    }));
+    setError(null);
+
+    try {
+      const data = await requestJson<ProviderModelsResponse>(
+        "/api/providers/models",
+        {
+          body: JSON.stringify({ providerId }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setProviderModelLists((current) => ({
+        ...current,
+        [providerId]: {
+          message: null,
+          models: data.models,
+          status: "ok",
+        },
+      }));
+    } catch (requestError) {
+      setProviderModelLists((current) => ({
+        ...current,
+        [providerId]: {
+          message: errorMessage(requestError),
+          models: [],
+          status: "error",
+        },
+      }));
+    }
+  }
+
+  function toggleProviderModels(providerId: string) {
+    const shouldExpand = !expandedProviderIds.has(providerId);
+    setExpandedProviderIds((current) => {
+      const next = new Set(current);
+      if (next.has(providerId)) {
+        next.delete(providerId);
+      } else {
+        next.add(providerId);
+      }
+      return next;
+    });
+
+    if (shouldExpand && !providerModelLists[providerId]) {
+      void loadProviderModels(providerId);
     }
   }
 
@@ -16670,7 +16764,7 @@ function SettingsPanel({
                               kind: event.target.value,
                             }))
                           }
-                          value={providerForm.kind || providerKinds[0]?.kind || ""}
+                          value={providerForm.kind || defaultProviderKind(providerKinds)}
                         >
                           {providerKinds.map((kind) => (
                             <option key={kind.kind} value={kind.kind}>
@@ -16697,7 +16791,7 @@ function SettingsPanel({
                         <span className="relative block">
                           <input
                             autoComplete="off"
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 pr-11 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className={`h-10 w-full rounded-lg border border-stone-300 bg-white px-3 ${hasProviderKeyClearButton ? "pr-20" : "pr-11"} text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100`}
                             name="api-key"
                             onChange={(event) =>
                               setProviderForm((current) => ({
@@ -16711,10 +16805,33 @@ function SettingsPanel({
                                 ? t("Saved key is kept unless replaced")
                                 : t("API key")
                             }
-                            type="password"
+                            type={isProviderApiKeyVisible ? "text" : "password"}
                             value={providerForm.apiKey}
                           />
-                          {hasSavedProviderKey || providerForm.clearApiKey ? (
+                          <button
+                            aria-label={
+                              isProviderApiKeyVisible
+                                ? t("Hide API key")
+                                : t("Show API key")
+                            }
+                            className={`absolute ${hasProviderKeyClearButton ? "right-10" : "right-1"} top-1 inline-flex size-8 items-center justify-center rounded-md text-stone-500 hover:bg-stone-100 hover:text-stone-900`}
+                            onClick={() =>
+                              setIsProviderApiKeyVisible((current) => !current)
+                            }
+                            title={
+                              isProviderApiKeyVisible
+                                ? t("Hide API key")
+                                : t("Show API key")
+                            }
+                            type="button"
+                          >
+                            {isProviderApiKeyVisible ? (
+                              <EyeOff aria-hidden="true" className="size-4" />
+                            ) : (
+                              <Eye aria-hidden="true" className="size-4" />
+                            )}
+                          </button>
+                          {hasProviderKeyClearButton ? (
                             <button
                               aria-label={t("Clear saved API key")}
                               className={`absolute right-1 top-1 inline-flex size-8 items-center justify-center rounded-md ${providerForm.clearApiKey
@@ -17003,39 +17120,66 @@ function SettingsPanel({
                   {providers.length ? (
                     providers.map((provider) => {
                       const test = providerTests[provider.id];
+                      const modelList = providerModelLists[provider.id];
+                      const isExpanded = expandedProviderIds.has(provider.id);
 
                       return (
                         <div className="px-4 py-3" key={provider.id}>
                           <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-                            <div className="min-w-0">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <span className="truncate text-sm font-medium">
-                                  {provider.name}
-                                </span>
-                                <CapabilityPill
-                                  label={
-                                    provider.enabled ? t("enabled") : t("disabled")
-                                  }
-                                  ok={provider.enabled}
-                                />
-                                <CapabilityPill
-                                  label={
-                                    provider.hasApiKey
-                                      ? t("key saved")
-                                      : t("key missing")
-                                  }
-                                  ok={provider.hasApiKey}
-                                />
-                              </div>
-                              <div className="mt-1 truncate text-xs font-medium text-stone-500">
-                                {provider.id} / {provider.kindLabel}
-                              </div>
-                              {provider.baseUrl ? (
-                                <div className="mt-1 truncate text-xs text-stone-500">
-                                  {provider.baseUrl}
+                            <button
+                              aria-expanded={isExpanded}
+                              aria-label={
+                                isExpanded
+                                  ? t("Hide provider models for {name}", {
+                                    name: provider.name,
+                                  })
+                                  : t("Load provider models for {name}", {
+                                    name: provider.name,
+                                  })
+                              }
+                              className="-mx-2 -my-1 flex min-w-0 items-start gap-2 rounded-lg px-2 py-1 text-left hover:bg-stone-50 focus:outline-none focus:ring-2 focus:ring-teal-100"
+                              onClick={() => toggleProviderModels(provider.id)}
+                              title={
+                                isExpanded
+                                  ? t("Hide provider models")
+                                  : t("Load provider models")
+                              }
+                              type="button"
+                            >
+                              <ChevronDown
+                                aria-hidden="true"
+                                className={`mt-0.5 size-4 shrink-0 text-stone-400 transition ${isExpanded ? "" : "-rotate-90"}`}
+                              />
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className="truncate text-sm font-medium">
+                                    {provider.name}
+                                  </span>
+                                  <CapabilityPill
+                                    label={
+                                      provider.enabled ? t("enabled") : t("disabled")
+                                    }
+                                    ok={provider.enabled}
+                                  />
+                                  <CapabilityPill
+                                    label={
+                                      provider.hasApiKey
+                                        ? t("key saved")
+                                        : t("key missing")
+                                    }
+                                    ok={provider.hasApiKey}
+                                  />
                                 </div>
-                              ) : null}
-                            </div>
+                                <div className="mt-1 truncate text-xs font-medium text-stone-500">
+                                  {provider.id} / {provider.kindLabel}
+                                </div>
+                                {provider.baseUrl ? (
+                                  <div className="mt-1 truncate text-xs text-stone-500">
+                                    {provider.baseUrl}
+                                  </div>
+                                ) : null}
+                              </div>
+                            </button>
                             <div className="flex flex-wrap gap-2">
                               <button
                                 aria-label={t("Edit provider {name}", {
@@ -17069,6 +17213,57 @@ function SettingsPanel({
                               </button>
                             </div>
                           </div>
+                          {isExpanded ? (
+                            <div className="mt-3 rounded-lg border border-stone-200 bg-stone-50/70 px-3 py-3">
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div className="flex min-w-0 items-center gap-2 text-sm font-semibold text-stone-900">
+                                  <ListChecks
+                                    aria-hidden="true"
+                                    className="size-4 shrink-0 text-teal-700"
+                                  />
+                                  <span>{t("Provider models")}</span>
+                                </div>
+                                {modelList?.status === "ok" ? (
+                                  <CapabilityPill
+                                    label={t("models {count}", {
+                                      count: modelList.models.length,
+                                    })}
+                                    ok={modelList.models.length > 0}
+                                  />
+                                ) : null}
+                              </div>
+                              {modelList?.status === "error" ? (
+                                <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                                  {modelList.message}
+                                </div>
+                              ) : modelList?.status === "ok" ? (
+                                modelList.models.length ? (
+                                  <div className="mt-3 max-h-56 overflow-y-auto rounded-md border border-stone-200 bg-white">
+                                    {modelList.models.map((modelId, modelIndex) => (
+                                      <div
+                                        className="border-b border-stone-100 px-3 py-2 font-mono text-xs text-stone-700 last:border-b-0"
+                                        key={`${modelId}-${modelIndex}`}
+                                      >
+                                        {modelId}
+                                      </div>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <div className="mt-3 rounded-md border border-stone-200 bg-white px-3 py-2 text-sm text-stone-500">
+                                    {t("No provider models returned")}
+                                  </div>
+                                )
+                              ) : (
+                                <div className="mt-3 flex items-center gap-2 rounded-md border border-stone-200 bg-white px-3 py-2 text-sm text-stone-500">
+                                  <LoaderCircle
+                                    aria-hidden="true"
+                                    className="size-4 animate-spin"
+                                  />
+                                  {t("Loading provider models...")}
+                                </div>
+                              )}
+                            </div>
+                          ) : null}
                           {test ? (
                             <div
                               className={`mt-3 rounded-lg border px-3 py-2 text-sm ${test.status === "ok"
@@ -19309,6 +19504,14 @@ function memorySourceRecordsToForm(sources: MemorySourceRecord[]): MemorySourceF
 function optionalText(value: string) {
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
+}
+
+function defaultProviderKind(providerKinds: SettingsResponse["providerKinds"]) {
+  return (
+    providerKinds.find((kind) => kind.kind === OPENAI_RESPONSES_PROVIDER_KIND)?.kind ??
+    providerKinds[0]?.kind ??
+    OPENAI_RESPONSES_PROVIDER_KIND
+  );
 }
 
 function nextProviderId(

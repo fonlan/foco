@@ -901,6 +901,11 @@ export type ProviderTestResponse = {
   modelCount: number;
 };
 
+export type ProviderModelsResponse = {
+  providerId: string;
+  models: string[];
+};
+
 export type ProviderTestState = {
   message: string;
   status: "error" | "ok" | "testing";
