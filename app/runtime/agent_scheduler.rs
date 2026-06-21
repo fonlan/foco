@@ -42,6 +42,7 @@ const AGENT_CONTEXT_RECENT_MESSAGE_LIMIT: usize = 8;
 const AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT: usize = 16;
 const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 320;
 const AGENT_MAX_TASK_OUTCOME_BYTES: usize = 64 * 1024;
+const AGENT_WAIT_RESUME_INSTRUCTION: &str = "Foco Agent wait resume: the following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.";
 
 #[derive(Clone)]
 pub(crate) struct AgentScheduler {
@@ -1111,6 +1112,10 @@ fn agent_wait_resume_messages(
         ))
     })?;
     Ok(vec![
+        neutral_agent_message(
+            NeutralChatRole::System,
+            AGENT_WAIT_RESUME_INSTRUCTION.to_string(),
+        ),
         NeutralChatMessage {
             role: NeutralChatRole::Assistant,
             content: String::new(),
@@ -1827,6 +1832,55 @@ mod tests {
             creatable[0]["agentCreateInstancesSchema"]["maxInstancesForDefinition"]["const"],
             json!(3)
         );
+    }
+
+    #[test]
+    fn wait_resume_messages_include_parent_resume_instruction() {
+        let team_id = foco_agent::AgentTeamId::new("agent-team-wait-resume").expect("team id");
+        let waiting_task_id = AgentTaskId::new("agent-task-waiting").expect("waiting task id");
+        let dependency_task_id =
+            AgentTaskId::new("agent-task-dependency").expect("dependency task id");
+        let worker_id =
+            foco_agent::AgentInstanceId::new("agent-instance-worker").expect("worker id");
+        let now = "2026-01-01T00:00:00Z".to_string();
+        let dependencies = vec![foco_store::workspace::AgentTaskDependencyRecord {
+            team_id: team_id.clone(),
+            waiting_task_id: waiting_task_id.clone(),
+            dependency_task_id: dependency_task_id.clone(),
+            wait_mode: foco_agent::AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait".to_string()),
+            deadline_at: None,
+            created_at: now.clone(),
+        }];
+        let dependency_tasks = vec![AgentTaskRecord {
+            id: dependency_task_id,
+            team_id,
+            owner_instance_id: worker_id,
+            origin_instance_id: None,
+            parent_task_id: Some(waiting_task_id),
+            sequence: 0,
+            status: AgentTaskStatus::Completed,
+            input_json: "{}".to_string(),
+            result_json: Some(r#"{"text":"worker result"}"#.to_string()),
+            error_json: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            started_at: Some(now.clone()),
+            completed_at: Some(now),
+        }];
+
+        let messages = agent_wait_resume_messages(&dependencies, &dependency_tasks)
+            .expect("wait resume messages");
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, NeutralChatRole::System);
+        assert_eq!(messages[0].content, AGENT_WAIT_RESUME_INSTRUCTION);
+        assert_eq!(messages[1].role, NeutralChatRole::Assistant);
+        assert_eq!(messages[1].tool_calls.len(), 1);
+        assert_eq!(messages[1].tool_calls[0].call_id, "call-wait");
+        assert_eq!(messages[2].role, NeutralChatRole::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-wait"));
+        assert!(messages[2].content.contains("worker result"));
     }
 
     #[test]
