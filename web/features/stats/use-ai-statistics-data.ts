@@ -8,7 +8,7 @@ import type {
   AiStatsFilterState,
 } from "../../api/types";
 
-const AI_STATS_POLL_INTERVAL_MS = 1000;
+const AI_STATS_POLL_INTERVAL_MS = 5000;
 
 export function emptyAiStatsFilters(): AiStatsFilterState {
   return {
@@ -37,6 +37,7 @@ export function useAiStatisticsData() {
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const selectedRequestRef = useRef<AiRequestAuditSummary | null>(null);
+  const isStatsRequestInFlightRef = useRef(false);
 
   const loadRequestDetail = useCallback(
     async (request: AiRequestAuditSummary, showLoading: boolean) => {
@@ -67,6 +68,11 @@ export function useAiStatisticsData() {
 
   const loadStats = useCallback(
     async (showLoading = true) => {
+      if (isStatsRequestInFlightRef.current) {
+        return;
+      }
+
+      isStatsRequestInFlightRef.current = true;
       if (showLoading) {
         setIsLoading(true);
       }
@@ -78,12 +84,27 @@ export function useAiStatisticsData() {
           `/api/ai-statistics${query ? `?${query}` : ""}`,
         );
         setStats(data);
-        if (selectedRequestRef.current) {
-          void loadRequestDetail(selectedRequestRef.current, false);
+        const selectedRequest = selectedRequestRef.current;
+        if (selectedRequest) {
+          const refreshedRequest =
+            data.requests.find(
+              (request) =>
+                request.id === selectedRequest.id &&
+                request.workspaceId === selectedRequest.workspaceId,
+            ) ?? selectedRequest;
+          selectedRequestRef.current = refreshedRequest;
+          if (
+            selectedRequest.finalState === "running" ||
+            refreshedRequest.finalState === "running" ||
+            refreshedRequest.finalState !== selectedRequest.finalState
+          ) {
+            void loadRequestDetail(refreshedRequest, false);
+          }
         }
       } catch (requestError) {
         setError(errorMessage(requestError));
       } finally {
+        isStatsRequestInFlightRef.current = false;
         if (showLoading) {
           setIsLoading(false);
         }
@@ -205,4 +226,3 @@ function datetimeLocalToRfc3339(value: string) {
 
   return date.toISOString().replace(/\.\d{3}Z$/, "Z");
 }
-

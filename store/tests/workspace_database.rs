@@ -1733,6 +1733,14 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             .expect("audit count"),
         2
     );
+    let empty_summary = database
+        .llm_request_audit_summary(LlmRequestAuditFilters {
+            final_state: Some("missing"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("empty audit summary");
+    assert_eq!(empty_summary.total_requests, 0);
+    assert_eq!(empty_summary.total_tokens, 0);
 
     let second_page_rows = database
         .llm_request_audit_rows(LlmRequestAuditFilters {

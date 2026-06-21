@@ -3180,7 +3180,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
             content: "Before.After.",
             sequence: 0,
             metadata_json: Some(
-                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one.Think two."},{"type":"toolCall","tool_call_id":"tool-1"},{"type":"text","text":"Before.After."}]}"#,
+                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one.Think two."},{"type":"toolCall","tool_call_id":"tool-1"},{"type":"text","text":"Before.After."}],"partsVersion":2,"partsSource":"live_sse"}"#,
             ),
         })
         .expect("assistant insert");

@@ -4193,6 +4193,7 @@ impl PreparedChatContext {
                                 assistant_message_id: self.assistant_message_id.clone(),
                                 delta,
                             };
+                            events.push(captured_event(&event));
                             yield event;
                         }
                         NeutralChatStreamEvent::ReasoningDelta { delta } => {
@@ -4204,6 +4205,7 @@ impl PreparedChatContext {
                                 assistant_message_id: self.assistant_message_id.clone(),
                                 delta,
                             };
+                            events.push(captured_event(&event));
                             yield event;
                         }
                         NeutralChatStreamEvent::ThoughtSignatureDelta { delta: _ } => {
@@ -8200,13 +8202,48 @@ fn ai_statistics_workspaces<'a>(
     Ok(config.workspaces.iter().collect())
 }
 
-fn chat_title_map(database: &WorkspaceDatabase) -> Result<HashMap<String, String>, ApiError> {
-    Ok(database
-        .chats()
+fn chat_title_map_for_audit_rows(
+    database: &WorkspaceDatabase,
+    rows: &[LlmRequestAuditRow],
+) -> Result<HashMap<String, String>, ApiError> {
+    let mut chat_titles = HashMap::new();
+    let mut seen_chat_ids = HashSet::new();
+
+    for chat_id in rows.iter().filter_map(|row| row.chat_id.as_deref()) {
+        if seen_chat_ids.insert(chat_id.to_string()) {
+            insert_chat_title(database, chat_id, &mut chat_titles)?;
+        }
+    }
+
+    Ok(chat_titles)
+}
+
+fn chat_title_map_for_chat_id(
+    database: &WorkspaceDatabase,
+    chat_id: Option<&str>,
+) -> Result<HashMap<String, String>, ApiError> {
+    let mut chat_titles = HashMap::new();
+
+    if let Some(chat_id) = chat_id {
+        insert_chat_title(database, chat_id, &mut chat_titles)?;
+    }
+
+    Ok(chat_titles)
+}
+
+fn insert_chat_title(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    chat_titles: &mut HashMap<String, String>,
+) -> Result<(), ApiError> {
+    if let Some(chat) = database
+        .chat(chat_id)
         .map_err(ApiError::from_workspace_error)?
-        .into_iter()
-        .map(|chat| (chat.id, chat.title))
-        .collect())
+    {
+        chat_titles.insert(chat.id, chat.title);
+    }
+
+    Ok(())
 }
 
 fn merge_llm_request_audit_summary(
@@ -9756,13 +9793,18 @@ fn non_empty_string(value: &str) -> Option<String> {
 
 fn assistant_message_needs_part_materialization(metadata_json: &str) -> Result<bool, ApiError> {
     let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
-    if metadata.get("parts").is_some()
-        && metadata.get("partsVersion").and_then(Value::as_i64) == Some(STORED_CHAT_PARTS_VERSION)
+    if assistant_message_has_current_parts(&metadata)
+        && metadata.get("partsSource").and_then(Value::as_str) == Some("run_events")
     {
         return Ok(false);
     }
 
     Ok(metadata.get("streamingState").and_then(Value::as_str) != Some("streaming"))
+}
+
+fn assistant_message_has_current_parts(metadata: &Value) -> bool {
+    metadata.get("parts").is_some()
+        && metadata.get("partsVersion").and_then(Value::as_i64) == Some(STORED_CHAT_PARTS_VERSION)
 }
 
 fn materialize_missing_assistant_parts(
@@ -9892,14 +9934,17 @@ fn materialize_missing_assistant_parts(
             .map(Vec::as_slice)
             .unwrap_or_default();
         let reasoning = assistant_reasoning_from_metadata(&message.metadata_json)?;
-        let parts = parts_by_message
-            .remove(&message.id)
-            .filter(|parts| !parts.is_empty())
-            .unwrap_or_else(|| {
-                fallback_chat_message_parts(&message.content, reasoning.as_deref(), tool_calls)
-            });
-        let stored_parts = stored_chat_message_parts(parts)?;
         let mut metadata = parse_json_value(&message.metadata_json, "assistant message metadata")?;
+        let has_current_parts = assistant_message_has_current_parts(&metadata);
+        let parts_from_run_events = parts_by_message
+            .remove(&message.id)
+            .filter(|parts| !parts.is_empty());
+        let parts = match parts_from_run_events {
+            Some(parts) => parts,
+            None if has_current_parts => continue,
+            None => fallback_chat_message_parts(&message.content, reasoning.as_deref(), tool_calls),
+        };
+        let stored_parts = stored_chat_message_parts(parts)?;
         let metadata = metadata.as_object_mut().ok_or_else(|| {
             ApiError::internal("assistant message metadata must be a JSON object")
         })?;

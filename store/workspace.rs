@@ -12,7 +12,10 @@ use foco_agent::{
     AgentInstanceStatus, AgentMessageId, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
     AgentTeamId, AgentTeamStatus, TeamWorkload,
 };
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter,
+    types::Value as SqlValue,
+};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
@@ -1511,61 +1514,45 @@ impl WorkspaceDatabase {
     ) -> Result<Vec<LlmRequestAuditRow>, WorkspaceDatabaseError> {
         let limit = filters.limit.unwrap_or(200).max(1);
         let offset = filters.offset.unwrap_or(0).max(0);
+        let mut query = String::from(
+            "SELECT
+                id, workspace_id, chat_id, provider_id, model_id, request_started_at,
+                first_token_at, completed_at, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, cache_ratio,
+                first_token_latency_ms, total_latency_ms, status_code, final_state
+             FROM llm_requests",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+        query.push_str(" ORDER BY request_started_at DESC, id DESC LIMIT ? OFFSET ?");
+        query_params.push(SqlValue::Integer(limit));
+        query_params.push(SqlValue::Integer(offset));
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT
-                    id, workspace_id, chat_id, provider_id, model_id, request_started_at,
-                    first_token_at, completed_at, input_tokens, output_tokens,
-                    cache_read_tokens, cache_write_tokens, cache_ratio,
-                    first_token_latency_ms, total_latency_ms, status_code, final_state
-                 FROM llm_requests
-                 WHERE (?1 IS NULL OR workspace_id = ?1)
-                   AND (?2 IS NULL OR chat_id = ?2)
-                   AND (?3 IS NULL OR provider_id = ?3)
-                   AND (?4 IS NULL OR model_id = ?4)
-                   AND (?5 IS NULL OR final_state = ?5)
-                   AND (?6 IS NULL OR request_started_at >= ?6)
-                   AND (?7 IS NULL OR request_started_at <= ?7)
-                 ORDER BY request_started_at DESC, id DESC
-                 LIMIT ?8 OFFSET ?9",
-            )
+            .prepare(&query)
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
-            .query_map(
-                params![
-                    filters.workspace_id,
-                    filters.chat_id,
-                    filters.provider_id,
-                    filters.model_id,
-                    filters.final_state,
-                    filters.started_after,
-                    filters.started_before,
-                    limit,
-                    offset
-                ],
-                |row| {
-                    Ok(LlmRequestAuditRow {
-                        id: row.get(0)?,
-                        workspace_id: row.get(1)?,
-                        chat_id: row.get(2)?,
-                        provider_id: row.get(3)?,
-                        model_id: row.get(4)?,
-                        request_started_at: row.get(5)?,
-                        first_token_at: row.get(6)?,
-                        completed_at: row.get(7)?,
-                        input_tokens: row.get(8)?,
-                        output_tokens: row.get(9)?,
-                        cache_read_tokens: row.get(10)?,
-                        cache_write_tokens: row.get(11)?,
-                        cache_ratio: row.get(12)?,
-                        first_token_latency_ms: row.get(13)?,
-                        total_latency_ms: row.get(14)?,
-                        status_code: row.get(15)?,
-                        final_state: row.get(16)?,
-                    })
-                },
-            )
+            .query_map(params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditRow {
+                    id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    chat_id: row.get(2)?,
+                    provider_id: row.get(3)?,
+                    model_id: row.get(4)?,
+                    request_started_at: row.get(5)?,
+                    first_token_at: row.get(6)?,
+                    completed_at: row.get(7)?,
+                    input_tokens: row.get(8)?,
+                    output_tokens: row.get(9)?,
+                    cache_read_tokens: row.get(10)?,
+                    cache_write_tokens: row.get(11)?,
+                    cache_ratio: row.get(12)?,
+                    first_token_latency_ms: row.get(13)?,
+                    total_latency_ms: row.get(14)?,
+                    status_code: row.get(15)?,
+                    final_state: row.get(16)?,
+                })
+            })
             .map_err(|source| self.sqlite_error(source))?;
 
         collect_rows(rows, &self.database_path)
@@ -1575,28 +1562,12 @@ impl WorkspaceDatabase {
         &self,
         filters: LlmRequestAuditFilters<'_>,
     ) -> Result<i64, WorkspaceDatabaseError> {
+        let mut query = String::from("SELECT COUNT(*) FROM llm_requests");
+        let mut query_params = Vec::new();
+        append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+
         self.connection
-            .query_row(
-                "SELECT COUNT(*)
-                 FROM llm_requests
-                 WHERE (?1 IS NULL OR workspace_id = ?1)
-                   AND (?2 IS NULL OR chat_id = ?2)
-                   AND (?3 IS NULL OR provider_id = ?3)
-                   AND (?4 IS NULL OR model_id = ?4)
-                   AND (?5 IS NULL OR final_state = ?5)
-                   AND (?6 IS NULL OR request_started_at >= ?6)
-                   AND (?7 IS NULL OR request_started_at <= ?7)",
-                params![
-                    filters.workspace_id,
-                    filters.chat_id,
-                    filters.provider_id,
-                    filters.model_id,
-                    filters.final_state,
-                    filters.started_after,
-                    filters.started_before,
-                ],
-                |row| row.get(0),
-            )
+            .query_row(&query, params_from_iter(query_params), |row| row.get(0))
             .map_err(|source| self.sqlite_error(source))
     }
 
@@ -1604,49 +1575,36 @@ impl WorkspaceDatabase {
         &self,
         filters: LlmRequestAuditFilters<'_>,
     ) -> Result<LlmRequestAuditSummaryRow, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT
+                COUNT(*),
+                COUNT(CASE WHEN final_state NOT IN ('succeeded', 'completed') THEN 1 END),
+                COALESCE(SUM(COALESCE(input_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(output_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0),
+                COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+                COUNT(total_latency_ms),
+                COALESCE(SUM(COALESCE(total_latency_ms, 0)), 0)
+             FROM llm_requests",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+
         self.connection
-            .query_row(
-                "SELECT
-                    COUNT(*),
-                    COUNT(CASE WHEN final_state NOT IN ('succeeded', 'completed') THEN 1 END),
-                    SUM(COALESCE(input_tokens, 0)),
-                    SUM(COALESCE(output_tokens, 0)),
-                    SUM(COALESCE(cache_read_tokens, 0)),
-                    SUM(COALESCE(cache_write_tokens, 0)),
-                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)),
-                    COUNT(total_latency_ms),
-                    SUM(COALESCE(total_latency_ms, 0))
-                 FROM llm_requests
-                 WHERE (?1 IS NULL OR workspace_id = ?1)
-                   AND (?2 IS NULL OR chat_id = ?2)
-                   AND (?3 IS NULL OR provider_id = ?3)
-                   AND (?4 IS NULL OR model_id = ?4)
-                   AND (?5 IS NULL OR final_state = ?5)
-                   AND (?6 IS NULL OR request_started_at >= ?6)
-                   AND (?7 IS NULL OR request_started_at <= ?7)",
-                params![
-                    filters.workspace_id,
-                    filters.chat_id,
-                    filters.provider_id,
-                    filters.model_id,
-                    filters.final_state,
-                    filters.started_after,
-                    filters.started_before,
-                ],
-                |row| {
-                    Ok(LlmRequestAuditSummaryRow {
-                        total_requests: row.get(0)?,
-                        failed_requests: row.get(1)?,
-                        total_input_tokens: row.get(2)?,
-                        total_output_tokens: row.get(3)?,
-                        total_cache_read_tokens: row.get(4)?,
-                        total_cache_write_tokens: row.get(5)?,
-                        total_tokens: row.get(6)?,
-                        latency_count: row.get(7)?,
-                        latency_sum: row.get(8)?,
-                    })
-                },
-            )
+            .query_row(&query, params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditSummaryRow {
+                    total_requests: row.get(0)?,
+                    failed_requests: row.get(1)?,
+                    total_input_tokens: row.get(2)?,
+                    total_output_tokens: row.get(3)?,
+                    total_cache_read_tokens: row.get(4)?,
+                    total_cache_write_tokens: row.get(5)?,
+                    total_tokens: row.get(6)?,
+                    latency_count: row.get(7)?,
+                    latency_sum: row.get(8)?,
+                })
+            })
             .map_err(|source| self.sqlite_error(source))
     }
 
@@ -1654,44 +1612,28 @@ impl WorkspaceDatabase {
         &self,
         filters: LlmRequestAuditFilters<'_>,
     ) -> Result<Vec<LlmRequestAuditTrendPoint>, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT
+                SUBSTR(request_started_at, 1, 10) AS bucket,
+                COUNT(*),
+                SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
+             FROM llm_requests",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+        query.push_str(" GROUP BY bucket ORDER BY bucket DESC");
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT
-                    SUBSTR(request_started_at, 1, 10) AS bucket,
-                    COUNT(*),
-                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
-                 FROM llm_requests
-                 WHERE (?1 IS NULL OR workspace_id = ?1)
-                   AND (?2 IS NULL OR chat_id = ?2)
-                   AND (?3 IS NULL OR provider_id = ?3)
-                   AND (?4 IS NULL OR model_id = ?4)
-                   AND (?5 IS NULL OR final_state = ?5)
-                   AND (?6 IS NULL OR request_started_at >= ?6)
-                   AND (?7 IS NULL OR request_started_at <= ?7)
-                 GROUP BY bucket
-                 ORDER BY bucket DESC",
-            )
+            .prepare(&query)
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
-            .query_map(
-                params![
-                    filters.workspace_id,
-                    filters.chat_id,
-                    filters.provider_id,
-                    filters.model_id,
-                    filters.final_state,
-                    filters.started_after,
-                    filters.started_before,
-                ],
-                |row| {
-                    Ok(LlmRequestAuditTrendPoint {
-                        bucket: row.get(0)?,
-                        request_count: row.get(1)?,
-                        total_tokens: row.get(2)?,
-                    })
-                },
-            )
+            .query_map(params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditTrendPoint {
+                    bucket: row.get(0)?,
+                    request_count: row.get(1)?,
+                    total_tokens: row.get(2)?,
+                })
+            })
             .map_err(|source| self.sqlite_error(source))?;
 
         collect_rows(rows, &self.database_path)
@@ -1701,43 +1643,28 @@ impl WorkspaceDatabase {
         &self,
         filters: LlmRequestAuditFilters<'_>,
     ) -> Result<Vec<LlmRequestAuditModelBreakdown>, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT
+                model_id,
+                COUNT(*),
+                SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
+             FROM llm_requests",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+        query.push_str(" GROUP BY model_id");
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT
-                    model_id,
-                    COUNT(*),
-                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
-                 FROM llm_requests
-                 WHERE (?1 IS NULL OR workspace_id = ?1)
-                   AND (?2 IS NULL OR chat_id = ?2)
-                   AND (?3 IS NULL OR provider_id = ?3)
-                   AND (?4 IS NULL OR model_id = ?4)
-                   AND (?5 IS NULL OR final_state = ?5)
-                   AND (?6 IS NULL OR request_started_at >= ?6)
-                   AND (?7 IS NULL OR request_started_at <= ?7)
-                 GROUP BY model_id",
-            )
+            .prepare(&query)
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
-            .query_map(
-                params![
-                    filters.workspace_id,
-                    filters.chat_id,
-                    filters.provider_id,
-                    filters.model_id,
-                    filters.final_state,
-                    filters.started_after,
-                    filters.started_before,
-                ],
-                |row| {
-                    Ok(LlmRequestAuditModelBreakdown {
-                        model_id: row.get(0)?,
-                        request_count: row.get(1)?,
-                        total_tokens: row.get(2)?,
-                    })
-                },
-            )
+            .query_map(params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditModelBreakdown {
+                    model_id: row.get(0)?,
+                    request_count: row.get(1)?,
+                    total_tokens: row.get(2)?,
+                })
+            })
             .map_err(|source| self.sqlite_error(source))?;
 
         collect_rows(rows, &self.database_path)
@@ -1747,49 +1674,34 @@ impl WorkspaceDatabase {
         &self,
         filters: LlmRequestAuditFilters<'_>,
     ) -> Result<Vec<LlmRequestAuditProviderBreakdown>, WorkspaceDatabaseError> {
+        let mut query = String::from(
+            "SELECT
+                provider_id,
+                COUNT(*),
+                COUNT(CASE WHEN final_state IN ('succeeded', 'completed') THEN 1 END),
+                SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)),
+                COUNT(total_latency_ms),
+                SUM(COALESCE(total_latency_ms, 0))
+             FROM llm_requests",
+        );
+        let mut query_params = Vec::new();
+        append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
+        query.push_str(" GROUP BY provider_id");
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT
-                    provider_id,
-                    COUNT(*),
-                    COUNT(CASE WHEN final_state IN ('succeeded', 'completed') THEN 1 END),
-                    SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)),
-                    COUNT(total_latency_ms),
-                    SUM(COALESCE(total_latency_ms, 0))
-                 FROM llm_requests
-                 WHERE (?1 IS NULL OR workspace_id = ?1)
-                   AND (?2 IS NULL OR chat_id = ?2)
-                   AND (?3 IS NULL OR provider_id = ?3)
-                   AND (?4 IS NULL OR model_id = ?4)
-                   AND (?5 IS NULL OR final_state = ?5)
-                   AND (?6 IS NULL OR request_started_at >= ?6)
-                   AND (?7 IS NULL OR request_started_at <= ?7)
-                 GROUP BY provider_id",
-            )
+            .prepare(&query)
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
-            .query_map(
-                params![
-                    filters.workspace_id,
-                    filters.chat_id,
-                    filters.provider_id,
-                    filters.model_id,
-                    filters.final_state,
-                    filters.started_after,
-                    filters.started_before,
-                ],
-                |row| {
-                    Ok(LlmRequestAuditProviderBreakdown {
-                        provider_id: row.get(0)?,
-                        request_count: row.get(1)?,
-                        success_count: row.get(2)?,
-                        total_tokens: row.get(3)?,
-                        latency_count: row.get(4)?,
-                        latency_sum: row.get(5)?,
-                    })
-                },
-            )
+            .query_map(params_from_iter(query_params), |row| {
+                Ok(LlmRequestAuditProviderBreakdown {
+                    provider_id: row.get(0)?,
+                    request_count: row.get(1)?,
+                    success_count: row.get(2)?,
+                    total_tokens: row.get(3)?,
+                    latency_count: row.get(4)?,
+                    latency_sum: row.get(5)?,
+                })
+            })
             .map_err(|source| self.sqlite_error(source))?;
 
         collect_rows(rows, &self.database_path)
@@ -6287,6 +6199,42 @@ const TODO_GRAPH_STATUSES: &[&str] = &[
     "failed",
     "cancelled",
 ];
+
+fn append_llm_request_audit_where_clause(
+    query: &mut String,
+    query_params: &mut Vec<SqlValue>,
+    filters: LlmRequestAuditFilters<'_>,
+) {
+    let mut has_where = false;
+    let mut push_condition = |condition: &str, value: &str| {
+        query.push_str(if has_where { " AND " } else { " WHERE " });
+        query.push_str(condition);
+        query_params.push(SqlValue::Text(value.to_string()));
+        has_where = true;
+    };
+
+    if let Some(value) = filters.workspace_id {
+        push_condition("workspace_id = ?", value);
+    }
+    if let Some(value) = filters.chat_id {
+        push_condition("chat_id = ?", value);
+    }
+    if let Some(value) = filters.provider_id {
+        push_condition("provider_id = ?", value);
+    }
+    if let Some(value) = filters.model_id {
+        push_condition("model_id = ?", value);
+    }
+    if let Some(value) = filters.final_state {
+        push_condition("final_state = ?", value);
+    }
+    if let Some(value) = filters.started_after {
+        push_condition("request_started_at >= ?", value);
+    }
+    if let Some(value) = filters.started_before {
+        push_condition("request_started_at <= ?", value);
+    }
+}
 
 fn sqlite_error(database_path: &Path, source: rusqlite::Error) -> WorkspaceDatabaseError {
     WorkspaceDatabaseError::Sqlite {

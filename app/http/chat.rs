@@ -566,18 +566,6 @@ pub(crate) async fn ai_statistics(
             elapsed_ms = database_started_at.elapsed().as_millis() as u64,
             "AI statistics workspace database opened"
         );
-        let chat_titles_started_at = Instant::now();
-        tracing::info!(
-            workspace_id = %workspace.id,
-            "AI statistics chat title query started"
-        );
-        let chat_titles = chat_title_map(&database)?;
-        tracing::info!(
-            workspace_id = %workspace.id,
-            chat_count = chat_titles.len(),
-            elapsed_ms = chat_titles_started_at.elapsed().as_millis() as u64,
-            "AI statistics chat title query completed"
-        );
         let audit_filters = LlmRequestAuditFilters {
             workspace_id: None,
             chat_id: filters.chat_id.as_deref(),
@@ -590,35 +578,23 @@ pub(crate) async fn ai_statistics(
             offset: Some(0),
         };
 
-        let count_started_at = Instant::now();
+        let summary_started_at = Instant::now();
         tracing::info!(
             workspace_id = %workspace.id,
-            "AI statistics audit count query started"
+            "AI statistics summary query started"
         );
-        let workspace_request_count = database
-            .llm_request_audit_count(audit_filters)
+        let workspace_summary = database
+            .llm_request_audit_summary(audit_filters)
             .map_err(ApiError::from_workspace_error)?;
         tracing::info!(
             workspace_id = %workspace.id,
-            request_count = workspace_request_count,
-            elapsed_ms = count_started_at.elapsed().as_millis() as u64,
-            "AI statistics audit count query completed"
+            request_count = workspace_summary.total_requests,
+            elapsed_ms = summary_started_at.elapsed().as_millis() as u64,
+            "AI statistics summary query completed"
         );
+        let workspace_request_count = workspace_summary.total_requests;
         total_count += workspace_request_count;
         if workspace_request_count > 0 {
-            let summary_started_at = Instant::now();
-            tracing::info!(
-                workspace_id = %workspace.id,
-                "AI statistics summary query started"
-            );
-            let workspace_summary = database
-                .llm_request_audit_summary(audit_filters)
-                .map_err(ApiError::from_workspace_error)?;
-            tracing::info!(
-                workspace_id = %workspace.id,
-                elapsed_ms = summary_started_at.elapsed().as_millis() as u64,
-                "AI statistics summary query completed"
-            );
             merge_llm_request_audit_summary(&mut merged_summary, &workspace_summary);
             let trend_started_at = Instant::now();
             tracing::info!(
@@ -692,27 +668,39 @@ pub(crate) async fn ai_statistics(
                     })
                     .or_insert(row);
             }
-        }
-        let rows_started_at = Instant::now();
-        tracing::info!(
-            workspace_id = %workspace.id,
-            limit = page_limit,
-            "AI statistics rows query started"
-        );
-        let rows = database
-            .llm_request_audit_rows(audit_filters)
-            .map_err(ApiError::from_workspace_error)?;
-        tracing::info!(
-            workspace_id = %workspace.id,
-            row_count = rows.len(),
-            elapsed_ms = rows_started_at.elapsed().as_millis() as u64,
-            "AI statistics rows query completed"
-        );
+            let rows_started_at = Instant::now();
+            tracing::info!(
+                workspace_id = %workspace.id,
+                limit = page_limit,
+                "AI statistics rows query started"
+            );
+            let rows = database
+                .llm_request_audit_rows(audit_filters)
+                .map_err(ApiError::from_workspace_error)?;
+            tracing::info!(
+                workspace_id = %workspace.id,
+                row_count = rows.len(),
+                elapsed_ms = rows_started_at.elapsed().as_millis() as u64,
+                "AI statistics rows query completed"
+            );
+            let chat_titles_started_at = Instant::now();
+            tracing::info!(
+                workspace_id = %workspace.id,
+                "AI statistics chat title query started"
+            );
+            let chat_titles = chat_title_map_for_audit_rows(&database, &rows)?;
+            tracing::info!(
+                workspace_id = %workspace.id,
+                chat_count = chat_titles.len(),
+                elapsed_ms = chat_titles_started_at.elapsed().as_millis() as u64,
+                "AI statistics chat title query completed"
+            );
 
-        requests.extend(
-            rows.into_iter()
-                .map(|row| ai_request_audit_summary(row, workspace, &chat_titles)),
-        );
+            requests.extend(
+                rows.into_iter()
+                    .map(|row| ai_request_audit_summary(row, workspace, &chat_titles)),
+            );
+        }
         tracing::info!(
             workspace_id = %workspace.id,
             elapsed_ms = workspace_started_at.elapsed().as_millis() as u64,
@@ -785,11 +773,11 @@ pub(crate) async fn ai_statistics_detail(
 
     let database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
-    let chat_titles = chat_title_map(&database)?;
     let request = database
         .llm_request(request_id)
         .map_err(ApiError::from_workspace_error)?
         .ok_or_else(|| ApiError::bad_request(format!("LLM request was not found: {request_id}")))?;
+    let chat_titles = chat_title_map_for_chat_id(&database, request.chat_id.as_deref())?;
     let events = database
         .llm_request_events(request_id)
         .map_err(ApiError::from_workspace_error)?
