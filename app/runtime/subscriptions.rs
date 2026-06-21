@@ -122,8 +122,14 @@ impl ActiveChatRunRegistry {
         assistant_sequence: i64,
         memories_used: Vec<ChatMemoryUsedSummary>,
         primary_chat_output: bool,
+        next_sequence: i64,
         guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
     ) -> Result<ActiveChatRunRegistration, ApiError> {
+        if next_sequence < 0 {
+            return Err(ApiError::internal(
+                "active chat run sequence must be non-negative",
+            ));
+        }
         let mut runs = self
             .runs
             .lock()
@@ -165,7 +171,7 @@ impl ActiveChatRunRegistry {
             events,
             event_tx,
             completed_tx,
-            next_sequence: 0,
+            next_sequence,
             assistant_draft: StreamingAssistantDraft::default(),
             completed: false,
         })
@@ -577,6 +583,28 @@ impl ActiveChatRunRegistration {
         self.completed = true;
         let _ = self.completed_tx.send(true);
         self.registry.unregister(&self.run_id);
+    }
+
+    pub(crate) fn finish_suspended(
+        &mut self,
+        workspace_path: &Path,
+        chat_id: &str,
+    ) -> Result<(), ApiError> {
+        let result = if self.primary_chat_output
+            && self.assistant_draft.status == StreamingAssistantStatus::Streaming
+        {
+            self.assistant_draft.status = StreamingAssistantStatus::Pending;
+            match WorkspaceDatabase::open_or_create(workspace_path)
+                .map_err(ApiError::from_workspace_error)
+            {
+                Ok(mut database) => self.persist_assistant_draft(&mut database, chat_id),
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        };
+        self.finish();
+        result
     }
 }
 

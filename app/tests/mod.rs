@@ -3,7 +3,9 @@ use std::collections::BTreeSet;
 
 use axum::{
     Json,
+    body::to_bytes,
     extract::{Path as AxumPath, State},
+    response::IntoResponse,
 };
 use foco_agent::{
     ToolResource, ToolResourceAccess, ToolResourceLock, context_compression_trigger_tokens,
@@ -51,6 +53,76 @@ fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> Neutra
         arguments,
         thought_signatures: None,
     }
+}
+
+fn insert_waiting_coordinator_task(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    user_message_id: &str,
+    suffix: &str,
+) -> foco_agent::AgentTaskId {
+    let team_id = foco_agent::AgentTeamId::new(format!("agent-team-{suffix}")).expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new(format!("agent-instance-{suffix}")).expect("instance id");
+    let task_id = foco_agent::AgentTaskId::new(format!("agent-task-{suffix}")).expect("task id");
+    let attempt_id =
+        foco_agent::AgentAttemptId::new(format!("agent-attempt-{suffix}")).expect("attempt id");
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new(format!("agent-definition-{suffix}")).expect("definition id"),
+        revision: 1,
+        name: "Waiting coordinator".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Coordinate.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        permissions: AgentPermissions::default(),
+    };
+    database
+        .create_agent_team(foco_store::workspace::NewAgentTeam {
+            id: &team_id,
+            chat_id,
+            coordinator_instance_id: &instance_id,
+            coordinator_definition: &definition,
+            max_concurrent_runs: 1,
+        })
+        .expect("team create");
+    let input_json = serde_json::to_string(&json!({
+        "queuedUserMessageId": user_message_id,
+        "message": "Wait for child task.",
+        "attachments": [],
+        "skillIds": [],
+        "collaborationToolsEnabled": true,
+    }))
+    .expect("task input json");
+    database
+        .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: &input_json,
+        })
+        .expect("enqueue waiting task");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .expect("claim waiting task")
+        .expect("waiting task claimed");
+    database
+        .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: foco_agent::AgentTaskStatus::Running,
+            transition: foco_agent::AgentTaskTransition::Wait,
+            result_json: Some(r#"{"control":{"kind":"agent_wait_tasks"}}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("suspend waiting task");
+    task_id
 }
 
 struct FixtureAgentRunTask {
@@ -2606,6 +2678,7 @@ fn active_chat_run_registry_accepts_matching_guidance() {
             1,
             Vec::new(),
             true,
+            0,
             guidance_tx,
         )
         .expect("register active run");
@@ -2660,6 +2733,7 @@ fn active_chat_run_record_event_persists_streaming_assistant_message() {
             1,
             Vec::new(),
             true,
+            0,
             guidance_tx,
         )
         .expect("register active run");
@@ -2716,6 +2790,79 @@ fn active_chat_run_record_event_persists_streaming_assistant_message() {
 }
 
 #[test]
+fn active_chat_run_finish_suspended_clears_streaming_assistant_state() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-suspended-assistant-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Suspended chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-1",
+            chat_id: "chat-1",
+            role: "user",
+            content: "Delegate this.",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("user message insert");
+    drop(database);
+
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active run");
+
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::TextDelta {
+                assistant_message_id: "assistant-1".to_string(),
+                delta: "Waiting on worker.".to_string(),
+            },
+        )
+        .expect("text delta record");
+    registration
+        .finish_suspended(&workspace_dir, "chat-1")
+        .expect("finish suspended run");
+
+    let database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database reopen");
+    let assistant = database
+        .message("assistant-1")
+        .expect("assistant read")
+        .expect("assistant message");
+    let metadata = parse_json_value(&assistant.metadata_json, "assistant metadata")
+        .expect("assistant metadata json");
+
+    assert_eq!(assistant.content, "Waiting on worker.");
+    assert!(metadata.get("streamingState").is_none());
+    assert!(
+        registry
+            .active_run_for_chat("workspace-1", "chat-1")
+            .expect("active run lookup")
+            .is_none()
+    );
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn active_chat_run_private_output_records_events_without_main_chat_draft() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-private-agent-stream-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -2737,6 +2884,7 @@ fn active_chat_run_private_output_records_events_without_main_chat_draft() {
             1,
             Vec::new(),
             false,
+            0,
             guidance_tx,
         )
         .expect("register private active run");
@@ -2835,6 +2983,7 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
             1,
             Vec::new(),
             true,
+            0,
             guidance_tx,
         )
         .expect("register active run");
@@ -2971,6 +3120,8 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: Some(task_run_id.to_string()),
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -2995,6 +3146,7 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
             context.assistant_sequence,
             Vec::new(),
             true,
+            0,
             guidance_tx,
         )
         .expect("register active run");
@@ -3120,6 +3272,7 @@ fn active_chat_run_registry_rejects_guidance_after_complete_event() {
             1,
             Vec::new(),
             true,
+            0,
             guidance_tx,
         )
         .expect("register active run");
@@ -4158,8 +4311,35 @@ async fn queue_chat_message_creates_default_team_for_normal_send() {
     let input = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json)
         .expect("Coordinator task input");
     assert_eq!(input.queued_user_message_id, queued.user_message_id);
+    assert_eq!(
+        input.visible_assistant_message_id.as_deref(),
+        Some(queued.assistant_message_id.as_str())
+    );
+    assert_eq!(input.visible_assistant_sequence, Some(1));
     assert_eq!(input.message, "Normal send");
     assert!(!input.collaboration_tools_enabled);
+    let chat = database
+        .chat(&queued.chat_id)
+        .expect("chat lookup")
+        .expect("queued chat");
+    let chat_metadata =
+        parse_json_value(&chat.metadata_json, "chat metadata").expect("chat metadata");
+    assert_eq!(
+        chat_metadata["queuedRun"]["assistantMessageId"],
+        json!(queued.assistant_message_id)
+    );
+    assert_eq!(chat_metadata["queuedRun"]["assistantSequence"], json!(1));
+    let user_message = database
+        .message(&queued.user_message_id)
+        .expect("user message lookup")
+        .expect("queued user message");
+    let user_metadata =
+        parse_json_value(&user_message.metadata_json, "user metadata").expect("user metadata");
+    assert_eq!(
+        user_metadata["queuedRun"]["assistantMessageId"],
+        json!(queued.assistant_message_id)
+    );
+    assert_eq!(user_metadata["queuedRun"]["assistantSequence"], json!(1));
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
@@ -4754,6 +4934,116 @@ fn chat_message_summaries_clear_stale_pending_message_without_resumable_agent_ta
 }
 
 #[test]
+fn queued_run_stays_visible_while_coordinator_task_is_waiting() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-waiting-queue-summary-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let chat_id = "chat-waiting-queued-run";
+    let user_message_id = "user-waiting-queued-run";
+    let chat_metadata_json = format!(
+        r#"{{"queuedRun":{{"status":"running","userMessageId":"{user_message_id}","modelId":"gpt-5.4","providerId":"openai-responses","content":"Hello"}}}}"#
+    );
+    let message_metadata_json =
+        r#"{"queuedRun":{"status":"running","modelId":"gpt-5.4","providerId":"openai-responses"}}"#;
+
+    database
+        .insert_chat_with_metadata(chat_id, "Waiting queued run", &chat_metadata_json)
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: user_message_id,
+            chat_id,
+            role: "user",
+            content: "Hello",
+            sequence: 0,
+            metadata_json: Some(message_metadata_json),
+        })
+        .expect("message insert");
+    insert_waiting_coordinator_task(
+        &mut database,
+        chat_id,
+        user_message_id,
+        "waiting-queue-summary",
+    );
+
+    let chat = database.chat(chat_id).expect("chat read").expect("chat");
+    let summary =
+        chat_summary(&mut database, chat, CodeChangeStats::default(), None).expect("chat summary");
+    let messages = database
+        .messages_for_chat(chat_id)
+        .expect("messages for chat");
+    let summaries = chat_message_summaries(&mut database, &workspace_dir, None, chat_id, messages)
+        .expect("message summaries");
+    let chat_metadata = parse_json_value(
+        &database
+            .chat(chat_id)
+            .expect("chat read")
+            .expect("chat")
+            .metadata_json,
+        "chat metadata",
+    )
+    .expect("chat metadata json");
+    let message_metadata = parse_json_value(
+        &database
+            .message(user_message_id)
+            .expect("message read")
+            .expect("message")
+            .metadata_json,
+        "message metadata",
+    )
+    .expect("message metadata json");
+
+    assert!(summary.queued_run.is_some());
+    assert_eq!(summaries.len(), 1);
+    assert!(summaries[0].queued_run.is_some());
+    assert!(chat_metadata.get("queuedRun").is_some());
+    assert!(message_metadata.get("queuedRun").is_some());
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn team_chat_task_sse_stays_open_while_coordinator_task_is_waiting() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-waiting-team-stream-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-waiting-team-stream-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let chat_id = "chat-waiting-team-stream";
+    let user_message_id = "user-waiting-team-stream";
+    let task_id = {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat(chat_id, "Waiting team stream")
+            .expect("chat insert");
+        insert_waiting_coordinator_task(
+            &mut database,
+            chat_id,
+            user_message_id,
+            "waiting-team-stream",
+        )
+    };
+
+    let state = test_app_state(config, profile_dir.clone());
+    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id)
+        .await
+        .expect("waiting Coordinator stream response");
+    let body = response.into_response().into_body();
+    let completed = timeout(Duration::from_millis(200), to_bytes(body, usize::MAX)).await;
+
+    assert!(
+        completed.is_err(),
+        "waiting Coordinator stream should stay open instead of sending StreamEnd"
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[test]
 fn persist_chat_result_writes_each_captured_llm_request() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-multi-audit-request-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -5272,6 +5562,7 @@ fn active_chat_run_subscription_replays_cached_events_after_sequence() {
             1,
             Vec::new(),
             true,
+            0,
             guidance_tx,
         )
         .expect("register active run");
@@ -5304,6 +5595,88 @@ fn active_chat_run_subscription_replays_cached_events_after_sequence() {
         .expect("run events for run");
     assert_eq!(run_events.len(), 2);
     assert!(registry.subscribe("workspace-1", "run-1", Some(0)).is_err());
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn active_chat_run_registration_continues_persisted_run_event_sequence() {
+    let registry = ActiveChatRunRegistry::default();
+    let workspace_dir = env::temp_dir().join(unique_id("foco-active-run-sequence-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-1", "Active run sequence")
+            .expect("chat insert");
+    }
+
+    let (first_guidance_tx, _first_guidance_rx) = mpsc::unbounded_channel();
+    let mut first_registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            first_guidance_tx,
+        )
+        .expect("register first active run");
+    first_registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::TextDelta {
+                assistant_message_id: "assistant-1".to_string(),
+                delta: "before wait".to_string(),
+            },
+        )
+        .expect("record first attempt event");
+    first_registration.finish();
+
+    let next_sequence = WorkspaceDatabase::open_or_create(&workspace_dir)
+        .expect("workspace database")
+        .next_run_event_sequence("run-1")
+        .expect("next run event sequence");
+    let (second_guidance_tx, _second_guidance_rx) = mpsc::unbounded_channel();
+    let mut second_registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-2".to_string(),
+            2,
+            Vec::new(),
+            true,
+            next_sequence,
+            second_guidance_tx,
+        )
+        .expect("register second active run");
+    second_registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::TextDelta {
+                assistant_message_id: "assistant-2".to_string(),
+                delta: "after wait".to_string(),
+            },
+        )
+        .expect("record second attempt event");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let run_events = database
+        .run_events_for_run("run-1")
+        .expect("run events for run");
+    let sequences = run_events
+        .iter()
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, vec![0, 1]);
+
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
@@ -6650,6 +7023,8 @@ Search memory before repo work.
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -6775,6 +7150,8 @@ Search memory before repo work.
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: Some(new_context.chat_id.clone()),
             model_id: "model".to_string(),
             provider_id: None,
@@ -6899,6 +7276,8 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -7012,6 +7391,8 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -7107,6 +7488,8 @@ Use the existing product UI conventions.
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -7584,6 +7967,8 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -7612,6 +7997,8 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: Some(first_context.chat_id.clone()),
             model_id: "review-model".to_string(),
             provider_id: None,
@@ -8034,6 +8421,8 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: None,
             model_id: "model".to_string(),
             provider_id: None,
@@ -8116,6 +8505,8 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         ChatStreamRequest {
             queued_user_message_id: None,
             run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             chat_id: Some(first_context.chat_id.clone()),
             model_id: "model".to_string(),
             provider_id: None,

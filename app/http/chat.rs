@@ -18,8 +18,7 @@ use foco_store::{
         workspace_database_path,
     },
 };
-use futures_util::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::*;
 
@@ -94,8 +93,12 @@ pub(crate) async fn queue_chat_message(
     let mut database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let user_message_id = unique_id("msg-user");
+    let assistant_message_id = unique_id("msg-assistant");
+    let assistant_sequence = prompt_context.next_message_sequence + 1;
     let user_metadata_json = queued_user_message_metadata_json(
         &prompt_context.attachments,
+        &assistant_message_id,
+        assistant_sequence,
         &requested_model_id,
         requested_provider_id.as_deref(),
         requested_thinking_level.as_deref(),
@@ -107,6 +110,8 @@ pub(crate) async fn queue_chat_message(
         let title = chat_title_for_prompt(raw_message, &prompt_context.attachments);
         let chat_metadata_json = queued_chat_metadata_json(
             &user_message_id,
+            &assistant_message_id,
+            assistant_sequence,
             &requested_model_id,
             requested_provider_id.as_deref(),
             requested_thinking_level.as_deref(),
@@ -167,6 +172,8 @@ pub(crate) async fn queue_chat_message(
             .map_err(|error| ApiError::internal(error.to_string()))?;
         let input_json = serde_json::to_string(&CoordinatorTaskInput {
             queued_user_message_id: user_message_id.clone(),
+            visible_assistant_message_id: Some(assistant_message_id.clone()),
+            visible_assistant_sequence: Some(assistant_sequence),
             message: task_message,
             attachments: task_attachments,
             skill_ids: requested_skill_ids.clone(),
@@ -230,6 +237,7 @@ pub(crate) async fn queue_chat_message(
         created_at: chat.created_at,
         updated_at: chat.updated_at,
         user_message_id,
+        assistant_message_id,
         content: message.to_string(),
         parts: user_message_response_parts(message, &prompt_context.attachments),
         agent_task_id,
@@ -401,6 +409,7 @@ pub(crate) async fn stream_chat_response(
         chat_context.assistant_sequence,
         chat_context.memories_used.clone(),
         chat_context.agent_primary_chat_output,
+        0,
         guidance_tx,
     )?;
     let subscription = state
@@ -446,17 +455,56 @@ fn team_chat_task_event_stream(
     let stream = async_stream::stream! {
         // ponytail: polling avoids a new task-status broadcast; switch to notifications if queued streams become numerous.
         loop {
+            let mut streamed_active_run = false;
             if let Ok(subscription) =
                 state
                     .active_chat_runs
                     .subscribe(&workspace.id, task_id.as_str(), Some(-1))
             {
-                let subscription_stream = chat_run_subscription_stream(subscription);
-                futures_util::pin_mut!(subscription_stream);
-                while let Some(event) = subscription_stream.next().await {
-                    yield event;
+                streamed_active_run = true;
+                let mut subscription = subscription;
+                let mut last_sequence = subscription.after_sequence;
+                for event in subscription.replay {
+                    if event.sequence > last_sequence {
+                        last_sequence = event.sequence;
+                    }
+                    yield Ok(sse_event_payload(&event.payload_json));
                 }
-                return;
+
+                if !*subscription.completed_rx.borrow() {
+                    loop {
+                        tokio::select! {
+                            changed = subscription.completed_rx.changed() => {
+                                if changed.is_err() || *subscription.completed_rx.borrow() {
+                                    while let Ok(event) = subscription.event_rx.try_recv() {
+                                        if event.sequence > last_sequence {
+                                            last_sequence = event.sequence;
+                                            yield Ok(sse_event_payload(&event.payload_json));
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                            event = subscription.event_rx.recv() => {
+                                match event {
+                                    Ok(event) => {
+                                        if event.sequence > last_sequence {
+                                            last_sequence = event.sequence;
+                                            yield Ok(sse_event_payload(&event.payload_json));
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                                        yield Ok(sse_event(&ChatSseEvent::Error {
+                                            message: "chat run event subscriber lagged behind; refresh to replay the run".to_string(),
+                                        }));
+                                        return;
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             let database = match WorkspaceDatabase::open_or_create(&workspace.path)
@@ -487,9 +535,11 @@ fn team_chat_task_event_stream(
                     return;
                 }
             };
-            if task.status != foco_agent::AgentTaskStatus::Queued
-                && task.status != foco_agent::AgentTaskStatus::Running
-            {
+            if !agent_task_keeps_team_stream_open(task.status) {
+                if streamed_active_run {
+                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                    return;
+                }
                 let events = match database
                     .run_events_for_run(task_id.as_str())
                     .map_err(ApiError::from_workspace_error)
@@ -511,6 +561,15 @@ fn team_chat_task_event_stream(
         }
     };
     Box::pin(stream)
+}
+
+fn agent_task_keeps_team_stream_open(status: foco_agent::AgentTaskStatus) -> bool {
+    matches!(
+        status,
+        foco_agent::AgentTaskStatus::Queued
+            | foco_agent::AgentTaskStatus::Running
+            | foco_agent::AgentTaskStatus::Waiting
+    )
 }
 
 pub(crate) async fn subscribe_chat_run(

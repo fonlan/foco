@@ -102,6 +102,7 @@ export type QueuedRunSummary = {
   status: "queued" | "running" | string;
   userMessageId: string;
   assistantMessageId: string | null;
+  assistantSequence?: number | null;
   modelId?: string | null;
   providerId: string | null;
   thinkingLevel: string | null;
@@ -226,6 +227,7 @@ export type QueuedMessageRunSummary = {
   thinkingLevel: string | null;
   skillIds: string[];
   assistantMessageId: string | null;
+  assistantSequence?: number | null;
 };
 
 export type ChatRunBadge =
@@ -254,6 +256,7 @@ export type QueueChatMessageResponse = {
   createdAt: string;
   updatedAt: string;
   userMessageId: string;
+  assistantMessageId: string;
   content: string;
   parts: ChatMessagePart[];
   agentTaskId?: string;
@@ -1546,6 +1549,7 @@ export type RetryRunRequest = {
   localChatKey?: string;
   pendingUserMessageId?: string;
   queuedUserMessageId?: string;
+  assistantMessageId?: string;
 };
 
 export type ScheduledWorkspaceRun = {

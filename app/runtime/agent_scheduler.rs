@@ -53,6 +53,10 @@ pub(crate) struct AgentScheduler {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct CoordinatorTaskInput {
     pub(crate) queued_user_message_id: String,
+    #[serde(default)]
+    pub(crate) visible_assistant_message_id: Option<String>,
+    #[serde(default)]
+    pub(crate) visible_assistant_sequence: Option<i64>,
     pub(crate) message: String,
     #[serde(default)]
     pub(crate) attachments: Vec<ChatAttachmentInput>,
@@ -384,6 +388,8 @@ async fn run_coordinator_task_inner(
             chat_id: Some(team.chat_id.clone()),
             queued_user_message_id: Some(task_input.queued_user_message_id.clone()),
             run_id_override: Some(task.id.to_string()),
+            visible_assistant_message_id: task_input.visible_assistant_message_id.clone(),
+            visible_assistant_sequence: task_input.visible_assistant_sequence,
             model_id: model_selection.model_id,
             provider_id: model_selection.provider_id,
             thinking_level: model_selection.thinking_level,
@@ -481,6 +487,10 @@ async fn run_coordinator_task_inner(
     chat_context.session_upload_paths = Some(session_upload_paths);
 
     let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    let next_run_event_sequence = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?
+        .next_run_event_sequence(task.id.as_str())
+        .map_err(ApiError::from_workspace_error)?;
     let registration = state.active_chat_runs.register(
         task.id.to_string(),
         workspace.id.clone(),
@@ -489,6 +499,7 @@ async fn run_coordinator_task_inner(
         chat_context.assistant_sequence,
         chat_context.memories_used.clone(),
         chat_context.agent_primary_chat_output,
+        next_run_event_sequence,
         guidance_tx,
     )?;
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;
@@ -895,14 +906,13 @@ fn creatable_agent_definitions_prompt(
     let mut definitions = Vec::with_capacity(permissions.allowed_agent_definition_ids.len());
 
     for allowed_id in &permissions.allowed_agent_definition_ids {
-        let definition = agent_definitions
-            .iter()
-            .find(|definition| definition.id == *allowed_id)
-            .ok_or_else(|| {
-                ApiError::internal(format!(
-                    "Agent team protocol references missing creatable definition '{allowed_id}'"
-                ))
-            })?;
+        let Some(definition) =
+            creatable_agent_definition(allowed_id, agent_definitions, team_instances)
+        else {
+            // ponytail: stale create permissions should shrink advertised options, not fail
+            // the current task; config validation still rejects bad newly-saved definitions.
+            continue;
+        };
         let current_definition_instances = u32::try_from(
             team_instances
                 .iter()
@@ -952,6 +962,22 @@ fn creatable_agent_definitions_prompt(
     }
 
     Ok(definitions)
+}
+
+fn creatable_agent_definition<'a>(
+    allowed_id: &foco_agent::AgentDefinitionId,
+    agent_definitions: &'a [AgentDefinitionSettings],
+    team_instances: &'a [AgentInstanceRecord],
+) -> Option<&'a AgentDefinitionSettings> {
+    agent_definitions
+        .iter()
+        .find(|definition| definition.id == *allowed_id)
+        .or_else(|| {
+            team_instances
+                .iter()
+                .find(|instance| instance.definition_id == *allowed_id)
+                .map(|instance| &instance.definition_snapshot)
+        })
 }
 
 fn agent_private_context_prompt(
@@ -1836,6 +1862,95 @@ mod tests {
     }
 
     #[test]
+    fn team_protocol_uses_instance_snapshot_for_stale_creatable_definition() {
+        let coordinator_definition = test_agent_definition("stale-coordinator", 1);
+        let worker_definition = test_agent_definition("stale-worker", 3);
+        let missing_id = foco_agent::AgentDefinitionId::new("agent-definition-stale-missing")
+            .expect("missing definition id");
+        let team_id = foco_agent::AgentTeamId::new("agent-team-stale-creatable").expect("team id");
+        let coordinator_id = foco_agent::AgentInstanceId::new("agent-instance-stale-coordinator")
+            .expect("coordinator id");
+        let worker_id =
+            foco_agent::AgentInstanceId::new("agent-instance-stale-worker").expect("worker id");
+        let task_id = AgentTaskId::new("agent-task-stale-creatable").expect("task id");
+        let attempt_id = AgentAttemptId::new("agent-attempt-stale-creatable").expect("attempt id");
+        let now = "2026-01-01T00:00:00Z".to_string();
+        let team = AgentTeamRecord {
+            id: team_id.clone(),
+            chat_id: "chat-stale-creatable".to_string(),
+            coordinator_instance_id: coordinator_id.clone(),
+            status: foco_agent::AgentTeamStatus::Active,
+            max_concurrent_runs: 1,
+            next_event_sequence: 0,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+        };
+        let coordinator = test_agent_instance(
+            &team_id,
+            &coordinator_id,
+            coordinator_definition.clone(),
+            AgentRole::Coordinator,
+            &now,
+        );
+        let worker = test_agent_instance(
+            &team_id,
+            &worker_id,
+            worker_definition.clone(),
+            AgentRole::Worker,
+            &now,
+        );
+        let task = AgentTaskRecord {
+            id: task_id,
+            team_id: team_id.clone(),
+            owner_instance_id: coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            sequence: 0,
+            status: AgentTaskStatus::Running,
+            input_json: "{}".to_string(),
+            result_json: None,
+            error_json: None,
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            started_at: Some(now.clone()),
+            completed_at: None,
+        };
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            can_delegate: false,
+            allowed_agent_definition_ids: vec![worker_definition.id.clone(), missing_id],
+        };
+
+        let prompt = agent_team_protocol_prompt(
+            &team,
+            &coordinator,
+            &task,
+            &attempt_id,
+            &HashSet::new(),
+            &permissions,
+            &[coordinator_definition],
+            &[coordinator.clone(), worker],
+        )
+        .expect("protocol prompt");
+        let protocol: Value = serde_json::from_str(
+            prompt
+                .strip_prefix("Foco Agent team protocol:\n")
+                .expect("protocol prefix"),
+        )
+        .expect("protocol json");
+        let creatable = protocol["creatableAgentDefinitions"]
+            .as_array()
+            .expect("creatable definitions");
+
+        assert_eq!(creatable.len(), 1);
+        assert_eq!(
+            creatable[0]["definitionId"],
+            json!("agent-definition-stale-worker")
+        );
+        assert_eq!(creatable[0]["maxInstances"], json!(3));
+    }
+
+    #[test]
     fn wait_resume_messages_include_parent_resume_instruction() {
         let team_id = foco_agent::AgentTeamId::new("agent-team-wait-resume").expect("team id");
         let waiting_task_id = AgentTaskId::new("agent-task-waiting").expect("waiting task id");
@@ -1915,6 +2030,8 @@ mod tests {
         );
         let task_input = CoordinatorTaskInput {
             queued_user_message_id: "user-model-selection".to_string(),
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
             message: "Use override".to_string(),
             attachments: Vec::new(),
             skill_ids: Vec::new(),

@@ -539,6 +539,79 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("keeps a resumed agent-team reply in the original assistant bubble", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "test multi-agent resume",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    const assistantMessageId = "message-assistant-stream";
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        delta: "Waiting for worker.",
+        type: "textDelta",
+      });
+    });
+    expect(await screen.findByText("Waiting for worker.")).toBeInTheDocument();
+    const waitingRow = screen
+      .getByText("Waiting for worker.")
+      .closest(".message-row") as HTMLElement | null;
+    expect(waitingRow).not.toBeNull();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        chatId: "queued-chat-1",
+        llmRequestId: "request-stream",
+        memoriesUsed: [],
+        type: "start",
+        userMessageId: "message-user-stream",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        delta: "Final worker summary.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        chatId: "queued-chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 3,
+          providerId: "provider-1",
+          totalLatencyMs: 1000,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "Final worker summary.",
+        type: "complete",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 10,
+          outputTokens: 3,
+        },
+      });
+    });
+
+    await waitFor(() =>
+      expect(waitingRow).toHaveTextContent("Final worker summary."),
+    );
+
+    await act(async () => {
+      enqueueChatStreamEvent({ type: "streamEnd" });
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("cancels the active run id after a later provider attempt starts", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

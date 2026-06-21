@@ -462,7 +462,7 @@ fn clears_completed_queued_run_metadata_from_chat_and_user_message() {
         .expect("message insert");
 
     database
-        .mark_chat_queued_run_started("chat-queued", "user-queued", "assistant-queued")
+        .mark_chat_queued_run_started("chat-queued", "user-queued", "assistant-queued", 1)
         .expect("queued run started");
     let running_chat_metadata: Value = serde_json::from_str(
         &database
@@ -473,6 +473,11 @@ fn clears_completed_queued_run_metadata_from_chat_and_user_message() {
     )
     .expect("chat metadata json");
     assert_eq!(running_chat_metadata["queuedRun"]["status"], "running");
+    assert_eq!(
+        running_chat_metadata["queuedRun"]["assistantMessageId"],
+        "assistant-queued"
+    );
+    assert_eq!(running_chat_metadata["queuedRun"]["assistantSequence"], 1);
 
     database
         .clear_chat_queued_run("chat-queued", "user-queued")

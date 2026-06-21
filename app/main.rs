@@ -1798,6 +1798,10 @@ struct ChatStreamRequest {
     queued_user_message_id: Option<String>,
     #[serde(skip)]
     run_id_override: Option<String>,
+    #[serde(skip)]
+    visible_assistant_message_id: Option<String>,
+    #[serde(skip)]
+    visible_assistant_sequence: Option<i64>,
     model_id: String,
     provider_id: Option<String>,
     thinking_level: Option<String>,
@@ -1830,6 +1834,7 @@ struct QueueChatMessageResponse {
     created_at: String,
     updated_at: String,
     user_message_id: String,
+    assistant_message_id: String,
     content: String,
     parts: Vec<ChatMessagePart>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2516,6 +2521,7 @@ struct QueuedRunSummary {
     status: String,
     user_message_id: String,
     assistant_message_id: Option<String>,
+    assistant_sequence: Option<i64>,
     model_id: Option<String>,
     provider_id: Option<String>,
     thinking_level: Option<String>,
@@ -2798,6 +2804,7 @@ struct QueuedMessageRunSummary {
     thinking_level: Option<String>,
     skill_ids: Vec<String>,
     assistant_message_id: Option<String>,
+    assistant_sequence: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3440,7 +3447,17 @@ async fn run_chat_context_in_background(
         let _ = active_run_registration.record_event(&workspace_path, &chat_id, &error_event);
     }
 
-    active_run_registration.finish();
+    if matches!(&outcome, AgentRunOutcome::Suspended { .. }) {
+        if let Err(error) = active_run_registration.finish_suspended(&workspace_path, &chat_id) {
+            tracing::warn!(
+                error = %error.message,
+                run_id = %active_run_registration.run_id,
+                "failed to clear suspended chat run draft state"
+            );
+        }
+    } else {
+        active_run_registration.finish();
+    }
     let cleanup_result = match session_upload_paths {
         Some(paths) => cleanup_chat_session_upload_files(&workspace_path, &chat_id, &paths),
         None => cleanup_chat_session_uploads(&workspace_path, &chat_id),
@@ -5230,6 +5247,13 @@ async fn prepare_chat_context(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let visible_assistant_message_id = request
+        .visible_assistant_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let visible_assistant_sequence = request.visible_assistant_sequence;
     let run_id_override = request
         .run_id_override
         .as_deref()
@@ -5266,7 +5290,52 @@ async fn prepare_chat_context(
     let user_message_id = queued_user_message_id
         .clone()
         .unwrap_or_else(|| unique_id("msg-user"));
-    let assistant_message_id = unique_id("msg-assistant");
+    let mut queued_assistant_message_id = None;
+    let mut queued_assistant_sequence = None;
+    if let Some(queued_user_message_id) = queued_user_message_id.as_deref()
+        && let Some(chat_id) = prompt_context.chat_id.as_deref()
+    {
+        let database = WorkspaceDatabase::open_or_create(&prompt_context.workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+        if let Some(message) = database
+            .message(queued_user_message_id)
+            .map_err(ApiError::from_workspace_error)?
+        {
+            if message.chat_id != chat_id {
+                return Err(ApiError::bad_request(format!(
+                    "queued user message '{queued_user_message_id}' belongs to chat '{}' instead of '{chat_id}'",
+                    message.chat_id
+                )));
+            }
+            if let Some(summary) = queued_run_summary_from_message_metadata(&message.metadata_json)?
+            {
+                queued_assistant_message_id = summary.assistant_message_id;
+                queued_assistant_sequence = summary.assistant_sequence;
+            }
+        }
+    }
+    if let (Some(visible), Some(queued)) = (
+        visible_assistant_message_id.as_deref(),
+        queued_assistant_message_id.as_deref(),
+    ) && visible != queued
+    {
+        return Err(ApiError::internal(format!(
+            "Coordinator task assistant message id '{visible}' does not match queued message assistant id '{queued}'"
+        )));
+    }
+    if let (Some(visible), Some(queued)) = (visible_assistant_sequence, queued_assistant_sequence)
+        && visible != queued
+    {
+        return Err(ApiError::internal(format!(
+            "Coordinator task assistant sequence '{visible}' does not match queued message assistant sequence '{queued}'"
+        )));
+    }
+    let assistant_message_id = visible_assistant_message_id
+        .or(queued_assistant_message_id)
+        .unwrap_or_else(|| unique_id("msg-assistant"));
+    let assistant_sequence = visible_assistant_sequence
+        .or(queued_assistant_sequence)
+        .unwrap_or(assistant_sequence);
     let llm_request_id = run_id_override.unwrap_or_else(|| unique_id("llm"));
     let user_prompt_summary = state
         .hook_runtime
@@ -5360,7 +5429,12 @@ async fn prepare_chat_context(
             })
             .map_err(ApiError::from_workspace_error)?;
         database
-            .mark_chat_queued_run_started(&chat_id, &user_message_id, &assistant_message_id)
+            .mark_chat_queued_run_started(
+                &chat_id,
+                &user_message_id,
+                &assistant_message_id,
+                assistant_sequence,
+            )
             .map_err(ApiError::from_workspace_error)?;
     } else {
         database
@@ -9087,6 +9161,8 @@ fn code_change_stats_from_changed_files(
 
 fn queued_chat_metadata_json(
     user_message_id: &str,
+    assistant_message_id: &str,
+    assistant_sequence: i64,
     model_id: &str,
     provider_id: Option<&str>,
     thinking_level: Option<&str>,
@@ -9097,6 +9173,8 @@ fn queued_chat_metadata_json(
         "queuedRun": {
             "status": "queued",
             "userMessageId": user_message_id,
+            "assistantMessageId": assistant_message_id,
+            "assistantSequence": assistant_sequence,
             "modelId": model_id,
             "providerId": provider_id,
             "thinkingLevel": thinking_level,
@@ -9113,6 +9191,8 @@ fn queued_chat_metadata_json(
 
 fn queued_user_message_metadata_json(
     attachments: &[NeutralChatAttachment],
+    assistant_message_id: &str,
+    assistant_sequence: i64,
     model_id: &str,
     provider_id: Option<&str>,
     thinking_level: Option<&str>,
@@ -9129,6 +9209,8 @@ fn queued_user_message_metadata_json(
         "queuedRun".to_string(),
         json!({
             "status": "queued",
+            "assistantMessageId": assistant_message_id,
+            "assistantSequence": assistant_sequence,
             "modelId": model_id,
             "providerId": provider_id,
             "thinkingLevel": thinking_level,
@@ -10350,7 +10432,9 @@ fn queued_run_has_resumable_task(
         .is_some_and(|task| {
             matches!(
                 task.status,
-                foco_agent::AgentTaskStatus::Queued | foco_agent::AgentTaskStatus::Running
+                foco_agent::AgentTaskStatus::Queued
+                    | foco_agent::AgentTaskStatus::Running
+                    | foco_agent::AgentTaskStatus::Waiting
             )
         }))
 }
@@ -10376,6 +10460,7 @@ fn queued_run_summary_from_chat_metadata(
     let assistant_message_id =
         string_json_field(queued_run, "assistantMessageId", "assistant_message_id")
             .map(str::to_string);
+    let assistant_sequence = i64_json_field(queued_run, "assistantSequence", "assistant_sequence");
     let content = string_json_field(queued_run, "content", "content").map(str::to_string);
     let skill_ids = queued_run
         .get("skillIds")
@@ -10394,6 +10479,7 @@ fn queued_run_summary_from_chat_metadata(
         status: status.to_string(),
         user_message_id: user_message_id.to_string(),
         assistant_message_id,
+        assistant_sequence,
         model_id,
         provider_id,
         thinking_level,
@@ -10422,6 +10508,7 @@ fn queued_run_summary_from_message_metadata(
     let assistant_message_id =
         string_json_field(queued_run, "assistantMessageId", "assistant_message_id")
             .map(str::to_string);
+    let assistant_sequence = i64_json_field(queued_run, "assistantSequence", "assistant_sequence");
     let skill_ids = queued_run
         .get("skillIds")
         .or_else(|| queued_run.get("skill_ids"))
@@ -10442,6 +10529,7 @@ fn queued_run_summary_from_message_metadata(
         thinking_level,
         skill_ids,
         assistant_message_id,
+        assistant_sequence,
     }))
 }
 
@@ -10478,6 +10566,13 @@ fn string_json_field<'a>(value: &'a Value, primary: &str, alternate: &str) -> Op
         .get(primary)
         .or_else(|| value.get(alternate))
         .and_then(Value::as_str)
+}
+
+fn i64_json_field(value: &Value, primary: &str, alternate: &str) -> Option<i64> {
+    value
+        .get(primary)
+        .or_else(|| value.get(alternate))
+        .and_then(Value::as_i64)
 }
 
 fn nullable_string_json_field<'a>(

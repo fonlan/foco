@@ -465,6 +465,7 @@ impl WorkspaceDatabase {
         chat_id: &str,
         user_message_id: &str,
         assistant_message_id: &str,
+        assistant_sequence: i64,
     ) -> Result<(), WorkspaceDatabaseError> {
         let chat =
             self.chat(chat_id)?
@@ -482,6 +483,10 @@ impl WorkspaceDatabase {
             queued_run_object.insert(
                 "assistantMessageId".to_string(),
                 Value::String(assistant_message_id.to_string()),
+            );
+            queued_run_object.insert(
+                "assistantSequence".to_string(),
+                Value::Number(assistant_sequence.into()),
             );
         }
         let chat_metadata_json = serde_json::to_string(&chat_metadata).map_err(|source| {
@@ -507,6 +512,10 @@ impl WorkspaceDatabase {
             queued_run_object.insert(
                 "assistantMessageId".to_string(),
                 Value::String(assistant_message_id.to_string()),
+            );
+            queued_run_object.insert(
+                "assistantSequence".to_string(),
+                Value::Number(assistant_sequence.into()),
             );
         }
         let message_metadata_json = serde_json::to_string(&message_metadata).map_err(|source| {
@@ -794,6 +803,18 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
 
         collect_rows(rows, &self.database_path)
+    }
+
+    pub fn next_run_event_sequence(&self, run_id: &str) -> Result<i64, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), -1) + 1
+                 FROM run_events
+                 WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn history_run_events_for_chat(

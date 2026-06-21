@@ -2381,6 +2381,7 @@ export function App() {
             localChatKey: chatKey,
             pendingUserMessageId: chat.queuedRun.userMessageId,
             queuedUserMessageId: chat.queuedRun.userMessageId,
+            assistantMessageId: chat.queuedRun.assistantMessageId ?? undefined,
           };
           const existingRun = currentByChatKey.get(chatKey);
           const scheduledRun: ScheduledWorkspaceRun = existingRun
@@ -2430,6 +2431,7 @@ export function App() {
         localChatKey: chatKey,
         pendingUserMessageId: message.id,
         queuedUserMessageId: message.id,
+        assistantMessageId: message.queuedRun?.assistantMessageId ?? undefined,
       }))
       .filter(
         (request) => request.modelId.trim() && request.providerId.trim(),
@@ -3873,6 +3875,7 @@ export function App() {
           localChatKey: chatKey,
           pendingUserMessageId: queued.userMessageId,
           queuedUserMessageId: queued.userMessageId,
+          assistantMessageId: queued.assistantMessageId,
         },
         status: "queued",
       };
@@ -3950,6 +3953,7 @@ export function App() {
         chatId: runInfo.chatId ?? request.chatId,
         pendingUserMessageId: queued.userMessageId,
         queuedUserMessageId: queued.userMessageId,
+        assistantMessageId: queued.assistantMessageId,
         workspaceId: runInfo.workspaceId ?? request.workspaceId,
       };
       updateQueuedRunRequestsForChatKey(runInfo.chatKey, (current) => [
@@ -4420,6 +4424,7 @@ export function App() {
 
     const abortController = new AbortController();
     let assistantMessageId = `active-assistant-${activeRun.runId}`;
+    const placeholderAssistantMessageId = assistantMessageId;
     let currentAssistantMessageId = assistantMessageId;
     // Once a guidance message is applied, the backend keeps emitting subsequent
     // stream events under the original (now-interrupted) assistant message id,
@@ -4473,6 +4478,17 @@ export function App() {
           streamingAssistantMessage(nextAssistantMessageId, memoriesUsed),
         ];
       });
+    };
+    const finishStreamingAssistantMessage = (finishedAssistantMessageId: string) => {
+      setMessagesForChatKey(chatKey, (current) =>
+        current.map((message) =>
+          message.role === "assistant" &&
+          message.id === finishedAssistantMessageId &&
+          message.status === "streaming"
+            ? { ...message, status: undefined }
+            : message,
+        ),
+      );
     };
 
     const isCurrentAssistantMessage = (
@@ -4605,8 +4621,15 @@ export function App() {
 
       await readChatStream(response, (streamEvent) => {
         if (streamEvent.type === "start") {
+          const previousAssistantMessageId = currentAssistantMessageId;
+          const startsNewAssistantBubble =
+            previousAssistantMessageId !== streamEvent.assistantMessageId &&
+            previousAssistantMessageId !== placeholderAssistantMessageId;
           assistantMessageId = streamEvent.assistantMessageId;
           currentAssistantMessageId = streamEvent.assistantMessageId;
+          if (startsNewAssistantBubble) {
+            finishStreamingAssistantMessage(previousAssistantMessageId);
+          }
           setMessagesForChatKey(chatKey, (current) =>
             current.map((message) =>
               message.role === "assistant" && message.id === streamEvent.assistantMessageId
@@ -5029,6 +5052,7 @@ export function App() {
           chatId: queued.chatId,
           pendingUserMessageId: queued.userMessageId,
           queuedUserMessageId: queued.userMessageId,
+          assistantMessageId: queued.assistantMessageId,
         };
         const queuedChatKey = chatRunKey(request.workspaceId, queued.chatId);
         setActiveWorkspaceId(request.workspaceId);
@@ -5059,7 +5083,7 @@ export function App() {
     const runKey = localRandomId();
     const pendingUserMessageId = request.pendingUserMessageId ?? null;
     const localUserId = pendingUserMessageId ?? `local-user-${runKey}`;
-    const localAssistantId = `local-assistant-${runKey}`;
+    const localAssistantId = request.assistantMessageId ?? `local-assistant-${runKey}`;
     const localCreatedAt = new Date().toISOString();
     const visibleUserContent = messageWithSelectedSkills(
       detectedSkills,
@@ -5219,17 +5243,73 @@ export function App() {
       abortController,
     );
 
+    const ensureStreamingAssistantMessage = (
+      nextAssistantMessageId: string,
+      memoriesUsed: ChatMemoryUsedSummary[] = [],
+    ) => {
+      setMessagesForChatKey(runMessagesKey, (current) => {
+        if (current.some((message) => message.id === nextAssistantMessageId)) {
+          return current.map((message) =>
+            message.id === nextAssistantMessageId && message.role === "assistant"
+              ? {
+                ...message,
+                memoriesUsed: message.memoriesUsed.length
+                  ? message.memoriesUsed
+                  : memoriesUsed,
+                status: "streaming",
+              }
+              : message,
+          );
+        }
+
+        return [
+          ...current,
+          streamingAssistantMessage(nextAssistantMessageId, memoriesUsed),
+        ];
+      });
+    };
+    const finishStreamingAssistantMessage = (finishedAssistantMessageId: string) => {
+      setMessagesForChatKey(runMessagesKey, (current) =>
+        current.map((message) =>
+          message.role === "assistant" &&
+          message.id === finishedAssistantMessageId &&
+          message.status === "streaming"
+            ? { ...message, status: undefined }
+            : message,
+        ),
+      );
+    };
     const isCurrentAssistantMessage = (
       message: ShellMessage,
       eventAssistantMessageId?: string,
-    ) =>
-      message.role === "assistant" &&
-      (message.id === currentAssistantMessageId ||
-        (currentAssistantMessageId === assistantMessageId &&
-          eventAssistantMessageId !== undefined &&
-          message.id === eventAssistantMessageId) ||
-        (currentAssistantMessageId === localAssistantId &&
-          message.id === localAssistantId));
+    ) => {
+      const ignoreInterruptedId =
+        interruptedAssistantMessageId !== null &&
+        (eventAssistantMessageId === undefined ||
+          eventAssistantMessageId === interruptedAssistantMessageId);
+      return (
+        message.role === "assistant" &&
+        (message.id === currentAssistantMessageId ||
+          (!ignoreInterruptedId &&
+            eventAssistantMessageId !== undefined &&
+            message.id === eventAssistantMessageId) ||
+          (!ignoreInterruptedId && message.id === assistantMessageId) ||
+          (currentAssistantMessageId === localAssistantId &&
+            message.id === localAssistantId))
+      );
+    };
+    const resolvedAssistantMessageId = (
+      eventAssistantMessageId?: string,
+    ): string => {
+      if (
+        interruptedAssistantMessageId !== null &&
+        (eventAssistantMessageId === undefined ||
+          eventAssistantMessageId === interruptedAssistantMessageId)
+      ) {
+        return currentAssistantMessageId;
+      }
+      return eventAssistantMessageId ?? currentAssistantMessageId;
+    };
     let activeReasoningStartedAtMs: number | null = null;
     let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null = null;
     const updateLiveReasoningDuration = (startedAtMs: number) => {
@@ -5321,6 +5401,10 @@ export function App() {
 
       await readChatStream(response, (streamEvent) => {
         if (streamEvent.type === "start") {
+          const previousAssistantMessageId = currentAssistantMessageId;
+          const startsNewAssistantBubble =
+            previousAssistantMessageId !== streamEvent.assistantMessageId &&
+            previousAssistantMessageId !== localAssistantId;
           assistantMessageId = streamEvent.assistantMessageId;
           currentAssistantMessageId = streamEvent.assistantMessageId;
           requestChatId = streamEvent.chatId;
@@ -5418,6 +5502,13 @@ export function App() {
               }),
             );
           }
+          if (startsNewAssistantBubble) {
+            finishStreamingAssistantMessage(previousAssistantMessageId);
+          }
+          ensureStreamingAssistantMessage(
+            streamEvent.assistantMessageId,
+            streamEvent.memoriesUsed,
+          );
           setChatRunning(currentRunningChatKey, true);
           activeRunId = streamEvent.llmRequestId ?? activeRunId;
           setActiveRunInfoForChatKey(currentRunningChatKey, {
@@ -5457,6 +5548,9 @@ export function App() {
 
         if (streamEvent.type === "textDelta") {
           finishLiveReasoningDuration(streamEvent.assistantMessageId);
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5473,6 +5567,9 @@ export function App() {
 
         if (streamEvent.type === "reasoningDelta") {
           const reasoningStartedAtMs = startLiveReasoningDuration();
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5497,6 +5594,9 @@ export function App() {
           if (interruptedAssistantMessageId === null) {
             currentAssistantMessageId = streamEvent.assistantMessageId;
           }
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
           setActiveRunInfoForChatKey(runMessagesKey, {
             acceptingGuidance: activeRunId !== null,
             chatId: requestChatId,
@@ -5575,6 +5675,9 @@ export function App() {
           const completedReasoningStartedAtMs = activeReasoningStartedAtMs;
           activeReasoningStartedAtMs = null;
           stopLiveReasoningDuration();
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
           const liveStatisticsUsage = streamEvent.usage ?? latestResponseUsage;
           updateLiveChatStatistics(runMessagesKey, {
             modelId: streamEvent.metrics.modelId,
@@ -5616,6 +5719,9 @@ export function App() {
 
         if (streamEvent.type === "toolCall") {
           finishLiveReasoningDuration(streamEvent.assistantMessageId);
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5634,6 +5740,9 @@ export function App() {
         }
 
         if (streamEvent.type === "toolResult") {
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -5659,6 +5768,9 @@ export function App() {
         }
 
         if (streamEvent.type === "toolOutputDelta") {
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -22507,6 +22619,11 @@ function normalizeQueuedMessageRunSummary(
     "assistantMessageId",
     "assistant_message_id",
   );
+  const assistantSequence = fieldValue(
+    queuedRun,
+    "assistantSequence",
+    "assistant_sequence",
+  );
   const status = fieldValue(queuedRun, "status");
 
   return {
@@ -22519,6 +22636,8 @@ function normalizeQueuedMessageRunSummary(
       : [],
     assistantMessageId:
       typeof assistantMessageId === "string" ? assistantMessageId : null,
+    assistantSequence:
+      typeof assistantSequence === "number" ? assistantSequence : null,
   };
 }
 

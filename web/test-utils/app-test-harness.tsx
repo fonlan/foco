@@ -1847,6 +1847,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     const content = body.message ?? "";
     appTestState.chatQueueCounter += 1;
     const chatId = body.chatId ?? `queued-chat-${appTestState.chatQueueCounter}`;
+    const assistantMessageId =
+      appTestState.chatQueueCounter === 1
+        ? "message-assistant-stream"
+        : `message-assistant-stream-${appTestState.chatQueueCounter}`;
     return jsonResponse({
       chatId,
       chatTitle: content || "Queued chat",
@@ -1855,6 +1859,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       parts: content ? [{ text: content, type: "text" }] : [],
       updatedAt: "2026-06-05T12:00:00Z",
       userMessageId: `queued-user-${appTestState.chatQueueCounter}`,
+      assistantMessageId,
     });
   }
 
