@@ -1146,6 +1146,16 @@ fn context_compression_summary(
 fn compact_message_for_compression(message: &NeutralChatMessage) -> String {
     let mut content = truncate_for_context_snapshot(&message.content);
 
+    if let Some(reasoning) = message.reasoning.as_deref() {
+        let reasoning = truncate_for_context_snapshot(reasoning);
+        if content.is_empty() {
+            content = format!("reasoning: {reasoning}");
+        } else {
+            content.push_str("; reasoning: ");
+            content.push_str(&reasoning);
+        }
+    }
+
     if !message.attachments.is_empty() {
         let names = message
             .attachments

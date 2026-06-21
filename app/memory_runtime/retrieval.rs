@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use foco_agent::estimate_text_tokens;
-use foco_providers::{NeutralChatRequest, NeutralChatRole};
+use foco_providers::{NeutralChatMessage, NeutralChatRequest, NeutralChatRole};
 use foco_store::{
     config::GlobalConfig,
     memory::{MemoryDatabase, MemoryFactRecord, MemoryScope},
-    workspace::{MessageRecord, PromptContextInjectionRecord, WorkspaceDatabase},
+    workspace::{
+        MessageRecord, PromptContextInjectionRecord, ToolCallWithResultRecord, WorkspaceDatabase,
+    },
 };
 
 use crate::prompt::{neutral_message_estimated_tokens, neutral_tool_call_from_record};
@@ -1238,6 +1240,10 @@ pub(crate) fn neutral_messages_from_record(
             .tool_calls_for_message(&message.id)
             .map_err(ApiError::from_workspace_error)?;
 
+        if let Some(parts) = stored_assistant_parts_from_metadata(&message.metadata_json)? {
+            return replay_stored_assistant_parts(&message, parts, &tool_calls, reasoning);
+        }
+
         if tool_calls.is_empty() {
             return Ok(vec![NeutralChatMessage {
                 role,
@@ -1328,4 +1334,132 @@ pub(crate) fn neutral_messages_from_record(
         tool_call_id: Some(tool_call_id),
         tool_name,
     }])
+}
+
+fn stored_assistant_parts_from_metadata(
+    metadata_json: &str,
+) -> Result<Option<Vec<StoredChatMessagePart>>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
+    let Some(parts) = metadata.get("parts") else {
+        return Ok(None);
+    };
+
+    serde_json::from_value::<Vec<StoredChatMessagePart>>(parts.clone())
+        .map(Some)
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to parse assistant message metadata.parts: {source}"
+            ))
+        })
+}
+
+fn replay_stored_assistant_parts(
+    message: &MessageRecord,
+    parts: Vec<StoredChatMessagePart>,
+    tool_calls: &[ToolCallWithResultRecord],
+    fallback_reasoning: Option<String>,
+) -> Result<Vec<NeutralChatMessage>, ApiError> {
+    let tool_calls_by_id = tool_calls
+        .iter()
+        .map(|tool_call| (tool_call.id.as_str(), tool_call))
+        .collect::<HashMap<_, _>>();
+    let mut replayed_tool_call_ids = HashSet::new();
+    let mut messages = Vec::new();
+
+    for part in parts {
+        match part {
+            StoredChatMessagePart::Text { text } => {
+                if !text.trim().is_empty() {
+                    messages.push(neutral_assistant_message(text, None));
+                }
+            }
+            StoredChatMessagePart::Reasoning { text } => {
+                if !text.trim().is_empty() {
+                    messages.push(neutral_assistant_message(String::new(), Some(text)));
+                }
+            }
+            StoredChatMessagePart::ToolCall { tool_call_id } => {
+                append_replayed_tool_call_pair(
+                    &mut messages,
+                    message,
+                    tool_calls_by_id.get(tool_call_id.as_str()).copied(),
+                    &tool_call_id,
+                    &mut replayed_tool_call_ids,
+                )?;
+            }
+        }
+    }
+
+    for tool_call in tool_calls {
+        if replayed_tool_call_ids.contains(&tool_call.id) {
+            continue;
+        }
+        append_replayed_tool_call_pair(
+            &mut messages,
+            message,
+            Some(tool_call),
+            &tool_call.id,
+            &mut replayed_tool_call_ids,
+        )?;
+    }
+
+    if messages.is_empty() && (!message.content.trim().is_empty() || fallback_reasoning.is_some()) {
+        messages.push(neutral_assistant_message(
+            message.content.clone(),
+            fallback_reasoning,
+        ));
+    }
+
+    Ok(messages)
+}
+
+fn append_replayed_tool_call_pair(
+    messages: &mut Vec<NeutralChatMessage>,
+    message: &MessageRecord,
+    tool_call: Option<&ToolCallWithResultRecord>,
+    tool_call_id: &str,
+    replayed_tool_call_ids: &mut HashSet<String>,
+) -> Result<(), ApiError> {
+    if !replayed_tool_call_ids.insert(tool_call_id.to_string()) {
+        return Ok(());
+    }
+
+    let Some(tool_call) = tool_call else {
+        tracing::warn!(
+            assistant_message_id = %message.id,
+            tool_call_id,
+            "skipping missing persisted tool call while rebuilding provider prompt from stored parts"
+        );
+        return Ok(());
+    };
+    let Some(result) = tool_call.result.as_ref() else {
+        tracing::warn!(
+            assistant_message_id = %message.id,
+            tool_call_id = %tool_call.id,
+            tool_call_status = %tool_call.status,
+            "skipping incomplete persisted tool call while rebuilding provider prompt"
+        );
+        return Ok(());
+    };
+
+    messages.push(NeutralChatMessage {
+        role: NeutralChatRole::Assistant,
+        content: String::new(),
+        attachments: Vec::new(),
+        reasoning: None,
+        tool_calls: vec![neutral_tool_call_from_record(tool_call)?],
+        tool_call_id: None,
+        tool_name: None,
+    });
+    messages.push(NeutralChatMessage {
+        role: NeutralChatRole::Tool,
+        content: result.output_json.clone(),
+        attachments: Vec::new(),
+        reasoning: None,
+        tool_calls: Vec::new(),
+        tool_call_id: Some(tool_call.id.clone()),
+        tool_name: Some(tool_call.tool_name.clone()),
+    });
+
+    Ok(())
 }

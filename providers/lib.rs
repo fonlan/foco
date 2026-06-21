@@ -630,20 +630,28 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
                     "assistant messages cannot contain attachments".to_string(),
                 ));
             }
+            let reasoning = message
+                .reasoning
+                .as_deref()
+                .filter(|value| !value.trim().is_empty());
             if message.tool_calls.is_empty() {
-                if message.content.trim().is_empty() {
+                if message.content.trim().is_empty() && reasoning.is_none() {
                     return Err(ProviderConfigError::InvalidRequest(
-                        "assistant message content must not be empty unless it contains tool calls"
+                        "assistant message content or reasoning must not be empty unless it contains tool calls"
                             .to_string(),
                     ));
                 }
 
+                if message.content.trim().is_empty() {
+                    return Ok(ChatMessage::assistant(MessageContent::from_parts(vec![
+                        ContentPart::ReasoningContent(
+                            reasoning.expect("reasoning was checked above").to_string(),
+                        ),
+                    ])));
+                }
+
                 let mut chat_message = ChatMessage::assistant(message.content.clone());
-                if let Some(reasoning) = message
-                    .reasoning
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                {
+                if let Some(reasoning) = reasoning {
                     chat_message = chat_message.with_reasoning_content(Some(reasoning.to_string()));
                 }
 
@@ -655,12 +663,7 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
                 .iter()
                 .map(genai_tool_call)
                 .collect::<Vec<_>>();
-            if message.content.trim().is_empty()
-                && message
-                    .reasoning
-                    .as_deref()
-                    .is_none_or(|value| value.trim().is_empty())
-            {
+            if message.content.trim().is_empty() && reasoning.is_none() {
                 return Ok(ChatMessage::from(tool_calls));
             }
 
@@ -668,11 +671,7 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
             if !message.content.trim().is_empty() {
                 parts.push(ContentPart::Text(message.content.clone()));
             }
-            if let Some(reasoning) = message
-                .reasoning
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-            {
+            if let Some(reasoning) = reasoning {
                 parts.push(ContentPart::ReasoningContent(reasoning.to_string()));
             }
             if let Some(thought_signatures) = tool_calls
@@ -1271,6 +1270,29 @@ mod tests {
 
         assert!(chat_request.messages[1].content.contains_tool_call());
         assert!(chat_request.messages[2].content.contains_tool_response());
+    }
+
+    #[test]
+    fn converts_reasoning_only_assistant_messages_for_genai_continuation() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-4o-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::Assistant,
+                content: String::new(),
+                attachments: Vec::new(),
+                reasoning: Some("Thinking.".to_string()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        genai_chat_request(&request).expect("reasoning-only assistant message should convert");
     }
 
     #[test]

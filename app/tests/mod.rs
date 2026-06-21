@@ -2428,6 +2428,82 @@ fn neutral_messages_from_record_replays_complete_tool_state_and_skips_incomplete
 }
 
 #[test]
+fn neutral_messages_from_record_replays_stored_assistant_parts_in_order() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-part-replay-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Part replay chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Before.After.",
+            sequence: 0,
+            metadata_json: Some(
+                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one."},{"type":"text","text":"Before."},{"type":"toolCall","tool_call_id":"call-1"},{"type":"reasoning","text":"Think two."},{"type":"text","text":"After."}],"partsVersion":2,"partsSource":"live_sse"}"#,
+            ),
+        })
+        .expect("assistant message insert");
+    database
+        .insert_tool_call(NewToolCall {
+            id: "call-1",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md"}"#,
+            status: "completed",
+            started_at: "2026-06-21T10:00:00Z",
+            completed_at: Some("2026-06-21T10:00:01Z"),
+        })
+        .expect("tool call insert");
+    database
+        .insert_tool_result(NewToolResult {
+            id: "call-1-result",
+            tool_call_id: "call-1",
+            output_json: r#"{"content":"hello"}"#,
+            is_error: false,
+            created_at: "2026-06-21T10:00:01Z",
+        })
+        .expect("tool result insert");
+
+    let message = database
+        .messages_for_chat("chat-1")
+        .expect("messages")
+        .into_iter()
+        .next()
+        .expect("assistant message");
+    let messages =
+        neutral_messages_from_record(&database, message).expect("neutral message replay");
+
+    assert_eq!(messages.len(), 6);
+    assert_eq!(messages[0].role, NeutralChatRole::Assistant);
+    assert!(messages[0].content.is_empty());
+    assert_eq!(messages[0].reasoning.as_deref(), Some("Think one."));
+    assert_eq!(messages[1].role, NeutralChatRole::Assistant);
+    assert_eq!(messages[1].content, "Before.");
+    assert!(messages[1].reasoning.is_none());
+    assert_eq!(messages[2].role, NeutralChatRole::Assistant);
+    assert_eq!(messages[2].tool_calls[0].call_id, "call-1");
+    assert_eq!(messages[3].role, NeutralChatRole::Tool);
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call-1"));
+    assert_eq!(messages[4].role, NeutralChatRole::Assistant);
+    assert!(messages[4].content.is_empty());
+    assert_eq!(messages[4].reasoning.as_deref(), Some("Think two."));
+    assert_eq!(messages[5].role, NeutralChatRole::Assistant);
+    assert_eq!(messages[5].content, "After.");
+
+    drop(messages);
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn normalized_chat_attachments_rejects_invalid_payloads() {
     let invalid_base64 = normalized_chat_attachments(vec![ChatAttachmentInput {
         id: "att-1".to_string(),
