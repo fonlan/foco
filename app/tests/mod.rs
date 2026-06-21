@@ -3923,6 +3923,103 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
 }
 
 #[tokio::test]
+async fn team_chat_task_sse_returns_while_coordinator_task_is_still_queued() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-team-queued-stream-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-agent-team-queued-stream-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let chat_id = "chat-agent-queued-stream";
+    let team_id = foco_agent::AgentTeamId::new("agent-team-queued-stream").expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new("agent-instance-queued-stream").expect("instance id");
+    let running_task_id =
+        foco_agent::AgentTaskId::new("agent-task-queued-stream-running").expect("task id");
+    let queued_task_id =
+        foco_agent::AgentTaskId::new("agent-task-queued-stream-waiting").expect("task id");
+    let attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-queued-stream").expect("attempt id");
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat(chat_id, "Queued Coordinator stream")
+            .expect("chat insert");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-queued-stream").expect("definition id"),
+            revision: 1,
+            name: "Queued stream coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Coordinate.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id,
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                max_concurrent_runs: 1,
+            })
+            .expect("team create");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &running_task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue running task");
+        database
+            .claim_runnable_agent_task(&team_id, &running_task_id, &attempt_id)
+            .expect("claim running task")
+            .expect("running task claimed");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &queued_task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue queued task");
+    }
+
+    let state = test_app_state(config, profile_dir.clone());
+    let response = timeout(
+        Duration::from_millis(200),
+        crate::http::chat::team_chat_task_sse(&state, &workspace, &queued_task_id),
+    )
+    .await
+    .expect("queued Coordinator stream should not wait for task start")
+    .expect("queued Coordinator stream response");
+    drop(response);
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&queued_task_id)
+            .expect("queued task")
+            .expect("queued task")
+            .status,
+        foco_agent::AgentTaskStatus::Queued
+    );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn queue_chat_message_creates_default_team_for_normal_send() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-normal-queue-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-agent-normal-queue-profile"));

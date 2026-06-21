@@ -18,6 +18,7 @@ use foco_store::{
         workspace_database_path,
     },
 };
+use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::*;
@@ -28,6 +29,7 @@ type BoxedChatSse = Sse<KeepAliveStream<BoxedChatEventStream>>;
 
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete the user's task directly. When Agent team tools are available, coordinate or create worker agents only when that materially reduces the work.";
+const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub(crate) async fn queue_chat_message(
     State(state): State<AppState>,
@@ -422,52 +424,92 @@ fn boxed_chat_run_sse(subscription: ActiveChatRunSubscription) -> BoxedChatSse {
     )
 }
 
-async fn team_chat_task_sse(
+pub(crate) async fn team_chat_task_sse(
     state: &AppState,
     workspace: &WorkspaceConfig,
     task_id: &foco_agent::AgentTaskId,
 ) -> Result<BoxedChatSse, ApiError> {
-    for _ in 0..1_000 {
-        if let Ok(subscription) =
-            state
-                .active_chat_runs
-                .subscribe(&workspace.id, task_id.as_str(), Some(-1))
-        {
-            return Ok(boxed_chat_run_sse(subscription));
-        }
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
-        let task = database
-            .agent_task(task_id)
-            .map_err(ApiError::from_workspace_error)?
-            .ok_or_else(|| {
-                ApiError::bad_request(format!("Agent task '{task_id}' was not found"))
-            })?;
-        if task.status != foco_agent::AgentTaskStatus::Queued
-            && task.status != foco_agent::AgentTaskStatus::Running
-        {
-            let events = database
-                .run_events_for_run(task_id.as_str())
-                .map_err(ApiError::from_workspace_error)?;
-            let stream = async_stream::stream! {
+    let stream = team_chat_task_event_stream(state.clone(), workspace.clone(), task_id.clone());
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(10))
+            .text("keep-alive"),
+    ))
+}
+
+fn team_chat_task_event_stream(
+    state: AppState,
+    workspace: WorkspaceConfig,
+    task_id: foco_agent::AgentTaskId,
+) -> BoxedChatEventStream {
+    let stream = async_stream::stream! {
+        // ponytail: polling avoids a new task-status broadcast; switch to notifications if queued streams become numerous.
+        loop {
+            if let Ok(subscription) =
+                state
+                    .active_chat_runs
+                    .subscribe(&workspace.id, task_id.as_str(), Some(-1))
+            {
+                let subscription_stream = chat_run_subscription_stream(subscription);
+                futures_util::pin_mut!(subscription_stream);
+                while let Some(event) = subscription_stream.next().await {
+                    yield event;
+                }
+                return;
+            }
+
+            let database = match WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)
+            {
+                Ok(database) => database,
+                Err(error) => {
+                    yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
+                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                    return;
+                }
+            };
+            let task = match database
+                .agent_task(&task_id)
+                .map_err(ApiError::from_workspace_error)
+            {
+                Ok(Some(task)) => task,
+                Ok(None) => {
+                    yield Ok(sse_event(&ChatSseEvent::Error {
+                        message: format!("Agent task '{task_id}' was not found"),
+                    }));
+                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                    return;
+                }
+                Err(error) => {
+                    yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
+                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                    return;
+                }
+            };
+            if task.status != foco_agent::AgentTaskStatus::Queued
+                && task.status != foco_agent::AgentTaskStatus::Running
+            {
+                let events = match database
+                    .run_events_for_run(task_id.as_str())
+                    .map_err(ApiError::from_workspace_error)
+                {
+                    Ok(events) => events,
+                    Err(error) => {
+                        yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
+                        yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                        return;
+                    }
+                };
                 for event in events {
                     yield Ok(Event::default().data(event.payload_json));
                 }
                 yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-            };
-            let stream: BoxedChatEventStream = Box::pin(stream);
-            return Ok(Sse::new(stream).keep_alive(
-                KeepAlive::new()
-                    .interval(Duration::from_secs(10))
-                    .text("keep-alive"),
-            ));
+                return;
+            }
+            tokio::time::sleep(TEAM_CHAT_TASK_STREAM_POLL_INTERVAL).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-
-    Err(ApiError::internal(format!(
-        "Coordinator task '{task_id}' did not start within 10 seconds"
-    )))
+    };
+    Box::pin(stream)
 }
 
 pub(crate) async fn subscribe_chat_run(
