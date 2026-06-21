@@ -1419,6 +1419,36 @@ fn new_provider_is_associated_with_matching_local_models() {
     assert_eq!(models[2].active_provider_id, None);
 }
 
+#[test]
+fn provider_model_refresh_removes_stale_local_model_associations() {
+    let mut models = vec![
+        ModelSettings {
+            provider_ids: vec!["refreshed-provider".to_string(), "fallback".to_string()],
+            active_provider_id: Some("refreshed-provider".to_string()),
+            ..test_model_settings("removed-model")
+        },
+        ModelSettings {
+            provider_ids: vec!["fallback".to_string()],
+            active_provider_id: Some("fallback".to_string()),
+            ..test_model_settings("added-model")
+        },
+    ];
+
+    associate_provider_with_local_models(
+        &mut models,
+        "refreshed-provider",
+        &["added-model".to_string()],
+    );
+
+    assert_eq!(models[0].provider_ids, vec!["fallback"]);
+    assert_eq!(models[0].active_provider_id.as_deref(), Some("fallback"));
+    assert_eq!(
+        models[1].provider_ids,
+        vec!["fallback", "refreshed-provider"]
+    );
+    assert_eq!(models[1].active_provider_id.as_deref(), Some("fallback"));
+}
+
 fn test_agent_definition_input() -> AgentDefinitionInput {
     AgentDefinitionInput {
         name: "Coordinator".to_string(),

@@ -906,6 +906,11 @@ export type ProviderModelsResponse = {
   models: string[];
 };
 
+export type ProviderModelsRefreshResponse = {
+  settings: SettingsResponse;
+  providers: ProviderModelsResponse[];
+};
+
 export type ProviderTestState = {
   message: string;
   status: "error" | "ok" | "testing";

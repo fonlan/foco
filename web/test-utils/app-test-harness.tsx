@@ -1603,6 +1603,21 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse(savedSettings.provider);
   }
 
+  if (path === "/api/providers/models/refresh") {
+    return jsonResponse({
+      providers: [
+        { providerId: "openai", models: ["gpt-4.1-refresh", "gpt-4.1-mini"] },
+        { providerId: "anthropic", models: [] },
+      ],
+      settings: {
+        ...settings,
+        providers: settings.providers.map((provider) =>
+          provider.id === "anthropic" ? { ...provider, enabled: false } : provider,
+        ),
+      },
+    });
+  }
+
   if (path === "/api/providers/models") {
     return jsonResponse({
       providerId: "openai",

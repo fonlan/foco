@@ -789,6 +789,10 @@ fn app_router(state: AppState) -> Router {
             post(crate::http::settings::provider_models),
         )
         .route(
+            "/api/providers/models/refresh",
+            post(crate::http::settings::refresh_provider_models),
+        )
+        .route(
             "/api/model-metadata",
             get(crate::http::settings::model_metadata),
         )
@@ -2363,6 +2367,13 @@ struct ProviderTestResponse {
 struct ProviderModelsResponse {
     provider_id: String,
     models: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderModelsRefreshResponse {
+    settings: SettingsResponse,
+    providers: Vec<ProviderModelsResponse>,
 }
 
 #[derive(Serialize)]

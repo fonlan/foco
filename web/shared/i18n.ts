@@ -750,6 +750,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No request overrides configured.": "暂无请求字段覆写。",
     "Configured providers": "已配置供应商",
     "Provider models": "供应商模型",
+    "Refresh provider models": "刷新供应商模型",
     "Load provider models": "加载供应商模型",
     "Hide provider models": "隐藏供应商模型",
     "Load provider models for {name}": "加载供应商 {name} 的模型",

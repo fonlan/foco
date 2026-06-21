@@ -81,6 +81,47 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
   });
 
+  it("refreshes configured provider model support", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+    const providersSection = screen.getByText("Configured providers").closest("section");
+    expect(providersSection).not.toBeNull();
+
+    await userEvent.click(
+      within(providersSection as HTMLElement).getByRole("button", {
+        name: "Refresh provider models",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/providers/models/refresh",
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    expect(await within(providersSection as HTMLElement).findByText("disabled")).toBeInTheDocument();
+
+    const singleProviderFetchCount = fetchMock.mock.calls.filter(
+      ([url]) => url === "/api/providers/models",
+    ).length;
+    await userEvent.click(
+      within(providersSection as HTMLElement).getByRole("button", {
+        name: "Load provider models for OpenAI",
+      }),
+    );
+
+    expect(
+      await within(providersSection as HTMLElement).findByText("gpt-4.1-refresh"),
+    ).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([url]) => url === "/api/providers/models"),
+    ).toHaveLength(singleProviderFetchCount);
+  });
+
   it("toggles the app theme from the nav rail", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

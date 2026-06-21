@@ -196,6 +196,7 @@ import type {
   PromptSettingsSummary,
   ProviderFormState,
   ProviderModelsResponse,
+  ProviderModelsRefreshResponse,
   ProviderRequestOverrideFormState,
   ProviderRequestOverrideTarget,
   ProviderRequestOverrideValueType,
@@ -10918,6 +10919,8 @@ function SettingsPanel({
   const [isSelectingWorkspaceFormPath, setIsSelectingWorkspaceFormPath] =
     useState(false);
   const [isSavingProvider, setIsSavingProvider] = useState(false);
+  const [isRefreshingProviderModels, setIsRefreshingProviderModels] =
+    useState(false);
   const [isSavingMcpServer, setIsSavingMcpServer] = useState(false);
   const [isSavingModelOrder, setIsSavingModelOrder] = useState(false);
   const [isSavingSkills, setIsSavingSkills] = useState(false);
@@ -13308,6 +13311,36 @@ function SettingsPanel({
           status: "error",
         },
       }));
+    }
+  }
+
+  async function refreshProviderModels() {
+    setIsRefreshingProviderModels(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<ProviderModelsRefreshResponse>(
+        "/api/providers/models/refresh",
+        { method: "POST" },
+      );
+      setSettings(data.settings);
+      onSettingsChange(data.settings);
+      setProviderTests({});
+      setProviderModelLists((current) => {
+        const next = { ...current };
+        for (const provider of data.providers) {
+          next[provider.providerId] = {
+            message: null,
+            models: provider.models,
+            status: "ok",
+          };
+        }
+        return next;
+      });
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsRefreshingProviderModels(false);
     }
   }
 
@@ -17098,14 +17131,14 @@ function SettingsPanel({
                       <Plus aria-hidden="true" className="size-4" />
                     </button>
                     <button
-                      aria-label={t("Reload settings")}
+                      aria-label={t("Refresh provider models")}
                       className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                      disabled={isLoadingSettings}
-                      onClick={() => void loadSettings()}
-                      title={t("Reload settings")}
+                      disabled={isLoadingSettings || isRefreshingProviderModels}
+                      onClick={() => void refreshProviderModels()}
+                      title={t("Refresh provider models")}
                       type="button"
                     >
-                      {isLoadingSettings ? (
+                      {isRefreshingProviderModels ? (
                         <LoaderCircle
                           aria-hidden="true"
                           className="size-4 animate-spin"

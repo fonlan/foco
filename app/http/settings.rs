@@ -590,16 +590,85 @@ pub(crate) fn associate_provider_with_local_models(
         .collect::<HashSet<_>>();
 
     for model in models {
-        if !provider_model_ids.contains(model.id.as_str()) {
-            continue;
+        if provider_model_ids.contains(model.id.as_str()) {
+            if !model.provider_ids.iter().any(|id| id == provider_id) {
+                model.provider_ids.push(provider_id.to_string());
+            }
+            if model.active_provider_id.is_none() {
+                model.active_provider_id = Some(provider_id.to_string());
+            }
+        } else if model.provider_ids.iter().any(|id| id == provider_id) {
+            model.provider_ids.retain(|id| id != provider_id);
+            if model.active_provider_id.as_deref() == Some(provider_id) {
+                model.active_provider_id = model.provider_ids.first().cloned();
+            }
         }
+    }
+}
 
-        if !model.provider_ids.iter().any(|id| id == provider_id) {
-            model.provider_ids.push(provider_id.to_string());
-        }
-        if model.active_provider_id.is_none() {
-            model.active_provider_id = Some(provider_id.to_string());
-        }
+pub(crate) async fn refresh_provider_models(
+    State(state): State<AppState>,
+) -> Result<Json<ProviderModelsRefreshResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    let providers = config.providers.clone();
+    let mut refreshed_providers = Vec::new();
+
+    for provider in providers {
+        let models = match provider_connection_config(&provider) {
+            Ok(connection_config) => match fetch_provider_model_ids(&connection_config).await {
+                Ok(model_ids) => {
+                    associate_provider_with_local_models(
+                        &mut config.models,
+                        &provider.id,
+                        &model_ids,
+                    );
+                    model_ids
+                }
+                Err(source) => {
+                    tracing::warn!(
+                        provider_id = %provider.id,
+                        error = ?source,
+                        "disabling provider after model list refresh failed"
+                    );
+                    disable_provider(&mut config.providers, &provider.id);
+                    Vec::new()
+                }
+            },
+            Err(source) => {
+                tracing::warn!(
+                    provider_id = %provider.id,
+                    error = ?source,
+                    "disabling provider after provider config build failed"
+                );
+                disable_provider(&mut config.providers, &provider.id);
+                Vec::new()
+            }
+        };
+
+        refreshed_providers.push(ProviderModelsResponse {
+            provider_id: provider.id,
+            models,
+        });
+    }
+
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    save_config(&state, config.clone())?;
+
+    let Json(settings) = settings_response(&state, &config).await?;
+    Ok(Json(ProviderModelsRefreshResponse {
+        providers: refreshed_providers,
+        settings,
+    }))
+}
+
+fn disable_provider(providers: &mut [ProviderSettings], provider_id: &str) {
+    if let Some(provider) = providers
+        .iter_mut()
+        .find(|provider| provider.id == provider_id)
+    {
+        provider.enabled = false;
     }
 }
 
