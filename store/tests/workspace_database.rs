@@ -2103,6 +2103,88 @@ fn two_schedulers_cannot_claim_the_same_agent_task() {
 }
 
 #[test]
+fn agent_team_max_concurrent_runs_blocks_second_instance_claim() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-agent-team-limit", "team-limit");
+    let worker_id = create_test_agent_worker(&database, &team_id, "team-limit-worker");
+    let first_task = AgentTaskId::new("agent-task-team-limit-first").expect("task id");
+    let second_task = AgentTaskId::new("agent-task-team-limit-second").expect("task id");
+
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &first_task,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("first enqueue");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &second_task,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&first_task),
+            input_json: "{}",
+        })
+        .expect("second enqueue");
+
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &first_task,
+            &AgentAttemptId::new("agent-attempt-team-limit-first").expect("attempt id"),
+        )
+        .expect("claim first task")
+        .expect("first task claimed");
+    assert!(
+        database
+            .runnable_agent_tasks(10)
+            .expect("runnable while team is saturated")
+            .is_empty()
+    );
+    assert!(
+        database
+            .claim_runnable_agent_task(
+                &team_id,
+                &second_task,
+                &AgentAttemptId::new("agent-attempt-team-limit-blocked").expect("attempt id"),
+            )
+            .expect("claim blocked second task")
+            .is_none(),
+        "team max_concurrent_runs=1 must block another running task"
+    );
+
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &first_task,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"done"}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete first task");
+    assert_eq!(
+        database.runnable_agent_tasks(10).expect("runnable")[0].id,
+        second_task
+    );
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &second_task,
+            &AgentAttemptId::new("agent-attempt-team-limit-second").expect("attempt id"),
+        )
+        .expect("claim second task")
+        .expect("second task claimed");
+}
+
+#[test]
 fn messages_for_chat_filters_worker_agent_assistant_messages() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
@@ -2942,6 +3024,13 @@ fn phase8_runnable_tasks_are_fair_and_keep_instance_fifo() {
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
     let (team_id, _) =
         create_test_agent_team(&mut database, "chat-agent-phase8-fair", "phase8-fair");
+    Connection::open(database.database_path())
+        .expect("database connection")
+        .execute(
+            "UPDATE agent_teams SET max_concurrent_runs = 2 WHERE id = ?1",
+            params![team_id.as_str()],
+        )
+        .expect("raise team run limit");
     let definition = phase8_agent_definition("phase8-fair-worker", 1, 4);
     let first_id = AgentInstanceId::new("agent-instance-phase8-fair-a").expect("instance id");
     let second_id = AgentInstanceId::new("agent-instance-phase8-fair-b").expect("instance id");

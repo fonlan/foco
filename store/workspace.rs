@@ -3230,6 +3230,12 @@ impl WorkspaceDatabase {
                  JOIN agent_teams AS team ON team.id = task.team_id
                  WHERE task.status = 'queued' AND instance.status IN ('idle', 'draining')
                    AND team.status IN ('active', 'draining')
+                   AND (
+                        SELECT COUNT(*)
+                        FROM agent_tasks AS running_task
+                        WHERE running_task.team_id = task.team_id
+                          AND running_task.status = 'running'
+                   ) < team.max_concurrent_runs
                    AND NOT EXISTS (
                         SELECT 1 FROM agent_tasks AS earlier_task
                         WHERE earlier_task.owner_instance_id = task.owner_instance_id
@@ -3307,6 +3313,12 @@ impl WorkspaceDatabase {
                  WHERE task.id = ?1 AND task.team_id = ?2 AND task.status = 'queued'
                    AND instance.status IN ('idle', 'draining')
                    AND team.status IN ('active', 'draining')
+                   AND (
+                        SELECT COUNT(*)
+                        FROM agent_tasks AS running_task
+                        WHERE running_task.team_id = task.team_id
+                          AND running_task.status = 'running'
+                   ) < team.max_concurrent_runs
                    AND NOT EXISTS (
                         SELECT 1 FROM agent_tasks AS earlier_task
                         WHERE earlier_task.owner_instance_id = task.owner_instance_id
