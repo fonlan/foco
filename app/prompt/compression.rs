@@ -5,7 +5,6 @@ use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
 use foco_store::workspace::{ContextCompressionSnapshotRecord, ToolCallWithResultRecord};
 use serde_json::{Value, json};
 
-use crate::memory_runtime::MemoryExtractionHandle;
 use crate::*;
 
 pub(crate) fn neutral_tool_call_from_record(
@@ -1423,7 +1422,7 @@ pub(crate) fn persist_chat_result(
     assistant_text: Option<&str>,
     assistant_reasoning: Option<&str>,
     tool_calls: &[ExecutedToolCall],
-) -> Result<Option<MemoryExtractionHandle>, ApiError> {
+) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let final_state = outcome.final_state;
@@ -1547,13 +1546,11 @@ pub(crate) fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
-    let memory_extraction = if context.agent_primary_chat_output {
-        queue_memory_extraction_job(context, final_state)?
-    } else {
-        None
-    };
+    if context.agent_primary_chat_output {
+        queue_memory_extraction_job(context, final_state)?;
+    }
 
-    Ok(memory_extraction)
+    Ok(())
 }
 
 pub(crate) fn persist_running_llm_request(

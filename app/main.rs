@@ -4605,27 +4605,8 @@ impl PreparedChatContext {
                                 };
 
                                 match persist_chat_result(&self, &request_started_at, outcome, &events, Some(&assistant_message_text), non_empty_string(&assistant_reasoning).as_deref(), &executed_tool_calls) {
-                                    Ok(memory_extraction) => {
+                                    Ok(()) => {
                                         yield complete_event;
-                                        if let Some(memory_extraction) = memory_extraction {
-                                            match memory_extraction.wait().await {
-                                                Ok(extracted_memories) => {
-                                                    let extracted_memories: Vec<ChatExtractedMemorySummary> = extracted_memories;
-                                                    if !extracted_memories.is_empty() {
-                                                        yield ChatSseEvent::MemoryExtractionComplete {
-                                                            assistant_message_id: self.assistant_message_id.clone(),
-                                                            extracted_memories,
-                                                        };
-                                                    }
-                                                }
-                                                Err(error) => {
-                                                    tracing::warn!(
-                                                        error = %error.message,
-                                                        "memory extraction job worker failed"
-                                                    );
-                                                }
-                                            }
-                                        }
                                     }
                                     Err(error) => {
                                         let event = ChatSseEvent::Error {

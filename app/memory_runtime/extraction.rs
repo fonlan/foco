@@ -44,18 +44,6 @@ pub(crate) struct MemoryExtractionTask {
     pub(crate) config: GlobalConfig,
 }
 
-pub(crate) struct MemoryExtractionHandle {
-    pub(crate) task: tokio::task::JoinHandle<Result<Vec<ChatExtractedMemorySummary>, ApiError>>,
-}
-
-impl MemoryExtractionHandle {
-    pub(crate) async fn wait(self) -> Result<Vec<ChatExtractedMemorySummary>, ApiError> {
-        self.task.await.map_err(|source| {
-            ApiError::internal(format!("memory extraction worker failed: {source}"))
-        })?
-    }
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct MemoryExtractionEvidenceCandidate {
     pub(crate) evidence_id: String,
@@ -112,9 +100,9 @@ pub(crate) struct ValidatedExtractedMemoryFact {
 pub(crate) fn queue_memory_extraction_job(
     context: &PreparedChatContext,
     final_state: &str,
-) -> Result<Option<MemoryExtractionHandle>, ApiError> {
+) -> Result<(), ApiError> {
     if final_state != "succeeded" || !should_queue_memory_extraction(&context.memory_settings) {
-        return Ok(None);
+        return Ok(());
     }
 
     let target_status = memory_extraction_target_status(
@@ -158,7 +146,13 @@ pub(crate) fn queue_memory_extraction_job(
         .map_err(ApiError::from_memory_error)?;
 
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        return Ok(None);
+        tracing::warn!(
+            job_id = %job_id,
+            workspace_id = %context.workspace_id,
+            chat_id = %context.chat_id,
+            "memory extraction job queued without an active async runtime"
+        );
+        return Ok(());
     };
     let task = MemoryExtractionTask {
         job_id: job_id.clone(),
@@ -173,9 +167,22 @@ pub(crate) fn queue_memory_extraction_job(
         target_status,
         config: context.global_config.clone(),
     };
-    let task = handle.spawn(run_memory_extraction_job(task));
+    handle.spawn(async move {
+        let job_id = task.job_id.clone();
+        let workspace_id = task.workspace_id.clone();
+        let chat_id = task.chat_id.clone();
+        if let Err(error) = run_memory_extraction_job(task).await {
+            tracing::warn!(
+                job_id = %job_id,
+                workspace_id = %workspace_id,
+                chat_id = %chat_id,
+                error = %error.message,
+                "memory extraction background job failed"
+            );
+        }
+    });
 
-    Ok(Some(MemoryExtractionHandle { task }))
+    Ok(())
 }
 
 pub(crate) fn should_queue_memory_extraction(settings: &MemorySettings) -> bool {

@@ -4247,7 +4247,7 @@ fn queued_team_runs_cleanup_only_their_own_uploaded_attachments() {
 }
 
 #[test]
-fn persist_chat_result_writes_audit_status_code() {
+fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-audit-status-code-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let team_id = foco_agent::AgentTeamId::new("agent-team-audit").expect("team id");
