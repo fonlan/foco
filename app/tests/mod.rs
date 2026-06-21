@@ -3348,6 +3348,162 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
 }
 
 #[test]
+fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-streaming-history-parts-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Streaming history order")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Before.After.",
+            sequence: 0,
+            metadata_json: Some(
+                r#"{"reasoning":"Think one.Think two.","streamingState":"streaming"}"#,
+            ),
+        })
+        .expect("assistant insert");
+    for (sequence, event_type, value) in [
+        (
+            0,
+            "reasoning_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Think one." }),
+        ),
+        (
+            1,
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Before." }),
+        ),
+        (
+            2,
+            "tool_call",
+            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-1" } }),
+        ),
+        (
+            3,
+            "reasoning_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Think two." }),
+        ),
+        (
+            4,
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "After." }),
+        ),
+    ] {
+        database
+            .insert_run_event(NewRunEvent {
+                id: &format!("run-event-{sequence}"),
+                chat_id: "chat-1",
+                run_id: "agent-task-1",
+                sequence,
+                event_type,
+                payload_json: &value.to_string(),
+            })
+            .expect("run event insert");
+    }
+    database
+        .insert_tool_call(NewToolCall {
+            id: "tool-1",
+            chat_id: "chat-1",
+            run_id: "agent-task-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"README.md"}"#,
+            status: "running",
+            started_at: "2026-06-18T10:00:00Z",
+            completed_at: None,
+        })
+        .expect("tool insert");
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
+        .into_iter()
+        .next()
+        .expect("assistant summary");
+    assert!(
+        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text } if text == "Think one.")
+    );
+    assert!(matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Before."));
+    assert!(
+        matches!(&summary.parts[2], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-1")
+    );
+    assert!(
+        matches!(&summary.parts[3], ChatMessagePart::Reasoning { text } if text == "Think two.")
+    );
+    assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "After."));
+
+    let saved = database
+        .message("assistant-1")
+        .expect("saved message read")
+        .expect("saved message");
+    assert!(
+        saved
+            .metadata_json
+            .contains(r#""streamingState":"streaming""#)
+    );
+    assert!(
+        saved
+            .metadata_json
+            .contains(r#""partsSource":"run_events""#)
+    );
+    assert!(saved.metadata_json.contains(r#""partsVersion":2"#));
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn historical_chat_fallback_parts_are_not_cached_as_run_events() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-history-fallback-parts-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Fallback history")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Fallback answer.",
+            sequence: 0,
+            metadata_json: Some(r#"{"reasoning":"Fallback reasoning."}"#),
+        })
+        .expect("assistant insert");
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
+        .into_iter()
+        .next()
+        .expect("assistant summary");
+    assert!(
+        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text } if text == "Fallback reasoning.")
+    );
+    assert!(
+        matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Fallback answer.")
+    );
+
+    let saved = database
+        .message("assistant-1")
+        .expect("saved message read")
+        .expect("saved message");
+    assert!(!saved.metadata_json.contains("partsSource"));
+    assert!(!saved.metadata_json.contains("partsVersion"));
+    assert!(!saved.metadata_json.contains(r#""parts""#));
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn workspace_logo_file_detects_manual_logo_png() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-workspace-logo-test"));
     let logo_dir = workspace_dir.join(".foco");

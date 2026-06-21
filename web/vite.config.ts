@@ -25,12 +25,13 @@ export default defineConfig({
               test: isMarkdownVendorModule,
             },
             {
+              name: "vendor-monaco",
+              test: /node_modules[\\/]monaco-editor[\\/]/,
+            },
+            {
               maxSize: 450 * 1024,
               name: (moduleId) => {
                 const normalized = moduleId.replaceAll("\\", "/");
-                if (normalized.includes("/node_modules/monaco-editor/")) {
-                  return "vendor-monaco";
-                }
                 if (normalized.includes("/node_modules/@xterm/")) {
                   return "vendor-terminal";
                 }

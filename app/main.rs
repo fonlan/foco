@@ -9821,7 +9821,7 @@ fn assistant_message_needs_part_materialization(metadata_json: &str) -> Result<b
         return Ok(false);
     }
 
-    Ok(metadata.get("streamingState").and_then(Value::as_str) != Some("streaming"))
+    Ok(true)
 }
 
 fn assistant_message_has_current_parts(metadata: &Value) -> bool {
@@ -9951,20 +9951,12 @@ fn materialize_missing_assistant_parts(
         .iter_mut()
         .filter(|message| message.role == "assistant" && missing_message_ids.contains(&message.id))
     {
-        let tool_calls = tool_calls_by_message
-            .get(&message.id)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let reasoning = assistant_reasoning_from_metadata(&message.metadata_json)?;
         let mut metadata = parse_json_value(&message.metadata_json, "assistant message metadata")?;
-        let has_current_parts = assistant_message_has_current_parts(&metadata);
-        let parts_from_run_events = parts_by_message
+        let Some(parts) = parts_by_message
             .remove(&message.id)
-            .filter(|parts| !parts.is_empty());
-        let parts = match parts_from_run_events {
-            Some(parts) => parts,
-            None if has_current_parts => continue,
-            None => fallback_chat_message_parts(&message.content, reasoning.as_deref(), tool_calls),
+            .filter(|parts| !parts.is_empty())
+        else {
+            continue;
         };
         let stored_parts = stored_chat_message_parts(parts)?;
         let metadata = metadata.as_object_mut().ok_or_else(|| {

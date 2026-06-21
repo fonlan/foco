@@ -4606,6 +4606,21 @@ export function App() {
         if (streamEvent.type === "start") {
           assistantMessageId = streamEvent.assistantMessageId;
           currentAssistantMessageId = streamEvent.assistantMessageId;
+          setMessagesForChatKey(chatKey, (current) =>
+            current.map((message) =>
+              message.role === "assistant" && message.id === streamEvent.assistantMessageId
+                ? {
+                  ...message,
+                  content: "",
+                  reasoning: null,
+                  toolCalls: [],
+                  parts: [],
+                  metrics: null,
+                  status: "streaming",
+                }
+                : message,
+            ),
+          );
           ensureStreamingAssistantMessage(
             streamEvent.assistantMessageId,
             streamEvent.memoriesUsed,

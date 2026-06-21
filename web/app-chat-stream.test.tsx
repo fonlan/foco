@@ -1736,7 +1736,21 @@ describe("app-chat-stream verification surfaces", () => {
 
       if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
         return jsonResponse({
-          ...chatMessages,
+          messages: [
+            chatMessages.messages[0],
+            {
+              ...chatMessages.messages[1],
+              content: "Persisted fallback text.",
+              id: "message-assistant-stream",
+              metrics: null,
+              parts: [
+                { text: "Persisted fallback reasoning.", type: "reasoning" },
+                { text: "Persisted fallback text.", type: "text" },
+              ],
+              reasoning: "Persisted fallback reasoning.",
+              toolCalls: [],
+            },
+          ],
           activeRun: {
             chatId: "chat-1",
             lastSequence: 0,
@@ -1772,6 +1786,8 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(await screen.findByText("Still running.")).toBeInTheDocument();
+    expect(screen.queryByText("Persisted fallback text.")).not.toBeInTheDocument();
+    expect(screen.queryByText("Persisted fallback reasoning.")).not.toBeInTheDocument();
     expect(screen.getByRole("status", { name: "Chat is running" })).toBeInTheDocument();
 
     await act(async () => {
