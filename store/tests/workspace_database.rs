@@ -2118,7 +2118,7 @@ fn messages_for_chat_filters_worker_agent_assistant_messages() {
             owner_instance_id: &worker_id,
             origin_instance_id: Some(&coordinator_id),
             parent_task_id: None,
-            input_json: "{}",
+            input_json: r#"{"queuedUserMessageId":"user-worker"}"#,
         })
         .expect("worker task enqueue");
     database
@@ -2143,11 +2143,21 @@ fn messages_for_chat_filters_worker_agent_assistant_messages() {
         .expect("main assistant message insert");
     database
         .insert_message(NewMessage {
+            id: "user-worker",
+            chat_id: "chat-agent-message-filter",
+            role: "user",
+            content: "Worker-only prompt",
+            sequence: 2,
+            metadata_json: None,
+        })
+        .expect("worker user message insert");
+    database
+        .insert_message(NewMessage {
             id: "assistant-worker",
             chat_id: "chat-agent-message-filter",
             role: "assistant",
             content: "Worker-only answer",
-            sequence: 2,
+            sequence: 3,
             metadata_json: None,
         })
         .expect("worker assistant message insert");

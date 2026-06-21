@@ -708,14 +708,14 @@ impl WorkspaceDatabase {
                  FROM messages
                  WHERE chat_id = ?1
                    AND id NOT IN (
-                       SELECT assistant_message_id
+                       SELECT private_message_id
                        FROM (
                            SELECT DISTINCT CAST(
                                COALESCE(
                                    json_extract(run_events.payload_json, '$.assistantMessageId'),
                                    json_extract(run_events.payload_json, '$.assistant_message_id')
                                ) AS TEXT
-                           ) AS assistant_message_id
+                           ) AS private_message_id
                            FROM run_events
                            INNER JOIN agent_tasks
                               ON agent_tasks.id = run_events.run_id
@@ -725,9 +725,21 @@ impl WorkspaceDatabase {
                            WHERE run_events.chat_id = ?1
                              AND run_events.event_type = 'start'
                              AND agent_tasks.owner_instance_id <> agent_teams.coordinator_instance_id
+                           UNION
+                           SELECT DISTINCT CAST(
+                               COALESCE(
+                                   json_extract(agent_tasks.input_json, '$.queuedUserMessageId'),
+                                   json_extract(agent_tasks.input_json, '$.queued_user_message_id')
+                               ) AS TEXT
+                           ) AS private_message_id
+                           FROM agent_tasks
+                           INNER JOIN agent_teams
+                              ON agent_teams.id = agent_tasks.team_id
+                           WHERE agent_teams.chat_id = ?1
+                             AND agent_tasks.owner_instance_id <> agent_teams.coordinator_instance_id
                        )
-                       WHERE assistant_message_id IS NOT NULL
-                         AND assistant_message_id <> ''
+                       WHERE private_message_id IS NOT NULL
+                         AND private_message_id <> ''
                    )
                  ORDER BY sequence ASC",
             )
