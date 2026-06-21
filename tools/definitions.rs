@@ -681,7 +681,7 @@ fn sleep_definition() -> ToolDefinition {
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
-                    "description": "Optional tool timeout in milliseconds. Defaults to 300000."
+                    "description": "Optional tool timeout in milliseconds. Defaults to 600000."
                 }
             },
             "required": ["durationMs", "timeoutMs"]
