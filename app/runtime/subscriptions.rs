@@ -26,6 +26,7 @@ pub(crate) struct ActiveChatRunRegistry {
 struct ActiveChatRun {
     workspace_id: String,
     chat_id: String,
+    primary_chat_output: bool,
     guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
     accepting_guidance: bool,
     cancellation: ChatRunCancellation,
@@ -120,6 +121,7 @@ impl ActiveChatRunRegistry {
         assistant_message_id: String,
         assistant_sequence: i64,
         memories_used: Vec<ChatMemoryUsedSummary>,
+        primary_chat_output: bool,
         guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
     ) -> Result<ActiveChatRunRegistration, ApiError> {
         let mut runs = self
@@ -142,6 +144,7 @@ impl ActiveChatRunRegistry {
             ActiveChatRun {
                 workspace_id,
                 chat_id,
+                primary_chat_output,
                 guidance_tx,
                 accepting_guidance: true,
                 cancellation: cancellation.clone(),
@@ -157,6 +160,7 @@ impl ActiveChatRunRegistry {
             assistant_message_id,
             assistant_sequence,
             memories_used,
+            primary_chat_output,
             cancellation,
             events,
             event_tx,
@@ -195,6 +199,7 @@ impl ActiveChatRunRegistry {
             .filter(|(_, run)| {
                 run.workspace_id == workspace_id
                     && run.chat_id == chat_id
+                    && run.primary_chat_output
                     && !*run.completed_rx.borrow()
             })
             .collect::<Vec<_>>();
@@ -341,6 +346,7 @@ pub(crate) struct ActiveChatRunRegistration {
     assistant_message_id: String,
     assistant_sequence: i64,
     memories_used: Vec<ChatMemoryUsedSummary>,
+    primary_chat_output: bool,
     cancellation: ChatRunCancellation,
     events: Arc<Mutex<Vec<ChatRunEventFrame>>>,
     event_tx: broadcast::Sender<ChatRunEventFrame>,
@@ -384,8 +390,10 @@ impl ActiveChatRunRegistration {
                     payload_json: &event_frame.payload_json,
                 })
                 .map_err(ApiError::from_workspace_error)?;
-            self.persist_assistant_draft_for_event(&mut database, chat_id, event)?;
-            self.persist_tool_state_for_event(&mut database, chat_id, event)?;
+            if self.primary_chat_output {
+                self.persist_assistant_draft_for_event(&mut database, chat_id, event)?;
+                self.persist_tool_state_for_event(&mut database, chat_id, event)?;
+            }
         }
 
         self.events

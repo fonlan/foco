@@ -2098,6 +2098,76 @@ fn two_schedulers_cannot_claim_the_same_agent_task() {
 }
 
 #[test]
+fn messages_for_chat_filters_worker_agent_assistant_messages() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-agent-message-filter", "message-filter");
+    let worker_id = create_test_agent_worker(&database, &team_id, "message-filter-worker");
+    let worker_task_id =
+        AgentTaskId::new("agent-task-message-filter-worker").expect("worker task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &worker_task_id,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("worker task enqueue");
+    database
+        .insert_message(NewMessage {
+            id: "user-main",
+            chat_id: "chat-agent-message-filter",
+            role: "user",
+            content: "Main request",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("user message insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-main",
+            chat_id: "chat-agent-message-filter",
+            role: "assistant",
+            content: "Main answer",
+            sequence: 1,
+            metadata_json: None,
+        })
+        .expect("main assistant message insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-worker",
+            chat_id: "chat-agent-message-filter",
+            role: "assistant",
+            content: "Worker-only answer",
+            sequence: 2,
+            metadata_json: None,
+        })
+        .expect("worker assistant message insert");
+    database
+        .insert_run_event(NewRunEvent {
+            id: "worker-run-start",
+            chat_id: "chat-agent-message-filter",
+            run_id: worker_task_id.as_str(),
+            sequence: 0,
+            event_type: "start",
+            payload_json: r#"{"assistantMessageId":"assistant-worker"}"#,
+        })
+        .expect("worker start event insert");
+
+    let message_ids = database
+        .messages_for_chat("chat-agent-message-filter")
+        .expect("messages for chat")
+        .into_iter()
+        .map(|message| message.id)
+        .collect::<Vec<_>>();
+
+    assert_eq!(message_ids, vec!["user-main", "assistant-main"]);
+}
+
+#[test]
 fn agent_queue_limits_and_team_lifecycle_are_enforced() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");

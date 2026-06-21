@@ -400,6 +400,7 @@ pub(crate) async fn stream_chat_response(
         chat_context.assistant_message_id.clone(),
         chat_context.assistant_sequence,
         chat_context.memories_used.clone(),
+        chat_context.agent_primary_chat_output,
         guidance_tx,
     )?;
     let subscription = state

@@ -698,6 +698,28 @@ impl WorkspaceDatabase {
                 "SELECT id, chat_id, role, content, sequence, created_at, metadata_json
                  FROM messages
                  WHERE chat_id = ?1
+                   AND id NOT IN (
+                       SELECT assistant_message_id
+                       FROM (
+                           SELECT DISTINCT CAST(
+                               COALESCE(
+                                   json_extract(run_events.payload_json, '$.assistantMessageId'),
+                                   json_extract(run_events.payload_json, '$.assistant_message_id')
+                               ) AS TEXT
+                           ) AS assistant_message_id
+                           FROM run_events
+                           INNER JOIN agent_tasks
+                              ON agent_tasks.id = run_events.run_id
+                           INNER JOIN agent_teams
+                              ON agent_teams.id = agent_tasks.team_id
+                             AND agent_teams.chat_id = run_events.chat_id
+                           WHERE run_events.chat_id = ?1
+                             AND run_events.event_type = 'start'
+                             AND agent_tasks.owner_instance_id <> agent_teams.coordinator_instance_id
+                       )
+                       WHERE assistant_message_id IS NOT NULL
+                         AND assistant_message_id <> ''
+                   )
                  ORDER BY sequence ASC",
             )
             .map_err(|source| self.sqlite_error(source))?;

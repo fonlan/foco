@@ -488,6 +488,7 @@ async fn run_coordinator_task_inner(
         chat_context.assistant_message_id.clone(),
         chat_context.assistant_sequence,
         chat_context.memories_used.clone(),
+        chat_context.agent_primary_chat_output,
         guidance_tx,
     )?;
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;

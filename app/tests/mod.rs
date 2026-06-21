@@ -2605,6 +2605,7 @@ fn active_chat_run_registry_accepts_matching_guidance() {
             "assistant-1".to_string(),
             1,
             Vec::new(),
+            true,
             guidance_tx,
         )
         .expect("register active run");
@@ -2658,6 +2659,7 @@ fn active_chat_run_record_event_persists_streaming_assistant_message() {
             "assistant-1".to_string(),
             1,
             Vec::new(),
+            true,
             guidance_tx,
         )
         .expect("register active run");
@@ -2714,6 +2716,94 @@ fn active_chat_run_record_event_persists_streaming_assistant_message() {
 }
 
 #[test]
+fn active_chat_run_private_output_records_events_without_main_chat_draft() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-private-agent-stream-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Private agent stream")
+        .expect("chat insert");
+    drop(database);
+
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            "agent-task-private-run".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-private".to_string(),
+            1,
+            Vec::new(),
+            false,
+            guidance_tx,
+        )
+        .expect("register private active run");
+
+    assert!(
+        registry
+            .active_run_for_chat("workspace-1", "chat-1")
+            .expect("active run lookup")
+            .is_none()
+    );
+
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::TextDelta {
+                assistant_message_id: "assistant-private".to_string(),
+                delta: "Worker-only text".to_string(),
+            },
+        )
+        .expect("private text delta record");
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::ToolCall {
+                assistant_message_id: "assistant-private".to_string(),
+                tool_call: ChatToolCallSummary {
+                    id: "tool-private".to_string(),
+                    name: "read_file".to_string(),
+                    status: "running".to_string(),
+                    input: json!({ "path": "README.md" }),
+                    output: None,
+                    is_error: false,
+                },
+            },
+        )
+        .expect("private tool call record");
+
+    let database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database reopen");
+    assert!(
+        database
+            .messages_for_chat("chat-1")
+            .expect("messages for chat")
+            .is_empty()
+    );
+    assert!(
+        database
+            .tool_calls_for_chat("chat-1")
+            .expect("tool calls for chat")
+            .is_empty()
+    );
+    assert_eq!(
+        database
+            .run_events_for_run("agent-task-private-run")
+            .expect("run events for private run")
+            .len(),
+        2
+    );
+
+    drop(database);
+    registration.finish();
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-cancelled-tool-history-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -2744,6 +2834,7 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
             "assistant-1".to_string(),
             1,
             Vec::new(),
+            true,
             guidance_tx,
         )
         .expect("register active run");
@@ -2903,6 +2994,7 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
             context.assistant_message_id.clone(),
             context.assistant_sequence,
             Vec::new(),
+            true,
             guidance_tx,
         )
         .expect("register active run");
@@ -3027,6 +3119,7 @@ fn active_chat_run_registry_rejects_guidance_after_complete_event() {
             "assistant-1".to_string(),
             1,
             Vec::new(),
+            true,
             guidance_tx,
         )
         .expect("register active run");
@@ -5178,6 +5271,7 @@ fn active_chat_run_subscription_replays_cached_events_after_sequence() {
             "assistant-1".to_string(),
             1,
             Vec::new(),
+            true,
             guidance_tx,
         )
         .expect("register active run");
