@@ -436,6 +436,7 @@ export function App() {
   );
   const [messages, setMessages] = useState<ShellMessage[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
+  const [isPreparingChatRun, setIsPreparingChatRun] = useState(false);
   const [activeMainTab, setActiveMainTab] = useState<ActiveMainTab>({
     chatId: null,
     type: "chat",
@@ -5045,6 +5046,7 @@ export function App() {
   async function runChatMessage(initialRequest: RetryRunRequest): Promise<string | null> {
     let request = initialRequest;
     if (!request.queuedUserMessageId) {
+      setIsPreparingChatRun(true);
       try {
         const queued = await persistQueuedRunRequest(request);
         request = {
@@ -5078,6 +5080,8 @@ export function App() {
       } catch (requestError) {
         setError(errorMessage(requestError));
         return null;
+      } finally {
+        setIsPreparingChatRun(false);
       }
     }
     const runKey = localRandomId();
@@ -6757,6 +6761,7 @@ export function App() {
                   overviewRenderer={() => (
                     <ApiOverviewPanel
                       activeWorkspaceId={activeWorkspaceId}
+                      autoLoadEnabled={!isPreparingChatRun}
                       settings={settings}
                       workspaces={workspaces}
                     />
@@ -7793,10 +7798,12 @@ function NavRailButton({
 
 function ApiOverviewPanel({
   activeWorkspaceId,
+  autoLoadEnabled,
   settings,
   workspaces,
 }: {
   activeWorkspaceId: string;
+  autoLoadEnabled: boolean;
   settings: SettingsResponse | null;
   workspaces: WorkspaceSummary[];
 }) {
@@ -7815,6 +7822,7 @@ function ApiOverviewPanel({
   const [stats, setStats] = useState<AiStatisticsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const activeOverviewRequestRef = useRef<AbortController | null>(null);
   const summary = stats?.summary ?? emptyAiStatisticsSummary();
   const providerLabels = useMemo(
     () =>
@@ -7886,10 +7894,18 @@ function ApiOverviewPanel({
   }));
 
   const loadOverview = useCallback(async () => {
-    if (settings === null || workspaces.length === 0 || !hasAppliedInitialWorkspace) {
+    if (
+      !autoLoadEnabled ||
+      settings === null ||
+      workspaces.length === 0 ||
+      !hasAppliedInitialWorkspace
+    ) {
       return;
     }
 
+    activeOverviewRequestRef.current?.abort();
+    const controller = new AbortController();
+    activeOverviewRequestRef.current = controller;
     setIsLoading(true);
     setError(null);
 
@@ -7897,14 +7913,45 @@ function ApiOverviewPanel({
       const query = aiOverviewQuery(filters);
       const data = await requestJson<AiStatisticsResponse>(
         `/api/ai-statistics${query ? `?${query}` : ""}`,
+        { signal: controller.signal },
       );
+      if (controller.signal.aborted) {
+        return;
+      }
       setStats(data);
     } catch (requestError) {
+      if (controller.signal.aborted) {
+        return;
+      }
       setError(errorMessage(requestError));
     } finally {
-      setIsLoading(false);
+      if (activeOverviewRequestRef.current === controller) {
+        activeOverviewRequestRef.current = null;
+        setIsLoading(false);
+      }
     }
-  }, [filters, hasAppliedInitialWorkspace, settings, workspaces.length]);
+  }, [
+    autoLoadEnabled,
+    filters,
+    hasAppliedInitialWorkspace,
+    settings,
+    workspaces.length,
+  ]);
+
+  useEffect(() => {
+    if (autoLoadEnabled) {
+      return;
+    }
+
+    activeOverviewRequestRef.current?.abort();
+  }, [autoLoadEnabled]);
+
+  useEffect(
+    () => () => {
+      activeOverviewRequestRef.current?.abort();
+    },
+    [],
+  );
 
   useEffect(() => {
     if (hasAppliedInitialWorkspace || preferredWorkspaceId === "") {

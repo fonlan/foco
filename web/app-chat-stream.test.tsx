@@ -1081,6 +1081,52 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("cancels API overview statistics while queueing a new chat", async () => {
+    const fetchMock = vi.mocked(fetch);
+    let statsSignal: AbortSignal | null = null;
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/ai-statistics") {
+        statsSignal = init?.signal ?? null;
+        return new Promise<Response>((_, reject) => {
+          statsSignal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    renderApp();
+
+    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    await waitFor(() => expect(statsSignal).not.toBeNull());
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "stats must not block",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(statsSignal?.aborted).toBe(true));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-1/chat/queue",
+        ),
+      ).toBe(true),
+    );
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("schedules a new workspace chat until the current workspace run finishes", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation(async (input, init) => {

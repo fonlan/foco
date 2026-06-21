@@ -672,6 +672,21 @@ pub(crate) async fn ai_statistics(
         "AI statistics config snapshot loaded"
     );
     let filters = normalized_ai_statistics_query(query)?;
+
+    let response = tokio::task::spawn_blocking(move || {
+        load_ai_statistics_response(config, filters, started_at)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("AI statistics worker failed: {error}")))??;
+
+    Ok(Json(response))
+}
+
+fn load_ai_statistics_response(
+    config: GlobalConfig,
+    filters: NormalizedAiStatisticsFilters,
+    started_at: Instant,
+) -> Result<AiStatisticsResponse, ApiError> {
     let workspace_filter = filters.workspace_id.as_deref().unwrap_or("<all>");
     let workspaces = ai_statistics_workspaces(&config, filters.workspace_id.as_deref())?;
     tracing::info!(
@@ -901,14 +916,14 @@ pub(crate) async fn ai_statistics(
         "AI statistics request completed"
     );
 
-    Ok(Json(AiStatisticsResponse {
+    Ok(AiStatisticsResponse {
         page: filters.page,
         page_size: filters.page_size,
         requests,
         summary,
         total_count,
         total_pages,
-    }))
+    })
 }
 
 pub(crate) async fn ai_statistics_detail(
