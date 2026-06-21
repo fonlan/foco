@@ -156,6 +156,10 @@ pub(crate) async fn queue_chat_message(
         coordinator = Some(created_coordinator);
     }
 
+    if let (Some(team), Some(coordinator)) = (&team, &mut coordinator) {
+        resume_chat_coordinator_for_new_message(&mut database, team, coordinator)?;
+    }
+
     let agent_task_id = if let (Some(team), Some(coordinator)) = (&team, &coordinator) {
         let task_id = foco_agent::AgentTaskId::new(unique_id("agent-task"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -306,6 +310,52 @@ async fn default_agent_allowed_tools(
     tools.sort();
     tools.dedup();
     Ok(tools)
+}
+
+fn resume_chat_coordinator_for_new_message(
+    database: &mut WorkspaceDatabase,
+    team: &foco_store::workspace::AgentTeamRecord,
+    coordinator: &mut foco_store::workspace::AgentInstanceRecord,
+) -> Result<(), ApiError> {
+    if team.status != foco_agent::AgentTeamStatus::Active
+        || coordinator.status != foco_agent::AgentInstanceStatus::Paused
+    {
+        return Ok(());
+    }
+    let has_active_coordinator_task = database
+        .agent_tasks_for_team(&team.id)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .any(|task| {
+            task.owner_instance_id == coordinator.id
+                && matches!(
+                    task.status,
+                    foco_agent::AgentTaskStatus::Queued
+                        | foco_agent::AgentTaskStatus::Running
+                        | foco_agent::AgentTaskStatus::Waiting
+                )
+        });
+    if has_active_coordinator_task {
+        return Ok(());
+    }
+
+    database
+        .transition_agent_instance_status(&coordinator.id, foco_agent::AgentInstanceStatus::Idle)
+        .map_err(ApiError::from_workspace_error)?;
+    coordinator.status = foco_agent::AgentInstanceStatus::Idle;
+    insert_agent_event(
+        database,
+        &team.id,
+        "instance_status_changed",
+        Some(&coordinator.id),
+        None,
+        None,
+        serde_json::json!({
+            "status": foco_agent::AgentInstanceStatus::Idle,
+            "reason": "chat_message_resume",
+        }),
+    )?;
+    Ok(())
 }
 
 pub(crate) async fn stream_chat_response(

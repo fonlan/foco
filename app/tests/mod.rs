@@ -3899,6 +3899,133 @@ async fn queue_chat_message_creates_default_team_for_normal_send() {
     remove_dir_if_exists(&profile_dir);
 }
 
+#[tokio::test]
+async fn queue_chat_message_resumes_paused_coordinator_without_active_work() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-resume-queue-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-agent-resume-queue-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let chat_id = "chat-paused-coordinator";
+    let team_id = foco_agent::AgentTeamId::new("agent-team-paused-coordinator").expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new("agent-instance-paused-coordinator").expect("instance id");
+    let interrupted_task_id =
+        foco_agent::AgentTaskId::new("agent-task-paused-coordinator-first").expect("task id");
+    let attempt_id = foco_agent::AgentAttemptId::new("agent-attempt-paused-coordinator-first")
+        .expect("attempt id");
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat(chat_id, "Paused Coordinator")
+            .expect("chat insert");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-paused-coordinator")
+                .expect("definition id"),
+            revision: 1,
+            name: "Paused coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Continue chats.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id,
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                max_concurrent_runs: 1,
+            })
+            .expect("team create");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &interrupted_task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue interrupted task");
+        database
+            .claim_runnable_agent_task(&team_id, &interrupted_task_id, &attempt_id)
+            .expect("claim task")
+            .expect("claimed task");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &interrupted_task_id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Interrupt,
+                result_json: None,
+                error_json: Some(r#"{"message":"restart"}"#),
+                interruption_reason: Some("restart"),
+            })
+            .expect("interrupt task");
+        database
+            .transition_agent_instance_status(&instance_id, foco_agent::AgentInstanceStatus::Paused)
+            .expect("pause coordinator");
+    }
+
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (scheduler, mut scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = scheduler;
+    let queued = crate::http::chat::queue_chat_message(
+        State(state),
+        AxumPath(workspace_id),
+        Json(QueueChatMessageRequest {
+            chat_id: Some(chat_id.to_string()),
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            message: "Continue after restart".to_string(),
+            team_mode_enabled: false,
+            attachments: Vec::new(),
+        }),
+    )
+    .await
+    .expect("queue follow-up message")
+    .0;
+    let new_task_id = queued.agent_task_id.expect("Agent task id");
+    assert_eq!(scheduler_rx.recv().await, Some(()));
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    assert_eq!(
+        database
+            .agent_instance(&instance_id)
+            .expect("instance")
+            .expect("instance")
+            .status,
+        foco_agent::AgentInstanceStatus::Idle
+    );
+    assert_eq!(
+        database
+            .agent_task(&interrupted_task_id)
+            .expect("interrupted task")
+            .expect("interrupted task")
+            .status,
+        foco_agent::AgentTaskStatus::Interrupted
+    );
+    let new_task = database
+        .agent_task(&new_task_id)
+        .expect("new task")
+        .expect("new task");
+    assert_eq!(new_task.status, foco_agent::AgentTaskStatus::Queued);
+    assert_eq!(new_task.sequence, 1);
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
 #[test]
 fn queued_team_runs_cleanup_only_their_own_uploaded_attachments() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-upload-test"));
