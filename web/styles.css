@@ -3066,6 +3066,7 @@ body,
   .message-composer-control-row .composer-run-button,
   .message-composer-control-row .context-usage-circle,
   .composer-team-toggle,
+  .composer-model-provider-select,
   .composer-model-select,
   .composer-provider-select,
   .composer-thinking-select,
@@ -3105,6 +3106,31 @@ body,
     right: 0;
     width: auto;
     max-width: none;
+  }
+
+  .message-composer-control-row .composer-model-provider-select {
+    order: 2;
+  }
+
+  .message-composer-control-row .composer-thinking-select {
+    order: 3;
+  }
+
+  .message-composer-control-row > .composer-branch-select {
+    order: 4;
+  }
+
+  .message-composer-control-row .composer-control-spacer {
+    order: 10;
+  }
+
+  .message-composer-control-row .context-usage-circle {
+    order: 11;
+  }
+
+  .message-composer-control-row .composer-run-button,
+  .message-composer-control-row .composer-send-button-shell {
+    order: 12;
   }
 
   .message-composer-actions-with-retry .composer-retry-button {
