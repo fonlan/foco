@@ -124,6 +124,8 @@ pub(crate) fn find_files(
     }))
 }
 
+const INTERNAL_FIND_FILES_EXCLUDE_PATTERNS: &[&str] = &[".foco", ".foco/**"];
+
 fn find_files_in_directory(
     workspace_path: &Path,
     directory_path: &Path,
@@ -147,14 +149,36 @@ fn find_files_in_directory(
             return Ok(());
         }
         let entry_path = entry.path();
-        let file_type = entry.file_type().map_err(|source| ToolRuntimeError::Io {
-            path: entry_path.clone(),
-            source,
-        })?;
-        let metadata = entry.metadata().map_err(|source| ToolRuntimeError::Io {
-            path: entry_path.clone(),
-            source,
-        })?;
+        let relative_path = relative_workspace_path(workspace_path, &entry_path)?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(ToolRuntimeError::Io {
+                    path: entry_path.clone(),
+                    source,
+                });
+            }
+        };
+
+        if file_type.is_dir() && filter.prunes_directory(&relative_path) {
+            continue;
+        }
+
+        let file_bytes = if file_type.is_file() {
+            match entry.metadata() {
+                Ok(metadata) => Some(metadata.len()),
+                Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
+                Err(source) => {
+                    return Err(ToolRuntimeError::Io {
+                        path: entry_path.clone(),
+                        source,
+                    });
+                }
+            }
+        } else {
+            None
+        };
         let kind = if file_type.is_dir() {
             "directory"
         } else if file_type.is_file() {
@@ -162,13 +186,12 @@ fn find_files_in_directory(
         } else {
             "other"
         };
-        let relative_path = relative_workspace_path(workspace_path, &entry_path)?;
 
         if filter.matches(&relative_path) {
             entries.push(json!({
                 "path": relative_path,
                 "kind": kind,
-                "bytes": if file_type.is_file() { Some(metadata.len()) } else { None }
+                "bytes": file_bytes
             }));
         }
 
@@ -185,6 +208,7 @@ struct GlobFilter {
     exclude: Vec<String>,
     include_set: Option<GlobSet>,
     exclude_set: Option<GlobSet>,
+    prune_set: Option<GlobSet>,
 }
 
 impl GlobFilter {
@@ -194,14 +218,18 @@ impl GlobFilter {
     ) -> Result<Self, ToolRuntimeError> {
         let include = normalize_glob_patterns("include", include)?;
         let exclude = normalize_glob_patterns("exclude", exclude)?;
+        let effective_exclude = effective_exclude_patterns(&exclude);
+        let prune_patterns = directory_prune_patterns(&effective_exclude);
         let include_set = compile_glob_set("include", &include)?;
-        let exclude_set = compile_glob_set("exclude", &exclude)?;
+        let exclude_set = compile_glob_set("exclude", &effective_exclude)?;
+        let prune_set = compile_glob_set("exclude", &prune_patterns)?;
 
         Ok(Self {
             include,
             exclude,
             include_set,
             exclude_set,
+            prune_set,
         })
     }
 
@@ -219,6 +247,12 @@ impl GlobFilter {
         }
 
         true
+    }
+
+    fn prunes_directory(&self, path: &str) -> bool {
+        self.prune_set
+            .as_ref()
+            .is_some_and(|prune_set| prune_set.is_match(path))
     }
 
     fn include_patterns(&self) -> &[String] {
@@ -248,6 +282,27 @@ fn normalize_glob_patterns(
             Ok(pattern.replace('\\', "/"))
         })
         .collect()
+}
+
+fn effective_exclude_patterns(exclude: &[String]) -> Vec<String> {
+    INTERNAL_FIND_FILES_EXCLUDE_PATTERNS
+        .iter()
+        .map(|pattern| (*pattern).to_string())
+        .chain(exclude.iter().cloned())
+        .collect()
+}
+
+fn directory_prune_patterns(exclude: &[String]) -> Vec<String> {
+    let mut patterns = Vec::new();
+    for pattern in exclude {
+        patterns.push(pattern.clone());
+        if let Some(parent_pattern) = pattern.strip_suffix("/**")
+            && !parent_pattern.is_empty()
+        {
+            patterns.push(parent_pattern.to_string());
+        }
+    }
+    patterns
 }
 
 fn compile_glob_set(
@@ -650,4 +705,52 @@ pub(crate) struct EditFileInput {
     pub(crate) new_str: String,
     pub(crate) replace_all: Option<bool>,
     pub(crate) timeout_ms: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn find_files_excludes_internal_foco_directory() {
+        let workspace = tempdir().expect("create temp workspace");
+        fs::write(workspace.path().join("package.json"), "{}").expect("write package.json");
+        fs::create_dir(workspace.path().join(".foco")).expect("create .foco");
+        fs::write(workspace.path().join(".foco").join("foco.sqlite-shm"), "")
+            .expect("write sqlite shm placeholder");
+
+        let output = find_files(
+            workspace.path(),
+            json!({
+                "path": ".",
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 10000
+            }),
+        )
+        .expect("find files succeeds");
+        let entries = output["entries"].as_array().expect("entries array");
+        let paths = entries
+            .iter()
+            .map(|entry| entry["path"].as_str().expect("entry path"))
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&"package.json"));
+        assert!(paths.iter().all(|path| !path.starts_with(".foco")));
+    }
+
+    #[test]
+    fn glob_filter_prunes_directories_matched_by_descendant_excludes() {
+        let filter = GlobFilter::new(None, Some(vec!["node_modules/**".to_string()]))
+            .expect("create glob filter");
+
+        assert!(filter.prunes_directory("node_modules"));
+        assert!(!filter.matches("node_modules/package.json"));
+        assert!(filter.matches("package.json"));
+    }
 }
