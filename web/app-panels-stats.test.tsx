@@ -724,6 +724,8 @@ describe("app-panels-stats verification surfaces", () => {
       name: "Preview markdown",
     });
     expect(previewButton).not.toHaveAttribute("aria-pressed");
+    expect(previewButton.querySelector(".lucide-eye")).toBeInTheDocument();
+    expect(previewButton.querySelector(".lucide-eye-off")).not.toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "Preview title" }),
     ).not.toBeInTheDocument();
@@ -733,6 +735,10 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       await screen.findByRole("heading", { name: "Preview title" }),
     ).toBeInTheDocument();
+    const editButton = screen.getByRole("button", { name: "Edit markdown" });
+    expect(editButton).toHaveAttribute("aria-pressed", "true");
+    expect(editButton.querySelector(".lucide-eye-off")).toBeInTheDocument();
+    expect(editButton.querySelector(".lucide-eye")).not.toBeInTheDocument();
     expect(screen.getByRole("img", { name: "Remote asset" })).toHaveAttribute(
       "src",
       "https://example.com/asset.png",
@@ -747,7 +753,7 @@ describe("app-panels-stats verification surfaces", () => {
       "flowchart TD\n  A --> B",
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "Edit markdown" }));
+    await userEvent.click(editButton);
     expect(
       screen.queryByRole("heading", { name: "Preview title" }),
     ).not.toBeInTheDocument();
