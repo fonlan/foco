@@ -7,8 +7,9 @@ use foco_providers::{NeutralChatRequest, NeutralChatRole, ProviderConnectionConf
 use foco_store::{
     config::{GlobalConfig, MemorySettings},
     memory::{
-        MemoryDatabase, MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, MemoryScope,
-        MemorySourceType, MemoryStatus, NewMemoryExtractionJob, NewMemoryFact, NewMemorySource,
+        MemoryDatabase, MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind,
+        MemoryRelationKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryEdge,
+        NewMemoryExtractionJob, NewMemoryFact, NewMemorySource,
     },
     workspace::{WorkspaceDatabase, workspace_database_path},
 };
@@ -94,7 +95,16 @@ pub(crate) struct ValidatedExtractedMemoryFact {
     pub(crate) fact: String,
     pub(crate) confidence: Option<f64>,
     pub(crate) evidence_ids: Vec<String>,
+    pub(crate) relation_candidates: Vec<ValidatedExtractedMemoryRelationCandidate>,
     pub(crate) metadata_json: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct ValidatedExtractedMemoryRelationCandidate {
+    pub(crate) relation: MemoryRelationKind,
+    pub(crate) target_fact_id: String,
+    pub(crate) target_fact: Option<String>,
+    pub(crate) reason: Option<String>,
 }
 
 pub(crate) fn queue_memory_extraction_job(
@@ -787,6 +797,7 @@ pub(crate) fn store_extracted_memory_facts(
                 metadata_json: &fact.metadata_json,
             })
             .map_err(ApiError::from_memory_error)?;
+        insert_extracted_memory_edges(database, &task.job_id, &fact_id, &fact.relation_candidates)?;
         apply_memory_expiration_to_fact(database, &fact_id, &task.config.memory)?;
         let stored_fact = database
             .fact(&fact_id)
@@ -854,15 +865,25 @@ pub(crate) fn validate_extracted_memory_facts(
             }
         }
 
+        let mut relation_candidates = Vec::new();
         for relation in &fact.relation_candidates {
-            if !matches!(
-                relation.relation.as_str(),
-                "updates" | "extends" | "derives"
-            ) {
+            let Some(relation_kind) = memory_relation_kind_from_str(&relation.relation) else {
                 return Err(ApiError::bad_request(format!(
                     "extracted fact {index} has unsupported relation '{}'",
                     relation.relation
                 )));
+            };
+            if let Some(target_fact_id) = relation
+                .target_fact_id
+                .as_deref()
+                .and_then(|target| memory_relation_target_fact_id(target, scope))
+            {
+                relation_candidates.push(ValidatedExtractedMemoryRelationCandidate {
+                    relation: relation_kind,
+                    target_fact_id,
+                    target_fact: normalized_optional_text(relation.target_fact.clone()),
+                    reason: normalized_optional_text(relation.reason.clone()),
+                });
             }
         }
 
@@ -883,9 +904,92 @@ pub(crate) fn validate_extracted_memory_facts(
             fact: fact_text.to_string(),
             confidence: fact.confidence,
             evidence_ids,
+            relation_candidates,
             metadata_json,
         });
     }
 
     Ok(validated)
+}
+
+fn insert_extracted_memory_edges(
+    database: &mut MemoryDatabase,
+    extraction_job_id: &str,
+    source_fact_id: &str,
+    relation_candidates: &[ValidatedExtractedMemoryRelationCandidate],
+) -> Result<(), ApiError> {
+    // ponytail: only materialize explicit targetFactId links; add fact-text matching if extraction needs targetFact fallback.
+    for relation in relation_candidates {
+        if relation.target_fact_id == source_fact_id {
+            continue;
+        }
+        if database
+            .fact(&relation.target_fact_id)
+            .map_err(ApiError::from_memory_error)?
+            .is_none()
+        {
+            continue;
+        }
+
+        let metadata_json = serde_json::to_string(&json!({
+            "source": "memory_extraction",
+            "extractionJobId": extraction_job_id,
+            "targetFact": relation.target_fact,
+            "reason": relation.reason,
+        }))
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to serialize memory edge metadata: {source}"
+            ))
+        })?;
+        let edge_id = unique_id("memory-edge");
+        database
+            .insert_edge(NewMemoryEdge {
+                id: &edge_id,
+                source_fact_id,
+                target_fact_id: &relation.target_fact_id,
+                relation: relation.relation,
+                metadata_json: &metadata_json,
+            })
+            .map_err(ApiError::from_memory_error)?;
+    }
+
+    Ok(())
+}
+
+fn memory_relation_kind_from_str(value: &str) -> Option<MemoryRelationKind> {
+    match value.trim() {
+        "updates" => Some(MemoryRelationKind::Updates),
+        "extends" => Some(MemoryRelationKind::Extends),
+        "derives" => Some(MemoryRelationKind::Derives),
+        _ => None,
+    }
+}
+
+fn memory_relation_target_fact_id(value: &str, source_scope: MemoryScope) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let Some((scope, fact_id)) = value.split_once(':') else {
+        return Some(value.to_string());
+    };
+    let target_scope = MemoryScope::parse(scope.trim()).ok()?;
+    if !memory_scopes_share_database(source_scope, target_scope) {
+        return None;
+    }
+    let fact_id = fact_id.trim();
+    if fact_id.is_empty() {
+        None
+    } else {
+        Some(fact_id.to_string())
+    }
+}
+
+fn memory_scopes_share_database(left: MemoryScope, right: MemoryScope) -> bool {
+    match (left, right) {
+        (MemoryScope::Global, MemoryScope::Global) => true,
+        (MemoryScope::Global, _) | (_, MemoryScope::Global) => false,
+        _ => true,
+    }
 }

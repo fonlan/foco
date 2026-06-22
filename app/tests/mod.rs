@@ -6384,6 +6384,97 @@ fn memory_extraction_stores_pending_facts_with_sources() {
 }
 
 #[test]
+fn memory_extraction_materializes_update_relations() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-memory-extract-edge-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    {
+        let mut workspace_database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        workspace_database
+            .insert_chat("chat-1", "Memory extraction edges")
+            .expect("chat insert");
+    }
+    {
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut memory_database,
+            "old-source",
+            "old-fact",
+            MemoryScope::Workspace,
+            None,
+            "Use the old memory retrieval plan.",
+            false,
+        );
+    }
+    let task = MemoryExtractionTask {
+        job_id: "job-1".to_string(),
+        workspace_id: "workspace-1".to_string(),
+        workspace_path: workspace_dir.clone(),
+        global_memory_database_file: workspace_dir.join("global-memory.sqlite"),
+        chat_id: "chat-1".to_string(),
+        run_id: "run-1".to_string(),
+        user_message_id: "user-1".to_string(),
+        assistant_message_id: "assistant-1".to_string(),
+        model_id: "model-1".to_string(),
+        target_status: MemoryStatus::Active,
+        config: GlobalConfig::first_run(workspace_dir.clone()),
+    };
+    let evidence = vec![MemoryExtractionEvidenceCandidate {
+        evidence_id: "assistant_message".to_string(),
+        source_type: MemorySourceType::AssistantMessage,
+        source_id: "assistant-1".to_string(),
+        title: "Assistant message".to_string(),
+        content: "Use the new memory graph retrieval plan.".to_string(),
+        metadata: json!({"role":"assistant"}),
+    }];
+    let output = parse_memory_extraction_output(json!({
+        "facts": [{
+            "scope": "workspace",
+            "kind": "project_decision",
+            "fact": "Use the new memory graph retrieval plan.",
+            "confidence": 0.9,
+            "relationCandidates": [{
+                "relation": "updates",
+                "targetFactId": "workspace:old-fact",
+                "targetFact": "Use the old memory retrieval plan.",
+                "reason": "The new plan replaces the old plan."
+            }],
+            "evidenceReferences": [{
+                "evidenceId": "assistant_message",
+                "quote": "new memory graph retrieval plan"
+            }]
+        }]
+    }))
+    .expect("valid extraction JSON");
+
+    let summaries =
+        store_extracted_memory_facts(&task, &evidence, &output).expect("store extracted facts");
+
+    let memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+    assert_eq!(summaries.len(), 1);
+    let old_fact = memory_database
+        .fact("old-fact")
+        .expect("old fact lookup")
+        .expect("old fact");
+    let new_fact = memory_database
+        .fact(&summaries[0].id)
+        .expect("new fact lookup")
+        .expect("new fact");
+
+    assert_eq!(old_fact.status, "superseded");
+    assert!(!old_fact.is_latest);
+    assert_eq!(new_fact.status, "active");
+    assert!(new_fact.is_latest);
+
+    drop(memory_database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn explicit_remember_this_extraction_stores_active_facts() {
     assert_eq!(
         memory_target_status_for_prompt("remember this: prefer concise replies"),
