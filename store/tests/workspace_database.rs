@@ -19,9 +19,9 @@ use foco_store::{
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
         NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession, NewToolCall, NewToolResult, ScheduledTaskRunUpdate,
-        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
-        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
+        NewTerminalSession, NewToolCall, NewToolResult, ScheduledTaskDueRunClaim,
+        ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
+        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
         WorkspaceDatabaseError, initialize_workspace_databases, workspace_database_path,
     },
 };
@@ -785,6 +785,73 @@ fn scheduled_task_records_round_trip_and_list_runs() {
             .scheduled_task_runs_for_task("scheduled-task-1")
             .expect("deleted scheduled task runs")
             .is_empty()
+    );
+}
+
+#[test]
+fn claims_due_scheduled_task_run_once_and_updates_task_state() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_scheduled_task(NewScheduledTask {
+            id: "scheduled-task-due",
+            title: "Due task",
+            description: None,
+            schedule_json: r#"{"type":"one_shot_at","run_at":"2026-06-22T10:00:00Z"}"#,
+            action_json: r#"{"type":"agent_prompt","prompt":"Run"}"#,
+            status: "enabled",
+            next_run_at: Some("2026-06-22T10:00:00Z"),
+            metadata_json: Some("{}"),
+        })
+        .expect("scheduled task insert");
+
+    let run = database
+        .claim_due_scheduled_task_run(ScheduledTaskDueRunClaim {
+            task_id: "scheduled-task-due",
+            expected_next_run_at: "2026-06-22T10:00:00Z",
+            run_id: "scheduled-run-due",
+            trigger_reason: "scheduled",
+            run_status: "pending",
+            scheduled_at: "2026-06-22T10:00:00Z",
+            completed_at: None,
+            error_message: None,
+            task_status: "completed",
+            task_next_run_at: None,
+            task_last_run_at: "2026-06-22T10:00:01Z",
+            metadata_json: None,
+        })
+        .expect("claim due scheduled task")
+        .expect("due task claimed");
+    assert_eq!(run.status, "pending");
+
+    let task = database
+        .scheduled_task("scheduled-task-due")
+        .expect("scheduled task lookup")
+        .expect("scheduled task");
+    assert_eq!(task.status, "completed");
+    assert_eq!(task.next_run_at, None);
+    assert_eq!(task.last_run_at.as_deref(), Some("2026-06-22T10:00:01Z"));
+
+    assert!(
+        database
+            .claim_due_scheduled_task_run(ScheduledTaskDueRunClaim {
+                task_id: "scheduled-task-due",
+                expected_next_run_at: "2026-06-22T10:00:00Z",
+                run_id: "scheduled-run-duplicate",
+                trigger_reason: "scheduled",
+                run_status: "pending",
+                scheduled_at: "2026-06-22T10:00:00Z",
+                completed_at: None,
+                error_message: None,
+                task_status: "completed",
+                task_next_run_at: None,
+                task_last_run_at: "2026-06-22T10:00:02Z",
+                metadata_json: None,
+            })
+            .expect("duplicate claim")
+            .is_none()
     );
 }
 

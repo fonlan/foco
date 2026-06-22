@@ -41,9 +41,10 @@ pub use workspace_records::{
     NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
     NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
     NewTerminalSession, NewToolCall, NewToolResult, PromptContextInjectionRecord, RunEventRecord,
-    ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate,
-    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
-    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
+    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
+    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
+    UpdateLlmRequestOutcome,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -2070,6 +2071,122 @@ impl WorkspaceDatabase {
             .query_map([], scheduled_task_from_row)
             .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
+    }
+
+    pub fn active_scheduled_task_run_count(
+        &self,
+        task_id: &str,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM scheduled_task_runs
+                 WHERE task_id = ?1 AND status IN ('pending', 'queued', 'running')",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn claim_due_scheduled_task_run(
+        &mut self,
+        claim: ScheduledTaskDueRunClaim<'_>,
+    ) -> Result<Option<ScheduledTaskRunRecord>, WorkspaceDatabaseError> {
+        validate_scheduled_task_trigger_reason(claim.trigger_reason)?;
+        validate_scheduled_task_run_status(claim.run_status)?;
+        validate_scheduled_task_status(claim.task_status)?;
+        let metadata_json = claim.metadata_json.unwrap_or("{}");
+        validate_scheduled_task_json_object(metadata_json, "metadata_json")?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let due = transaction
+            .query_row(
+                "SELECT 1
+                 FROM scheduled_tasks
+                 WHERE id = ?1
+                   AND status = 'enabled'
+                   AND next_run_at = ?2
+                   AND next_run_at <= ?3",
+                params![
+                    claim.task_id,
+                    claim.expected_next_run_at,
+                    claim.task_last_run_at
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if due.is_none() {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(None);
+        }
+
+        let updated = transaction
+            .execute(
+                "UPDATE scheduled_tasks
+                 SET status = ?2,
+                     next_run_at = ?3,
+                     last_run_at = ?4,
+                     updated_at = ?4
+                 WHERE id = ?1
+                   AND status = 'enabled'
+                   AND next_run_at = ?5",
+                params![
+                    claim.task_id,
+                    claim.task_status,
+                    claim.task_next_run_at,
+                    claim.task_last_run_at,
+                    claim.expected_next_run_at
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated != 1 {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(None);
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO scheduled_task_runs
+                    (
+                        id, task_id, trigger_reason, status, scheduled_at, queued_at,
+                        started_at, completed_at, chat_id, user_message_id,
+                        assistant_message_id, agent_team_id, agent_task_id, agent_attempt_id,
+                        active_run_id, error_message, output_summary, created_at, updated_at,
+                        metadata_json
+                    )
+                 VALUES
+                    (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, NULL, NULL,
+                     NULL, NULL, NULL, NULL, NULL, ?7, NULL, ?8, ?8, ?9)",
+                params![
+                    claim.run_id,
+                    claim.task_id,
+                    claim.trigger_reason,
+                    claim.run_status,
+                    claim.scheduled_at,
+                    claim.completed_at,
+                    claim.error_message,
+                    claim.task_last_run_at,
+                    metadata_json
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        self.scheduled_task_run(claim.run_id)
+            .map(|run| {
+                run.expect("claimed scheduled task run should exist after transaction commit")
+            })
+            .map(Some)
     }
 
     pub fn delete_scheduled_task(&mut self, id: &str) -> Result<bool, WorkspaceDatabaseError> {

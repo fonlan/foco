@@ -285,6 +285,22 @@ pub struct ScheduledTaskRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledTaskDueRunClaim<'a> {
+    pub task_id: &'a str,
+    pub expected_next_run_at: &'a str,
+    pub run_id: &'a str,
+    pub trigger_reason: &'a str,
+    pub run_status: &'a str,
+    pub scheduled_at: &'a str,
+    pub completed_at: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+    pub task_status: &'a str,
+    pub task_next_run_at: Option<&'a str>,
+    pub task_last_run_at: &'a str,
+    pub metadata_json: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewScheduledTaskRun<'a> {
     pub id: &'a str,
     pub task_id: &'a str,

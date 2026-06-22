@@ -335,6 +335,18 @@ pub(crate) async fn archive_scheduled_task(
     set_scheduled_task_status(state, &workspace_id, &task_id, STATUS_ARCHIVED).map(Json)
 }
 
+pub(crate) async fn run_scheduled_task_now(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, task_id)): AxumPath<(String, String)>,
+) -> Result<Json<ScheduledTaskRunResponse>, ApiError> {
+    let run =
+        crate::scheduled_tasks::scheduler::run_scheduled_task_now(&state, &workspace_id, &task_id)
+            .await?;
+    Ok(Json(ScheduledTaskRunResponse {
+        run: scheduled_task_run_view(&workspace_id, run)?,
+    }))
+}
+
 pub(crate) async fn scheduled_task_runs(
     State(state): State<AppState>,
     AxumPath((workspace_id, task_id)): AxumPath<(String, String)>,
@@ -619,8 +631,7 @@ fn scheduled_task_error(error: crate::scheduled_tasks::service::ScheduledTaskErr
 }
 
 fn notify_scheduled_task_change(state: &AppState) -> Result<(), ApiError> {
-    // ponytail: reuse the existing coalesced wake until Phase 5 adds a scheduled-task scheduler handle.
-    state.agent_scheduler.wake()
+    state.scheduled_task_scheduler.wake()
 }
 
 #[cfg(test)]

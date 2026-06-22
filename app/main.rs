@@ -122,6 +122,7 @@ use crate::runtime::{
     insert_agent_event, is_agent_tool_name, pending_tool_calls,
     validate_agent_snapshot_for_workspace,
 };
+use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 
 #[cfg(all(windows, not(debug_assertions)))]
 use std::sync::atomic::AtomicU32;
@@ -373,6 +374,7 @@ pub(crate) struct AppState {
     question_registry: QuestionRegistry,
     active_chat_runs: ActiveChatRunRegistry,
     agent_scheduler: AgentScheduler,
+    scheduled_task_scheduler: ScheduledTaskScheduler,
     tool_resource_locks: ToolResourceLockRegistry,
     _code_graph_watchers: Arc<Mutex<Vec<CodeGraphWatcher>>>,
     #[cfg(all(windows, not(debug_assertions)))]
@@ -542,6 +544,8 @@ async fn run_server_until_shutdown(
         }
     };
     let (agent_scheduler, agent_scheduler_wake_rx) = AgentScheduler::new();
+    let (scheduled_task_scheduler, scheduled_task_scheduler_wake_rx) =
+        ScheduledTaskScheduler::new();
     let state = AppState {
         config: Arc::new(Mutex::new(loaded_config.config)),
         config_file: loaded_config.paths.config_file,
@@ -560,13 +564,19 @@ async fn run_server_until_shutdown(
         question_registry: QuestionRegistry::default(),
         active_chat_runs: ActiveChatRunRegistry::default(),
         agent_scheduler: agent_scheduler.clone(),
+        scheduled_task_scheduler: scheduled_task_scheduler.clone(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         _code_graph_watchers: code_graph_watchers.clone(),
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
     };
     let agent_scheduler_task = agent_scheduler.spawn(state.clone(), agent_scheduler_wake_rx);
+    let scheduled_task_scheduler_task =
+        scheduled_task_scheduler.spawn(state.clone(), scheduled_task_scheduler_wake_rx);
     agent_scheduler
+        .wake()
+        .map_err(|error| std::io::Error::other(error.message))?;
+    scheduled_task_scheduler
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
     let app = app_router(state);
@@ -600,8 +610,10 @@ async fn run_server_until_shutdown(
     .await;
     if server_result.is_err() {
         agent_scheduler_task.abort();
+        scheduled_task_scheduler_task.abort();
     }
     let _ = agent_scheduler_task.await;
+    let _ = scheduled_task_scheduler_task.await;
     server_result?;
 
     Ok(())
@@ -794,6 +806,10 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}/archive",
             post(crate::http::scheduled_tasks::archive_scheduled_task),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}/run-now",
+            post(crate::http::scheduled_tasks::run_scheduled_task_now),
         )
         .route(
             "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}/runs",

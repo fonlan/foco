@@ -16,7 +16,7 @@ use foco_store::{
         MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, NewMemoryExtractionJob,
         NewMemoryFact, NewMemorySource,
     },
-    workspace::{LlmRequestAuditFilters, NewRunEvent, NewTerminalSession},
+    workspace::{LlmRequestAuditFilters, NewRunEvent, NewScheduledTask, NewTerminalSession},
 };
 use foco_tools::{
     GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL, READ_FILE_TOOL, SEARCH_TEXT_TOOL,
@@ -45,6 +45,7 @@ use crate::runtime::{
     QuestionItem, QuestionItemAnswer, QuestionOption, ToolResourceLockOwner, execute_tool,
     wait_for_tool_resource_lock,
 };
+use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 
 fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
     NeutralToolCall {
@@ -4376,6 +4377,7 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
             message: "Scheduled prompt".to_string(),
             team_mode_enabled: false,
             attachments: Vec::new(),
+            agent_definition_id: None,
             origin: crate::http::chat::QueuedChatMessageOrigin::ScheduledTask {
                 task_id: "scheduled-task-test".to_string(),
                 run_id: "scheduled-run-test".to_string(),
@@ -4428,6 +4430,188 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
         user_metadata["queuedRun"]["assistantMessageId"],
         json!(queued.assistant_message_id)
     );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn scheduled_task_dispatch_queues_visible_chat_and_completes_one_shot() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-dispatch-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-dispatch-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (agent_scheduler, mut agent_scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = agent_scheduler;
+    let metadata_json = format!(
+        r#"{{"workspaceId":"{workspace_id}","concurrencyPolicy":"skip_if_running","misfirePolicy":"catch_up_once"}}"#
+    );
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_scheduled_task(NewScheduledTask {
+                id: "scheduled-task-due",
+                title: "Due task",
+                description: None,
+                schedule_json: r#"{"type":"one_shot_at","run_at":"2020-01-01T00:00:00Z"}"#,
+                action_json: r#"{"type":"agent_prompt","prompt":"Scheduled prompt","session_mode":"create_new_chat","model_id":"model","provider_id":"provider","skill_ids":[],"collaboration_tools_enabled":false}"#,
+                status: "enabled",
+                next_run_at: Some("2020-01-01T00:00:00Z"),
+                metadata_json: Some(&metadata_json),
+            })
+            .expect("scheduled task insert");
+    }
+
+    crate::scheduled_tasks::scheduler::dispatch_due_scheduled_tasks(&state)
+        .await
+        .expect("dispatch due scheduled tasks");
+    assert_eq!(agent_scheduler_rx.recv().await, Some(()));
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let task = database
+        .scheduled_task("scheduled-task-due")
+        .expect("scheduled task lookup")
+        .expect("scheduled task");
+    assert_eq!(task.status, "completed");
+    assert_eq!(task.next_run_at, None);
+
+    let runs = database
+        .scheduled_task_runs_for_task("scheduled-task-due")
+        .expect("scheduled task runs");
+    assert_eq!(runs.len(), 1);
+    let run = &runs[0];
+    assert_eq!(run.status, "queued");
+    assert_eq!(run.trigger_reason, "scheduled");
+    let chat_id = run.chat_id.as_deref().expect("run chat id");
+    let user_message_id = run.user_message_id.as_deref().expect("run user message id");
+    assert!(run.agent_task_id.is_some());
+
+    let user_message = database
+        .message(user_message_id)
+        .expect("user message lookup")
+        .expect("scheduled user message");
+    assert_eq!(user_message.chat_id, chat_id);
+    assert_eq!(user_message.content, "Scheduled prompt");
+    let user_metadata =
+        parse_json_value(&user_message.metadata_json, "user metadata").expect("user metadata");
+    assert_eq!(user_metadata["source"], json!("scheduled_task"));
+    assert_eq!(
+        user_metadata["scheduledTaskId"],
+        json!("scheduled-task-due")
+    );
+    assert_eq!(user_metadata["scheduledTaskRunId"], json!(run.id));
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn scheduled_task_dispatch_ignores_paused_due_task() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-paused-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-paused-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile_dir.clone());
+    let metadata_json = format!(
+        r#"{{"workspaceId":"{workspace_id}","concurrencyPolicy":"skip_if_running","misfirePolicy":"catch_up_once"}}"#
+    );
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_scheduled_task(NewScheduledTask {
+                id: "scheduled-task-paused",
+                title: "Paused task",
+                description: None,
+                schedule_json: r#"{"type":"interval","every_seconds":60,"start_at":"2020-01-01T00:00:00Z"}"#,
+                action_json: r#"{"type":"agent_prompt","prompt":"Paused prompt","session_mode":"create_new_chat","model_id":"model","provider_id":"provider","skill_ids":[],"collaboration_tools_enabled":false}"#,
+                status: "paused",
+                next_run_at: Some("2020-01-01T00:00:00Z"),
+                metadata_json: Some(&metadata_json),
+            })
+            .expect("scheduled task insert");
+    }
+
+    crate::scheduled_tasks::scheduler::dispatch_due_scheduled_tasks(&state)
+        .await
+        .expect("dispatch due scheduled tasks");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    assert!(
+        database
+            .scheduled_task_runs_for_task("scheduled-task-paused")
+            .expect("scheduled task runs")
+            .is_empty()
+    );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn scheduled_task_run_now_queues_manual_run_without_advancing_schedule() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-run-now-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-run-now-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (agent_scheduler, mut agent_scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = agent_scheduler;
+    let metadata_json = format!(
+        r#"{{"workspaceId":"{workspace_id}","concurrencyPolicy":"skip_if_running","misfirePolicy":"catch_up_once"}}"#
+    );
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_scheduled_task(NewScheduledTask {
+                id: "scheduled-task-run-now",
+                title: "Run now task",
+                description: None,
+                schedule_json: r#"{"type":"interval","every_seconds":60,"start_at":"2099-01-01T00:00:00Z"}"#,
+                action_json: r#"{"type":"agent_prompt","prompt":"Manual prompt","session_mode":"create_new_chat","model_id":"model","provider_id":"provider","skill_ids":[],"collaboration_tools_enabled":false}"#,
+                status: "enabled",
+                next_run_at: Some("2099-01-01T00:00:00Z"),
+                metadata_json: Some(&metadata_json),
+            })
+            .expect("scheduled task insert");
+    }
+
+    let run = crate::scheduled_tasks::scheduler::run_scheduled_task_now(
+        &state,
+        &workspace_id,
+        "scheduled-task-run-now",
+    )
+    .await
+    .expect("run scheduled task now");
+    assert_eq!(agent_scheduler_rx.recv().await, Some(()));
+    assert_eq!(run.status, "queued");
+    assert_eq!(run.trigger_reason, "manual");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let task = database
+        .scheduled_task("scheduled-task-run-now")
+        .expect("scheduled task lookup")
+        .expect("scheduled task");
+    assert_eq!(task.status, "enabled");
+    assert_eq!(task.next_run_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+    assert!(task.last_run_at.is_some());
+    let user_message = database
+        .message(run.user_message_id.as_deref().expect("user message id"))
+        .expect("user message lookup")
+        .expect("user message");
+    assert_eq!(user_message.content, "Manual prompt");
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
@@ -9690,6 +9874,7 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
     let mcp_registry = Arc::new(McpRegistry::default());
     let foco_root_dir = user_profile_dir.join(".foco");
     let (agent_scheduler, _agent_scheduler_rx) = AgentScheduler::new();
+    let (scheduled_task_scheduler, _scheduled_task_scheduler_rx) = ScheduledTaskScheduler::new();
 
     AppState {
         config: Arc::new(Mutex::new(config)),
@@ -9711,6 +9896,7 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         question_registry: QuestionRegistry::default(),
         active_chat_runs: ActiveChatRunRegistry::default(),
         agent_scheduler,
+        scheduled_task_scheduler,
         tool_resource_locks: ToolResourceLockRegistry::default(),
         _code_graph_watchers: Arc::new(Mutex::new(Vec::new())),
     }

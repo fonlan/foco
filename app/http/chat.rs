@@ -68,6 +68,7 @@ pub(crate) struct QueueChatMessageInput {
     pub(crate) message: String,
     pub(crate) team_mode_enabled: bool,
     pub(crate) attachments: Vec<ChatAttachmentInput>,
+    pub(crate) agent_definition_id: Option<String>,
     pub(crate) origin: QueuedChatMessageOrigin,
 }
 
@@ -101,6 +102,7 @@ pub(crate) async fn queue_chat_message(
             message: request.message,
             team_mode_enabled: request.team_mode_enabled,
             attachments: request.attachments,
+            agent_definition_id: None,
             origin: QueuedChatMessageOrigin::User,
         },
     )
@@ -136,6 +138,7 @@ pub(crate) async fn queue_chat_message_internal(
         message: task_message,
         team_mode_enabled,
         attachments,
+        agent_definition_id,
         origin,
     } = input;
     let mut team = if let Some(chat_id) = chat_id.as_deref() {
@@ -248,7 +251,10 @@ pub(crate) async fn queue_chat_message_internal(
     };
 
     if team.is_none() {
-        let definition = default_agent_definition(&state, &config, &prompt_context).await?;
+        let definition = match agent_definition_id.as_deref() {
+            Some(id) => configured_agent_definition(&config, id)?,
+            None => default_agent_definition(&state, &config, &prompt_context).await?,
+        };
         validate_agent_snapshot_for_workspace(&config, workspace, &definition)?;
         let team_id = foco_agent::AgentTeamId::new(unique_id("agent-team"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -357,6 +363,20 @@ pub(crate) async fn queue_chat_message_internal(
         agent_team_id,
         agent_task_id,
     })
+}
+
+fn configured_agent_definition(
+    config: &GlobalConfig,
+    id: &str,
+) -> Result<foco_store::config::AgentDefinitionSettings, ApiError> {
+    let id = foco_agent::AgentDefinitionId::new(id.to_string())
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    config
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == id)
+        .cloned()
+        .ok_or_else(|| ApiError::bad_request(format!("AgentDefinition '{id}' was not found")))
 }
 
 async fn default_agent_definition(
