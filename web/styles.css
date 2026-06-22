@@ -3663,8 +3663,48 @@ summary:focus-visible {
   box-shadow: var(--foco-shadow-soft);
 }
 
+.chat-panel {
+  --composer-editor-height: 4.25rem;
+}
+
+.composer-resize-splitter {
+  position: relative;
+  z-index: 10;
+  flex: 0 0 0.625rem;
+  height: 0.625rem;
+  cursor: row-resize;
+  touch-action: none;
+  user-select: none;
+  background: var(--foco-main-panel-gradient), var(--foco-canvas);
+}
+
+.composer-resize-splitter::before {
+  position: absolute;
+  top: 0.3125rem;
+  right: 0;
+  left: 0;
+  height: 1px;
+  content: "";
+  background: var(--foco-border);
+  transition:
+    background 120ms ease,
+    height 120ms ease;
+}
+
+.composer-resize-splitter:hover::before,
+.composer-resize-splitter:focus-visible::before,
+.composer-resize-splitter-active::before {
+  height: 2px;
+  background: var(--foco-accent);
+}
+
+.composer-resize-splitter:focus-visible {
+  outline: 2px solid var(--foco-primary);
+  outline-offset: -2px;
+}
+
 .composer-shell {
-  border-top-color: var(--foco-border);
+  border-top: 0;
   background: var(--foco-composer-shell-gradient);
 }
 
@@ -3684,6 +3724,10 @@ summary:focus-visible {
   box-shadow:
     var(--foco-focus-ring),
     0 16px 38px rgba(17, 32, 51, 0.12);
+}
+
+.message-composer-textarea {
+  height: var(--composer-editor-height);
 }
 
 .message-composer-control-row {

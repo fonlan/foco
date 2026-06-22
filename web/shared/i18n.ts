@@ -173,6 +173,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Open context panel": "打开右侧面板",
     "Resize workspace sidebar": "调整工作区面板宽度",
     "Resize context panel": "调整右侧面板宽度",
+    "Resize message composer": "调整发送框高度",
     "Open git diff": "打开 Git diff",
     "Cancel the current run before deleting this chat.":
       "删除此聊天前请先取消当前运行。",

@@ -595,6 +595,81 @@ describe("app-shell verification surfaces", () => {
     }
   });
 
+  it("resizes the message composer from the splitter on desktop and mobile browsers", async () => {
+    const originalInnerWidth = window.innerWidth;
+
+    try {
+      renderApp();
+
+      await screen.findByPlaceholderText(defaultComposerPlaceholder);
+
+      const splitter = await screen.findByRole("separator", {
+        name: "Resize message composer",
+      });
+      const chatPanel = splitter.closest(".chat-panel") as HTMLElement | null;
+      if (!chatPanel) {
+        throw new Error("Expected composer splitter inside chat panel");
+      }
+
+      vi.spyOn(chatPanel, "getBoundingClientRect").mockReturnValue({
+        bottom: 800,
+        height: 800,
+        left: 0,
+        right: 1000,
+        toJSON: () => ({}),
+        top: 0,
+        width: 1000,
+        x: 0,
+        y: 0,
+      } as DOMRect);
+
+      fireEvent.pointerDown(splitter, { clientY: 700, pointerId: 1 });
+
+      await waitFor(() => {
+        expect(document.body.style.cursor).toBe("row-resize");
+        expect(document.body.style.userSelect).toBe("none");
+      });
+
+      fireEvent.pointerMove(window, { clientY: 620 });
+
+      await waitFor(() => {
+        expect(chatPanel.style.getPropertyValue("--composer-editor-height")).toBe(
+          "148px",
+        );
+        expect(splitter).toHaveAttribute("aria-valuenow", "148");
+      });
+
+      fireEvent.pointerUp(window);
+
+      await waitFor(() => {
+        expect(document.body.style.cursor).toBe("");
+        expect(document.body.style.userSelect).toBe("");
+      });
+
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: 390,
+      });
+
+      fireEvent.pointerDown(splitter, { clientY: 620, pointerId: 2 });
+      fireEvent.pointerMove(window, { clientY: 580 });
+
+      await waitFor(() => {
+        expect(chatPanel.style.getPropertyValue("--composer-editor-height")).toBe(
+          "188px",
+        );
+        expect(splitter).toHaveAttribute("aria-valuenow", "188");
+      });
+
+      fireEvent.pointerUp(window);
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+    }
+  });
+
   it("prompts to install ripgrep when the search dependency is missing", async () => {
     const missingRipgrepSettings = {
       ...settings,

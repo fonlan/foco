@@ -25,6 +25,7 @@ import {
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -57,9 +58,19 @@ import { CHAT_BOTTOM_LOCK_THRESHOLD_PX, CREATE_BRANCH_OPTION_VALUE } from "../..
 import { useI18n } from "../../shared/i18n";
 import { MarkdownContent, type SelectedSkillPrefixResolver } from "./MarkdownContent";
 
+const COMPOSER_EDITOR_MIN_HEIGHT_PX = 68;
+const COMPOSER_EDITOR_KEY_STEP_PX = 24;
+const COMPOSER_EDITOR_MAX_HEIGHT_RATIO = 0.55;
+
 type ToolCallChangeStats = {
   linesAdded: number;
   linesRemoved: number;
+};
+
+type ComposerResizeDrag = {
+  maxHeight: number;
+  startHeight: number;
+  startY: number;
 };
 
 export type ChatPanelHelpers = {
@@ -214,15 +225,21 @@ export function ChatPanel({
     toolStatusText,
   } = helpers;
   const { t } = useI18n();
+  const chatPanelRef = useRef<HTMLDivElement>(null);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const messageScrollContentRef = useRef<HTMLDivElement>(null);
   const messageScrollEndRef = useRef<HTMLDivElement>(null);
   const messageTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const composerResizeDragRef = useRef<ComposerResizeDrag | null>(null);
   const copiedMessageTimerRef = useRef<number | null>(null);
   const shouldLockMessageScrollRef = useRef(true);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
+  const [isResizingComposer, setIsResizingComposer] = useState(false);
   const [isSendButtonTooltipOpen, setIsSendButtonTooltipOpen] = useState(false);
+  const [composerEditorHeight, setComposerEditorHeight] = useState(
+    COMPOSER_EDITOR_MIN_HEIGHT_PX,
+  );
   const skillQuery = activeSkillQuery(draftMessage);
   const selectedSkillSet = new Set(selectedSkillIds);
   const selectedSkills = selectedSkillIds
@@ -348,6 +365,47 @@ export function ChatPanel({
   }, []);
 
   useEffect(() => {
+    if (!isResizingComposer) {
+      return;
+    }
+
+    function handlePointerMove(event: PointerEvent) {
+      const drag = composerResizeDragRef.current;
+      if (!drag) {
+        return;
+      }
+
+      setComposerEditorHeight(
+        clampComposerEditorHeight(
+          drag.startHeight + drag.startY - event.clientY,
+          drag.maxHeight,
+        ),
+      );
+    }
+
+    function handlePointerUp() {
+      composerResizeDragRef.current = null;
+      setIsResizingComposer(false);
+    }
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
+
+    return () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+    };
+  }, [isResizingComposer]);
+
+  useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
       if (event.ctrlKey) {
         setIsCtrlKeyPressed(true);
@@ -373,6 +431,40 @@ export function ChatPanel({
       window.removeEventListener("blur", handleWindowBlur);
     };
   }, []);
+
+  function composerEditorMaxHeight() {
+    const panelHeight =
+      chatPanelRef.current?.getBoundingClientRect().height ?? window.innerHeight;
+    // ponytail: one shared drag ceiling for desktop/mobile; split per breakpoint if UX needs it.
+    return Math.max(
+      COMPOSER_EDITOR_MIN_HEIGHT_PX,
+      Math.floor(panelHeight * COMPOSER_EDITOR_MAX_HEIGHT_RATIO),
+    );
+  }
+
+  function clampComposerEditorHeight(value: number, maxHeight = composerEditorMaxHeight()) {
+    return Math.min(Math.max(value, COMPOSER_EDITOR_MIN_HEIGHT_PX), maxHeight);
+  }
+
+  function resizeComposerEditorBy(delta: number) {
+    setComposerEditorHeight((current) => clampComposerEditorHeight(current + delta));
+  }
+
+  function handleComposerResizePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const startHeight =
+      messageTextareaRef.current?.getBoundingClientRect().height ||
+      composerEditorHeight;
+    const maxHeight = composerEditorMaxHeight();
+    composerResizeDragRef.current = {
+      maxHeight,
+      startHeight: clampComposerEditorHeight(startHeight, maxHeight),
+      startY: event.clientY,
+    };
+    setComposerEditorHeight(composerResizeDragRef.current.startHeight);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setIsResizingComposer(true);
+  }
 
   function handleMessageScroll() {
     const element = messageScrollRef.current;
@@ -473,7 +565,15 @@ export function ChatPanel({
   }
 
   return (
-    <div className="chat-panel flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div
+      className="chat-panel flex min-h-0 flex-1 flex-col overflow-hidden"
+      ref={chatPanelRef}
+      style={
+        {
+          "--composer-editor-height": `${composerEditorHeight}px`,
+        } as CSSProperties
+      }
+    >
       <div
         className="message-list panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4"
         onScroll={handleMessageScroll}
@@ -707,6 +807,30 @@ export function ChatPanel({
         </div>
         <div aria-hidden="true" className="h-px" ref={messageScrollEndRef} />
       </div>
+
+      <div
+        aria-label={t("Resize message composer")}
+        aria-orientation="horizontal"
+        aria-valuemax={composerEditorMaxHeight()}
+        aria-valuemin={COMPOSER_EDITOR_MIN_HEIGHT_PX}
+        aria-valuenow={composerEditorHeight}
+        className={`composer-resize-splitter ${isResizingComposer ? "composer-resize-splitter-active" : ""
+          }`}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowUp") {
+            event.preventDefault();
+            resizeComposerEditorBy(COMPOSER_EDITOR_KEY_STEP_PX);
+          }
+
+          if (event.key === "ArrowDown") {
+            event.preventDefault();
+            resizeComposerEditorBy(-COMPOSER_EDITOR_KEY_STEP_PX);
+          }
+        }}
+        onPointerDown={handleComposerResizePointerDown}
+        role="separator"
+        tabIndex={0}
+      />
 
       <div className="composer-shell shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
         <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
