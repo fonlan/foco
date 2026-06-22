@@ -378,6 +378,7 @@ type WorkspaceFileContextMenuState = {
   left: number;
   node: WorkspaceFileTreeNode;
   top: number;
+  workspacePath: string;
 };
 
 type ChartDatum = {
@@ -3443,6 +3444,48 @@ export function App() {
     } finally {
       setWorkspaceFileOperationKey(null);
     }
+  }
+
+  async function toggleWorkspaceFileTreePath(node: WorkspaceFileTreeNode) {
+    const isExpanded = expandedFileTreePaths.has(node.path);
+    if (isExpanded) {
+      setExpandedFileTreePaths((current) => {
+        const next = new Set(current);
+        next.delete(node.path);
+        return next;
+      });
+      return;
+    }
+
+    if (
+      activeWorkspace?.id &&
+      node.kind === "directory" &&
+      node.hasChildren &&
+      !node.childrenLoaded
+    ) {
+      const loaded = await loadWorkspaceDirectoryChildren(activeWorkspace.id, node.path);
+      if (!loaded) {
+        return;
+      }
+    }
+
+    setExpandedFileTreePaths((current) => new Set([...current, node.path]));
+  }
+
+  async function copyWorkspaceFileText(text: string) {
+    setWorkspaceFilesError(null);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (copyError) {
+      setWorkspaceFilesError(errorMessage(copyError));
+    }
+  }
+
+  function workspaceFileAbsolutePath(workspacePath: string, relativePath: string) {
+    const separator = workspacePath.includes("\\") ? "\\" : "/";
+    const root = workspacePath.replace(/[\\/]+$/, "");
+    const normalizedRelativePath = relativePath.replace(/[\\/]+/g, separator);
+    return root ? `${root}${separator}${normalizedRelativePath}` : `${separator}${normalizedRelativePath}`;
   }
 
   async function handleGitFileOperation(
@@ -6738,10 +6781,13 @@ export function App() {
               >
                 <button
                   className="workspace-chat-context-menu-item"
-                  disabled={workspaceFileContextMenu.node.kind !== "file"}
                   onClick={() => {
                     const { node } = workspaceFileContextMenu;
                     setWorkspaceFileContextMenu(null);
+                    if (node.kind === "directory") {
+                      void toggleWorkspaceFileTreePath(node);
+                      return;
+                    }
                     void openWorkspaceFileTab(node);
                   }}
                   role="menuitem"
@@ -6786,6 +6832,47 @@ export function App() {
                 >
                   <Trash2 aria-hidden="true" className="size-3.5" />
                   <span>{t("Delete")}</span>
+                </button>
+                <button
+                  className="workspace-chat-context-menu-item"
+                  onClick={() => {
+                    const { node } = workspaceFileContextMenu;
+                    setWorkspaceFileContextMenu(null);
+                    void copyWorkspaceFileText(node.name);
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Copy aria-hidden="true" className="size-3.5" />
+                  <span>{t("Copy file name")}</span>
+                </button>
+                <button
+                  className="workspace-chat-context-menu-item"
+                  onClick={() => {
+                    const { node } = workspaceFileContextMenu;
+                    setWorkspaceFileContextMenu(null);
+                    void copyWorkspaceFileText(node.path);
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Copy aria-hidden="true" className="size-3.5" />
+                  <span>{t("Copy relative path")}</span>
+                </button>
+                <button
+                  className="workspace-chat-context-menu-item"
+                  onClick={() => {
+                    const { node, workspacePath } = workspaceFileContextMenu;
+                    setWorkspaceFileContextMenu(null);
+                    void copyWorkspaceFileText(
+                      workspaceFileAbsolutePath(workspacePath, node.path),
+                    );
+                  }}
+                  role="menuitem"
+                  type="button"
+                >
+                  <Copy aria-hidden="true" className="size-3.5" />
+                  <span>{t("Copy absolute path")}</span>
                 </button>
               </div>
             ) : null}
@@ -7034,45 +7121,20 @@ export function App() {
                         void loadWorkspaceFiles(activeWorkspace.id);
                       }
                     }}
-                    onRenameWorkspaceFile={(path, newName) =>
-                      void handleWorkspaceFileOperation("rename", path, newName)
-                    }
-                    onDeleteWorkspaceFile={(path) =>
-                      void handleWorkspaceFileOperation("delete", path)
-                    }
                     loadingWorkspaceDirectoryPaths={loadingWorkspaceDirectoryPaths}
-                    onToggleFileTreePath={async (node) => {
-                      const isExpanded = expandedFileTreePaths.has(node.path);
-                      if (isExpanded) {
-                        setExpandedFileTreePaths((current) => {
-                          const next = new Set(current);
-                          next.delete(node.path);
-                          return next;
-                        });
-                        return;
-                      }
-
-                      if (
-                        activeWorkspace?.id &&
-                        node.kind === "directory" &&
-                        node.hasChildren &&
-                        !node.childrenLoaded
-                      ) {
-                        const loaded = await loadWorkspaceDirectoryChildren(activeWorkspace.id, node.path);
-                        if (!loaded) {
-                          return;
-                        }
-                      }
-
-                      setExpandedFileTreePaths((current) => new Set([...current, node.path]));
-                    }}
+                    onToggleFileTreePath={toggleWorkspaceFileTreePath}
                     onOpenWorkspaceFile={(node) => void openWorkspaceFileTab(node)}
                     onOpenWorkspaceFileMenu={(event, node) => {
+                      if (!activeWorkspace) {
+                        return;
+                      }
                       event.preventDefault();
+                      event.stopPropagation();
                       setWorkspaceFileContextMenu({
                         left: event.clientX,
                         node,
                         top: event.clientY,
+                        workspacePath: activeWorkspace.path,
                       });
                     }}
                     onRefreshDiff={() => {
@@ -9363,8 +9425,6 @@ function ContextPanel({
   onMemoryPageChange,
   onRefreshDiff,
   onRefreshWorkspaceFiles,
-  onRenameWorkspaceFile,
-  onDeleteWorkspaceFile,
   onToggleFileTreePath,
   onOpenWorkspaceFile,
   onOpenWorkspaceFileMenu,
@@ -9405,8 +9465,6 @@ function ContextPanel({
   onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
   onRefreshDiff: () => void;
   onRefreshWorkspaceFiles: () => void;
-  onRenameWorkspaceFile: (path: string, newName: string) => void;
-  onDeleteWorkspaceFile: (path: string) => void;
   onToggleFileTreePath: (node: WorkspaceFileTreeNode) => void | Promise<void>;
   onOpenWorkspaceFile: (node: WorkspaceFileTreeNode) => void;
   onOpenWorkspaceFileMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
@@ -9468,11 +9526,9 @@ function ContextPanel({
             isLoading={isLoadingWorkspaceFiles}
             operationKey={workspaceFileOperationKey}
             loadingPaths={loadingWorkspaceDirectoryPaths}
-            onDeleteFile={onDeleteWorkspaceFile}
             onOpenFile={onOpenWorkspaceFile}
             onOpenContextMenu={onOpenWorkspaceFileMenu}
             onRefresh={onRefreshWorkspaceFiles}
-            onRenameFile={onRenameWorkspaceFile}
             onTogglePath={onToggleFileTreePath}
             response={workspaceFiles}
           />
@@ -9858,11 +9914,9 @@ function WorkspaceFilesTab({
   isLoading,
   loadingPaths,
   operationKey,
-  onDeleteFile,
   onOpenFile,
   onOpenContextMenu,
   onRefresh,
-  onRenameFile,
   onTogglePath,
   response,
 }: {
@@ -9871,11 +9925,9 @@ function WorkspaceFilesTab({
   isLoading: boolean;
   loadingPaths: Set<string>;
   operationKey: string | null;
-  onDeleteFile: (path: string) => void;
   onOpenFile: (node: WorkspaceFileTreeNode) => void;
   onOpenContextMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
   onRefresh: () => void;
-  onRenameFile: (path: string, newName: string) => void;
   onTogglePath: (node: WorkspaceFileTreeNode) => void | Promise<void>;
   response: WorkspaceFilesResponse | null;
 }) {
@@ -9921,10 +9973,8 @@ function WorkspaceFilesTab({
               expandedPaths={expandedPaths}
               loadingPaths={loadingPaths}
               node={response.root}
-              onDeleteFile={onDeleteFile}
               onOpenFile={onOpenFile}
               onOpenContextMenu={onOpenContextMenu}
-              onRenameFile={onRenameFile}
               onTogglePath={onTogglePath}
               operationKey={operationKey}
             />
@@ -9944,10 +9994,8 @@ function WorkspaceFileTreeNodeRow({
   expandedPaths,
   loadingPaths,
   node,
-  onDeleteFile,
   onOpenFile,
   onOpenContextMenu,
-  onRenameFile,
   onTogglePath,
   operationKey,
 }: {
@@ -9955,10 +10003,8 @@ function WorkspaceFileTreeNodeRow({
   expandedPaths: Set<string>;
   loadingPaths: Set<string>;
   node: WorkspaceFileTreeNode;
-  onDeleteFile: (path: string) => void;
   onOpenFile: (node: WorkspaceFileTreeNode) => void;
   onOpenContextMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
-  onRenameFile: (path: string, newName: string) => void;
   onTogglePath: (node: WorkspaceFileTreeNode) => void | Promise<void>;
   operationKey: string | null;
 }) {
@@ -10020,40 +10066,6 @@ function WorkspaceFileTreeNodeRow({
         {!isDirectory ? (
           <span className="workspace-file-tree-size">{formatFileSize(node.sizeBytes)}</span>
         ) : null}
-        {node.path ? (
-          <span className="workspace-file-tree-actions">
-            <button
-              aria-label={t("Rename file")}
-              className="workspace-file-tree-action"
-              onClick={() => {
-                const nextName = window.prompt(t("Rename file"), node.name);
-                if (nextName === null) {
-                  return;
-                }
-                const trimmedName = nextName.trim();
-                if (!trimmedName || trimmedName === node.name) {
-                  return;
-                }
-                onRenameFile(node.path, trimmedName);
-              }}
-              type="button"
-            >
-              <Pencil aria-hidden="true" className="size-3.5" />
-            </button>
-            <button
-              aria-label={t("Delete")}
-              className="workspace-file-tree-action workspace-file-tree-action-danger"
-              onClick={() => {
-                if (window.confirm(t("Delete file confirmation"))) {
-                  onDeleteFile(node.path);
-                }
-              }}
-              type="button"
-            >
-              <Trash2 aria-hidden="true" className="size-3.5" />
-            </button>
-          </span>
-        ) : null}
       </div>
       {isDirectory && isExpanded
         ? node.children.map((child) => (
@@ -10063,10 +10075,8 @@ function WorkspaceFileTreeNodeRow({
             key={child.path || child.name}
             loadingPaths={loadingPaths}
             node={child}
-            onDeleteFile={onDeleteFile}
             onOpenFile={onOpenFile}
             onOpenContextMenu={onOpenContextMenu}
-            onRenameFile={onRenameFile}
             onTogglePath={onTogglePath}
             operationKey={operationKey}
           />

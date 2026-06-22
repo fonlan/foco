@@ -663,6 +663,56 @@ describe("app-panels-stats verification surfaces", () => {
     expect(await screen.findByText("index.tsx")).toBeInTheDocument();
   });
 
+  it("copies file tree context menu values", async () => {
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+
+    const componentsRow = screen.getByText("components").closest("div[role='treeitem']");
+    expect(componentsRow).not.toBeNull();
+    await userEvent.click(
+      within(componentsRow as HTMLElement).getByRole("button", { name: "Expand folder" }),
+    );
+
+    const fileRow = (await screen.findByText("button.tsx")).closest("div[role='treeitem']");
+    expect(fileRow).not.toBeNull();
+
+    fireEvent.contextMenu(fileRow as HTMLElement);
+    const menu = await screen.findByRole("menu", { name: "button.tsx" });
+    for (const item of [
+      "Open",
+      "Rename",
+      "Delete",
+      "Copy file name",
+      "Copy relative path",
+      "Copy absolute path",
+    ]) {
+      expect(within(menu).getByRole("menuitem", { name: item })).toBeInTheDocument();
+    }
+
+    await userEvent.click(within(menu).getByRole("menuitem", { name: "Copy file name" }));
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith("button.tsx");
+
+    fireEvent.contextMenu(fileRow as HTMLElement);
+    await userEvent.click(
+      within(await screen.findByRole("menu", { name: "button.tsx" })).getByRole("menuitem", {
+        name: "Copy relative path",
+      }),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith("src/components/button.tsx");
+
+    fireEvent.contextMenu(fileRow as HTMLElement);
+    await userEvent.click(
+      within(await screen.findByRole("menu", { name: "button.tsx" })).getByRole("menuitem", {
+        name: "Copy absolute path",
+      }),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
+      `${workspace.path}\\src\\components\\button.tsx`,
+    );
+  });
+
   it("toggles markdown file preview from the editor toolbar", async () => {
     renderApp();
 
