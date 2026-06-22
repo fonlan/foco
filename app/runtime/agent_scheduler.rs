@@ -193,6 +193,10 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
                 Some(&record.attempt.id),
                 json!({ "reason": RESTART_INTERRUPTION_REASON }),
             )?;
+            crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
+                &workspace.path,
+                &record.task.id,
+            )?;
         }
         for instance in database
             .isolated_agent_instances()
@@ -273,6 +277,16 @@ async fn schedule_runnable_tasks(
                 drop(permit);
                 continue;
             };
+            if let Err(error) =
+                crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
+                    &workspace.path,
+                    &claimed.id,
+                )
+            {
+                let _ = fail_claimed_task(&workspace.path, &claimed.id, &error.message);
+                drop(permit);
+                continue;
+            }
             if let Err(error) = insert_agent_event(
                 &mut database,
                 &claimed.team_id,
@@ -1562,6 +1576,10 @@ fn finish_claimed_task(
         Some(attempt_id),
         payload,
     )?;
+    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
+        workspace_path,
+        &task.id,
+    )?;
     Ok(())
 }
 
@@ -1631,6 +1649,10 @@ fn fail_claimed_task(
             interruption_reason: None,
         })
         .map_err(ApiError::from_workspace_error)?;
+    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
+        workspace_path,
+        &task.id,
+    )?;
     Ok(())
 }
 

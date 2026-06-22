@@ -820,6 +820,10 @@ fn app_router(state: AppState) -> Router {
             get(crate::http::scheduled_tasks::scheduled_task_run),
         )
         .route(
+            "/api/workspaces/{workspace_id}/scheduled-task-runs/{scheduled_run_id}/cancel",
+            post(crate::http::scheduled_tasks::cancel_scheduled_task_run),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/hooks/runs",
             get(crate::http::hooks::hook_runs),
         )

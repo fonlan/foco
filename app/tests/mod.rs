@@ -4618,6 +4618,291 @@ async fn scheduled_task_run_now_queues_manual_run_without_advancing_schedule() {
 }
 
 #[tokio::test]
+async fn scheduled_task_run_status_tracks_agent_task_lifecycle() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-sync-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-sync-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (agent_scheduler, _agent_scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = agent_scheduler;
+    let metadata_json = format!(
+        r#"{{"workspaceId":"{workspace_id}","concurrencyPolicy":"skip_if_running","misfirePolicy":"catch_up_once"}}"#
+    );
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_scheduled_task(NewScheduledTask {
+                id: "scheduled-task-sync",
+                title: "Sync task",
+                description: None,
+                schedule_json: r#"{"type":"one_shot_at","run_at":"2020-01-01T00:00:00Z"}"#,
+                action_json: r#"{"type":"agent_prompt","prompt":"Sync prompt","session_mode":"create_new_chat","model_id":"model","provider_id":"provider","skill_ids":[],"collaboration_tools_enabled":false}"#,
+                status: "enabled",
+                next_run_at: Some("2020-01-01T00:00:00Z"),
+                metadata_json: Some(&metadata_json),
+            })
+            .expect("scheduled task insert");
+    }
+
+    crate::scheduled_tasks::scheduler::dispatch_due_scheduled_tasks(&state)
+        .await
+        .expect("dispatch due scheduled tasks");
+    let run = WorkspaceDatabase::open_or_create(&workspace_dir)
+        .expect("database")
+        .scheduled_task_runs_for_task("scheduled-task-sync")
+        .expect("scheduled task runs")
+        .into_iter()
+        .next()
+        .expect("scheduled run");
+    assert_eq!(run.status, "queued");
+    let agent_task_id = run.agent_task_id.clone().expect("agent task id");
+    let attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-scheduled-sync").expect("attempt id");
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        let task = database
+            .agent_task(&agent_task_id)
+            .expect("agent task lookup")
+            .expect("agent task");
+        database
+            .claim_runnable_agent_task(&task.team_id, &agent_task_id, &attempt_id)
+            .expect("claim agent task")
+            .expect("claimed agent task");
+    }
+    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
+        &workspace_dir,
+        &agent_task_id,
+    )
+    .expect("sync running scheduled run");
+
+    {
+        let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        let running = database
+            .scheduled_task_run(&run.id)
+            .expect("scheduled run lookup")
+            .expect("scheduled run");
+        assert_eq!(running.status, "running");
+        assert_eq!(running.agent_attempt_id.as_ref(), Some(&attempt_id));
+        assert_eq!(
+            running.active_run_id.as_deref(),
+            Some(agent_task_id.as_str())
+        );
+        assert!(running.started_at.is_some());
+    }
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        let task = database
+            .agent_task(&agent_task_id)
+            .expect("agent task lookup")
+            .expect("agent task");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &task.team_id,
+                task_id: &task.id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Complete,
+                result_json: Some(r#"{"text":"done"}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete agent task");
+    }
+    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
+        &workspace_dir,
+        &agent_task_id,
+    )
+    .expect("sync completed scheduled run");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let completed = database
+        .scheduled_task_run(&run.id)
+        .expect("scheduled run lookup")
+        .expect("scheduled run");
+    assert_eq!(completed.status, "succeeded");
+    assert_eq!(completed.agent_attempt_id.as_ref(), Some(&attempt_id));
+    assert!(completed.completed_at.is_some());
+    assert!(completed.chat_id.is_some());
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn scheduled_task_run_cancel_cancels_queued_agent_task() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-cancel-queued-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-cancel-queued-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (agent_scheduler, _agent_scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = agent_scheduler;
+    let metadata_json = format!(
+        r#"{{"workspaceId":"{workspace_id}","concurrencyPolicy":"skip_if_running","misfirePolicy":"catch_up_once"}}"#
+    );
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_scheduled_task(NewScheduledTask {
+                id: "scheduled-task-cancel-queued",
+                title: "Cancel queued task",
+                description: None,
+                schedule_json: r#"{"type":"one_shot_at","run_at":"2020-01-01T00:00:00Z"}"#,
+                action_json: r#"{"type":"agent_prompt","prompt":"Cancel queued prompt","session_mode":"create_new_chat","model_id":"model","provider_id":"provider","skill_ids":[],"collaboration_tools_enabled":false}"#,
+                status: "enabled",
+                next_run_at: Some("2020-01-01T00:00:00Z"),
+                metadata_json: Some(&metadata_json),
+            })
+            .expect("scheduled task insert");
+    }
+
+    crate::scheduled_tasks::scheduler::dispatch_due_scheduled_tasks(&state)
+        .await
+        .expect("dispatch due scheduled tasks");
+    let run = WorkspaceDatabase::open_or_create(&workspace_dir)
+        .expect("database")
+        .scheduled_task_runs_for_task("scheduled-task-cancel-queued")
+        .expect("scheduled task runs")
+        .into_iter()
+        .next()
+        .expect("scheduled run");
+    let agent_task_id = run.agent_task_id.clone().expect("agent task id");
+
+    let cancelled = crate::scheduled_tasks::scheduler::cancel_scheduled_task_run(
+        &state,
+        &workspace_id,
+        &run.id,
+    )
+    .expect("cancel scheduled run");
+    assert_eq!(cancelled.status, "cancelled");
+    assert_eq!(
+        cancelled.error_message.as_deref(),
+        Some("cancelled explicitly")
+    );
+    assert!(cancelled.completed_at.is_some());
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let task = database
+        .agent_task(&agent_task_id)
+        .expect("agent task lookup")
+        .expect("agent task");
+    assert_eq!(task.status, foco_agent::AgentTaskStatus::Cancelled);
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn scheduled_task_run_cancel_signals_running_active_run() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-cancel-running-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-cancel-running-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (agent_scheduler, _agent_scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = agent_scheduler;
+    let metadata_json = format!(
+        r#"{{"workspaceId":"{workspace_id}","concurrencyPolicy":"skip_if_running","misfirePolicy":"catch_up_once"}}"#
+    );
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_scheduled_task(NewScheduledTask {
+                id: "scheduled-task-cancel-running",
+                title: "Cancel running task",
+                description: None,
+                schedule_json: r#"{"type":"one_shot_at","run_at":"2020-01-01T00:00:00Z"}"#,
+                action_json: r#"{"type":"agent_prompt","prompt":"Cancel running prompt","session_mode":"create_new_chat","model_id":"model","provider_id":"provider","skill_ids":[],"collaboration_tools_enabled":false}"#,
+                status: "enabled",
+                next_run_at: Some("2020-01-01T00:00:00Z"),
+                metadata_json: Some(&metadata_json),
+            })
+            .expect("scheduled task insert");
+    }
+
+    crate::scheduled_tasks::scheduler::dispatch_due_scheduled_tasks(&state)
+        .await
+        .expect("dispatch due scheduled tasks");
+    let run = WorkspaceDatabase::open_or_create(&workspace_dir)
+        .expect("database")
+        .scheduled_task_runs_for_task("scheduled-task-cancel-running")
+        .expect("scheduled task runs")
+        .into_iter()
+        .next()
+        .expect("scheduled run");
+    let agent_task_id = run.agent_task_id.clone().expect("agent task id");
+    let attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-scheduled-cancel").expect("attempt id");
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        let task = database
+            .agent_task(&agent_task_id)
+            .expect("agent task lookup")
+            .expect("agent task");
+        database
+            .claim_runnable_agent_task(&task.team_id, &agent_task_id, &attempt_id)
+            .expect("claim agent task")
+            .expect("claimed agent task");
+    }
+    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
+        &workspace_dir,
+        &agent_task_id,
+    )
+    .expect("sync running scheduled run");
+
+    let synced = WorkspaceDatabase::open_or_create(&workspace_dir)
+        .expect("database")
+        .scheduled_task_run(&run.id)
+        .expect("scheduled run lookup")
+        .expect("scheduled run");
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let registration = state
+        .active_chat_runs
+        .register(
+            agent_task_id.to_string(),
+            workspace_id.clone(),
+            synced.chat_id.clone().expect("chat id"),
+            "assistant-scheduled-active".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active run");
+    let cancellation_rx = registration.cancellation().subscribe();
+    assert!(!*cancellation_rx.borrow());
+
+    let cancelling = crate::scheduled_tasks::scheduler::cancel_scheduled_task_run(
+        &state,
+        &workspace_id,
+        &run.id,
+    )
+    .expect("cancel running scheduled run");
+    assert_eq!(cancelling.status, "running");
+    assert!(*cancellation_rx.borrow());
+
+    drop(registration);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn queue_chat_message_resumes_paused_coordinator_without_active_work() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-resume-queue-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-agent-resume-queue-profile"));

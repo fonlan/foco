@@ -768,6 +768,11 @@ fn scheduled_task_records_round_trip_and_list_runs() {
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].id, "scheduled-run-2");
     assert_eq!(runs[1].id, "scheduled-run-1");
+    let agent_runs = database
+        .scheduled_task_runs_for_agent_task(&agent_task_id)
+        .expect("scheduled task runs for agent task");
+    assert_eq!(agent_runs.len(), 1);
+    assert_eq!(agent_runs[0].id, "scheduled-run-1");
 
     assert!(
         database

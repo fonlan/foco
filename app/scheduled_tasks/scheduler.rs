@@ -1,12 +1,15 @@
+use std::path::Path;
+
 use chrono::{DateTime, SecondsFormat, Utc};
+use foco_agent::{AgentTaskId, AgentTaskStatus};
 use foco_store::{
     config::{AgentDefinitionSettings, WorkspaceConfig},
     workspace::{
-        NewScheduledTaskRun, ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord,
-        ScheduledTaskRunUpdate, ScheduledTaskUpdate, WorkspaceDatabase,
+        AgentTaskRecord, NewScheduledTaskRun, ScheduledTaskDueRunClaim, ScheduledTaskRecord,
+        ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate, WorkspaceDatabase,
     },
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -27,7 +30,10 @@ const STATUS_COMPLETED: &str = "completed";
 const STATUS_ARCHIVED: &str = "archived";
 const RUN_STATUS_PENDING: &str = "pending";
 const RUN_STATUS_QUEUED: &str = "queued";
+const RUN_STATUS_RUNNING: &str = "running";
+const RUN_STATUS_SUCCEEDED: &str = "succeeded";
 const RUN_STATUS_FAILED: &str = "failed";
+const RUN_STATUS_CANCELLED: &str = "cancelled";
 const RUN_STATUS_SKIPPED: &str = "skipped";
 const TRIGGER_REASON_SCHEDULED: &str = "scheduled";
 const TRIGGER_REASON_MANUAL: &str = "manual";
@@ -225,6 +231,143 @@ pub(crate) async fn run_scheduled_task_now(
     dispatch_scheduled_task_run(state, &config, workspace, task, run, TRIGGER_REASON_MANUAL).await
 }
 
+pub(crate) fn cancel_scheduled_task_run(
+    state: &AppState,
+    workspace_id: &str,
+    scheduled_run_id: &str,
+) -> Result<ScheduledTaskRunRecord, ApiError> {
+    let config = config_snapshot(state)?;
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let run = database
+        .scheduled_task_run(scheduled_run_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "scheduled task run was not found: {scheduled_run_id}"
+            ))
+        })?;
+    let run = sync_scheduled_task_run(&mut database, run)?;
+    if scheduled_run_status_is_terminal(&run.status) {
+        return Err(ApiError::bad_request(format!(
+            "scheduled task run '{}' cannot be cancelled while {}",
+            run.id, run.status
+        )));
+    }
+
+    let Some(agent_task_id) = run.agent_task_id.clone() else {
+        return mark_scheduled_run_cancelled(&mut database, run, "cancelled explicitly");
+    };
+    let task = database
+        .agent_task(&agent_task_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent task '{agent_task_id}' was not found"))
+        })?;
+
+    match task.status {
+        AgentTaskStatus::Queued => {
+            if !database
+                .cancel_queued_agent_task(
+                    &task.team_id,
+                    &task.id,
+                    r#"{"message":"cancelled explicitly"}"#,
+                )
+                .map_err(ApiError::from_workspace_error)?
+            {
+                let run = sync_scheduled_task_run_with_task(&mut database, run, &task)?;
+                return Err(ApiError::bad_request(format!(
+                    "scheduled task run '{}' changed state before cancellation; current status is {}",
+                    run.id, run.status
+                )));
+            }
+            crate::insert_agent_event(
+                &mut database,
+                &task.team_id,
+                "task_cancelled",
+                Some(&task.owner_instance_id),
+                Some(&task.id),
+                None,
+                json!({ "reason": "scheduled_run_cancel", "scheduledTaskRunId": run.id }),
+            )?;
+            state.agent_scheduler.wake()?;
+            let task = database
+                .agent_task(&agent_task_id)
+                .map_err(ApiError::from_workspace_error)?
+                .ok_or_else(|| {
+                    ApiError::internal(format!("Agent task '{agent_task_id}' was not found"))
+                })?;
+            sync_scheduled_task_run_with_task(&mut database, run, &task)
+        }
+        AgentTaskStatus::Running => {
+            let active_run_id = run
+                .active_run_id
+                .as_deref()
+                .unwrap_or_else(|| task.id.as_str());
+            state.active_chat_runs.cancel(workspace_id, active_run_id)?;
+            crate::insert_agent_event(
+                &mut database,
+                &task.team_id,
+                "task_cancel_requested",
+                Some(&task.owner_instance_id),
+                Some(&task.id),
+                None,
+                json!({ "scheduledTaskRunId": run.id }),
+            )?;
+            state.agent_scheduler.wake()?;
+            sync_scheduled_task_run_with_task(&mut database, run, &task)
+        }
+        AgentTaskStatus::Waiting => Err(ApiError::bad_request(format!(
+            "scheduled task run '{}' cannot be cancelled while Agent task '{}' is waiting",
+            run.id, task.id
+        ))),
+        AgentTaskStatus::Completed
+        | AgentTaskStatus::Failed
+        | AgentTaskStatus::Cancelled
+        | AgentTaskStatus::Interrupted => {
+            let run = sync_scheduled_task_run_with_task(&mut database, run, &task)?;
+            Err(ApiError::bad_request(format!(
+                "scheduled task run '{}' cannot be cancelled while {}",
+                run.id, run.status
+            )))
+        }
+    }
+}
+
+// ponytail: read-time sync avoids a second scheduled-task event bus; add push updates when
+// the UI needs live run rows without polling/refetching.
+pub(crate) fn sync_scheduled_task_run(
+    database: &mut WorkspaceDatabase,
+    run: ScheduledTaskRunRecord,
+) -> Result<ScheduledTaskRunRecord, ApiError> {
+    let Some(agent_task_id) = run.agent_task_id.clone() else {
+        return Ok(run);
+    };
+    let Some(task) = database
+        .agent_task(&agent_task_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(run);
+    };
+    sync_scheduled_task_run_with_task(database, run, &task)
+}
+
+pub(crate) fn sync_scheduled_task_runs_for_agent_task(
+    workspace_path: &Path,
+    agent_task_id: &AgentTaskId,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let runs = database
+        .scheduled_task_runs_for_agent_task(agent_task_id)
+        .map_err(ApiError::from_workspace_error)?;
+    for run in runs {
+        sync_scheduled_task_run(&mut database, run)?;
+    }
+    Ok(())
+}
+
 fn next_due_task(
     workspace: &WorkspaceConfig,
     now: DateTime<Utc>,
@@ -412,6 +555,135 @@ fn mark_scheduled_run_failed(
             metadata_json: &run.metadata_json,
         })
         .map_err(ApiError::from_workspace_error)
+}
+
+fn mark_scheduled_run_cancelled(
+    database: &mut WorkspaceDatabase,
+    run: ScheduledTaskRunRecord,
+    message: &str,
+) -> Result<ScheduledTaskRunRecord, ApiError> {
+    let completed_at = format_utc_timestamp(Utc::now());
+    database
+        .update_scheduled_task_run(ScheduledTaskRunUpdate {
+            id: &run.id,
+            status: RUN_STATUS_CANCELLED,
+            queued_at: run.queued_at.as_deref(),
+            started_at: run.started_at.as_deref(),
+            completed_at: Some(&completed_at),
+            chat_id: run.chat_id.as_deref(),
+            user_message_id: run.user_message_id.as_deref(),
+            assistant_message_id: run.assistant_message_id.as_deref(),
+            agent_team_id: run.agent_team_id.as_ref(),
+            agent_task_id: run.agent_task_id.as_ref(),
+            agent_attempt_id: run.agent_attempt_id.as_ref(),
+            active_run_id: run.active_run_id.as_deref(),
+            error_message: Some(message),
+            output_summary: run.output_summary.as_deref(),
+            metadata_json: &run.metadata_json,
+        })
+        .map_err(ApiError::from_workspace_error)
+}
+
+fn sync_scheduled_task_run_with_task(
+    database: &mut WorkspaceDatabase,
+    run: ScheduledTaskRunRecord,
+    task: &AgentTaskRecord,
+) -> Result<ScheduledTaskRunRecord, ApiError> {
+    let status = scheduled_run_status_for_agent_task(task.status);
+    let started_at = match task.status {
+        AgentTaskStatus::Queued => run.started_at.clone(),
+        AgentTaskStatus::Running
+        | AgentTaskStatus::Waiting
+        | AgentTaskStatus::Completed
+        | AgentTaskStatus::Failed
+        | AgentTaskStatus::Cancelled
+        | AgentTaskStatus::Interrupted => task.started_at.clone().or(run.started_at.clone()),
+    };
+    let completed_at = if task.status.is_terminal() {
+        task.completed_at.clone().or(run.completed_at.clone())
+    } else {
+        None
+    };
+    let error_message = match task.status {
+        AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted => {
+            agent_task_error_message(task)
+        }
+        AgentTaskStatus::Queued
+        | AgentTaskStatus::Running
+        | AgentTaskStatus::Waiting
+        | AgentTaskStatus::Completed => None,
+    };
+    let agent_attempt_id = database
+        .agent_attempts_for_task(&task.id)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .last()
+        .map(|attempt| attempt.id)
+        .or_else(|| run.agent_attempt_id.clone());
+    let active_run_id = run
+        .active_run_id
+        .clone()
+        .or_else(|| Some(task.id.to_string()));
+
+    if run.status == status
+        && run.started_at == started_at
+        && run.completed_at == completed_at
+        && run.error_message == error_message
+        && run.agent_attempt_id == agent_attempt_id
+        && run.active_run_id == active_run_id
+    {
+        return Ok(run);
+    }
+
+    database
+        .update_scheduled_task_run(ScheduledTaskRunUpdate {
+            id: &run.id,
+            status,
+            queued_at: run.queued_at.as_deref(),
+            started_at: started_at.as_deref(),
+            completed_at: completed_at.as_deref(),
+            chat_id: run.chat_id.as_deref(),
+            user_message_id: run.user_message_id.as_deref(),
+            assistant_message_id: run.assistant_message_id.as_deref(),
+            agent_team_id: run.agent_team_id.as_ref(),
+            agent_task_id: run.agent_task_id.as_ref(),
+            agent_attempt_id: agent_attempt_id.as_ref(),
+            active_run_id: active_run_id.as_deref(),
+            error_message: error_message.as_deref(),
+            output_summary: run.output_summary.as_deref(),
+            metadata_json: &run.metadata_json,
+        })
+        .map_err(ApiError::from_workspace_error)
+}
+
+fn scheduled_run_status_for_agent_task(status: AgentTaskStatus) -> &'static str {
+    match status {
+        AgentTaskStatus::Queued => RUN_STATUS_QUEUED,
+        AgentTaskStatus::Running | AgentTaskStatus::Waiting => RUN_STATUS_RUNNING,
+        AgentTaskStatus::Completed => RUN_STATUS_SUCCEEDED,
+        AgentTaskStatus::Failed | AgentTaskStatus::Interrupted => RUN_STATUS_FAILED,
+        AgentTaskStatus::Cancelled => RUN_STATUS_CANCELLED,
+    }
+}
+
+fn scheduled_run_status_is_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        RUN_STATUS_SUCCEEDED | RUN_STATUS_FAILED | RUN_STATUS_CANCELLED | RUN_STATUS_SKIPPED
+    )
+}
+
+fn agent_task_error_message(task: &AgentTaskRecord) -> Option<String> {
+    let error_json = task.error_json.as_deref()?;
+    serde_json::from_str::<Value>(error_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| Some(error_json.to_string()))
 }
 
 fn task_metadata(

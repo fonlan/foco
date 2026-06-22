@@ -2356,6 +2356,29 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn scheduled_task_runs_for_agent_task(
+        &self,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<Vec<ScheduledTaskRunRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, task_id, trigger_reason, status, scheduled_at, queued_at,
+                        started_at, completed_at, chat_id, user_message_id,
+                        assistant_message_id, agent_team_id, agent_task_id, agent_attempt_id,
+                        active_run_id, error_message, output_summary, created_at, updated_at,
+                        metadata_json
+                 FROM scheduled_task_runs
+                 WHERE agent_task_id = ?1
+                 ORDER BY scheduled_at DESC, created_at DESC, id DESC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![agent_task_id.as_str()], scheduled_task_run_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn create_agent_team(
         &mut self,
         team: NewAgentTeam<'_>,

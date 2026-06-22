@@ -353,17 +353,19 @@ pub(crate) async fn scheduled_task_runs(
 ) -> Result<Json<ScheduledTaskRunsResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
     require_scheduled_task(&database, &task_id)?;
     let runs = database
         .scheduled_task_runs_for_task(&task_id)
-        .map_err(ApiError::from_workspace_error)?
-        .into_iter()
-        .map(|run| scheduled_task_run_view(&workspace.id, run))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map_err(ApiError::from_workspace_error)?;
+    let mut views = Vec::with_capacity(runs.len());
+    for run in runs {
+        let run = crate::scheduled_tasks::scheduler::sync_scheduled_task_run(&mut database, run)?;
+        views.push(scheduled_task_run_view(&workspace.id, run)?);
+    }
 
-    Ok(Json(ScheduledTaskRunsResponse { runs }))
+    Ok(Json(ScheduledTaskRunsResponse { runs: views }))
 }
 
 pub(crate) async fn scheduled_task_run(
@@ -372,7 +374,7 @@ pub(crate) async fn scheduled_task_run(
 ) -> Result<Json<ScheduledTaskRunResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
     let run = database
         .scheduled_task_run(&scheduled_run_id)
@@ -382,9 +384,24 @@ pub(crate) async fn scheduled_task_run(
                 "scheduled task run was not found: {scheduled_run_id}"
             ))
         })?;
+    let run = crate::scheduled_tasks::scheduler::sync_scheduled_task_run(&mut database, run)?;
 
     Ok(Json(ScheduledTaskRunResponse {
         run: scheduled_task_run_view(&workspace.id, run)?,
+    }))
+}
+
+pub(crate) async fn cancel_scheduled_task_run(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, scheduled_run_id)): AxumPath<(String, String)>,
+) -> Result<Json<ScheduledTaskRunResponse>, ApiError> {
+    let run = crate::scheduled_tasks::scheduler::cancel_scheduled_task_run(
+        &state,
+        &workspace_id,
+        &scheduled_run_id,
+    )?;
+    Ok(Json(ScheduledTaskRunResponse {
+        run: scheduled_task_run_view(&workspace_id, run)?,
     }))
 }
 
