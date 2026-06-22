@@ -19,7 +19,7 @@ use foco_store::{
 use crate::*;
 
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
-const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete the user's task directly. When Agent team tools are available, coordinate or create worker agents only when that materially reduces the work.";
+const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.";
 
 pub(crate) async fn settings(
     State(state): State<AppState>,

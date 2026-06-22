@@ -344,7 +344,7 @@ pub(crate) async fn enable_agent_team(
             chat_id: &chat_id,
             coordinator_instance_id: &instance_id,
             coordinator_definition: definition,
-            max_concurrent_runs: 1,
+            max_concurrent_runs: DEFAULT_AGENT_TEAM_MAX_CONCURRENT_RUNS,
         })
         .map_err(ApiError::from_workspace_error)?;
     insert_agent_event(

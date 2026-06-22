@@ -216,6 +216,8 @@ const PROMPT_CACHE_RETENTION_24H: &str = "24h";
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 // Agent tool name exposed for writing manual memory notes.
 const MEMORY_WRITE_TOOL_NAME: &str = "memory_write";
+// Default number of Agent team tasks that may run at the same time.
+pub(crate) const DEFAULT_AGENT_TEAM_MAX_CONCURRENT_RUNS: i64 = 5;
 // Default timeout for memory tools when the caller does not provide timeoutMs.
 const DEFAULT_MEMORY_TOOL_TIMEOUT_MS: u64 = 10_000;
 // Upper bound accepted for memory tool timeoutMs.

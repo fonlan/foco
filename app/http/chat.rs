@@ -27,7 +27,7 @@ type BoxedChatEventStream =
 type BoxedChatSse = Sse<KeepAliveStream<BoxedChatEventStream>>;
 
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
-const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete the user's task directly. When Agent team tools are available, coordinate or create worker agents only when that materially reduces the work.";
+const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.";
 const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug)]
@@ -266,7 +266,7 @@ pub(crate) async fn queue_chat_message_internal(
                 chat_id: &chat_id,
                 coordinator_instance_id: &instance_id,
                 coordinator_definition: &definition,
-                max_concurrent_runs: 1,
+                max_concurrent_runs: DEFAULT_AGENT_TEAM_MAX_CONCURRENT_RUNS,
             })
             .map_err(ApiError::from_workspace_error)?;
         insert_agent_event(

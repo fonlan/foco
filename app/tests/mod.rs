@@ -4246,6 +4246,14 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
     let task_id = queued.agent_task_id.expect("Agent task id");
     assert_eq!(scheduler_rx.recv().await, Some(()));
     let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let team = database
+        .agent_team_for_chat("chat-agent-api")
+        .expect("team lookup")
+        .expect("enabled team");
+    assert_eq!(
+        team.max_concurrent_runs,
+        DEFAULT_AGENT_TEAM_MAX_CONCURRENT_RUNS
+    );
     let task = database.agent_task(&task_id).expect("task").expect("task");
     assert_eq!(task.status, foco_agent::AgentTaskStatus::Queued);
     let input = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json)
@@ -4441,6 +4449,10 @@ async fn queue_chat_message_creates_default_team_for_normal_send() {
         .agent_team_for_chat(&queued.chat_id)
         .expect("team lookup")
         .expect("default team");
+    assert_eq!(
+        team.max_concurrent_runs,
+        DEFAULT_AGENT_TEAM_MAX_CONCURRENT_RUNS
+    );
     let task = database
         .agent_task(&task_id)
         .expect("task lookup")
