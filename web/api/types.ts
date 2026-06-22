@@ -1593,6 +1593,27 @@ export type ScheduledTaskStatus =
   | "completed"
   | "archived";
 
+export type ScheduledTaskSchedule =
+  | { type: "one_shot_at"; run_at: string }
+  | { type: "interval"; every_seconds: number; start_at?: string | null }
+  | { type: "cron"; expression: string; timezone?: string | null };
+
+export type ScheduledSessionMode =
+  | "create_new_chat"
+  | { reuse_chat: { chat_id: string } };
+
+export type ScheduledTaskAction = {
+  type: "agent_prompt";
+  prompt: string;
+  session_mode: ScheduledSessionMode;
+  agent_definition_id?: string | null;
+  model_id?: string | null;
+  provider_id?: string | null;
+  thinking_level?: string | null;
+  skill_ids: string[];
+  collaboration_tools_enabled: boolean;
+};
+
 export type ScheduledTaskView = {
   id: string;
   workspaceId: string;
@@ -1611,6 +1632,47 @@ export type ScheduledTaskView = {
 
 export type ScheduledTasksResponse = {
   tasks: ScheduledTaskView[];
+};
+
+export type ScheduledTaskRunStatus =
+  | "pending"
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "skipped";
+
+export type ScheduledTaskRunView = {
+  id: string;
+  workspaceId: string;
+  taskId: string;
+  triggerReason: "scheduled" | "manual" | "retry" | "misfire_catch_up" | string;
+  status: ScheduledTaskRunStatus;
+  scheduledAt: string;
+  queuedAt: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  chatId: string | null;
+  userMessageId: string | null;
+  assistantMessageId: string | null;
+  agentTeamId: string | null;
+  agentTaskId: string | null;
+  agentAttemptId: string | null;
+  activeRunId: string | null;
+  errorMessage: string | null;
+  outputSummary: string | null;
+  createdAt: string;
+  updatedAt: string;
+  metadata: JsonValue;
+};
+
+export type ScheduledTaskRunsResponse = {
+  runs: ScheduledTaskRunView[];
+};
+
+export type ScheduledTaskRunResponse = {
+  run: ScheduledTaskRunView;
 };
 
 export type ActiveRunInfo = {

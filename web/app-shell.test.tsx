@@ -369,7 +369,7 @@ describe("app-shell verification surfaces", () => {
     expect(
       await screen.findByRole("heading", { name: "Scheduled tasks" }),
     ).toBeInTheDocument();
-    expect(await screen.findByText("Daily workspace summary")).toBeInTheDocument();
+    expect(await screen.findAllByText("Daily workspace summary")).not.toHaveLength(0);
     expect(window.location.pathname).toBe("/scheduled");
     expect(
       fetchMock.mock.calls.some(
@@ -385,6 +385,34 @@ describe("app-shell verification surfaces", () => {
     expect(
       await screen.findByRole("heading", { name: "Scheduled tasks" }),
     ).toBeInTheDocument();
+  });
+
+  it("creates and runs a scheduled task from the scheduled tasks page", async () => {
+    renderApp();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Scheduled tasks" }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "New task" }));
+
+    await userEvent.type(screen.getByLabelText("Title"), "Morning report");
+    await userEvent.type(
+      screen.getByLabelText("Prompt"),
+      "Summarize open work.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Save task" }));
+
+    expect(await screen.findAllByText("Morning report")).not.toHaveLength(0);
+
+    await userEvent.click(screen.getByRole("button", { name: "Pause task" }));
+    expect(await screen.findAllByText("Paused")).not.toHaveLength(0);
+
+    await userEvent.click(screen.getByRole("button", { name: "Run task now" }));
+    expect(await screen.findByText("Manual")).toBeInTheDocument();
+
+    await userEvent.click(screen.getAllByRole("button", { name: "Open chat" })[0]!);
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/workspace-1/chat-1");
   });
 
   it("opens a chat from the URL and writes chat selection changes back to the URL", async () => {

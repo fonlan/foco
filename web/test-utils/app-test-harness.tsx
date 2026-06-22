@@ -1245,12 +1245,28 @@ export const importedHooks = {
   validationErrors: [],
 };
 
-export const scheduledTasks = {
+type ScheduledTaskFixture = {
+  action: Record<string, unknown>;
+  createdAt: string;
+  description: string | null;
+  id: string;
+  lastRunAt: string | null;
+  metadata: Record<string, unknown>;
+  nextRunAt: string | null;
+  schedule: Record<string, unknown>;
+  status: string;
+  title: string;
+  updatedAt: string;
+  workspaceId: string;
+  workspaceName: string;
+};
+
+export const scheduledTasks: { tasks: ScheduledTaskFixture[] } = {
   tasks: [
     {
       action: {
         prompt: "Summarize workspace changes.",
-        sessionMode: "create_new_chat",
+        session_mode: "create_new_chat",
         type: "agent_prompt",
       },
       createdAt: "2026-06-22T08:00:00Z",
@@ -1277,12 +1293,65 @@ export const scheduledTasks = {
   ],
 };
 
+type ScheduledTaskRunFixture = {
+  activeRunId: string | null;
+  agentAttemptId: string | null;
+  agentTaskId: string | null;
+  agentTeamId: string | null;
+  assistantMessageId: string | null;
+  chatId: string | null;
+  completedAt: string | null;
+  createdAt: string;
+  errorMessage: string | null;
+  id: string;
+  metadata: Record<string, unknown>;
+  outputSummary: string | null;
+  queuedAt: string | null;
+  scheduledAt: string;
+  startedAt: string | null;
+  status: string;
+  taskId: string;
+  triggerReason: string;
+  updatedAt: string;
+  userMessageId: string | null;
+  workspaceId: string;
+};
+
+export const scheduledTaskRunsByTaskId: Record<string, ScheduledTaskRunFixture[]> = {
+  "scheduled-task-1": [
+    {
+      activeRunId: "agent-task-scheduled-1",
+      agentAttemptId: null,
+      agentTaskId: "agent-task-scheduled-1",
+      agentTeamId: "agent-team-1",
+      assistantMessageId: "message-assistant-1",
+      chatId: "chat-1",
+      completedAt: "2026-06-22T08:02:00Z",
+      createdAt: "2026-06-22T08:00:00Z",
+      errorMessage: null,
+      id: "scheduled-run-1",
+      metadata: {},
+      outputSummary: null,
+      queuedAt: "2026-06-22T08:00:01Z",
+      scheduledAt: "2026-06-22T08:00:00Z",
+      startedAt: "2026-06-22T08:00:03Z",
+      status: "succeeded",
+      taskId: "scheduled-task-1",
+      triggerReason: "scheduled",
+      updatedAt: "2026-06-22T08:02:00Z",
+      userMessageId: "message-user-1",
+      workspaceId: "workspace-1",
+    },
+  ],
+};
+
 export const appTestState: {
   activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null;
   chatStreamControllers: Map<string, ReadableStreamDefaultController<Uint8Array>>;
   terminalSessionCounter: number;
   chatStreamCounter: number;
   chatQueueCounter: number;
+  scheduledTaskRunsByTaskId: Record<string, ScheduledTaskRunFixture[]>;
   scheduledTasksResponse: typeof scheduledTasks;
   workspaceGitDiffResponse: typeof gitDiff;
   workspaceResponseWorkspaces: unknown[];
@@ -1292,6 +1361,7 @@ export const appTestState: {
   terminalSessionCounter: 0,
   chatStreamCounter: 0,
   chatQueueCounter: 0,
+  scheduledTaskRunsByTaskId,
   scheduledTasksResponse: scheduledTasks,
   workspaceGitDiffResponse: gitDiff,
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
@@ -1358,6 +1428,9 @@ export function resetAppTestEnvironment() {
   appTestState.terminalSessionCounter = 0;
   appTestState.chatStreamCounter = 0;
   appTestState.chatQueueCounter = 0;
+  appTestState.scheduledTaskRunsByTaskId = {
+    "scheduled-task-1": [...scheduledTaskRunsByTaskId["scheduled-task-1"]],
+  };
   appTestState.scheduledTasksResponse = scheduledTasks;
   appTestState.workspaceGitDiffResponse = gitDiff;
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
@@ -1422,6 +1495,190 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/scheduled-tasks") {
     return jsonResponse(appTestState.scheduledTasksResponse);
+  }
+
+  const scheduledRunsMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/scheduled-tasks\/([^/]+)\/runs$/,
+  );
+  if (scheduledRunsMatch) {
+    const taskId = decodeURIComponent(scheduledRunsMatch[2] ?? "");
+    return jsonResponse({
+      runs: appTestState.scheduledTaskRunsByTaskId[taskId] ?? [],
+    });
+  }
+
+  const scheduledRunNowMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/scheduled-tasks\/([^/]+)\/run-now$/,
+  );
+  if (scheduledRunNowMatch) {
+    const workspaceId = decodeURIComponent(scheduledRunNowMatch[1] ?? "");
+    const taskId = decodeURIComponent(scheduledRunNowMatch[2] ?? "");
+    const now = "2026-06-22T09:00:00Z";
+    const run: ScheduledTaskRunFixture = {
+      activeRunId: "agent-task-manual-1",
+      agentAttemptId: null,
+      agentTaskId: "agent-task-manual-1",
+      agentTeamId: "agent-team-1",
+      assistantMessageId: "message-assistant-1",
+      chatId: "chat-1",
+      completedAt: null,
+      createdAt: now,
+      errorMessage: null,
+      id: `scheduled-run-${(appTestState.scheduledTaskRunsByTaskId[taskId] ?? []).length + 1}`,
+      metadata: {},
+      outputSummary: null,
+      queuedAt: now,
+      scheduledAt: now,
+      startedAt: null,
+      status: "queued",
+      taskId,
+      triggerReason: "manual",
+      updatedAt: now,
+      userMessageId: "message-user-1",
+      workspaceId,
+    };
+    appTestState.scheduledTaskRunsByTaskId = {
+      ...appTestState.scheduledTaskRunsByTaskId,
+      [taskId]: [run, ...(appTestState.scheduledTaskRunsByTaskId[taskId] ?? [])],
+    };
+    appTestState.scheduledTasksResponse = {
+      tasks: appTestState.scheduledTasksResponse.tasks.map((task) =>
+        task.id === taskId ? { ...task, lastRunAt: now, updatedAt: now } : task,
+      ),
+    };
+    return jsonResponse({ run });
+  }
+
+  const scheduledTaskActionMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/scheduled-tasks\/([^/]+)\/(pause|resume|archive)$/,
+  );
+  if (scheduledTaskActionMatch) {
+    const taskId = decodeURIComponent(scheduledTaskActionMatch[2] ?? "");
+    const action = scheduledTaskActionMatch[3];
+    const status =
+      action === "pause" ? "paused" : action === "resume" ? "enabled" : "archived";
+    let updatedTask = appTestState.scheduledTasksResponse.tasks.find(
+      (task) => task.id === taskId,
+    );
+    if (updatedTask) {
+      updatedTask = {
+        ...updatedTask,
+        nextRunAt: status === "enabled" ? updatedTask.nextRunAt : null,
+        status,
+        updatedAt: "2026-06-22T09:00:00Z",
+      };
+      appTestState.scheduledTasksResponse = {
+        tasks: appTestState.scheduledTasksResponse.tasks.map((task) =>
+          task.id === taskId ? updatedTask! : task,
+        ),
+      };
+    }
+    return jsonResponse({ task: updatedTask });
+  }
+
+  const scheduledTaskItemMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/scheduled-tasks\/([^/]+)$/,
+  );
+  if (scheduledTaskItemMatch) {
+    const taskId = decodeURIComponent(scheduledTaskItemMatch[2] ?? "");
+    const existingTask = appTestState.scheduledTasksResponse.tasks.find(
+      (task) => task.id === taskId,
+    );
+    if (init?.method === "DELETE") {
+      appTestState.scheduledTasksResponse = {
+        tasks: appTestState.scheduledTasksResponse.tasks.filter(
+          (task) => task.id !== taskId,
+        ),
+      };
+      return jsonResponse({ task: existingTask });
+    }
+    if (init?.method === "PATCH" && existingTask) {
+      const body = JSON.parse(String(init.body ?? "{}")) as Record<string, unknown>;
+      const updatedTask = {
+        ...existingTask,
+        action:
+          (body.action as Record<string, unknown> | undefined) ??
+          existingTask.action,
+        description:
+          "description" in body
+            ? (body.description as string | null)
+            : existingTask.description,
+        metadata: {
+          ...(existingTask.metadata as Record<string, unknown>),
+          concurrencyPolicy:
+            body.concurrencyPolicy ??
+            (existingTask.metadata as Record<string, unknown>).concurrencyPolicy,
+          misfirePolicy:
+            body.misfirePolicy ??
+            (existingTask.metadata as Record<string, unknown>).misfirePolicy,
+        },
+        schedule:
+          (body.schedule as Record<string, unknown> | undefined) ??
+          existingTask.schedule,
+        status: (body.status as string | undefined) ?? existingTask.status,
+        title: (body.title as string | undefined) ?? existingTask.title,
+        updatedAt: "2026-06-22T09:00:00Z",
+      };
+      appTestState.scheduledTasksResponse = {
+        tasks: appTestState.scheduledTasksResponse.tasks.map((task) =>
+          task.id === taskId ? updatedTask : task,
+        ),
+      };
+      return jsonResponse({ task: updatedTask });
+    }
+  }
+
+  const scheduledTaskCreateMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/scheduled-tasks$/,
+  );
+  if (scheduledTaskCreateMatch && init?.method === "POST") {
+    const workspaceId = decodeURIComponent(scheduledTaskCreateMatch[1] ?? "");
+    const body = JSON.parse(String(init.body ?? "{}")) as Record<string, unknown>;
+    const workspaceName =
+      (
+        appTestState.workspaceResponseWorkspaces.find(
+          (item) =>
+            typeof item === "object" &&
+            item !== null &&
+            "id" in item &&
+            item.id === workspaceId,
+        ) as { name?: string } | undefined
+      )?.name ?? workspaceId;
+    const now = "2026-06-22T09:00:00Z";
+    const task = {
+      action: (body.action as Record<string, unknown> | undefined) ?? {
+        prompt: "",
+        session_mode: "create_new_chat",
+        type: "agent_prompt",
+      },
+      createdAt: now,
+      description: (body.description as string | null | undefined) ?? null,
+      id: `scheduled-task-${appTestState.scheduledTasksResponse.tasks.length + 1}`,
+      lastRunAt: null,
+      metadata: {
+        concurrencyPolicy: body.concurrencyPolicy ?? "skip_if_running",
+        misfirePolicy: body.misfirePolicy ?? "catch_up_once",
+        workspaceId,
+      },
+      nextRunAt: now,
+      schedule: (body.schedule as Record<string, unknown> | undefined) ?? {
+        every_seconds: 86400,
+        type: "interval",
+      },
+      status: (body.status as string | undefined) ?? "enabled",
+      title: (body.title as string | undefined) ?? "New scheduled task",
+      updatedAt: now,
+      workspaceId,
+      workspaceName,
+    };
+    appTestState.scheduledTasksResponse = {
+      tasks: [task, ...appTestState.scheduledTasksResponse.tasks],
+    };
+    appTestState.scheduledTaskRunsByTaskId = {
+      ...appTestState.scheduledTaskRunsByTaskId,
+      [task.id]: [],
+    };
+    return jsonResponse({ task });
   }
 
   if (path === "/api/native/select-directory") {

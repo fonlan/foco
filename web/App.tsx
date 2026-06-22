@@ -6270,7 +6270,12 @@ export function App() {
                   workspaceDialogRevision={workspaceDialogRevision}
                 />
               ) : viewMode === "scheduled" ? (
-                <ScheduledTasksPage />
+                <ScheduledTasksPage
+                  agentDefinitions={agentDefinitions}
+                  onOpenChat={selectWorkspaceChat}
+                  settings={settings}
+                  workspaces={workspaces}
+                />
               ) : (
                 <ApiStatsPanel
                   settings={settings}
