@@ -47,6 +47,7 @@ pub(crate) enum ScheduledSessionMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ScheduledTaskMetadata {
     pub workspace_id: String,
     #[serde(default)]

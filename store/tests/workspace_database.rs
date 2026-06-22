@@ -768,6 +768,24 @@ fn scheduled_task_records_round_trip_and_list_runs() {
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].id, "scheduled-run-2");
     assert_eq!(runs[1].id, "scheduled-run-1");
+
+    assert!(
+        database
+            .delete_scheduled_task("scheduled-task-1")
+            .expect("scheduled task delete")
+    );
+    assert!(
+        database
+            .scheduled_task("scheduled-task-1")
+            .expect("deleted scheduled task lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .scheduled_task_runs_for_task("scheduled-task-1")
+            .expect("deleted scheduled task runs")
+            .is_empty()
+    );
 }
 
 #[test]

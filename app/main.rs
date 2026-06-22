@@ -766,6 +766,44 @@ fn app_router(state: AppState) -> Router {
         )
         .route("/api/hooks/test", post(crate::http::hooks::test_hooks))
         .route(
+            "/api/scheduled-tasks",
+            get(crate::http::scheduled_tasks::scheduled_tasks),
+        )
+        .route(
+            "/api/scheduled-tasks/preview-next-run",
+            post(crate::http::scheduled_tasks::preview_scheduled_task_next_run),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/scheduled-tasks",
+            post(crate::http::scheduled_tasks::create_scheduled_task),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}",
+            get(crate::http::scheduled_tasks::scheduled_task)
+                .patch(crate::http::scheduled_tasks::update_scheduled_task)
+                .delete(crate::http::scheduled_tasks::delete_scheduled_task),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}/pause",
+            post(crate::http::scheduled_tasks::pause_scheduled_task),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}/resume",
+            post(crate::http::scheduled_tasks::resume_scheduled_task),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}/archive",
+            post(crate::http::scheduled_tasks::archive_scheduled_task),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}/runs",
+            get(crate::http::scheduled_tasks::scheduled_task_runs),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/scheduled-task-runs/{scheduled_run_id}",
+            get(crate::http::scheduled_tasks::scheduled_task_run),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/hooks/runs",
             get(crate::http::hooks::hook_runs),
         )
@@ -7049,7 +7087,10 @@ impl ApiError {
             foco_store::workspace::WorkspaceDatabaseError::AgentDomain { .. }
             | foco_store::workspace::WorkspaceDatabaseError::AgentRuntimeJson { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidAgentRuntimeData { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::InvalidScheduledTaskData { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidTodoGraph { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::MissingScheduledTask { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::MissingScheduledTaskRun { .. }
             | foco_store::workspace::WorkspaceDatabaseError::MissingTodoGraph { .. } => {
                 Self::bad_request(error.to_string())
             }

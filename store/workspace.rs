@@ -2072,6 +2072,15 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn delete_scheduled_task(&mut self, id: &str) -> Result<bool, WorkspaceDatabaseError> {
+        let deleted = self
+            .connection
+            .execute("DELETE FROM scheduled_tasks WHERE id = ?1", params![id])
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(deleted > 0)
+    }
+
     pub fn insert_scheduled_task_run(
         &mut self,
         run: NewScheduledTaskRun<'_>,

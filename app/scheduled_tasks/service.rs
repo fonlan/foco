@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use super::types::ScheduleSpec;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PreviewNextRunRequest {
     pub schedule: ScheduleSpec,
     #[serde(default)]
@@ -13,6 +14,7 @@ pub(crate) struct PreviewNextRunRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct PreviewNextRunResponse {
     pub next_run_at: Option<String>,
 }
