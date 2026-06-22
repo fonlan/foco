@@ -15,8 +15,18 @@ export type SettingsSection =
   | "skills"
   | "workspaces";
 
+export type BrowserRouteChatTab = {
+  workspaceId: string;
+  chatId: string;
+};
+
 export type BrowserRoute =
-  | { viewMode: "chat"; workspaceId: string | null; chatId: string | null }
+  | {
+      viewMode: "chat";
+      workspaceId: string | null;
+      chatId: string | null;
+      tabs?: BrowserRouteChatTab[];
+    }
   | { viewMode: "settings"; section: SettingsSection }
   | { viewMode: "stats" };
 

@@ -117,6 +117,7 @@ import type {
   AppThemeId,
   AuthStatusResponse,
   BrowserRoute,
+  BrowserRouteChatTab,
   ChatAttachmentPartSummary,
   ChatAttachmentPayload,
   ChatCompressionStatistics,
@@ -443,6 +444,7 @@ export function App() {
     workspaceId: "",
   });
   const [openChatTabs, setOpenChatTabs] = useState<OpenChatTab[]>([]);
+  const openChatTabsRef = useRef<OpenChatTab[]>([]);
   const [openAgentTabs, setOpenAgentTabs] = useState<OpenAgentTab[]>([]);
   const [loadingChatKeys, setLoadingChatKeys] = useState<Set<string>>(() => new Set());
   const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
@@ -814,8 +816,12 @@ export function App() {
         return;
       }
 
-      const nextPath = browserPathForRoute(route);
-      if (window.location.pathname === nextPath) {
+      const routeWithTabs = route.viewMode === "chat"
+        ? browserRouteWithOpenChatTabs(route, openChatTabsRef.current)
+        : route;
+      const nextPath = browserPathForRoute(routeWithTabs);
+      const currentPath = `${window.location.pathname}${window.location.search}`;
+      if (currentPath === nextPath) {
         return;
       }
 
@@ -831,6 +837,10 @@ export function App() {
 
   useDocumentLanguage(language);
   useDocumentTheme(theme);
+
+  useEffect(() => {
+    openChatTabsRef.current = openChatTabs;
+  }, [openChatTabs]);
 
   useEffect(() => {
     activeWorkspaceIdRef.current = activeWorkspaceId;
@@ -2690,15 +2700,35 @@ export function App() {
   function openChatTab(workspaceId: string, chatId: string) {
     const workspace = workspaces.find((workspace) => workspace.id === workspaceId);
     const chat = workspace?.chats.find((chat) => chat.id === chatId);
+    const nextTabs = upsertOpenChatTab(openChatTabsRef.current, {
+      workspaceId,
+      chatId,
+      fallbackTitle: chat?.title ?? t("Chat"),
+      fallbackWorkspaceName: workspace?.name ?? t("Workspace"),
+    });
 
-    setOpenChatTabs((current) =>
-      upsertOpenChatTab(current, {
-        workspaceId,
-        chatId,
-        fallbackTitle: chat?.title ?? t("Chat"),
-        fallbackWorkspaceName: workspace?.name ?? t("Workspace"),
-      }),
-    );
+    openChatTabsRef.current = nextTabs;
+    setOpenChatTabs(nextTabs);
+  }
+
+  function restoreWorkspaceChatTabs(tabs: BrowserRouteChatTab[]) {
+    const nextTabs = tabs.flatMap((tab) => {
+      const workspace = workspaces.find((workspace) => workspace.id === tab.workspaceId);
+      const chat = workspace?.chats.find((chat) => chat.id === tab.chatId);
+      if (!workspace || !chat) {
+        return [];
+      }
+
+      return [{
+        chatId: tab.chatId,
+        fallbackTitle: chat.title,
+        fallbackWorkspaceName: workspace.name,
+        workspaceId: tab.workspaceId,
+      } satisfies OpenChatTab];
+    });
+
+    openChatTabsRef.current = nextTabs;
+    setOpenChatTabs(nextTabs);
   }
 
   function selectAgentTab(tab: OpenAgentTab) {
@@ -3094,11 +3124,11 @@ export function App() {
     const tabIndex = mainTabs.findIndex(
       (tab) => tab.type === "chat" && tab.workspaceId === workspaceId && tab.chatId === chatId,
     );
-    setOpenChatTabs((current) =>
-      current.filter(
-        (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
-      ),
+    const nextOpenChatTabs = openChatTabsRef.current.filter(
+      (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
     );
+    openChatTabsRef.current = nextOpenChatTabs;
+    setOpenChatTabs(nextOpenChatTabs);
     setChatRunFailed(chatKey, false);
     removeMessagesForChatKey(chatKey);
     removeContextUsageForChatKey(chatKey);
@@ -3108,6 +3138,12 @@ export function App() {
       activeMainTab.workspaceId !== workspaceId ||
       activeMainTab.chatId !== chatId
     ) {
+      updateBrowserRoute({
+        chatId: activeChatId,
+        tabs: openChatTabsToBrowserRouteTabs(nextOpenChatTabs),
+        viewMode: "chat",
+        workspaceId: activeWorkspaceId || workspaceId,
+      }, "replace");
       return;
     }
 
@@ -4147,6 +4183,7 @@ export function App() {
     activeChatKeyRef,
     activeWorkspaceIdOrNull: activeWorkspace?.id ?? (activeWorkspaceId || null),
     onMissingWorkspace: setError,
+    onRestoreWorkspaceChatTabs: restoreWorkspaceChatTabs,
     onSelectWorkspaceChat: selectWorkspaceChat,
     onStartNewWorkspaceChat: startNewWorkspaceChat,
     setActiveChatId,
@@ -18504,6 +18541,42 @@ function upsertOpenChatTab(tabs: OpenChatTab[], nextTab: OpenChatTab) {
   }
 
   return [...tabs, nextTab];
+}
+
+function browserRouteWithOpenChatTabs(
+  route: Extract<BrowserRoute, { viewMode: "chat" }>,
+  tabs: OpenChatTab[],
+): BrowserRoute {
+  if (route.tabs) {
+    return { ...route, tabs: dedupeBrowserRouteChatTabs(route.tabs) };
+  }
+
+  const routeTabs = openChatTabsToBrowserRouteTabs(tabs);
+  if (route.workspaceId && route.chatId) {
+    routeTabs.push({ chatId: route.chatId, workspaceId: route.workspaceId });
+  }
+
+  return { ...route, tabs: dedupeBrowserRouteChatTabs(routeTabs) };
+}
+
+function openChatTabsToBrowserRouteTabs(tabs: OpenChatTab[]): BrowserRouteChatTab[] {
+  return tabs.map((tab) => ({
+    chatId: tab.chatId,
+    workspaceId: tab.workspaceId,
+  }));
+}
+
+function dedupeBrowserRouteChatTabs(tabs: BrowserRouteChatTab[]) {
+  const seen = new Set<string>();
+  return tabs.filter((tab) => {
+    const key = `${tab.workspaceId}\u0000${tab.chatId}`;
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
 }
 
 function upsertOpenAgentTab(tabs: OpenAgentTab[], nextTab: OpenAgentTab) {

@@ -1,15 +1,20 @@
-import type { BrowserRoute, SettingsSection } from "../api/types";
+import type { BrowserRoute, BrowserRouteChatTab, SettingsSection } from "../api/types";
 import { SETTINGS_SECTION_IDS } from "../app/constants";
+
+const CHAT_TAB_QUERY_PARAM = "tab";
 
 export function currentBrowserRoute(): BrowserRoute {
   if (typeof window === "undefined") {
     return { chatId: null, viewMode: "chat", workspaceId: null };
   }
 
-  return browserRouteFromPathname(window.location.pathname);
+  return browserRouteFromPathname(window.location.pathname, window.location.search);
 }
 
-export function browserRouteFromPathname(pathname: string): BrowserRoute {
+export function browserRouteFromPathname(
+  pathname: string,
+  search = "",
+): BrowserRoute {
   const segments = pathname
     .split("/")
     .filter(Boolean)
@@ -24,19 +29,27 @@ export function browserRouteFromPathname(pathname: string): BrowserRoute {
     return { viewMode: "stats" };
   }
 
+  const tabs = chatTabsFromSearch(search);
+
   if (segments.length >= 2) {
-    return {
+    return chatRouteWithTabs({
       chatId: segments[1],
       viewMode: "chat",
       workspaceId: segments[0],
-    };
+    }, tabs);
   }
 
   if (segments.length === 1) {
-    return { chatId: null, viewMode: "chat", workspaceId: segments[0] };
+    return chatRouteWithTabs(
+      { chatId: null, viewMode: "chat", workspaceId: segments[0] },
+      tabs,
+    );
   }
 
-  return { chatId: null, viewMode: "chat", workspaceId: null };
+  return chatRouteWithTabs(
+    { chatId: null, viewMode: "chat", workspaceId: null },
+    tabs,
+  );
 }
 
 export function browserPathForRoute(route: BrowserRoute) {
@@ -48,6 +61,14 @@ export function browserPathForRoute(route: BrowserRoute) {
     return "/stats";
   }
 
+  const path = browserPathnameForChatRoute(route);
+  const search = chatTabsSearch(route.tabs ?? []);
+  return search ? `${path}?${search}` : path;
+}
+
+function browserPathnameForChatRoute(
+  route: Extract<BrowserRoute, { viewMode: "chat" }>,
+) {
   if (route.workspaceId && route.chatId) {
     return `/${encodeURIComponent(route.workspaceId)}/${encodeURIComponent(
       route.chatId,
@@ -61,11 +82,109 @@ export function browserPathForRoute(route: BrowserRoute) {
   return "/";
 }
 
+function chatTabsFromSearch(search: string): BrowserRouteChatTab[] {
+  const params = new URLSearchParams(search);
+  const tabs: BrowserRouteChatTab[] = [];
+  const seen = new Set<string>();
+
+  for (const value of params.getAll(CHAT_TAB_QUERY_PARAM)) {
+    const tab = chatTabFromParamValue(value);
+    if (!tab) {
+      continue;
+    }
+
+    const key = `${tab.workspaceId}\u0000${tab.chatId}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    tabs.push(tab);
+  }
+
+  return tabs;
+}
+
+function chatTabFromParamValue(value: string): BrowserRouteChatTab | null {
+  const separatorIndex = value.indexOf("/");
+  if (separatorIndex <= 0 || separatorIndex >= value.length - 1) {
+    return null;
+  }
+
+  const workspaceId = decodeTabComponent(value.slice(0, separatorIndex));
+  const chatId = decodeTabComponent(value.slice(separatorIndex + 1));
+  if (!workspaceId || !chatId) {
+    return null;
+  }
+
+  return { chatId, workspaceId };
+}
+
+function chatTabsSearch(tabs: BrowserRouteChatTab[]) {
+  if (!tabs.length) {
+    return "";
+  }
+
+  const params = new URLSearchParams();
+  const seen = new Set<string>();
+  for (const tab of tabs) {
+    if (!tab.workspaceId || !tab.chatId) {
+      continue;
+    }
+
+    const key = `${tab.workspaceId}\u0000${tab.chatId}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    params.append(
+      CHAT_TAB_QUERY_PARAM,
+      `${encodeURIComponent(tab.workspaceId)}/${encodeURIComponent(tab.chatId)}`,
+    );
+  }
+
+  return params.toString();
+}
+
+function chatRouteWithTabs(
+  route: Extract<BrowserRoute, { viewMode: "chat" }>,
+  tabs: BrowserRouteChatTab[],
+): BrowserRoute {
+  const routeTabs = route.workspaceId && route.chatId
+    ? [...tabs, { chatId: route.chatId, workspaceId: route.workspaceId }]
+    : tabs;
+  const dedupedRouteTabs = dedupeChatTabs(routeTabs);
+
+  return dedupedRouteTabs.length ? { ...route, tabs: dedupedRouteTabs } : route;
+}
+
+function dedupeChatTabs(tabs: BrowserRouteChatTab[]) {
+  const seen = new Set<string>();
+  return tabs.filter((tab) => {
+    const key = `${tab.workspaceId}\u0000${tab.chatId}`;
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
 function decodePathSegment(segment: string) {
   try {
     return decodeURIComponent(segment);
   } catch {
     return segment;
+  }
+}
+
+function decodeTabComponent(value: string) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
   }
 }
 

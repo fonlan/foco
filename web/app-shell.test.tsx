@@ -822,6 +822,11 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(screen.getByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/workspace-1/chat-2");
+    expect(new URLSearchParams(window.location.search).getAll("tab")).toEqual([
+      "workspace-1/chat-1",
+      "workspace-1/chat-2",
+    ]);
     expect(
       within(tabList).getByRole("tab", { name: /Second chat/ }),
     ).toHaveAttribute("aria-selected", "true");
@@ -837,6 +842,9 @@ describe("app-shell verification surfaces", () => {
     expect(
       within(tabList).queryByRole("tab", { name: /Tool run/ }),
     ).not.toBeInTheDocument();
+    expect(new URLSearchParams(window.location.search).getAll("tab")).toEqual([
+      "workspace-1/chat-2",
+    ]);
     expect(
       within(tabList).getByRole("tab", { name: /Second chat/ }),
     ).toHaveAttribute("aria-selected", "true");
@@ -854,6 +862,28 @@ describe("app-shell verification surfaces", () => {
 
     expect(await screen.findByText("API overview")).toBeInTheDocument();
     expect(messageList.scrollTop).toBe(0);
+  });
+
+  it("restores open chat tabs from the URL after refresh", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/workspace-1/chat-2?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2",
+    );
+
+    renderApp();
+
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toBeInTheDocument();
+    expect(within(tabList).getByRole("tab", { name: /Second chat/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(new URLSearchParams(window.location.search).getAll("tab")).toEqual([
+      "workspace-1/chat-1",
+      "workspace-1/chat-2",
+    ]);
   });
 
   it("opens and selects a historical chat tab before its messages finish loading", async () => {

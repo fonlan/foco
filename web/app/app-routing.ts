@@ -1,12 +1,18 @@
 import { useCallback, type RefObject } from "react";
 
-import type { BrowserRoute, SettingsSection, WorkspaceSummary } from "../api/types";
+import type {
+  BrowserRoute,
+  BrowserRouteChatTab,
+  SettingsSection,
+  WorkspaceSummary,
+} from "../api/types";
 
 type AppRoutingOptions = {
   activeChatId: string | null;
   activeChatKeyRef: RefObject<string | null>;
   activeWorkspaceIdOrNull: string | null;
   onMissingWorkspace: (message: string) => void;
+  onRestoreWorkspaceChatTabs: (tabs: BrowserRouteChatTab[]) => void;
   onSelectWorkspaceChat: (
     workspaceId: string,
     chatId: string,
@@ -33,6 +39,7 @@ export function useAppRouting({
   activeChatKeyRef,
   activeWorkspaceIdOrNull,
   onMissingWorkspace,
+  onRestoreWorkspaceChatTabs,
   onSelectWorkspaceChat,
   onStartNewWorkspaceChat,
   setActiveChatId,
@@ -94,6 +101,8 @@ export function useAppRouting({
 
       setViewMode("chat");
       setIsMobileWorkspaceOpen(false);
+      const routeTabs = route.tabs ?? [];
+      onRestoreWorkspaceChatTabs(routeTabs);
       if (!route.workspaceId) {
         setActiveChatId(null);
         activeChatKeyRef.current = null;
@@ -118,6 +127,7 @@ export function useAppRouting({
     [
       activeChatKeyRef,
       onMissingWorkspace,
+      onRestoreWorkspaceChatTabs,
       onSelectWorkspaceChat,
       onStartNewWorkspaceChat,
       setActiveChatId,
