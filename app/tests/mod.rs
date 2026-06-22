@@ -16,7 +16,10 @@ use foco_store::{
         MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, NewMemoryExtractionJob,
         NewMemoryFact, NewMemorySource,
     },
-    workspace::{LlmRequestAuditFilters, NewRunEvent, NewScheduledTask, NewTerminalSession},
+    workspace::{
+        LlmRequestAuditFilters, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+        NewTerminalSession,
+    },
 };
 use foco_tools::{
     GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL, READ_FILE_TOOL, SEARCH_TEXT_TOOL,
@@ -4612,6 +4615,82 @@ async fn scheduled_task_run_now_queues_manual_run_without_advancing_schedule() {
         .expect("user message lookup")
         .expect("user message");
     assert_eq!(user_message.content, "Manual prompt");
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn scheduled_task_reconciliation_dispatches_stale_pending_run() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-reconcile-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-reconcile-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (agent_scheduler, mut agent_scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = agent_scheduler;
+    let metadata_json = format!(
+        r#"{{"workspaceId":"{workspace_id}","concurrencyPolicy":"skip_if_running","misfirePolicy":"catch_up_once"}}"#
+    );
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_scheduled_task(NewScheduledTask {
+                id: "scheduled-task-reconcile",
+                title: "Reconcile task",
+                description: None,
+                schedule_json: r#"{"type":"one_shot_at","run_at":"2020-01-01T00:00:00Z"}"#,
+                action_json: r#"{"type":"agent_prompt","prompt":"Recovered prompt","session_mode":"create_new_chat","model_id":"model","provider_id":"provider","skill_ids":[],"collaboration_tools_enabled":false}"#,
+                status: "completed",
+                next_run_at: None,
+                metadata_json: Some(&metadata_json),
+            })
+            .expect("scheduled task insert");
+        database
+            .insert_scheduled_task_run(NewScheduledTaskRun {
+                id: "scheduled-run-reconcile",
+                task_id: "scheduled-task-reconcile",
+                trigger_reason: "scheduled",
+                status: "pending",
+                scheduled_at: "2020-01-01T00:00:00Z",
+                queued_at: None,
+                started_at: None,
+                completed_at: None,
+                chat_id: None,
+                user_message_id: None,
+                assistant_message_id: None,
+                agent_team_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                active_run_id: None,
+                error_message: None,
+                output_summary: None,
+                metadata_json: None,
+            })
+            .expect("stale scheduled run insert");
+    }
+
+    crate::scheduled_tasks::scheduler::reconcile_scheduled_task_runs(&state)
+        .await
+        .expect("reconcile scheduled task runs");
+    assert_eq!(agent_scheduler_rx.recv().await, Some(()));
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let run = database
+        .scheduled_task_run("scheduled-run-reconcile")
+        .expect("scheduled run lookup")
+        .expect("scheduled run");
+    assert_eq!(run.status, "queued");
+    assert!(run.agent_task_id.is_some());
+    let user_message = database
+        .message(run.user_message_id.as_deref().expect("user message id"))
+        .expect("user message lookup")
+        .expect("user message");
+    assert_eq!(user_message.content, "Recovered prompt");
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);

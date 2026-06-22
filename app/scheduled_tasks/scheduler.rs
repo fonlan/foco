@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use foco_agent::{AgentTaskId, AgentTaskStatus};
 use foco_store::{
     config::{AgentDefinitionSettings, WorkspaceConfig},
@@ -40,6 +40,7 @@ const TRIGGER_REASON_MANUAL: &str = "manual";
 const SCHEDULED_TASK_WAKE_CAPACITY: usize = 1;
 const SCHEDULED_TASK_SCAN_LIMIT: usize = 64;
 const SCHEDULED_TASK_SCAN_INTERVAL_MS: u64 = 1_000;
+const SCHEDULED_TASK_RUN_RETENTION_DAYS: i64 = 90;
 
 #[derive(Clone)]
 pub(crate) struct ScheduledTaskScheduler {
@@ -102,6 +103,8 @@ async fn run_scheduled_task_scheduler(state: AppState, mut wake_rx: mpsc::Receiv
 
 pub(crate) async fn dispatch_due_scheduled_tasks(state: &AppState) -> Result<(), ApiError> {
     let config = config_snapshot(state)?;
+    reconcile_scheduled_task_runs_for_config(state, &config).await?;
+    prune_old_scheduled_task_runs(&config)?;
     let now = Utc::now();
     let now_text = format_utc_timestamp(now);
 
@@ -168,6 +171,94 @@ pub(crate) async fn dispatch_due_scheduled_tasks(state: &AppState) -> Result<(),
         }
     }
 
+    Ok(())
+}
+
+pub(crate) async fn reconcile_scheduled_task_runs(state: &AppState) -> Result<(), ApiError> {
+    let config = config_snapshot(state)?;
+    reconcile_scheduled_task_runs_for_config(state, &config).await
+}
+
+async fn reconcile_scheduled_task_runs_for_config(
+    state: &AppState,
+    config: &GlobalConfig,
+) -> Result<(), ApiError> {
+    for workspace in &config.workspaces {
+        let runs = {
+            let database = WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)?;
+            database
+                .active_scheduled_task_runs()
+                .map_err(ApiError::from_workspace_error)?
+        };
+
+        for run in runs {
+            if run.agent_task_id.is_some() {
+                let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+                    .map_err(ApiError::from_workspace_error)?;
+                sync_scheduled_task_run(&mut database, run)?;
+                continue;
+            }
+
+            if run.status == RUN_STATUS_PENDING {
+                let task = {
+                    let database = WorkspaceDatabase::open_or_create(&workspace.path)
+                        .map_err(ApiError::from_workspace_error)?;
+                    database
+                        .scheduled_task(&run.task_id)
+                        .map_err(ApiError::from_workspace_error)?
+                };
+                match task {
+                    Some(task) => {
+                        let trigger_reason = run.trigger_reason.clone();
+                        dispatch_scheduled_task_run(
+                            state,
+                            config,
+                            workspace,
+                            task,
+                            run,
+                            &trigger_reason,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+                            .map_err(ApiError::from_workspace_error)?;
+                        mark_scheduled_run_failed_in_database(
+                            &mut database,
+                            run,
+                            "scheduled task was not found during reconciliation",
+                        )?;
+                    }
+                }
+                continue;
+            }
+
+            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+                .map_err(ApiError::from_workspace_error)?;
+            mark_scheduled_run_failed_in_database(
+                &mut database,
+                run,
+                "scheduled run is missing linked Agent task",
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn prune_old_scheduled_task_runs(config: &GlobalConfig) -> Result<(), ApiError> {
+    let cutoff = Utc::now()
+        .checked_sub_signed(ChronoDuration::days(SCHEDULED_TASK_RUN_RETENTION_DAYS))
+        .ok_or_else(|| ApiError::internal("scheduled run retention cutoff overflowed"))?;
+    let cutoff = format_utc_timestamp(cutoff);
+    for workspace in &config.workspaces {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .delete_old_scheduled_task_runs(&cutoff)
+            .map_err(ApiError::from_workspace_error)?;
+    }
     Ok(())
 }
 
@@ -348,7 +439,14 @@ pub(crate) fn sync_scheduled_task_run(
         .agent_task(&agent_task_id)
         .map_err(ApiError::from_workspace_error)?
     else {
-        return Ok(run);
+        if scheduled_run_status_is_terminal(&run.status) {
+            return Ok(run);
+        }
+        return mark_scheduled_run_failed_in_database(
+            database,
+            run,
+            "linked Agent task was not found",
+        );
     };
     sync_scheduled_task_run_with_task(database, run, &task)
 }
@@ -533,9 +631,17 @@ fn mark_scheduled_run_failed(
     run: ScheduledTaskRunRecord,
     message: &str,
 ) -> Result<ScheduledTaskRunRecord, ApiError> {
-    let completed_at = format_utc_timestamp(Utc::now());
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
+    mark_scheduled_run_failed_in_database(&mut database, run, message)
+}
+
+fn mark_scheduled_run_failed_in_database(
+    database: &mut WorkspaceDatabase,
+    run: ScheduledTaskRunRecord,
+    message: &str,
+) -> Result<ScheduledTaskRunRecord, ApiError> {
+    let completed_at = format_utc_timestamp(Utc::now());
     database
         .update_scheduled_task_run(ScheduledTaskRunUpdate {
             id: &run.id,

@@ -1257,8 +1257,21 @@ type ScheduledTaskFixture = {
   status: string;
   title: string;
   updatedAt: string;
+  usage: Record<string, number | null>;
   workspaceId: string;
   workspaceName: string;
+};
+
+const emptyScheduledTaskUsage = {
+  averageLatencyMs: null,
+  failedRequests: 0,
+  totalCacheReadTokens: 0,
+  totalCacheWriteTokens: 0,
+  totalInputTokens: 0,
+  totalLatencyMs: 0,
+  totalOutputTokens: 0,
+  totalRequests: 0,
+  totalTokens: 0,
 };
 
 export const scheduledTasks: { tasks: ScheduledTaskFixture[] } = {
@@ -1287,6 +1300,16 @@ export const scheduledTasks: { tasks: ScheduledTaskFixture[] } = {
       status: "enabled",
       title: "Daily workspace summary",
       updatedAt: "2026-06-22T08:00:00Z",
+      usage: {
+        ...emptyScheduledTaskUsage,
+        averageLatencyMs: 2000,
+        failedRequests: 0,
+        totalInputTokens: 100,
+        totalLatencyMs: 2000,
+        totalOutputTokens: 20,
+        totalRequests: 1,
+        totalTokens: 120,
+      },
       workspaceId: "workspace-1",
       workspaceName: "Default",
     },
@@ -1497,6 +1520,19 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse(appTestState.scheduledTasksResponse);
   }
 
+  if (path === "/api/scheduled-tasks/preview-next-run") {
+    return jsonResponse({
+      nextRunAt: "2026-06-22T09:00:00.000Z",
+      nextRuns: [
+        "2026-06-22T09:00:00.000Z",
+        "2026-06-23T09:00:00.000Z",
+        "2026-06-24T09:00:00.000Z",
+        "2026-06-25T09:00:00.000Z",
+        "2026-06-26T09:00:00.000Z",
+      ],
+    });
+  }
+
   const scheduledRunsMatch = path.match(
     /^\/api\/workspaces\/([^/]+)\/scheduled-tasks\/([^/]+)\/runs$/,
   );
@@ -1574,6 +1610,37 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       };
     }
     return jsonResponse({ task: updatedTask });
+  }
+
+  const scheduledTaskDuplicateMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/scheduled-tasks\/([^/]+)\/duplicate$/,
+  );
+  if (scheduledTaskDuplicateMatch) {
+    const taskId = decodeURIComponent(scheduledTaskDuplicateMatch[2] ?? "");
+    const existingTask = appTestState.scheduledTasksResponse.tasks.find(
+      (task) => task.id === taskId,
+    );
+    if (!existingTask) {
+      return jsonResponse({ message: "scheduled task was not found" }, { status: 404 });
+    }
+    const now = "2026-06-22T09:00:00Z";
+    const task = {
+      ...existingTask,
+      createdAt: now,
+      id: `scheduled-task-${appTestState.scheduledTasksResponse.tasks.length + 1}`,
+      nextRunAt: null,
+      status: "paused",
+      title: `${existingTask.title} copy`,
+      updatedAt: now,
+    };
+    appTestState.scheduledTasksResponse = {
+      tasks: [task, ...appTestState.scheduledTasksResponse.tasks],
+    };
+    appTestState.scheduledTaskRunsByTaskId = {
+      ...appTestState.scheduledTaskRunsByTaskId,
+      [task.id]: [],
+    };
+    return jsonResponse({ task });
   }
 
   const scheduledTaskItemMatch = path.match(
@@ -1668,6 +1735,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       status: (body.status as string | undefined) ?? "enabled",
       title: (body.title as string | undefined) ?? "New scheduled task",
       updatedAt: now,
+      usage: emptyScheduledTaskUsage,
       workspaceId,
       workspaceName,
     };

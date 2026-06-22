@@ -350,6 +350,34 @@ pub(crate) async fn archive_scheduled_task(
     set_scheduled_task_status(state, &workspace_id, &task_id, STATUS_ARCHIVED).map(Json)
 }
 
+pub(crate) async fn duplicate_scheduled_task(
+    State(state): State<AppState>,
+    AxumPath((workspace_id, task_id)): AxumPath<(String, String)>,
+) -> Result<Json<ScheduledTaskResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let existing = require_scheduled_task(&database, &task_id)?;
+    let title = format!("{} copy", existing.title);
+    let task = database
+        .insert_scheduled_task(NewScheduledTask {
+            id: &unique_id("scheduled-task"),
+            title: &title,
+            description: existing.description.as_deref(),
+            schedule_json: &existing.schedule_json,
+            action_json: &existing.action_json,
+            status: STATUS_PAUSED,
+            next_run_at: None,
+            metadata_json: Some(&existing.metadata_json),
+        })
+        .map_err(ApiError::from_workspace_error)?;
+
+    Ok(Json(ScheduledTaskResponse {
+        task: scheduled_task_view(workspace, &database, task)?,
+    }))
+}
+
 pub(crate) async fn run_scheduled_task_now(
     State(state): State<AppState>,
     AxumPath((workspace_id, task_id)): AxumPath<(String, String)>,
@@ -604,6 +632,7 @@ fn task_next_run_at(schedule: &ScheduleSpec, status: &str) -> Result<Option<Stri
     }
 
     preview_next_run(PreviewNextRunRequest {
+        count: None,
         schedule: schedule.clone(),
         now: None,
     })

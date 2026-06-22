@@ -2,6 +2,7 @@ import {
   Archive,
   CalendarClock,
   Clock3,
+  Copy,
   ExternalLink,
   LoaderCircle,
   Pause,
@@ -28,6 +29,7 @@ import type {
   ConfiguredProviderSummary,
   JsonValue,
   ScheduledTaskAction,
+  ScheduledTaskPreviewNextRunResponse,
   ScheduledTaskRunResponse,
   ScheduledTaskRunsResponse,
   ScheduledTaskRunStatus,
@@ -265,6 +267,24 @@ export function ScheduledTasksPage({
     }
   }
 
+  async function duplicateTask(task: ScheduledTaskView) {
+    setOperationKey(`duplicate:${task.id}`);
+    setError(null);
+    try {
+      const data = await requestJson<{ task: ScheduledTaskView }>(
+        `/api/workspaces/${encodeURIComponent(task.workspaceId)}/scheduled-tasks/${encodeURIComponent(task.id)}/duplicate`,
+        { method: "POST" },
+      );
+      setTasks((current) => [data.task, ...current]);
+      setSelectedTaskId(data.task.id);
+      setRunsByTaskId((current) => ({ ...current, [data.task.id]: [] }));
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setOperationKey(null);
+    }
+  }
+
   async function deleteTask(task: ScheduledTaskView) {
     if (!window.confirm(t("Delete scheduled task?"))) {
       return;
@@ -477,6 +497,7 @@ export function ScheduledTasksPage({
               )
             }
             onDelete={(task) => void deleteTask(task)}
+            onDuplicate={(task) => void duplicateTask(task)}
             onEdit={(task) => setFormMode({ task, type: "edit" })}
             onOpenChat={onOpenChat}
             onPause={(task) =>
@@ -507,6 +528,7 @@ export function ScheduledTasksPage({
         <ScheduledTaskDrawer
           agentDefinitions={agentDefinitions}
           enabledModels={enabledModels}
+          language={language}
           mode={formMode}
           onClose={() => setFormMode(null)}
           onSaved={(task) => void handleTaskSaved(task)}
@@ -525,6 +547,7 @@ function TaskDetails({
   language,
   onArchive,
   onDelete,
+  onDuplicate,
   onEdit,
   onOpenChat,
   onPause,
@@ -540,6 +563,7 @@ function TaskDetails({
   language: string;
   onArchive: (task: ScheduledTaskView) => void;
   onDelete: (task: ScheduledTaskView) => void;
+  onDuplicate: (task: ScheduledTaskView) => void;
   onEdit: (task: ScheduledTaskView) => void;
   onOpenChat: (workspaceId: string, chatId: string) => void;
   onPause: (task: ScheduledTaskView) => void;
@@ -612,6 +636,12 @@ function TaskDetails({
             icon={Pencil}
             label={t("Edit task")}
             onClick={() => onEdit(task)}
+          />
+          <IconButton
+            busy={operationKey === `duplicate:${task.id}`}
+            icon={Copy}
+            label={t("Duplicate task")}
+            onClick={() => onDuplicate(task)}
           />
           <IconButton
             busy={operationKey === `archive:${task.id}`}
@@ -799,6 +829,7 @@ function TaskDetails({
 function ScheduledTaskDrawer({
   agentDefinitions,
   enabledModels,
+  language,
   mode,
   onClose,
   onSaved,
@@ -809,6 +840,7 @@ function ScheduledTaskDrawer({
 }: {
   agentDefinitions: AgentDefinitionSettings[];
   enabledModels: ConfiguredModelSummary[];
+  language: string;
   mode: TaskFormMode;
   onClose: () => void;
   onSaved: (task: ScheduledTaskView) => void;
@@ -822,6 +854,9 @@ function ScheduledTaskDrawer({
   );
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewRuns, setPreviewRuns] = useState<string[]>([]);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
 
   const selectedModel = enabledModels.find((model) => model.id === form.modelId) ?? null;
   const selectableProviders = selectedModel
@@ -851,6 +886,59 @@ function ScheduledTaskDrawer({
         definition?.modelOptions.thinkingLevel ?? (definition ? "" : current.thinkingLevel),
     }));
   }
+
+  useEffect(() => {
+    let schedule: ScheduledTaskSchedule;
+    try {
+      schedule = scheduleFromForm(form);
+    } catch {
+      setPreviewError(null);
+      setPreviewRuns([]);
+      setIsPreviewLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setIsPreviewLoading(true);
+    const timeout = window.setTimeout(() => {
+      void requestJson<ScheduledTaskPreviewNextRunResponse>(
+        "/api/scheduled-tasks/preview-next-run",
+        {
+          body: JSON.stringify({ count: 5, schedule }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      )
+        .then((data) => {
+          if (!cancelled) {
+            setPreviewError(null);
+            setPreviewRuns(data.nextRuns);
+          }
+        })
+        .catch((requestError) => {
+          if (!cancelled) {
+            setPreviewError(errorMessage(requestError));
+            setPreviewRuns([]);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setIsPreviewLoading(false);
+          }
+        });
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeout);
+    };
+  }, [
+    form.intervalEvery,
+    form.intervalStartAt,
+    form.intervalUnit,
+    form.runAt,
+    form.scheduleType,
+  ]);
 
   async function saveTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1056,6 +1144,13 @@ function ScheduledTaskDrawer({
                 <option value="skip">{t("Skip")}</option>
               </SelectField>
             </div>
+            <RunPreview
+              error={previewError}
+              isLoading={isPreviewLoading}
+              language={language}
+              runs={previewRuns}
+              t={t}
+            />
           </DetailBlock>
 
           <DetailBlock title={t("Action")}>
@@ -1333,6 +1428,41 @@ function SelectField({
         {children}
       </select>
     </label>
+  );
+}
+
+function RunPreview({
+  error,
+  isLoading,
+  language,
+  runs,
+  t,
+}: {
+  error: string | null;
+  isLoading: boolean;
+  language: string;
+  runs: string[];
+  t: Translate;
+}) {
+  return (
+    <div className="border-t border-stone-200 pt-3">
+      <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+        {t("Next five runs")}
+      </div>
+      {isLoading ? (
+        <div className="mt-2 text-sm text-stone-500">{t("Loading...")}</div>
+      ) : error ? (
+        <div className="mt-2 text-sm text-rose-700">{error}</div>
+      ) : runs.length ? (
+        <ol className="mt-2 space-y-1 text-sm text-stone-700">
+          {runs.map((runAt) => (
+            <li key={runAt}>{formatTimestamp(runAt, language, t)}</li>
+          ))}
+        </ol>
+      ) : (
+        <div className="mt-2 text-sm text-stone-500">{t("No upcoming runs")}</div>
+      )}
+    </div>
   );
 }
 

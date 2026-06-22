@@ -393,7 +393,12 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(
       await screen.findByRole("button", { name: "Scheduled tasks" }),
     );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Duplicate task" }));
+    expect(await screen.findAllByText("Daily workspace summary copy")).not.toHaveLength(0);
+
     await userEvent.click(await screen.findByRole("button", { name: "New task" }));
+    expect(await screen.findByText("Next five runs")).toBeInTheDocument();
 
     await userEvent.type(screen.getByLabelText("Title"), "Morning report");
     await userEvent.type(

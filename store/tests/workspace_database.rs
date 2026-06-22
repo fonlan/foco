@@ -953,6 +953,101 @@ fn claims_due_scheduled_task_run_once_and_updates_task_state() {
 }
 
 #[test]
+fn scheduled_task_active_runs_and_retention_policy() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_scheduled_task(NewScheduledTask {
+            id: "scheduled-task-retention",
+            title: "Retention task",
+            description: None,
+            schedule_json: r#"{"type":"interval","every_seconds":60}"#,
+            action_json: r#"{"type":"agent_prompt","prompt":"Run"}"#,
+            status: "enabled",
+            next_run_at: Some("2026-06-22T10:00:00Z"),
+            metadata_json: Some("{}"),
+        })
+        .expect("scheduled task insert");
+
+    for (id, status, completed_at) in [
+        (
+            "scheduled-run-old",
+            "succeeded",
+            Some("2026-01-01T00:00:00Z"),
+        ),
+        (
+            "scheduled-run-recent",
+            "failed",
+            Some("2026-06-22T10:00:00Z"),
+        ),
+        ("scheduled-run-pending", "pending", None),
+        ("scheduled-run-queued", "queued", None),
+    ] {
+        database
+            .insert_scheduled_task_run(NewScheduledTaskRun {
+                id,
+                task_id: "scheduled-task-retention",
+                trigger_reason: "scheduled",
+                status,
+                scheduled_at: "2026-06-22T10:00:00Z",
+                queued_at: None,
+                started_at: None,
+                completed_at,
+                chat_id: None,
+                user_message_id: None,
+                assistant_message_id: None,
+                agent_team_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                active_run_id: None,
+                error_message: None,
+                output_summary: None,
+                metadata_json: None,
+            })
+            .expect("scheduled run insert");
+    }
+
+    let active_ids = database
+        .active_scheduled_task_runs()
+        .expect("active scheduled runs")
+        .into_iter()
+        .map(|run| run.id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        active_ids,
+        vec!["scheduled-run-pending", "scheduled-run-queued"]
+    );
+
+    assert_eq!(
+        database
+            .delete_old_scheduled_task_runs("2026-06-01T00:00:00Z")
+            .expect("delete old scheduled runs"),
+        1
+    );
+
+    assert!(
+        database
+            .scheduled_task_run("scheduled-run-old")
+            .expect("old run lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .scheduled_task_run("scheduled-run-recent")
+            .expect("recent run lookup")
+            .is_some()
+    );
+    assert!(
+        database
+            .scheduled_task_run("scheduled-run-pending")
+            .expect("pending run lookup")
+            .is_some()
+    );
+}
+
+#[test]
 fn repository_helpers_reject_invalid_todo_graph_dependencies() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

@@ -2128,6 +2128,28 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn active_scheduled_task_runs(
+        &self,
+    ) -> Result<Vec<ScheduledTaskRunRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, task_id, trigger_reason, status, scheduled_at, queued_at,
+                        started_at, completed_at, chat_id, user_message_id,
+                        assistant_message_id, agent_team_id, agent_task_id, agent_attempt_id,
+                        active_run_id, error_message, output_summary, created_at, updated_at,
+                        metadata_json
+                 FROM scheduled_task_runs
+                 WHERE status IN ('pending', 'queued', 'running')
+                 ORDER BY scheduled_at ASC, created_at ASC, id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], scheduled_task_run_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn claim_due_scheduled_task_run(
         &mut self,
         claim: ScheduledTaskDueRunClaim<'_>,
@@ -2394,6 +2416,21 @@ impl WorkspaceDatabase {
             .query_map(params![task_id], scheduled_task_run_from_row)
             .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
+    }
+
+    pub fn delete_old_scheduled_task_runs(
+        &mut self,
+        completed_before: &str,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        self.connection
+            .execute(
+                "DELETE FROM scheduled_task_runs
+                 WHERE status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+                   AND completed_at IS NOT NULL
+                   AND completed_at < ?1",
+                params![completed_before],
+            )
+            .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn scheduled_task_runs_for_agent_task(

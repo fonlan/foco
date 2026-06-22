@@ -808,6 +808,10 @@ fn app_router(state: AppState) -> Router {
             post(crate::http::scheduled_tasks::archive_scheduled_task),
         )
         .route(
+            "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}/duplicate",
+            post(crate::http::scheduled_tasks::duplicate_scheduled_task),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}/run-now",
             post(crate::http::scheduled_tasks::run_scheduled_task_now),
         )

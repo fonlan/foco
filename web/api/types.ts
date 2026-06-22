@@ -1647,6 +1647,11 @@ export type ScheduledTasksResponse = {
   tasks: ScheduledTaskView[];
 };
 
+export type ScheduledTaskPreviewNextRunResponse = {
+  nextRunAt: string | null;
+  nextRuns: string[];
+};
+
 export type ScheduledTaskRunStatus =
   | "pending"
   | "queued"
