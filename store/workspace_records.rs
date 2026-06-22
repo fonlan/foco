@@ -245,6 +245,111 @@ pub struct AgentContextSnapshotRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewScheduledTask<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub schedule_json: &'a str,
+    pub action_json: &'a str,
+    pub status: &'a str,
+    pub next_run_at: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledTaskUpdate<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub schedule_json: &'a str,
+    pub action_json: &'a str,
+    pub status: &'a str,
+    pub next_run_at: Option<&'a str>,
+    pub last_run_at: Option<&'a str>,
+    pub metadata_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledTaskRecord {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub schedule_json: String,
+    pub action_json: String,
+    pub status: String,
+    pub next_run_at: Option<String>,
+    pub last_run_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewScheduledTaskRun<'a> {
+    pub id: &'a str,
+    pub task_id: &'a str,
+    pub trigger_reason: &'a str,
+    pub status: &'a str,
+    pub scheduled_at: &'a str,
+    pub queued_at: Option<&'a str>,
+    pub started_at: Option<&'a str>,
+    pub completed_at: Option<&'a str>,
+    pub chat_id: Option<&'a str>,
+    pub user_message_id: Option<&'a str>,
+    pub assistant_message_id: Option<&'a str>,
+    pub agent_team_id: Option<&'a AgentTeamId>,
+    pub agent_task_id: Option<&'a AgentTaskId>,
+    pub agent_attempt_id: Option<&'a AgentAttemptId>,
+    pub active_run_id: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+    pub output_summary: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledTaskRunUpdate<'a> {
+    pub id: &'a str,
+    pub status: &'a str,
+    pub queued_at: Option<&'a str>,
+    pub started_at: Option<&'a str>,
+    pub completed_at: Option<&'a str>,
+    pub chat_id: Option<&'a str>,
+    pub user_message_id: Option<&'a str>,
+    pub assistant_message_id: Option<&'a str>,
+    pub agent_team_id: Option<&'a AgentTeamId>,
+    pub agent_task_id: Option<&'a AgentTaskId>,
+    pub agent_attempt_id: Option<&'a AgentAttemptId>,
+    pub active_run_id: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+    pub output_summary: Option<&'a str>,
+    pub metadata_json: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledTaskRunRecord {
+    pub id: String,
+    pub task_id: String,
+    pub trigger_reason: String,
+    pub status: String,
+    pub scheduled_at: String,
+    pub queued_at: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub chat_id: Option<String>,
+    pub user_message_id: Option<String>,
+    pub assistant_message_id: Option<String>,
+    pub agent_team_id: Option<AgentTeamId>,
+    pub agent_task_id: Option<AgentTaskId>,
+    pub agent_attempt_id: Option<AgentAttemptId>,
+    pub active_run_id: Option<String>,
+    pub error_message: Option<String>,
+    pub output_summary: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub metadata_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatRecord {
     pub id: String,
     pub title: String,

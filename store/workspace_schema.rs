@@ -781,6 +781,94 @@ CREATE INDEX agent_context_entries_owner_idx
     ON agent_context_entries (instance_id, generation, sequence);
 "#;
 
+pub(crate) const MIGRATION_015: &str = r#"
+CREATE TABLE scheduled_tasks (
+    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) > 0),
+
+    title TEXT NOT NULL CHECK(length(title) > 0),
+    description TEXT,
+
+    schedule_json TEXT NOT NULL CHECK(length(schedule_json) > 0),
+    action_json TEXT NOT NULL CHECK(length(action_json) > 0),
+
+    status TEXT NOT NULL CHECK(status IN (
+        'enabled',
+        'paused',
+        'completed',
+        'archived'
+    )),
+
+    next_run_at TEXT,
+    last_run_at TEXT,
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX scheduled_tasks_status_next_run_idx
+ON scheduled_tasks(status, next_run_at);
+
+CREATE TABLE scheduled_task_runs (
+    id TEXT PRIMARY KEY NOT NULL CHECK(length(id) > 0),
+
+    task_id TEXT NOT NULL
+        REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
+
+    trigger_reason TEXT NOT NULL CHECK(trigger_reason IN (
+        'scheduled',
+        'manual',
+        'retry',
+        'misfire_catch_up'
+    )),
+
+    status TEXT NOT NULL CHECK(status IN (
+        'pending',
+        'queued',
+        'running',
+        'succeeded',
+        'failed',
+        'cancelled',
+        'skipped'
+    )),
+
+    scheduled_at TEXT NOT NULL,
+    queued_at TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+
+    chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+    user_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    assistant_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+
+    agent_team_id TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
+    agent_task_id TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    agent_attempt_id TEXT REFERENCES agent_attempts(id) ON DELETE SET NULL,
+    active_run_id TEXT,
+
+    error_message TEXT,
+    output_summary TEXT,
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX scheduled_task_runs_task_scheduled_idx
+ON scheduled_task_runs(task_id, scheduled_at DESC);
+
+CREATE INDEX scheduled_task_runs_status_idx
+ON scheduled_task_runs(status);
+
+CREATE INDEX scheduled_task_runs_chat_idx
+ON scheduled_task_runs(chat_id);
+
+CREATE INDEX scheduled_task_runs_agent_task_idx
+ON scheduled_task_runs(agent_task_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

@@ -39,20 +39,21 @@ pub use workspace_records::{
     NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
     NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
     NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-    NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
-    PromptContextInjectionRecord, RunEventRecord, TerminalSessionRecord, TodoGraphFilter,
-    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
+    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+    NewTerminalSession, NewToolCall, NewToolResult, PromptContextInjectionRecord, RunEventRecord,
+    ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate,
+    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
+    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
-    MIGRATION_014, Migration,
+    MIGRATION_014, MIGRATION_015, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 14;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 15;
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -113,6 +114,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 14,
         sql: MIGRATION_014,
+    },
+    Migration {
+        version: 15,
+        sql: MIGRATION_015,
     },
 ];
 
@@ -1914,6 +1919,314 @@ impl WorkspaceDatabase {
             })
             .map_err(|source| self.sqlite_error(source))?;
 
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn insert_scheduled_task(
+        &mut self,
+        task: NewScheduledTask<'_>,
+    ) -> Result<ScheduledTaskRecord, WorkspaceDatabaseError> {
+        validate_scheduled_task_status(task.status)?;
+        validate_scheduled_task_json_object(task.schedule_json, "schedule_json")?;
+        validate_scheduled_task_json_object(task.action_json, "action_json")?;
+        let metadata_json = task.metadata_json.unwrap_or("{}");
+        validate_scheduled_task_json_object(metadata_json, "metadata_json")?;
+        let now = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO scheduled_tasks
+                    (id, title, description, schedule_json, action_json, status,
+                     next_run_at, created_at, updated_at, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)",
+                params![
+                    task.id,
+                    task.title,
+                    task.description,
+                    task.schedule_json,
+                    task.action_json,
+                    task.status,
+                    task.next_run_at,
+                    now,
+                    metadata_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        self.scheduled_task(task.id)?
+            .ok_or_else(|| WorkspaceDatabaseError::MissingScheduledTask {
+                id: task.id.to_string(),
+            })
+    }
+
+    pub fn update_scheduled_task(
+        &mut self,
+        task: ScheduledTaskUpdate<'_>,
+    ) -> Result<ScheduledTaskRecord, WorkspaceDatabaseError> {
+        validate_scheduled_task_status(task.status)?;
+        validate_scheduled_task_json_object(task.schedule_json, "schedule_json")?;
+        validate_scheduled_task_json_object(task.action_json, "action_json")?;
+        validate_scheduled_task_json_object(task.metadata_json, "metadata_json")?;
+        let now = now_timestamp();
+
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE scheduled_tasks
+                 SET title = ?2,
+                     description = ?3,
+                     schedule_json = ?4,
+                     action_json = ?5,
+                     status = ?6,
+                     next_run_at = ?7,
+                     last_run_at = ?8,
+                     updated_at = ?9,
+                     metadata_json = ?10
+                 WHERE id = ?1",
+                params![
+                    task.id,
+                    task.title,
+                    task.description,
+                    task.schedule_json,
+                    task.action_json,
+                    task.status,
+                    task.next_run_at,
+                    task.last_run_at,
+                    now,
+                    task.metadata_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        if updated == 0 {
+            return Err(WorkspaceDatabaseError::MissingScheduledTask {
+                id: task.id.to_string(),
+            });
+        }
+
+        self.scheduled_task(task.id)?
+            .ok_or_else(|| WorkspaceDatabaseError::MissingScheduledTask {
+                id: task.id.to_string(),
+            })
+    }
+
+    pub fn scheduled_task(
+        &self,
+        id: &str,
+    ) -> Result<Option<ScheduledTaskRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, title, description, schedule_json, action_json, status,
+                        next_run_at, last_run_at, created_at, updated_at, metadata_json
+                 FROM scheduled_tasks
+                 WHERE id = ?1",
+                params![id],
+                scheduled_task_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn scheduled_tasks(
+        &self,
+        status: Option<&str>,
+    ) -> Result<Vec<ScheduledTaskRecord>, WorkspaceDatabaseError> {
+        if let Some(status) = status {
+            validate_scheduled_task_status(status)?;
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT id, title, description, schedule_json, action_json, status,
+                            next_run_at, last_run_at, created_at, updated_at, metadata_json
+                     FROM scheduled_tasks
+                     WHERE status = ?1
+                     ORDER BY
+                        CASE WHEN next_run_at IS NULL THEN 1 ELSE 0 END,
+                        next_run_at ASC,
+                        updated_at DESC,
+                        id ASC",
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map(params![status], scheduled_task_from_row)
+                .map_err(|source| self.sqlite_error(source))?;
+            return collect_rows(rows, &self.database_path);
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, title, description, schedule_json, action_json, status,
+                        next_run_at, last_run_at, created_at, updated_at, metadata_json
+                 FROM scheduled_tasks
+                 ORDER BY
+                    CASE WHEN next_run_at IS NULL THEN 1 ELSE 0 END,
+                    next_run_at ASC,
+                    updated_at DESC,
+                    id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], scheduled_task_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn insert_scheduled_task_run(
+        &mut self,
+        run: NewScheduledTaskRun<'_>,
+    ) -> Result<ScheduledTaskRunRecord, WorkspaceDatabaseError> {
+        validate_scheduled_task_trigger_reason(run.trigger_reason)?;
+        validate_scheduled_task_run_status(run.status)?;
+        let metadata_json = run.metadata_json.unwrap_or("{}");
+        validate_scheduled_task_json_object(metadata_json, "metadata_json")?;
+        let now = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO scheduled_task_runs
+                    (
+                        id, task_id, trigger_reason, status, scheduled_at, queued_at,
+                        started_at, completed_at, chat_id, user_message_id,
+                        assistant_message_id, agent_team_id, agent_task_id, agent_attempt_id,
+                        active_run_id, error_message, output_summary, created_at, updated_at,
+                        metadata_json
+                    )
+                 VALUES
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18, ?19)",
+                params![
+                    run.id,
+                    run.task_id,
+                    run.trigger_reason,
+                    run.status,
+                    run.scheduled_at,
+                    run.queued_at,
+                    run.started_at,
+                    run.completed_at,
+                    run.chat_id,
+                    run.user_message_id,
+                    run.assistant_message_id,
+                    run.agent_team_id.map(AgentTeamId::as_str),
+                    run.agent_task_id.map(AgentTaskId::as_str),
+                    run.agent_attempt_id.map(AgentAttemptId::as_str),
+                    run.active_run_id,
+                    run.error_message,
+                    run.output_summary,
+                    now,
+                    metadata_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        self.scheduled_task_run(run.id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::MissingScheduledTaskRun {
+                id: run.id.to_string(),
+            }
+        })
+    }
+
+    pub fn update_scheduled_task_run(
+        &mut self,
+        run: ScheduledTaskRunUpdate<'_>,
+    ) -> Result<ScheduledTaskRunRecord, WorkspaceDatabaseError> {
+        validate_scheduled_task_run_status(run.status)?;
+        validate_scheduled_task_json_object(run.metadata_json, "metadata_json")?;
+        let now = now_timestamp();
+
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE scheduled_task_runs
+                 SET status = ?2,
+                     queued_at = ?3,
+                     started_at = ?4,
+                     completed_at = ?5,
+                     chat_id = ?6,
+                     user_message_id = ?7,
+                     assistant_message_id = ?8,
+                     agent_team_id = ?9,
+                     agent_task_id = ?10,
+                     agent_attempt_id = ?11,
+                     active_run_id = ?12,
+                     error_message = ?13,
+                     output_summary = ?14,
+                     updated_at = ?15,
+                     metadata_json = ?16
+                 WHERE id = ?1",
+                params![
+                    run.id,
+                    run.status,
+                    run.queued_at,
+                    run.started_at,
+                    run.completed_at,
+                    run.chat_id,
+                    run.user_message_id,
+                    run.assistant_message_id,
+                    run.agent_team_id.map(AgentTeamId::as_str),
+                    run.agent_task_id.map(AgentTaskId::as_str),
+                    run.agent_attempt_id.map(AgentAttemptId::as_str),
+                    run.active_run_id,
+                    run.error_message,
+                    run.output_summary,
+                    now,
+                    run.metadata_json
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        if updated == 0 {
+            return Err(WorkspaceDatabaseError::MissingScheduledTaskRun {
+                id: run.id.to_string(),
+            });
+        }
+
+        self.scheduled_task_run(run.id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::MissingScheduledTaskRun {
+                id: run.id.to_string(),
+            }
+        })
+    }
+
+    pub fn scheduled_task_run(
+        &self,
+        id: &str,
+    ) -> Result<Option<ScheduledTaskRunRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, task_id, trigger_reason, status, scheduled_at, queued_at,
+                        started_at, completed_at, chat_id, user_message_id,
+                        assistant_message_id, agent_team_id, agent_task_id, agent_attempt_id,
+                        active_run_id, error_message, output_summary, created_at, updated_at,
+                        metadata_json
+                 FROM scheduled_task_runs
+                 WHERE id = ?1",
+                params![id],
+                scheduled_task_run_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn scheduled_task_runs_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<ScheduledTaskRunRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, task_id, trigger_reason, status, scheduled_at, queued_at,
+                        started_at, completed_at, chat_id, user_message_id,
+                        assistant_message_id, agent_team_id, agent_task_id, agent_attempt_id,
+                        active_run_id, error_message, output_summary, created_at, updated_at,
+                        metadata_json
+                 FROM scheduled_task_runs
+                 WHERE task_id = ?1
+                 ORDER BY scheduled_at DESC, created_at DESC, id DESC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![task_id], scheduled_task_run_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
     }
 
@@ -5240,6 +5553,47 @@ const AGENT_MESSAGE_SELECT_BY_ID: &str =
             reply_to_message_id, kind, content, sequence, created_at, consumed_at
      FROM agent_messages WHERE id = ?1";
 
+fn scheduled_task_from_row(row: &Row<'_>) -> rusqlite::Result<ScheduledTaskRecord> {
+    Ok(ScheduledTaskRecord {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        description: row.get(2)?,
+        schedule_json: row.get(3)?,
+        action_json: row.get(4)?,
+        status: row.get(5)?,
+        next_run_at: row.get(6)?,
+        last_run_at: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
+        metadata_json: row.get(10)?,
+    })
+}
+
+fn scheduled_task_run_from_row(row: &Row<'_>) -> rusqlite::Result<ScheduledTaskRunRecord> {
+    Ok(ScheduledTaskRunRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        trigger_reason: row.get(2)?,
+        status: row.get(3)?,
+        scheduled_at: row.get(4)?,
+        queued_at: row.get(5)?,
+        started_at: row.get(6)?,
+        completed_at: row.get(7)?,
+        chat_id: row.get(8)?,
+        user_message_id: row.get(9)?,
+        assistant_message_id: row.get(10)?,
+        agent_team_id: optional_agent_id_from_row(row, 11)?,
+        agent_task_id: optional_agent_id_from_row(row, 12)?,
+        agent_attempt_id: optional_agent_id_from_row(row, 13)?,
+        active_run_id: row.get(14)?,
+        error_message: row.get(15)?,
+        output_summary: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+        metadata_json: row.get(19)?,
+    })
+}
+
 fn agent_team_from_row(row: &Row<'_>) -> rusqlite::Result<AgentTeamRecord> {
     Ok(AgentTeamRecord {
         id: agent_id_from_row(row, 0)?,
@@ -5513,6 +5867,72 @@ fn validate_agent_definition_snapshot(value: &str) -> Result<(), WorkspaceDataba
     Ok(())
 }
 
+fn validate_scheduled_task_status(status: &str) -> Result<(), WorkspaceDatabaseError> {
+    validate_scheduled_task_value(
+        "status",
+        status,
+        &["enabled", "paused", "completed", "archived"],
+    )
+}
+
+fn validate_scheduled_task_run_status(status: &str) -> Result<(), WorkspaceDatabaseError> {
+    validate_scheduled_task_value(
+        "run status",
+        status,
+        &[
+            "pending",
+            "queued",
+            "running",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "skipped",
+        ],
+    )
+}
+
+fn validate_scheduled_task_trigger_reason(
+    trigger_reason: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    validate_scheduled_task_value(
+        "trigger reason",
+        trigger_reason,
+        &["scheduled", "manual", "retry", "misfire_catch_up"],
+    )
+}
+
+fn validate_scheduled_task_value(
+    field: &str,
+    value: &str,
+    allowed: &[&str],
+) -> Result<(), WorkspaceDatabaseError> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(WorkspaceDatabaseError::InvalidScheduledTaskData {
+            message: format!("{field} must be one of: {}", allowed.join(", ")),
+        })
+    }
+}
+
+fn validate_scheduled_task_json_object(
+    value: &str,
+    field: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    let parsed = serde_json::from_str::<Value>(value).map_err(|source| {
+        WorkspaceDatabaseError::InvalidScheduledTaskData {
+            message: format!("{field} must be valid JSON: {source}"),
+        }
+    })?;
+    if parsed.is_object() {
+        Ok(())
+    } else {
+        Err(WorkspaceDatabaseError::InvalidScheduledTaskData {
+            message: format!("{field} must be a JSON object"),
+        })
+    }
+}
+
 fn validate_llm_agent_references(
     connection: &Connection,
     database_path: &Path,
@@ -5654,6 +6074,9 @@ pub enum WorkspaceDatabaseError {
     InvalidMessageMetadata {
         message: String,
     },
+    InvalidScheduledTaskData {
+        message: String,
+    },
     InvalidToolCall {
         message: String,
     },
@@ -5684,6 +6107,12 @@ pub enum WorkspaceDatabaseError {
         id: String,
     },
     MissingLlmRequest {
+        id: String,
+    },
+    MissingScheduledTask {
+        id: String,
+    },
+    MissingScheduledTaskRun {
         id: String,
     },
     NonUtf8Path {
@@ -5722,6 +6151,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             Self::InvalidMessageMetadata { message } => {
                 write!(formatter, "invalid message metadata: {message}")
             }
+            Self::InvalidScheduledTaskData { message } => {
+                write!(formatter, "invalid scheduled task data: {message}")
+            }
             Self::InvalidToolCall { message } => {
                 write!(formatter, "invalid tool call data: {message}")
             }
@@ -5751,6 +6183,12 @@ impl fmt::Display for WorkspaceDatabaseError {
             }
             Self::MissingLlmRequest { id } => {
                 write!(formatter, "LLM request audit row was not found: {id}")
+            }
+            Self::MissingScheduledTask { id } => {
+                write!(formatter, "scheduled task was not found: {id}")
+            }
+            Self::MissingScheduledTaskRun { id } => {
+                write!(formatter, "scheduled task run was not found: {id}")
             }
             Self::NonUtf8Path { path } => {
                 write!(formatter, "path must be valid UTF-8: {}", path.display())
@@ -5794,10 +6232,13 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
             | Self::InvalidMessageMetadata { .. }
+            | Self::InvalidScheduledTaskData { .. }
             | Self::InvalidToolCall { .. }
             | Self::InvalidTodoGraph { .. }
             | Self::MissingDatabaseParent { .. }
             | Self::MissingLlmRequest { .. }
+            | Self::MissingScheduledTask { .. }
+            | Self::MissingScheduledTaskRun { .. }
             | Self::MissingTodoGraph { .. }
             | Self::MissingTerminalSession { .. }
             | Self::MissingToolCall { .. }

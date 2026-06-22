@@ -18,10 +18,11 @@ use foco_store::{
         NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-        NewPromptContextInjection, NewRunEvent, NewTerminalSession, NewToolCall, NewToolResult,
-        TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome,
-        WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase, WorkspaceDatabaseError,
-        initialize_workspace_databases, workspace_database_path,
+        NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+        NewTerminalSession, NewToolCall, NewToolResult, ScheduledTaskRunUpdate,
+        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
+        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
+        WorkspaceDatabaseError, initialize_workspace_databases, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -81,6 +82,8 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "agent_events",
         "agent_context_entries",
         "agent_context_snapshots",
+        "scheduled_tasks",
+        "scheduled_task_runs",
     ] {
         assert!(
             table_exists(&connection, table),
@@ -573,6 +576,198 @@ fn repository_helpers_round_trip_todo_graphs() {
     assert_eq!(completed.tasks.len(), 1);
     assert_eq!(completed.tasks[0].id, "probe");
     assert!(completed.tasks[0].subtasks.is_empty());
+}
+
+#[test]
+fn scheduled_task_records_round_trip_and_list_runs() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    let task = database
+        .insert_scheduled_task(NewScheduledTask {
+            id: "scheduled-task-1",
+            title: "Daily workspace summary",
+            description: Some("Summarize the current workspace."),
+            schedule_json: r#"{"type":"one_shot_at","run_at":"2026-06-22T10:00:00Z"}"#,
+            action_json: r#"{"type":"agent_prompt","prompt":"Summarize changes"}"#,
+            status: "enabled",
+            next_run_at: Some("2026-06-22T10:00:00Z"),
+            metadata_json: Some(
+                r#"{"workspaceId":"workspace-1","concurrencyPolicy":"skip_if_running"}"#,
+            ),
+        })
+        .expect("scheduled task insert");
+    assert_eq!(task.id, "scheduled-task-1");
+    assert_eq!(task.status, "enabled");
+    assert_eq!(task.last_run_at, None);
+
+    let paused = database
+        .update_scheduled_task(ScheduledTaskUpdate {
+            id: "scheduled-task-1",
+            title: "Daily workspace summary",
+            description: task.description.as_deref(),
+            schedule_json: &task.schedule_json,
+            action_json: &task.action_json,
+            status: "paused",
+            next_run_at: None,
+            last_run_at: Some("2026-06-22T10:00:00Z"),
+            metadata_json: &task.metadata_json,
+        })
+        .expect("scheduled task pause");
+    assert_eq!(paused.status, "paused");
+    assert_eq!(paused.next_run_at, None);
+
+    let paused_tasks = database
+        .scheduled_tasks(Some("paused"))
+        .expect("paused scheduled tasks");
+    assert_eq!(paused_tasks.len(), 1);
+    assert_eq!(paused_tasks[0].id, "scheduled-task-1");
+
+    let resumed = database
+        .update_scheduled_task(ScheduledTaskUpdate {
+            id: "scheduled-task-1",
+            title: &paused.title,
+            description: paused.description.as_deref(),
+            schedule_json: &paused.schedule_json,
+            action_json: &paused.action_json,
+            status: "enabled",
+            next_run_at: Some("2026-06-23T10:00:00Z"),
+            last_run_at: paused.last_run_at.as_deref(),
+            metadata_json: &paused.metadata_json,
+        })
+        .expect("scheduled task resume");
+    assert_eq!(resumed.status, "enabled");
+    assert_eq!(resumed.next_run_at.as_deref(), Some("2026-06-23T10:00:00Z"));
+    assert_eq!(
+        database
+            .scheduled_tasks(None)
+            .expect("all scheduled tasks")
+            .len(),
+        1
+    );
+
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-scheduled-run", "scheduled-run");
+    database
+        .insert_message(NewMessage {
+            id: "message-scheduled-user",
+            chat_id: "chat-scheduled-run",
+            role: "user",
+            content: "Summarize changes",
+            sequence: 0,
+            metadata_json: Some("{}"),
+        })
+        .expect("scheduled user message insert");
+    database
+        .insert_message(NewMessage {
+            id: "message-scheduled-assistant",
+            chat_id: "chat-scheduled-run",
+            role: "assistant",
+            content: "",
+            sequence: 1,
+            metadata_json: Some("{}"),
+        })
+        .expect("scheduled assistant message insert");
+
+    let agent_task_id = AgentTaskId::new("agent-task-scheduled-run").expect("agent task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &agent_task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"goal":"Summarize changes"}"#,
+        })
+        .expect("agent task enqueue");
+    let attempt_id = AgentAttemptId::new("agent-attempt-scheduled-run").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &agent_task_id, &attempt_id)
+        .expect("agent task claim")
+        .expect("claimed agent task");
+
+    let run = database
+        .insert_scheduled_task_run(NewScheduledTaskRun {
+            id: "scheduled-run-1",
+            task_id: "scheduled-task-1",
+            trigger_reason: "manual",
+            status: "queued",
+            scheduled_at: "2026-06-22T10:00:00Z",
+            queued_at: Some("2026-06-22T10:00:01Z"),
+            started_at: None,
+            completed_at: None,
+            chat_id: Some("chat-scheduled-run"),
+            user_message_id: Some("message-scheduled-user"),
+            assistant_message_id: Some("message-scheduled-assistant"),
+            agent_team_id: Some(&team_id),
+            agent_task_id: Some(&agent_task_id),
+            agent_attempt_id: None,
+            active_run_id: Some("agent-task-scheduled-run"),
+            error_message: None,
+            output_summary: None,
+            metadata_json: Some(r#"{"triggeredBy":"test"}"#),
+        })
+        .expect("scheduled task run insert");
+    assert_eq!(run.status, "queued");
+    assert_eq!(run.chat_id.as_deref(), Some("chat-scheduled-run"));
+    assert_eq!(run.agent_task_id.as_ref(), Some(&agent_task_id));
+
+    let completed = database
+        .update_scheduled_task_run(ScheduledTaskRunUpdate {
+            id: "scheduled-run-1",
+            status: "succeeded",
+            queued_at: run.queued_at.as_deref(),
+            started_at: Some("2026-06-22T10:00:02Z"),
+            completed_at: Some("2026-06-22T10:00:30Z"),
+            chat_id: run.chat_id.as_deref(),
+            user_message_id: run.user_message_id.as_deref(),
+            assistant_message_id: run.assistant_message_id.as_deref(),
+            agent_team_id: run.agent_team_id.as_ref(),
+            agent_task_id: run.agent_task_id.as_ref(),
+            agent_attempt_id: Some(&attempt_id),
+            active_run_id: run.active_run_id.as_deref(),
+            error_message: None,
+            output_summary: Some("Workspace summarized."),
+            metadata_json: &run.metadata_json,
+        })
+        .expect("scheduled task run update");
+    assert_eq!(completed.status, "succeeded");
+    assert_eq!(completed.agent_attempt_id.as_ref(), Some(&attempt_id));
+    assert_eq!(
+        completed.output_summary.as_deref(),
+        Some("Workspace summarized.")
+    );
+
+    database
+        .insert_scheduled_task_run(NewScheduledTaskRun {
+            id: "scheduled-run-2",
+            task_id: "scheduled-task-1",
+            trigger_reason: "scheduled",
+            status: "failed",
+            scheduled_at: "2026-06-23T10:00:00Z",
+            queued_at: None,
+            started_at: None,
+            completed_at: Some("2026-06-23T10:00:01Z"),
+            chat_id: None,
+            user_message_id: None,
+            assistant_message_id: None,
+            agent_team_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            active_run_id: None,
+            error_message: Some("dispatch failed"),
+            output_summary: None,
+            metadata_json: None,
+        })
+        .expect("second scheduled task run insert");
+
+    let runs = database
+        .scheduled_task_runs_for_task("scheduled-task-1")
+        .expect("scheduled task runs");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].id, "scheduled-run-2");
+    assert_eq!(runs[1].id, "scheduled-run-1");
 }
 
 #[test]
@@ -1963,6 +2158,102 @@ fn migrates_v13_agent_message_foreign_keys_to_current_table() {
     );
     let connection = Connection::open(database.database_path()).expect("open migrated database");
     assert_no_agent_messages_old_references(&connection);
+}
+
+#[test]
+fn migrates_v14_scheduled_task_tables_without_losing_existing_data() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v14 database");
+    connection
+        .execute_batch(
+            r#"CREATE TABLE chats (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+             );
+             CREATE TABLE messages (
+                id TEXT PRIMARY KEY NOT NULL,
+                chat_id TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+             );
+             CREATE TABLE agent_teams (
+                id TEXT PRIMARY KEY NOT NULL,
+                chat_id TEXT NOT NULL
+             );
+             CREATE TABLE agent_instances (
+                id TEXT PRIMARY KEY NOT NULL,
+                team_id TEXT NOT NULL,
+                UNIQUE (team_id, id)
+             );
+             CREATE TABLE agent_tasks (
+                id TEXT PRIMARY KEY NOT NULL,
+                team_id TEXT NOT NULL,
+                UNIQUE (team_id, id)
+             );
+             CREATE TABLE agent_attempts (
+                id TEXT PRIMARY KEY NOT NULL,
+                team_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                UNIQUE (team_id, id)
+             );
+             CREATE TABLE llm_requests (
+                id TEXT PRIMARY KEY NOT NULL,
+                chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+                agent_team_id TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
+                agent_task_id TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
+                agent_attempt_id TEXT REFERENCES agent_attempts(id) ON DELETE SET NULL,
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                request_started_at TEXT NOT NULL,
+                final_state TEXT NOT NULL
+             );
+             INSERT INTO chats (id, title, created_at, updated_at)
+                VALUES ('chat-existing', 'Existing', '2026-06-22T00:00:00Z', '2026-06-22T00:00:00Z');
+             INSERT INTO messages (id, chat_id, role, content, sequence, created_at)
+                VALUES ('message-existing', 'chat-existing', 'user', 'keep me', 0, '2026-06-22T00:00:00Z');
+             INSERT INTO agent_teams (id, chat_id)
+                VALUES ('agent-team-existing', 'chat-existing');
+             INSERT INTO agent_instances (id, team_id)
+                VALUES ('agent-instance-existing', 'agent-team-existing');
+             INSERT INTO agent_tasks (id, team_id)
+                VALUES ('agent-task-existing', 'agent-team-existing');
+             INSERT INTO agent_attempts (id, team_id, task_id)
+                VALUES ('agent-attempt-existing', 'agent-team-existing', 'agent-task-existing');
+             INSERT INTO llm_requests
+                (id, chat_id, agent_team_id, agent_task_id, agent_attempt_id,
+                 provider_id, model_id, request_started_at, final_state)
+                VALUES
+                ('request-existing', 'chat-existing', 'agent-team-existing',
+                 'agent-task-existing', 'agent-attempt-existing',
+                 'provider-test', 'model-test', '2026-06-22T00:00:00Z', 'completed');
+             PRAGMA user_version = 14;"#,
+        )
+        .expect("v14 schema");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+
+    let connection = Connection::open(database.database_path()).expect("open migrated database");
+    assert!(table_exists(&connection, "scheduled_tasks"));
+    assert!(table_exists(&connection, "scheduled_task_runs"));
+    assert_eq!(table_count(&connection, "chats"), 1);
+    assert_eq!(table_count(&connection, "messages"), 1);
+    assert_eq!(table_count(&connection, "agent_teams"), 1);
+    assert_eq!(table_count(&connection, "agent_tasks"), 1);
+    assert_eq!(table_count(&connection, "agent_attempts"), 1);
+    assert_eq!(table_count(&connection, "llm_requests"), 1);
 }
 
 #[test]
