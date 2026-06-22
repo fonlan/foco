@@ -774,6 +774,98 @@ fn scheduled_task_records_round_trip_and_list_runs() {
     assert_eq!(agent_runs.len(), 1);
     assert_eq!(agent_runs[0].id, "scheduled-run-1");
 
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-scheduled-1",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-scheduled-run"),
+            agent_team_id: Some(&team_id),
+            agent_instance_id: Some(&instance_id),
+            agent_task_id: Some(&agent_task_id),
+            agent_attempt_id: Some(&attempt_id),
+            provider_id: "openai-responses",
+            model_id: "gpt-scheduled",
+            request_started_at: "2026-06-22T10:00:02Z",
+            first_token_at: Some("2026-06-22T10:00:03Z"),
+            completed_at: Some("2026-06-22T10:00:04Z"),
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cache_read_tokens: Some(5),
+            cache_write_tokens: Some(7),
+            first_token_latency_ms: Some(1000),
+            total_latency_ms: Some(2000),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: Some("{}"),
+            response_body_json: Some("{}"),
+        })
+        .expect("scheduled llm request insert");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-scheduled-2",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-scheduled-run"),
+            agent_team_id: Some(&team_id),
+            agent_instance_id: Some(&instance_id),
+            agent_task_id: Some(&agent_task_id),
+            agent_attempt_id: Some(&attempt_id),
+            provider_id: "openai-responses",
+            model_id: "gpt-scheduled",
+            request_started_at: "2026-06-22T10:00:05Z",
+            first_token_at: None,
+            completed_at: Some("2026-06-22T10:00:06Z"),
+            input_tokens: Some(10),
+            output_tokens: Some(0),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: Some(500),
+            final_state: "failed",
+            request_body_json: Some("{}"),
+            response_body_json: Some("{}"),
+        })
+        .expect("failed scheduled llm request insert");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-unrelated",
+            workspace_id: "workspace-1",
+            chat_id: Some("chat-scheduled-run"),
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai-responses",
+            model_id: "gpt-scheduled",
+            request_started_at: "2026-06-22T10:00:07Z",
+            first_token_at: None,
+            completed_at: Some("2026-06-22T10:00:08Z"),
+            input_tokens: Some(999),
+            output_tokens: Some(999),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            first_token_latency_ms: None,
+            total_latency_ms: Some(999),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: Some("{}"),
+            response_body_json: Some("{}"),
+        })
+        .expect("unrelated llm request insert");
+
+    let usage = database
+        .scheduled_task_usage_summary("scheduled-task-1")
+        .expect("scheduled task usage summary");
+    assert_eq!(usage.total_requests, 2);
+    assert_eq!(usage.failed_requests, 1);
+    assert_eq!(usage.total_input_tokens, 110);
+    assert_eq!(usage.total_output_tokens, 20);
+    assert_eq!(usage.total_cache_read_tokens, 5);
+    assert_eq!(usage.total_cache_write_tokens, 7);
+    assert_eq!(usage.total_tokens, 130);
+    assert_eq!(usage.latency_count, 1);
+    assert_eq!(usage.latency_sum, 2000);
+
     assert!(
         database
             .delete_scheduled_task("scheduled-task-1")

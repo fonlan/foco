@@ -5,8 +5,8 @@ use axum::{
 use foco_store::{
     config::WorkspaceConfig,
     workspace::{
-        NewScheduledTask, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskUpdate,
-        WorkspaceDatabase,
+        LlmRequestAuditSummaryRow, NewScheduledTask, ScheduledTaskRecord, ScheduledTaskRunRecord,
+        ScheduledTaskUpdate, WorkspaceDatabase,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,21 @@ pub(crate) struct ScheduledTaskView {
     created_at: String,
     updated_at: String,
     metadata: Value,
+    usage: ScheduledTaskUsageView,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScheduledTaskUsageView {
+    total_requests: i64,
+    failed_requests: i64,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_cache_read_tokens: i64,
+    total_cache_write_tokens: i64,
+    total_tokens: i64,
+    total_latency_ms: i64,
+    average_latency_ms: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -152,7 +167,7 @@ pub(crate) async fn scheduled_tasks(
             .map_err(ApiError::from_workspace_error)?
         {
             if scheduled_task_matches_search(workspace, &task, search.as_deref()) {
-                tasks.push(scheduled_task_view(workspace, task)?);
+                tasks.push(scheduled_task_view(workspace, &database, task)?);
             }
         }
     }
@@ -200,7 +215,7 @@ pub(crate) async fn create_scheduled_task(
 
     notify_scheduled_task_change(&state)?;
     Ok(Json(ScheduledTaskResponse {
-        task: scheduled_task_view(workspace, task)?,
+        task: scheduled_task_view(workspace, &database, task)?,
     }))
 }
 
@@ -215,7 +230,7 @@ pub(crate) async fn scheduled_task(
     let task = require_scheduled_task(&database, &task_id)?;
 
     Ok(Json(ScheduledTaskResponse {
-        task: scheduled_task_view(workspace, task)?,
+        task: scheduled_task_view(workspace, &database, task)?,
     }))
 }
 
@@ -286,7 +301,7 @@ pub(crate) async fn update_scheduled_task(
 
     notify_scheduled_task_change(&state)?;
     Ok(Json(ScheduledTaskResponse {
-        task: scheduled_task_view(workspace, task)?,
+        task: scheduled_task_view(workspace, &database, task)?,
     }))
 }
 
@@ -310,7 +325,7 @@ pub(crate) async fn delete_scheduled_task(
     }
 
     Ok(Json(ScheduledTaskResponse {
-        task: scheduled_task_view(workspace, task)?,
+        task: scheduled_task_view(workspace, &database, task)?,
     }))
 }
 
@@ -445,7 +460,7 @@ fn set_scheduled_task_status(
     }
 
     Ok(ScheduledTaskResponse {
-        task: scheduled_task_view(workspace, task)?,
+        task: scheduled_task_view(workspace, &database, task)?,
     })
 }
 
@@ -477,8 +492,12 @@ fn require_scheduled_task(
 
 fn scheduled_task_view(
     workspace: &WorkspaceConfig,
+    database: &WorkspaceDatabase,
     task: ScheduledTaskRecord,
 ) -> Result<ScheduledTaskView, ApiError> {
+    let usage = database
+        .scheduled_task_usage_summary(&task.id)
+        .map_err(ApiError::from_workspace_error)?;
     Ok(ScheduledTaskView {
         id: task.id,
         workspace_id: workspace.id.clone(),
@@ -493,7 +512,30 @@ fn scheduled_task_view(
         created_at: task.created_at,
         updated_at: task.updated_at,
         metadata: persisted_json_object("scheduled task metadata", &task.metadata_json)?,
+        usage: scheduled_task_usage_view(usage),
     })
+}
+
+fn scheduled_task_usage_view(summary: LlmRequestAuditSummaryRow) -> ScheduledTaskUsageView {
+    ScheduledTaskUsageView {
+        total_requests: summary.total_requests,
+        failed_requests: summary.failed_requests,
+        total_input_tokens: summary.total_input_tokens,
+        total_output_tokens: summary.total_output_tokens,
+        total_cache_read_tokens: summary.total_cache_read_tokens,
+        total_cache_write_tokens: summary.total_cache_write_tokens,
+        total_tokens: summary.total_tokens,
+        total_latency_ms: summary.latency_sum,
+        average_latency_ms: average_i64(summary.latency_sum, summary.latency_count),
+    }
+}
+
+fn average_i64(sum: i64, count: i64) -> Option<i64> {
+    if count == 0 {
+        None
+    } else {
+        Some((sum as f64 / count as f64).round() as i64)
+    }
 }
 
 fn scheduled_task_run_view(

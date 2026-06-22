@@ -1614,6 +1614,18 @@ export type ScheduledTaskAction = {
   collaboration_tools_enabled: boolean;
 };
 
+export type ScheduledTaskUsageSummary = {
+  totalRequests: number;
+  failedRequests: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+  totalTokens: number;
+  totalLatencyMs: number;
+  averageLatencyMs: number | null;
+};
+
 export type ScheduledTaskView = {
   id: string;
   workspaceId: string;
@@ -1628,6 +1640,7 @@ export type ScheduledTaskView = {
   createdAt: string;
   updatedAt: string;
   metadata: JsonValue;
+  usage: ScheduledTaskUsageSummary;
 };
 
 export type ScheduledTasksResponse = {

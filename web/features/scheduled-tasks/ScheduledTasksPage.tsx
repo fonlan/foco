@@ -565,6 +565,7 @@ function TaskDetails({
   const providerId = stringField(action, "provider_id", "providerId");
   const agentDefinitionId = stringField(action, "agent_definition_id", "agentDefinitionId");
   const thinkingLevel = stringField(action, "thinking_level", "thinkingLevel");
+  const usage = task.usage;
 
   return (
     <div className="min-w-0 overflow-hidden rounded-lg border border-stone-200 bg-white/85 shadow-sm">
@@ -667,6 +668,37 @@ function TaskDetails({
             value={booleanField(action, "collaboration_tools_enabled", "collaborationToolsEnabled")
               ? t("Enabled")
               : t("Disabled")}
+          />
+        </DetailBlock>
+
+        <DetailBlock title={t("Usage")}>
+          <KeyValue
+            label={t("Recorded requests")}
+            value={formatNumber(usage.totalRequests, language)}
+          />
+          <KeyValue
+            label={t("Failed requests")}
+            value={formatNumber(usage.failedRequests, language)}
+          />
+          <KeyValue
+            label={t("Total tokens")}
+            value={formatNumber(usage.totalTokens, language)}
+          />
+          <KeyValue
+            label={t("Input tokens")}
+            value={formatNumber(usage.totalInputTokens, language)}
+          />
+          <KeyValue
+            label={t("Output tokens")}
+            value={formatNumber(usage.totalOutputTokens, language)}
+          />
+          <KeyValue
+            label={t("Total time")}
+            value={formatLatencyMs(usage.totalLatencyMs, language, t)}
+          />
+          <KeyValue
+            label={t("Average latency")}
+            value={formatLatencyMs(usage.averageLatencyMs, language, t)}
           />
         </DetailBlock>
       </div>
@@ -1623,6 +1655,19 @@ function formatTimestamp(value: string | null, language: string, t: Translate) {
 
 function formatNumber(value: number, language: string) {
   return new Intl.NumberFormat(language).format(value);
+}
+
+function formatLatencyMs(value: number | null, language: string, t: Translate) {
+  if (value === null) {
+    return t("Not available");
+  }
+  if (value >= 1000) {
+    return `${new Intl.NumberFormat(language, {
+      maximumFractionDigits: 1,
+      minimumFractionDigits: 0,
+    }).format(value / 1000)}s`;
+  }
+  return `${formatNumber(value, language)}ms`;
 }
 
 function recordValue(value: unknown): Record<string, JsonValue> {

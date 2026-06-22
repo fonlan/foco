@@ -318,6 +318,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Request audit": "请求审计",
     "Refresh request audit": "刷新请求审计",
     Columns: "列",
+    Usage: "用量",
     "Recorded requests": "已记录请求",
     "Input tokens": "输入 token",
     "Output tokens": "输出 token",

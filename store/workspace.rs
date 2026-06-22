@@ -1791,6 +1791,46 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn scheduled_task_usage_summary(
+        &self,
+        task_id: &str,
+    ) -> Result<LlmRequestAuditSummaryRow, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT
+                    COUNT(*),
+                    COUNT(CASE WHEN final_state NOT IN ('succeeded', 'completed') THEN 1 END),
+                    COALESCE(SUM(COALESCE(input_tokens, 0)), 0),
+                    COALESCE(SUM(COALESCE(output_tokens, 0)), 0),
+                    COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0),
+                    COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0),
+                    COALESCE(SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)), 0),
+                    COUNT(total_latency_ms),
+                    COALESCE(SUM(COALESCE(total_latency_ms, 0)), 0)
+                 FROM llm_requests
+                 WHERE agent_task_id IN (
+                    SELECT DISTINCT agent_task_id
+                    FROM scheduled_task_runs
+                    WHERE task_id = ?1 AND agent_task_id IS NOT NULL
+                 )",
+                params![task_id],
+                |row| {
+                    Ok(LlmRequestAuditSummaryRow {
+                        total_requests: row.get(0)?,
+                        failed_requests: row.get(1)?,
+                        total_input_tokens: row.get(2)?,
+                        total_output_tokens: row.get(3)?,
+                        total_cache_read_tokens: row.get(4)?,
+                        total_cache_write_tokens: row.get(5)?,
+                        total_tokens: row.get(6)?,
+                        latency_count: row.get(7)?,
+                        latency_sum: row.get(8)?,
+                    })
+                },
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn insert_context_compression_snapshot(
         &mut self,
         snapshot: NewContextCompressionSnapshot<'_>,
