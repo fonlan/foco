@@ -1044,6 +1044,17 @@ export function App() {
     [loadAgentTeamSnapshot],
   );
 
+  const refreshActiveAgentTeamSnapshot = useCallback(
+    (workspaceId: string, chatId: string) => {
+      if (activeChatKeyRef.current !== chatRunKey(workspaceId, chatId)) {
+        return;
+      }
+
+      void loadAgentTeamSnapshot(workspaceId, chatId);
+    },
+    [loadAgentTeamSnapshot],
+  );
+
   useEffect(() => {
     if (!canUseApp) {
       return;
@@ -4723,6 +4734,7 @@ export function App() {
             startedAtMs: liveStartedAtMs,
             usage: null,
           });
+          refreshActiveAgentTeamSnapshot(activeRun.workspaceId, streamEvent.chatId);
           return;
         }
 
@@ -5054,6 +5066,7 @@ export function App() {
         if (streamEvent.type === "streamEnd") {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
+          refreshActiveAgentTeamSnapshot(activeRun.workspaceId, activeRun.chatId);
           return;
         }
 
@@ -5590,6 +5603,7 @@ export function App() {
             startedAtMs: liveStartedAtMs,
             usage: null,
           });
+          refreshActiveAgentTeamSnapshot(request.workspaceId, streamEvent.chatId);
           const shouldActivateStartedChat =
             shouldActivateRun ||
             activeChatKeyRef.current === currentRunningChatKey ||
@@ -5955,6 +5969,9 @@ export function App() {
         if (streamEvent.type === "streamEnd") {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
+          if (requestChatId) {
+            refreshActiveAgentTeamSnapshot(request.workspaceId, requestChatId);
+          }
           return;
         }
 

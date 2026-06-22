@@ -220,6 +220,35 @@ describe("app agents verification surfaces", () => {
     expect(screen.getAllByLabelText("Agent status active").length).toBeGreaterThan(0);
   });
 
+  it("refreshes the active chat Agent snapshot when a chat stream starts and ends", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const snapshotCallCount = () =>
+      fetchMock.mock.calls.filter(
+        ([url]) => url === "/api/workspaces/workspace-1/chats/chat-1/agent-team",
+      ).length;
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await waitFor(() => expect(snapshotCallCount()).toBeGreaterThan(0));
+    const callsBeforeStart = snapshotCallCount();
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "refresh agent state",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() => expect(snapshotCallCount()).toBeGreaterThan(callsBeforeStart));
+    const callsAfterStart = snapshotCallCount();
+
+    await act(async () => {
+      enqueueChatStreamEvent({ type: "streamEnd" });
+    });
+
+    await waitFor(() => expect(snapshotCallCount()).toBeGreaterThan(callsAfterStart));
+  });
+
   it("queues the first message with Team tools disabled by default from the composer", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
