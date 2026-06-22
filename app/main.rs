@@ -1879,6 +1879,8 @@ struct QueueChatMessageResponse {
     content: String,
     parts: Vec<ChatMessagePart>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    agent_team_id: Option<foco_agent::AgentTeamId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     agent_task_id: Option<foco_agent::AgentTaskId>,
 }
 
@@ -1978,23 +1980,6 @@ impl ChatStreamRequest {
         PromptContextRequest {
             chat_id: self.chat_id,
             queued_user_message_id: self.queued_user_message_id,
-            model_id: self.model_id,
-            provider_id: self.provider_id,
-            thinking_level: self.thinking_level,
-            skill_ids: self.skill_ids,
-            message: Some(self.message),
-            assistant_draft: None,
-            assistant_draft_reasoning: None,
-            attachments: self.attachments,
-        }
-    }
-}
-
-impl QueueChatMessageRequest {
-    fn into_prompt_request(self) -> PromptContextRequest {
-        PromptContextRequest {
-            chat_id: self.chat_id,
-            queued_user_message_id: None,
             model_id: self.model_id,
             provider_id: self.provider_id,
             thinking_level: self.thinking_level,
@@ -9297,8 +9282,9 @@ fn queued_chat_metadata_json(
     thinking_level: Option<&str>,
     skill_ids: &[String],
     content: &str,
+    origin_metadata: Option<&Value>,
 ) -> Result<String, ApiError> {
-    serde_json::to_string(&json!({
+    let mut metadata = json!({
         "queuedRun": {
             "status": "queued",
             "userMessageId": user_message_id,
@@ -9310,8 +9296,9 @@ fn queued_chat_metadata_json(
             "skillIds": skill_ids,
             "content": content,
         }
-    }))
-    .map_err(|source| {
+    });
+    merge_queued_origin_metadata(&mut metadata, origin_metadata, "queued chat metadata")?;
+    serde_json::to_string(&metadata).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize queued chat metadata: {source}"
         ))
@@ -9326,6 +9313,7 @@ fn queued_user_message_metadata_json(
     provider_id: Option<&str>,
     thinking_level: Option<&str>,
     skill_ids: &[String],
+    origin_metadata: Option<&Value>,
 ) -> Result<String, ApiError> {
     let mut metadata = serde_json::from_str::<Value>(&user_message_metadata_json(attachments)?)
         .map_err(|source| ApiError::internal(format!("failed to parse user metadata: {source}")))?;
@@ -9346,11 +9334,32 @@ fn queued_user_message_metadata_json(
             "skillIds": skill_ids,
         }),
     );
+    merge_queued_origin_metadata(&mut metadata, origin_metadata, "queued user metadata")?;
     serde_json::to_string(&metadata).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize queued user metadata: {source}"
         ))
     })
+}
+
+fn merge_queued_origin_metadata(
+    metadata: &mut Value,
+    origin_metadata: Option<&Value>,
+    field: &str,
+) -> Result<(), ApiError> {
+    let Some(origin_metadata) = origin_metadata else {
+        return Ok(());
+    };
+    let Some(metadata_object) = metadata.as_object_mut() else {
+        return Err(ApiError::internal(format!("{field} must be an object")));
+    };
+    let Some(origin_object) = origin_metadata.as_object() else {
+        return Err(ApiError::internal(format!(
+            "{field} origin metadata must be an object"
+        )));
+    };
+    metadata_object.extend(origin_object.clone());
+    Ok(())
 }
 
 fn user_message_response_parts(

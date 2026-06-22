@@ -269,6 +269,7 @@ export type QueueChatMessageResponse = {
   assistantMessageId: string;
   content: string;
   parts: ChatMessagePart[];
+  agentTeamId?: string;
   agentTaskId?: string;
 };
 

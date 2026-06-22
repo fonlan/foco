@@ -30,15 +30,115 @@ const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete the user's task directly. When Agent team tools are available, coordinate or create worker agents only when that materially reduces the work.";
 const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+#[derive(Clone, Debug)]
+pub(crate) enum QueuedChatMessageOrigin {
+    User,
+    #[allow(dead_code)] // Phase 5 scheduler dispatch will construct this outside tests.
+    ScheduledTask {
+        task_id: String,
+        run_id: String,
+        trigger_reason: String,
+    },
+}
+
+impl QueuedChatMessageOrigin {
+    fn metadata_value(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::User => None,
+            Self::ScheduledTask {
+                task_id,
+                run_id,
+                trigger_reason,
+            } => Some(serde_json::json!({
+                "source": "scheduled_task",
+                "scheduledTaskId": task_id,
+                "scheduledTaskRunId": run_id,
+                "triggerReason": trigger_reason,
+            })),
+        }
+    }
+}
+
+pub(crate) struct QueueChatMessageInput {
+    pub(crate) chat_id: Option<String>,
+    pub(crate) model_id: String,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) thinking_level: Option<String>,
+    pub(crate) skill_ids: Option<Vec<String>>,
+    pub(crate) message: String,
+    pub(crate) team_mode_enabled: bool,
+    pub(crate) attachments: Vec<ChatAttachmentInput>,
+    pub(crate) origin: QueuedChatMessageOrigin,
+}
+
+pub(crate) struct QueuedChatMessageArtifacts {
+    pub(crate) chat_id: String,
+    pub(crate) chat_title: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) user_message_id: String,
+    pub(crate) assistant_message_id: String,
+    pub(crate) content: String,
+    pub(crate) parts: Vec<ChatMessagePart>,
+    pub(crate) agent_team_id: Option<foco_agent::AgentTeamId>,
+    pub(crate) agent_task_id: Option<foco_agent::AgentTaskId>,
+}
+
 pub(crate) async fn queue_chat_message(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
     Json(request): Json<QueueChatMessageRequest>,
 ) -> Result<Json<QueueChatMessageResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
-    let workspace = workspace_by_id(&config, &workspace_id)?;
-    let team_mode_enabled = request.team_mode_enabled;
-    let mut team = if let Some(chat_id) = request.chat_id.as_deref() {
+    let queued = queue_chat_message_internal(
+        &state,
+        &workspace_id,
+        QueueChatMessageInput {
+            chat_id: request.chat_id,
+            model_id: request.model_id,
+            provider_id: request.provider_id,
+            thinking_level: request.thinking_level,
+            skill_ids: request.skill_ids,
+            message: request.message,
+            team_mode_enabled: request.team_mode_enabled,
+            attachments: request.attachments,
+            origin: QueuedChatMessageOrigin::User,
+        },
+    )
+    .await?;
+
+    Ok(Json(QueueChatMessageResponse {
+        chat_id: queued.chat_id,
+        chat_title: queued.chat_title,
+        created_at: queued.created_at,
+        updated_at: queued.updated_at,
+        user_message_id: queued.user_message_id,
+        assistant_message_id: queued.assistant_message_id,
+        content: queued.content,
+        parts: queued.parts,
+        agent_team_id: queued.agent_team_id,
+        agent_task_id: queued.agent_task_id,
+    }))
+}
+
+pub(crate) async fn queue_chat_message_internal(
+    state: &AppState,
+    workspace_id: &str,
+    input: QueueChatMessageInput,
+) -> Result<QueuedChatMessageArtifacts, ApiError> {
+    let config = config_snapshot(state)?;
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    let QueueChatMessageInput {
+        chat_id,
+        model_id,
+        provider_id,
+        thinking_level,
+        skill_ids,
+        message: task_message,
+        team_mode_enabled,
+        attachments,
+        origin,
+    } = input;
+    let mut team = if let Some(chat_id) = chat_id.as_deref() {
         let database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
         database
@@ -59,16 +159,27 @@ pub(crate) async fn queue_chat_message(
     } else {
         None
     };
-    let requested_model_id = request.model_id.clone();
-    let requested_provider_id = request.provider_id.clone();
-    let requested_thinking_level = request.thinking_level.clone();
-    let requested_skill_ids = request.skill_ids.clone().unwrap_or_default();
-    let task_message = request.message.clone();
+    let requested_model_id = model_id.clone();
+    let requested_provider_id = provider_id.clone();
+    let requested_thinking_level = thinking_level.clone();
+    let requested_skill_ids = skill_ids.clone().unwrap_or_default();
+    let origin_metadata = origin.metadata_value();
     let prompt_context = prepare_prompt_context(
-        &state,
+        state,
         &config,
-        &workspace_id,
-        request.into_prompt_request(),
+        workspace_id,
+        PromptContextRequest {
+            chat_id,
+            queued_user_message_id: None,
+            model_id,
+            provider_id,
+            thinking_level,
+            skill_ids,
+            message: Some(task_message.clone()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments,
+        },
         None,
         PromptAssemblyPurpose::ChatRun,
     )
@@ -103,6 +214,7 @@ pub(crate) async fn queue_chat_message(
         requested_provider_id.as_deref(),
         requested_thinking_level.as_deref(),
         &requested_skill_ids,
+        origin_metadata.as_ref(),
     )?;
 
     let (chat_id, chat_title) = if prompt_context.is_new_chat {
@@ -117,6 +229,7 @@ pub(crate) async fn queue_chat_message(
             requested_thinking_level.as_deref(),
             &requested_skill_ids,
             message,
+            origin_metadata.as_ref(),
         )?;
         database
             .insert_chat_with_metadata(&chat_id, &title, &chat_metadata_json)
@@ -212,6 +325,7 @@ pub(crate) async fn queue_chat_message(
     } else {
         None
     };
+    let agent_team_id = team.as_ref().map(|team| team.id.clone());
 
     database
         .insert_message(NewMessage {
@@ -231,7 +345,7 @@ pub(crate) async fn queue_chat_message(
         .map_err(ApiError::from_workspace_error)?
         .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
 
-    Ok(Json(QueueChatMessageResponse {
+    Ok(QueuedChatMessageArtifacts {
         chat_id,
         chat_title,
         created_at: chat.created_at,
@@ -240,8 +354,9 @@ pub(crate) async fn queue_chat_message(
         assistant_message_id,
         content: message.to_string(),
         parts: user_message_response_parts(message, &prompt_context.attachments),
+        agent_team_id,
         agent_task_id,
-    }))
+    })
 }
 
 async fn default_agent_definition(

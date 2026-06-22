@@ -4352,6 +4352,88 @@ async fn queue_chat_message_creates_default_team_for_normal_send() {
 }
 
 #[tokio::test]
+async fn queue_chat_message_internal_marks_scheduled_origin() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-queue-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-queue-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (scheduler, mut scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = scheduler;
+
+    let queued = crate::http::chat::queue_chat_message_internal(
+        &state,
+        &workspace_id,
+        crate::http::chat::QueueChatMessageInput {
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            message: "Scheduled prompt".to_string(),
+            team_mode_enabled: false,
+            attachments: Vec::new(),
+            origin: crate::http::chat::QueuedChatMessageOrigin::ScheduledTask {
+                task_id: "scheduled-task-test".to_string(),
+                run_id: "scheduled-run-test".to_string(),
+                trigger_reason: "scheduled".to_string(),
+            },
+        },
+    )
+    .await
+    .expect("queue scheduled message");
+
+    assert!(queued.agent_team_id.is_some());
+    assert!(queued.agent_task_id.is_some());
+    assert_eq!(scheduler_rx.recv().await, Some(()));
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let chat = database
+        .chat(&queued.chat_id)
+        .expect("chat lookup")
+        .expect("scheduled chat");
+    let chat_metadata =
+        parse_json_value(&chat.metadata_json, "chat metadata").expect("chat metadata");
+    assert_eq!(chat_metadata["source"], json!("scheduled_task"));
+    assert_eq!(
+        chat_metadata["scheduledTaskId"],
+        json!("scheduled-task-test")
+    );
+    assert_eq!(
+        chat_metadata["scheduledTaskRunId"],
+        json!("scheduled-run-test")
+    );
+    assert_eq!(chat_metadata["triggerReason"], json!("scheduled"));
+    assert_eq!(
+        chat_metadata["queuedRun"]["assistantMessageId"],
+        json!(queued.assistant_message_id)
+    );
+
+    let user_message = database
+        .message(&queued.user_message_id)
+        .expect("user message lookup")
+        .expect("scheduled user message");
+    assert_eq!(user_message.content, "Scheduled prompt");
+    let user_metadata =
+        parse_json_value(&user_message.metadata_json, "user metadata").expect("user metadata");
+    assert_eq!(user_metadata["source"], json!("scheduled_task"));
+    assert_eq!(
+        user_metadata["scheduledTaskRunId"],
+        json!("scheduled-run-test")
+    );
+    assert_eq!(
+        user_metadata["queuedRun"]["assistantMessageId"],
+        json!(queued.assistant_message_id)
+    );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn queue_chat_message_resumes_paused_coordinator_without_active_work() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-resume-queue-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-agent-resume-queue-profile"));
