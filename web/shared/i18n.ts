@@ -386,6 +386,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Undo: "撤销",
     Redo: "恢复",
     Find: "查找",
+    "Reload file": "重新加载文件",
+    "Save changes before reloading this file?": "重新加载此文件前是否保存未保存的改动？",
     "Word wrap": "自动换行",
     "Preview markdown": "预览 Markdown",
     "Edit markdown": "编辑 Markdown",

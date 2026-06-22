@@ -752,5 +752,31 @@ describe("app-panels-stats verification surfaces", () => {
       screen.queryByRole("heading", { name: "Preview title" }),
     ).not.toBeInTheDocument();
   });
+  it("reloads the active file from the leftmost editor toolbar button", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+    await userEvent.dblClick(await screen.findByText("README.md"));
+
+    const toolbar = await screen.findByRole("toolbar", { name: "Editor toolbar" });
+    const toolbarButtons = within(toolbar).getAllByRole("button");
+    expect(toolbarButtons[0]).toHaveAccessibleName("Reload file");
+
+    const contentRequestCount = fetchMock.mock.calls.filter(
+      ([url]) => url === "/api/workspaces/workspace-1/files/content",
+    ).length;
+
+    await userEvent.click(toolbarButtons[0]);
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.filter(
+          ([url]) => url === "/api/workspaces/workspace-1/files/content",
+        ),
+      ).toHaveLength(contentRequestCount + 1);
+    });
+  });
 
 });

@@ -1605,6 +1605,7 @@ body,
 }
 
 .workspace-file-editor-shell {
+  position: relative;
   display: flex;
   min-height: 0;
   height: 100%;
@@ -1685,6 +1686,47 @@ body,
 .workspace-file-markdown-preview .markdown-content h3,
 .workspace-file-markdown-preview .markdown-content h4 {
   font-size: 1.02rem;
+}
+
+.workspace-file-reload-dialog-backdrop {
+  position: absolute;
+  inset: 2.25rem 0 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(28, 25, 23, 0.28);
+  padding: 1rem;
+}
+
+.workspace-file-reload-dialog {
+  width: min(92vw, 24rem);
+  border: 1px solid var(--foco-border);
+  border-radius: 0.75rem;
+  background: var(--foco-panel);
+  box-shadow: 0 18px 48px rgba(28, 25, 23, 0.24);
+  padding: 1rem;
+}
+
+.workspace-file-reload-dialog h2 {
+  margin: 0;
+  color: var(--foco-foreground);
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.workspace-file-reload-dialog p {
+  margin: 0.5rem 0 0;
+  color: var(--foco-muted-foreground);
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+
+.workspace-file-reload-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
 }
 
 .workspace-file-editor .monaco-editor,

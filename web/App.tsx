@@ -2875,6 +2875,63 @@ export function App() {
     }
   }
 
+  const reloadWorkspaceFileEditor = useCallback(async (file: OpenFileTab) => {
+    const editorKey = workspaceFileEditorKey(file.workspaceId, file.path);
+    setWorkspaceFileEditors((current) => {
+      const editor = current[editorKey];
+      if (!editor) {
+        return current;
+      }
+
+      return {
+        ...current,
+        [editorKey]: {
+          ...editor,
+          error: null,
+          isLoading: true,
+        },
+      };
+    });
+
+    try {
+      const response = await requestJson<WorkspaceFileContentResponse>(
+        `/api/workspaces/${encodeURIComponent(file.workspaceId)}/files/content`,
+        {
+          body: JSON.stringify({ path: file.path }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setWorkspaceFileEditors((current) => ({
+        ...current,
+        [editorKey]: {
+          content: response.content,
+          error: null,
+          isDirty: false,
+          isLoading: false,
+          isSaving: false,
+          lastSavedContent: response.content,
+        },
+      }));
+    } catch (requestError) {
+      setWorkspaceFileEditors((current) => {
+        const editor = current[editorKey];
+        if (!editor) {
+          return current;
+        }
+
+        return {
+          ...current,
+          [editorKey]: {
+            ...editor,
+            error: errorMessage(requestError),
+            isLoading: false,
+          },
+        };
+      });
+    }
+  }, []);
+
   const updateWorkspaceFileEditorContent = useCallback(
     (workspaceId: string, path: string, content: string) => {
       const editorKey = workspaceFileEditorKey(workspaceId, path);
@@ -2944,6 +3001,7 @@ export function App() {
             },
           };
         });
+        return true;
       } catch (requestError) {
         setWorkspaceFileEditors((current) => {
           const editor = current[editorKey];
@@ -2960,6 +3018,7 @@ export function App() {
             },
           };
         });
+        return false;
       }
     },
     [],
@@ -6894,6 +6953,7 @@ export function App() {
                   editor={activeFileEditor}
                   file={activeFileTab}
                   onChangeContent={updateWorkspaceFileEditorContent}
+                  onReload={reloadWorkspaceFileEditor}
                   onSave={saveWorkspaceFileEditor}
                 />
               ) : activeMainTab.type === "agent" && activeAgentTab ? (
@@ -9584,12 +9644,14 @@ function WorkspaceFileEditorPanel({
   editor,
   file,
   onChangeContent,
+  onReload,
   onSave,
 }: {
   editor: WorkspaceFileEditorState | null;
   file: OpenFileTab;
   onChangeContent: (workspaceId: string, path: string, content: string) => void;
-  onSave: (file: OpenFileTab, content: string) => void;
+  onReload: (file: OpenFileTab) => Promise<void>;
+  onSave: (file: OpenFileTab, content: string) => Promise<boolean> | boolean;
 }) {
   const { t } = useI18n();
   const language = monacoLanguageForPath(file.path);
@@ -9599,6 +9661,7 @@ function WorkspaceFileEditorPanel({
     (content: string) => onChangeContent(file.workspaceId, file.path, content),
     [file.path, file.workspaceId, onChangeContent],
   );
+  const handleReload = useCallback(() => onReload(file), [file, onReload]);
   const handleSave = useCallback(
     (content: string) => onSave(file, content),
     [file, onSave],
@@ -9619,6 +9682,7 @@ function WorkspaceFileEditorPanel({
           isSaving={editor?.isSaving ?? false}
           language={language}
           onChange={handleChange}
+          onReload={handleReload}
           onSave={handleSave}
           path={editorPath}
           value={editor?.content ?? ""}
@@ -9645,6 +9709,7 @@ function MonacoFileEditor({
   isSaving,
   language,
   onChange,
+  onReload,
   onSave,
   path,
   value,
@@ -9655,7 +9720,8 @@ function MonacoFileEditor({
   isSaving: boolean;
   language: string;
   onChange: (value: string) => void;
-  onSave: (value: string) => void;
+  onReload: () => Promise<void>;
+  onSave: (value: string) => Promise<boolean> | boolean;
   path: string;
   value: string;
 }) {
@@ -9667,6 +9733,10 @@ function MonacoFileEditor({
   const valueRef = useRef(value);
   const [previewEnabled, setPreviewEnabled] = useState(false);
   const [wordWrapEnabled, setWordWrapEnabled] = useState(false);
+  const [isReloadConfirmOpen, setIsReloadConfirmOpen] = useState(false);
+  const [isReloading, setIsReloading] = useState(false);
+  const reloadConfirmTitleId = useId();
+  const reloadConfirmDescriptionId = useId();
 
   useEffect(() => {
     valueRef.current = value;
@@ -9685,6 +9755,51 @@ function MonacoFileEditor({
   const focusEditor = useCallback(() => {
     editorRef.current?.focus();
   }, []);
+
+  const reloadFile = useCallback(async () => {
+    if (isReloading) {
+      return;
+    }
+
+    setIsReloading(true);
+    try {
+      await onReload();
+    } finally {
+      setIsReloading(false);
+      editorRef.current?.focus();
+    }
+  }, [isReloading, onReload]);
+
+  const handleReloadClick = useCallback(() => {
+    if (!isDirty) {
+      void reloadFile();
+      return;
+    }
+
+    setIsReloadConfirmOpen(true);
+  }, [isDirty, reloadFile]);
+
+  const handleReloadConfirm = useCallback(
+    async (action: "save" | "discard" | "cancel") => {
+      if (action === "cancel") {
+        setIsReloadConfirmOpen(false);
+        editorRef.current?.focus();
+        return;
+      }
+
+      setIsReloadConfirmOpen(false);
+      if (action === "save") {
+        const saveResult = await onSave(editorRef.current?.getValue() ?? valueRef.current);
+        if (saveResult === false) {
+          editorRef.current?.focus();
+          return;
+        }
+      }
+
+      await reloadFile();
+    },
+    [onSave, reloadFile],
+  );
 
   const runEditorCommand = useCallback(
     (command: MonacoFileEditorCommand) => {
@@ -9797,6 +9912,13 @@ function MonacoFileEditor({
     <div className="workspace-file-editor-shell">
       <div aria-label={t("Editor toolbar")} className="workspace-file-editor-toolbar" role="toolbar">
         <EditorToolbarButton
+          disabled={!canSave || isReloading}
+          icon={RefreshCw}
+          label={t("Reload file")}
+          onClick={handleReloadClick}
+        />
+        <span className="workspace-file-editor-toolbar-separator" />
+        <EditorToolbarButton
           disabled={!canSave || isSaving}
           icon={Save}
           isActive={isDirty}
@@ -9853,7 +9975,7 @@ function MonacoFileEditor({
           <>
             <span className="workspace-file-editor-toolbar-separator" />
             <EditorToolbarButton
-              icon={Eye}
+              icon={previewEnabled ? EyeOff : Eye}
               isActive={previewEnabled}
               label={previewEnabled ? t("Edit markdown") : t("Preview markdown")}
               onClick={() => setPreviewEnabled((current) => !current)}
@@ -9874,6 +9996,43 @@ function MonacoFileEditor({
             isUser={false}
             selectedSkillPrefix={selectedSkillPrefix}
           />
+        </div>
+      ) : null}
+      {isReloadConfirmOpen ? (
+        <div className="workspace-file-reload-dialog-backdrop">
+          <div
+            aria-describedby={reloadConfirmDescriptionId}
+            aria-labelledby={reloadConfirmTitleId}
+            aria-modal="true"
+            className="workspace-file-reload-dialog"
+            role="dialog"
+          >
+            <h2 id={reloadConfirmTitleId}>{t("Reload file")}</h2>
+            <p id={reloadConfirmDescriptionId}>{t("Save changes before reloading this file?")}</p>
+            <div className="workspace-file-reload-dialog-actions">
+              <button
+                className="rounded-lg bg-stone-900 px-3 py-2 text-sm font-semibold text-white hover:bg-stone-800"
+                onClick={() => void handleReloadConfirm("save")}
+                type="button"
+              >
+                {t("Yes")}
+              </button>
+              <button
+                className="rounded-lg border border-stone-300 px-3 py-2 text-sm font-medium text-stone-700 hover:bg-stone-50"
+                onClick={() => void handleReloadConfirm("discard")}
+                type="button"
+              >
+                {t("No")}
+              </button>
+              <button
+                className="rounded-lg border border-stone-300 px-3 py-2 text-sm font-medium text-stone-700 hover:bg-stone-50"
+                onClick={() => void handleReloadConfirm("cancel")}
+                type="button"
+              >
+                {t("Cancel")}
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
     </div>
