@@ -1351,35 +1351,43 @@ export function App() {
     [],
   );
 
-  const loadTodoGraph = useCallback(async (workspaceId: string, chatId: string) => {
-    const requestedChatKey = chatRunKey(workspaceId, chatId);
-    const requestId = todoGraphRequestIdRef.current + 1;
-    todoGraphRequestIdRef.current = requestId;
-    const isCurrentRequest = () =>
-      activeChatKeyRef.current === requestedChatKey &&
-      todoGraphRequestIdRef.current === requestId;
-    setIsLoadingTodoGraph(true);
-    setTodoGraphError(null);
+  const loadTodoGraph = useCallback(
+    async (
+      workspaceId: string,
+      chatId: string,
+      options: { ignoreRequestInvalidation?: boolean } = {},
+    ) => {
+      const requestedChatKey = chatRunKey(workspaceId, chatId);
+      const requestId = todoGraphRequestIdRef.current + 1;
+      todoGraphRequestIdRef.current = requestId;
+      const isCurrentRequest = () =>
+        activeChatKeyRef.current === requestedChatKey &&
+        (options.ignoreRequestInvalidation ||
+          todoGraphRequestIdRef.current === requestId);
+      setIsLoadingTodoGraph(true);
+      setTodoGraphError(null);
 
-    try {
-      const data = await requestJson<TodoGraphResponse>(
-        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/todo-graph`,
-      );
-      if (isCurrentRequest()) {
-        setTodoGraph(data);
-        setTodoGraphError(null);
+      try {
+        const data = await requestJson<TodoGraphResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/todo-graph`,
+        );
+        if (isCurrentRequest()) {
+          setTodoGraph(data);
+          setTodoGraphError(null);
+        }
+      } catch (requestError) {
+        if (isCurrentRequest()) {
+          setTodoGraph(null);
+          setTodoGraphError(errorMessage(requestError));
+        }
+      } finally {
+        if (isCurrentRequest()) {
+          setIsLoadingTodoGraph(false);
+        }
       }
-    } catch (requestError) {
-      if (isCurrentRequest()) {
-        setTodoGraph(null);
-        setTodoGraphError(errorMessage(requestError));
-      }
-    } finally {
-      if (isCurrentRequest()) {
-        setIsLoadingTodoGraph(false);
-      }
-    }
-  }, []);
+    },
+    [],
+  );
 
   const loadChatStatistics = useCallback(
     async (workspaceId: string, chatId: string) => {
@@ -1515,10 +1523,14 @@ export function App() {
   ]);
 
   useEffect(() => {
+    const todoGraphChatTarget =
+      activeWorkspace?.id && activeChatKey ? parseChatRunKey(activeChatKey) : null;
+
     if (
       !activeWorkspace?.id ||
-      !activeChatId ||
-      isPendingChatId(activeChatId)
+      !todoGraphChatTarget ||
+      todoGraphChatTarget.workspaceId !== activeWorkspace.id ||
+      isPendingChatId(todoGraphChatTarget.chatId)
     ) {
       todoGraphRequestIdRef.current += 1;
       setTodoGraph(null);
@@ -1529,8 +1541,11 @@ export function App() {
 
     setTodoGraph(null);
     setTodoGraphError(null);
-    void loadTodoGraph(activeWorkspace.id, activeChatId);
-  }, [activeChatId, activeWorkspace?.id, loadTodoGraph]);
+    void loadTodoGraph(
+      todoGraphChatTarget.workspaceId,
+      todoGraphChatTarget.chatId,
+    );
+  }, [activeChatKey, activeWorkspace?.id, loadTodoGraph]);
 
   useEffect(() => {
     if (
@@ -5122,12 +5137,12 @@ export function App() {
         }
 
         if (streamEvent.type === "todoGraphRefresh") {
-          const activeKey = activeChatKeyRef.current;
-          if (activeKey === chatRunKey(streamEvent.workspaceId, streamEvent.chatId)) {
-            setContextPanelTab("todo");
-            setIsContextPanelOpen(true);
-            void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId);
-          }
+          setActiveWorkspaceChatRefs(streamEvent.workspaceId, streamEvent.chatId);
+          setContextPanelTab("todo");
+          setIsContextPanelOpen(true);
+          void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId, {
+            ignoreRequestInvalidation: true,
+          });
           return;
         }
 
@@ -6021,15 +6036,12 @@ export function App() {
         }
 
         if (streamEvent.type === "todoGraphRefresh") {
-          const activeKey = activeChatKeyRef.current;
-          if (
-            activeKey ===
-            chatRunKey(streamEvent.workspaceId, streamEvent.chatId)
-          ) {
-            setContextPanelTab("todo");
-            setIsContextPanelOpen(true);
-            void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId);
-          }
+          setActiveWorkspaceChatRefs(streamEvent.workspaceId, streamEvent.chatId);
+          setContextPanelTab("todo");
+          setIsContextPanelOpen(true);
+          void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId, {
+            ignoreRequestInvalidation: true,
+          });
           return;
         }
 
@@ -10183,7 +10195,7 @@ function WorkspaceFileTreeNodeRow({
             onOpenContextMenu(event, node);
           }
         }}
-        onDoubleClick={() => {
+        onClick={() => {
           if (isDirectory) {
             void onTogglePath(node);
             return;
@@ -10197,7 +10209,8 @@ function WorkspaceFileTreeNodeRow({
           aria-label={isExpanded ? t("Collapse folder") : t("Expand folder")}
           className="workspace-file-tree-toggle"
           disabled={!isDirectory}
-          onClick={() => {
+          onClick={(event) => {
+            event.stopPropagation();
             if (isDirectory) {
               void onTogglePath(node);
             }

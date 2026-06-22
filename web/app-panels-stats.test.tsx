@@ -718,7 +718,7 @@ describe("app-panels-stats verification surfaces", () => {
 
     await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("tab", { name: "Files" }));
-    await userEvent.dblClick(await screen.findByText("README.md"));
+    await userEvent.click(await screen.findByText("README.md"));
 
     const previewButton = await screen.findByRole("button", {
       name: "Preview markdown",
@@ -764,7 +764,7 @@ describe("app-panels-stats verification surfaces", () => {
 
     await screen.findAllByText("Default");
     await userEvent.click(screen.getByRole("tab", { name: "Files" }));
-    await userEvent.dblClick(await screen.findByText("README.md"));
+    await userEvent.click(await screen.findByText("README.md"));
 
     const toolbar = await screen.findByRole("toolbar", { name: "Editor toolbar" });
     const toolbarButtons = within(toolbar).getAllByRole("button");
