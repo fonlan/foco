@@ -61,6 +61,7 @@ pub(crate) struct ScheduledTaskMetadata {
 pub(crate) enum ScheduledConcurrencyPolicy {
     SkipIfRunning,
     QueueAfterCurrent,
+    ForceRun,
 }
 
 impl Default for ScheduledConcurrencyPolicy {

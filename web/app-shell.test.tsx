@@ -400,6 +400,11 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(await screen.findByRole("button", { name: "New task" }));
     expect(await screen.findByText("Next five runs")).toBeInTheDocument();
 
+    const unitSelect = screen.getByLabelText("Unit");
+    expect(within(unitSelect).getByRole("option", { name: "Weeks" })).toBeInTheDocument();
+    expect(within(unitSelect).getByRole("option", { name: "Months" })).toBeInTheDocument();
+    await userEvent.selectOptions(unitSelect, "months");
+    await userEvent.selectOptions(screen.getByLabelText("Concurrency"), "force_run");
     await userEvent.type(screen.getByLabelText("Title"), "Morning report");
     await userEvent.type(
       screen.getByLabelText("Prompt"),
@@ -408,6 +413,17 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save task" }));
 
     expect(await screen.findAllByText("Morning report")).not.toHaveLength(0);
+    const createCall = vi.mocked(fetch).mock.calls.find(
+      ([url, init]) =>
+        url === "/api/workspaces/workspace-1/scheduled-tasks" &&
+        init?.method === "POST",
+    );
+    const createBody = JSON.parse(String(createCall?.[1]?.body ?? "{}"));
+    expect(createBody.schedule).toMatchObject({
+      every_seconds: 2592000,
+      type: "interval",
+    });
+    expect(createBody.concurrencyPolicy).toBe("force_run");
 
     await userEvent.click(screen.getByRole("button", { name: "Pause task" }));
     expect(await screen.findAllByText("Paused")).not.toHaveLength(0);

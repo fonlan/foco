@@ -743,5 +743,16 @@ mod tests {
         assert_eq!(value["concurrencyPolicy"], "queue_after_current");
         assert_eq!(value["misfirePolicy"], "catch_up_once");
         assert_eq!(value["label"], "keep");
+
+        let metadata = scheduled_task_metadata_json(
+            "workspace-1",
+            None,
+            Some(ScheduledConcurrencyPolicy::ForceRun),
+            None,
+        )
+        .expect("force metadata json");
+        let value: Value = serde_json::from_str(&metadata).expect("force metadata value");
+
+        assert_eq!(value["concurrencyPolicy"], "force_run");
     }
 }

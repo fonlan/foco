@@ -60,14 +60,14 @@ type ScheduledTasksPageProps = {
 
 type TaskStatusFilter = "all" | ScheduledTaskStatus;
 type ScheduleKind = "one_shot_at" | "interval";
-type IntervalUnit = "minutes" | "hours" | "days";
+type IntervalUnit = "minutes" | "hours" | "days" | "weeks" | "months";
 type SessionModeDraft = "create_new_chat" | "reuse_chat";
 type TaskFormMode = { type: "create" } | { task: ScheduledTaskView; type: "edit" };
 
 type ScheduledTaskFormState = {
   agentDefinitionId: string;
   collaborationToolsEnabled: boolean;
-  concurrencyPolicy: "skip_if_running" | "queue_after_current";
+  concurrencyPolicy: "skip_if_running" | "queue_after_current" | "force_run";
   description: string;
   intervalEvery: string;
   intervalStartAt: string;
@@ -93,6 +93,14 @@ const TASK_STATUSES: ScheduledTaskStatus[] = [
   "archived",
 ];
 const DEFAULT_INTERVAL_SECONDS = 86400;
+const INTERVAL_UNIT_SECONDS: Record<IntervalUnit, number> = {
+  minutes: 60,
+  hours: 3600,
+  days: 86400,
+  weeks: 604800,
+  // ponytail: month intervals use fixed 30-day seconds; add calendar units if real month boundaries matter.
+  months: 2592000,
+};
 
 export async function listScheduledTasks(query: ScheduledTasksQuery = {}) {
   const params = new URLSearchParams();
@@ -1101,6 +1109,8 @@ function ScheduledTaskDrawer({
                   <option value="minutes">{t("Minutes")}</option>
                   <option value="hours">{t("Hours")}</option>
                   <option value="days">{t("Days")}</option>
+                  <option value="weeks">{t("Weeks")}</option>
+                  <option value="months">{t("Months")}</option>
                 </SelectField>
                 <div className="sm:col-span-2">
                   <TextField
@@ -1128,6 +1138,7 @@ function ScheduledTaskDrawer({
               >
                 <option value="skip_if_running">{t("Skip if running")}</option>
                 <option value="queue_after_current">{t("Queue after current")}</option>
+                <option value="force_run">{t("Force run")}</option>
               </SelectField>
               <SelectField
                 label={t("Misfire")}
@@ -1599,10 +1610,8 @@ function scheduleFromForm(form: ScheduledTaskFormState): ScheduledTaskSchedule {
   if (!Number.isSafeInteger(every) || every <= 0) {
     throw new Error("Interval must be a positive whole number.");
   }
-  const multiplier =
-    form.intervalUnit === "days" ? 86400 : form.intervalUnit === "hours" ? 3600 : 60;
   const schedule: ScheduledTaskSchedule = {
-    every_seconds: every * multiplier,
+    every_seconds: every * INTERVAL_UNIT_SECONDS[form.intervalUnit],
     type: "interval",
   };
   if (form.intervalStartAt) {
@@ -1710,6 +1719,8 @@ function policyLabel(value: string, t: Translate) {
       return t("Skip if running");
     case "queue_after_current":
       return t("Queue after current");
+    case "force_run":
+      return t("Force run");
     case "catch_up_once":
       return t("Catch up once");
     case "skip":
@@ -1755,6 +1766,12 @@ function actionPrompt(action: unknown) {
 }
 
 function formatDurationSeconds(seconds: number) {
+  if (seconds % 2592000 === 0) {
+    return `${seconds / 2592000}mo`;
+  }
+  if (seconds % 604800 === 0) {
+    return `${seconds / 604800}w`;
+  }
   if (seconds % 86400 === 0) {
     return `${seconds / 86400}d`;
   }
@@ -1849,6 +1866,12 @@ function reuseChatIdFromSession(value: JsonValue | undefined) {
 }
 
 function intervalDraft(seconds: number): { every: string; unit: IntervalUnit } {
+  if (seconds % 2592000 === 0) {
+    return { every: String(seconds / 2592000), unit: "months" };
+  }
+  if (seconds % 604800 === 0) {
+    return { every: String(seconds / 604800), unit: "weeks" };
+  }
   if (seconds % 86400 === 0) {
     return { every: String(seconds / 86400), unit: "days" };
   }
