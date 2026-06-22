@@ -92,6 +92,8 @@ const TASK_STATUSES: ScheduledTaskStatus[] = [
   "completed",
   "archived",
 ];
+const FORM_TASK_STATUSES: ScheduledTaskStatus[] = ["enabled", "paused"];
+const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
 const DEFAULT_INTERVAL_SECONDS = 86400;
 const INTERVAL_UNIT_SECONDS: Record<IntervalUnit, number> = {
   minutes: 60,
@@ -702,7 +704,7 @@ function TaskDetails({
           <KeyValue label={t("Provider")} value={providerId ?? t("Model default")} />
           <KeyValue label={t("Thinking level")} value={thinkingLevel ?? t("None")} />
           <KeyValue
-            label={t("Collaboration tools")}
+            label={t("Team mode")}
             value={booleanField(action, "collaboration_tools_enabled", "collaborationToolsEnabled")
               ? t("Enabled")
               : t("Disabled")}
@@ -858,7 +860,7 @@ function ScheduledTaskDrawer({
   workspaces: WorkspaceSummary[];
 }) {
   const [form, setForm] = useState<ScheduledTaskFormState>(() =>
-    taskFormDefaults(mode, workspaces, enabledModels),
+    taskFormDefaults(mode, workspaces, enabledModels, agentDefinitions),
   );
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
@@ -877,7 +879,7 @@ function ScheduledTaskDrawer({
       ...current,
       modelId,
       providerId: nextModel?.activeProviderId ?? nextModel?.providerIds[0] ?? "",
-      thinkingLevel: nextModel?.thinkingLevel ?? current.thinkingLevel,
+      thinkingLevel: nextModel?.thinkingLevel ?? "",
     }));
   }
 
@@ -888,8 +890,8 @@ function ScheduledTaskDrawer({
     setForm((current) => ({
       ...current,
       agentDefinitionId,
-      modelId: definition ? "" : current.modelId,
-      providerId: definition ? "" : current.providerId,
+      modelId: definition?.modelId ?? current.modelId,
+      providerId: definition?.providerId ?? current.providerId,
       thinkingLevel:
         definition?.modelOptions.thinkingLevel ?? (definition ? "" : current.thinkingLevel),
     }));
@@ -954,7 +956,7 @@ function ScheduledTaskDrawer({
 
     let payload: ReturnType<typeof taskFormPayload>;
     try {
-      payload = taskFormPayload(form);
+      payload = taskFormPayload(form, mode, t);
     } catch (validationError) {
       setError(errorMessage(validationError));
       return;
@@ -1063,6 +1065,7 @@ function ScheduledTaskDrawer({
                 <option value="interval">{t("Interval")}</option>
               </SelectField>
               <SelectField
+                disabled={!isFormTaskStatus(form.status)}
                 label={t("Status")}
                 onChange={(status) =>
                   setForm((current) => ({
@@ -1072,7 +1075,10 @@ function ScheduledTaskDrawer({
                 }
                 value={form.status}
               >
-                {TASK_STATUSES.map((status) => (
+                {(isFormTaskStatus(form.status)
+                  ? FORM_TASK_STATUSES
+                  : [form.status]
+                ).map((status) => (
                   <option key={status} value={status}>
                     {statusLabel(status, t)}
                   </option>
@@ -1252,7 +1258,7 @@ function ScheduledTaskDrawer({
             </SelectField>
             <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
               <span className="text-sm font-semibold text-stone-700">
-                {t("Collaboration tools")}
+                {t("Enable Team mode")}
               </span>
               <input
                 checked={form.collaborationToolsEnabled}
@@ -1481,30 +1487,39 @@ function taskFormDefaults(
   mode: TaskFormMode,
   workspaces: WorkspaceSummary[],
   enabledModels: ConfiguredModelSummary[],
+  agentDefinitions: AgentDefinitionSettings[],
 ): ScheduledTaskFormState {
   if (mode.type === "edit") {
     return taskFormFromTask(mode.task);
   }
 
-  const model = enabledModels[0] ?? null;
+  const agentDefinition = defaultTaskAgentDefinition(agentDefinitions);
+  const model = agentDefinition
+    ? enabledModels.find((item) => item.id === agentDefinition.modelId) ?? null
+    : enabledModels[0] ?? null;
   return {
-    agentDefinitionId: "",
-    collaborationToolsEnabled: false,
+    agentDefinitionId: agentDefinition?.id ?? "",
+    collaborationToolsEnabled: true,
     concurrencyPolicy: "skip_if_running",
     description: "",
     intervalEvery: "1",
     intervalStartAt: "",
     intervalUnit: "days",
     misfirePolicy: "catch_up_once",
-    modelId: model?.id ?? "",
+    modelId: agentDefinition?.modelId ?? model?.id ?? "",
     prompt: "",
-    providerId: model?.activeProviderId ?? model?.providerIds[0] ?? "",
+    providerId:
+      agentDefinition?.providerId ??
+      model?.activeProviderId ??
+      model?.providerIds[0] ??
+      "",
     reuseChatId: "",
     runAt: dateTimeLocalFromDate(new Date(Date.now() + 60 * 60 * 1000)),
     scheduleType: "interval",
     sessionMode: "create_new_chat",
     status: "enabled",
-    thinkingLevel: model?.thinkingLevel ?? "",
+    thinkingLevel:
+      agentDefinition?.modelOptions.thinkingLevel ?? model?.thinkingLevel ?? "",
     title: "",
     workspaceId: workspaces[0]?.id ?? "",
   };
@@ -1555,29 +1570,33 @@ function taskFormFromTask(task: ScheduledTaskView): ScheduledTaskFormState {
   };
 }
 
-function taskFormPayload(form: ScheduledTaskFormState) {
+function taskFormPayload(
+  form: ScheduledTaskFormState,
+  mode: TaskFormMode,
+  t: Translate,
+) {
   const title = form.title.trim();
   const prompt = form.prompt.trim();
   if (!title) {
-    throw new Error("Title is required.");
+    throw new Error(t("Title is required."));
   }
   if (!form.workspaceId) {
-    throw new Error("Workspace is required.");
+    throw new Error(t("Workspace is required."));
   }
   if (!prompt) {
-    throw new Error("Prompt is required.");
+    throw new Error(t("Prompt is required."));
   }
   if (!form.agentDefinitionId && !form.modelId) {
-    throw new Error("Select an agent or model.");
+    throw new Error(t("Select an agent or model."));
   }
 
-  const schedule = scheduleFromForm(form);
+  const schedule = scheduleFromForm(form, t);
   const action: ScheduledTaskAction = {
     collaboration_tools_enabled: form.collaborationToolsEnabled,
     prompt,
     session_mode:
       form.sessionMode === "reuse_chat"
-        ? { reuse_chat: { chat_id: requiredText(form.reuseChatId, "Chat id") } }
+        ? { reuse_chat: { chat_id: requiredText(form.reuseChatId, t("Chat id is required.")) } }
         : "create_new_chat",
     skill_ids: [],
     type: "agent_prompt",
@@ -1593,39 +1612,56 @@ function taskFormPayload(form: ScheduledTaskFormState) {
     description: form.description.trim() || null,
     misfirePolicy: form.misfirePolicy,
     schedule,
-    status: form.status,
+    ...(mode.type === "create" || isFormTaskStatus(form.status)
+      ? { status: form.status }
+      : {}),
     title,
   };
 }
 
-function scheduleFromForm(form: ScheduledTaskFormState): ScheduledTaskSchedule {
+function scheduleFromForm(
+  form: ScheduledTaskFormState,
+  t: Translate = (key) => key,
+): ScheduledTaskSchedule {
   if (form.scheduleType === "one_shot_at") {
     return {
-      run_at: localDateTimeToIso(requiredText(form.runAt, "Run at")),
+      run_at: localDateTimeToIso(requiredText(form.runAt, t("Run at is required.")), t),
       type: "one_shot_at",
     };
   }
 
   const every = Number.parseInt(form.intervalEvery, 10);
   if (!Number.isSafeInteger(every) || every <= 0) {
-    throw new Error("Interval must be a positive whole number.");
+    throw new Error(t("Interval must be a positive whole number."));
   }
   const schedule: ScheduledTaskSchedule = {
     every_seconds: every * INTERVAL_UNIT_SECONDS[form.intervalUnit],
     type: "interval",
   };
   if (form.intervalStartAt) {
-    schedule.start_at = localDateTimeToIso(form.intervalStartAt);
+    schedule.start_at = localDateTimeToIso(form.intervalStartAt, t);
   }
   return schedule;
 }
 
-function requiredText(value: string, label: string) {
+function requiredText(value: string, message: string) {
   const normalized = value.trim();
   if (!normalized) {
-    throw new Error(`${label} is required.`);
+    throw new Error(message);
   }
   return normalized;
+}
+
+function defaultTaskAgentDefinition(agentDefinitions: AgentDefinitionSettings[]) {
+  return (
+    agentDefinitions.find((definition) => definition.id === DEFAULT_AGENT_DEFINITION_ID) ??
+    agentDefinitions[0] ??
+    null
+  );
+}
+
+function isFormTaskStatus(status: ScheduledTaskStatus) {
+  return status === "enabled" || status === "paused";
 }
 
 function statusLabel(status: string, t: Translate) {
@@ -1900,10 +1936,10 @@ function dateTimeLocalFromDate(date: Date) {
   return local.toISOString().slice(0, 16);
 }
 
-function localDateTimeToIso(value: string) {
+function localDateTimeToIso(value: string, t: Translate = (key) => key) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) {
-    throw new Error("Date/time is invalid.");
+    throw new Error(t("Date/time is invalid."));
   }
   return date.toISOString();
 }

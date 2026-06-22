@@ -400,6 +400,16 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(await screen.findByRole("button", { name: "New task" }));
     expect(await screen.findByText("Next five runs")).toBeInTheDocument();
 
+    const statusSelect = screen.getByLabelText("Status");
+    expect(within(statusSelect).getByRole("option", { name: "Enabled" })).toBeInTheDocument();
+    expect(within(statusSelect).getByRole("option", { name: "Paused" })).toBeInTheDocument();
+    expect(within(statusSelect).queryByRole("option", { name: "Completed" })).not.toBeInTheDocument();
+    expect(within(statusSelect).queryByRole("option", { name: "Archived" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Agent")).toHaveValue("agent-definition-coordinator");
+    expect(screen.getByLabelText("Model")).toHaveValue("gpt-test");
+    expect(screen.getByLabelText("Provider")).toHaveValue("openai");
+    expect(screen.getByRole("checkbox", { name: "Enable Team mode" })).toBeChecked();
+
     const unitSelect = screen.getByLabelText("Unit");
     expect(within(unitSelect).getByRole("option", { name: "Weeks" })).toBeInTheDocument();
     expect(within(unitSelect).getByRole("option", { name: "Months" })).toBeInTheDocument();
@@ -423,7 +433,14 @@ describe("app-shell verification surfaces", () => {
       every_seconds: 2592000,
       type: "interval",
     });
+    expect(createBody.status).toBe("enabled");
     expect(createBody.concurrencyPolicy).toBe("force_run");
+    expect(createBody.action).toMatchObject({
+      agent_definition_id: "agent-definition-coordinator",
+      collaboration_tools_enabled: true,
+      model_id: "gpt-test",
+      provider_id: "openai",
+    });
 
     await userEvent.click(screen.getByRole("button", { name: "Pause task" }));
     expect(await screen.findAllByText("Paused")).not.toHaveLength(0);

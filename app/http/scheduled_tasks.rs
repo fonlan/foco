@@ -186,7 +186,7 @@ pub(crate) async fn create_scheduled_task(
     let description = normalized_optional_text(request.description);
     let status = request
         .status
-        .map(|status| normalize_task_status("status", &status))
+        .map(|status| normalize_initial_task_status("status", &status))
         .transpose()?
         .unwrap_or_else(|| STATUS_ENABLED.to_string());
     let schedule_json = scheduled_json("schedule", &request.schedule)?;
@@ -626,6 +626,16 @@ fn normalize_task_status(field: &str, status: &str) -> Result<String, ApiError> 
     }
 }
 
+fn normalize_initial_task_status(field: &str, status: &str) -> Result<String, ApiError> {
+    let status = status.trim();
+    match status {
+        STATUS_ENABLED | STATUS_PAUSED => Ok(status.to_string()),
+        _ => Err(ApiError::bad_request(format!(
+            "{field} must be one of enabled, paused"
+        ))),
+    }
+}
+
 fn task_next_run_at(schedule: &ScheduleSpec, status: &str) -> Result<Option<String>, ApiError> {
     if status != STATUS_ENABLED {
         return Ok(None);
@@ -754,5 +764,19 @@ mod tests {
         let value: Value = serde_json::from_str(&metadata).expect("force metadata value");
 
         assert_eq!(value["concurrencyPolicy"], "force_run");
+    }
+
+    #[test]
+    fn initial_task_status_only_allows_runnable_states() {
+        assert_eq!(
+            normalize_initial_task_status("status", "enabled").expect("enabled"),
+            STATUS_ENABLED
+        );
+        assert_eq!(
+            normalize_initial_task_status("status", "paused").expect("paused"),
+            STATUS_PAUSED
+        );
+        assert!(normalize_initial_task_status("status", "completed").is_err());
+        assert!(normalize_initial_task_status("status", "archived").is_err());
     }
 }
