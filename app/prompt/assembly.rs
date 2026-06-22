@@ -42,6 +42,9 @@ pub(crate) async fn prepare_prompt_context(
         .iter()
         .find(|workspace| workspace.id == workspace_id)
         .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
+    if purpose.allows_code_graph_initialization() {
+        spawn_code_graph_workspace_initialization_if_needed(state, workspace);
+    }
     let model = config
         .models
         .iter()

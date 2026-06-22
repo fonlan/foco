@@ -25,7 +25,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose};
-use chrono::{SecondsFormat, Utc};
+use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions, AgentRunAssociations,
     AgentRunContext, AgentRunEvent, AgentRunEventEmitter, AgentRunEventKind, AgentRunExecutor,
@@ -376,9 +376,43 @@ pub(crate) struct AppState {
     agent_scheduler: AgentScheduler,
     scheduled_task_scheduler: ScheduledTaskScheduler,
     tool_resource_locks: ToolResourceLockRegistry,
-    _code_graph_watchers: Arc<Mutex<Vec<CodeGraphWatcher>>>,
+    code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
     #[cfg(all(windows, not(debug_assertions)))]
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
+}
+
+#[derive(Default)]
+struct CodeGraphIndexState {
+    initializing: HashSet<PathBuf>,
+    initialized: HashSet<PathBuf>,
+    watchers: Vec<CodeGraphWatcher>,
+}
+
+impl CodeGraphIndexState {
+    fn claim(&mut self, workspace_path: &Path) -> bool {
+        let workspace_path = workspace_path.to_path_buf();
+        if self.initialized.contains(&workspace_path) || self.initializing.contains(&workspace_path)
+        {
+            return false;
+        }
+        self.initializing.insert(workspace_path);
+        true
+    }
+
+    fn complete(&mut self, workspace_path: &Path, watcher: CodeGraphWatcher) {
+        self.initializing.remove(workspace_path);
+        self.initialized.insert(workspace_path.to_path_buf());
+        self.watchers.push(watcher);
+    }
+
+    fn fail(&mut self, workspace_path: &Path) {
+        self.initializing.remove(workspace_path);
+    }
+
+    #[cfg(test)]
+    fn watcher_count(&self) -> usize {
+        self.watchers.len()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -532,8 +566,9 @@ async fn run_server_until_shutdown(
         elapsed_ms = frontend_assets_started_at.elapsed().as_millis() as u64,
         "frontend asset verification completed"
     );
-    let code_graph_workspaces = loaded_config.config.workspaces.clone();
-    let code_graph_watchers = Arc::new(Mutex::new(Vec::new()));
+    let code_graph_workspaces =
+        recently_active_code_graph_workspaces(&loaded_config.config.workspaces)?;
+    let code_graph_indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
     let (terminal_shutdown_tx, _) = broadcast::channel(16);
     let (owned_shutdown_tx, owned_shutdown_rx);
     let (shutdown_tx, app_shutdown_rx) = match shutdown_rx {
@@ -566,7 +601,7 @@ async fn run_server_until_shutdown(
         agent_scheduler: agent_scheduler.clone(),
         scheduled_task_scheduler: scheduled_task_scheduler.clone(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
-        _code_graph_watchers: code_graph_watchers.clone(),
+        code_graph_indexes: code_graph_indexes.clone(),
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
     };
@@ -589,7 +624,7 @@ async fn run_server_until_shutdown(
         "HTTP listener bound"
     );
     let _code_graph_index_thread =
-        spawn_code_graph_index_initialization(code_graph_workspaces, code_graph_watchers)?;
+        spawn_code_graph_index_initialization(code_graph_workspaces, code_graph_indexes)?;
 
     tracing::info!(
         %addr,
@@ -643,6 +678,30 @@ fn initialize_workspace_databases_for_startup(
     }
 
     Ok(count)
+}
+
+fn recently_active_code_graph_workspaces(
+    workspaces: &[WorkspaceConfig],
+) -> Result<Vec<WorkspaceConfig>, WorkspaceDatabaseError> {
+    let since = (Utc::now() - ChronoDuration::days(7)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let mut active_workspaces = Vec::new();
+
+    for workspace in workspaces {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)?;
+        if database.has_user_message_since(&since)? {
+            active_workspaces.push(workspace.clone());
+        }
+    }
+
+    tracing::info!(
+        workspace_count = workspaces.len(),
+        active_workspace_count = active_workspaces.len(),
+        inactive_workspace_count = workspaces.len().saturating_sub(active_workspaces.len()),
+        since,
+        "selected recently active workspaces for startup code graph initialization"
+    );
+
+    Ok(active_workspaces)
 }
 
 fn app_router(state: AppState) -> Router {
@@ -1259,17 +1318,17 @@ fn open_foco_ui(ui_url: &str) {
 
 fn spawn_code_graph_index_initialization(
     workspaces: Vec<WorkspaceConfig>,
-    watchers: Arc<Mutex<Vec<CodeGraphWatcher>>>,
+    indexes: Arc<Mutex<CodeGraphIndexState>>,
 ) -> AppResult<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("foco-code-graph-startup".to_string())
-        .spawn(move || initialize_code_graph_indexes(&workspaces, &watchers))
+        .spawn(move || initialize_code_graph_indexes(&workspaces, &indexes))
         .map_err(Into::into)
 }
 
 fn initialize_code_graph_indexes(
     workspaces: &[WorkspaceConfig],
-    watchers: &Arc<Mutex<Vec<CodeGraphWatcher>>>,
+    indexes: &Arc<Mutex<CodeGraphIndexState>>,
 ) {
     let all_started_at = Instant::now();
     tracing::info!(
@@ -1277,40 +1336,128 @@ fn initialize_code_graph_indexes(
         "background code graph initialization started"
     );
     for workspace in workspaces {
-        let started_at = Instant::now();
-        tracing::info!(
-            workspace_id = %workspace.id,
-            workspace_path = %workspace.path.display(),
-            "background code graph workspace initialization started"
-        );
-        match initialize_code_graph_workspace(workspace) {
-            Ok(watcher) => {
-                watchers
-                    .lock()
-                    .expect("code graph watcher lock poisoned")
-                    .push(watcher);
-                tracing::info!(
-                    workspace_id = %workspace.id,
-                    workspace_path = %workspace.path.display(),
-                    elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    "background code graph workspace initialization completed"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    workspace_id = %workspace.id,
-                    workspace_path = %workspace.path.display(),
-                    error = %error,
-                    elapsed_ms = started_at.elapsed().as_millis() as u64,
-                    "failed to initialize code graph index"
-                );
-            }
-        }
+        initialize_code_graph_workspace_if_needed(workspace.clone(), indexes.clone());
     }
     tracing::info!(
         elapsed_ms = all_started_at.elapsed().as_millis() as u64,
         "background code graph initialization completed"
     );
+}
+
+fn initialize_code_graph_workspace_if_needed(
+    workspace: WorkspaceConfig,
+    indexes: Arc<Mutex<CodeGraphIndexState>>,
+) {
+    if !indexes
+        .lock()
+        .expect("code graph index lock poisoned")
+        .claim(&workspace.path)
+    {
+        return;
+    }
+
+    let started_at = Instant::now();
+    tracing::info!(
+        workspace_id = %workspace.id,
+        workspace_path = %workspace.path.display(),
+        "background code graph workspace initialization started"
+    );
+    match initialize_code_graph_workspace(&workspace) {
+        Ok(watcher) => {
+            indexes
+                .lock()
+                .expect("code graph index lock poisoned")
+                .complete(&workspace.path, watcher);
+            tracing::info!(
+                workspace_id = %workspace.id,
+                workspace_path = %workspace.path.display(),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "background code graph workspace initialization completed"
+            );
+        }
+        Err(error) => {
+            indexes
+                .lock()
+                .expect("code graph index lock poisoned")
+                .fail(&workspace.path);
+            tracing::error!(
+                workspace_id = %workspace.id,
+                workspace_path = %workspace.path.display(),
+                error = %error,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "failed to initialize code graph index"
+            );
+        }
+    }
+}
+
+fn spawn_code_graph_workspace_initialization_if_needed(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+) {
+    if !state
+        .code_graph_indexes
+        .lock()
+        .expect("code graph index lock poisoned")
+        .claim(&workspace.path)
+    {
+        return;
+    }
+
+    let workspace = workspace.clone();
+    let worker_workspace = workspace.clone();
+    let indexes = state.code_graph_indexes.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name(format!("foco-code-graph-{}", workspace.id))
+        .spawn(move || {
+            let workspace = worker_workspace;
+            let started_at = Instant::now();
+            tracing::info!(
+                workspace_id = %workspace.id,
+                workspace_path = %workspace.path.display(),
+                "lazy code graph workspace initialization started"
+            );
+            match initialize_code_graph_workspace(&workspace) {
+                Ok(watcher) => {
+                    indexes
+                        .lock()
+                        .expect("code graph index lock poisoned")
+                        .complete(&workspace.path, watcher);
+                    tracing::info!(
+                        workspace_id = %workspace.id,
+                        workspace_path = %workspace.path.display(),
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "lazy code graph workspace initialization completed"
+                    );
+                }
+                Err(error) => {
+                    indexes
+                        .lock()
+                        .expect("code graph index lock poisoned")
+                        .fail(&workspace.path);
+                    tracing::error!(
+                        workspace_id = %workspace.id,
+                        workspace_path = %workspace.path.display(),
+                        error = %error,
+                        elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        "failed to initialize lazy code graph index"
+                    );
+                }
+            }
+        })
+    {
+        state
+            .code_graph_indexes
+            .lock()
+            .expect("code graph index lock poisoned")
+            .fail(&workspace.path);
+        tracing::error!(
+            workspace_id = %workspace.id,
+            workspace_path = %workspace.path.display(),
+            error = %error,
+            "failed to spawn lazy code graph initialization"
+        );
+    }
 }
 
 fn initialize_code_graph_workspace(workspace: &WorkspaceConfig) -> AppResult<CodeGraphWatcher> {
@@ -3142,6 +3289,10 @@ impl PromptAssemblyPurpose {
     }
 
     fn allows_memory_mutation(self) -> bool {
+        matches!(self, Self::ChatRun)
+    }
+
+    fn allows_code_graph_initialization(self) -> bool {
         matches!(self, Self::ChatRun)
     }
 }

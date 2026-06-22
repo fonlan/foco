@@ -396,6 +396,22 @@ impl WorkspaceDatabase {
         Ok(total)
     }
 
+    pub fn has_user_message_since(&self, since: &str) -> Result<bool, WorkspaceDatabaseError> {
+        let count = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM messages
+                 WHERE role = 'user' AND created_at >= ?1
+                 LIMIT 1",
+                params![since],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        Ok(count > 0)
+    }
+
     pub fn insert_message(
         &mut self,
         message: NewMessage<'_>,
