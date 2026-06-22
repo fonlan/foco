@@ -539,6 +539,96 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("keeps updating a pre-guidance tool block after guidance is applied", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "start work",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-before-guidance",
+          input: { path: "src/index.ts" },
+          isError: false,
+          name: "pre_guidance_tool",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    const toolName = await screen.findByText("pre_guidance_tool");
+    const interruptedAssistantRow = toolName.closest(".message-row") as HTMLElement | null;
+    expect(interruptedAssistantRow).not.toBeNull();
+    expect(
+      within(interruptedAssistantRow as HTMLElement).getByText("running"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        content: "avoid the risky path",
+        id: "guidance-before-tool-finish",
+        interruptedAssistantMetrics: null,
+        parts: [],
+        type: "guidanceApplied",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Use safer option.",
+        type: "textDelta",
+      });
+    });
+
+    const guidedAnswer = await screen.findByText("Use safer option.");
+    const guidedAssistantRow = guidedAnswer.closest(".message-row") as HTMLElement | null;
+    expect(guidedAssistantRow).not.toBeNull();
+    expect(guidedAssistantRow).not.toBe(interruptedAssistantRow);
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "partial output",
+        stream: "stdout",
+        toolCallId: "call-before-guidance",
+        type: "toolOutputDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        isError: false,
+        output: "finished output",
+        toolCallId: "call-before-guidance",
+        type: "toolResult",
+      });
+    });
+
+    await waitFor(() =>
+      expect(
+        within(interruptedAssistantRow as HTMLElement).queryByText("running"),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      within(interruptedAssistantRow as HTMLElement).getByText("completed"),
+    ).toBeInTheDocument();
+    expect(
+      within(interruptedAssistantRow as HTMLElement).getByText(/finished output/),
+    ).toBeInTheDocument();
+    expect(
+      within(guidedAssistantRow as HTMLElement).queryByText("pre_guidance_tool"),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("keeps a resumed agent-team reply in the original assistant bubble", async () => {
     renderApp();
 
@@ -1381,11 +1471,9 @@ describe("app-chat-stream verification surfaces", () => {
       screen.getByRole("button", { name: "New chat in Default" }),
     );
     const composer = screen.getByPlaceholderText(defaultComposerPlaceholder);
-    await userEvent.type(composer, "Keyboard scheduled task");
-    fireEvent.keyDown(composer, {
-      ctrlKey: true,
-      key: "Enter",
-    });
+    changeInput(composer, "Keyboard scheduled task");
+    composer.focus();
+    await userEvent.keyboard("{Control>}{Enter}{/Control}");
 
     const streamCallsBeforeComplete = fetchMock.mock.calls.filter(
       ([url]) =>
@@ -1419,7 +1507,7 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(
       screen.getByRole("button", { name: "New chat in Default" }),
     );
-    await userEvent.type(
+    changeInput(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
       "Click scheduled task",
     );
