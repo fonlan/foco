@@ -358,6 +358,35 @@ describe("app-shell verification surfaces", () => {
     expect(window.location.pathname).toBe("/settings/general");
   });
 
+  it("opens scheduled tasks from the nav and URL", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Scheduled tasks" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Scheduled tasks" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Daily workspace summary")).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/scheduled");
+    expect(
+      fetchMock.mock.calls.some(
+        ([url]) => typeof url === "string" && url === "/api/scheduled-tasks",
+      ),
+    ).toBe(true);
+
+    window.history.pushState(null, "", "/");
+    fireEvent.popState(window);
+    window.history.pushState(null, "", "/scheduled");
+    fireEvent.popState(window);
+
+    expect(
+      await screen.findByRole("heading", { name: "Scheduled tasks" }),
+    ).toBeInTheDocument();
+  });
+
   it("opens a chat from the URL and writes chat selection changes back to the URL", async () => {
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();

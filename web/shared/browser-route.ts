@@ -29,6 +29,10 @@ export function browserRouteFromPathname(
     return { viewMode: "stats" };
   }
 
+  if (segments[0] === "scheduled") {
+    return { viewMode: "scheduled" };
+  }
+
   const tabs = chatTabsFromSearch(search);
 
   if (segments.length >= 2) {
@@ -59,6 +63,10 @@ export function browserPathForRoute(route: BrowserRoute) {
 
   if (route.viewMode === "stats") {
     return "/stats";
+  }
+
+  if (route.viewMode === "scheduled") {
+    return "/scheduled";
   }
 
   const path = browserPathnameForChatRoute(route);

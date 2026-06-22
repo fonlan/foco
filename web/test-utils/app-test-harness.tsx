@@ -1245,12 +1245,45 @@ export const importedHooks = {
   validationErrors: [],
 };
 
+export const scheduledTasks = {
+  tasks: [
+    {
+      action: {
+        prompt: "Summarize workspace changes.",
+        sessionMode: "create_new_chat",
+        type: "agent_prompt",
+      },
+      createdAt: "2026-06-22T08:00:00Z",
+      description: "Daily repository summary",
+      id: "scheduled-task-1",
+      lastRunAt: "2026-06-22T08:00:00Z",
+      metadata: {
+        concurrencyPolicy: "skip_if_running",
+        misfirePolicy: "catch_up_once",
+        workspaceId: "workspace-1",
+      },
+      nextRunAt: "2026-06-23T08:00:00Z",
+      schedule: {
+        every_seconds: 86400,
+        start_at: "2026-06-22T08:00:00Z",
+        type: "interval",
+      },
+      status: "enabled",
+      title: "Daily workspace summary",
+      updatedAt: "2026-06-22T08:00:00Z",
+      workspaceId: "workspace-1",
+      workspaceName: "Default",
+    },
+  ],
+};
+
 export const appTestState: {
   activeChatStreamController: ReadableStreamDefaultController<Uint8Array> | null;
   chatStreamControllers: Map<string, ReadableStreamDefaultController<Uint8Array>>;
   terminalSessionCounter: number;
   chatStreamCounter: number;
   chatQueueCounter: number;
+  scheduledTasksResponse: typeof scheduledTasks;
   workspaceGitDiffResponse: typeof gitDiff;
   workspaceResponseWorkspaces: unknown[];
 } = {
@@ -1259,6 +1292,7 @@ export const appTestState: {
   terminalSessionCounter: 0,
   chatStreamCounter: 0,
   chatQueueCounter: 0,
+  scheduledTasksResponse: scheduledTasks,
   workspaceGitDiffResponse: gitDiff,
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
 };
@@ -1324,6 +1358,7 @@ export function resetAppTestEnvironment() {
   appTestState.terminalSessionCounter = 0;
   appTestState.chatStreamCounter = 0;
   appTestState.chatQueueCounter = 0;
+  appTestState.scheduledTasksResponse = scheduledTasks;
   appTestState.workspaceGitDiffResponse = gitDiff;
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
   window.history.replaceState(null, "", "/");
@@ -1383,6 +1418,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       activeWorkspaceId: workspace.id,
       workspaces: appTestState.workspaceResponseWorkspaces,
     });
+  }
+
+  if (path === "/api/scheduled-tasks") {
+    return jsonResponse(appTestState.scheduledTasksResponse);
   }
 
   if (path === "/api/native/select-directory") {

@@ -48,4 +48,11 @@ describe("browser route chat tabs", () => {
       workspaceId: "workspace-1",
     });
   });
+
+  it("round-trips the scheduled tasks route", () => {
+    expect(browserRouteFromPathname("/scheduled")).toEqual({
+      viewMode: "scheduled",
+    });
+    expect(browserPathForRoute({ viewMode: "scheduled" })).toBe("/scheduled");
+  });
 });

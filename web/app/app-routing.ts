@@ -26,7 +26,7 @@ type AppRoutingOptions = {
   setIsMobileWorkspaceOpen: (isOpen: boolean) => void;
   setMessages: (messages: []) => void;
   setSettingsSection: (section: SettingsSection) => void;
-  setViewMode: (viewMode: "chat" | "settings" | "stats") => void;
+  setViewMode: (viewMode: BrowserRoute["viewMode"]) => void;
   updateBrowserRoute: (
     route: BrowserRoute,
     mode?: "push" | "replace",
@@ -79,6 +79,12 @@ export function useAppRouting({
     updateBrowserRoute({ viewMode: "stats" });
   }, [setIsMobileWorkspaceOpen, setViewMode, updateBrowserRoute]);
 
+  const openScheduledTasksView = useCallback(() => {
+    setViewMode("scheduled");
+    setIsMobileWorkspaceOpen(false);
+    updateBrowserRoute({ viewMode: "scheduled" });
+  }, [setIsMobileWorkspaceOpen, setViewMode, updateBrowserRoute]);
+
   const openCurrentChatView = useCallback(() => {
     setViewMode("chat");
     updateBrowserRoute(currentChatBrowserRoute());
@@ -95,6 +101,12 @@ export function useAppRouting({
 
       if (route.viewMode === "stats") {
         setViewMode("stats");
+        setIsMobileWorkspaceOpen(false);
+        return;
+      }
+
+      if (route.viewMode === "scheduled") {
+        setViewMode("scheduled");
         setIsMobileWorkspaceOpen(false);
         return;
       }
@@ -143,6 +155,7 @@ export function useAppRouting({
     applyBrowserRoute,
     currentChatBrowserRoute,
     openCurrentChatView,
+    openScheduledTasksView,
     openSettingsSection,
     openStatsView,
   };

@@ -6,6 +6,7 @@ import {
   BarChart3,
   Bot,
   Brain,
+  CalendarClock,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -308,8 +309,9 @@ import {
   emptyAiStatsFilters,
   useAiStatisticsData,
 } from "./features/stats/use-ai-statistics-data";
+import { ScheduledTasksPage } from "./features/scheduled-tasks/ScheduledTasksPage";
 
-type ViewMode = "chat" | "settings" | "stats";
+type ViewMode = BrowserRoute["viewMode"];
 type ContextPanelTab = "todo" | "files" | "git" | "memory" | "stats" | "agents";
 type ProviderModelListState = {
   message: string | null;
@@ -785,7 +787,8 @@ export function App() {
   const isTerminalOpen = activeWorkspace
     ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
     : false;
-  const isGlobalView = viewMode === "settings" || viewMode === "stats";
+  const isGlobalView =
+    viewMode === "settings" || viewMode === "stats" || viewMode === "scheduled";
   const showContextPanel = !isGlobalView && isContextPanelOpen;
   const canUseApp = Boolean(
     authStatus && (!authStatus.enabled || authStatus.authenticated),
@@ -4176,6 +4179,7 @@ export function App() {
   const {
     applyBrowserRoute,
     openCurrentChatView,
+    openScheduledTasksView,
     openSettingsSection,
     openStatsView,
   } = useAppRouting({
@@ -6234,6 +6238,7 @@ export function App() {
               onAddWorkspace={openWorkspaceDialog}
               onLogout={handleLogout}
               onHomeClick={handleHomeNavClick}
+              onOpenScheduledTasks={openScheduledTasksView}
               onOpenSettings={() => openSettingsSection("general")}
               onOpenStats={openStatsView}
               onReturnHome={openCurrentChatView}
@@ -6264,6 +6269,8 @@ export function App() {
                   onWorkspacesChange={refreshWorkspaces}
                   workspaceDialogRevision={workspaceDialogRevision}
                 />
+              ) : viewMode === "scheduled" ? (
+                <ScheduledTasksPage />
               ) : (
                 <ApiStatsPanel
                   settings={settings}
@@ -6314,6 +6321,7 @@ export function App() {
                 onClick: toggleWorkspaceTerminal,
               }}
               onLogout={handleLogout}
+              onOpenScheduledTasks={openScheduledTasksView}
               onOpenSettings={() => openSettingsSection("general")}
               onOpenStats={openStatsView}
               onHomeClick={handleHomeNavClick}
@@ -7752,6 +7760,7 @@ function FocoNavRail({
   onAddWorkspace,
   onLogout,
   onHomeClick,
+  onOpenScheduledTasks,
   onOpenSettings,
   onOpenStats,
   onReturnHome,
@@ -7766,6 +7775,7 @@ function FocoNavRail({
   onAddWorkspace: () => void;
   onLogout: () => Promise<void>;
   onHomeClick: () => void;
+  onOpenScheduledTasks: () => void;
   onOpenSettings: () => void;
   onOpenStats: () => void;
   onReturnHome: () => void;
@@ -7800,6 +7810,12 @@ function FocoNavRail({
           icon={Activity}
           label={t("API details")}
           onClick={onOpenStats}
+        />
+        <NavRailButton
+          active={activeMode === "scheduled"}
+          icon={CalendarClock}
+          label={t("Scheduled tasks")}
+          onClick={onOpenScheduledTasks}
         />
         <NavRailButton
           active={activeMode === "settings"}

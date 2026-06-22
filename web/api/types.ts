@@ -28,7 +28,8 @@ export type BrowserRoute =
       tabs?: BrowserRouteChatTab[];
     }
   | { viewMode: "settings"; section: SettingsSection }
-  | { viewMode: "stats" };
+  | { viewMode: "stats" }
+  | { viewMode: "scheduled" };
 
 export type Translate = (
   key: string,
@@ -1584,6 +1585,32 @@ export type ScheduledWorkspaceRun = {
   pendingUserMessageId: string;
   request: RetryRunRequest;
   status: "queued" | "starting";
+};
+
+export type ScheduledTaskStatus =
+  | "enabled"
+  | "paused"
+  | "completed"
+  | "archived";
+
+export type ScheduledTaskView = {
+  id: string;
+  workspaceId: string;
+  workspaceName: string;
+  title: string;
+  description: string | null;
+  schedule: JsonValue;
+  action: JsonValue;
+  status: ScheduledTaskStatus;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  metadata: JsonValue;
+};
+
+export type ScheduledTasksResponse = {
+  tasks: ScheduledTaskView[];
 };
 
 export type ActiveRunInfo = {
