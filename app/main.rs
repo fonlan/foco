@@ -135,6 +135,7 @@ mod memory_runtime;
 mod platform;
 mod prompt;
 mod runtime;
+mod scheduled_tasks;
 mod settings_runtime;
 mod skills;
 mod terminal;
