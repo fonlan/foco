@@ -3555,6 +3555,17 @@ summary:focus-visible {
   background: var(--foco-accent);
 }
 
+.chat-tab-running-spinner {
+  animation: chat-tab-running-spinner-spin 1s linear infinite;
+  transform-origin: center;
+}
+
+@keyframes chat-tab-running-spinner-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .chat-tab-scroll-button {
   display: inline-flex;
   width: 2rem;
@@ -3935,6 +3946,11 @@ summary:focus-visible {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+
+  .chat-tab-running-spinner {
+    animation-duration: 1s !important;
+    animation-iteration-count: infinite !important;
   }
 }
 

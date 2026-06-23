@@ -1300,9 +1300,13 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       await within(tabList).findByRole("tab", { name: /memory-gated chat/ }),
     ).toHaveAttribute("aria-selected", "true");
-    expect(
-      within(tabList).getByRole("status", { name: "Chat is running" }),
-    ).toBeInTheDocument();
+    const runningStatus = within(tabList).getByRole("status", {
+      name: "Chat is running",
+    });
+    expect(runningStatus).toBeInTheDocument();
+    expect(runningStatus.querySelector("svg")).toHaveClass(
+      "chat-tab-running-spinner",
+    );
     const streamCall = fetchMock.mock.calls.find(
       ([url]) =>
         typeof url === "string" &&

@@ -8038,7 +8038,7 @@ function MainTabBar({
                     <span aria-label={t("Chat is running")} role="status">
                       <LoaderCircle
                         aria-hidden="true"
-                        className="size-4 animate-spin text-teal-700"
+                        className="chat-tab-running-spinner size-4 animate-spin text-teal-700"
                       />
                     </span>
                   ) : (
