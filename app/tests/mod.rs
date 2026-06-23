@@ -37,7 +37,9 @@ use crate::http::{
     terminal::create_terminal_session,
     workspaces::add_workspace,
 };
-use crate::memory_runtime::scheduler::{dispatch_auto_memory_dreams_at, memory_dream_interval_due};
+use crate::memory_runtime::scheduler::{
+    dispatch_auto_memory_dreams_at, memory_dream_interval_due, reconcile_memory_dream_runs,
+};
 use crate::memory_runtime::{
     MemoryExtractionEvidenceCandidate, MemoryExtractionTask, MemorySearchToolInput,
     MemoryWriteToolInput, execute_memory_search_tool, execute_memory_write_tool,
@@ -7139,6 +7141,57 @@ async fn auto_memory_dream_scheduler_skips_in_process_active_run() {
         .dream_jobs_for_scope(MemoryDreamScope::Workspace, Some(&workspace_id), None, 10)
         .expect("workspace dream jobs");
     assert!(workspace_jobs.is_empty());
+}
+
+#[tokio::test]
+async fn auto_memory_dream_startup_reconciles_interrupted_runs() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    config.memory.dream.enabled = true;
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        memory_database
+            .insert_dream_job(NewMemoryDreamJob {
+                id: "interrupted-dream",
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some(&workspace_id),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::Llm,
+                status: MemoryDreamJobStatus::Running,
+                model_id: Some("model-1"),
+                input_summary_json: "{}",
+                output_summary_json: None,
+                transcript_chat_id: None,
+                error_message: None,
+            })
+            .expect("active dream job");
+    }
+
+    let reconciled = reconcile_memory_dream_runs(&state).expect("reconcile dream jobs");
+
+    assert_eq!(reconciled, 1);
+    let memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+            .expect("workspace memory database");
+    let jobs = memory_database
+        .dream_jobs_for_scope(MemoryDreamScope::Workspace, Some(&workspace_id), None, 10)
+        .expect("workspace dream jobs");
+    assert_eq!(jobs[0].status, MemoryDreamJobStatus::Failed.as_str());
+    assert!(
+        jobs[0]
+            .error_message
+            .as_deref()
+            .expect("error message")
+            .contains("interrupted")
+    );
 }
 
 fn insert_completed_dream_job(

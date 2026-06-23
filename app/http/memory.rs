@@ -796,15 +796,22 @@ pub(crate) async fn run_memory_dream(
         .filter(|value| !value.is_empty())
         .unwrap_or(config.memory.dream.mode.as_str());
     let mode = MemoryDreamRunMode::parse(mode).map_err(ApiError::from_memory_error)?;
-    let result = run_memory_dream_for_state(
-        &state,
-        &config,
-        scope,
-        workspace_id.as_deref(),
-        MemoryDreamTriggerType::Manual,
-        mode,
-    )
-    .await?;
+    let run_state = state.clone();
+    let run_config = config.clone();
+    let run_workspace_id = workspace_id.clone();
+    let result = tokio::spawn(async move {
+        run_memory_dream_for_state(
+            &run_state,
+            &run_config,
+            scope,
+            run_workspace_id.as_deref(),
+            MemoryDreamTriggerType::Manual,
+            mode,
+        )
+        .await
+    })
+    .await
+    .map_err(|source| ApiError::internal(format!("memory Dream task failed: {source}")))??;
 
     Ok(Json(MemoryDreamRunResponse {
         job_id: result.job.id,

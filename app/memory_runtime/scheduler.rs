@@ -6,7 +6,7 @@ use foco_store::{
     config::{GlobalConfig, WorkspaceConfig},
     memory::{
         MemoryDatabase, MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope,
-        MemoryDreamTriggerType,
+        MemoryDreamTriggerType, UpdateMemoryDreamJob,
     },
     workspace::{WorkspaceDatabase, workspace_database_path},
 };
@@ -19,6 +19,8 @@ use crate::memory_runtime::dream::{
 use crate::*;
 
 const MEMORY_DREAM_SCHEDULER_DEFAULT_SCAN_MINUTES: u32 = 60;
+// ponytail: startup-only sweep is capped; page through rows if users accumulate 1000+ interrupted jobs.
+const MEMORY_DREAM_RECONCILE_LIMIT: u32 = 1_000;
 
 #[derive(Clone, Default)]
 pub(crate) struct MemoryDreamScheduler;
@@ -42,6 +44,9 @@ pub(crate) struct MemoryDreamSchedulerScan {
 
 async fn run_memory_dream_scheduler(state: AppState) {
     let mut shutdown_rx = state.app_shutdown_rx.clone();
+    if let Err(error) = reconcile_memory_dream_runs(&state) {
+        tracing::error!(error = %error.message, "Memory Dream startup reconciliation failed");
+    }
 
     loop {
         let scan_minutes = match dispatch_auto_memory_dreams_at(&state, Utc::now()).await {
@@ -63,6 +68,63 @@ async fn run_memory_dream_scheduler(state: AppState) {
             _ = &mut delay => {}
         }
     }
+}
+
+pub(crate) fn reconcile_memory_dream_runs(state: &AppState) -> Result<usize, ApiError> {
+    let config = config_snapshot(state)?;
+    let mut reconciled =
+        reconcile_memory_dream_scope(state, &config, MemoryDreamScope::Global, None)?;
+    for workspace in &config.workspaces {
+        reconciled += reconcile_memory_dream_scope(
+            state,
+            &config,
+            MemoryDreamScope::Workspace,
+            Some(workspace.id.as_str()),
+        )?;
+    }
+
+    Ok(reconciled)
+}
+
+fn reconcile_memory_dream_scope(
+    state: &AppState,
+    config: &GlobalConfig,
+    scope: MemoryDreamScope,
+    workspace_id: Option<&str>,
+) -> Result<usize, ApiError> {
+    let mut database = open_dream_memory_database(state, config, scope, workspace_id)?;
+    let mut reconciled = 0;
+    for status in [MemoryDreamJobStatus::Queued, MemoryDreamJobStatus::Running] {
+        let jobs = database
+            .dream_jobs_for_scope(
+                scope,
+                workspace_id,
+                Some(status),
+                MEMORY_DREAM_RECONCILE_LIMIT,
+            )
+            .map_err(ApiError::from_memory_error)?;
+        for job in jobs {
+            database
+                .update_dream_job_status(UpdateMemoryDreamJob {
+                    id: &job.id,
+                    status: MemoryDreamJobStatus::Failed,
+                    output_summary_json: None,
+                    transcript_chat_id: None,
+                    error_message: Some("memory Dream was interrupted before completion"),
+                })
+                .map_err(ApiError::from_memory_error)?;
+            reconciled += 1;
+            tracing::warn!(
+                job_id = %job.id,
+                scope = scope.as_str(),
+                workspace_id,
+                previous_status = job.status.as_str(),
+                "Memory Dream startup reconciliation marked interrupted job failed"
+            );
+        }
+    }
+
+    Ok(reconciled)
 }
 
 pub(crate) async fn dispatch_auto_memory_dreams_at(

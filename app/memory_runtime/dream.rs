@@ -1494,7 +1494,7 @@ async fn call_memory_dream_planner_provider(
         MEMORY_DREAM_PLANNER_TOOL_NAME,
         "submit changeset tool",
         MEMORY_DREAM_PLANNER_TIMEOUT_MS,
-        0,
+        planner.config.app.llm_request_retry_count,
         api_audit_save_details(planner.config),
     )
     .await
