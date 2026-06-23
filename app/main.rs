@@ -747,6 +747,10 @@ async fn run_server_until_shutdown(
         elapsed_ms = bind_started_at.elapsed().as_millis() as u64,
         "HTTP listener bound"
     );
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        open_foco_ui_if_listener_bound(true, addr, open_foco_ui);
+    }
     let _code_graph_index_thread =
         spawn_code_graph_index_initialization(code_graph_workspaces, code_graph_indexes)?;
 
@@ -1439,7 +1443,7 @@ async fn log_http_request(request: axum::extract::Request, next: middleware::Nex
 fn run_windows_tray_entrypoint() -> AppResult<()> {
     let loaded_config = load_or_create_global_config()?;
     let addr = local_addr(&loaded_config.config)?;
-    let ui_url = format!("http://{}", browser_addr_for_listen_addr(addr));
+    let ui_url = foco_ui_url_for_listen_addr(addr);
     let labels = tray_menu_labels(&loaded_config.config.app.language)?;
     let (tray_menu_update_tx, tray_menu_update_rx) = std::sync::mpsc::channel();
     let tray_menu_thread_id = Arc::new(AtomicU32::new(0));
@@ -11898,6 +11902,26 @@ fn browser_addr_for_listen_addr(addr: SocketAddr) -> SocketAddr {
     };
 
     SocketAddr::from((host, addr.port()))
+}
+
+#[cfg(any(test, all(windows, not(debug_assertions))))]
+fn foco_ui_url_for_listen_addr(addr: SocketAddr) -> String {
+    format!("http://{}", browser_addr_for_listen_addr(addr))
+}
+
+#[cfg(any(test, all(windows, not(debug_assertions))))]
+fn open_foco_ui_if_listener_bound(
+    listener_bound: bool,
+    addr: SocketAddr,
+    open_ui: impl FnOnce(&str),
+) -> bool {
+    if !listener_bound {
+        return false;
+    }
+
+    let ui_url = foco_ui_url_for_listen_addr(addr);
+    open_ui(&ui_url);
+    true
 }
 
 pub(crate) fn web_auth_enabled(config: &GlobalConfig) -> bool {

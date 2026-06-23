@@ -792,6 +792,22 @@ fn browser_open_addr_uses_loopback_for_unspecified_listen_hosts() {
 }
 
 #[test]
+fn startup_browser_open_waits_for_bound_listener_and_uses_browser_url() {
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3210));
+    let mut opened_urls = Vec::new();
+
+    assert!(!open_foco_ui_if_listener_bound(false, addr, |url| {
+        opened_urls.push(url.to_string());
+    }));
+    assert!(opened_urls.is_empty());
+
+    assert!(open_foco_ui_if_listener_bound(true, addr, |url| {
+        opened_urls.push(url.to_string());
+    }));
+    assert_eq!(opened_urls, vec!["http://127.0.0.1:3210"]);
+}
+
+#[test]
 fn tray_menu_labels_follow_app_language() {
     assert_eq!(
         tray_menu_labels("en").expect("English tray labels"),
