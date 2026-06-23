@@ -310,7 +310,7 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
-  it("shows Dream history details and runs manual Dream jobs", async () => {
+  it("shows Dream history actions and runs manual Dream jobs", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
@@ -319,25 +319,58 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
 
     expect(await screen.findByText("Dream history")).toBeInTheDocument();
-    expect(await screen.findByText(memoryDreamJob.summary!)).toBeInTheDocument();
-    expect(await screen.findByText(memoryDreamChange.reason)).toBeInTheDocument();
-    expect(within(screen.getByRole("table")).getAllByText(workspace.name)).toHaveLength(2);
-    expect(screen.getByText("Before JSON")).toBeInTheDocument();
-    expect(screen.getByText("Memory state before this Dream change.")).toBeInTheDocument();
-    expect(screen.getByText("After JSON")).toBeInTheDocument();
-    expect(screen.getByText("Memory state Dream wrote or proposed.")).toBeInTheDocument();
-    expect(screen.getByText("Evidence JSON")).toBeInTheDocument();
-    expect(screen.getByText("Sources Dream used to justify the change.")).toBeInTheDocument();
+    const dreamTable = screen.getByRole("table");
+    expect(within(dreamTable).getByRole("columnheader", { name: "Actions" })).toBeInTheDocument();
+    expect(within(dreamTable).getAllByText(workspace.name)).toHaveLength(2);
+    expect(within(dreamTable).getAllByRole("button", { name: "View details" })).toHaveLength(2);
+    expect(screen.queryByText(memoryDreamJob.summary!)).not.toBeInTheDocument();
+    expect(screen.queryByText(memoryDreamChange.reason)).not.toBeInTheDocument();
+    expect(screen.queryByText("Before JSON")).not.toBeInTheDocument();
     expect(
       workspace.chats.some((chat) => chat.id === memoryDreamJob.transcriptChatId),
     ).toBe(false);
     expect(screen.getByRole("button", { name: "Open transcript" })).toBeInTheDocument();
 
-    const dreamRows = within(screen.getByRole("table")).getAllByRole("row");
+    const dreamRows = within(dreamTable).getAllByRole("row");
     await userEvent.click(within(dreamRows[2]).getByText(workspace.name));
-    expect(await screen.findByText(failedMemoryDreamJob.errorMessage!)).toBeInTheDocument();
-    await userEvent.click(within(dreamRows[1]).getByText(workspace.name));
-    expect(await screen.findByText(memoryDreamChange.reason)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "Dream job details" })).not.toBeInTheDocument();
+
+    await userEvent.click(within(dreamRows[2]).getByRole("button", { name: "View details" }));
+    const failedDreamDialog = await screen.findByRole("dialog", {
+      name: "Dream job details",
+    });
+    expect(
+      within(failedDreamDialog).getByText(failedMemoryDreamJob.errorMessage!),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(failedDreamDialog).getByRole("button", { name: "Close Dream job details" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Dream job details" })).not.toBeInTheDocument();
+    });
+
+    await userEvent.click(within(dreamRows[1]).getByRole("button", { name: "View details" }));
+    const dreamDialog = await screen.findByRole("dialog", { name: "Dream job details" });
+    expect(within(dreamDialog).getByText(memoryDreamJob.summary!)).toBeInTheDocument();
+    expect(await within(dreamDialog).findByText(memoryDreamChange.reason)).toBeInTheDocument();
+    expect(within(dreamDialog).getByText("Before JSON")).toBeInTheDocument();
+    expect(
+      within(dreamDialog).getByText("Memory state before this Dream change."),
+    ).toBeInTheDocument();
+    expect(within(dreamDialog).getByText("After JSON")).toBeInTheDocument();
+    expect(
+      within(dreamDialog).getByText("Memory state Dream wrote or proposed."),
+    ).toBeInTheDocument();
+    expect(within(dreamDialog).getByText("Evidence JSON")).toBeInTheDocument();
+    expect(
+      within(dreamDialog).getByText("Sources Dream used to justify the change."),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(dreamDialog).getByRole("button", { name: "Close Dream job details" }),
+    );
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Dream job details" })).not.toBeInTheDocument();
+    });
 
     await userEvent.click(screen.getByLabelText("Enable memory"));
     await userEvent.click(screen.getByLabelText("Enable Dream"));

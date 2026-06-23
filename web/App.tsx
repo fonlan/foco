@@ -11493,7 +11493,7 @@ function SettingsPanel({
   const [memoryDreamChanges, setMemoryDreamChanges] = useState<
     MemoryDreamChangeSummary[]
   >([]);
-  const [selectedMemoryDreamJobId, setSelectedMemoryDreamJobId] = useState<
+  const [memoryDreamDetailJobId, setMemoryDreamDetailJobId] = useState<
     string | null
   >(null);
   const [memoryDreamError, setMemoryDreamError] = useState<string | null>(null);
@@ -11651,8 +11651,8 @@ function SettingsPanel({
       ),
     [memoryDreamJobs],
   );
-  const selectedMemoryDreamJob =
-    sortedMemoryDreamJobs.find((job) => job.id === selectedMemoryDreamJobId) ??
+  const memoryDreamDetailJob =
+    sortedMemoryDreamJobs.find((job) => job.id === memoryDreamDetailJobId) ??
     null;
   const activeMemoryDreamJobKeys = useMemo(
     () =>
@@ -12040,15 +12040,13 @@ function SettingsPanel({
         "/api/memory/dream/jobs",
       );
       setMemoryDreamJobs(data.jobs);
-      setSelectedMemoryDreamJobId((current) =>
-        current && data.jobs.some((job) => job.id === current)
-          ? current
-          : data.jobs[0]?.id ?? null,
+      setMemoryDreamDetailJobId((current) =>
+        current && data.jobs.some((job) => job.id === current) ? current : null,
       );
     } catch (requestError) {
       setMemoryDreamJobs([]);
       setMemoryDreamChanges([]);
-      setSelectedMemoryDreamJobId(null);
+      setMemoryDreamDetailJobId(null);
       setMemoryDreamError(errorMessage(requestError));
     } finally {
       setIsLoadingMemoryDreamJobs(false);
@@ -12071,6 +12069,11 @@ function SettingsPanel({
       setIsLoadingMemoryDreamChanges(false);
     }
   }, []);
+
+  function closeMemoryDreamDetailDialog() {
+    setMemoryDreamDetailJobId(null);
+    setMemoryDreamChanges([]);
+  }
 
   useEffect(() => {
     void loadMetadata();
@@ -12096,13 +12099,23 @@ function SettingsPanel({
   }, [activeSection, loadMemoryDreamJobs]);
 
   useEffect(() => {
-    if (activeSection !== "memory" || !selectedMemoryDreamJobId) {
+    if (activeSection !== "memory" || !memoryDreamDetailJobId) {
       setMemoryDreamChanges([]);
       return;
     }
 
-    void loadMemoryDreamChanges(selectedMemoryDreamJobId);
-  }, [activeSection, loadMemoryDreamChanges, selectedMemoryDreamJobId]);
+    if (!memoryDreamJobs.some((job) => job.id === memoryDreamDetailJobId)) {
+      closeMemoryDreamDetailDialog();
+      return;
+    }
+
+    void loadMemoryDreamChanges(memoryDreamDetailJobId);
+  }, [
+    activeSection,
+    loadMemoryDreamChanges,
+    memoryDreamDetailJobId,
+    memoryDreamJobs,
+  ]);
 
   useEffect(() => {
     if (activeSection !== "memory" || !selectedMemory) {
@@ -12890,7 +12903,7 @@ function SettingsPanel({
     setMemoryDreamError(null);
 
     try {
-      const data = await requestJson<MemoryDreamRunResponse>("/api/memory/dream/run", {
+      await requestJson<MemoryDreamRunResponse>("/api/memory/dream/run", {
         body: JSON.stringify({
           scope,
           ...(workspaceId ? { workspaceId } : {}),
@@ -12901,7 +12914,6 @@ function SettingsPanel({
         method: "POST",
       });
       await loadMemoryDreamJobs();
-      setSelectedMemoryDreamJobId(data.jobId);
     } catch (requestError) {
       setMemoryDreamError(errorMessage(requestError));
     } finally {
@@ -16302,7 +16314,7 @@ function SettingsPanel({
                         <th className="px-3 py-2">{t("Model")}</th>
                         <th className="px-3 py-2">{t("Status")}</th>
                         <th className="px-3 py-2">{t("Changes")}</th>
-                        <th className="px-3 py-2">{t("Transcript")}</th>
+                        <th className="px-3 py-2 text-right">{t("Actions")}</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-stone-100">
@@ -16330,24 +16342,8 @@ function SettingsPanel({
                               : memoryDreamScopeLabel(job.scope, t);
                           return (
                             <tr
-                              className={
-                                selectedMemoryDreamJobId === job.id
-                                  ? "cursor-pointer bg-teal-50/70 hover:bg-teal-50 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-teal-500/40"
-                                  : "cursor-pointer bg-white hover:bg-stone-50 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-teal-500/40"
-                              }
-                              aria-selected={selectedMemoryDreamJobId === job.id}
+                              className="bg-white hover:bg-stone-50"
                               key={job.id}
-                              onClick={() => setSelectedMemoryDreamJobId(job.id)}
-                              onKeyDown={(event) => {
-                                if (event.target !== event.currentTarget) {
-                                  return;
-                                }
-                                if (event.key === "Enter" || event.key === " ") {
-                                  event.preventDefault();
-                                  setSelectedMemoryDreamJobId(job.id);
-                                }
-                              }}
-                              tabIndex={0}
                             >
                               <td className="px-3 py-2 align-top">
                                 <span className="text-xs font-semibold text-stone-700">
@@ -16391,24 +16387,38 @@ function SettingsPanel({
                                 })}
                               </td>
                               <td className="px-3 py-2 align-top">
-                                {job.transcriptChatId && transcriptWorkspaceId ? (
+                                <div className="flex items-center justify-end gap-1">
                                   <button
-                                    className="text-xs font-semibold text-teal-800 hover:text-teal-950"
+                                    aria-label={t("View details")}
+                                    className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                                     onClick={(event) => {
                                       event.stopPropagation();
-                                      onOpenChat(transcriptWorkspaceId, job.transcriptChatId!);
+                                      setMemoryDreamDetailJobId(job.id);
                                     }}
+                                    title={t("View details")}
                                     type="button"
                                   >
-                                    {t("Open transcript")}
+                                    <Eye aria-hidden="true" className="size-4" />
                                   </button>
-                                ) : job.transcriptChatId ? (
-                                  <span className="text-xs text-stone-500">
-                                    {job.transcriptChatId}
-                                  </span>
-                                ) : (
-                                  <span className="text-xs text-stone-400">-</span>
-                                )}
+                                  {job.transcriptChatId && transcriptWorkspaceId ? (
+                                    <button
+                                      aria-label={t("Open transcript")}
+                                      className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        onOpenChat(transcriptWorkspaceId, job.transcriptChatId!);
+                                      }}
+                                      title={t("Open transcript")}
+                                      type="button"
+                                    >
+                                      <ScrollText aria-hidden="true" className="size-4" />
+                                    </button>
+                                  ) : job.transcriptChatId ? (
+                                    <span className="text-xs text-stone-500">
+                                      {job.transcriptChatId}
+                                    </span>
+                                  ) : null}
+                                </div>
                               </td>
                             </tr>
                           );
@@ -16418,134 +16428,159 @@ function SettingsPanel({
                   </table>
                 </div>
 
-                {selectedMemoryDreamJob ? (
-                  <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h4 className="text-sm font-semibold text-stone-950">
-                        {t("Dream job details")}
-                      </h4>
-                      <CapabilityPill
-                        label={memoryDreamStatusLabel(
-                          selectedMemoryDreamJob.status,
-                          t,
-                        )}
-                        ok={selectedMemoryDreamJob.status === "completed"}
-                      />
-                      <CapabilityPill
-                        label={memoryDreamScopeLabel(selectedMemoryDreamJob.scope, t)}
-                        ok={selectedMemoryDreamJob.scope === "workspace"}
-                      />
-                    </div>
-                    <p className="mt-2 text-sm text-stone-600">
-                      {selectedMemoryDreamJob.summary ||
-                        selectedMemoryDreamJob.errorMessage ||
-                        t("No summary")}
-                    </p>
-                    <div className="mt-3 grid gap-3">
-                      {isLoadingMemoryDreamChanges ? (
-                        <div className="text-sm text-stone-500">
-                          {t("Loading Dream changes...")}
-                        </div>
-                      ) : memoryDreamChangesByOperation.length === 0 ? (
-                        <div className="text-sm text-stone-500">
-                          {t("No Dream changes")}
-                        </div>
-                      ) : (
-                        memoryDreamChangesByOperation.map((group) => (
-                          <div
-                            className="rounded-lg border border-stone-200 bg-white px-3 py-3"
-                            key={group.operation}
-                          >
-                            <div className="mb-3 flex flex-wrap items-center gap-2">
-                              <h5 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
-                                {memoryDreamChangeOperationLabel(group.operation, t)}
-                              </h5>
-                              <CapabilityPill
-                                label={formatNumber(group.changes.length, language)}
-                                ok
-                              />
-                            </div>
-                            <div className="grid gap-3">
-                              {group.changes.map((change) => (
-                                <div
-                                  className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-3"
-                                  key={change.id}
-                                >
-                                  <div className="flex flex-wrap items-center gap-2">
-                                    <CapabilityPill
-                                      label={memoryDreamChangeStatusLabel(change.status, t)}
-                                      ok={change.status === "applied"}
-                                    />
-                                    <CapabilityPill
-                                      label={memoryDreamRiskLabel(change.riskLevel, t)}
-                                      ok={change.riskLevel === "low"}
-                                    />
-                                    {change.confidence !== null ? (
-                                      <span className="text-xs font-semibold text-stone-500">
-                                        {formatNumber(
-                                          Math.round(change.confidence * 100),
-                                          language,
-                                        )}
-                                        %
-                                      </span>
-                                    ) : null}
-                                  </div>
-                                  <div className="mt-2 text-sm font-semibold text-stone-900">
-                                    {change.reason}
-                                  </div>
-                                  {change.targetFactIds.length ? (
-                                    <div className="mt-1 break-all text-xs text-stone-500">
-                                      {change.targetFactIds.join(", ")}
-                                    </div>
-                                  ) : null}
-                                  {change.errorMessage ? (
-                                    <div className="mt-2 text-sm text-rose-700">
-                                      {change.errorMessage}
-                                    </div>
-                                  ) : null}
-                                  <div className="mt-3 grid gap-3 lg:grid-cols-3">
-                                    <div>
-                                      <div className="text-xs font-semibold text-stone-700">
-                                        {t("Before JSON")}
-                                      </div>
-                                      <p className="mt-1 text-xs text-stone-500">
-                                        {t("Memory state before this Dream change.")}
-                                      </p>
-                                      <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
-                                        {memoryDreamJsonText(change.beforeJson)}
-                                      </pre>
-                                    </div>
-                                    <div>
-                                      <div className="text-xs font-semibold text-stone-700">
-                                        {t("After JSON")}
-                                      </div>
-                                      <p className="mt-1 text-xs text-stone-500">
-                                        {t("Memory state Dream wrote or proposed.")}
-                                      </p>
-                                      <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
-                                        {memoryDreamJsonText(change.afterJson)}
-                                      </pre>
-                                    </div>
-                                    <div>
-                                      <div className="text-xs font-semibold text-stone-700">
-                                        {t("Evidence JSON")}
-                                      </div>
-                                      <p className="mt-1 text-xs text-stone-500">
-                                        {t("Sources Dream used to justify the change.")}
-                                      </p>
-                                      <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
-                                        {memoryDreamJsonText(change.evidence)}
-                                      </pre>
-                                    </div>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
+                {memoryDreamDetailJob ? (
+                  <>
+                    <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+                    <div
+                      aria-labelledby="memory-dream-detail-title"
+                      aria-modal="true"
+                      className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(94vw,72rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                      role="dialog"
+                    >
+                      <div className="mb-4 flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Sparkles aria-hidden="true" className="size-5 text-teal-700" />
+                            <h4
+                              className="text-sm font-semibold text-stone-950"
+                              id="memory-dream-detail-title"
+                            >
+                              {t("Dream job details")}
+                            </h4>
+                            <CapabilityPill
+                              label={memoryDreamStatusLabel(memoryDreamDetailJob.status, t)}
+                              ok={memoryDreamDetailJob.status === "completed"}
+                            />
+                            <CapabilityPill
+                              label={memoryDreamScopeLabel(memoryDreamDetailJob.scope, t)}
+                              ok={memoryDreamDetailJob.scope === "workspace"}
+                            />
                           </div>
-                        ))
-                      )}
+                          <div className="mt-1 text-xs text-stone-500">
+                            {formatAuditDate(memoryDreamDetailJob.createdAt, language)}
+                          </div>
+                        </div>
+                        <button
+                          aria-label={t("Close Dream job details")}
+                          className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                          onClick={closeMemoryDreamDetailDialog}
+                          title={t("Close")}
+                          type="button"
+                        >
+                          <X aria-hidden="true" className="size-4" />
+                        </button>
+                      </div>
+                      <p className="text-sm text-stone-600">
+                        {memoryDreamDetailJob.summary ||
+                          memoryDreamDetailJob.errorMessage ||
+                          t("No summary")}
+                      </p>
+                      <div className="mt-3 grid gap-3">
+                        {isLoadingMemoryDreamChanges ? (
+                          <div className="text-sm text-stone-500">
+                            {t("Loading Dream changes...")}
+                          </div>
+                        ) : memoryDreamChangesByOperation.length === 0 ? (
+                          <div className="text-sm text-stone-500">
+                            {t("No Dream changes")}
+                          </div>
+                        ) : (
+                          memoryDreamChangesByOperation.map((group) => (
+                            <div
+                              className="rounded-lg border border-stone-200 bg-white px-3 py-3"
+                              key={group.operation}
+                            >
+                              <div className="mb-3 flex flex-wrap items-center gap-2">
+                                <h5 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+                                  {memoryDreamChangeOperationLabel(group.operation, t)}
+                                </h5>
+                                <CapabilityPill
+                                  label={formatNumber(group.changes.length, language)}
+                                  ok
+                                />
+                              </div>
+                              <div className="grid gap-3">
+                                {group.changes.map((change) => (
+                                  <div
+                                    className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-3"
+                                    key={change.id}
+                                  >
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <CapabilityPill
+                                        label={memoryDreamChangeStatusLabel(change.status, t)}
+                                        ok={change.status === "applied"}
+                                      />
+                                      <CapabilityPill
+                                        label={memoryDreamRiskLabel(change.riskLevel, t)}
+                                        ok={change.riskLevel === "low"}
+                                      />
+                                      {change.confidence !== null ? (
+                                        <span className="text-xs font-semibold text-stone-500">
+                                          {formatNumber(
+                                            Math.round(change.confidence * 100),
+                                            language,
+                                          )}
+                                          %
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                    <div className="mt-2 text-sm font-semibold text-stone-900">
+                                      {change.reason}
+                                    </div>
+                                    {change.targetFactIds.length ? (
+                                      <div className="mt-1 break-all text-xs text-stone-500">
+                                        {change.targetFactIds.join(", ")}
+                                      </div>
+                                    ) : null}
+                                    {change.errorMessage ? (
+                                      <div className="mt-2 text-sm text-rose-700">
+                                        {change.errorMessage}
+                                      </div>
+                                    ) : null}
+                                    <div className="mt-3 grid gap-3 lg:grid-cols-3">
+                                      <div>
+                                        <div className="text-xs font-semibold text-stone-700">
+                                          {t("Before JSON")}
+                                        </div>
+                                        <p className="mt-1 text-xs text-stone-500">
+                                          {t("Memory state before this Dream change.")}
+                                        </p>
+                                        <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                          {memoryDreamJsonText(change.beforeJson)}
+                                        </pre>
+                                      </div>
+                                      <div>
+                                        <div className="text-xs font-semibold text-stone-700">
+                                          {t("After JSON")}
+                                        </div>
+                                        <p className="mt-1 text-xs text-stone-500">
+                                          {t("Memory state Dream wrote or proposed.")}
+                                        </p>
+                                        <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                          {memoryDreamJsonText(change.afterJson)}
+                                        </pre>
+                                      </div>
+                                      <div>
+                                        <div className="text-xs font-semibold text-stone-700">
+                                          {t("Evidence JSON")}
+                                        </div>
+                                        <p className="mt-1 text-xs text-stone-500">
+                                          {t("Sources Dream used to justify the change.")}
+                                        </p>
+                                        <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                          {memoryDreamJsonText(change.evidence)}
+                                        </pre>
+                                      </div>
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
                     </div>
-                  </div>
+                  </>
                 ) : null}
               </section>
 
