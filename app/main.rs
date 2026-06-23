@@ -45,12 +45,12 @@ use foco_store::{
     config::{
         AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
         ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL, GlobalConfig,
-        HookConfig, McpServerConfig, MemorySettings, ModelLimits, ModelSettings, ProviderSettings,
-        SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
-        SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings,
-        SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
-        default_agent_execution_workspace_modes, load_or_create_global_config, save_global_config,
-        validate_agent_definition_tool_references,
+        HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings, ModelLimits,
+        ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
+        SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS,
+        SkillSettings, SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand,
+        WorkspaceConfig, default_agent_execution_workspace_modes, load_or_create_global_config,
+        save_global_config, validate_agent_definition_tool_references,
     },
     memory::{MemoryDatabase, MemoryDatabaseError, MemoryScope, MemorySourceType, MemoryStatus},
     model_metadata::{
@@ -1836,6 +1836,22 @@ struct ManualMemorySettingsRequest {
     retention_days: Option<u32>,
     extraction_model_id: Option<String>,
     retrieval_model_id: Option<String>,
+    dream: Option<ManualMemoryDreamSettingsRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualMemoryDreamSettingsRequest {
+    enabled: bool,
+    auto_enabled: bool,
+    mode: String,
+    model_id: Option<String>,
+    workspace_interval_days: u32,
+    global_interval_days: u32,
+    create_transcript_chat: bool,
+    max_facts_per_run: u32,
+    max_changes_per_run: u32,
+    scheduler_scan_minutes: u32,
 }
 
 #[derive(Deserialize)]
@@ -2304,8 +2320,24 @@ struct MemorySettingsSummary {
     retention_days: Option<u32>,
     extraction_model_id: Option<String>,
     retrieval_model_id: Option<String>,
+    dream: MemoryDreamSettingsSummary,
     extraction_modes: Vec<MemoryExtractionModeSummary>,
     retrieval_modes: Vec<MemoryExtractionModeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryDreamSettingsSummary {
+    enabled: bool,
+    auto_enabled: bool,
+    mode: String,
+    model_id: Option<String>,
+    workspace_interval_days: u32,
+    global_interval_days: u32,
+    create_transcript_chat: bool,
+    max_facts_per_run: u32,
+    max_changes_per_run: u32,
+    scheduler_scan_minutes: u32,
 }
 
 #[derive(Serialize)]

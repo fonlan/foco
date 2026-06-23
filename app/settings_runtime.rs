@@ -79,6 +79,18 @@ pub(crate) async fn settings_response(
             retention_days: config.memory.retention_days,
             extraction_model_id: config.memory.extraction_model_id.clone(),
             retrieval_model_id: config.memory.retrieval_model_id.clone(),
+            dream: MemoryDreamSettingsSummary {
+                enabled: config.memory.dream.enabled,
+                auto_enabled: config.memory.dream.auto_enabled,
+                mode: config.memory.dream.mode.clone(),
+                model_id: config.memory.dream.model_id.clone(),
+                workspace_interval_days: config.memory.dream.workspace_interval_days,
+                global_interval_days: config.memory.dream.global_interval_days,
+                create_transcript_chat: config.memory.dream.create_transcript_chat,
+                max_facts_per_run: config.memory.dream.max_facts_per_run,
+                max_changes_per_run: config.memory.dream.max_changes_per_run,
+                scheduler_scan_minutes: config.memory.dream.scheduler_scan_minutes,
+            },
             extraction_modes: vec![
                 MemoryExtractionModeSummary {
                     value: "manual",

@@ -157,6 +157,18 @@ export const settings = {
     retrievalMode: "fts",
     extractionModelId: null,
     retrievalModelId: null,
+    dream: {
+      enabled: false,
+      autoEnabled: false,
+      mode: "llm",
+      modelId: null,
+      workspaceIntervalDays: 7,
+      globalIntervalDays: 30,
+      createTranscriptChat: true,
+      maxFactsPerRun: 200,
+      maxChangesPerRun: 50,
+      schedulerScanMinutes: 60,
+    },
     extractionModes: [
       { label: "Manual", value: "manual" },
       { label: "Pending review", value: "pending_review" },

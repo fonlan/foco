@@ -5428,6 +5428,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
             retention_days: None,
             extraction_model_id: Some("extract-model".to_string()),
             retrieval_model_id: None,
+            dream: MemoryDreamSettings::default(),
         },
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
@@ -5896,6 +5897,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
             retention_days: None,
             extraction_model_id: None,
             retrieval_model_id: None,
+            dream: MemoryDreamSettings::default(),
         },
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
@@ -5997,6 +5999,7 @@ fn persist_chat_result_for_worker_skips_main_chat_and_memory_extraction() {
         retention_days: None,
         extraction_model_id: Some("extract-model".to_string()),
         retrieval_model_id: None,
+        dream: MemoryDreamSettings::default(),
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -6235,6 +6238,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
             retention_days: None,
             extraction_model_id: None,
             retrieval_model_id: None,
+            dream: MemoryDreamSettings::default(),
         },
         memories_used: Vec::new(),
         memory_target_status: MemoryStatus::Pending,
@@ -7337,6 +7341,7 @@ fn automatic_memory_extraction_targets_active_facts() {
         retention_days: None,
         extraction_model_id: None,
         retrieval_model_id: None,
+        dream: MemoryDreamSettings::default(),
     };
     let automatic_settings = MemorySettings {
         enabled: true,
@@ -7345,6 +7350,7 @@ fn automatic_memory_extraction_targets_active_facts() {
         retention_days: None,
         extraction_model_id: None,
         retrieval_model_id: None,
+        dream: MemoryDreamSettings::default(),
     };
     let manual_settings = MemorySettings {
         enabled: true,
@@ -7353,6 +7359,7 @@ fn automatic_memory_extraction_targets_active_facts() {
         retention_days: None,
         extraction_model_id: None,
         retrieval_model_id: None,
+        dream: MemoryDreamSettings::default(),
     };
 
     assert!(should_queue_memory_extraction(&pending_review_settings));
@@ -10238,6 +10245,7 @@ fn memory_tool_test_context(
             extraction_model_id: None,
             retrieval_model_id: None,
             retention_days: None,
+            dream: MemoryDreamSettings::default(),
         },
     }
 }

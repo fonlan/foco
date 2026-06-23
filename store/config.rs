@@ -807,6 +807,8 @@ pub struct MemorySettings {
     pub extraction_model_id: Option<String>,
     #[serde(default)]
     pub retrieval_model_id: Option<String>,
+    #[serde(default)]
+    pub dream: MemoryDreamSettings,
 }
 
 impl Default for MemorySettings {
@@ -818,6 +820,49 @@ impl Default for MemorySettings {
             retention_days: None,
             extraction_model_id: None,
             retrieval_model_id: None,
+            dream: MemoryDreamSettings::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MemoryDreamSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub auto_enabled: bool,
+    #[serde(default = "default_memory_dream_mode")]
+    pub mode: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default = "default_memory_dream_workspace_interval_days")]
+    pub workspace_interval_days: u32,
+    #[serde(default = "default_memory_dream_global_interval_days")]
+    pub global_interval_days: u32,
+    #[serde(default = "default_true")]
+    pub create_transcript_chat: bool,
+    #[serde(default = "default_memory_dream_max_facts_per_run")]
+    pub max_facts_per_run: u32,
+    #[serde(default = "default_memory_dream_max_changes_per_run")]
+    pub max_changes_per_run: u32,
+    #[serde(default = "default_memory_dream_scheduler_scan_minutes")]
+    pub scheduler_scan_minutes: u32,
+}
+
+impl Default for MemoryDreamSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_enabled: false,
+            mode: default_memory_dream_mode(),
+            model_id: None,
+            workspace_interval_days: default_memory_dream_workspace_interval_days(),
+            global_interval_days: default_memory_dream_global_interval_days(),
+            create_transcript_chat: true,
+            max_facts_per_run: default_memory_dream_max_facts_per_run(),
+            max_changes_per_run: default_memory_dream_max_changes_per_run(),
+            scheduler_scan_minutes: default_memory_dream_scheduler_scan_minutes(),
         }
     }
 }
@@ -919,6 +964,30 @@ fn default_memory_extraction_mode() -> String {
 
 fn default_memory_retrieval_mode() -> String {
     "fts".to_string()
+}
+
+fn default_memory_dream_mode() -> String {
+    "llm".to_string()
+}
+
+fn default_memory_dream_workspace_interval_days() -> u32 {
+    7
+}
+
+fn default_memory_dream_global_interval_days() -> u32 {
+    30
+}
+
+fn default_memory_dream_max_facts_per_run() -> u32 {
+    200
+}
+
+fn default_memory_dream_max_changes_per_run() -> u32 {
+    50
+}
+
+fn default_memory_dream_scheduler_scan_minutes() -> u32 {
+    60
 }
 
 fn default_system_prompt_name() -> String {
@@ -1760,6 +1829,71 @@ fn validate_memory_settings(
                 format!("memory.retrieval_model_id references missing model '{model_id}'"),
             );
         }
+    }
+
+    validate_memory_dream_settings(config_path, &settings.dream, models)?;
+
+    Ok(())
+}
+
+fn validate_memory_dream_settings(
+    config_path: Option<&Path>,
+    settings: &MemoryDreamSettings,
+    models: &[ModelSettings],
+) -> Result<(), ConfigError> {
+    match settings.mode.as_str() {
+        "deterministic_only" | "llm" => {}
+        other => {
+            return invalid_config(
+                config_path,
+                format!("memory.dream.mode has unsupported value '{other}'"),
+            );
+        }
+    }
+
+    if let Some(model_id) = &settings.model_id {
+        require_non_empty(config_path, "memory.dream.model_id", model_id)?;
+
+        if !models
+            .iter()
+            .any(|model| model.id == *model_id && model.enabled)
+        {
+            return invalid_config(
+                config_path,
+                format!("memory.dream.model_id references missing or disabled model '{model_id}'"),
+            );
+        }
+    }
+
+    if settings.workspace_interval_days == 0 {
+        return invalid_config(
+            config_path,
+            "memory.dream.workspace_interval_days must be greater than 0",
+        );
+    }
+    if settings.global_interval_days == 0 {
+        return invalid_config(
+            config_path,
+            "memory.dream.global_interval_days must be greater than 0",
+        );
+    }
+    if settings.max_facts_per_run == 0 {
+        return invalid_config(
+            config_path,
+            "memory.dream.max_facts_per_run must be greater than 0",
+        );
+    }
+    if settings.max_changes_per_run == 0 {
+        return invalid_config(
+            config_path,
+            "memory.dream.max_changes_per_run must be greater than 0",
+        );
+    }
+    if settings.scheduler_scan_minutes == 0 {
+        return invalid_config(
+            config_path,
+            "memory.dream.scheduler_scan_minutes must be greater than 0",
+        );
     }
 
     Ok(())
@@ -2866,6 +3000,141 @@ mod tests {
                 .to_string()
                 .contains("memory.retrieval_model_id references missing model")
         );
+    }
+
+    #[test]
+    fn memory_dream_defaults_are_loaded_for_old_configs() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+
+        let config = GlobalConfig::first_run(paths.workspace_dir.clone());
+        let mut json = serde_json::to_value(&config).expect("config json");
+        json.get_mut("memory")
+            .and_then(Value::as_object_mut)
+            .expect("memory object")
+            .remove("dream");
+        fs::write(
+            &paths.config_file,
+            serde_json::to_string_pretty(&json).expect("serialize config"),
+        )
+        .expect("config write");
+
+        let loaded = load_global_config(&paths.config_file).expect("old config should load");
+
+        assert_eq!(loaded.memory.dream, MemoryDreamSettings::default());
+    }
+
+    #[test]
+    fn memory_dream_settings_can_be_saved() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+        loaded
+            .config
+            .models
+            .push(enabled_memory_model("dream-model"));
+        loaded.config.memory.dream = MemoryDreamSettings {
+            enabled: true,
+            auto_enabled: true,
+            mode: "deterministic_only".to_string(),
+            model_id: Some("dream-model".to_string()),
+            workspace_interval_days: 3,
+            global_interval_days: 14,
+            create_transcript_chat: false,
+            max_facts_per_run: 25,
+            max_changes_per_run: 10,
+            scheduler_scan_minutes: 15,
+        };
+
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("dream settings should save");
+        let reloaded = load_global_config(&loaded.paths.config_file).expect("config reload");
+
+        assert_eq!(reloaded.memory.dream, loaded.config.memory.dream);
+    }
+
+    #[test]
+    fn memory_dream_settings_are_validated() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+        loaded
+            .config
+            .models
+            .push(enabled_memory_model("dream-model"));
+
+        loaded.config.memory.dream.mode = "agent".to_string();
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("unsupported dream mode should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("memory.dream.mode has unsupported value")
+        );
+
+        loaded.config.memory.dream.mode = "llm".to_string();
+        loaded.config.memory.dream.workspace_interval_days = 0;
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("zero workspace interval should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("memory.dream.workspace_interval_days must be greater than 0")
+        );
+
+        loaded.config.memory.dream.workspace_interval_days = 7;
+        loaded.config.memory.dream.max_changes_per_run = 0;
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("zero change limit should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("memory.dream.max_changes_per_run must be greater than 0")
+        );
+
+        loaded.config.memory.dream.max_changes_per_run = 50;
+        loaded.config.memory.dream.model_id = Some("missing-model".to_string());
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("missing dream model should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("memory.dream.model_id references missing or disabled model")
+        );
+
+        loaded.config.models.push(ModelSettings {
+            enabled: false,
+            ..enabled_memory_model("disabled-dream-model")
+        });
+        loaded.config.memory.dream.model_id = Some("disabled-dream-model".to_string());
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("disabled dream model should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("memory.dream.model_id references missing or disabled model")
+        );
+    }
+
+    fn enabled_memory_model(id: &str) -> ModelSettings {
+        ModelSettings {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            enabled: true,
+            provider_ids: Vec::new(),
+            active_provider_id: None,
+            thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 16_384,
+            }),
+        }
     }
 
     #[test]

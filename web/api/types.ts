@@ -1062,6 +1062,19 @@ type MemoryExtractionModeSummary = {
   label: string;
 };
 
+type MemoryDreamSettingsSummary = {
+  enabled: boolean;
+  autoEnabled: boolean;
+  mode: "deterministic_only" | "llm";
+  modelId: string | null;
+  workspaceIntervalDays: number;
+  globalIntervalDays: number;
+  createTranscriptChat: boolean;
+  maxFactsPerRun: number;
+  maxChangesPerRun: number;
+  schedulerScanMinutes: number;
+};
+
 type MemorySettingsSummary = {
   enabled: boolean;
   extractionMode: string;
@@ -1069,6 +1082,7 @@ type MemorySettingsSummary = {
   retentionDays: number | null;
   extractionModelId: string | null;
   retrievalModelId: string | null;
+  dream: MemoryDreamSettingsSummary;
   extractionModes: MemoryExtractionModeSummary[];
   retrievalModes: MemoryExtractionModeSummary[];
 };

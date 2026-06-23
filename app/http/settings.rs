@@ -423,6 +423,10 @@ pub(crate) async fn save_memory_settings(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let dream = match request.dream {
+        Some(dream) => memory_dream_settings_from_request(dream),
+        None => config.memory.dream.clone(),
+    };
 
     config.memory = MemorySettings {
         enabled: request.enabled,
@@ -431,6 +435,7 @@ pub(crate) async fn save_memory_settings(
         retention_days: request.retention_days,
         extraction_model_id,
         retrieval_model_id,
+        dream,
     };
     config
         .validate(Some(&state.config_file))
@@ -438,6 +443,28 @@ pub(crate) async fn save_memory_settings(
     save_config(&state, config.clone())?;
 
     settings_response(&state, &config).await
+}
+
+fn memory_dream_settings_from_request(
+    request: ManualMemoryDreamSettingsRequest,
+) -> MemoryDreamSettings {
+    MemoryDreamSettings {
+        enabled: request.enabled,
+        auto_enabled: request.auto_enabled,
+        mode: request.mode.trim().to_string(),
+        model_id: request
+            .model_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        workspace_interval_days: request.workspace_interval_days,
+        global_interval_days: request.global_interval_days,
+        create_transcript_chat: request.create_transcript_chat,
+        max_facts_per_run: request.max_facts_per_run,
+        max_changes_per_run: request.max_changes_per_run,
+        scheduler_scan_minutes: request.scheduler_scan_minutes,
+    }
 }
 
 pub(crate) async fn save_prompt_settings(
