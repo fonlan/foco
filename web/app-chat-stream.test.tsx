@@ -629,6 +629,154 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("updates a streaming run_command preview in place when full input arrives", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "run tests",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    const assistantMessageId = "message-assistant-stream";
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        delta: "Before command.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          id: "call-run-command",
+          input: "{\"",
+          isError: false,
+          name: "run_command",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        delta: "After command.",
+        type: "textDelta",
+      });
+    });
+
+    const toolName = await screen.findByText("run_command");
+    const assistantRow = toolName.closest(".message-row") as HTMLElement | null;
+    expect(assistantRow).not.toBeNull();
+    const row = assistantRow as HTMLElement;
+    const beforeText = within(row).getByText("Before command.");
+    const afterText = within(row).getByText("After command.");
+    expect(within(row).getAllByText("run_command")).toHaveLength(1);
+    expect(within(row).getByText("running")).toBeInTheDocument();
+    expect(
+      beforeText.compareDocumentPosition(toolName) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      toolName.compareDocumentPosition(afterText) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          id: "call-run-command",
+          input: {
+            args: ["run", "test", "--", "--watch=false"],
+            command: "npm",
+            cwd: "web",
+          },
+          isError: false,
+          name: "run_command",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    const fullCommand = "npm run test -- --watch=false | cwd: web";
+    expect(await within(row).findByText(fullCommand)).toBeInTheDocument();
+    const updatedToolName = within(row).getByText("run_command");
+    expect(within(row).getAllByText("run_command")).toHaveLength(1);
+    expect(
+      beforeText.compareDocumentPosition(updatedToolName) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      updatedToolName.compareDocumentPosition(afterText) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        delta: "tests still running",
+        stream: "stdout",
+        toolCallId: "call-run-command",
+        type: "toolOutputDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          id: "call-run-command",
+          input: {
+            args: ["run", "test", "--", "--watch=false"],
+            command: "npm",
+            cwd: "web",
+          },
+          isError: false,
+          name: "run_command",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+    expect(within(row).getByText(/tests still running/)).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        isError: false,
+        output: "tests done",
+        toolCallId: "call-run-command",
+        type: "toolResult",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          id: "call-run-command",
+          input: {
+            args: ["run", "test", "--", "--watch=false"],
+            command: "npm",
+            cwd: "web",
+          },
+          isError: false,
+          name: "run_command",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    expect(within(row).queryByText("running")).not.toBeInTheDocument();
+    expect(within(row).getByText("completed")).toBeInTheDocument();
+    expect(within(row).getByText(/tests done/)).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("keeps a resumed agent-team reply in the original assistant bubble", async () => {
     renderApp();
 

@@ -5047,9 +5047,14 @@ export function App() {
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+          const messageOwnsToolCall = (message: ShellMessage) =>
+            messageHasToolCall(message, streamEvent.toolCall.id);
+          setMessagesForChatKey(chatKey, (current) => {
+            const updateExistingToolCall = current.some(messageOwnsToolCall);
+            return current.map((message) =>
+              (updateExistingToolCall
+                ? messageOwnsToolCall(message)
+                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
                 ? {
                   ...message,
                   parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
@@ -5059,8 +5064,8 @@ export function App() {
                   ),
                 }
                 : message,
-            ),
-          );
+            );
+          });
           return;
         }
 
@@ -5948,9 +5953,14 @@ export function App() {
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
-          setMessagesForChatKey(runMessagesKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+          const messageOwnsToolCall = (message: ShellMessage) =>
+            messageHasToolCall(message, streamEvent.toolCall.id);
+          setMessagesForChatKey(runMessagesKey, (current) => {
+            const updateExistingToolCall = current.some(messageOwnsToolCall);
+            return current.map((message) =>
+              (updateExistingToolCall
+                ? messageOwnsToolCall(message)
+                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
                 ? {
                   ...message,
                   toolCalls: upsertToolCall(
@@ -5960,8 +5970,8 @@ export function App() {
                   parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
                 }
                 : message,
-            ),
-          );
+            );
+          });
           return;
         }
 
@@ -21492,8 +21502,29 @@ function upsertToolCall(
   }
 
   return toolCalls.map((toolCall, index) =>
-    index === existingIndex ? normalizedToolCall : toolCall,
+    index === existingIndex
+      ? mergeToolCallUpdate(toolCall, normalizedToolCall)
+      : toolCall,
   );
+}
+
+function mergeToolCallUpdate(
+  currentToolCall: ChatToolCallSummary,
+  nextToolCall: ChatToolCallSummary,
+): ChatToolCallSummary {
+  const normalizedToolCall = normalizedToolCallSummary(nextToolCall);
+  const keepExistingOutcome =
+    currentToolCall.output !== null && normalizedToolCall.output === null;
+
+  return {
+    ...normalizedToolCall,
+    status: keepExistingOutcome ? currentToolCall.status : normalizedToolCall.status,
+    output: keepExistingOutcome ? currentToolCall.output : normalizedToolCall.output,
+    isError: keepExistingOutcome ? currentToolCall.isError : normalizedToolCall.isError,
+    liveOutput:
+      normalizedToolCall.liveOutput ??
+      (normalizedToolCall.output === null ? currentToolCall.liveOutput : undefined),
+  };
 }
 
 function applyToolResult(
@@ -21871,7 +21902,12 @@ function upsertToolCallPart(
   }
 
   return parts.map((part, index) =>
-    index === existingIndex ? nextPart : part,
+    index === existingIndex && part.type === "toolCall"
+      ? {
+        type: "toolCall",
+        toolCall: mergeToolCallUpdate(part.toolCall, normalizedToolCall),
+      }
+      : part,
   );
 }
 
