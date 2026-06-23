@@ -16,20 +16,30 @@ mod memory_schema;
 
 use memory_records::MemoryDatabaseKind;
 pub use memory_records::{
-    MemoryExtractionJobRecord, MemoryFactRecord, MemoryProfileRecord, MemorySourceRecord,
+    MemoryDreamChangeRecord, MemoryDreamJobRecord, MemoryExtractionJobRecord, MemoryFactRecord,
+    MemoryProfileRecord, MemorySourceRecord, NewMemoryDreamChange, NewMemoryDreamJob,
     NewMemoryEdge, NewMemoryExtractionJob, NewMemoryFact, NewMemoryProfile, NewMemorySource,
-    UpdateMemoryFact, UpdateMemorySource,
+    UpdateMemoryDreamChange, UpdateMemoryDreamJob, UpdateMemoryFact, UpdateMemorySource,
 };
 use memory_schema::MemoryMigration;
-pub use memory_schema::{GLOBAL_MEMORY_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL};
+pub use memory_schema::{
+    GLOBAL_MEMORY_DREAM_SCHEMA_SQL, GLOBAL_MEMORY_SCHEMA_SQL, WORKSPACE_MEMORY_DREAM_SCHEMA_SQL,
+    WORKSPACE_MEMORY_SCHEMA_SQL,
+};
 
 pub const GLOBAL_MEMORY_DATABASE_FILE: &str = "memory.sqlite";
-pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 1;
+pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 2;
 
-const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[MemoryMigration {
-    version: 1,
-    sql: GLOBAL_MEMORY_SCHEMA_SQL,
-}];
+const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[
+    MemoryMigration {
+        version: 1,
+        sql: GLOBAL_MEMORY_SCHEMA_SQL,
+    },
+    MemoryMigration {
+        version: 2,
+        sql: GLOBAL_MEMORY_DREAM_SCHEMA_SQL,
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryScope {
@@ -144,6 +154,85 @@ impl MemoryDreamRunMode {
             "llm" => Ok(Self::Llm),
             _ => Err(MemoryDatabaseError::InvalidMemoryInput {
                 message: format!("unknown memory Dream run mode: {value}"),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryDreamJobStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Skipped,
+}
+
+impl MemoryDreamJobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "skipped" => Ok(Self::Skipped),
+            _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("unknown memory Dream job status: {value}"),
+            }),
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::Skipped
+        )
+    }
+
+    fn starts_run(self) -> bool {
+        self == Self::Running || self.is_terminal()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryDreamChangeStatus {
+    Proposed,
+    Applied,
+    Skipped,
+    Failed,
+}
+
+impl MemoryDreamChangeStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proposed => "proposed",
+            Self::Applied => "applied",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        match value {
+            "proposed" => Ok(Self::Proposed),
+            "applied" => Ok(Self::Applied),
+            "skipped" => Ok(Self::Skipped),
+            "failed" => Ok(Self::Failed),
+            _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("unknown memory Dream change status: {value}"),
             }),
         }
     }
@@ -1168,6 +1257,297 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn insert_dream_job(
+        &mut self,
+        job: NewMemoryDreamJob<'_>,
+    ) -> Result<(), MemoryDatabaseError> {
+        self.validate_dream_scope(job.scope, job.workspace_id)?;
+        validate_dream_job(&job)?;
+        let now = now_timestamp();
+        let input_summary_json = redact_memory_json(
+            job.input_summary_json,
+            "memory_dream_jobs.input_summary_json",
+        )?;
+        let output_summary_json = redact_optional_memory_json(
+            job.output_summary_json,
+            "memory_dream_jobs.output_summary_json",
+        )?;
+        let started_at = job.status.starts_run().then_some(now.as_str());
+        let completed_at = job.status.is_terminal().then_some(now.as_str());
+
+        self.connection
+            .execute(
+                "INSERT INTO memory_dream_jobs
+                    (id, scope, workspace_id, trigger_type, mode, status, model_id,
+                     input_summary_json, output_summary_json, transcript_chat_id, error_message,
+                     created_at, started_at, completed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    job.id,
+                    job.scope.as_str(),
+                    job.workspace_id,
+                    job.trigger_type.as_str(),
+                    job.mode.as_str(),
+                    job.status.as_str(),
+                    job.model_id,
+                    input_summary_json,
+                    output_summary_json,
+                    job.transcript_chat_id,
+                    job.error_message,
+                    now,
+                    started_at,
+                    completed_at,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(())
+    }
+
+    pub fn update_dream_job_status(
+        &mut self,
+        update: UpdateMemoryDreamJob<'_>,
+    ) -> Result<bool, MemoryDatabaseError> {
+        validate_dream_job_update(&update)?;
+        let now = now_timestamp();
+        let output_summary_json = redact_optional_memory_json(
+            update.output_summary_json,
+            "memory_dream_jobs.output_summary_json",
+        )?;
+        let started_at = update.status.starts_run().then_some(now.as_str());
+        let completed_at = update.status.is_terminal().then_some(now.as_str());
+        let error_message = match update.status {
+            MemoryDreamJobStatus::Failed
+            | MemoryDreamJobStatus::Cancelled
+            | MemoryDreamJobStatus::Skipped => update.error_message,
+            MemoryDreamJobStatus::Queued
+            | MemoryDreamJobStatus::Running
+            | MemoryDreamJobStatus::Completed => None,
+        };
+
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE memory_dream_jobs
+                 SET status = ?2,
+                     output_summary_json = ?3,
+                     transcript_chat_id = COALESCE(?4, transcript_chat_id),
+                     error_message = ?5,
+                     started_at = CASE
+                        WHEN ?6 IS NULL THEN started_at
+                        ELSE COALESCE(started_at, ?6)
+                     END,
+                     completed_at = ?7
+                 WHERE id = ?1",
+                params![
+                    update.id,
+                    update.status.as_str(),
+                    output_summary_json,
+                    update.transcript_chat_id,
+                    error_message,
+                    started_at,
+                    completed_at,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(changed > 0)
+    }
+
+    pub fn insert_dream_change(
+        &mut self,
+        change: NewMemoryDreamChange<'_>,
+    ) -> Result<(), MemoryDatabaseError> {
+        validate_dream_change(&change)?;
+        let now = now_timestamp();
+        let target_fact_ids_json = redact_memory_json(
+            change.target_fact_ids_json,
+            "memory_dream_changes.target_fact_ids_json",
+        )?;
+        let before_json =
+            redact_optional_memory_json(change.before_json, "memory_dream_changes.before_json")?;
+        let after_json =
+            redact_optional_memory_json(change.after_json, "memory_dream_changes.after_json")?;
+        let evidence_json =
+            redact_memory_json(change.evidence_json, "memory_dream_changes.evidence_json")?;
+        let applied_at =
+            (change.status == MemoryDreamChangeStatus::Applied).then_some(now.as_str());
+
+        self.connection
+            .execute(
+                "INSERT INTO memory_dream_changes
+                    (id, job_id, operation, target_fact_ids_json, new_fact_id, before_json,
+                     after_json, reason, confidence, risk_level, status, evidence_json,
+                     error_message, created_at, applied_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    change.id,
+                    change.job_id,
+                    change.operation,
+                    target_fact_ids_json,
+                    change.new_fact_id,
+                    before_json,
+                    after_json,
+                    change.reason,
+                    change.confidence,
+                    change.risk_level,
+                    change.status.as_str(),
+                    evidence_json,
+                    change.error_message,
+                    now,
+                    applied_at,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(())
+    }
+
+    pub fn update_dream_change_status(
+        &mut self,
+        update: UpdateMemoryDreamChange<'_>,
+    ) -> Result<bool, MemoryDatabaseError> {
+        validate_dream_change_update(&update)?;
+        let now = now_timestamp();
+        let after_json =
+            redact_optional_memory_json(update.after_json, "memory_dream_changes.after_json")?;
+        let applied_at =
+            (update.status == MemoryDreamChangeStatus::Applied).then_some(now.as_str());
+        let error_message = match update.status {
+            MemoryDreamChangeStatus::Failed | MemoryDreamChangeStatus::Skipped => {
+                update.error_message
+            }
+            MemoryDreamChangeStatus::Proposed | MemoryDreamChangeStatus::Applied => None,
+        };
+
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE memory_dream_changes
+                 SET status = ?2,
+                     after_json = COALESCE(?3, after_json),
+                     error_message = ?4,
+                     applied_at = CASE
+                        WHEN ?5 IS NULL THEN applied_at
+                        ELSE COALESCE(applied_at, ?5)
+                     END
+                 WHERE id = ?1",
+                params![
+                    update.id,
+                    update.status.as_str(),
+                    after_json,
+                    error_message,
+                    applied_at,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(changed > 0)
+    }
+
+    pub fn dream_jobs_for_scope(
+        &self,
+        scope: MemoryDreamScope,
+        workspace_id: Option<&str>,
+        status: Option<MemoryDreamJobStatus>,
+        limit: u32,
+    ) -> Result<Vec<MemoryDreamJobRecord>, MemoryDatabaseError> {
+        self.validate_dream_scope(scope, workspace_id)?;
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, scope, workspace_id, trigger_type, mode, status, model_id,
+                        input_summary_json, output_summary_json, transcript_chat_id,
+                        error_message, created_at, started_at, completed_at
+                 FROM memory_dream_jobs
+                 WHERE scope = ?1
+                   AND (?2 IS NULL OR workspace_id = ?2)
+                   AND (?3 IS NULL OR status = ?3)
+                 ORDER BY created_at DESC, id ASC
+                 LIMIT ?4",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(
+                params![
+                    scope.as_str(),
+                    workspace_id,
+                    status.map(MemoryDreamJobStatus::as_str),
+                    limit,
+                ],
+                memory_dream_job_from_row,
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn dream_changes_for_job(
+        &self,
+        job_id: &str,
+        status: Option<MemoryDreamChangeStatus>,
+        limit: u32,
+    ) -> Result<Vec<MemoryDreamChangeRecord>, MemoryDatabaseError> {
+        require_non_empty("job_id", job_id)?;
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, job_id, operation, target_fact_ids_json, new_fact_id, before_json,
+                        after_json, reason, confidence, risk_level, status, evidence_json,
+                        error_message, created_at, applied_at
+                 FROM memory_dream_changes
+                 WHERE job_id = ?1
+                   AND (?2 IS NULL OR status = ?2)
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT ?3",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(
+                params![job_id, status.map(MemoryDreamChangeStatus::as_str), limit],
+                memory_dream_change_from_row,
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn latest_successful_dream_time(
+        &self,
+        scope: MemoryDreamScope,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<String>, MemoryDatabaseError> {
+        self.validate_dream_scope(scope, workspace_id)?;
+
+        self.connection
+            .query_row(
+                "SELECT completed_at
+                 FROM memory_dream_jobs
+                 WHERE scope = ?1
+                   AND (?2 IS NULL OR workspace_id = ?2)
+                   AND status = 'completed'
+                   AND completed_at IS NOT NULL
+                 ORDER BY completed_at DESC, id ASC
+                 LIMIT 1",
+                params![scope.as_str(), workspace_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.database_path, source))
+    }
+
     pub fn fact(&self, id: &str) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("id", id)?;
         self.connection
@@ -2071,6 +2451,38 @@ impl MemoryDatabase {
             }
         }
     }
+
+    fn validate_dream_scope(
+        &self,
+        scope: MemoryDreamScope,
+        workspace_id: Option<&str>,
+    ) -> Result<(), MemoryDatabaseError> {
+        if let Some(workspace_id) = workspace_id {
+            require_non_empty("workspace_id", workspace_id)?;
+        }
+
+        match (self.kind, scope, workspace_id) {
+            (MemoryDatabaseKind::Global, MemoryDreamScope::Global, None)
+            | (MemoryDatabaseKind::Workspace, MemoryDreamScope::Workspace, _) => Ok(()),
+            (MemoryDatabaseKind::Global, MemoryDreamScope::Global, Some(_)) => {
+                Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: "global memory Dream must not include workspace_id".to_string(),
+                })
+            }
+            (MemoryDatabaseKind::Global, MemoryDreamScope::Workspace, _) => {
+                Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: "global memory database does not accept workspace Dream scope"
+                        .to_string(),
+                })
+            }
+            (MemoryDatabaseKind::Workspace, MemoryDreamScope::Global, _) => {
+                Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: "workspace memory database does not accept global Dream scope"
+                        .to_string(),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2436,6 +2848,157 @@ fn validate_extraction_job(job: &NewMemoryExtractionJob<'_>) -> Result<(), Memor
     Ok(())
 }
 
+fn validate_dream_job(job: &NewMemoryDreamJob<'_>) -> Result<(), MemoryDatabaseError> {
+    require_non_empty("id", job.id)?;
+    if let Some(workspace_id) = job.workspace_id {
+        require_non_empty("workspace_id", workspace_id)?;
+    }
+    if let Some(model_id) = job.model_id {
+        require_non_empty("model_id", model_id)?;
+    }
+    if let Some(transcript_chat_id) = job.transcript_chat_id {
+        require_non_empty("transcript_chat_id", transcript_chat_id)?;
+    }
+    validate_json("input_summary_json", job.input_summary_json)?;
+    if let Some(output_summary_json) = job.output_summary_json {
+        validate_json("output_summary_json", output_summary_json)?;
+    }
+    validate_dream_job_status_payload(job.status, job.output_summary_json, job.error_message)
+}
+
+fn validate_dream_job_update(update: &UpdateMemoryDreamJob<'_>) -> Result<(), MemoryDatabaseError> {
+    require_non_empty("id", update.id)?;
+    if let Some(transcript_chat_id) = update.transcript_chat_id {
+        require_non_empty("transcript_chat_id", transcript_chat_id)?;
+    }
+    if let Some(output_summary_json) = update.output_summary_json {
+        validate_json("output_summary_json", output_summary_json)?;
+    }
+    validate_dream_job_status_payload(
+        update.status,
+        update.output_summary_json,
+        update.error_message,
+    )
+}
+
+fn validate_dream_job_status_payload(
+    status: MemoryDreamJobStatus,
+    output_summary_json: Option<&str>,
+    error_message: Option<&str>,
+) -> Result<(), MemoryDatabaseError> {
+    if let Some(error_message) = error_message {
+        require_non_empty("error_message", error_message)?;
+    }
+
+    match status {
+        MemoryDreamJobStatus::Queued | MemoryDreamJobStatus::Running => {
+            if output_summary_json.is_some() || error_message.is_some() {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!(
+                        "{} memory Dream job must not include output or error",
+                        status.as_str()
+                    ),
+                });
+            }
+        }
+        MemoryDreamJobStatus::Completed => {
+            if error_message.is_some() {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: "completed memory Dream job must not include error".to_string(),
+                });
+            }
+        }
+        MemoryDreamJobStatus::Failed => {
+            if error_message.is_none() {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: "failed memory Dream job requires error_message".to_string(),
+                });
+            }
+        }
+        MemoryDreamJobStatus::Cancelled | MemoryDreamJobStatus::Skipped => {}
+    }
+
+    Ok(())
+}
+
+fn validate_dream_change(change: &NewMemoryDreamChange<'_>) -> Result<(), MemoryDatabaseError> {
+    require_non_empty("id", change.id)?;
+    require_non_empty("job_id", change.job_id)?;
+    require_non_empty("operation", change.operation)?;
+    validate_json_array("target_fact_ids_json", change.target_fact_ids_json)?;
+    if let Some(new_fact_id) = change.new_fact_id {
+        require_non_empty("new_fact_id", new_fact_id)?;
+    }
+    if let Some(before_json) = change.before_json {
+        validate_json("before_json", before_json)?;
+    }
+    if let Some(after_json) = change.after_json {
+        validate_json("after_json", after_json)?;
+    }
+    require_non_empty("reason", change.reason)?;
+    if let Some(confidence) = change.confidence
+        && !(0.0..=1.0).contains(&confidence)
+    {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("confidence must be between 0 and 1, got {confidence}"),
+        });
+    }
+    validate_dream_risk_level(change.risk_level)?;
+    validate_json_array("evidence_json", change.evidence_json)?;
+    validate_dream_change_status_payload(change.status, change.error_message)
+}
+
+fn validate_dream_change_update(
+    update: &UpdateMemoryDreamChange<'_>,
+) -> Result<(), MemoryDatabaseError> {
+    require_non_empty("id", update.id)?;
+    if let Some(after_json) = update.after_json {
+        validate_json("after_json", after_json)?;
+    }
+    validate_dream_change_status_payload(update.status, update.error_message)
+}
+
+fn validate_dream_change_status_payload(
+    status: MemoryDreamChangeStatus,
+    error_message: Option<&str>,
+) -> Result<(), MemoryDatabaseError> {
+    if let Some(error_message) = error_message {
+        require_non_empty("error_message", error_message)?;
+    }
+
+    match status {
+        MemoryDreamChangeStatus::Failed => {
+            if error_message.is_none() {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: "failed memory Dream change requires error_message".to_string(),
+                });
+            }
+        }
+        MemoryDreamChangeStatus::Proposed | MemoryDreamChangeStatus::Applied => {
+            if error_message.is_some() {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!(
+                        "{} memory Dream change must not include error",
+                        status.as_str()
+                    ),
+                });
+            }
+        }
+        MemoryDreamChangeStatus::Skipped => {}
+    }
+
+    Ok(())
+}
+
+fn validate_dream_risk_level(value: &str) -> Result<(), MemoryDatabaseError> {
+    match value {
+        "low" | "medium" | "high" => Ok(()),
+        _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("unknown memory Dream risk level: {value}"),
+        }),
+    }
+}
+
 fn validate_scope_chat_id(
     scope: MemoryScope,
     chat_id: Option<&str>,
@@ -2482,6 +3045,18 @@ fn validate_json(field: &'static str, value: &str) -> Result<(), MemoryDatabaseE
     serde_json::from_str::<Value>(value)
         .map(|_| ())
         .map_err(|source| MemoryDatabaseError::InvalidMemoryJson { field, source })
+}
+
+fn validate_json_array(field: &'static str, value: &str) -> Result<(), MemoryDatabaseError> {
+    let parsed: Value = serde_json::from_str(value)
+        .map_err(|source| MemoryDatabaseError::InvalidMemoryJson { field, source })?;
+    if !parsed.is_array() {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("{field} must be a JSON array"),
+        });
+    }
+
+    Ok(())
 }
 
 fn redact_optional_memory_json(
@@ -2596,6 +3171,47 @@ fn memory_extraction_job_from_row(
         created_at: row.get(8)?,
         started_at: row.get(9)?,
         completed_at: row.get(10)?,
+    })
+}
+
+fn memory_dream_job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryDreamJobRecord> {
+    Ok(MemoryDreamJobRecord {
+        id: row.get(0)?,
+        scope: row.get(1)?,
+        workspace_id: row.get(2)?,
+        trigger_type: row.get(3)?,
+        mode: row.get(4)?,
+        status: row.get(5)?,
+        model_id: row.get(6)?,
+        input_summary_json: row.get(7)?,
+        output_summary_json: row.get(8)?,
+        transcript_chat_id: row.get(9)?,
+        error_message: row.get(10)?,
+        created_at: row.get(11)?,
+        started_at: row.get(12)?,
+        completed_at: row.get(13)?,
+    })
+}
+
+fn memory_dream_change_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<MemoryDreamChangeRecord> {
+    Ok(MemoryDreamChangeRecord {
+        id: row.get(0)?,
+        job_id: row.get(1)?,
+        operation: row.get(2)?,
+        target_fact_ids_json: row.get(3)?,
+        new_fact_id: row.get(4)?,
+        before_json: row.get(5)?,
+        after_json: row.get(6)?,
+        reason: row.get(7)?,
+        confidence: row.get(8)?,
+        risk_level: row.get(9)?,
+        status: row.get(10)?,
+        evidence_json: row.get(11)?,
+        error_message: row.get(12)?,
+        created_at: row.get(13)?,
+        applied_at: row.get(14)?,
     })
 }
 
@@ -3026,6 +3642,7 @@ fn bool_to_i64(value: bool) -> i64 {
 mod tests {
     use super::*;
     use crate::workspace::{WorkspaceDatabase, workspace_database_path};
+    use rusqlite::Connection;
 
     #[test]
     fn global_database_creates_memory_schema() {
@@ -3038,6 +3655,33 @@ mod tests {
             database.schema_version().expect("schema version"),
             GLOBAL_MEMORY_SCHEMA_VERSION
         );
+        let connection = Connection::open(database.database_path()).expect("open database");
+        assert!(memory_table_exists(&connection, "memory_dream_jobs"));
+        assert!(memory_table_exists(&connection, "memory_dream_changes"));
+    }
+
+    #[test]
+    fn global_database_migrates_v1_dream_schema() {
+        let profile = tempfile::tempdir().expect("profile");
+        let database_path = global_memory_database_path(profile.path());
+        let connection = Connection::open(&database_path).expect("v1 memory database");
+        connection
+            .execute_batch(&format!(
+                "{GLOBAL_MEMORY_SCHEMA_SQL}
+                 PRAGMA user_version = 1;"
+            ))
+            .expect("v1 memory schema");
+        drop(connection);
+
+        let database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("migrated database");
+        assert_eq!(
+            database.schema_version().expect("schema version"),
+            GLOBAL_MEMORY_SCHEMA_VERSION
+        );
+        let connection = Connection::open(database.database_path()).expect("open database");
+        assert!(memory_table_exists(&connection, "memory_dream_jobs"));
+        assert!(memory_table_exists(&connection, "memory_dream_changes"));
     }
 
     #[test]
@@ -3094,6 +3738,128 @@ mod tests {
         assert!(!policy.allows_direct_expiration(MemoryKind::ProjectFact, true, true, false));
         assert!(!policy.allows_direct_expiration(MemoryKind::UserNote, false, false, true));
         assert!(policy.allows_direct_expiration(MemoryKind::UserNote, false, true, true));
+    }
+
+    #[test]
+    fn memory_dream_jobs_and_changes_round_trip() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+
+        database
+            .insert_dream_job(NewMemoryDreamJob {
+                id: "dream-job-1",
+                scope: MemoryDreamScope::Global,
+                workspace_id: None,
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                status: MemoryDreamJobStatus::Queued,
+                model_id: Some("model-1"),
+                input_summary_json: r#"{"candidateFacts":1}"#,
+                output_summary_json: None,
+                transcript_chat_id: None,
+                error_message: None,
+            })
+            .expect("dream job insert");
+        assert!(
+            database
+                .update_dream_job_status(UpdateMemoryDreamJob {
+                    id: "dream-job-1",
+                    status: MemoryDreamJobStatus::Running,
+                    output_summary_json: None,
+                    transcript_chat_id: Some("transcript-chat-1"),
+                    error_message: None,
+                })
+                .expect("mark running")
+        );
+        assert!(
+            database
+                .update_dream_job_status(UpdateMemoryDreamJob {
+                    id: "dream-job-1",
+                    status: MemoryDreamJobStatus::Completed,
+                    output_summary_json: Some(
+                        r#"{"authorization":"Bearer secret","changesApplied":1}"#
+                    ),
+                    transcript_chat_id: None,
+                    error_message: None,
+                })
+                .expect("mark completed")
+        );
+
+        database
+            .insert_dream_change(NewMemoryDreamChange {
+                id: "dream-change-1",
+                job_id: "dream-job-1",
+                operation: "expire",
+                target_fact_ids_json: r#"["fact-1"]"#,
+                new_fact_id: None,
+                before_json: Some(r#"{"id":"fact-1","api_key":"sk-secret","status":"active"}"#),
+                after_json: None,
+                reason: "Fact expired.",
+                confidence: Some(1.0),
+                risk_level: "low",
+                status: MemoryDreamChangeStatus::Proposed,
+                evidence_json: r#"[{"sourceType":"memory_fact","sourceId":"fact-1"}]"#,
+                error_message: None,
+            })
+            .expect("dream change insert");
+        assert!(
+            database
+                .update_dream_change_status(UpdateMemoryDreamChange {
+                    id: "dream-change-1",
+                    status: MemoryDreamChangeStatus::Applied,
+                    after_json: Some(r#"{"id":"fact-1","status":"expired"}"#),
+                    error_message: None,
+                })
+                .expect("mark change applied")
+        );
+
+        let jobs = database
+            .dream_jobs_for_scope(
+                MemoryDreamScope::Global,
+                None,
+                Some(MemoryDreamJobStatus::Completed),
+                10,
+            )
+            .expect("completed dream jobs");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "completed");
+        assert_eq!(
+            jobs[0].transcript_chat_id.as_deref(),
+            Some("transcript-chat-1")
+        );
+        assert!(jobs[0].started_at.is_some());
+        assert!(jobs[0].completed_at.is_some());
+        assert_eq!(
+            serde_json::from_str::<Value>(jobs[0].output_summary_json.as_deref().unwrap())
+                .expect("output json")["authorization"],
+            "[REDACTED]"
+        );
+        assert_eq!(
+            database
+                .latest_successful_dream_time(MemoryDreamScope::Global, None)
+                .expect("latest successful dream"),
+            jobs[0].completed_at
+        );
+
+        let changes = database
+            .dream_changes_for_job("dream-job-1", Some(MemoryDreamChangeStatus::Applied), 10)
+            .expect("applied dream changes");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].status, "applied");
+        assert!(changes[0].applied_at.is_some());
+        assert!(
+            changes[0]
+                .after_json
+                .as_deref()
+                .unwrap()
+                .contains("expired")
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(changes[0].before_json.as_deref().unwrap())
+                .expect("before json")["api_key"],
+            "[REDACTED]"
+        );
     }
 
     #[test]
@@ -4188,5 +4954,17 @@ mod tests {
 
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].id, "fact-related");
+    }
+
+    fn memory_table_exists(connection: &Connection, table: &str) -> bool {
+        connection
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+                 )",
+                [table],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("table exists query")
     }
 }

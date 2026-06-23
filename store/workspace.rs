@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::config::WorkspaceConfig;
-use crate::memory::WORKSPACE_MEMORY_SCHEMA_SQL;
+use crate::memory::{WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL};
 #[path = "workspace_records.rs"]
 mod workspace_records;
 #[path = "workspace_schema.rs"]
@@ -54,7 +54,7 @@ use workspace_schema::{
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 15;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 16;
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -119,6 +119,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 15,
         sql: MIGRATION_015,
+    },
+    Migration {
+        version: 16,
+        sql: WORKSPACE_MEMORY_DREAM_SCHEMA_SQL,
     },
 ];
 

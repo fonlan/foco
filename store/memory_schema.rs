@@ -142,6 +142,53 @@ CREATE INDEX memory_extraction_jobs_chat_idx ON memory_extraction_jobs (chat_id)
 CREATE INDEX memory_extraction_jobs_created_idx ON memory_extraction_jobs (created_at);
 "#;
 
+pub const WORKSPACE_MEMORY_DREAM_SCHEMA_SQL: &str = r#"
+CREATE TABLE memory_dream_jobs (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    scope TEXT NOT NULL CHECK (scope = 'workspace'),
+    workspace_id TEXT CHECK (workspace_id IS NULL OR length(workspace_id) > 0),
+    trigger_type TEXT NOT NULL CHECK (trigger_type IN ('manual', 'auto_interval', 'auto_threshold')),
+    mode TEXT NOT NULL CHECK (mode IN ('deterministic_only', 'llm')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'skipped')),
+    model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
+    input_summary_json TEXT NOT NULL DEFAULT '{}',
+    output_summary_json TEXT,
+    transcript_chat_id TEXT CHECK (transcript_chat_id IS NULL OR length(transcript_chat_id) > 0),
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+);
+
+CREATE INDEX memory_dream_jobs_scope_status_created_idx
+    ON memory_dream_jobs (scope, status, created_at);
+CREATE INDEX memory_dream_jobs_workspace_idx ON memory_dream_jobs (workspace_id);
+
+CREATE TABLE memory_dream_changes (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    job_id TEXT NOT NULL REFERENCES memory_dream_jobs(id) ON DELETE CASCADE,
+    operation TEXT NOT NULL CHECK (length(operation) > 0),
+    target_fact_ids_json TEXT NOT NULL DEFAULT '[]',
+    new_fact_id TEXT CHECK (new_fact_id IS NULL OR length(new_fact_id) > 0),
+    before_json TEXT,
+    after_json TEXT,
+    reason TEXT NOT NULL CHECK (length(reason) > 0),
+    confidence REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
+    risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high')),
+    status TEXT NOT NULL CHECK (status IN ('proposed', 'applied', 'skipped', 'failed')),
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    applied_at TEXT
+);
+
+CREATE INDEX memory_dream_changes_job_status_idx
+    ON memory_dream_changes (job_id, status);
+CREATE INDEX memory_dream_changes_target_fact_ids_idx
+    ON memory_dream_changes (target_fact_ids_json);
+CREATE INDEX memory_dream_changes_new_fact_idx ON memory_dream_changes (new_fact_id);
+"#;
+
 pub const GLOBAL_MEMORY_SCHEMA_SQL: &str = r#"
 CREATE TABLE memory_sources (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
@@ -271,4 +318,50 @@ CREATE TABLE memory_extraction_jobs (
 
 CREATE INDEX memory_extraction_jobs_scope_status_idx ON memory_extraction_jobs (scope, status);
 CREATE INDEX memory_extraction_jobs_created_idx ON memory_extraction_jobs (created_at);
+"#;
+
+pub const GLOBAL_MEMORY_DREAM_SCHEMA_SQL: &str = r#"
+CREATE TABLE memory_dream_jobs (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    scope TEXT NOT NULL CHECK (scope = 'global'),
+    workspace_id TEXT CHECK (workspace_id IS NULL),
+    trigger_type TEXT NOT NULL CHECK (trigger_type IN ('manual', 'auto_interval', 'auto_threshold')),
+    mode TEXT NOT NULL CHECK (mode IN ('deterministic_only', 'llm')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'skipped')),
+    model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
+    input_summary_json TEXT NOT NULL DEFAULT '{}',
+    output_summary_json TEXT,
+    transcript_chat_id TEXT CHECK (transcript_chat_id IS NULL OR length(transcript_chat_id) > 0),
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+);
+
+CREATE INDEX memory_dream_jobs_scope_status_created_idx
+    ON memory_dream_jobs (scope, status, created_at);
+
+CREATE TABLE memory_dream_changes (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    job_id TEXT NOT NULL REFERENCES memory_dream_jobs(id) ON DELETE CASCADE,
+    operation TEXT NOT NULL CHECK (length(operation) > 0),
+    target_fact_ids_json TEXT NOT NULL DEFAULT '[]',
+    new_fact_id TEXT CHECK (new_fact_id IS NULL OR length(new_fact_id) > 0),
+    before_json TEXT,
+    after_json TEXT,
+    reason TEXT NOT NULL CHECK (length(reason) > 0),
+    confidence REAL CHECK (confidence IS NULL OR (confidence >= 0.0 AND confidence <= 1.0)),
+    risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high')),
+    status TEXT NOT NULL CHECK (status IN ('proposed', 'applied', 'skipped', 'failed')),
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    applied_at TEXT
+);
+
+CREATE INDEX memory_dream_changes_job_status_idx
+    ON memory_dream_changes (job_id, status);
+CREATE INDEX memory_dream_changes_target_fact_ids_idx
+    ON memory_dream_changes (target_fact_ids_json);
+CREATE INDEX memory_dream_changes_new_fact_idx ON memory_dream_changes (new_fact_id);
 "#;

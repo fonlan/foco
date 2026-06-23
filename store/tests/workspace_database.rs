@@ -72,6 +72,8 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "memory_fts_index",
         "memory_profiles",
         "memory_extraction_jobs",
+        "memory_dream_jobs",
+        "memory_dream_changes",
         "prompt_context_injections",
         "agent_teams",
         "agent_instances",
@@ -2531,6 +2533,47 @@ fn migrates_v14_scheduled_task_tables_without_losing_existing_data() {
     assert_eq!(table_count(&connection, "agent_tasks"), 1);
     assert_eq!(table_count(&connection, "agent_attempts"), 1);
     assert_eq!(table_count(&connection, "llm_requests"), 1);
+}
+
+#[test]
+fn migrates_v15_memory_dream_tables() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v15 database");
+    connection
+        .execute_batch(
+            r#"CREATE TABLE workspace_metadata (
+                key TEXT PRIMARY KEY NOT NULL CHECK (length(key) > 0),
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             INSERT INTO workspace_metadata (key, value, updated_at)
+                VALUES ('sentinel', 'keep', '2026-06-23T00:00:00Z');
+             PRAGMA user_version = 15;"#,
+        )
+        .expect("v15 schema");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+
+    let connection = Connection::open(database.database_path()).expect("open migrated database");
+    assert!(table_exists(&connection, "memory_dream_jobs"));
+    assert!(table_exists(&connection, "memory_dream_changes"));
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT value FROM workspace_metadata WHERE key = 'sentinel'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .expect("sentinel metadata"),
+        "keep"
+    );
 }
 
 #[test]

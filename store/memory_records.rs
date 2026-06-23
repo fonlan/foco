@@ -1,8 +1,9 @@
 use serde::Serialize;
 
 use crate::memory::{
-    MemoryExtractionJobStatus, MemoryKind, MemoryRelationKind, MemoryScope, MemorySourceType,
-    MemoryStatus,
+    MemoryDreamChangeStatus, MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope,
+    MemoryDreamTriggerType, MemoryExtractionJobStatus, MemoryKind, MemoryRelationKind, MemoryScope,
+    MemorySourceType, MemoryStatus,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +91,55 @@ pub struct NewMemoryExtractionJob<'a> {
     pub error_message: Option<&'a str>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewMemoryDreamJob<'a> {
+    pub id: &'a str,
+    pub scope: MemoryDreamScope,
+    pub workspace_id: Option<&'a str>,
+    pub trigger_type: MemoryDreamTriggerType,
+    pub mode: MemoryDreamRunMode,
+    pub status: MemoryDreamJobStatus,
+    pub model_id: Option<&'a str>,
+    pub input_summary_json: &'a str,
+    pub output_summary_json: Option<&'a str>,
+    pub transcript_chat_id: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateMemoryDreamJob<'a> {
+    pub id: &'a str,
+    pub status: MemoryDreamJobStatus,
+    pub output_summary_json: Option<&'a str>,
+    pub transcript_chat_id: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewMemoryDreamChange<'a> {
+    pub id: &'a str,
+    pub job_id: &'a str,
+    pub operation: &'a str,
+    pub target_fact_ids_json: &'a str,
+    pub new_fact_id: Option<&'a str>,
+    pub before_json: Option<&'a str>,
+    pub after_json: Option<&'a str>,
+    pub reason: &'a str,
+    pub confidence: Option<f64>,
+    pub risk_level: &'a str,
+    pub status: MemoryDreamChangeStatus,
+    pub evidence_json: &'a str,
+    pub error_message: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateMemoryDreamChange<'a> {
+    pub id: &'a str,
+    pub status: MemoryDreamChangeStatus,
+    pub after_json: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MemorySourceRecord {
     pub id: String,
@@ -145,4 +195,41 @@ pub struct MemoryExtractionJobRecord {
     pub created_at: String,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MemoryDreamJobRecord {
+    pub id: String,
+    pub scope: String,
+    pub workspace_id: Option<String>,
+    pub trigger_type: String,
+    pub mode: String,
+    pub status: String,
+    pub model_id: Option<String>,
+    pub input_summary_json: String,
+    pub output_summary_json: Option<String>,
+    pub transcript_chat_id: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MemoryDreamChangeRecord {
+    pub id: String,
+    pub job_id: String,
+    pub operation: String,
+    pub target_fact_ids_json: String,
+    pub new_fact_id: Option<String>,
+    pub before_json: Option<String>,
+    pub after_json: Option<String>,
+    pub reason: String,
+    pub confidence: Option<f64>,
+    pub risk_level: String,
+    pub status: String,
+    pub evidence_json: String,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub applied_at: Option<String>,
 }
