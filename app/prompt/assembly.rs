@@ -7,6 +7,7 @@ use crate::memory_runtime::{
 };
 use crate::runtime::web_search_enabled;
 use crate::*;
+use foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND;
 
 pub(crate) async fn prepare_prompt_context(
     state: &AppState,
@@ -116,14 +117,20 @@ pub(crate) async fn prepare_prompt_context(
     let is_new_chat = requested_chat_id.is_none();
     let chat_id = match requested_chat_id {
         Some(chat_id) => {
-            if database
+            let chat = database
                 .chat(&chat_id)
                 .map_err(ApiError::from_workspace_error)?
-                .is_none()
+                .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+            let metadata =
+                serde_json::from_str::<Value>(&chat.metadata_json).map_err(|source| {
+                    ApiError::bad_request(format!("chat metadata was invalid: {source}"))
+                })?;
+            if metadata.get("kind").and_then(Value::as_str)
+                == Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND)
             {
-                return Err(ApiError::bad_request(format!(
-                    "chat was not found: {chat_id}"
-                )));
+                return Err(ApiError::bad_request(
+                    "memory Dream transcript chats are read-only",
+                ));
             }
             Some(chat_id)
         }

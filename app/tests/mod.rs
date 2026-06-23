@@ -8977,6 +8977,71 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
 }
 
 #[tokio::test]
+async fn prepare_prompt_context_rejects_memory_dream_transcript_chat() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-dream-transcript-prompt-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-dream-transcript-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    let chat_id = unique_id("chat");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+    database
+        .insert_chat_with_metadata(
+            &chat_id,
+            "Memory Dream: global manual",
+            &json!({ "kind": foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND }).to_string(),
+        )
+        .expect("insert transcript chat");
+    database
+        .insert_message(NewMessage {
+            id: &unique_id("msg-system"),
+            chat_id: &chat_id,
+            role: "system",
+            content: "job started",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("insert transcript message");
+    drop(database);
+
+    let result = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: Some(chat_id),
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: Some("continue".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ChatRun,
+    )
+    .await;
+    let error = match result {
+        Ok(_) => panic!("memory Dream transcript chat was accepted as a normal prompt"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .message
+            .contains("memory Dream transcript chats are read-only")
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-ripgrep-tools-disabled-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-ripgrep-tools-disabled-profile-test"));
