@@ -726,6 +726,58 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("renames user system prompts before saving prompt settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+
+    await userEvent.type(screen.getByPlaceholderText("Prompt name"), "Review");
+    await userEvent.click(screen.getByRole("button", { name: "Add system prompt" }));
+    expect(
+      screen.queryByRole("button", { name: "Rename system prompt Default" }),
+    ).not.toBeInTheDocument();
+    const renameButton = screen.getByRole("button", {
+      name: "Rename system prompt Review",
+    });
+    expect(renameButton).toBeInTheDocument();
+
+    await userEvent.type(screen.getByLabelText("System prompt"), "Review as senior engineer.");
+    await userEvent.click(renameButton);
+    const nameInput = screen.getByRole("textbox", { name: "System prompt name" });
+    await userEvent.clear(nameInput);
+    await userEvent.type(nameInput, "Reviewer");
+    await userEvent.click(screen.getByRole("button", { name: "Save system prompt name" }));
+    expect(screen.getByRole("button", { name: "Reviewer" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/prompts",
+        expect.objectContaining({
+          body: JSON.stringify({
+            extraText: "",
+            files: [],
+            systemPrompts: [
+              {
+                content: "You are Foco, a local coding agent.",
+                name: "Default",
+              },
+              {
+                name: "Reviewer",
+                content: "Review as senior engineer.",
+              },
+            ],
+          }),
+          method: "POST",
+        }),
+      );
+    });
+  });
+
   it("restores the default system prompt", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

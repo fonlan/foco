@@ -11808,6 +11808,8 @@ function SettingsPanel({
       files: data.prompts.files,
       pendingFile: "",
       pendingSystemPromptName: "",
+      pendingSystemPromptRename: "",
+      renamingSystemPromptName: null,
       systemPrompts,
     });
   }
@@ -12544,7 +12546,77 @@ function SettingsPanel({
           current.activeSystemPromptName === name
             ? DEFAULT_SYSTEM_PROMPT_NAME
             : current.activeSystemPromptName,
+        pendingSystemPromptRename:
+          current.renamingSystemPromptName === name
+            ? ""
+            : current.pendingSystemPromptRename,
+        renamingSystemPromptName:
+          current.renamingSystemPromptName === name
+            ? null
+            : current.renamingSystemPromptName,
         systemPrompts,
+      };
+    });
+  }
+
+  function startRenameSystemPrompt(name: string) {
+    if (name === DEFAULT_SYSTEM_PROMPT_NAME) {
+      return;
+    }
+
+    setPromptSettingsForm((current) => ({
+      ...current,
+      activeSystemPromptName: name,
+      pendingSystemPromptRename: name,
+      renamingSystemPromptName: name,
+    }));
+  }
+
+  function cancelRenameSystemPrompt() {
+    setPromptSettingsForm((current) => ({
+      ...current,
+      pendingSystemPromptRename: "",
+      renamingSystemPromptName: null,
+    }));
+  }
+
+  function submitRenameSystemPrompt(name: string) {
+    if (name === DEFAULT_SYSTEM_PROMPT_NAME) {
+      return;
+    }
+
+    setPromptSettingsForm((current) => {
+      const nextName = current.pendingSystemPromptRename.trim();
+      if (!nextName) {
+        return current;
+      }
+
+      const currentSystemPrompts = current.systemPrompts.length
+        ? current.systemPrompts
+        : settings
+          ? normalizedSystemPromptSummaries(settings.prompts)
+          : [];
+      if (
+        currentSystemPrompts.some(
+          (prompt) => prompt.name !== name && prompt.name === nextName,
+        )
+      ) {
+        return current;
+      }
+
+      return {
+        ...current,
+        activeSystemPromptName: nextName,
+        pendingSystemPromptRename: "",
+        renamingSystemPromptName: null,
+        systemPrompts: currentSystemPrompts.map((prompt) =>
+          prompt.name === name
+            ? {
+              ...prompt,
+              name: nextName,
+            }
+            : prompt,
+        ),
       };
     });
   }
@@ -15005,55 +15077,126 @@ function SettingsPanel({
                 <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(180px,240px)_minmax(0,1fr)]">
                   <div className="grid content-start gap-2">
                     <div className="overflow-hidden rounded-xl border border-stone-200 bg-stone-50/80">
-                      {systemPrompts.map((prompt) => (
-                        <div
-                          className={`flex items-center gap-2 px-3 py-2 ${prompt.name === promptSettingsForm.activeSystemPromptName
-                              ? "bg-teal-50"
-                              : "hover:bg-white"
-                            }`}
-                          key={prompt.name}
-                        >
-                          <button
-                            className={`min-w-0 flex-1 truncate text-left text-sm font-semibold ${prompt.name === promptSettingsForm.activeSystemPromptName
-                                ? "text-teal-900"
-                                : "text-stone-700"
+                      {systemPrompts.map((prompt) => {
+                        const isActive =
+                          prompt.name === promptSettingsForm.activeSystemPromptName;
+                        const isRenaming =
+                          prompt.name === promptSettingsForm.renamingSystemPromptName;
+
+                        return (
+                          <div
+                            className={`flex items-center gap-2 px-3 py-2 ${isActive
+                                ? "bg-teal-50"
+                                : "hover:bg-white"
                               }`}
-                            onClick={() =>
-                              setPromptSettingsForm((current) => ({
-                                ...current,
-                                activeSystemPromptName: prompt.name,
-                              }))
-                            }
-                            type="button"
+                            key={prompt.name}
                           >
-                            {prompt.name}
-                          </button>
-                          {prompt.name === DEFAULT_SYSTEM_PROMPT_NAME ? (
-                            <button
-                              aria-label={t("Restore default system prompt")}
-                              className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                              disabled={isLoadingSettings || !settings}
-                              onClick={restoreDefaultSystemPrompt}
-                              title={t("Restore default system prompt")}
-                              type="button"
-                            >
-                              <RefreshCw aria-hidden="true" className="size-4" />
-                            </button>
-                          ) : (
-                            <button
-                              aria-label={t("Remove system prompt {name}", {
-                                name: prompt.name,
-                              })}
-                              className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
-                              onClick={() => removeSystemPrompt(prompt.name)}
-                              title={t("Remove system prompt")}
-                              type="button"
-                            >
-                              <Trash2 aria-hidden="true" className="size-4" />
-                            </button>
-                          )}
-                        </div>
-                      ))}
+                            {isRenaming ? (
+                              <>
+                                <input
+                                  aria-label={t("System prompt name")}
+                                  autoComplete="off"
+                                  autoFocus
+                                  className="h-8 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-2 text-sm font-semibold text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                  onChange={(event) =>
+                                    setPromptSettingsForm((current) => ({
+                                      ...current,
+                                      pendingSystemPromptRename: event.target.value,
+                                    }))
+                                  }
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter") {
+                                      event.preventDefault();
+                                      submitRenameSystemPrompt(prompt.name);
+                                    }
+                                    if (event.key === "Escape") {
+                                      event.preventDefault();
+                                      cancelRenameSystemPrompt();
+                                    }
+                                  }}
+                                  value={promptSettingsForm.pendingSystemPromptRename}
+                                />
+                                <button
+                                  aria-label={t("Save system prompt name")}
+                                  className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                                  disabled={
+                                    !promptSettingsForm.pendingSystemPromptRename.trim()
+                                  }
+                                  onClick={() => submitRenameSystemPrompt(prompt.name)}
+                                  title={t("Save system prompt name")}
+                                  type="button"
+                                >
+                                  <CheckCircle2 aria-hidden="true" className="size-4" />
+                                </button>
+                                <button
+                                  aria-label={t("Cancel system prompt rename")}
+                                  className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                  onClick={cancelRenameSystemPrompt}
+                                  title={t("Cancel system prompt rename")}
+                                  type="button"
+                                >
+                                  <X aria-hidden="true" className="size-4" />
+                                </button>
+                              </>
+                            ) : (
+                              <>
+                                <button
+                                  className={`min-w-0 flex-1 truncate text-left text-sm font-semibold ${isActive
+                                      ? "text-teal-900"
+                                      : "text-stone-700"
+                                    }`}
+                                  onClick={() =>
+                                    setPromptSettingsForm((current) => ({
+                                      ...current,
+                                      activeSystemPromptName: prompt.name,
+                                    }))
+                                  }
+                                  type="button"
+                                >
+                                  {prompt.name}
+                                </button>
+                                {prompt.name === DEFAULT_SYSTEM_PROMPT_NAME ? (
+                                  <button
+                                    aria-label={t("Restore default system prompt")}
+                                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                    disabled={isLoadingSettings || !settings}
+                                    onClick={restoreDefaultSystemPrompt}
+                                    title={t("Restore default system prompt")}
+                                    type="button"
+                                  >
+                                    <RefreshCw aria-hidden="true" className="size-4" />
+                                  </button>
+                                ) : (
+                                  <>
+                                    <button
+                                      aria-label={t("Rename system prompt {name}", {
+                                        name: prompt.name,
+                                      })}
+                                      className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                      onClick={() => startRenameSystemPrompt(prompt.name)}
+                                      title={t("Rename system prompt")}
+                                      type="button"
+                                    >
+                                      <Pencil aria-hidden="true" className="size-4" />
+                                    </button>
+                                    <button
+                                      aria-label={t("Remove system prompt {name}", {
+                                        name: prompt.name,
+                                      })}
+                                      className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                                      onClick={() => removeSystemPrompt(prompt.name)}
+                                      title={t("Remove system prompt")}
+                                      type="button"
+                                    >
+                                      <Trash2 aria-hidden="true" className="size-4" />
+                                    </button>
+                                  </>
+                                )}
+                              </>
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                     <div className="flex gap-2">
                       <input
@@ -20400,6 +20543,8 @@ function emptyPromptSettingsForm(): PromptSettingsFormState {
     files: [],
     pendingFile: "",
     pendingSystemPromptName: "",
+    pendingSystemPromptRename: "",
+    renamingSystemPromptName: null,
     systemPrompts: [],
   };
 }

@@ -1051,6 +1051,8 @@ export type PromptSettingsFormState = {
   extraText: string;
   pendingFile: string;
   pendingSystemPromptName: string;
+  pendingSystemPromptRename: string;
+  renamingSystemPromptName: string | null;
 };
 
 export type TerminalShellSummary = {
