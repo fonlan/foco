@@ -15778,7 +15778,7 @@ function SettingsPanel({
                         )}
                       </p>
                     </div>
-                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    <div className="grid gap-3 md:grid-cols-3">
                       <div className="rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
                           <span className="text-sm font-semibold text-stone-800">
@@ -15823,6 +15823,30 @@ function SettingsPanel({
                           </label>
                         </div>
                       </div>
+                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-sm font-semibold text-stone-800">
+                            {t("Create transcript chat")}
+                          </span>
+                          <label
+                            aria-label={t("Create transcript chat")}
+                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                          >
+                            <input
+                              checked={memorySettingsForm.dream.createTranscriptChat}
+                              className="size-4 accent-teal-700"
+                              onChange={(event) =>
+                                updateMemoryDreamForm({
+                                  createTranscriptChat: event.target.checked,
+                                })
+                              }
+                              type="checkbox"
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                       <label className="block">
                         <span className="mb-1.5 block text-xs font-semibold text-stone-600">
                           {t("Dream mode")}
@@ -15920,28 +15944,6 @@ function SettingsPanel({
                         placeholder="60"
                         value={memorySettingsForm.dream.schedulerScanMinutes}
                       />
-                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3">
-                        <div className="flex items-center justify-between gap-3">
-                          <span className="text-sm font-semibold text-stone-800">
-                            {t("Create transcript chat")}
-                          </span>
-                          <label
-                            aria-label={t("Create transcript chat")}
-                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
-                          >
-                            <input
-                              checked={memorySettingsForm.dream.createTranscriptChat}
-                              className="size-4 accent-teal-700"
-                              onChange={(event) =>
-                                updateMemoryDreamForm({
-                                  createTranscriptChat: event.target.checked,
-                                })
-                              }
-                              type="checkbox"
-                            />
-                          </label>
-                        </div>
-                      </div>
                     </div>
                   </fieldset>
                 </div>

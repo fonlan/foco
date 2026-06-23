@@ -232,6 +232,24 @@ describe("app-settings verification surfaces", () => {
     expect(await screen.findByText("Memory settings")).toBeInTheDocument();
     expect((await screen.findAllByText(activeMemory.fact)).length).toBeGreaterThan(0);
 
+    const dreamControlOrder = [
+      screen.getByLabelText("Enable Dream"),
+      screen.getByLabelText("Enable Auto Dream"),
+      screen.getByLabelText("Create transcript chat"),
+      screen.getByLabelText("Dream mode"),
+      screen.getByLabelText("Dream model"),
+      screen.getByLabelText("Workspace interval days"),
+    ];
+    for (const [index, control] of dreamControlOrder.entries()) {
+      const nextControl = dreamControlOrder[index + 1];
+      if (nextControl) {
+        expect(
+          control.compareDocumentPosition(nextControl) &
+            Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      }
+    }
+
     await userEvent.click(screen.getByRole("button", { name: "Go to page 2" }));
     await waitFor(() => {
       const pageCall = [...fetchMock.mock.calls].find(([url]) => {
