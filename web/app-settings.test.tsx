@@ -320,6 +320,7 @@ describe("app-settings verification surfaces", () => {
     expect(await screen.findByText("Dream history")).toBeInTheDocument();
     expect(await screen.findByText(memoryDreamJob.summary!)).toBeInTheDocument();
     expect(await screen.findByText(memoryDreamChange.reason)).toBeInTheDocument();
+    expect(within(screen.getByRole("table")).getAllByText(workspace.name)).toHaveLength(2);
     expect(
       workspace.chats.some((chat) => chat.id === memoryDreamJob.transcriptChatId),
     ).toBe(false);

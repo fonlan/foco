@@ -16321,6 +16321,13 @@ function SettingsPanel({
                         sortedMemoryDreamJobs.map((job) => {
                           const transcriptWorkspaceId =
                             job.transcriptWorkspaceId ?? job.workspaceId;
+                          const scopeLabel =
+                            job.scope === "workspace"
+                              ? workspaces.find((workspace) => workspace.id === job.workspaceId)
+                                  ?.name ??
+                                job.workspaceId ??
+                                memoryDreamScopeLabel(job.scope, t)
+                              : memoryDreamScopeLabel(job.scope, t);
                           return (
                             <tr
                               className={
@@ -16340,7 +16347,7 @@ function SettingsPanel({
                                 </button>
                               </td>
                               <td className="px-3 py-2 align-top">
-                                {memoryDreamScopeLabel(job.scope, t)}
+                                {scopeLabel}
                               </td>
                               <td className="px-3 py-2 align-top">
                                 {memoryDreamTriggerLabel(job.triggerType, t)}
