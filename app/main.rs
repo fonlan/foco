@@ -54,8 +54,8 @@ use foco_store::{
         validate_agent_definition_tool_references,
     },
     memory::{
-        MemoryDatabase, MemoryDatabaseError, MemoryDreamChangeStatus, MemoryDreamScope,
-        MemoryScope, MemorySourceType, MemoryStatus,
+        MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MemoryDatabase, MemoryDatabaseError,
+        MemoryDreamChangeStatus, MemoryDreamScope, MemoryScope, MemorySourceType, MemoryStatus,
     },
     model_metadata::{
         ModelMetadataCache, ModelMetadataError, ModelMetadataRecord, read_model_metadata_cache,
@@ -3139,8 +3139,19 @@ struct QueuedRunSummary {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatMessagesResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat: Option<ChatMessagesChatSummary>,
     messages: Vec<ChatMessageSummary>,
     active_run: Option<ActiveChatRunSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatMessagesChatSummary {
+    id: String,
+    title: String,
+    kind: Option<String>,
+    read_only: bool,
 }
 
 #[derive(Serialize)]
@@ -3443,6 +3454,7 @@ enum StoredChatMessagePart {
 }
 
 const STORED_CHAT_PARTS_VERSION: i64 = 2;
+const MEMORY_DREAM_TRANSCRIPT_STEP_KIND: &str = "memory_dream_transcript_step";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -10895,7 +10907,25 @@ fn chat_message_summaries(
     workspace_path: &Path,
     global_memory_database_file: Option<&Path>,
     chat_id: &str,
+    messages: Vec<MessageRecord>,
+) -> Result<Vec<ChatMessageSummary>, ApiError> {
+    chat_message_summaries_for_chat(
+        database,
+        workspace_path,
+        global_memory_database_file,
+        chat_id,
+        messages,
+        false,
+    )
+}
+
+fn chat_message_summaries_for_chat(
+    database: &mut WorkspaceDatabase,
+    workspace_path: &Path,
+    global_memory_database_file: Option<&Path>,
+    chat_id: &str,
     mut messages: Vec<MessageRecord>,
+    include_memory_dream_transcript_steps: bool,
 ) -> Result<Vec<ChatMessageSummary>, ApiError> {
     let assistant_message_ids = messages
         .iter()
@@ -10989,72 +11019,113 @@ fn chat_message_summaries(
         }
     }
 
-    messages
-        .into_iter()
-        .filter(|message| message.role == "user" || message.role == "assistant")
-        .map(|message| {
-            let tool_calls = tool_calls_by_message
-                .remove(&message.id)
-                .unwrap_or_default();
-            let reasoning = if message.role == "assistant" {
-                assistant_reasoning_from_metadata(&message.metadata_json)?
-            } else {
-                None
-            };
-            let memories_used = if message.role == "assistant" {
-                assistant_memories_used_from_metadata(&message.metadata_json)?
-            } else {
-                Vec::new()
-            };
-            let parts = if message.role == "assistant" {
-                assistant_parts_from_metadata(&message.metadata_json, &tool_calls)?.unwrap_or_else(
-                    || {
-                        fallback_chat_message_parts(
-                            &message.content,
-                            reasoning.as_deref(),
-                            &tool_calls,
-                        )
-                    },
-                )
-            } else {
-                let mut parts = fallback_chat_message_parts(&message.content, None, &[]);
-                parts.extend(chat_attachment_message_parts(&message.metadata_json)?);
-                parts
-            };
-            let queued_run = if message.role == "user" {
-                queued_run_summary_for_message(
-                    database,
-                    chat_id,
-                    &message.id,
-                    &message.metadata_json,
-                )?
-            } else {
-                None
-            };
-            let pending_mode = queued_run.as_ref().and_then(|queued_run| {
-                (queued_run.status == "queued").then(|| "queued".to_string())
-            });
-            let metrics = metrics_by_message.remove(&message.id);
-            let extracted_memories = extracted_memories_by_message
-                .remove(&message.id)
-                .unwrap_or_default();
+    let mut summaries = Vec::new();
+    for message in messages {
+        let Some(visible_role) =
+            visible_chat_message_role(&message, include_memory_dream_transcript_steps)?
+        else {
+            continue;
+        };
+        let is_user_message = message.role == "user";
+        let is_assistant_message = message.role == "assistant";
+        let tool_calls = tool_calls_by_message
+            .remove(&message.id)
+            .unwrap_or_default();
+        let reasoning = if is_assistant_message {
+            assistant_reasoning_from_metadata(&message.metadata_json)?
+        } else {
+            None
+        };
+        let memories_used = if is_assistant_message {
+            assistant_memories_used_from_metadata(&message.metadata_json)?
+        } else {
+            Vec::new()
+        };
+        let parts = if is_assistant_message {
+            assistant_parts_from_metadata(&message.metadata_json, &tool_calls)?.unwrap_or_else(
+                || fallback_chat_message_parts(&message.content, reasoning.as_deref(), &tool_calls),
+            )
+        } else if is_user_message {
+            let mut parts = fallback_chat_message_parts(&message.content, None, &[]);
+            parts.extend(chat_attachment_message_parts(&message.metadata_json)?);
+            parts
+        } else {
+            fallback_chat_message_parts(&message.content, None, &[])
+        };
+        let queued_run = if is_user_message {
+            queued_run_summary_for_message(database, chat_id, &message.id, &message.metadata_json)?
+        } else {
+            None
+        };
+        let pending_mode = queued_run
+            .as_ref()
+            .and_then(|queued_run| (queued_run.status == "queued").then(|| "queued".to_string()));
+        let metrics = metrics_by_message.remove(&message.id);
+        let extracted_memories = extracted_memories_by_message
+            .remove(&message.id)
+            .unwrap_or_default();
 
-            Ok(ChatMessageSummary {
-                id: message.id,
-                role: message.role,
-                content: message.content,
-                created_at: message.created_at,
-                reasoning,
-                pending_mode,
-                queued_run,
-                tool_calls,
-                parts,
-                metrics,
-                memories_used,
-                extracted_memories,
-            })
-        })
-        .collect()
+        summaries.push(ChatMessageSummary {
+            id: message.id,
+            role: visible_role.to_string(),
+            content: message.content,
+            created_at: message.created_at,
+            reasoning,
+            pending_mode,
+            queued_run,
+            tool_calls,
+            parts,
+            metrics,
+            memories_used,
+            extracted_memories,
+        });
+    }
+
+    Ok(summaries)
+}
+
+fn visible_chat_message_role(
+    message: &MessageRecord,
+    include_memory_dream_transcript_steps: bool,
+) -> Result<Option<&'static str>, ApiError> {
+    match message.role.as_str() {
+        "user" => Ok(Some("user")),
+        "assistant" => Ok(Some("assistant")),
+        "system"
+            if include_memory_dream_transcript_steps
+                && metadata_kind_matches(
+                    &message.metadata_json,
+                    "message metadata",
+                    MEMORY_DREAM_TRANSCRIPT_STEP_KIND,
+                )? =>
+        {
+            Ok(Some("assistant"))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn chat_messages_chat_summary(chat: &ChatRecord) -> Result<ChatMessagesChatSummary, ApiError> {
+    let kind = metadata_kind(&chat.metadata_json, "chat metadata")?;
+    let read_only = kind.as_deref() == Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND);
+
+    Ok(ChatMessagesChatSummary {
+        id: chat.id.clone(),
+        title: chat.title.clone(),
+        kind,
+        read_only,
+    })
+}
+
+fn metadata_kind(metadata_json: &str, context: &str) -> Result<Option<String>, ApiError> {
+    Ok(parse_json_value(metadata_json, context)?
+        .get("kind")
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+fn metadata_kind_matches(metadata_json: &str, context: &str, kind: &str) -> Result<bool, ApiError> {
+    Ok(metadata_kind(metadata_json, context)?.as_deref() == Some(kind))
 }
 
 fn chat_reply_metrics_from_requests(requests: &[LlmRequestMetricsRecord]) -> ChatReplyMetrics {

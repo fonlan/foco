@@ -1191,25 +1191,24 @@ pub(crate) async fn chat_messages(
     let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
 
-    if database
+    let chat = database
         .chat(chat_id)
         .map_err(ApiError::from_workspace_error)?
-        .is_none()
-    {
-        return Err(ApiError::bad_request(format!(
-            "chat was not found: {chat_id}"
-        )));
-    }
+        .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+    let chat_summary = chat_messages_chat_summary(&chat)?;
+    let include_memory_dream_transcript_steps =
+        chat_summary.kind.as_deref() == Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND);
 
     let message_records = database
         .messages_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?;
-    let messages = chat_message_summaries(
+    let messages = chat_message_summaries_for_chat(
         &mut database,
         &workspace.path,
         Some(&state.memory_database_file),
         chat_id,
         message_records,
+        include_memory_dream_transcript_steps,
     )?;
 
     let active_run = state
@@ -1217,6 +1216,7 @@ pub(crate) async fn chat_messages(
         .active_run_for_chat(workspace_id, chat_id)?;
 
     Ok(Json(ChatMessagesResponse {
+        chat: Some(chat_summary),
         messages,
         active_run,
     }))

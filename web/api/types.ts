@@ -261,6 +261,13 @@ export type ChatMessageSummary = {
   extractedMemories: ChatExtractedMemorySummary[];
 };
 
+export type ChatMessagesChatSummary = {
+  id: string;
+  title: string;
+  kind?: string | null;
+  readOnly: boolean;
+};
+
 export type QueueChatMessageResponse = {
   chatId: string;
   chatTitle: string;
@@ -275,6 +282,7 @@ export type QueueChatMessageResponse = {
 };
 
 export type ChatMessagesResponse = {
+  chat?: ChatMessagesChatSummary | null;
   messages: ChatMessageSummary[];
   activeRun?: ActiveChatRunSummary | null;
 };

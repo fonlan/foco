@@ -320,6 +320,9 @@ describe("app-settings verification surfaces", () => {
     expect(await screen.findByText("Dream history")).toBeInTheDocument();
     expect(await screen.findByText(memoryDreamJob.summary!)).toBeInTheDocument();
     expect(await screen.findByText(memoryDreamChange.reason)).toBeInTheDocument();
+    expect(
+      workspace.chats.some((chat) => chat.id === memoryDreamJob.transcriptChatId),
+    ).toBe(false);
     expect(screen.getByRole("button", { name: "Open transcript" })).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText("Enable memory"));
@@ -344,6 +347,12 @@ describe("app-settings verification surfaces", () => {
         mode: "llm",
       });
     });
+
+    await userEvent.click(screen.getByRole("button", { name: "Open transcript" }));
+    expect(await screen.findByText("Memory Dream: workspace manual")).toBeInTheDocument();
+    expect(await screen.findByText(/job started/)).toBeInTheDocument();
+    expect(screen.queryByText("API overview")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send message" })).not.toBeInTheDocument();
   });
 
   it("creates and edits manual memories", async () => {

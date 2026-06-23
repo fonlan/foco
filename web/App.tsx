@@ -577,6 +577,7 @@ export function App() {
   const [activeRunInfoByChatKey, setActiveRunInfoByChatKey] = useState<
     Record<string, ActiveRunInfo>
   >({});
+  const [readOnlyChatKeys, setReadOnlyChatKeys] = useState<Record<string, boolean>>({});
   const [contextUsageByChatKey, setContextUsageByChatKey] = useState<
     Record<string, ContextUsageResponse>
   >({});
@@ -671,6 +672,9 @@ export function App() {
   const activeRunInfo = activeChatKey
     ? activeRunInfoByChatKey[activeChatKey] ?? null
     : null;
+  const activeChatReadOnly = activeChatKey
+    ? readOnlyChatKeys[activeChatKey] === true
+    : false;
   const canUseTeamMode = agentDefinitions.length > 1;
   const isSendingMessage =
     activeChatKey !== null && runningChatKeys.has(activeChatKey);
@@ -2612,6 +2616,20 @@ export function App() {
       );
       const nextMessages = data.messages.map(normalizeChatMessageSummary);
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
+      updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);
+      setReadOnlyChatKeys((current) => {
+        const readOnly = data.chat?.readOnly === true;
+        if ((current[chatKey] === true) === readOnly && (readOnly || !(chatKey in current))) {
+          return current;
+        }
+        const next = { ...current };
+        if (readOnly) {
+          next[chatKey] = true;
+        } else {
+          delete next[chatKey];
+        }
+        return next;
+      });
       setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
       restoreQueuedRunRequestsForChatKey(workspaceId, chatId, nextMessages);
       if (activeChatKeyRef.current === chatKey) {
@@ -2751,6 +2769,36 @@ export function App() {
 
     openChatTabsRef.current = nextTabs;
     setOpenChatTabs(nextTabs);
+  }
+
+  function updateOpenChatTabTitle(
+    workspaceId: string,
+    chatId: string,
+    title: string | null,
+  ) {
+    const fallbackTitle = title?.trim();
+    if (!fallbackTitle) {
+      return;
+    }
+
+    setOpenChatTabs((current) => {
+      let changed = false;
+      const nextTabs = current.map((tab) => {
+        if (tab.workspaceId !== workspaceId || tab.chatId !== chatId) {
+          return tab;
+        }
+        if (tab.fallbackTitle === fallbackTitle) {
+          return tab;
+        }
+        changed = true;
+        return { ...tab, fallbackTitle };
+      });
+      if (!changed) {
+        return current;
+      }
+      openChatTabsRef.current = nextTabs;
+      return nextTabs;
+    });
   }
 
   function restoreWorkspaceChatTabs(tabs: BrowserRouteChatTab[]) {
@@ -3987,6 +4035,11 @@ export function App() {
 
     const request = currentDraftRunRequest();
     if (!request) {
+      return;
+    }
+
+    if (request.chatId && readOnlyChatKeys[chatRunKey(request.workspaceId, request.chatId)]) {
+      setError(t("This transcript is read-only."));
       return;
     }
 
@@ -7062,6 +7115,7 @@ export function App() {
                   isSelectingAttachments={isSelectingAttachments}
                   isTeamModeEnabled={canUseTeamMode && isTeamModeEnabled}
                   messages={messages}
+                  readOnly={activeChatReadOnly}
                   overviewRenderer={() => (
                     <ApiOverviewPanel
                       activeWorkspaceId={activeWorkspaceId}

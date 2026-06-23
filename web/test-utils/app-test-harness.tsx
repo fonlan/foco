@@ -572,7 +572,7 @@ export const memoryDreamJob = {
   startedAt: "2026-06-10T02:00:30Z",
   status: "completed",
   summary: "Merged duplicate workspace preferences.",
-  transcriptChatId: "chat-1",
+  transcriptChatId: "dream-transcript-chat-1",
   transcriptWorkspaceId: "workspace-1",
   triggerType: "manual",
   workspaceId: "workspace-1",
@@ -908,6 +908,12 @@ export const generatedGitDiff = {
 };
 
 export const chatMessages = {
+  chat: {
+    id: "chat-1",
+    kind: null,
+    readOnly: false,
+    title: "Tool run",
+  },
   messages: [
     {
       content: "Please inspect README.",
@@ -987,7 +993,36 @@ export const chatMessages = {
   ],
 };
 
+export const dreamTranscriptChatMessages = {
+  chat: {
+    id: "dream-transcript-chat-1",
+    kind: "memory_dream",
+    readOnly: true,
+    title: "Memory Dream: workspace manual",
+  },
+  messages: [
+    {
+      content: "job started\n\nfinal status: completed",
+      createdAt: "2026-06-10T02:00:30.000Z",
+      extractedMemories: [],
+      id: "dream-transcript-message-1",
+      memoriesUsed: [],
+      metrics: null,
+      parts: [{ text: "job started\n\nfinal status: completed", type: "text" }],
+      reasoning: null,
+      role: "assistant",
+      toolCalls: [],
+    },
+  ],
+};
+
 export const secondChatMessages = {
+  chat: {
+    id: "chat-2",
+    kind: null,
+    readOnly: false,
+    title: "Second chat",
+  },
   messages: [
     {
       content: "Second question.",
@@ -2262,6 +2297,10 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
     return jsonResponse({ ...chatMessages, activeRun: null });
+  }
+
+  if (path === "/api/workspaces/workspace-1/chats/dream-transcript-chat-1/messages") {
+    return jsonResponse({ ...dreamTranscriptChatMessages, activeRun: null });
   }
 
   if (path === "/api/workspaces/workspace-1/chats/chat-1/todo-graph") {

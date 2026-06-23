@@ -108,6 +108,7 @@ export function ChatPanel({
   gitBranches,
   helpers,
   queuedRunCount,
+  readOnly,
   isLoadingBranches,
   isLoadingContextUsage,
   isLoadingMessages,
@@ -161,6 +162,7 @@ export function ChatPanel({
   gitBranches: GitBranchesResponse | null;
   helpers: ChatPanelHelpers;
   queuedRunCount: number;
+  readOnly: boolean;
   isLoadingBranches: boolean;
   isLoadingContextUsage: boolean;
   isLoadingMessages: boolean;
@@ -801,6 +803,10 @@ export function ChatPanel({
               <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
               <span>{t("Loading...")}</span>
             </div>
+          ) : readOnly ? (
+            <div className="flex min-h-48 items-center justify-center text-sm font-medium text-stone-500">
+              {t("No transcript records")}
+            </div>
           ) : (
             overviewRenderer()
           )}
@@ -808,31 +814,33 @@ export function ChatPanel({
         <div aria-hidden="true" className="h-px" ref={messageScrollEndRef} />
       </div>
 
-      <div
-        aria-label={t("Resize message composer")}
-        aria-orientation="horizontal"
-        aria-valuemax={composerEditorMaxHeight()}
-        aria-valuemin={COMPOSER_EDITOR_MIN_HEIGHT_PX}
-        aria-valuenow={composerEditorHeight}
-        className={`composer-resize-splitter ${isResizingComposer ? "composer-resize-splitter-active" : ""
-          }`}
-        onKeyDown={(event) => {
-          if (event.key === "ArrowUp") {
-            event.preventDefault();
-            resizeComposerEditorBy(COMPOSER_EDITOR_KEY_STEP_PX);
-          }
+      {!readOnly ? (
+        <>
+          <div
+            aria-label={t("Resize message composer")}
+            aria-orientation="horizontal"
+            aria-valuemax={composerEditorMaxHeight()}
+            aria-valuemin={COMPOSER_EDITOR_MIN_HEIGHT_PX}
+            aria-valuenow={composerEditorHeight}
+            className={`composer-resize-splitter ${isResizingComposer ? "composer-resize-splitter-active" : ""
+              }`}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowUp") {
+                event.preventDefault();
+                resizeComposerEditorBy(COMPOSER_EDITOR_KEY_STEP_PX);
+              }
 
-          if (event.key === "ArrowDown") {
-            event.preventDefault();
-            resizeComposerEditorBy(-COMPOSER_EDITOR_KEY_STEP_PX);
-          }
-        }}
-        onPointerDown={handleComposerResizePointerDown}
-        role="separator"
-        tabIndex={0}
-      />
+              if (event.key === "ArrowDown") {
+                event.preventDefault();
+                resizeComposerEditorBy(-COMPOSER_EDITOR_KEY_STEP_PX);
+              }
+            }}
+            onPointerDown={handleComposerResizePointerDown}
+            role="separator"
+            tabIndex={0}
+          />
 
-      <div className="composer-shell shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
+          <div className="composer-shell shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
         <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
           <div className="composer-surface relative rounded-xl border border-stone-300 bg-white">
             {selectedSkills.length ? (
@@ -1107,6 +1115,8 @@ export function ChatPanel({
           ) : null}
         </form>
       </div>
+        </>
+      ) : null}
     </div>
   );
 }

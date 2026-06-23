@@ -5803,6 +5803,93 @@ fn chat_message_summaries_clear_stale_pending_message_without_resumable_agent_ta
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
+#[tokio::test]
+async fn chat_messages_return_memory_dream_transcript_steps_as_read_only_chat() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-dream-transcript-messages-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-dream-transcript-messages-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile_dir.clone());
+    let chat_id = "dream-transcript-chat";
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    database
+        .insert_chat_with_metadata(
+            chat_id,
+            "Memory Dream: global manual",
+            &json!({ "kind": foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND }).to_string(),
+        )
+        .expect("transcript chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "dream-transcript-step",
+            chat_id,
+            role: "system",
+            content: "job started",
+            sequence: 0,
+            metadata_json: Some(&json!({ "kind": "memory_dream_transcript_step" }).to_string()),
+        })
+        .expect("transcript message insert");
+    drop(database);
+
+    let Json(response) = crate::http::chat::chat_messages(
+        State(state),
+        AxumPath((workspace_id, chat_id.to_string())),
+    )
+    .await
+    .expect("chat messages response");
+
+    let chat = response.chat.expect("chat metadata");
+    assert_eq!(chat.id, chat_id);
+    assert_eq!(chat.title, "Memory Dream: global manual");
+    assert_eq!(
+        chat.kind.as_deref(),
+        Some(foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND)
+    );
+    assert!(chat.read_only);
+    assert_eq!(response.messages.len(), 1);
+    assert_eq!(response.messages[0].id, "dream-transcript-step");
+    assert_eq!(response.messages[0].role, "assistant");
+    assert_eq!(response.messages[0].content, "job started");
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[test]
+fn chat_message_summaries_keep_normal_system_messages_hidden() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-normal-system-hidden-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let chat_id = "normal-chat";
+    database
+        .insert_chat(chat_id, "Normal chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "system-message",
+            chat_id,
+            role: "system",
+            content: "internal instruction",
+            sequence: 0,
+            metadata_json: Some(&json!({ "kind": "memory_dream_transcript_step" }).to_string()),
+        })
+        .expect("system message insert");
+
+    let messages = database
+        .messages_for_chat(chat_id)
+        .expect("messages for chat");
+    let summaries = chat_message_summaries(&mut database, &workspace_dir, None, chat_id, messages)
+        .expect("message summaries");
+
+    assert!(summaries.is_empty());
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
 #[test]
 fn queued_run_stays_visible_while_coordinator_task_is_waiting() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-waiting-queue-summary-test"));
