@@ -44,15 +44,19 @@ use foco_providers::{
 use foco_store::{
     config::{
         AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
-        ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL, GlobalConfig,
-        HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings, ModelLimits,
-        ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
-        SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS,
-        SkillSettings, SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand,
-        WorkspaceConfig, default_agent_execution_workspace_modes, load_or_create_global_config,
-        save_global_config, validate_agent_definition_tool_references,
+        ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL, FocoPaths,
+        GlobalConfig, HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings,
+        ModelLimits, ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES,
+        SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS,
+        SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings, SystemPromptSettings, WebServerSettings,
+        WorkspaceCommonCommand, WorkspaceConfig, default_agent_execution_workspace_modes,
+        load_global_config, load_or_create_global_config, save_global_config,
+        validate_agent_definition_tool_references,
     },
-    memory::{MemoryDatabase, MemoryDatabaseError, MemoryScope, MemorySourceType, MemoryStatus},
+    memory::{
+        MemoryDatabase, MemoryDatabaseError, MemoryDreamChangeStatus, MemoryDreamScope,
+        MemoryScope, MemorySourceType, MemoryStatus,
+    },
     model_metadata::{
         ModelMetadataCache, ModelMetadataError, ModelMetadataRecord, read_model_metadata_cache,
     },
@@ -311,6 +315,7 @@ const RIPGREP_RELEASE_API_URL: &str =
 const RIPGREP_DOWNLOAD_ARCHIVE_NAME: &str = "ripgrep-download.tmp";
 // Temporary directory name used while extracting a downloaded ripgrep archive.
 const RIPGREP_EXTRACT_DIR_NAME: &str = "ripgrep-extract";
+const MEMORY_DREAM_LATEST_COMMAND: &str = "--memory-dream-latest";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 // Process-wide counter used by unique_id to keep IDs distinct within the same millisecond.
@@ -465,6 +470,10 @@ async fn main() {
 }
 
 async fn run_entrypoint() -> AppResult<()> {
+    if print_latest_memory_dream_job_if_requested()? {
+        return Ok(());
+    }
+
     #[cfg(all(windows, not(debug_assertions)))]
     {
         return run_windows_tray_entrypoint();
@@ -474,6 +483,109 @@ async fn run_entrypoint() -> AppResult<()> {
     {
         run_server_until_shutdown(None).await
     }
+}
+
+fn print_latest_memory_dream_job_if_requested() -> AppResult<bool> {
+    let mut args = env::args().skip(1);
+    let Some(command) = args.next() else {
+        return Ok(false);
+    };
+    if command != MEMORY_DREAM_LATEST_COMMAND {
+        return Ok(false);
+    }
+
+    let scope_arg = args.next().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            memory_dream_latest_usage(),
+        )
+    })?;
+    let scope = MemoryDreamScope::parse(scope_arg.trim())?;
+    let paths = FocoPaths::from_user_profile_env()?;
+    if !paths.config_file.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "global config does not exist: {}",
+                paths.config_file.display()
+            ),
+        )
+        .into());
+    }
+    let config = load_global_config(&paths.config_file)?;
+    let (database, workspace_id) = match scope {
+        MemoryDreamScope::Global => {
+            if !paths.memory_database_file.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "global memory database does not exist: {}",
+                        paths.memory_database_file.display()
+                    ),
+                )
+                .into());
+            }
+            (
+                MemoryDatabase::open_or_create_global_at(&paths.memory_database_file)?,
+                None,
+            )
+        }
+        MemoryDreamScope::Workspace => {
+            let workspace_id = args.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    memory_dream_latest_usage(),
+                )
+            })?;
+            let workspace = workspace_by_id(&config, &workspace_id).map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.message)
+            })?;
+            let database_path = workspace_database_path(&workspace.path);
+            if !database_path.exists() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "workspace memory database does not exist: {}",
+                        database_path.display()
+                    ),
+                )
+                .into());
+            }
+            (
+                MemoryDatabase::open_workspace_at(database_path)?,
+                Some(workspace.id.as_str()),
+            )
+        }
+    };
+
+    let job = database
+        .dream_jobs_for_scope(scope, workspace_id, None, 1)?
+        .into_iter()
+        .next();
+    let output = if let Some(job) = job {
+        let changes = database.dream_changes_for_job(&job.id, None, 1_000)?;
+        json!({
+            "job": job,
+            "changeCounts": {
+                "total": changes.len(),
+                "applied": changes.iter().filter(|change| change.status == MemoryDreamChangeStatus::Applied.as_str()).count(),
+                "skipped": changes.iter().filter(|change| change.status == MemoryDreamChangeStatus::Skipped.as_str()).count(),
+                "failed": changes.iter().filter(|change| change.status == MemoryDreamChangeStatus::Failed.as_str()).count(),
+            },
+            "rollbackGuidance": "Automatic Dream never hard-deletes memory facts. Use applied change beforeJson values to reverse status/field changes and remove Dream-created edges or promoted facts listed in change rows."
+        })
+    } else {
+        json!({ "job": null })
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+
+    Ok(true)
+}
+
+fn memory_dream_latest_usage() -> String {
+    format!(
+        "usage: foco {MEMORY_DREAM_LATEST_COMMAND} global | foco {MEMORY_DREAM_LATEST_COMMAND} workspace <workspace-id>"
+    )
 }
 
 async fn run_server_until_shutdown(

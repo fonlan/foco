@@ -5,6 +5,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
+    time::Instant,
 };
 
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
@@ -36,6 +37,9 @@ const MEMORY_DREAM_PLANNER_TIMEOUT_MS: u64 = 60_000;
 const MEMORY_DREAM_PLANNER_MAX_OUTPUT_TOKENS: u32 = 2048;
 const MEMORY_DREAM_PLANNER_MAX_EDGE_RECORDS: u32 = 80;
 const MEMORY_DREAM_TRANSCRIPT_MAX_CHARS: usize = 6_000;
+const MEMORY_DREAM_ROLLBACK_GUIDANCE: &str = "Automatic Dream never hard-deletes memory facts. \
+Recovery is status/field reversal from applied change beforeJson plus cleanup of Dream-created edges \
+or promoted facts recorded in change rows.";
 const MEMORY_DREAM_PLANNER_SYSTEM_PROMPT: &str = "\
 Plan conservative Foco memory maintenance changes from the provided compact audit input. \
 Use the submit_memory_dream_changeset tool exactly once. Do not return prose. \
@@ -314,6 +318,7 @@ pub(crate) async fn run_memory_dream_job(
     database: &mut MemoryDatabase,
     request: MemoryDreamJobRequest<'_>,
 ) -> Result<MemoryDreamJobResult, ApiError> {
+    let started_at = Instant::now();
     let policy = MemoryDreamSafetyPolicy::new(
         request.settings.max_facts_per_run as usize,
         request.settings.max_changes_per_run as usize,
@@ -372,6 +377,15 @@ pub(crate) async fn run_memory_dream_job(
             error_message: None,
         })
         .map_err(ApiError::from_memory_error)?;
+    tracing::info!(
+        job_id = %job_id,
+        scope = request.scope.as_str(),
+        workspace_id = request.workspace_id,
+        trigger_type = request.trigger_type.as_str(),
+        mode = request.mode.as_str(),
+        model_id = job_model_id,
+        "Memory Dream job started"
+    );
 
     let mut transcript = MemoryDreamTranscript::create(request, &job_id, &input_summary_json)?;
     if let Some(transcript_chat_id) = transcript.chat_id() {
@@ -415,24 +429,50 @@ pub(crate) async fn run_memory_dream_job(
                     "summary": summary.to_json(),
                 }),
             );
+            tracing::info!(
+                job_id = %job_id,
+                scope = request.scope.as_str(),
+                workspace_id = request.workspace_id,
+                candidates_considered = summary.candidates_considered,
+                deterministic_changes_proposed = summary.deterministic_changes_proposed,
+                llm_changes_proposed = summary.llm_changes_proposed,
+                changes_applied = summary.changes_applied,
+                changes_skipped = summary.changes_skipped,
+                changes_failed = summary.changes_failed,
+                profiles_refreshed = summary.profiles_refreshed,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "Memory Dream job completed"
+            );
             output_summary_json
         }
         Err(error) => {
             let error_message = error.message.clone();
+            let failure_summary = DreamRunSummary::failed(&error);
+            let output_summary_json = failure_summary.to_json().to_string();
             transcript.record_json(
                 "final status",
                 json!({
                     "status": MemoryDreamJobStatus::Failed.as_str(),
                     "errorMessage": &error_message,
+                    "summary": failure_summary.to_json(),
                 }),
             );
             let _ = database.update_dream_job_status(UpdateMemoryDreamJob {
                 id: &job_id,
                 status: MemoryDreamJobStatus::Failed,
-                output_summary_json: None,
+                output_summary_json: Some(&output_summary_json),
                 transcript_chat_id: None,
                 error_message: Some(&error_message),
             });
+            tracing::error!(
+                job_id = %job_id,
+                scope = request.scope.as_str(),
+                workspace_id = request.workspace_id,
+                failure_category = failure_summary.failure_category.unwrap_or("unknown"),
+                error = %error_message,
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "Memory Dream job failed"
+            );
             return Err(error);
         }
     };
@@ -477,6 +517,14 @@ async fn run_memory_dream_job_inner(
         .map_err(ApiError::from_memory_error)?;
     let mut changes = deterministic_changes(database, request.scope, &candidates, policy)
         .map_err(ApiError::from_memory_error)?;
+    tracing::info!(
+        job_id,
+        scope = request.scope.as_str(),
+        workspace_id = request.workspace_id,
+        candidates_considered = candidates.len(),
+        deterministic_changes_proposed = changes.len(),
+        "Memory Dream deterministic planning completed"
+    );
     transcript.record_json(
         "deterministic candidates",
         json!({
@@ -513,6 +561,15 @@ async fn run_memory_dream_job_inner(
         .map_err(ApiError::from_memory_error)?;
     let mut profiles_refreshed = refresh_dream_profiles(database, request.scope, &apply_summary)
         .map_err(ApiError::from_memory_error)?;
+    tracing::info!(
+        job_id,
+        scope = request.scope.as_str(),
+        workspace_id = request.workspace_id,
+        changes_applied = apply_summary.applied,
+        changes_failed = apply_summary.failed,
+        profiles_refreshed,
+        "Memory Dream deterministic changes applied"
+    );
     transcript.record_json(
         "applied changes summary",
         json!({
@@ -572,6 +629,13 @@ async fn run_memory_dream_job_inner(
             Ok(validated_changes) => {
                 llm_planner = "applied";
                 llm_changes_proposed = validated_changes.len();
+                tracing::info!(
+                    job_id,
+                    scope = request.scope.as_str(),
+                    workspace_id = request.workspace_id,
+                    llm_changes_proposed,
+                    "Memory Dream LLM planning completed"
+                );
                 let llm_apply_summary = apply_llm_changes(
                     database,
                     job_id,
@@ -602,6 +666,15 @@ async fn run_memory_dream_job_inner(
                         "profilesRefreshed": profiles_refreshed,
                     }),
                 );
+                tracing::info!(
+                    job_id,
+                    scope = request.scope.as_str(),
+                    workspace_id = request.workspace_id,
+                    changes_applied = llm_applied,
+                    changes_failed = llm_failed,
+                    profiles_refreshed,
+                    "Memory Dream LLM changes applied"
+                );
             }
             Err(error)
                 if request.trigger_type != MemoryDreamTriggerType::Manual
@@ -614,6 +687,14 @@ async fn run_memory_dream_job_inner(
                         "fallback": llm_planner,
                         "errorMessage": &error.message,
                     }),
+                );
+                tracing::warn!(
+                    job_id,
+                    scope = request.scope.as_str(),
+                    workspace_id = request.workspace_id,
+                    failure_category = dream_failure_category(&error),
+                    error = %error.message,
+                    "Memory Dream LLM planner fell back to deterministic-only"
                 );
                 llm_error = Some(error.message);
                 changes_skipped = 1;
@@ -641,6 +722,8 @@ async fn run_memory_dream_job_inner(
         profiles_refreshed,
         llm_planner,
         llm_error,
+        failure_category: None,
+        error_message: None,
     })
 }
 
@@ -2506,11 +2589,38 @@ struct DreamRunSummary {
     profiles_refreshed: usize,
     llm_planner: &'static str,
     llm_error: Option<String>,
+    failure_category: Option<&'static str>,
+    error_message: Option<String>,
 }
 
 impl DreamRunSummary {
+    fn failed(error: &ApiError) -> Self {
+        Self {
+            candidates_considered: 0,
+            deterministic_changes_proposed: 0,
+            llm_changes_proposed: 0,
+            changes_applied: 0,
+            changes_skipped: 0,
+            changes_failed: 0,
+            profiles_refreshed: 0,
+            llm_planner: "failed",
+            llm_error: None,
+            failure_category: Some(dream_failure_category(error)),
+            error_message: Some(error.message.clone()),
+        }
+    }
+
     fn to_json(&self) -> Value {
+        let summary = if let Some(failure_category) = self.failure_category {
+            format!("Memory Dream failed: {failure_category}")
+        } else {
+            format!(
+                "{} changes applied, {} skipped, {} failed",
+                self.changes_applied, self.changes_skipped, self.changes_failed
+            )
+        };
         json!({
+            "summary": summary,
             "candidatesConsidered": self.candidates_considered,
             "deterministicChangesProposed": self.deterministic_changes_proposed,
             "llmChangesProposed": self.llm_changes_proposed,
@@ -2520,8 +2630,50 @@ impl DreamRunSummary {
             "profilesRefreshed": self.profiles_refreshed,
             "llmPlanner": self.llm_planner,
             "llmError": self.llm_error,
+            "failureCategory": self.failure_category,
+            "errorMessage": self.error_message,
+            "rollbackGuidance": MEMORY_DREAM_ROLLBACK_GUIDANCE,
         })
     }
+}
+
+fn dream_failure_category(error: &ApiError) -> &'static str {
+    let message = error.message.to_ascii_lowercase();
+    if message.contains("cancel") || message.contains("shutdown") || message.contains("interrupted")
+    {
+        return "cancelled_shutdown";
+    }
+    if message.contains("malformed memory dream planner json")
+        || message.contains("did not call")
+        || message.contains("returned text instead")
+        || message.contains("unsupported tool")
+    {
+        return "malformed_llm_output";
+    }
+    if message.contains("not configured")
+        || message.contains("requires a configured model")
+        || message.contains("audit workspace")
+    {
+        return "config_error";
+    }
+    if message.contains("model")
+        || message.contains("provider")
+        || message.contains("stream failed")
+        || message.contains("timed out")
+    {
+        return "model_unavailable";
+    }
+    if message.contains("target changed before apply")
+        || message.contains("sqlite")
+        || message.contains("database")
+    {
+        return "database_conflict";
+    }
+    if error.status == axum::http::StatusCode::BAD_REQUEST {
+        return "validation_failed";
+    }
+
+    "config_error"
 }
 
 fn now_minus_days(days: i64) -> String {
@@ -3055,6 +3207,55 @@ mod tests {
             .expect_err("manual dream without planner should fail");
 
         assert!(error.message.contains("requires a configured model"));
+        let job = database
+            .dream_jobs_for_scope(MemoryDreamScope::Global, None, None, 1)
+            .expect("dream jobs")
+            .into_iter()
+            .next()
+            .expect("failed job");
+        let output: Value = serde_json::from_str(
+            job.output_summary_json
+                .as_deref()
+                .expect("failed output summary"),
+        )
+        .expect("failed summary json");
+        assert_eq!(output["failureCategory"], "config_error");
+        assert!(
+            output["rollbackGuidance"]
+                .as_str()
+                .expect("rollback guidance")
+                .contains("never hard-deletes")
+        );
+    }
+
+    #[test]
+    fn dream_failure_category_covers_phase10_labels() {
+        assert_eq!(
+            dream_failure_category(&ApiError::bad_request("requires a configured model")),
+            "config_error"
+        );
+        assert_eq!(
+            dream_failure_category(&ApiError::internal("provider stream failed")),
+            "model_unavailable"
+        );
+        assert_eq!(
+            dream_failure_category(&ApiError::bad_request(
+                "malformed memory Dream planner JSON"
+            )),
+            "malformed_llm_output"
+        );
+        assert_eq!(
+            dream_failure_category(&ApiError::bad_request("non-candidate fact id")),
+            "validation_failed"
+        );
+        assert_eq!(
+            dream_failure_category(&ApiError::internal("target changed before apply")),
+            "database_conflict"
+        );
+        assert_eq!(
+            dream_failure_category(&ApiError::internal("app shutdown requested")),
+            "cancelled_shutdown"
+        );
     }
 
     #[tokio::test]
