@@ -44,8 +44,8 @@ use foco_providers::{
 use foco_store::{
     config::{
         AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
-        ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL, FocoPaths,
-        GlobalConfig, HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings,
+        ApiAuditSettings, ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, DEFAULT_TERMINAL_SHELL,
+        FocoPaths, GlobalConfig, HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings,
         ModelLimits, ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES,
         SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS,
         SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings, SystemPromptSettings, WebServerSettings,
@@ -236,6 +236,8 @@ const GIT_COMMIT_MESSAGE_TOOL_NAME: &str = "submit_commit_message";
 const GIT_COMMIT_MESSAGE_TIMEOUT_MS: u64 = 60_000;
 const GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS: u32 = 256;
 const GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS: usize = 60_000;
+const API_AUDIT_CLEANUP_STARTUP_DELAY_SECS: u64 = 30;
+const API_AUDIT_CLEANUP_INTERVAL_SECS: u64 = 6 * 60 * 60;
 const GIT_COMMIT_MESSAGE_SYSTEM_PROMPT: &str = "\
 Generate one concise Git commit message for the staged changes only. \
 Use the submit_commit_message tool exactly once. Do not return prose. \
@@ -726,6 +728,7 @@ async fn run_server_until_shutdown(
     let scheduled_task_scheduler_task =
         scheduled_task_scheduler.spawn(state.clone(), scheduled_task_scheduler_wake_rx);
     let memory_dream_scheduler_task = memory_dream_scheduler.spawn(state.clone());
+    let api_audit_cleanup_task = spawn_api_audit_cleanup_scheduler(state.clone());
     agent_scheduler
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
@@ -765,10 +768,12 @@ async fn run_server_until_shutdown(
         agent_scheduler_task.abort();
         scheduled_task_scheduler_task.abort();
         memory_dream_scheduler_task.abort();
+        api_audit_cleanup_task.abort();
     }
     let _ = agent_scheduler_task.await;
     let _ = scheduled_task_scheduler_task.await;
     let _ = memory_dream_scheduler_task.await;
+    let _ = api_audit_cleanup_task.await;
     server_result?;
 
     Ok(())
@@ -798,6 +803,117 @@ fn initialize_workspace_databases_for_startup(
     }
 
     Ok(count)
+}
+
+fn spawn_api_audit_cleanup_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut shutdown_rx = state.app_shutdown_rx.clone();
+        if sleep_until_shutdown(
+            &mut shutdown_rx,
+            Duration::from_secs(API_AUDIT_CLEANUP_STARTUP_DELAY_SECS),
+        )
+        .await
+        {
+            return;
+        }
+
+        loop {
+            let config = match config_snapshot(&state) {
+                Ok(config) => config,
+                Err(error) => {
+                    tracing::warn!(error = %error.message, "API audit cleanup skipped");
+                    if sleep_until_shutdown(
+                        &mut shutdown_rx,
+                        Duration::from_secs(API_AUDIT_CLEANUP_INTERVAL_SECS),
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            run_api_audit_cleanup_in_background(config).await;
+            if sleep_until_shutdown(
+                &mut shutdown_rx,
+                Duration::from_secs(API_AUDIT_CLEANUP_INTERVAL_SECS),
+            )
+            .await
+            {
+                return;
+            }
+        }
+    })
+}
+
+pub(crate) fn spawn_api_audit_cleanup_once(state: AppState, config: GlobalConfig) {
+    if *state.app_shutdown_rx.borrow() {
+        return;
+    }
+    tokio::spawn(async move {
+        run_api_audit_cleanup_in_background(config).await;
+    });
+}
+
+async fn run_api_audit_cleanup_in_background(config: GlobalConfig) {
+    match tokio::task::spawn_blocking(move || prune_api_audit_details_for_config(&config)).await {
+        Ok(Ok(pruned_count)) => {
+            tracing::info!(pruned_count, "API audit cleanup completed");
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error.message, "API audit cleanup failed");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "API audit cleanup task failed");
+        }
+    }
+}
+
+async fn sleep_until_shutdown(shutdown_rx: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    if *shutdown_rx.borrow() {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => false,
+        changed = shutdown_rx.changed() => changed.is_err() || *shutdown_rx.borrow(),
+    }
+}
+
+fn prune_api_audit_details_for_config(config: &GlobalConfig) -> Result<i64, ApiError> {
+    let cutoff = api_audit_detail_cutoff(config);
+    let mut total_pruned = 0_i64;
+
+    for workspace in &config.workspaces {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        let pruned = database
+            .prune_llm_request_details_before(&cutoff)
+            .map_err(ApiError::from_workspace_error)?;
+        total_pruned = total_pruned.saturating_add(pruned);
+        if pruned > 0 {
+            tracing::info!(
+                workspace_id = %workspace.id,
+                workspace_path = %workspace.path.display(),
+                pruned,
+                cutoff,
+                "pruned API request details"
+            );
+        }
+    }
+
+    Ok(total_pruned)
+}
+
+fn api_audit_detail_cutoff(config: &GlobalConfig) -> String {
+    let now = Utc::now();
+    let cutoff = if config.app.api_audit.save_request_response_details {
+        now - ChronoDuration::days(i64::from(
+            config.app.api_audit.request_detail_retention_days,
+        ))
+    } else {
+        now
+    };
+    cutoff.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 fn recently_active_code_graph_workspaces(
@@ -1665,6 +1781,25 @@ fn normalize_web_server_settings(
     })
 }
 
+fn normalize_api_audit_settings(
+    current: &ApiAuditSettings,
+    request: Option<&ManualApiAuditSettingsRequest>,
+) -> Result<ApiAuditSettings, ApiError> {
+    let Some(request) = request else {
+        return Ok(current.clone());
+    };
+    if request.request_detail_retention_days == 0 {
+        return Err(ApiError::bad_request(
+            "API request detail retention days must be greater than 0",
+        ));
+    }
+
+    Ok(ApiAuditSettings {
+        request_detail_retention_days: request.request_detail_retention_days,
+        save_request_response_details: request.save_request_response_details,
+    })
+}
+
 fn normalize_prompt_file_paths(files: Vec<String>) -> Result<Vec<PathBuf>, ApiError> {
     let mut normalized = Vec::with_capacity(files.len());
     let mut seen = HashSet::new();
@@ -1939,6 +2074,7 @@ struct WorkspaceLogoFile {
 struct ManualGeneralSettingsRequest {
     auto_start_enabled: Option<bool>,
     default_team_mode_enabled: Option<bool>,
+    api_audit: Option<ManualApiAuditSettingsRequest>,
     listen_host: String,
     listen_port: u32,
     llm_request_retry_count: Option<u32>,
@@ -1947,6 +2083,13 @@ struct ManualGeneralSettingsRequest {
     hook_audit_enabled: Option<bool>,
     password: Option<String>,
     clear_password: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualApiAuditSettingsRequest {
+    request_detail_retention_days: u32,
+    save_request_response_details: bool,
 }
 
 #[derive(Deserialize)]
@@ -2420,6 +2563,7 @@ struct GithubReleaseAsset {
 struct GeneralSettingsSummary {
     auto_start_enabled: bool,
     default_team_mode_enabled: bool,
+    api_audit: ApiAuditSettingsSummary,
     web_server: WebServerSettingsSummary,
     llm_request_retry_count: u32,
     max_llm_request_retry_count: u32,
@@ -2428,6 +2572,13 @@ struct GeneralSettingsSummary {
     hook_audit_enabled: bool,
     supported_languages: Vec<AppLanguageSummary>,
     supported_themes: Vec<AppThemeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiAuditSettingsSummary {
+    request_detail_retention_days: u32,
+    save_request_response_details: bool,
 }
 
 #[derive(Serialize)]
@@ -3495,7 +3646,7 @@ struct MemoryPromptSearch {
 }
 
 #[derive(Clone)]
-struct CapturedAuditEvent {
+pub(crate) struct CapturedAuditEvent {
     event_at: String,
     event_type: String,
     normalized_event_json: String,
@@ -3715,6 +3866,7 @@ fn persist_completed_llm_request(
 ) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
+    let save_details = api_audit_save_details(&context.global_config);
     database
         .update_llm_request_outcome(
             &request.id,
@@ -3729,15 +3881,22 @@ fn persist_completed_llm_request(
                 total_latency_ms: Some(request.outcome.total_latency_ms),
                 status_code: request.outcome.status_code,
                 final_state: request.outcome.final_state,
-                response_body_json: request.outcome.response_body_json.as_deref(),
+                response_body_json: request
+                    .outcome
+                    .response_body_json
+                    .as_deref()
+                    .and_then(|value| api_audit_detail_json(value, save_details)),
             },
         )
         .map_err(ApiError::from_workspace_error)?;
-    let existing_event_count = database
-        .llm_request_events(&request.id)
+    let next_sequence = database
+        .llm_request_event_next_sequence(&request.id)
         .map_err(ApiError::from_workspace_error)?
-        .len();
-    for (index, event) in request.events.iter().enumerate().skip(existing_event_count) {
+        .max(1);
+    for (index, event) in compact_audit_events(&request.events, save_details)
+        .into_iter()
+        .filter(|(index, _)| *index >= next_sequence)
+    {
         let sequence = i64::try_from(index).map_err(|_| {
             ApiError::internal("too many LLM request events to fit SQLite sequence")
         })?;
@@ -4911,6 +5070,7 @@ impl PreparedChatContext {
                                 let stop_text = assistant_message_text.clone();
                                 let stop_summary = self.hook_runtime.run_hooks(HookRunRequest {
                                     global_config: &self.global_hooks,
+                                    api_audit_save_details: api_audit_save_details(&self.global_config),
                                     workspace_id: &self.workspace_id,
                                     workspace_path: &self.workspace_path,
                                     event: "Stop",
@@ -5218,6 +5378,7 @@ impl PreparedChatContext {
                                     self.mcp_registry.clone(),
                                     self.hook_runtime.clone(),
                                     self.global_hooks.clone(),
+                                    api_audit_save_details(&self.global_config),
                                     self.provider_config.clone(),
                                     self.global_config.web_search.clone(),
                                     self.question_registry.clone(),
@@ -5375,6 +5536,7 @@ impl PreparedChatContext {
                             }
                             let batch_summary = self.hook_runtime.run_hooks(HookRunRequest {
                                 global_config: &self.global_hooks,
+                                api_audit_save_details: api_audit_save_details(&self.global_config),
                                 workspace_id: &self.workspace_id,
                                 workspace_path: &self.workspace_path,
                                 event: "PostToolBatch",
@@ -5740,6 +5902,7 @@ async fn prepare_chat_context(
         .hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &config.hooks,
+            api_audit_save_details: api_audit_save_details(&config),
             workspace_id: &prompt_context.workspace_id,
             workspace_path: &prompt_context.workspace_path,
             event: "UserPromptSubmit",
@@ -5790,6 +5953,7 @@ async fn prepare_chat_context(
         .hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &config.hooks,
+            api_audit_save_details: api_audit_save_details(&config),
             workspace_id: &prompt_context.workspace_id,
             workspace_path: &prompt_context.workspace_path,
             event: "SessionStart",
@@ -6228,6 +6392,7 @@ pub(crate) async fn generate_git_commit_message(
         "commit message submission tool",
         GIT_COMMIT_MESSAGE_TIMEOUT_MS,
         0,
+        api_audit_save_details(config),
     )
     .await?;
     let message = arguments
@@ -6253,6 +6418,7 @@ async fn audited_provider_tool_request(
     tool_label: &str,
     timeout_ms: u64,
     retry_count: u32,
+    save_details: bool,
 ) -> Result<Value, ApiError> {
     let request_body_json = serialize_provider_request(&request)?;
 
@@ -6284,7 +6450,7 @@ async fn audited_provider_tool_request(
                 total_latency_ms: None,
                 status_code: None,
                 final_state: "running",
-                request_body_json: Some(&request_body_json),
+                request_body_json: api_audit_detail_json(&request_body_json, save_details),
                 response_body_json: None,
             })
             .map_err(ApiError::from_workspace_error)?;
@@ -6350,14 +6516,24 @@ async fn audited_provider_tool_request(
                             total_latency_ms: Some(elapsed_millis(started_at)),
                             status_code: Some(200),
                             final_state: "succeeded",
-                            response_body_json: Some(&response_body_json),
+                            response_body_json: api_audit_detail_json(
+                                &response_body_json,
+                                save_details,
+                            ),
                         },
                     )
                     .map_err(ApiError::from_workspace_error)?;
-                persist_audited_provider_events(&mut database, &request_id, &events, 1)?;
+                persist_audited_provider_events(
+                    &mut database,
+                    &request_id,
+                    &events,
+                    1,
+                    save_details,
+                )?;
                 return Ok(tool_arguments);
             }
             Err(error) => {
+                let error_body_json = json!({ "error": &error.message }).to_string();
                 database
                     .update_llm_request_outcome(
                         &request_id,
@@ -6372,8 +6548,9 @@ async fn audited_provider_tool_request(
                             total_latency_ms: Some(elapsed_millis(started_at)),
                             status_code: error.status_code,
                             final_state: "failed",
-                            response_body_json: Some(
-                                &json!({ "error": &error.message }).to_string(),
+                            response_body_json: api_audit_detail_json(
+                                &error_body_json,
+                                save_details,
                             ),
                         },
                     )
@@ -6567,8 +6744,17 @@ fn persist_audited_provider_events(
     request_id: &str,
     events: &[NeutralChatStreamEvent],
     sequence_offset: i64,
+    save_details: bool,
 ) -> Result<(), ApiError> {
-    for (index, event) in events.iter().enumerate() {
+    if !save_details {
+        return Ok(());
+    }
+
+    let captured_events = events
+        .iter()
+        .map(captured_provider_event)
+        .collect::<Vec<_>>();
+    for (index, captured) in compact_audit_events(&captured_events, true) {
         let sequence = sequence_offset
             .checked_add(i64::try_from(index).map_err(|_| {
                 ApiError::internal("too many LLM request events to fit SQLite sequence")
@@ -6576,7 +6762,6 @@ fn persist_audited_provider_events(
             .ok_or_else(|| {
                 ApiError::internal("too many LLM request events to fit SQLite sequence")
             })?;
-        let captured = captured_provider_event(event);
         database
             .insert_llm_request_event(NewLlmRequestEvent {
                 id: &format!("{request_id}-event-{sequence}"),
@@ -7089,6 +7274,7 @@ async fn failed_chat_audit_outcome(
         .hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &context.global_hooks,
+            api_audit_save_details: api_audit_save_details(&context.global_config),
             workspace_id: &context.workspace_id,
             workspace_path: &context.workspace_path,
             event: "StopFailure",
@@ -7227,6 +7413,7 @@ async fn session_end_hook(
         .hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &context.global_hooks,
+            api_audit_save_details: api_audit_save_details(&context.global_config),
             workspace_id: &context.workspace_id,
             workspace_path: &context.workspace_path,
             event: "SessionEnd",
@@ -7299,6 +7486,58 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         normalized_event_json: serde_json::to_string(event)
             .expect("chat SSE events are always serializable"),
     }
+}
+
+pub(crate) fn api_audit_save_details(config: &GlobalConfig) -> bool {
+    config.app.api_audit.save_request_response_details
+}
+
+pub(crate) fn api_audit_detail_json<'a>(value: &'a str, save_details: bool) -> Option<&'a str> {
+    save_details.then_some(value)
+}
+
+pub(crate) fn compact_audit_events(
+    events: &[CapturedAuditEvent],
+    save_details: bool,
+) -> Vec<(usize, &CapturedAuditEvent)> {
+    if !save_details {
+        return events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| event.event_type == "start")
+            .collect();
+    }
+
+    let mut last_tool_call_event_by_id = HashMap::<String, usize>::new();
+    for (index, event) in events.iter().enumerate() {
+        if event.event_type == "tool_call"
+            && let Some(tool_call_id) = audit_event_tool_call_id(event)
+        {
+            last_tool_call_event_by_id.insert(tool_call_id, index);
+        }
+    }
+
+    events
+        .iter()
+        .enumerate()
+        .filter(|(index, event)| {
+            if event.event_type != "tool_call" {
+                return true;
+            }
+            let Some(tool_call_id) = audit_event_tool_call_id(event) else {
+                return true;
+            };
+            last_tool_call_event_by_id.get(&tool_call_id) == Some(index)
+        })
+        .collect()
+}
+
+fn audit_event_tool_call_id(event: &CapturedAuditEvent) -> Option<String> {
+    let value = serde_json::from_str::<Value>(&event.normalized_event_json).ok()?;
+    let tool_call = value.get("toolCall").or_else(|| value.get("tool_call"))?;
+    string_json_field(tool_call, "callId", "call_id")
+        .or_else(|| string_json_field(tool_call, "id", "id"))
+        .map(ToString::to_string)
 }
 
 fn sse_event(event: &ChatSseEvent) -> Event {

@@ -25,6 +25,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 
+use crate::api_audit_detail_json;
+
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 60_000;
 const HOOK_OUTPUT_PREVIEW_CHARS: usize = 4000;
 
@@ -194,6 +196,7 @@ impl HookRuntime {
 
 pub struct HookRunRequest<'a> {
     pub global_config: &'a HookConfig,
+    pub api_audit_save_details: bool,
     pub workspace_id: &'a str,
     pub workspace_path: &'a Path,
     pub event: &'a str,
@@ -212,6 +215,7 @@ pub struct HookRunRequest<'a> {
 
 struct OwnedHookRunRequest {
     global_config: HookConfig,
+    api_audit_save_details: bool,
     workspace_id: String,
     workspace_path: PathBuf,
     event: String,
@@ -232,6 +236,7 @@ impl<'a> HookRunRequest<'a> {
     fn to_owned_request(&self) -> OwnedHookRunRequest {
         OwnedHookRunRequest {
             global_config: (*self.global_config).clone(),
+            api_audit_save_details: self.api_audit_save_details,
             workspace_id: self.workspace_id.to_string(),
             workspace_path: self.workspace_path.to_path_buf(),
             event: self.event.to_string(),
@@ -254,6 +259,7 @@ impl OwnedHookRunRequest {
     fn as_request(&self) -> HookRunRequest<'_> {
         HookRunRequest {
             global_config: &self.global_config,
+            api_audit_save_details: self.api_audit_save_details,
             workspace_id: &self.workspace_id,
             workspace_path: &self.workspace_path,
             event: &self.event,
@@ -793,6 +799,7 @@ struct AuditedPromptHookStream {
     request_id: String,
     started_at: Instant,
     events: Vec<NeutralChatStreamEvent>,
+    save_details: bool,
 }
 
 impl AuditedPromptHookStream {
@@ -807,6 +814,12 @@ impl AuditedPromptHookStream {
             WorkspaceDatabase::open_or_create(&self.workspace_path).map_err(|source| {
                 format!("failed to open workspace database for prompt hook audit: {source}")
             })?;
+        let response_body_json = json!({
+            "requestKind": "prompt hook",
+            "text": output,
+            "usage": usage,
+        })
+        .to_string();
         database
             .update_llm_request_outcome(
                 &self.request_id,
@@ -821,13 +834,9 @@ impl AuditedPromptHookStream {
                     total_latency_ms: Some(elapsed_millis(self.started_at)),
                     status_code: Some(200),
                     final_state: "succeeded",
-                    response_body_json: Some(
-                        &json!({
-                            "requestKind": "prompt hook",
-                            "text": output,
-                            "usage": usage,
-                        })
-                        .to_string(),
+                    response_body_json: api_audit_detail_json(
+                        &response_body_json,
+                        self.save_details,
                     ),
                 },
             )
@@ -844,10 +853,14 @@ impl AuditedPromptHookStream {
             self.started_at,
             None,
             message,
+            self.save_details,
         )
     }
 
     fn persist_events(&self, database: &mut WorkspaceDatabase) -> Result<(), String> {
+        if !self.save_details {
+            return Ok(());
+        }
         for (index, event) in self.events.iter().enumerate() {
             let sequence = i64::try_from(index + 1)
                 .map_err(|_| "too many prompt hook LLM audit events".to_string())?;
@@ -913,7 +926,10 @@ async fn audited_prompt_hook_stream(
             total_latency_ms: None,
             status_code: None,
             final_state: "running",
-            request_body_json: Some(&request_body_json),
+            request_body_json: api_audit_detail_json(
+                &request_body_json,
+                request.api_audit_save_details,
+            ),
             response_body_json: None,
         })
         .map_err(|source| format!("failed to insert prompt hook LLM audit: {source}"))?;
@@ -952,6 +968,7 @@ async fn audited_prompt_hook_stream(
             request_id,
             started_at,
             events: Vec::new(),
+            save_details: request.api_audit_save_details,
         }),
         Ok(Err(source)) => {
             fail_prompt_hook_audit(
@@ -960,6 +977,7 @@ async fn audited_prompt_hook_stream(
                 started_at,
                 source.status_code().map(i64::from),
                 &format!("prompt hook provider call failed: {source}"),
+                request.api_audit_save_details,
             )?;
             Err(format!("prompt hook provider call failed: {source}"))
         }
@@ -971,6 +989,7 @@ async fn audited_prompt_hook_stream(
                 started_at,
                 None,
                 &message,
+                request.api_audit_save_details,
             )?;
             Err(message)
         }
@@ -1012,10 +1031,12 @@ fn fail_prompt_hook_audit(
     started_at: std::time::Instant,
     status_code: Option<i64>,
     message: &str,
+    save_details: bool,
 ) -> Result<(), String> {
     let mut database = WorkspaceDatabase::open_or_create(workspace_path).map_err(|source| {
         format!("failed to open workspace database for prompt hook audit: {source}")
     })?;
+    let response_body_json = json!({ "error": message }).to_string();
     database
         .update_llm_request_outcome(
             request_id,
@@ -1030,7 +1051,7 @@ fn fail_prompt_hook_audit(
                 total_latency_ms: Some(elapsed_millis(started_at)),
                 status_code: status_code.filter(|code| *code > 0),
                 final_state: "failed",
-                response_body_json: Some(&json!({ "error": message }).to_string()),
+                response_body_json: api_audit_detail_json(&response_body_json, save_details),
             },
         )
         .map_err(|source| format!("failed to update prompt hook LLM audit: {source}"))?;
@@ -1362,6 +1383,7 @@ mod tests {
     ) -> HookRunRequest<'a> {
         HookRunRequest {
             global_config,
+            api_audit_save_details: true,
             workspace_id: "workspace-1",
             workspace_path,
             event,

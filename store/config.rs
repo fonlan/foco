@@ -29,6 +29,7 @@ pub const DEFAULT_APP_THEME: &str = "light";
 pub const SUPPORTED_APP_THEMES: &[&str] = &["light", "dark"];
 pub const DEFAULT_LLM_REQUEST_RETRY_COUNT: u32 = 3;
 pub const MAX_LLM_REQUEST_RETRY_COUNT: u32 = 10;
+pub const DEFAULT_API_REQUEST_DETAIL_RETENTION_DAYS: u32 = 3;
 pub const DEFAULT_TERMINAL_SHELL: &str = if cfg!(windows) { "powershell" } else { "bash" };
 pub const SUPPORTED_TERMINAL_SHELLS: &[&str] = &["powershell", "cmd", "bash", "zsh"];
 pub const SUPPORTED_API_PROXY_TYPES: &[&str] = &[HTTP_PROXY_KIND, SOCKS_PROXY_KIND];
@@ -321,6 +322,7 @@ impl GlobalConfig {
                 llm_request_retry_count: DEFAULT_LLM_REQUEST_RETRY_COUNT,
                 auto_start_enabled: false,
                 default_team_mode_enabled: false,
+                api_audit: ApiAuditSettings::default(),
                 web_server: WebServerSettings::default(),
             },
             hooks: HookConfig::default(),
@@ -367,6 +369,7 @@ impl GlobalConfig {
             &self.app.active_workspace_id,
         )?;
         validate_llm_request_retry_count(config_path, self.app.llm_request_retry_count)?;
+        validate_api_audit_settings(config_path, &self.app.api_audit)?;
         validate_app_language(config_path, &self.app.language)?;
         validate_app_theme(config_path, &self.app.theme)?;
         validate_web_server_settings(config_path, &self.app.web_server)?;
@@ -679,7 +682,31 @@ pub struct AppSettings {
     #[serde(default)]
     pub default_team_mode_enabled: bool,
     #[serde(default)]
+    pub api_audit: ApiAuditSettings,
+    #[serde(default)]
     pub web_server: WebServerSettings,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApiAuditSettings {
+    #[serde(default = "default_api_request_detail_retention_days")]
+    pub request_detail_retention_days: u32,
+    #[serde(default = "default_true")]
+    pub save_request_response_details: bool,
+}
+
+impl Default for ApiAuditSettings {
+    fn default() -> Self {
+        Self {
+            request_detail_retention_days: DEFAULT_API_REQUEST_DETAIL_RETENTION_DAYS,
+            save_request_response_details: true,
+        }
+    }
+}
+
+fn default_api_request_detail_retention_days() -> u32 {
+    DEFAULT_API_REQUEST_DETAIL_RETENTION_DAYS
 }
 
 fn default_app_language() -> String {
@@ -2193,6 +2220,20 @@ fn validate_llm_request_retry_count(
     )
 }
 
+fn validate_api_audit_settings(
+    config_path: Option<&Path>,
+    settings: &ApiAuditSettings,
+) -> Result<(), ConfigError> {
+    if settings.request_detail_retention_days > 0 {
+        return Ok(());
+    }
+
+    invalid_config(
+        config_path,
+        "app.api_audit.request_detail_retention_days must be greater than 0".to_string(),
+    )
+}
+
 fn validate_app_language(config_path: Option<&Path>, language: &str) -> Result<(), ConfigError> {
     if SUPPORTED_APP_LANGUAGES.contains(&language) {
         return Ok(());
@@ -2372,6 +2413,20 @@ mod tests {
             PathBuf::from("/tmp/foco-dev/memory.sqlite")
         );
         assert_eq!(paths.logs_dir, PathBuf::from("/tmp/foco-dev/logs"));
+    }
+
+    #[test]
+    fn api_audit_settings_default_and_validate() {
+        let mut config = GlobalConfig::first_run(PathBuf::from("/tmp/foco-workspace"));
+
+        assert_eq!(
+            config.app.api_audit.request_detail_retention_days,
+            DEFAULT_API_REQUEST_DETAIL_RETENTION_DAYS
+        );
+        assert!(config.app.api_audit.save_request_response_details);
+
+        config.app.api_audit.request_detail_retention_days = 0;
+        assert!(config.validate(None).is_err());
     }
 
     #[test]

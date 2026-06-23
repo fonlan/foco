@@ -340,6 +340,7 @@ pub(crate) async fn run_memory_extraction_job_inner(
         &provider_config,
         request,
         task.config.app.llm_request_retry_count,
+        api_audit_save_details(&task.config),
     )
     .await?;
     let output = parse_memory_extraction_output(tool_arguments)?;
@@ -640,6 +641,7 @@ pub(crate) async fn call_memory_extraction_provider(
     provider_config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
     retry_count: u32,
+    save_details: bool,
 ) -> Result<Value, ApiError> {
     audited_provider_tool_request(
         workspace_path,
@@ -653,6 +655,7 @@ pub(crate) async fn call_memory_extraction_provider(
         "submit tool",
         MEMORY_EXTRACTION_TIMEOUT_MS,
         retry_count,
+        save_details,
     )
     .await
 }
@@ -665,6 +668,7 @@ pub(crate) async fn call_memory_retrieval_provider(
     provider_config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
     retry_count: u32,
+    save_details: bool,
 ) -> Result<Value, ApiError> {
     audited_provider_tool_request(
         workspace_path,
@@ -678,6 +682,7 @@ pub(crate) async fn call_memory_retrieval_provider(
         "select tool",
         MEMORY_RETRIEVAL_TIMEOUT_MS,
         retry_count,
+        save_details,
     )
     .await
 }

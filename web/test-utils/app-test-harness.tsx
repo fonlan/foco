@@ -122,6 +122,10 @@ export const settings = {
     },
   ],
   general: {
+    apiAudit: {
+      requestDetailRetentionDays: 3,
+      saveRequestResponseDetails: true,
+    },
     autoStartEnabled: false,
     defaultTeamModeEnabled: false,
     hookAuditEnabled: false,

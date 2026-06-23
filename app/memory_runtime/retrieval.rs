@@ -381,6 +381,7 @@ async fn relevant_memory_facts_llm(
         &provider_config,
         request,
         config.app.llm_request_retry_count,
+        api_audit_save_details(config),
     )
     .await?;
     let selected = parse_memory_retrieval_output(output)?;

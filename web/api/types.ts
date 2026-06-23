@@ -974,7 +974,13 @@ type AppThemeSummary = {
   name: string;
 };
 
+type ApiAuditSettingsSummary = {
+  requestDetailRetentionDays: number;
+  saveRequestResponseDetails: boolean;
+};
+
 export type GeneralSettingsSummary = {
+  apiAudit: ApiAuditSettingsSummary;
   autoStartEnabled: boolean;
   defaultTeamModeEnabled: boolean;
   hookAuditEnabled: boolean;
@@ -988,6 +994,8 @@ export type GeneralSettingsSummary = {
 };
 
 export type GeneralFormState = {
+  apiRequestDetailRetentionDays: string;
+  apiSaveRequestResponseDetails: boolean;
   autoStartEnabled: boolean;
   hookAuditEnabled: boolean;
   language: string;

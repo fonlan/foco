@@ -199,6 +199,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
+    api_audit_save_details: bool,
     provider_config: ProviderConnectionConfig,
     web_search_settings: WebSearchSettings,
     question_registry: QuestionRegistry,
@@ -235,6 +236,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                         mcp_registry.clone(),
                         hook_runtime.clone(),
                         global_hooks.clone(),
+                        api_audit_save_details,
                         provider_config.clone(),
                         web_search_settings.clone(),
                         question_registry.clone(),
@@ -273,6 +275,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                     let mcp_registry = mcp_registry.clone();
                     let hook_runtime = hook_runtime.clone();
                     let global_hooks = global_hooks.clone();
+                    let api_audit_save_details = api_audit_save_details;
                     let provider_config = provider_config.clone();
                     let web_search_settings = web_search_settings.clone();
                     let question_registry = question_registry.clone();
@@ -296,6 +299,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                                 mcp_registry,
                                 hook_runtime,
                                 global_hooks,
+                                api_audit_save_details,
                                 provider_config,
                                 web_search_settings,
                                 question_registry,
@@ -346,6 +350,7 @@ async fn execute_tool_call(
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
+    api_audit_save_details: bool,
     provider_config: ProviderConnectionConfig,
     web_search_settings: WebSearchSettings,
     question_registry: QuestionRegistry,
@@ -372,6 +377,7 @@ async fn execute_tool_call(
         mcp_registry,
         hook_runtime.clone(),
         &global_hooks,
+        api_audit_save_details,
         &provider_config,
         &web_search_settings,
         question_registry,
@@ -412,6 +418,7 @@ async fn execute_tool_call(
     let post_summary = hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &global_hooks,
+            api_audit_save_details,
             workspace_id,
             workspace_path,
             event: post_event,
@@ -445,6 +452,7 @@ pub(crate) async fn execute_tool(
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
     global_hooks: &HookConfig,
+    api_audit_save_details: bool,
     provider_config: &ProviderConnectionConfig,
     web_search_settings: &WebSearchSettings,
     question_registry: QuestionRegistry,
@@ -474,6 +482,7 @@ pub(crate) async fn execute_tool(
     let pre_summary = hook_runtime
         .run_hooks(HookRunRequest {
             global_config: global_hooks,
+            api_audit_save_details,
             workspace_id,
             workspace_path,
             event: "PreToolUse",
@@ -523,6 +532,7 @@ pub(crate) async fn execute_tool(
                 let permission_request_summary = hook_runtime
                     .run_hooks(HookRunRequest {
                         global_config: global_hooks,
+                        api_audit_save_details,
                         workspace_id,
                         workspace_path,
                         event: "PermissionRequest",
@@ -568,6 +578,7 @@ pub(crate) async fn execute_tool(
                         let denied_summary = hook_runtime
                             .run_hooks(HookRunRequest {
                                 global_config: global_hooks,
+                                api_audit_save_details,
                                 workspace_id,
                                 workspace_path,
                                 event: "PermissionDenied",
@@ -620,6 +631,7 @@ pub(crate) async fn execute_tool(
                         let denied_summary = hook_runtime
                             .run_hooks(HookRunRequest {
                                 global_config: global_hooks,
+                                api_audit_save_details,
                                 workspace_id,
                                 workspace_path,
                                 event: "PermissionDenied",
@@ -772,6 +784,7 @@ pub(crate) async fn execute_tool(
         let ask_question = execute_ask_question(
             hook_runtime,
             global_hooks,
+            api_audit_save_details,
             provider_config,
             question_registry,
             question_event_tx,
@@ -2344,6 +2357,7 @@ async fn wait_for_builtin_tool_worker(
 async fn execute_ask_question(
     hook_runtime: HookRuntime,
     global_hooks: &HookConfig,
+    api_audit_save_details: bool,
     provider_config: &ProviderConnectionConfig,
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
@@ -2388,6 +2402,7 @@ async fn execute_ask_question(
     let elicitation_summary = hook_runtime
         .run_hooks(HookRunRequest {
             global_config: global_hooks,
+            api_audit_save_details,
             workspace_id,
             workspace_path,
             event: "Elicitation",
@@ -2428,6 +2443,7 @@ async fn execute_ask_question(
                 let result_summary = hook_runtime
                     .run_hooks(HookRunRequest {
                         global_config: global_hooks,
+                        api_audit_save_details,
                         workspace_id,
                         workspace_path,
                         event: "ElicitationResult",
@@ -2520,6 +2536,7 @@ async fn execute_ask_question(
     let result_summary = hook_runtime
         .run_hooks(HookRunRequest {
             global_config: global_hooks,
+            api_audit_save_details,
             workspace_id,
             workspace_path,
             event: "ElicitationResult",

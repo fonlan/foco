@@ -35,6 +35,10 @@ pub(crate) async fn settings_response(
             },
             llm_request_retry_count: config.app.llm_request_retry_count,
             max_llm_request_retry_count: MAX_LLM_REQUEST_RETRY_COUNT,
+            api_audit: ApiAuditSettingsSummary {
+                request_detail_retention_days: config.app.api_audit.request_detail_retention_days,
+                save_request_response_details: config.app.api_audit.save_request_response_details,
+            },
             language: config.app.language.clone(),
             theme: config.app.theme.clone(),
             hook_audit_enabled: config.hooks.audit_enabled,

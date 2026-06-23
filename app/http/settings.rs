@@ -322,6 +322,9 @@ pub(crate) async fn save_general_settings(
     let should_clear_auth_cookie = request.clear_password.unwrap_or(false);
 
     config.app.web_server = normalize_web_server_settings(&config.app.web_server, &request)?;
+    let previous_api_audit = config.app.api_audit.clone();
+    config.app.api_audit =
+        normalize_api_audit_settings(&config.app.api_audit, request.api_audit.as_ref())?;
     if let Some(retry_count) = request.llm_request_retry_count {
         config.app.llm_request_retry_count = retry_count;
     }
@@ -340,6 +343,9 @@ pub(crate) async fn save_general_settings(
     validate_tray_menu_language(&config.app.language)?;
 
     save_config(&state, config.clone())?;
+    if config.app.api_audit != previous_api_audit {
+        spawn_api_audit_cleanup_once(state.clone(), config.clone());
+    }
     notify_tray_menu_language_change(&state, &current_language, &config.app.language)?;
 
     let response = settings_response(&state, &config).await?;

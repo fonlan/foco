@@ -670,6 +670,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
         mcp_registry.clone(),
         HookRuntime::new(mcp_registry),
         &HookConfig::default(),
+        true,
         &ProviderConnectionConfig {
             kind: foco_providers::ProviderKind::OpenAiResponses,
             base_url: None,
@@ -1142,6 +1143,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
     let preserved = normalize_web_server_settings(
         &current,
         &ManualGeneralSettingsRequest {
+            api_audit: None,
             auto_start_enabled: None,
             clear_password: None,
             default_team_mode_enabled: None,
@@ -1160,6 +1162,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
     let updated = normalize_web_server_settings(
         &current,
         &ManualGeneralSettingsRequest {
+            api_audit: None,
             auto_start_enabled: None,
             clear_password: None,
             default_team_mode_enabled: None,
@@ -1184,6 +1187,7 @@ fn normalize_web_server_settings_preserves_updates_and_clears_password_hash() {
     let cleared = normalize_web_server_settings(
         &current,
         &ManualGeneralSettingsRequest {
+            api_audit: None,
             auto_start_enabled: None,
             clear_password: Some(true),
             default_team_mode_enabled: None,
@@ -3655,6 +3659,52 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
         matches!(&parts[1], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-1")
     );
     assert!(matches!(&parts[2], ChatMessagePart::Text { text } if text == "After."));
+}
+
+#[test]
+fn compact_audit_events_keeps_only_final_tool_call_delta() {
+    let events = vec![
+        CapturedAuditEvent {
+            event_at: "2026-06-18T10:00:00Z".to_string(),
+            event_type: "start".to_string(),
+            normalized_event_json: json!({ "type": "start" }).to_string(),
+        },
+        CapturedAuditEvent {
+            event_at: "2026-06-18T10:00:01Z".to_string(),
+            event_type: "tool_call".to_string(),
+            normalized_event_json: json!({
+                "type": "toolCall",
+                "toolCall": { "callId": "call-1", "arguments": { "path": "REA" } }
+            })
+            .to_string(),
+        },
+        CapturedAuditEvent {
+            event_at: "2026-06-18T10:00:02Z".to_string(),
+            event_type: "tool_call".to_string(),
+            normalized_event_json: json!({
+                "type": "toolCall",
+                "toolCall": { "callId": "call-1", "arguments": { "path": "README.md" } }
+            })
+            .to_string(),
+        },
+        CapturedAuditEvent {
+            event_at: "2026-06-18T10:00:03Z".to_string(),
+            event_type: "text_delta".to_string(),
+            normalized_event_json: json!({ "type": "textDelta", "delta": "done" }).to_string(),
+        },
+    ];
+
+    let compacted = compact_audit_events(&events, true)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(compacted, vec![0, 2, 3]);
+
+    let summary_only = compact_audit_events(&events, false)
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(summary_only, vec![0]);
 }
 
 #[test]

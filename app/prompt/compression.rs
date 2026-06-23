@@ -157,6 +157,7 @@ pub(crate) async fn ensure_context_compression(
         .hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &context.global_hooks,
+            api_audit_save_details: api_audit_save_details(&context.global_config),
             workspace_id: &context.workspace_id,
             workspace_path: &context.workspace_path,
             event: "PreCompact",
@@ -266,6 +267,7 @@ pub(crate) async fn ensure_context_compression(
         .hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &context.global_hooks,
+            api_audit_save_details: api_audit_save_details(&context.global_config),
             workspace_id: &context.workspace_id,
             workspace_path: &context.workspace_path,
             event: "PostCompact",
@@ -349,6 +351,7 @@ async fn ensure_llm_context_compression(
         .hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &context.global_hooks,
+            api_audit_save_details: api_audit_save_details(&context.global_config),
             workspace_id: &context.workspace_id,
             workspace_path: &context.workspace_path,
             event: "PreCompact",
@@ -403,6 +406,7 @@ async fn ensure_llm_context_compression(
         .hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &context.global_hooks,
+            api_audit_save_details: api_audit_save_details(&context.global_config),
             workspace_id: &context.workspace_id,
             workspace_path: &context.workspace_path,
             event: "PostCompact",
@@ -1562,6 +1566,7 @@ pub(crate) fn persist_running_llm_request(
 ) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
+    let save_details = api_audit_save_details(&context.global_config);
     database
         .insert_llm_request(NewLlmRequest {
             id: request_id,
@@ -1584,11 +1589,11 @@ pub(crate) fn persist_running_llm_request(
             total_latency_ms: None,
             status_code: None,
             final_state: "running",
-            request_body_json: Some(request_body_json),
+            request_body_json: api_audit_detail_json(request_body_json, save_details),
             response_body_json: None,
         })
         .map_err(ApiError::from_workspace_error)?;
-    persist_llm_request_events(&mut database, request_id, events, 0)
+    persist_llm_request_events(&mut database, request_id, events, 0, save_details)
 }
 
 fn persist_llm_request(
@@ -1596,6 +1601,7 @@ fn persist_llm_request(
     context: &PreparedChatContext,
     request: &CapturedLlmRequest,
 ) -> Result<(), ApiError> {
+    let save_details = api_audit_save_details(&context.global_config);
     if database
         .llm_request(&request.id)
         .map_err(ApiError::from_workspace_error)?
@@ -1615,15 +1621,24 @@ fn persist_llm_request(
                     total_latency_ms: Some(request.outcome.total_latency_ms),
                     status_code: request.outcome.status_code,
                     final_state: request.outcome.final_state,
-                    response_body_json: request.outcome.response_body_json.as_deref(),
+                    response_body_json: request
+                        .outcome
+                        .response_body_json
+                        .as_deref()
+                        .and_then(|value| api_audit_detail_json(value, save_details)),
                 },
             )
             .map_err(ApiError::from_workspace_error)?;
-        let existing_event_count = database
-            .llm_request_events(&request.id)
-            .map_err(ApiError::from_workspace_error)?
-            .len();
-        persist_llm_request_events(database, &request.id, &request.events, existing_event_count)
+        let next_sequence = database
+            .llm_request_event_next_sequence(&request.id)
+            .map_err(ApiError::from_workspace_error)?;
+        persist_llm_request_events(
+            database,
+            &request.id,
+            &request.events,
+            next_sequence,
+            save_details,
+        )
     } else {
         database
             .insert_llm_request(NewLlmRequest {
@@ -1647,11 +1662,15 @@ fn persist_llm_request(
                 total_latency_ms: Some(request.outcome.total_latency_ms),
                 status_code: request.outcome.status_code,
                 final_state: request.outcome.final_state,
-                request_body_json: Some(&request.request_body_json),
-                response_body_json: request.outcome.response_body_json.as_deref(),
+                request_body_json: api_audit_detail_json(&request.request_body_json, save_details),
+                response_body_json: request
+                    .outcome
+                    .response_body_json
+                    .as_deref()
+                    .and_then(|value| api_audit_detail_json(value, save_details)),
             })
             .map_err(ApiError::from_workspace_error)?;
-        persist_llm_request_events(database, &request.id, &request.events, 0)
+        persist_llm_request_events(database, &request.id, &request.events, 0, save_details)
     }
 }
 
@@ -1660,8 +1679,12 @@ fn persist_llm_request_events(
     request_id: &str,
     events: &[CapturedAuditEvent],
     start_index: usize,
+    save_details: bool,
 ) -> Result<(), ApiError> {
-    for (index, event) in events.iter().enumerate().skip(start_index) {
+    for (index, event) in compact_audit_events(events, save_details)
+        .into_iter()
+        .filter(|(index, _)| *index >= start_index)
+    {
         let sequence = i64::try_from(index).map_err(|_| {
             ApiError::internal("too many LLM request events to fit SQLite sequence")
         })?;

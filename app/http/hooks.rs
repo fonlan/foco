@@ -175,6 +175,7 @@ pub(crate) async fn test_hooks(
         .hook_runtime
         .run_hooks(HookRunRequest {
             global_config: &config.hooks,
+            api_audit_save_details: api_audit_save_details(&config),
             workspace_id: &workspace.id,
             workspace_path: &workspace.path,
             event,

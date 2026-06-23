@@ -15,6 +15,7 @@ import {
   Code2,
   Copy,
   ClipboardPaste,
+  Database,
   Download,
   Eye,
   EyeOff,
@@ -11720,6 +11721,11 @@ function SettingsPanel({
     setIsEditingGeneralPassword(false);
     setIsGeneralPasswordVisible(false);
     setGeneralForm({
+      apiRequestDetailRetentionDays: String(
+        data.general.apiAudit.requestDetailRetentionDays,
+      ),
+      apiSaveRequestResponseDetails:
+        data.general.apiAudit.saveRequestResponseDetails,
       autoStartEnabled: data.general.autoStartEnabled,
       hookAuditEnabled: data.general.hookAuditEnabled,
       language: data.general.language,
@@ -12259,6 +12265,13 @@ function SettingsPanel({
         );
       const data = await requestJson<SettingsResponse>("/api/settings/general", {
         body: JSON.stringify({
+          apiAudit: {
+            requestDetailRetentionDays: optionalPositiveInteger(
+              generalForm.apiRequestDetailRetentionDays,
+              t("API request detail retention days"),
+            ),
+            saveRequestResponseDetails: generalForm.apiSaveRequestResponseDetails,
+          },
           ...(shouldSaveAutoStart
             ? { autoStartEnabled: generalForm.autoStartEnabled }
             : {}),
@@ -14342,6 +14355,71 @@ function SettingsPanel({
                       value={generalForm.llmRequestRetryCount}
                     />
                   </label>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("API request detail retention days")}
+                    </span>
+                    <input
+                      autoComplete="off"
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      inputMode="numeric"
+                      min={1}
+                      onChange={(event) =>
+                        setGeneralForm((current) => ({
+                          ...current,
+                          apiRequestDetailRetentionDays: event.target.value,
+                        }))
+                      }
+                      placeholder={String(
+                        settings?.general.apiAudit.requestDetailRetentionDays ?? 3,
+                      )}
+                      step={1}
+                      type="number"
+                      value={generalForm.apiRequestDetailRetentionDays}
+                    />
+                  </label>
+                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                      {t("API request details")}
+                    </legend>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <Database
+                          aria-hidden="true"
+                          className="size-4 shrink-0 text-teal-700"
+                        />
+                        <p className="text-sm font-semibold text-stone-800">
+                          {t("Save request and response bodies")}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <CapabilityPill
+                          label={
+                            generalForm.apiSaveRequestResponseDetails
+                              ? t("enabled")
+                              : t("disabled")
+                          }
+                          ok={generalForm.apiSaveRequestResponseDetails}
+                        />
+                        <label
+                          aria-label={t("Save request and response bodies")}
+                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                        >
+                          <input
+                            checked={generalForm.apiSaveRequestResponseDetails}
+                            className="size-4 accent-teal-700"
+                            onChange={(event) =>
+                              setGeneralForm((current) => ({
+                                ...current,
+                                apiSaveRequestResponseDetails: event.target.checked,
+                              }))
+                            }
+                            type="checkbox"
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  </fieldset>
                   <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
                     <legend className="px-1 text-xs font-semibold text-stone-600">
                       {t("Startup")}
@@ -14550,7 +14628,8 @@ function SettingsPanel({
                     disabled={
                       isSavingGeneral ||
                       !generalForm.listenHost.trim() ||
-                      !generalForm.listenPort.trim()
+                      !generalForm.listenPort.trim() ||
+                      !generalForm.apiRequestDetailRetentionDays.trim()
                     }
                     title={t("Save general settings")}
                     type="submit"
@@ -20246,6 +20325,8 @@ function emptyProviderForm(): ProviderFormState {
 
 function emptyGeneralForm(): GeneralFormState {
   return {
+    apiRequestDetailRetentionDays: "3",
+    apiSaveRequestResponseDetails: true,
     autoStartEnabled: false,
     hookAuditEnabled: false,
     language: "en",

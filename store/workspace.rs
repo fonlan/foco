@@ -1557,6 +1557,68 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn llm_request_event_next_sequence(
+        &self,
+        llm_request_id: &str,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let next_sequence: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0)
+                 FROM llm_request_events
+                 WHERE llm_request_id = ?1",
+                params![llm_request_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        usize::try_from(next_sequence).map_err(|_| WorkspaceDatabaseError::InvalidAuditData {
+            message: format!("LLM request '{llm_request_id}' has an invalid next event sequence"),
+        })
+    }
+
+    pub fn prune_llm_request_details_before(
+        &mut self,
+        cutoff_started_at: &str,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let deleted_events = transaction
+            .execute(
+                "DELETE FROM llm_request_events
+                 WHERE event_type != 'start'
+                   AND llm_request_id IN (
+                        SELECT id FROM llm_requests WHERE request_started_at < ?1
+                   )",
+                params![cutoff_started_at],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let pruned_requests = transaction
+            .execute(
+                "UPDATE llm_requests
+                 SET request_body_json = NULL,
+                     response_body_json = NULL
+                 WHERE request_started_at < ?1
+                   AND (request_body_json IS NOT NULL OR response_body_json IS NOT NULL)",
+                params![cutoff_started_at],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        i64::try_from(deleted_events.saturating_add(pruned_requests)).map_err(|_| {
+            WorkspaceDatabaseError::InvalidAuditData {
+                message: "pruned LLM request detail count exceeded i64".to_string(),
+            }
+        })
+    }
+
     pub fn llm_request_events_for_chat(
         &self,
         chat_id: &str,
@@ -6401,6 +6463,9 @@ pub enum WorkspaceDatabaseError {
         field: &'static str,
         source: serde_json::Error,
     },
+    InvalidAuditData {
+        message: String,
+    },
     InvalidAuditTokens {
         message: String,
     },
@@ -6477,6 +6542,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             Self::InvalidAuditJson { field, source } => {
                 write!(formatter, "invalid LLM audit JSON in {field}: {source}")
             }
+            Self::InvalidAuditData { message } => {
+                write!(formatter, "invalid LLM audit data: {message}")
+            }
             Self::InvalidAuditTokens { message } => {
                 write!(formatter, "invalid LLM audit token usage: {message}")
             }
@@ -6543,6 +6611,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             Self::Sqlite { source, .. } => Some(source),
             Self::TodoGraphJson { source } => Some(source),
             Self::InvalidAgentRuntimeData { .. }
+            | Self::InvalidAuditData { .. }
             | Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
             | Self::InvalidMessageMetadata { .. }

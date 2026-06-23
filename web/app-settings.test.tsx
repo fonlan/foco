@@ -193,6 +193,34 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("saves API request audit settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const retentionInput = await screen.findByLabelText(
+      "API request detail retention days",
+    );
+    await userEvent.clear(retentionInput);
+    await userEvent.type(retentionInput, "7");
+    await userEvent.click(
+      screen.getByRole("checkbox", { name: "Save request and response bodies" }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Save general settings" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/settings/general",
+        expect.objectContaining({
+          body: expect.stringContaining(
+            '"apiAudit":{"requestDetailRetentionDays":7,"saveRequestResponseDetails":false}',
+          ),
+          method: "POST",
+        }),
+      );
+    });
+  });
+
   it("saves memory settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

@@ -2286,6 +2286,116 @@ fn audits_mocked_llm_request_response_and_stream_events() {
 }
 
 #[test]
+fn prunes_llm_request_details_without_deleting_statistics() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "old-request",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-audit",
+            request_started_at: "2026-06-01T00:00:00.000Z",
+            first_token_at: Some("2026-06-01T00:00:00.100Z"),
+            completed_at: Some("2026-06-01T00:00:01.000Z"),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            first_token_latency_ms: Some(100),
+            total_latency_ms: Some(1000),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: Some(r#"{"input":"large"}"#),
+            response_body_json: Some(r#"{"output":"large"}"#),
+        })
+        .expect("old request insert");
+    database
+        .insert_llm_request_event(NewLlmRequestEvent {
+            id: "old-request-event-0",
+            llm_request_id: "old-request",
+            sequence: 0,
+            event_at: "2026-06-01T00:00:00.000Z",
+            event_type: "start",
+            raw_chunk_json: None,
+            normalized_event_json: r#"{"type":"start","assistantMessageId":"message-1"}"#,
+        })
+        .expect("old start event insert");
+    database
+        .insert_llm_request_event(NewLlmRequestEvent {
+            id: "old-request-event-1",
+            llm_request_id: "old-request",
+            sequence: 1,
+            event_at: "2026-06-01T00:00:00.500Z",
+            event_type: "tool_call",
+            raw_chunk_json: None,
+            normalized_event_json: r#"{"type":"toolCall","toolCall":{"callId":"call-1"}}"#,
+        })
+        .expect("old detail event insert");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "new-request",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-audit",
+            request_started_at: "2026-06-05T00:00:00.000Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: Some(7),
+            output_tokens: Some(3),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: Some(r#"{"input":"keep"}"#),
+            response_body_json: None,
+        })
+        .expect("new request insert");
+
+    let pruned = database
+        .prune_llm_request_details_before("2026-06-03T00:00:00.000Z")
+        .expect("prune request details");
+    assert_eq!(pruned, 2);
+
+    let old_request = database
+        .llm_request("old-request")
+        .expect("old request read")
+        .expect("old request");
+    assert_eq!(old_request.input_tokens, Some(10));
+    assert_eq!(old_request.output_tokens, Some(5));
+    assert_eq!(old_request.request_body_json, None);
+    assert_eq!(old_request.response_body_json, None);
+    let old_events = database
+        .llm_request_events("old-request")
+        .expect("old events read");
+    assert_eq!(old_events.len(), 1);
+    assert_eq!(old_events[0].event_type, "start");
+
+    let new_request = database
+        .llm_request("new-request")
+        .expect("new request read")
+        .expect("new request");
+    assert_eq!(
+        new_request.request_body_json.as_deref(),
+        Some(r#"{"input":"keep"}"#)
+    );
+}
+
+#[test]
 fn stores_prompt_context_injections_for_chat_replay() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
