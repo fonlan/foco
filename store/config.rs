@@ -848,6 +848,10 @@ pub struct MemoryDreamSettings {
     pub max_changes_per_run: u32,
     #[serde(default = "default_memory_dream_scheduler_scan_minutes")]
     pub scheduler_scan_minutes: u32,
+    #[serde(default = "default_memory_dream_workspace_threshold_facts")]
+    pub workspace_threshold_facts: u32,
+    #[serde(default = "default_memory_dream_global_threshold_facts")]
+    pub global_threshold_facts: u32,
 }
 
 impl Default for MemoryDreamSettings {
@@ -863,6 +867,8 @@ impl Default for MemoryDreamSettings {
             max_facts_per_run: default_memory_dream_max_facts_per_run(),
             max_changes_per_run: default_memory_dream_max_changes_per_run(),
             scheduler_scan_minutes: default_memory_dream_scheduler_scan_minutes(),
+            workspace_threshold_facts: default_memory_dream_workspace_threshold_facts(),
+            global_threshold_facts: default_memory_dream_global_threshold_facts(),
         }
     }
 }
@@ -988,6 +994,14 @@ fn default_memory_dream_max_changes_per_run() -> u32 {
 
 fn default_memory_dream_scheduler_scan_minutes() -> u32 {
     60
+}
+
+fn default_memory_dream_workspace_threshold_facts() -> u32 {
+    50
+}
+
+fn default_memory_dream_global_threshold_facts() -> u32 {
+    50
 }
 
 fn default_system_prompt_name() -> String {
@@ -1893,6 +1907,18 @@ fn validate_memory_dream_settings(
         return invalid_config(
             config_path,
             "memory.dream.scheduler_scan_minutes must be greater than 0",
+        );
+    }
+    if settings.workspace_threshold_facts == 0 {
+        return invalid_config(
+            config_path,
+            "memory.dream.workspace_threshold_facts must be greater than 0",
+        );
+    }
+    if settings.global_threshold_facts == 0 {
+        return invalid_config(
+            config_path,
+            "memory.dream.global_threshold_facts must be greater than 0",
         );
     }
 
@@ -3046,6 +3072,8 @@ mod tests {
             max_facts_per_run: 25,
             max_changes_per_run: 10,
             scheduler_scan_minutes: 15,
+            workspace_threshold_facts: 40,
+            global_threshold_facts: 80,
         };
 
         save_global_config(&loaded.paths.config_file, &loaded.config)
@@ -3095,6 +3123,16 @@ mod tests {
         );
 
         loaded.config.memory.dream.max_changes_per_run = 50;
+        loaded.config.memory.dream.workspace_threshold_facts = 0;
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("zero workspace threshold should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("memory.dream.workspace_threshold_facts must be greater than 0")
+        );
+
+        loaded.config.memory.dream.workspace_threshold_facts = 50;
         loaded.config.memory.dream.model_id = Some("missing-model".to_string());
         let error = save_global_config(&loaded.paths.config_file, &loaded.config)
             .expect_err("missing dream model should fail");

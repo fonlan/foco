@@ -424,7 +424,7 @@ pub(crate) async fn save_memory_settings(
         .filter(|value| !value.is_empty())
         .map(str::to_string);
     let dream = match request.dream {
-        Some(dream) => memory_dream_settings_from_request(dream),
+        Some(dream) => memory_dream_settings_from_request(&config.memory.dream, dream),
         None => config.memory.dream.clone(),
     };
 
@@ -446,6 +446,7 @@ pub(crate) async fn save_memory_settings(
 }
 
 fn memory_dream_settings_from_request(
+    current: &MemoryDreamSettings,
     request: ManualMemoryDreamSettingsRequest,
 ) -> MemoryDreamSettings {
     MemoryDreamSettings {
@@ -464,6 +465,12 @@ fn memory_dream_settings_from_request(
         max_facts_per_run: request.max_facts_per_run,
         max_changes_per_run: request.max_changes_per_run,
         scheduler_scan_minutes: request.scheduler_scan_minutes,
+        workspace_threshold_facts: request
+            .workspace_threshold_facts
+            .unwrap_or(current.workspace_threshold_facts),
+        global_threshold_facts: request
+            .global_threshold_facts
+            .unwrap_or(current.global_threshold_facts),
     }
 }
 

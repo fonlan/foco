@@ -90,6 +90,8 @@ pub(crate) async fn settings_response(
                 max_facts_per_run: config.memory.dream.max_facts_per_run,
                 max_changes_per_run: config.memory.dream.max_changes_per_run,
                 scheduler_scan_minutes: config.memory.dream.scheduler_scan_minutes,
+                workspace_threshold_facts: config.memory.dream.workspace_threshold_facts,
+                global_threshold_facts: config.memory.dream.global_threshold_facts,
             },
             extraction_modes: vec![
                 MemoryExtractionModeSummary {

@@ -1489,6 +1489,26 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn dream_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<MemoryDreamJobRecord>, MemoryDatabaseError> {
+        require_non_empty("job_id", job_id)?;
+
+        self.connection
+            .query_row(
+                "SELECT id, scope, workspace_id, trigger_type, mode, status, model_id,
+                        input_summary_json, output_summary_json, transcript_chat_id,
+                        error_message, created_at, started_at, completed_at
+                 FROM memory_dream_jobs
+                 WHERE id = ?1",
+                params![job_id],
+                memory_dream_job_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.database_path, source))
+    }
+
     pub fn dream_changes_for_job(
         &self,
         job_id: &str,
@@ -1588,6 +1608,38 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
         collect_rows(rows, &self.database_path)
+    }
+
+    pub fn dream_updated_fact_count_since(
+        &self,
+        scope: MemoryDreamScope,
+        workspace_id: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<u32, MemoryDatabaseError> {
+        self.validate_dream_scope(scope, workspace_id)?;
+        if let Some(since) = since {
+            require_non_empty("since", since)?;
+        }
+
+        let scope_filter = match scope {
+            MemoryDreamScope::Global => "scope = 'global'",
+            MemoryDreamScope::Workspace => "scope IN ('workspace', 'chat')",
+        };
+        let sql = format!(
+            "SELECT COUNT(*)
+             FROM memory_facts
+             WHERE ({scope_filter})
+               AND status IN ('active', 'pending')
+               AND (?1 IS NULL OR updated_at > ?1 OR created_at > ?1)"
+        );
+        let count: i64 = self
+            .connection
+            .query_row(&sql, params![since], |row| row.get(0))
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        u32::try_from(count).map_err(|_| MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("memory Dream updated fact count exceeds u32: {count}"),
+        })
     }
 
     pub fn update_chain_target_facts(

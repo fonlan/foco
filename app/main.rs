@@ -92,11 +92,11 @@ use crate::hooks::{
 };
 use crate::http::memory::{EditMemorySourceRequest, refresh_memory_profile};
 use crate::memory_runtime::{
-    MemoryToolContext, RetrievedMemoryFact, active_prompt_context_memory_keys,
-    call_memory_retrieval_provider, chat_extracted_memory_summary, execute_memory_tool,
-    expire_due_memories, is_memory_tool_name, memory_prompt_context,
-    memory_retrieval_tool_definition, memory_target_status_for_prompt, memory_tool_definitions,
-    memory_tool_timeout_ms, parse_memory_retrieval_output,
+    MemoryDreamScheduler, MemoryToolContext, RetrievedMemoryFact,
+    active_prompt_context_memory_keys, call_memory_retrieval_provider,
+    chat_extracted_memory_summary, execute_memory_tool, expire_due_memories, is_memory_tool_name,
+    memory_prompt_context, memory_retrieval_tool_definition, memory_target_status_for_prompt,
+    memory_tool_definitions, memory_tool_timeout_ms, parse_memory_retrieval_output,
     persist_pending_prompt_context_injections, prompt_cache_key, queue_memory_extraction_job,
     splice_resolved_memory, stored_prompt_context_record_memory_keys,
     stored_stable_prompt_context_messages,
@@ -375,6 +375,7 @@ pub(crate) struct AppState {
     hook_runtime: HookRuntime,
     question_registry: QuestionRegistry,
     active_chat_runs: ActiveChatRunRegistry,
+    memory_dream_runs: Arc<AsyncMutex<HashSet<String>>>,
     agent_scheduler: AgentScheduler,
     scheduled_task_scheduler: ScheduledTaskScheduler,
     tool_resource_locks: ToolResourceLockRegistry,
@@ -583,6 +584,7 @@ async fn run_server_until_shutdown(
     let (agent_scheduler, agent_scheduler_wake_rx) = AgentScheduler::new();
     let (scheduled_task_scheduler, scheduled_task_scheduler_wake_rx) =
         ScheduledTaskScheduler::new();
+    let memory_dream_scheduler = MemoryDreamScheduler::new();
     let state = AppState {
         config: Arc::new(Mutex::new(loaded_config.config)),
         config_file: loaded_config.paths.config_file,
@@ -600,6 +602,7 @@ async fn run_server_until_shutdown(
         hook_runtime,
         question_registry: QuestionRegistry::default(),
         active_chat_runs: ActiveChatRunRegistry::default(),
+        memory_dream_runs: Arc::new(AsyncMutex::new(HashSet::new())),
         agent_scheduler: agent_scheduler.clone(),
         scheduled_task_scheduler: scheduled_task_scheduler.clone(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
@@ -610,6 +613,7 @@ async fn run_server_until_shutdown(
     let agent_scheduler_task = agent_scheduler.spawn(state.clone(), agent_scheduler_wake_rx);
     let scheduled_task_scheduler_task =
         scheduled_task_scheduler.spawn(state.clone(), scheduled_task_scheduler_wake_rx);
+    let memory_dream_scheduler_task = memory_dream_scheduler.spawn(state.clone());
     agent_scheduler
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
@@ -648,9 +652,11 @@ async fn run_server_until_shutdown(
     if server_result.is_err() {
         agent_scheduler_task.abort();
         scheduled_task_scheduler_task.abort();
+        memory_dream_scheduler_task.abort();
     }
     let _ = agent_scheduler_task.await;
     let _ = scheduled_task_scheduler_task.await;
+    let _ = memory_dream_scheduler_task.await;
     server_result?;
 
     Ok(())
@@ -823,6 +829,22 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/api/memory/sources",
             get(crate::http::memory::memory_sources),
+        )
+        .route(
+            "/api/memory/dream/run",
+            post(crate::http::memory::run_memory_dream),
+        )
+        .route(
+            "/api/memory/dream/jobs",
+            get(crate::http::memory::memory_dream_jobs),
+        )
+        .route(
+            "/api/memory/dream/jobs/{job_id}",
+            get(crate::http::memory::memory_dream_job),
+        )
+        .route(
+            "/api/memory/dream/jobs/{job_id}/changes",
+            get(crate::http::memory::memory_dream_changes),
         )
         .route("/api/hooks", get(crate::http::hooks::hooks_settings))
         .route(
@@ -1852,6 +1874,8 @@ struct ManualMemoryDreamSettingsRequest {
     max_facts_per_run: u32,
     max_changes_per_run: u32,
     scheduler_scan_minutes: u32,
+    workspace_threshold_facts: Option<u32>,
+    global_threshold_facts: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -2338,6 +2362,8 @@ struct MemoryDreamSettingsSummary {
     max_facts_per_run: u32,
     max_changes_per_run: u32,
     scheduler_scan_minutes: u32,
+    workspace_threshold_facts: u32,
+    global_threshold_facts: u32,
 }
 
 #[derive(Serialize)]
@@ -7252,6 +7278,13 @@ impl ApiError {
     pub(crate) fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }

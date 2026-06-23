@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use axum::{
     Json,
     body::to_bytes,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     response::IntoResponse,
 };
 use foco_agent::{
@@ -13,8 +13,9 @@ use foco_agent::{
 use foco_store::{
     config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PromptSettings, WebSearchSettings},
     memory::{
-        MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, NewMemoryExtractionJob,
-        NewMemoryFact, NewMemorySource,
+        MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
+        MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, NewMemoryDreamJob,
+        NewMemoryExtractionJob, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
     },
     workspace::{
         LlmRequestAuditFilters, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
@@ -28,9 +29,15 @@ use foco_tools::{
 use serde_json::json;
 
 use crate::http::{
-    memory::memory_extraction_job_summaries, settings::associate_provider_with_local_models,
-    terminal::create_terminal_session, workspaces::add_workspace,
+    memory::{
+        MemoryDreamChangesQuery, MemoryDreamJobsQuery, MemoryDreamRunRequest, memory_dream_changes,
+        memory_dream_job, memory_dream_jobs, memory_extraction_job_summaries, run_memory_dream,
+    },
+    settings::associate_provider_with_local_models,
+    terminal::create_terminal_session,
+    workspaces::add_workspace,
 };
+use crate::memory_runtime::scheduler::{dispatch_auto_memory_dreams_at, memory_dream_interval_due};
 use crate::memory_runtime::{
     MemoryExtractionEvidenceCandidate, MemoryExtractionTask, MemorySearchToolInput,
     MemoryWriteToolInput, execute_memory_search_tool, execute_memory_write_tool,
@@ -6690,6 +6697,391 @@ fn memory_list_summarizes_failed_extraction_jobs() {
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
+#[tokio::test]
+async fn manual_memory_dream_http_runs_workspace_dream_and_lists_audit() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    config.memory.dream.enabled = true;
+    config.memory.dream.mode = MemoryDreamRunMode::DeterministicOnly.as_str().to_string();
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut memory_database,
+            "source-expired",
+            "fact-expired",
+            MemoryScope::Workspace,
+            None,
+            "Temporary fact",
+            false,
+        );
+        memory_database
+            .update_fact(UpdateMemoryFact {
+                id: "fact-expired",
+                expires_at: Some("2000-01-01T00:00:00.000Z"),
+                ..UpdateMemoryFact::default()
+            })
+            .expect("expire fact");
+    }
+
+    let run_request: MemoryDreamRunRequest = serde_json::from_value(json!({
+        "scope": "workspace",
+        "workspaceId": workspace_id,
+        "triggerType": "manual",
+        "mode": "deterministic_only"
+    }))
+    .expect("run request");
+    let Json(run_response) = run_memory_dream(State(state.clone()), Json(run_request))
+        .await
+        .expect("manual dream run");
+    let run_response = serde_json::to_value(run_response).expect("run response json");
+    assert_eq!(run_response["status"], "completed");
+    let job_id = run_response["jobId"].as_str().expect("job id").to_string();
+    assert!(run_response["transcriptChatId"].as_str().is_some());
+
+    let jobs_query: MemoryDreamJobsQuery =
+        serde_json::from_value(json!({ "workspaceId": workspace_id })).expect("jobs query");
+    let Json(jobs_response) = memory_dream_jobs(State(state.clone()), Query(jobs_query))
+        .await
+        .expect("dream jobs");
+    let jobs_response = serde_json::to_value(jobs_response).expect("jobs response json");
+    assert_eq!(jobs_response["jobs"][0]["id"], job_id);
+    assert_eq!(
+        jobs_response["jobs"][0]["transcriptWorkspaceId"],
+        workspace_id
+    );
+    assert_eq!(jobs_response["jobs"][0]["changeCounts"]["expired"], 1);
+
+    let Json(job_response) = memory_dream_job(State(state.clone()), AxumPath(job_id.clone()))
+        .await
+        .expect("dream job detail");
+    let job_response = serde_json::to_value(job_response).expect("job response json");
+    assert_eq!(job_response["job"]["id"], job_id);
+
+    let changes_query: MemoryDreamChangesQuery =
+        serde_json::from_value(json!({})).expect("changes query");
+    let Json(changes_response) =
+        memory_dream_changes(State(state), AxumPath(job_id.clone()), Query(changes_query))
+            .await
+            .expect("dream changes");
+    let changes_response = serde_json::to_value(changes_response).expect("changes response json");
+    assert_eq!(changes_response["changes"][0]["operation"], "expire");
+    assert_eq!(
+        changes_response["changes"][0]["targetFactIds"][0],
+        "fact-expired"
+    );
+}
+
+#[tokio::test]
+async fn manual_memory_dream_http_rejects_validation_errors() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    config.memory.dream.enabled = true;
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let run_request: MemoryDreamRunRequest = serde_json::from_value(json!({
+        "scope": "workspace",
+        "triggerType": "manual",
+        "mode": "deterministic_only"
+    }))
+    .expect("run request");
+
+    let error = run_memory_dream(State(state), Json(run_request))
+        .await
+        .expect_err("missing workspaceId should fail");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message.contains("workspaceId"));
+}
+
+#[tokio::test]
+async fn manual_memory_dream_http_rejects_active_run_conflict() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    config.memory.dream.enabled = true;
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        memory_database
+            .insert_dream_job(NewMemoryDreamJob {
+                id: "active-dream",
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some(&workspace_id),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                status: MemoryDreamJobStatus::Running,
+                model_id: None,
+                input_summary_json: "{}",
+                output_summary_json: None,
+                transcript_chat_id: None,
+                error_message: None,
+            })
+            .expect("active dream job");
+    }
+
+    let run_request: MemoryDreamRunRequest = serde_json::from_value(json!({
+        "scope": "workspace",
+        "workspaceId": workspace_id,
+        "triggerType": "manual",
+        "mode": "deterministic_only"
+    }))
+    .expect("run request");
+    let error = run_memory_dream(State(state), Json(run_request))
+        .await
+        .expect_err("active dream should conflict");
+
+    assert_eq!(error.status, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn manual_memory_dream_http_rejects_disabled_memory() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = false;
+    config.memory.dream.enabled = true;
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let run_request: MemoryDreamRunRequest = serde_json::from_value(json!({
+        "scope": "global",
+        "triggerType": "manual",
+        "mode": "deterministic_only"
+    }))
+    .expect("run request");
+
+    let error = run_memory_dream(State(state), Json(run_request))
+        .await
+        .expect_err("disabled memory should fail");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert!(error.message.contains("memory is disabled"));
+}
+
+#[test]
+fn auto_memory_dream_scheduler_interval_uses_injected_clock() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-06-23T00:00:00.000Z")
+        .expect("timestamp")
+        .with_timezone(&Utc);
+
+    assert!(memory_dream_interval_due(None, 7, now).expect("missing success is due"));
+    assert!(
+        !memory_dream_interval_due(Some("2026-06-17T00:00:00.000Z"), 7, now)
+            .expect("six days old is not due")
+    );
+    assert!(
+        memory_dream_interval_due(Some("2026-06-16T00:00:00.000Z"), 7, now)
+            .expect("seven days old is due")
+    );
+}
+
+#[tokio::test]
+async fn auto_memory_dream_scheduler_runs_due_jobs_without_scheduled_task_rows() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    config.memory.dream.enabled = true;
+    config.memory.dream.auto_enabled = true;
+    config.memory.dream.mode = MemoryDreamRunMode::DeterministicOnly.as_str().to_string();
+    config.memory.dream.create_transcript_chat = false;
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut memory_database,
+            "source-auto-expired",
+            "fact-auto-expired",
+            MemoryScope::Workspace,
+            None,
+            "Temporary auto fact",
+            false,
+        );
+        memory_database
+            .update_fact(UpdateMemoryFact {
+                id: "fact-auto-expired",
+                expires_at: Some("2000-01-01T00:00:00.000Z"),
+                ..UpdateMemoryFact::default()
+            })
+            .expect("expire fact");
+    }
+
+    let scan = dispatch_auto_memory_dreams_at(&state, Utc::now())
+        .await
+        .expect("auto dream scan");
+
+    assert_eq!(scan.runs_started, 2);
+    let global_database = MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+        .expect("global memory database");
+    let global_jobs = global_database
+        .dream_jobs_for_scope(MemoryDreamScope::Global, None, None, 10)
+        .expect("global dream jobs");
+    assert_eq!(global_jobs.len(), 1);
+    assert_eq!(global_jobs[0].trigger_type, "auto_interval");
+
+    let workspace_database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    assert!(
+        workspace_database
+            .scheduled_tasks(None)
+            .expect("scheduled tasks")
+            .is_empty()
+    );
+    drop(workspace_database);
+
+    let workspace_memory =
+        MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+            .expect("workspace memory database");
+    let workspace_jobs = workspace_memory
+        .dream_jobs_for_scope(MemoryDreamScope::Workspace, Some(&workspace_id), None, 10)
+        .expect("workspace dream jobs");
+    assert_eq!(workspace_jobs.len(), 1);
+    assert_eq!(workspace_jobs[0].trigger_type, "auto_interval");
+}
+
+#[tokio::test]
+async fn auto_memory_dream_scheduler_uses_threshold_trigger() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    config.memory.dream.enabled = true;
+    config.memory.dream.auto_enabled = true;
+    config.memory.dream.mode = MemoryDreamRunMode::DeterministicOnly.as_str().to_string();
+    config.memory.dream.create_transcript_chat = false;
+    config.memory.dream.workspace_threshold_facts = 1;
+    config.memory.dream.global_threshold_facts = 999;
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        let mut global_database =
+            MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+                .expect("global memory database");
+        insert_completed_dream_job(
+            &mut global_database,
+            "recent-global-dream",
+            MemoryDreamScope::Global,
+            None,
+        );
+    }
+    {
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let mut memory_database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+                .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut memory_database,
+            "source-threshold",
+            "fact-threshold",
+            MemoryScope::Workspace,
+            None,
+            "Threshold fact",
+            false,
+        );
+    }
+
+    let scan = dispatch_auto_memory_dreams_at(&state, Utc::now())
+        .await
+        .expect("auto dream scan");
+
+    assert_eq!(scan.runs_started, 1);
+    let workspace_memory =
+        MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+            .expect("workspace memory database");
+    let workspace_jobs = workspace_memory
+        .dream_jobs_for_scope(MemoryDreamScope::Workspace, Some(&workspace_id), None, 10)
+        .expect("workspace dream jobs");
+    assert_eq!(workspace_jobs.len(), 1);
+    assert_eq!(workspace_jobs[0].trigger_type, "auto_threshold");
+}
+
+#[tokio::test]
+async fn auto_memory_dream_scheduler_skips_in_process_active_run() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    config.memory.dream.enabled = true;
+    config.memory.dream.auto_enabled = true;
+    config.memory.dream.mode = MemoryDreamRunMode::DeterministicOnly.as_str().to_string();
+    config.memory.dream.create_transcript_chat = false;
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    {
+        let mut global_database =
+            MemoryDatabase::open_or_create_global_at(&state.memory_database_file)
+                .expect("global memory database");
+        insert_completed_dream_job(
+            &mut global_database,
+            "recent-global-dream",
+            MemoryDreamScope::Global,
+            None,
+        );
+    }
+    state
+        .memory_dream_runs
+        .lock()
+        .await
+        .insert(format!("workspace:{workspace_id}"));
+
+    let scan = dispatch_auto_memory_dreams_at(&state, Utc::now())
+        .await
+        .expect("auto dream scan");
+
+    assert_eq!(scan.runs_started, 0);
+    assert_eq!(scan.skipped_active, 1);
+    let workspace_memory =
+        MemoryDatabase::open_workspace_at(workspace_database_path(workspace.path()))
+            .expect("workspace memory database");
+    let workspace_jobs = workspace_memory
+        .dream_jobs_for_scope(MemoryDreamScope::Workspace, Some(&workspace_id), None, 10)
+        .expect("workspace dream jobs");
+    assert!(workspace_jobs.is_empty());
+}
+
+fn insert_completed_dream_job(
+    database: &mut MemoryDatabase,
+    id: &str,
+    scope: MemoryDreamScope,
+    workspace_id: Option<&str>,
+) {
+    database
+        .insert_dream_job(NewMemoryDreamJob {
+            id,
+            scope,
+            workspace_id,
+            trigger_type: MemoryDreamTriggerType::Manual,
+            mode: MemoryDreamRunMode::DeterministicOnly,
+            status: MemoryDreamJobStatus::Completed,
+            model_id: None,
+            input_summary_json: "{}",
+            output_summary_json: Some(r#"{"summary":"seed"}"#),
+            transcript_chat_id: None,
+            error_message: None,
+        })
+        .expect("completed dream job");
+}
+
 #[test]
 fn memory_tool_schemas_are_strict_and_require_all_properties() {
     for tool in memory_tool_definitions() {
@@ -10407,6 +10799,7 @@ fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
         mcp_registry,
         question_registry: QuestionRegistry::default(),
         active_chat_runs: ActiveChatRunRegistry::default(),
+        memory_dream_runs: Arc::new(AsyncMutex::new(HashSet::new())),
         agent_scheduler,
         scheduled_task_scheduler,
         tool_resource_locks: ToolResourceLockRegistry::default(),

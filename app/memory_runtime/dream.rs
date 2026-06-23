@@ -1,4 +1,4 @@
-// ponytail: Phase 7/8 will wire this engine; keep Phase 3 buildable without fake callers.
+// ponytail: Phase 8 will add scheduler callers; keep phased builds quiet meanwhile.
 #![allow(dead_code)]
 
 use std::{
@@ -2536,6 +2536,8 @@ mod tests {
             max_facts_per_run: 100,
             max_changes_per_run: 10,
             scheduler_scan_minutes: 60,
+            workspace_threshold_facts: 50,
+            global_threshold_facts: 50,
         }))
     }
 

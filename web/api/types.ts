@@ -1082,6 +1082,8 @@ export type MemoryDreamSettingsSummary = {
   maxFactsPerRun: number;
   maxChangesPerRun: number;
   schedulerScanMinutes: number;
+  workspaceThresholdFacts: number;
+  globalThresholdFacts: number;
 };
 
 type MemorySettingsSummary = {

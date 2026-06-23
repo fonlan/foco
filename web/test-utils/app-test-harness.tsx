@@ -168,6 +168,8 @@ export const settings = {
       maxFactsPerRun: 200,
       maxChangesPerRun: 50,
       schedulerScanMinutes: 60,
+      workspaceThresholdFacts: 50,
+      globalThresholdFacts: 50,
     },
     extractionModes: [
       { label: "Manual", value: "manual" },
