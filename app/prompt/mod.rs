@@ -21,5 +21,6 @@ pub(crate) use environment::environment_context_message;
 pub(crate) use environment::is_wsl_environment;
 pub(crate) use prompt_files::{
     active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
-    configured_prompt_messages, system_prompt_summaries, tool_prompt_infos,
+    configured_extra_prompt_message, configured_prompt_messages, system_prompt_summaries,
+    tool_prompt_infos,
 };

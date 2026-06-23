@@ -130,11 +130,13 @@ pub(crate) fn configured_prompt_messages(
         }
     }
 
-    if let Some(message) = extra_prompt_message(&settings.extra_text) {
-        messages.push(message);
-    }
-
     Ok(messages)
+}
+
+pub(crate) fn configured_extra_prompt_message(
+    settings: &PromptSettings,
+) -> Option<NeutralChatMessage> {
+    extra_prompt_message(&settings.extra_text)
 }
 
 fn prompt_file_message(

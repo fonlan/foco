@@ -2056,6 +2056,13 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
         extra_text: "Extra prompt instructions.\n".to_string(),
     })
     .expect("configured prompt messages");
+    let extra_prompt_message = configured_extra_prompt_message(&PromptSettings {
+        system_prompts: Vec::new(),
+        system_prompt: None,
+        files: Vec::new(),
+        extra_text: "Extra prompt instructions.\n".to_string(),
+    })
+    .expect("extra prompt message");
 
     assert_eq!(agents_messages.len(), 1);
     assert_eq!(agents_messages[0].role, NeutralChatRole::User);
@@ -2065,7 +2072,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
             .content
             .contains("Workspace instructions.")
     );
-    assert_eq!(prompt_messages.len(), 2);
+    assert_eq!(prompt_messages.len(), 1);
     assert_eq!(prompt_messages[0].role, NeutralChatRole::User);
     assert!(
         prompt_messages[0]
@@ -2078,12 +2085,12 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
             .contains("Configured prompt instructions.")
     );
     assert!(
-        prompt_messages[1]
+        extra_prompt_message
             .content
             .contains(EXTRA_PROMPT_MESSAGE_PREFIX)
     );
     assert!(
-        prompt_messages[1]
+        extra_prompt_message
             .content
             .contains("Extra prompt instructions.")
     );
@@ -8411,12 +8418,12 @@ Search memory before repo work.
     assert!(
         prompt_messages[0]
             .content
-            .contains("Configured prompt chat instructions.")
+            .contains("Extra configured prompt.")
     );
     assert!(
         prompt_messages[1]
             .content
-            .contains("Extra configured prompt.")
+            .contains("Configured prompt chat instructions.")
     );
     let skill_messages = new_context
         .provider_request
@@ -8484,7 +8491,14 @@ Search memory before repo work.
                 .messages_json
                 .contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX)
         );
+        assert!(
+            !context_injections[0]
+                .messages_json
+                .contains(EXTRA_PROMPT_MESSAGE_PREFIX)
+        );
     }
+
+    config.prompts.extra_text = "Updated extra configured prompt.\n".to_string();
 
     let existing_context = prepare_chat_context(
         &state,
@@ -8528,9 +8542,15 @@ Search memory before repo work.
         })
         .collect::<Vec<_>>();
     assert_eq!(existing_prompt_messages.len(), 2);
-    assert_eq!(
-        existing_prompt_messages[0].content,
-        prompt_messages[0].content
+    assert!(
+        existing_prompt_messages[0]
+            .content
+            .contains("Updated extra configured prompt.")
+    );
+    assert!(
+        !existing_prompt_messages[0]
+            .content
+            .contains("Extra configured prompt.")
     );
     assert_eq!(
         existing_prompt_messages[1].content,
@@ -8558,7 +8578,7 @@ Search memory before repo work.
         existing_environment_messages[0].content,
         environment_messages[0].content
     );
-    assert_eq!(
+    assert_ne!(
         new_context.provider_request.prompt_cache_key,
         existing_context.provider_request.prompt_cache_key
     );
