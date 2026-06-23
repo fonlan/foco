@@ -11,6 +11,7 @@ import {
   deferred,
   enqueueChatStreamEvent,
   enqueueChatStreamEventForRun,
+  failedMemoryDreamJob,
   jsonResponse,
   memoryDreamChange,
   memoryDreamJob,
@@ -321,10 +322,22 @@ describe("app-settings verification surfaces", () => {
     expect(await screen.findByText(memoryDreamJob.summary!)).toBeInTheDocument();
     expect(await screen.findByText(memoryDreamChange.reason)).toBeInTheDocument();
     expect(within(screen.getByRole("table")).getAllByText(workspace.name)).toHaveLength(2);
+    expect(screen.getByText("Before JSON")).toBeInTheDocument();
+    expect(screen.getByText("Memory state before this Dream change.")).toBeInTheDocument();
+    expect(screen.getByText("After JSON")).toBeInTheDocument();
+    expect(screen.getByText("Memory state Dream wrote or proposed.")).toBeInTheDocument();
+    expect(screen.getByText("Evidence JSON")).toBeInTheDocument();
+    expect(screen.getByText("Sources Dream used to justify the change.")).toBeInTheDocument();
     expect(
       workspace.chats.some((chat) => chat.id === memoryDreamJob.transcriptChatId),
     ).toBe(false);
     expect(screen.getByRole("button", { name: "Open transcript" })).toBeInTheDocument();
+
+    const dreamRows = within(screen.getByRole("table")).getAllByRole("row");
+    await userEvent.click(within(dreamRows[2]).getByText(workspace.name));
+    expect(await screen.findByText(failedMemoryDreamJob.errorMessage!)).toBeInTheDocument();
+    await userEvent.click(within(dreamRows[1]).getByText(workspace.name));
+    expect(await screen.findByText(memoryDreamChange.reason)).toBeInTheDocument();
 
     await userEvent.click(screen.getByLabelText("Enable memory"));
     await userEvent.click(screen.getByLabelText("Enable Dream"));

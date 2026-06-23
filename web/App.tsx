@@ -16332,19 +16332,27 @@ function SettingsPanel({
                             <tr
                               className={
                                 selectedMemoryDreamJobId === job.id
-                                  ? "bg-teal-50/70"
-                                  : "bg-white"
+                                  ? "cursor-pointer bg-teal-50/70 hover:bg-teal-50 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-teal-500/40"
+                                  : "cursor-pointer bg-white hover:bg-stone-50 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-teal-500/40"
                               }
+                              aria-selected={selectedMemoryDreamJobId === job.id}
                               key={job.id}
+                              onClick={() => setSelectedMemoryDreamJobId(job.id)}
+                              onKeyDown={(event) => {
+                                if (event.target !== event.currentTarget) {
+                                  return;
+                                }
+                                if (event.key === "Enter" || event.key === " ") {
+                                  event.preventDefault();
+                                  setSelectedMemoryDreamJobId(job.id);
+                                }
+                              }}
+                              tabIndex={0}
                             >
                               <td className="px-3 py-2 align-top">
-                                <button
-                                  className="text-left text-xs font-semibold text-stone-700 hover:text-teal-800"
-                                  onClick={() => setSelectedMemoryDreamJobId(job.id)}
-                                  type="button"
-                                >
+                                <span className="text-xs font-semibold text-stone-700">
                                   {formatAuditDate(job.createdAt, language)}
-                                </button>
+                                </span>
                               </td>
                               <td className="px-3 py-2 align-top">
                                 {scopeLabel}
@@ -16386,9 +16394,10 @@ function SettingsPanel({
                                 {job.transcriptChatId && transcriptWorkspaceId ? (
                                   <button
                                     className="text-xs font-semibold text-teal-800 hover:text-teal-950"
-                                    onClick={() =>
-                                      onOpenChat(transcriptWorkspaceId, job.transcriptChatId!)
-                                    }
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      onOpenChat(transcriptWorkspaceId, job.transcriptChatId!);
+                                    }}
                                     type="button"
                                   >
                                     {t("Open transcript")}
@@ -16495,15 +16504,39 @@ function SettingsPanel({
                                     </div>
                                   ) : null}
                                   <div className="mt-3 grid gap-3 lg:grid-cols-3">
-                                    <pre className="panel-scroll max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
-                                      {memoryDreamJsonText(change.beforeJson)}
-                                    </pre>
-                                    <pre className="panel-scroll max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
-                                      {memoryDreamJsonText(change.afterJson)}
-                                    </pre>
-                                    <pre className="panel-scroll max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
-                                      {memoryDreamJsonText(change.evidence)}
-                                    </pre>
+                                    <div>
+                                      <div className="text-xs font-semibold text-stone-700">
+                                        {t("Before JSON")}
+                                      </div>
+                                      <p className="mt-1 text-xs text-stone-500">
+                                        {t("Memory state before this Dream change.")}
+                                      </p>
+                                      <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                        {memoryDreamJsonText(change.beforeJson)}
+                                      </pre>
+                                    </div>
+                                    <div>
+                                      <div className="text-xs font-semibold text-stone-700">
+                                        {t("After JSON")}
+                                      </div>
+                                      <p className="mt-1 text-xs text-stone-500">
+                                        {t("Memory state Dream wrote or proposed.")}
+                                      </p>
+                                      <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                        {memoryDreamJsonText(change.afterJson)}
+                                      </pre>
+                                    </div>
+                                    <div>
+                                      <div className="text-xs font-semibold text-stone-700">
+                                        {t("Evidence JSON")}
+                                      </div>
+                                      <p className="mt-1 text-xs text-stone-500">
+                                        {t("Sources Dream used to justify the change.")}
+                                      </p>
+                                      <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                        {memoryDreamJsonText(change.evidence)}
+                                      </pre>
+                                    </div>
                                   </div>
                                 </div>
                               ))}
