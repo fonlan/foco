@@ -100,11 +100,13 @@ function TerminalCommandButton({
 
 export function TerminalPanel({
   errorMessage,
+  isVisible,
   onClose,
   requestJson,
   workspace,
 }: {
   errorMessage: (value: unknown) => string;
+  isVisible: boolean;
   onClose: () => void;
   requestJson: <T>(path: string, init?: RequestInit) => Promise<T>;
   workspace: WorkspaceSummary | undefined;
@@ -232,7 +234,9 @@ export function TerminalPanel({
 
   return (
     <section
+      aria-hidden={!isVisible}
       className="terminal-panel relative shrink-0 border-t border-stone-800 bg-[#16130f]"
+      hidden={!isVisible}
       style={{ "--terminal-panel-height": `${panelHeight}px` } as CSSProperties}
     >
       <div

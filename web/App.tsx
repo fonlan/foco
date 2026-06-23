@@ -7248,22 +7248,24 @@ export function App() {
                   workspaces={workspaces}
                 />
               )}
-              {isTerminalOpen ? (
-                <TerminalPanel
-                  errorMessage={errorMessage}
-                  onClose={() => {
-                    if (activeWorkspace) {
+              {workspaces
+                .filter((workspace) => terminalOpenWorkspaceIds.has(workspace.id))
+                .map((workspace) => (
+                  <TerminalPanel
+                    errorMessage={errorMessage}
+                    isVisible={workspace.id === activeWorkspace?.id}
+                    key={workspace.id}
+                    onClose={() => {
                       setTerminalOpenWorkspaceIds((current) => {
                         const next = new Set(current);
-                        next.delete(activeWorkspace.id);
+                        next.delete(workspace.id);
                         return next;
                       });
-                    }
-                  }}
-                  requestJson={requestJson}
-                  workspace={activeWorkspace}
-                />
-              ) : null}
+                    }}
+                    requestJson={requestJson}
+                    workspace={workspace}
+                  />
+                ))}
             </section>
 
             {showContextPanel ? (

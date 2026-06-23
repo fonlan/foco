@@ -132,6 +132,37 @@ describe("app-panels-stats verification surfaces", () => {
     });
   }, 10000);
 
+  it("keeps workspace terminals mounted while switching workspaces", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const closeSpy = vi.spyOn(window.WebSocket.prototype, "close");
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("button", { name: "Open terminal" }));
+    expect(await screen.findByText("connected")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url]) => url === "/api/workspaces/workspace-1/terminal/session",
+      ),
+    ).toHaveLength(1);
+
+    await userEvent.click(screen.getByRole("button", { name: "Side project" }));
+    await userEvent.click(screen.getByRole("button", { name: /Side note/ }));
+    expect(screen.getByRole("button", { name: "Open terminal" })).toBeInTheDocument();
+    expect(closeSpy).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Default" }));
+    await userEvent.click(screen.getByRole("button", { name: /Tool run/ }));
+    expect(screen.getAllByRole("button", { name: "Close terminal" })).toHaveLength(2);
+    expect(closeSpy).not.toHaveBeenCalled();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url]) => url === "/api/workspaces/workspace-1/terminal/session",
+      ),
+    ).toHaveLength(1);
+  });
+
   it("runs a workspace common command in the active terminal", async () => {
     const commandWorkspace = {
       ...workspace,
