@@ -10906,6 +10906,7 @@ fn push_materialized_tool_call_part(
     }
 }
 
+#[cfg(test)]
 fn chat_message_summaries(
     database: &mut WorkspaceDatabase,
     workspace_path: &Path,
