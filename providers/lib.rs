@@ -724,18 +724,18 @@ fn genai_chat_options(
     request: &NeutralChatRequest,
 ) -> Result<ChatOptions, ProviderConfigError> {
     // ponytail: model-id heuristic; add provider metadata if non-Claude ids ever contain "claude".
-    let temperature = if request.model_id.to_ascii_lowercase().contains("claude") {
-        1.0
-    } else {
-        0.0
-    };
+    let is_claude = request.model_id.to_ascii_lowercase().contains("claude");
+    let temperature = if is_claude { 1.0 } else { 0.0 };
     let mut options = ChatOptions::default()
         .with_temperature(temperature)
-        .with_top_p(1.0)
         .with_capture_usage(true)
         .with_capture_content(true)
         .with_capture_reasoning_content(true)
         .with_capture_tool_calls(true);
+
+    if !is_claude {
+        options = options.with_top_p(1.0);
+    }
 
     if let Some(max_output_tokens) = request.max_output_tokens {
         options = options.with_max_tokens(max_output_tokens);
@@ -1406,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn uses_temperature_one_for_claude_models() {
+    fn uses_temperature_one_and_omits_top_p_for_claude_models() {
         let request = NeutralChatRequest {
             model_id: "anthropic/claude-sonnet-4".to_string(),
             messages: Vec::new(),
@@ -1427,7 +1427,7 @@ mod tests {
         let options = genai_chat_options(&config, &request).expect("chat options");
 
         assert_eq!(options.temperature, Some(1.0));
-        assert_eq!(options.top_p, Some(1.0));
+        assert_eq!(options.top_p, None);
     }
 
     #[test]
