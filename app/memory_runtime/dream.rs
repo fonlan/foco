@@ -18,8 +18,8 @@ use foco_store::{
         MemoryDreamChangeStatus, MemoryDreamJobRecord, MemoryDreamJobStatus, MemoryDreamRunMode,
         MemoryDreamSafetyPolicy, MemoryDreamScope, MemoryDreamTriggerType, MemoryEdgeRecord,
         MemoryFactRecord, MemoryKind, MemoryProfileRecord, MemoryRelationKind, MemoryScope,
-        MemoryStatus, NewMemoryDreamChange, NewMemoryDreamJob, NewMemoryEdge, UpdateMemoryDreamJob,
-        UpdateMemoryFact,
+        MemorySourceType, MemoryStatus, NewMemoryDreamChange, NewMemoryDreamJob, NewMemoryEdge,
+        NewMemoryFact, NewMemorySource, UpdateMemoryDreamJob, UpdateMemoryFact,
     },
     workspace::{NewMessage, WorkspaceDatabase},
 };
@@ -52,6 +52,7 @@ pub(crate) struct MemoryDreamJobRequest<'a> {
     pub(crate) mode: MemoryDreamRunMode,
     pub(crate) model_id: Option<&'a str>,
     pub(crate) settings: &'a MemoryDreamSettings,
+    pub(crate) global_memory_database_file: Option<&'a Path>,
     pub(crate) planner: Option<MemoryDreamPlannerRequest<'a>>,
     pub(crate) transcript: Option<MemoryDreamTranscriptRequest<'a>>,
 }
@@ -571,9 +572,15 @@ async fn run_memory_dream_job_inner(
             Ok(validated_changes) => {
                 llm_planner = "applied";
                 llm_changes_proposed = validated_changes.len();
-                let llm_apply_summary =
-                    apply_llm_changes(database, job_id, &validated_changes, policy)
-                        .map_err(ApiError::from_memory_error)?;
+                let llm_apply_summary = apply_llm_changes(
+                    database,
+                    job_id,
+                    &validated_changes,
+                    policy,
+                    request.workspace_id,
+                    request.global_memory_database_file,
+                )
+                .map_err(ApiError::from_memory_error)?;
                 let llm_applied = llm_apply_summary.applied;
                 let llm_failed = llm_apply_summary.failed;
                 apply_summary.applied += llm_apply_summary.applied;
@@ -717,18 +724,20 @@ fn deterministic_changes(
         }
     }
 
-    for fact in candidates {
-        if changes.len() >= policy.max_changes_per_run {
-            break;
-        }
-        if fact.status == MemoryStatus::Pending.as_str()
-            && !fact.pinned
-            && fact.kind != MemoryKind::UserNote.as_str()
-            && fact.confidence.unwrap_or(0.0) < LOW_CONFIDENCE_PENDING_THRESHOLD
-            && timestamp_is_older_than(&fact.created_at, now, STALE_PENDING_DAYS)
-            && changed_fact_ids.insert(fact.id.clone())
-        {
-            changes.push(DreamChange::RejectPending { fact: fact.clone() });
+    if scope == MemoryDreamScope::Workspace {
+        for fact in candidates {
+            if changes.len() >= policy.max_changes_per_run {
+                break;
+            }
+            if fact.status == MemoryStatus::Pending.as_str()
+                && !fact.pinned
+                && fact.kind != MemoryKind::UserNote.as_str()
+                && fact.confidence.unwrap_or(0.0) < LOW_CONFIDENCE_PENDING_THRESHOLD
+                && timestamp_is_older_than(&fact.created_at, now, STALE_PENDING_DAYS)
+                && changed_fact_ids.insert(fact.id.clone())
+            {
+                changes.push(DreamChange::RejectPending { fact: fact.clone() });
+            }
         }
     }
 
@@ -1212,8 +1221,18 @@ fn validate_memory_dream_planner_output(
                 "memory Dream planner change {index} riskLevel is unsupported"
             )));
         }
-        validate_planner_evidence(index, operation, &change.evidence)?;
-        validate_operation_payload(index, operation, change.new_fact.as_ref(), scope)?;
+        let has_cross_project_evidence = validate_planner_evidence(index, &change.evidence)?;
+        validate_operation_payload(
+            index,
+            operation,
+            change.new_fact.as_ref(),
+            scope,
+            &target_facts,
+            &change.reason,
+            &change.evidence,
+            has_cross_project_evidence,
+            policy,
+        )?;
 
         validated.push(ValidatedDreamPlannerChange {
             operation,
@@ -1231,9 +1250,8 @@ fn validate_memory_dream_planner_output(
 
 fn validate_planner_evidence(
     index: usize,
-    operation: DreamPlannerOperation,
     evidence: &[DreamPlannerEvidence],
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     if evidence.is_empty() {
         return Err(ApiError::bad_request(format!(
             "memory Dream planner change {index} must include evidence"
@@ -1265,13 +1283,8 @@ fn validate_planner_evidence(
             has_cross_project_evidence = true;
         }
     }
-    if operation == DreamPlannerOperation::PromoteToGlobal && !has_cross_project_evidence {
-        return Err(ApiError::bad_request(
-            "memory Dream planner global promotion requires explicit cross-project evidence",
-        ));
-    }
 
-    Ok(())
+    Ok(has_cross_project_evidence)
 }
 
 fn validate_operation_payload(
@@ -1279,7 +1292,16 @@ fn validate_operation_payload(
     operation: DreamPlannerOperation,
     new_fact: Option<&DreamPlannerNewFact>,
     scope: MemoryDreamScope,
+    target_facts: &[MemoryFactRecord],
+    reason: &str,
+    evidence: &[DreamPlannerEvidence],
+    has_cross_project_evidence: bool,
+    policy: &MemoryDreamSafetyPolicy,
 ) -> Result<(), ApiError> {
+    if scope == MemoryDreamScope::Global {
+        validate_global_planner_operation(index, operation, target_facts)?;
+    }
+
     match operation {
         DreamPlannerOperation::Update => {
             let fact = new_fact
@@ -1313,14 +1335,146 @@ fn validate_operation_payload(
                     "memory Dream planner can only promote workspace candidates to global",
                 ));
             }
-            return Err(ApiError::bad_request(
-                "memory Dream planner promote_to_global is reserved for Phase 9",
-            ));
+            validate_global_promotion_candidate(
+                index,
+                target_facts,
+                new_fact,
+                reason,
+                evidence,
+                has_cross_project_evidence,
+                policy,
+            )?;
         }
         DreamPlannerOperation::Supersede
         | DreamPlannerOperation::Expire
         | DreamPlannerOperation::Merge
         | DreamPlannerOperation::Reject => {}
+    }
+
+    Ok(())
+}
+
+fn validate_global_planner_operation(
+    index: usize,
+    operation: DreamPlannerOperation,
+    target_facts: &[MemoryFactRecord],
+) -> Result<(), ApiError> {
+    match operation {
+        DreamPlannerOperation::Expire => {
+            let now = Utc::now();
+            if target_facts.iter().any(|fact| {
+                !fact
+                    .expires_at
+                    .as_deref()
+                    .is_some_and(|expires_at| timestamp_is_due(expires_at, now))
+            }) {
+                return Err(ApiError::bad_request(format!(
+                    "global memory Dream expire change {index} can only target due expired facts"
+                )));
+            }
+        }
+        DreamPlannerOperation::Merge => {
+            let Some(first) = target_facts.first() else {
+                return Ok(());
+            };
+            let first_text = normalized_duplicate_text(&first.fact);
+            let first_kind = &first.kind;
+            if target_facts.iter().any(|fact| {
+                normalized_duplicate_text(&fact.fact) != first_text || &fact.kind != first_kind
+            }) {
+                return Err(ApiError::bad_request(format!(
+                    "global memory Dream merge change {index} can only merge exact duplicates"
+                )));
+            }
+        }
+        DreamPlannerOperation::Update
+        | DreamPlannerOperation::Supersede
+        | DreamPlannerOperation::Reject
+        | DreamPlannerOperation::PromoteToGlobal
+        | DreamPlannerOperation::AddEdge => {
+            return Err(ApiError::bad_request(format!(
+                "global memory Dream planner operation '{}' is not conservative enough",
+                operation.as_str()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_global_promotion_candidate(
+    index: usize,
+    target_facts: &[MemoryFactRecord],
+    new_fact: Option<&DreamPlannerNewFact>,
+    reason: &str,
+    evidence: &[DreamPlannerEvidence],
+    has_cross_project_evidence: bool,
+    policy: &MemoryDreamSafetyPolicy,
+) -> Result<(), ApiError> {
+    if !policy.allows_automatic_global_promotion(has_cross_project_evidence) {
+        return Err(ApiError::bad_request(
+            "memory Dream planner global promotion requires explicit cross-project evidence",
+        ));
+    }
+
+    for fact in target_facts {
+        if MemoryScope::parse(&fact.scope).map_err(ApiError::from_memory_error)?
+            == MemoryScope::Global
+        {
+            return Err(ApiError::bad_request(
+                "memory Dream planner can only promote workspace or chat candidates",
+            ));
+        }
+        if fact.status != MemoryStatus::Active.as_str() || !fact.is_latest {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner promote_to_global change {index} can only promote active latest facts"
+            )));
+        }
+        if MemoryKind::parse(&fact.kind).map_err(ApiError::from_memory_error)?
+            != MemoryKind::Preference
+        {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner promote_to_global change {index} only supports preference facts"
+            )));
+        }
+        if text_mentions_project_specific_path(&fact.fact) {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner promote_to_global change {index} rejects project-specific file path evidence"
+            )));
+        }
+    }
+
+    if let Some(new_fact) = new_fact {
+        if let Some(kind) = new_fact.kind.as_deref().and_then(non_empty_trimmed)
+            && MemoryKind::parse(kind).map_err(ApiError::from_memory_error)?
+                != MemoryKind::Preference
+        {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner promote_to_global change {index} only supports preference facts"
+            )));
+        }
+        if let Some(fact) = new_fact.fact.as_deref().and_then(non_empty_trimmed) {
+            if fact.len() > 4_000 {
+                return Err(ApiError::bad_request(format!(
+                    "memory Dream planner promote_to_global change {index} newFact.fact is too long"
+                )));
+            }
+            if text_mentions_project_specific_path(fact) {
+                return Err(ApiError::bad_request(format!(
+                    "memory Dream planner promote_to_global change {index} rejects project-specific file path evidence"
+                )));
+            }
+        }
+    }
+
+    if text_mentions_project_specific_path(reason)
+        || evidence
+            .iter()
+            .any(|item| text_mentions_project_specific_path(&item.quote))
+    {
+        return Err(ApiError::bad_request(format!(
+            "memory Dream planner promote_to_global change {index} rejects project-specific file path evidence"
+        )));
     }
 
     Ok(())
@@ -1470,10 +1624,19 @@ fn apply_llm_changes(
     job_id: &str,
     changes: &[ValidatedDreamPlannerChange],
     policy: &MemoryDreamSafetyPolicy,
+    workspace_id: Option<&str>,
+    global_memory_database_file: Option<&Path>,
 ) -> Result<ApplySummary, MemoryDatabaseError> {
     let mut summary = ApplySummary::default();
     for change in changes {
-        match apply_llm_change(database, job_id, change, policy) {
+        match apply_llm_change(
+            database,
+            job_id,
+            change,
+            policy,
+            workspace_id,
+            global_memory_database_file,
+        ) {
             Ok(applied_scopes) => {
                 summary.applied += 1;
                 for changed_scope in applied_scopes {
@@ -1497,6 +1660,8 @@ fn apply_llm_change(
     job_id: &str,
     change: &ValidatedDreamPlannerChange,
     policy: &MemoryDreamSafetyPolicy,
+    workspace_id: Option<&str>,
+    global_memory_database_file: Option<&Path>,
 ) -> Result<Vec<(MemoryScope, Option<String>)>, MemoryDatabaseError> {
     match change.operation {
         DreamPlannerOperation::Expire => {
@@ -1511,9 +1676,14 @@ fn apply_llm_change(
         DreamPlannerOperation::Update => apply_llm_update(database, job_id, change, policy),
         DreamPlannerOperation::Merge => apply_llm_merge(database, job_id, change, policy),
         DreamPlannerOperation::AddEdge => apply_llm_add_edge(database, job_id, change),
-        DreamPlannerOperation::PromoteToGlobal => Err(MemoryDatabaseError::InvalidMemoryInput {
-            message: "promote_to_global is reserved for Phase 9".to_string(),
-        }),
+        DreamPlannerOperation::PromoteToGlobal => apply_llm_promote_to_global(
+            database,
+            job_id,
+            change,
+            policy,
+            workspace_id,
+            global_memory_database_file,
+        ),
     }
 }
 
@@ -1527,6 +1697,15 @@ fn apply_llm_status_change(
     let mut changed_scopes = Vec::new();
     for fact in &change.target_facts {
         let current = current_unchanged_fact(database, fact, policy)?;
+        if status == MemoryStatus::Expired {
+            let kind = MemoryKind::parse(&current.kind)?;
+            if !policy.allows_direct_expiration(kind, current.pinned, false, true) {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: "memory Dream LLM cannot directly expire pinned or user_note facts"
+                        .to_string(),
+                });
+            }
+        }
         update_fact_status(database, &fact.id, status)?;
         let after = database
             .fact(&fact.id)?
@@ -1670,6 +1849,149 @@ fn apply_llm_add_edge(
     )])
 }
 
+fn apply_llm_promote_to_global(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    change: &ValidatedDreamPlannerChange,
+    policy: &MemoryDreamSafetyPolicy,
+    workspace_id: Option<&str>,
+    global_memory_database_file: Option<&Path>,
+) -> Result<Vec<(MemoryScope, Option<String>)>, MemoryDatabaseError> {
+    let workspace_id = workspace_id.ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+        message: "promote_to_global requires workspace_id".to_string(),
+    })?;
+    let global_memory_database_file =
+        global_memory_database_file.ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+            message: "promote_to_global requires global memory database path".to_string(),
+        })?;
+    let current_facts = change
+        .target_facts
+        .iter()
+        .map(|fact| current_unchanged_fact(database, fact, policy))
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(primary_fact) = current_facts.first() else {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "promote_to_global requires target facts".to_string(),
+        });
+    };
+    let promoted_fact_id = unique_id("memory-fact");
+    let source_fact_ids = current_facts
+        .iter()
+        .map(|fact| fact.id.clone())
+        .collect::<Vec<_>>();
+    let fact_text = change
+        .new_fact
+        .as_ref()
+        .and_then(|new_fact| new_fact.fact.as_deref())
+        .and_then(non_empty_trimmed)
+        .unwrap_or(primary_fact.fact.as_str());
+    let confidence = change
+        .new_fact
+        .as_ref()
+        .and_then(|new_fact| new_fact.confidence)
+        .or(change.confidence)
+        .or(primary_fact.confidence);
+    let expires_at = change
+        .new_fact
+        .as_ref()
+        .and_then(|new_fact| new_fact.expires_at.as_deref())
+        .and_then(non_empty_trimmed);
+    let fact_metadata_json = promoted_fact_metadata_json(
+        &primary_fact.metadata_json,
+        job_id,
+        workspace_id,
+        &source_fact_ids,
+        &change.evidence,
+    )?;
+    let mut global_database =
+        MemoryDatabase::open_or_create_global_at(global_memory_database_file)?;
+    let mut promoted_source_ids = Vec::new();
+
+    for fact in &current_facts {
+        let sources = database.sources_for_fact(&fact.id)?;
+        if sources.is_empty() {
+            let source_id = unique_id("memory-source");
+            let source_metadata_json =
+                promoted_source_metadata_json("{}", job_id, workspace_id, &fact.id)?;
+            global_database.insert_source(NewMemorySource {
+                id: &source_id,
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: Some(&fact.id),
+                title: "Memory Dream promotion origin",
+                content: &fact.fact,
+                metadata_json: &source_metadata_json,
+            })?;
+            promoted_source_ids.push(source_id);
+            continue;
+        }
+
+        for source in sources {
+            let source_id = unique_id("memory-source");
+            let source_metadata_json = promoted_source_metadata_json(
+                &source.metadata_json,
+                job_id,
+                workspace_id,
+                &fact.id,
+            )?;
+            global_database.insert_source(NewMemorySource {
+                id: &source_id,
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::parse(&source.source_type)?,
+                source_id: source.source_id.as_deref().or(Some(fact.id.as_str())),
+                title: &source.title,
+                content: &source.content,
+                metadata_json: &source_metadata_json,
+            })?;
+            promoted_source_ids.push(source_id);
+        }
+    }
+
+    let promoted_source_refs = promoted_source_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    global_database.insert_fact(NewMemoryFact {
+        id: &promoted_fact_id,
+        scope: MemoryScope::Global,
+        chat_id: None,
+        status: MemoryStatus::Active,
+        kind: MemoryKind::Preference,
+        fact: fact_text,
+        confidence,
+        pinned: false,
+        source_ids: &promoted_source_refs,
+        metadata_json: &fact_metadata_json,
+    })?;
+    if let Some(expires_at) = expires_at {
+        global_database.update_fact(UpdateMemoryFact {
+            id: &promoted_fact_id,
+            expires_at: Some(expires_at),
+            ..UpdateMemoryFact::default()
+        })?;
+    }
+    let promoted_fact = global_database
+        .fact(&promoted_fact_id)?
+        .ok_or_else(|| missing_fact(&promoted_fact_id))?;
+    global_database.refresh_profile_from_active_facts(
+        MemoryScope::Global,
+        None,
+        MEMORY_PROFILE_REFRESH_FACT_LIMIT,
+    )?;
+    insert_applied_llm_change_with_new_fact(
+        database,
+        job_id,
+        change,
+        Some(primary_fact),
+        Some(&promoted_fact),
+        Some(&promoted_fact_id),
+    )?;
+
+    Ok(vec![(MemoryScope::Global, None)])
+}
+
 fn apply_status_change(
     database: &mut MemoryDatabase,
     job_id: &str,
@@ -1797,6 +2119,17 @@ fn insert_applied_llm_change(
     before: Option<&MemoryFactRecord>,
     after: Option<&MemoryFactRecord>,
 ) -> Result<(), MemoryDatabaseError> {
+    insert_applied_llm_change_with_new_fact(database, job_id, change, before, after, None)
+}
+
+fn insert_applied_llm_change_with_new_fact(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    change: &ValidatedDreamPlannerChange,
+    before: Option<&MemoryFactRecord>,
+    after: Option<&MemoryFactRecord>,
+    new_fact_id: Option<&str>,
+) -> Result<(), MemoryDatabaseError> {
     let target_fact_ids_json = json!(llm_change_target_fact_ids(change)).to_string();
     let before_json =
         before.map(|fact| serde_json::to_string(fact).expect("memory fact record serializes"));
@@ -1814,7 +2147,7 @@ fn insert_applied_llm_change(
         job_id,
         operation: change.operation.as_str(),
         target_fact_ids_json: &target_fact_ids_json,
-        new_fact_id: None,
+        new_fact_id,
         before_json: before_json.as_deref(),
         after_json: after_json.as_deref(),
         reason: &change.reason,
@@ -1927,6 +2260,107 @@ fn normalized_duplicate_text(value: &str) -> String {
     }
 
     normalized.trim().to_string()
+}
+
+fn text_mentions_project_specific_path(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains(":\\")
+        || lower.contains("\\\\")
+        || lower.contains(".foco")
+        || lower.contains(".git")
+    {
+        return true;
+    }
+
+    // ponytail: lexical path detection is enough for Phase 9; Phase 11 can replace it with parsed references.
+    for token in lower.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+            )
+    }) {
+        let token = token
+            .trim_matches(|character: char| matches!(character, '.' | ':' | '!' | '?' | '<' | '>'));
+        if token.starts_with("http://") || token.starts_with("https://") {
+            continue;
+        }
+        if token.contains('/') || token.contains('\\') {
+            return true;
+        }
+        if matches!(
+            token,
+            "cargo.toml"
+                | "package.json"
+                | "pnpm-lock.yaml"
+                | "package-lock.json"
+                | "tsconfig.json"
+                | "vite.config.ts"
+                | "auto-dream.md"
+                | "agents.md"
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn promoted_fact_metadata_json(
+    metadata_json: &str,
+    job_id: &str,
+    workspace_id: &str,
+    source_fact_ids: &[String],
+    evidence: &[DreamPlannerEvidence],
+) -> Result<String, MemoryDatabaseError> {
+    add_dream_promotion_metadata(
+        metadata_json,
+        json!({
+            "dreamJobId": job_id,
+            "originWorkspaceId": workspace_id,
+            "sourceFactIds": source_fact_ids,
+            "evidence": evidence,
+        }),
+    )
+}
+
+fn promoted_source_metadata_json(
+    metadata_json: &str,
+    job_id: &str,
+    workspace_id: &str,
+    source_fact_id: &str,
+) -> Result<String, MemoryDatabaseError> {
+    add_dream_promotion_metadata(
+        metadata_json,
+        json!({
+            "dreamJobId": job_id,
+            "originWorkspaceId": workspace_id,
+            "sourceFactId": source_fact_id,
+        }),
+    )
+}
+
+fn add_dream_promotion_metadata(
+    metadata_json: &str,
+    promotion: Value,
+) -> Result<String, MemoryDatabaseError> {
+    let metadata = serde_json::from_str::<Value>(metadata_json).map_err(|source| {
+        MemoryDatabaseError::InvalidMemoryJson {
+            field: "metadata_json",
+            source,
+        }
+    })?;
+    let mut object = match metadata {
+        Value::Object(object) => object,
+        _ => serde_json::Map::new(),
+    };
+    object.insert("dreamPromotion".to_string(), promotion);
+    serde_json::to_string(&Value::Object(object)).map_err(|source| {
+        MemoryDatabaseError::InvalidMemoryJson {
+            field: "metadata_json",
+            source,
+        }
+    })
 }
 
 fn compact_json_text(value: &str) -> String {
@@ -2391,6 +2825,176 @@ mod tests {
         assert!(error.message.contains("must include evidence"));
     }
 
+    #[test]
+    fn dream_planner_keeps_global_scope_conservative() {
+        let output = planner_output("update", vec!["fact-1"], true);
+        let candidates = vec![test_fact_record("fact-1", MemoryScope::Global)];
+        let policy = MemoryDreamSafetyPolicy::new(10, 10).expect("policy");
+
+        let error = validate_memory_dream_planner_output(
+            &output,
+            MemoryDreamScope::Global,
+            &candidates,
+            &policy,
+        )
+        .expect_err("global updates should fail");
+
+        assert!(error.message.contains("not conservative enough"));
+    }
+
+    #[test]
+    fn dream_planner_allows_explicit_workspace_preference_promotion() {
+        let output = promote_output("fact-1", Some("Prefer compact replies in all projects."));
+        let candidates = vec![test_fact_record("fact-1", MemoryScope::Workspace)];
+        let policy = MemoryDreamSafetyPolicy::new(10, 10).expect("policy");
+
+        let validated = validate_memory_dream_planner_output(
+            &output,
+            MemoryDreamScope::Workspace,
+            &candidates,
+            &policy,
+        )
+        .expect("promotion should validate");
+
+        assert_eq!(
+            validated[0].operation,
+            DreamPlannerOperation::PromoteToGlobal
+        );
+    }
+
+    #[test]
+    fn dream_planner_rejects_project_specific_global_promotion_candidates() {
+        let mut project_fact = test_fact_record("fact-project", MemoryScope::Workspace);
+        project_fact.kind = MemoryKind::ProjectDecision.as_str().to_string();
+        let policy = MemoryDreamSafetyPolicy::new(10, 10).expect("policy");
+
+        let error = validate_memory_dream_planner_output(
+            &promote_output(
+                "fact-project",
+                Some("Prefer compact replies in all projects."),
+            ),
+            MemoryDreamScope::Workspace,
+            &[project_fact],
+            &policy,
+        )
+        .expect_err("project decisions should not promote");
+        assert!(error.message.contains("only supports preference facts"));
+
+        let mut path_fact = test_fact_record("fact-path", MemoryScope::Workspace);
+        path_fact.fact = "Prefer editing app/main.rs first.".to_string();
+        let error = validate_memory_dream_planner_output(
+            &promote_output("fact-path", None),
+            MemoryDreamScope::Workspace,
+            &[path_fact],
+            &policy,
+        )
+        .expect_err("path-specific facts should not promote");
+        assert!(error.message.contains("project-specific file path"));
+    }
+
+    #[test]
+    fn dream_promotion_writes_global_origin_evidence() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let global_memory_path = temp_dir.path().join("global-memory.sqlite");
+        let mut database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        insert_test_fact(
+            &mut database,
+            "fact-source",
+            MemoryScope::Workspace,
+            None,
+            MemoryStatus::Active,
+            MemoryKind::Preference,
+            "Prefer concise answers.",
+            Some(0.9),
+        );
+        database
+            .insert_dream_job(NewMemoryDreamJob {
+                id: "job-1",
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some("workspace-1"),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::Llm,
+                status: MemoryDreamJobStatus::Running,
+                model_id: None,
+                input_summary_json: "{}",
+                output_summary_json: None,
+                transcript_chat_id: None,
+                error_message: None,
+            })
+            .expect("dream job");
+        let candidate = database
+            .fact("fact-source")
+            .expect("fact lookup")
+            .expect("fact exists");
+        let policy = MemoryDreamSafetyPolicy::new(10, 10).expect("policy");
+        let output = promote_output(
+            "fact-source",
+            Some("Prefer concise answers across all projects."),
+        );
+        let validated = validate_memory_dream_planner_output(
+            &output,
+            MemoryDreamScope::Workspace,
+            &[candidate],
+            &policy,
+        )
+        .expect("validated promotion");
+
+        let summary = apply_llm_changes(
+            &mut database,
+            "job-1",
+            &validated,
+            &policy,
+            Some("workspace-1"),
+            Some(&global_memory_path),
+        )
+        .expect("apply promotion");
+
+        assert_eq!(summary.applied, 1);
+        let global_database =
+            MemoryDatabase::open_or_create_global_at(&global_memory_path).expect("global memory");
+        let promoted = global_database
+            .dream_candidate_facts(MemoryDreamScope::Global, None, 10)
+            .expect("global facts");
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(
+            promoted[0].fact,
+            "Prefer concise answers across all projects."
+        );
+        let metadata: Value =
+            serde_json::from_str(&promoted[0].metadata_json).expect("promoted metadata");
+        assert_eq!(
+            metadata["dreamPromotion"]["originWorkspaceId"],
+            "workspace-1"
+        );
+        assert_eq!(
+            metadata["dreamPromotion"]["sourceFactIds"][0],
+            "fact-source"
+        );
+        let sources = global_database
+            .sources_for_fact(&promoted[0].id)
+            .expect("promoted sources");
+        assert!(!sources.is_empty());
+        let source_metadata: Value =
+            serde_json::from_str(&sources[0].metadata_json).expect("source metadata");
+        assert_eq!(
+            source_metadata["dreamPromotion"]["originWorkspaceId"],
+            "workspace-1"
+        );
+        let changes = database
+            .dream_changes_for_job("job-1", Some(MemoryDreamChangeStatus::Applied), 10)
+            .expect("dream changes");
+        assert_eq!(changes[0].operation, "promote_to_global");
+        assert_eq!(
+            changes[0].new_fact_id.as_deref(),
+            Some(promoted[0].id.as_str())
+        );
+    }
+
     #[tokio::test]
     async fn automatic_llm_dream_falls_back_to_deterministic_changes() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -2469,6 +3073,7 @@ mod tests {
             mode: MemoryDreamRunMode::DeterministicOnly,
             model_id: None,
             settings: test_settings(true),
+            global_memory_database_file: None,
             planner: None,
             transcript: Some(MemoryDreamTranscriptRequest {
                 workspace_path: &workspace_dir,
@@ -2519,6 +3124,7 @@ mod tests {
             mode: MemoryDreamRunMode::DeterministicOnly,
             model_id: None,
             settings: test_settings(false),
+            global_memory_database_file: None,
             planner: None,
             transcript: None,
         }
@@ -2567,6 +3173,32 @@ mod tests {
                         }]
                     })
                     .unwrap_or_default(),
+            }],
+        }
+    }
+
+    fn promote_output(target_fact_id: &str, fact: Option<&str>) -> MemoryDreamPlannerOutput {
+        MemoryDreamPlannerOutput {
+            summary: "promote user-wide preference".to_string(),
+            changes: vec![MemoryDreamPlannerChange {
+                operation: "promote_to_global".to_string(),
+                target_fact_ids: vec![target_fact_id.to_string()],
+                new_fact: Some(DreamPlannerNewFact {
+                    fact: fact.map(str::to_string),
+                    kind: Some(MemoryKind::Preference.as_str().to_string()),
+                    confidence: Some(0.9),
+                    relation: None,
+                    expires_at: None,
+                }),
+                reason: "explicit user-wide preference".to_string(),
+                confidence: Some(0.9),
+                risk_level: "low".to_string(),
+                evidence: vec![DreamPlannerEvidence {
+                    source_type: "memory_fact".to_string(),
+                    source_id: target_fact_id.to_string(),
+                    quote: "The user said this is a user-wide preference across workspaces."
+                        .to_string(),
+                }],
             }],
         }
     }
