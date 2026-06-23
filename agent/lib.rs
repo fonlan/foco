@@ -1428,7 +1428,7 @@ pub fn tool_resource_locks(
         }],
         WEB_SEARCH_TOOL_NAME | WEB_FETCH_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::ExternalTool(tool_call.name.clone()),
-            access: ToolResourceAccess::Exclusive,
+            access: ToolResourceAccess::Read,
         }],
         ASK_QUESTION_TOOL_NAME | "sleep" => Vec::new(),
         name if name.starts_with(MCP_TOOL_NAME_PREFIX) => vec![ToolResourceLock {
@@ -2567,6 +2567,42 @@ mod tests {
                 arguments: json!({ "query": "needle", "path": "." }),
             },
         ];
+
+        let plan = plan_tool_execution(&calls).expect("plan");
+
+        assert_eq!(
+            plan,
+            ToolExecutionPlan {
+                groups: vec![ToolExecutionGroup {
+                    mode: ToolExecutionMode::Parallel,
+                    call_indices: vec![0, 1],
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn plans_multiple_web_fetch_calls_in_one_parallel_group() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-a".to_string(),
+                name: WEB_FETCH_TOOL_NAME.to_string(),
+                arguments: json!({ "url": "https://example.com/a" }),
+            },
+            PendingToolCall {
+                id: "call-b".to_string(),
+                name: WEB_FETCH_TOOL_NAME.to_string(),
+                arguments: json!({ "url": "https://example.com/b" }),
+            },
+        ];
+
+        assert_eq!(
+            tool_resource_locks(&calls[0]).expect("web_fetch locks"),
+            vec![ToolResourceLock {
+                resource: ToolResource::ExternalTool(WEB_FETCH_TOOL_NAME.to_string()),
+                access: ToolResourceAccess::Read,
+            }]
+        );
 
         let plan = plan_tool_execution(&calls).expect("plan");
 
