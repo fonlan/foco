@@ -15757,7 +15757,7 @@ function SettingsPanel({
                           </span>
                           <label
                             aria-label={t("Enable Dream")}
-                            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
                           >
                             <input
                               checked={memorySettingsForm.dream.enabled}
@@ -15779,7 +15779,7 @@ function SettingsPanel({
                           </span>
                           <label
                             aria-label={t("Enable Auto Dream")}
-                            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
                           >
                             <input
                               checked={memorySettingsForm.dream.autoEnabled}
@@ -15898,7 +15898,7 @@ function SettingsPanel({
                           </span>
                           <label
                             aria-label={t("Create transcript chat")}
-                            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
                           >
                             <input
                               checked={memorySettingsForm.dream.createTranscriptChat}
@@ -16204,7 +16204,7 @@ function SettingsPanel({
                           >
                             <div className="mb-3 flex flex-wrap items-center gap-2">
                               <h5 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
-                                {group.operation}
+                                {memoryDreamChangeOperationLabel(group.operation, t)}
                               </h5>
                               <CapabilityPill
                                 label={formatNumber(group.changes.length, language)}
@@ -16219,11 +16219,11 @@ function SettingsPanel({
                                 >
                                   <div className="flex flex-wrap items-center gap-2">
                                     <CapabilityPill
-                                      label={change.status}
+                                      label={memoryDreamChangeStatusLabel(change.status, t)}
                                       ok={change.status === "applied"}
                                     />
                                     <CapabilityPill
-                                      label={change.riskLevel}
+                                      label={memoryDreamRiskLabel(change.riskLevel, t)}
                                       ok={change.riskLevel === "low"}
                                     />
                                     {change.confidence !== null ? (
@@ -21325,6 +21325,43 @@ function memoryDreamStatusLabel(status: string, t: Translate) {
     return t("Skipped");
   }
   return status;
+}
+
+function memoryDreamChangeOperationLabel(operation: string, t: Translate) {
+  const labels: Record<string, string> = {
+    add_edge: "Dream change add edge",
+    expire: "Dream change expire",
+    merge: "Dream change merge",
+    promote_to_global: "Dream change promote to global",
+    reject: "Dream change reject",
+    supersede: "Dream change supersede",
+    update: "Dream change update",
+  };
+
+  return labels[operation] ? t(labels[operation]) : operation;
+}
+
+function memoryDreamChangeStatusLabel(status: string, t: Translate) {
+  if (status === "applied") {
+    return t("Dream change applied");
+  }
+  if (status === "failed") {
+    return t("Failed");
+  }
+  return status;
+}
+
+function memoryDreamRiskLabel(riskLevel: string, t: Translate) {
+  if (riskLevel === "low") {
+    return t("Dream risk low");
+  }
+  if (riskLevel === "medium") {
+    return t("Dream risk medium");
+  }
+  if (riskLevel === "high") {
+    return t("Dream risk high");
+  }
+  return riskLevel;
 }
 
 function isActiveMemoryDreamStatus(status: string) {
