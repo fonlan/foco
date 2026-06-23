@@ -178,6 +178,13 @@ import type {
   ManualMemoryFormState,
   McpServerFormState,
   MemoryDialogMode,
+  MemoryDreamChangeSummary,
+  MemoryDreamChangesResponse,
+  MemoryDreamJobSummary,
+  MemoryDreamJobsResponse,
+  MemoryDreamRunMode,
+  MemoryDreamRunResponse,
+  MemoryDreamScope,
   MemoryExtractionJobSummary,
   MemoryFactRecord,
   MemoryFilterState,
@@ -6416,6 +6423,7 @@ export function App() {
                   onDeleteAgentDefinition={deleteAgentDefinition}
                   onUpdateAgentDefinition={updateAgentDefinition}
                   onLogout={handleLogout}
+                  onOpenChat={selectWorkspaceChat}
                   onSettingsChange={handleSettingsPanelSettingsChange}
                   onWorkspacesChange={refreshWorkspaces}
                   workspaceDialogRevision={workspaceDialogRevision}
@@ -11311,6 +11319,7 @@ function SettingsPanel({
   onDeleteAgentDefinition,
   onUpdateAgentDefinition,
   onLogout,
+  onOpenChat,
   onSettingsChange,
   onWorkspacesChange,
   workspaceDialogRevision,
@@ -11332,6 +11341,7 @@ function SettingsPanel({
     definition: AgentDefinitionInput,
   ) => Promise<boolean>;
   onLogout: () => Promise<void>;
+  onOpenChat: (workspaceId: string, chatId: string) => void;
   onSettingsChange: (settings: SettingsResponse) => void;
   onWorkspacesChange: () => Promise<void>;
   workspaceDialogRevision: number;
@@ -11383,6 +11393,16 @@ function SettingsPanel({
   const [memoryExtractionJobs, setMemoryExtractionJobs] = useState<
     MemoryExtractionJobSummary[]
   >([]);
+  const [memoryDreamJobs, setMemoryDreamJobs] = useState<MemoryDreamJobSummary[]>(
+    [],
+  );
+  const [memoryDreamChanges, setMemoryDreamChanges] = useState<
+    MemoryDreamChangeSummary[]
+  >([]);
+  const [selectedMemoryDreamJobId, setSelectedMemoryDreamJobId] = useState<
+    string | null
+  >(null);
+  const [memoryDreamError, setMemoryDreamError] = useState<string | null>(null);
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
   const [memorySources, setMemorySources] = useState<MemorySourceRecord[]>([]);
   const [workspaceForm, setWorkspaceForm] = useState<WorkspaceFormState>(() =>
@@ -11429,7 +11449,11 @@ function SettingsPanel({
   const [isSelectingPromptFile, setIsSelectingPromptFile] = useState(false);
   const [isSavingMemorySettings, setIsSavingMemorySettings] = useState(false);
   const [isLoadingMemories, setIsLoadingMemories] = useState(false);
+  const [isLoadingMemoryDreamJobs, setIsLoadingMemoryDreamJobs] = useState(false);
+  const [isLoadingMemoryDreamChanges, setIsLoadingMemoryDreamChanges] =
+    useState(false);
   const [isSavingMemory, setIsSavingMemory] = useState(false);
+  const [memoryDreamRunKey, setMemoryDreamRunKey] = useState<string | null>(null);
   const [isClearingPassword, setIsClearingPassword] = useState(false);
   const [isSavingLanguage, setIsSavingLanguage] = useState(false);
   const [isSavingTheme, setIsSavingTheme] = useState(false);
@@ -11525,6 +11549,50 @@ function SettingsPanel({
   const memoryPageEnd = memories.length
     ? Math.min(memoryListMeta.totalCount, memoryPageStart + memories.length - 1)
     : 0;
+  const memoryDreamWorkspaceId = memoryFilter.workspaceId || memoryWorkspace?.id || "";
+  const sortedMemoryDreamJobs = useMemo(
+    () =>
+      [...memoryDreamJobs].sort(
+        (left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt),
+      ),
+    [memoryDreamJobs],
+  );
+  const selectedMemoryDreamJob =
+    sortedMemoryDreamJobs.find((job) => job.id === selectedMemoryDreamJobId) ??
+    null;
+  const activeMemoryDreamJobKeys = useMemo(
+    () =>
+      new Set(
+        sortedMemoryDreamJobs
+          .filter((job) => isActiveMemoryDreamStatus(job.status))
+          .map((job) => memoryDreamJobKey(job.scope, job.workspaceId)),
+      ),
+    [sortedMemoryDreamJobs],
+  );
+  const globalDreamRunKey = memoryDreamJobKey("global", null);
+  const workspaceDreamRunKey = memoryDreamJobKey(
+    "workspace",
+    memoryDreamWorkspaceId,
+  );
+  const latestSuccessfulMemoryDreamJob =
+    sortedMemoryDreamJobs.find((job) => job.status === "completed") ?? null;
+  const latestFailedMemoryDreamJob =
+    sortedMemoryDreamJobs.find((job) => job.status === "failed") ?? null;
+  const memoryDreamNextRunEstimate = nextMemoryDreamRunEstimate(
+    latestSuccessfulMemoryDreamJob,
+    memorySettingsForm.dream,
+    language,
+    t,
+  );
+  const latestMemoryDreamChangeCount = latestSuccessfulMemoryDreamJob
+    ? memoryDreamAppliedChangeCount(latestSuccessfulMemoryDreamJob)
+    : 0;
+  const memoryDreamChangesByOperation = useMemo(
+    () => groupMemoryDreamChanges(memoryDreamChanges),
+    [memoryDreamChanges],
+  );
+  const isMemoryDreamRunnable =
+    memorySettingsForm.enabled && memorySettingsForm.dream.enabled;
   const canClearFilteredMemories =
     memoryFilter.scope !== "global" &&
     (memoryFilter.scope !== "chat" || Boolean(memoryFilter.chatId.trim()));
@@ -11708,6 +11776,18 @@ function SettingsPanel({
       retrievalModelId: data.memory.retrievalModelId ?? "",
       retentionDays:
         data.memory.retentionDays === null ? "" : String(data.memory.retentionDays),
+      dream: {
+        enabled: data.memory.dream.enabled,
+        autoEnabled: data.memory.dream.autoEnabled,
+        mode: data.memory.dream.mode,
+        modelId: data.memory.dream.modelId ?? "",
+        workspaceIntervalDays: String(data.memory.dream.workspaceIntervalDays),
+        globalIntervalDays: String(data.memory.dream.globalIntervalDays),
+        createTranscriptChat: data.memory.dream.createTranscriptChat,
+        maxFactsPerRun: String(data.memory.dream.maxFactsPerRun),
+        maxChangesPerRun: String(data.memory.dream.maxChangesPerRun),
+        schedulerScanMinutes: String(data.memory.dream.schedulerScanMinutes),
+      },
     });
     setMemoryFilter((current) => ({
       ...current,
@@ -11850,6 +11930,47 @@ function SettingsPanel({
     }
   }, [memoryFilter]);
 
+  const loadMemoryDreamJobs = useCallback(async () => {
+    setIsLoadingMemoryDreamJobs(true);
+    setMemoryDreamError(null);
+
+    try {
+      const data = await requestJson<MemoryDreamJobsResponse>(
+        "/api/memory/dream/jobs",
+      );
+      setMemoryDreamJobs(data.jobs);
+      setSelectedMemoryDreamJobId((current) =>
+        current && data.jobs.some((job) => job.id === current)
+          ? current
+          : data.jobs[0]?.id ?? null,
+      );
+    } catch (requestError) {
+      setMemoryDreamJobs([]);
+      setMemoryDreamChanges([]);
+      setSelectedMemoryDreamJobId(null);
+      setMemoryDreamError(errorMessage(requestError));
+    } finally {
+      setIsLoadingMemoryDreamJobs(false);
+    }
+  }, []);
+
+  const loadMemoryDreamChanges = useCallback(async (jobId: string) => {
+    setIsLoadingMemoryDreamChanges(true);
+    setMemoryDreamError(null);
+
+    try {
+      const data = await requestJson<MemoryDreamChangesResponse>(
+        `/api/memory/dream/jobs/${encodeURIComponent(jobId)}/changes`,
+      );
+      setMemoryDreamChanges(data.changes);
+    } catch (requestError) {
+      setMemoryDreamChanges([]);
+      setMemoryDreamError(errorMessage(requestError));
+    } finally {
+      setIsLoadingMemoryDreamChanges(false);
+    }
+  }, []);
+
   useEffect(() => {
     void loadMetadata();
     void loadSettings();
@@ -11866,6 +11987,21 @@ function SettingsPanel({
       void loadMemories();
     }
   }, [activeSection, loadMemories]);
+
+  useEffect(() => {
+    if (activeSection === "memory") {
+      void loadMemoryDreamJobs();
+    }
+  }, [activeSection, loadMemoryDreamJobs]);
+
+  useEffect(() => {
+    if (activeSection !== "memory" || !selectedMemoryDreamJobId) {
+      setMemoryDreamChanges([]);
+      return;
+    }
+
+    void loadMemoryDreamChanges(selectedMemoryDreamJobId);
+  }, [activeSection, loadMemoryDreamChanges, selectedMemoryDreamJobId]);
 
   useEffect(() => {
     if (activeSection !== "memory" || !selectedMemory) {
@@ -12528,6 +12664,33 @@ function SettingsPanel({
             memorySettingsForm.retentionDays,
             t("Retention days"),
           ),
+          dream: {
+            enabled: memorySettingsForm.dream.enabled,
+            autoEnabled: memorySettingsForm.dream.autoEnabled,
+            mode: memorySettingsForm.dream.mode,
+            modelId: memorySettingsForm.dream.modelId.trim() || null,
+            workspaceIntervalDays: requiredPositiveInteger(
+              memorySettingsForm.dream.workspaceIntervalDays,
+              t("Workspace interval days"),
+            ),
+            globalIntervalDays: requiredPositiveInteger(
+              memorySettingsForm.dream.globalIntervalDays,
+              t("Global interval days"),
+            ),
+            createTranscriptChat: memorySettingsForm.dream.createTranscriptChat,
+            maxFactsPerRun: requiredPositiveInteger(
+              memorySettingsForm.dream.maxFactsPerRun,
+              t("Max facts per run"),
+            ),
+            maxChangesPerRun: requiredPositiveInteger(
+              memorySettingsForm.dream.maxChangesPerRun,
+              t("Max changes per run"),
+            ),
+            schedulerScanMinutes: requiredPositiveInteger(
+              memorySettingsForm.dream.schedulerScanMinutes,
+              t("Scheduler scan minutes"),
+            ),
+          },
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -12540,6 +12703,44 @@ function SettingsPanel({
     } finally {
       setIsSavingMemorySettings(false);
     }
+  }
+
+  async function runMemoryDream(scope: MemoryDreamScope) {
+    const workspaceId = scope === "workspace" ? memoryDreamWorkspaceId : null;
+    const runKey = memoryDreamJobKey(scope, workspaceId);
+    setMemoryDreamRunKey(runKey);
+    setMemoryDreamError(null);
+
+    try {
+      const data = await requestJson<MemoryDreamRunResponse>("/api/memory/dream/run", {
+        body: JSON.stringify({
+          scope,
+          ...(workspaceId ? { workspaceId } : {}),
+          triggerType: "manual",
+          mode: memorySettingsForm.dream.mode,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      await loadMemoryDreamJobs();
+      setSelectedMemoryDreamJobId(data.jobId);
+    } catch (requestError) {
+      setMemoryDreamError(errorMessage(requestError));
+    } finally {
+      setMemoryDreamRunKey(null);
+    }
+  }
+
+  function updateMemoryDreamForm(
+    patch: Partial<MemorySettingsFormState["dream"]>,
+  ) {
+    setMemorySettingsForm((current) => ({
+      ...current,
+      dream: {
+        ...current.dream,
+        ...patch,
+      },
+    }));
   }
 
   function updateMemoryFilter(patch: Partial<MemoryFilterState>) {
@@ -15453,6 +15654,188 @@ function SettingsPanel({
                       </div>
                     </fieldset>
                   </div>
+
+                  <fieldset className="rounded-xl border border-stone-200 bg-white/75 px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                      {t("Dream")}
+                    </legend>
+                    <div className="mb-3 flex items-start gap-2">
+                      <Sparkles
+                        aria-hidden="true"
+                        className="mt-0.5 size-4 shrink-0 text-teal-700"
+                      />
+                      <p className="text-xs text-stone-500">
+                        {t(
+                          "Consolidates stale, duplicate, and pending memories without creating scheduled task rows.",
+                        )}
+                      </p>
+                    </div>
+                    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-sm font-semibold text-stone-800">
+                            {t("Enable Dream")}
+                          </span>
+                          <label
+                            aria-label={t("Enable Dream")}
+                            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                          >
+                            <input
+                              checked={memorySettingsForm.dream.enabled}
+                              className="size-4 accent-teal-700"
+                              onChange={(event) =>
+                                updateMemoryDreamForm({
+                                  enabled: event.target.checked,
+                                })
+                              }
+                              type="checkbox"
+                            />
+                          </label>
+                        </div>
+                      </div>
+                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-sm font-semibold text-stone-800">
+                            {t("Enable Auto Dream")}
+                          </span>
+                          <label
+                            aria-label={t("Enable Auto Dream")}
+                            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                          >
+                            <input
+                              checked={memorySettingsForm.dream.autoEnabled}
+                              className="size-4 accent-teal-700"
+                              onChange={(event) =>
+                                updateMemoryDreamForm({
+                                  autoEnabled: event.target.checked,
+                                })
+                              }
+                              type="checkbox"
+                            />
+                          </label>
+                        </div>
+                      </div>
+                      <label className="block">
+                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          {t("Dream mode")}
+                        </span>
+                        <select
+                          aria-label={t("Dream mode")}
+                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          onChange={(event) =>
+                            updateMemoryDreamForm({
+                              mode: event.target.value as MemoryDreamRunMode,
+                            })
+                          }
+                          value={memorySettingsForm.dream.mode}
+                        >
+                          <option value="deterministic_only">
+                            {t("Deterministic only")}
+                          </option>
+                          <option value="llm">{t("LLM")}</option>
+                        </select>
+                      </label>
+                      <label className="block">
+                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          {t("Dream model")}
+                        </span>
+                        <select
+                          aria-label={t("Dream model")}
+                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          onChange={(event) =>
+                            updateMemoryDreamForm({
+                              modelId: event.target.value,
+                            })
+                          }
+                          value={memorySettingsForm.dream.modelId}
+                        >
+                          <option value="">{t("Fallback model")}</option>
+                          {configuredModelsByName.map((model) => (
+                            <option key={model.id} value={model.id}>
+                              {model.displayName}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <TextField
+                        inputMode="numeric"
+                        label={t("Workspace interval days")}
+                        onChange={(value) =>
+                          updateMemoryDreamForm({
+                            workspaceIntervalDays: value,
+                          })
+                        }
+                        placeholder="7"
+                        value={memorySettingsForm.dream.workspaceIntervalDays}
+                      />
+                      <TextField
+                        inputMode="numeric"
+                        label={t("Global interval days")}
+                        onChange={(value) =>
+                          updateMemoryDreamForm({
+                            globalIntervalDays: value,
+                          })
+                        }
+                        placeholder="30"
+                        value={memorySettingsForm.dream.globalIntervalDays}
+                      />
+                      <TextField
+                        inputMode="numeric"
+                        label={t("Max facts per run")}
+                        onChange={(value) =>
+                          updateMemoryDreamForm({
+                            maxFactsPerRun: value,
+                          })
+                        }
+                        placeholder="200"
+                        value={memorySettingsForm.dream.maxFactsPerRun}
+                      />
+                      <TextField
+                        inputMode="numeric"
+                        label={t("Max changes per run")}
+                        onChange={(value) =>
+                          updateMemoryDreamForm({
+                            maxChangesPerRun: value,
+                          })
+                        }
+                        placeholder="50"
+                        value={memorySettingsForm.dream.maxChangesPerRun}
+                      />
+                      <TextField
+                        inputMode="numeric"
+                        label={t("Scheduler scan minutes")}
+                        onChange={(value) =>
+                          updateMemoryDreamForm({
+                            schedulerScanMinutes: value,
+                          })
+                        }
+                        placeholder="60"
+                        value={memorySettingsForm.dream.schedulerScanMinutes}
+                      />
+                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="text-sm font-semibold text-stone-800">
+                            {t("Create transcript chat")}
+                          </span>
+                          <label
+                            aria-label={t("Create transcript chat")}
+                            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                          >
+                            <input
+                              checked={memorySettingsForm.dream.createTranscriptChat}
+                              className="size-4 accent-teal-700"
+                              onChange={(event) =>
+                                updateMemoryDreamForm({
+                                  createTranscriptChat: event.target.checked,
+                                })
+                              }
+                              type="checkbox"
+                            />
+                          </label>
+                        </div>
+                      </div>
+                    </div>
+                  </fieldset>
                 </div>
                 <button
                   aria-label={t("Save memory settings")}
@@ -15469,6 +15852,345 @@ function SettingsPanel({
                   {t("Save")}
                 </button>
               </form>
+
+              <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <Sparkles aria-hidden="true" className="size-5 text-teal-700" />
+                      <h3 className="text-sm font-semibold text-stone-950">
+                        {t("Dream history")}
+                      </h3>
+                    </div>
+                    <p className="mt-1 truncate text-xs text-stone-500">
+                      {t("Memory maintenance jobs and applied changes")}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center justify-end gap-2">
+                    <button
+                      aria-label={t("Run workspace Dream now")}
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300"
+                      disabled={
+                        !isMemoryDreamRunnable ||
+                        !memoryDreamWorkspaceId ||
+                        activeMemoryDreamJobKeys.has(workspaceDreamRunKey) ||
+                        memoryDreamRunKey === workspaceDreamRunKey
+                      }
+                      onClick={() => void runMemoryDream("workspace")}
+                      title={t("Run workspace Dream now")}
+                      type="button"
+                    >
+                      {memoryDreamRunKey === workspaceDreamRunKey ? (
+                        <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                      ) : (
+                        <Play aria-hidden="true" className="size-4" />
+                      )}
+                      {t("Run workspace Dream now")}
+                    </button>
+                    <button
+                      aria-label={t("Run global Dream now")}
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      disabled={
+                        !isMemoryDreamRunnable ||
+                        activeMemoryDreamJobKeys.has(globalDreamRunKey) ||
+                        memoryDreamRunKey === globalDreamRunKey
+                      }
+                      onClick={() => void runMemoryDream("global")}
+                      title={t("Run global Dream now")}
+                      type="button"
+                    >
+                      {memoryDreamRunKey === globalDreamRunKey ? (
+                        <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                      ) : (
+                        <Globe aria-hidden="true" className="size-4" />
+                      )}
+                      {t("Run global Dream now")}
+                    </button>
+                    <button
+                      aria-label={t("Refresh Dream history")}
+                      className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      onClick={() => void loadMemoryDreamJobs()}
+                      title={t("Refresh Dream history")}
+                      type="button"
+                    >
+                      {isLoadingMemoryDreamJobs ? (
+                        <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                      ) : (
+                        <RefreshCw aria-hidden="true" className="size-4" />
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-4 grid gap-3 md:grid-cols-4">
+                  <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <div className="text-xs font-semibold text-stone-500">
+                      {t("Last successful run")}
+                    </div>
+                    <div className="mt-1 text-sm font-semibold text-stone-900">
+                      {latestSuccessfulMemoryDreamJob
+                        ? formatAuditDate(
+                          latestSuccessfulMemoryDreamJob.completedAt ??
+                          latestSuccessfulMemoryDreamJob.createdAt,
+                          language,
+                        )
+                        : t("None")}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <div className="text-xs font-semibold text-stone-500">
+                      {t("Last failed run")}
+                    </div>
+                    <div className="mt-1 text-sm font-semibold text-stone-900">
+                      {latestFailedMemoryDreamJob
+                        ? formatAuditDate(
+                          latestFailedMemoryDreamJob.completedAt ??
+                          latestFailedMemoryDreamJob.createdAt,
+                          language,
+                        )
+                        : t("None")}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <div className="text-xs font-semibold text-stone-500">
+                      {t("Next automatic run")}
+                    </div>
+                    <div className="mt-1 text-sm font-semibold text-stone-900">
+                      {memoryDreamNextRunEstimate}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <div className="text-xs font-semibold text-stone-500">
+                      {t("Latest applied changes")}
+                    </div>
+                    <div className="mt-1 text-sm font-semibold text-stone-900">
+                      {formatNumber(latestMemoryDreamChangeCount, language)}
+                    </div>
+                  </div>
+                </div>
+
+                {memoryDreamError ? (
+                  <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                    {memoryDreamError}
+                  </div>
+                ) : null}
+
+                <div className="panel-scroll mt-4 overflow-x-auto rounded-xl border border-stone-200 bg-white">
+                  <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
+                    <thead className="bg-stone-50 text-xs font-semibold uppercase tracking-wide text-stone-500">
+                      <tr>
+                        <th className="px-3 py-2">{t("Created")}</th>
+                        <th className="px-3 py-2">{t("Scope")}</th>
+                        <th className="px-3 py-2">{t("Trigger")}</th>
+                        <th className="px-3 py-2">{t("Model")}</th>
+                        <th className="px-3 py-2">{t("Status")}</th>
+                        <th className="px-3 py-2">{t("Changes")}</th>
+                        <th className="px-3 py-2">{t("Transcript")}</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-stone-100">
+                      {sortedMemoryDreamJobs.length === 0 ? (
+                        <tr>
+                          <td
+                            className="px-3 py-6 text-center text-sm font-medium text-stone-500"
+                            colSpan={7}
+                          >
+                            {isLoadingMemoryDreamJobs
+                              ? t("Loading Dream history...")
+                              : t("No Dream jobs")}
+                          </td>
+                        </tr>
+                      ) : (
+                        sortedMemoryDreamJobs.map((job) => {
+                          const transcriptWorkspaceId =
+                            job.transcriptWorkspaceId ?? job.workspaceId;
+                          return (
+                            <tr
+                              className={
+                                selectedMemoryDreamJobId === job.id
+                                  ? "bg-teal-50/70"
+                                  : "bg-white"
+                              }
+                              key={job.id}
+                            >
+                              <td className="px-3 py-2 align-top">
+                                <button
+                                  className="text-left text-xs font-semibold text-stone-700 hover:text-teal-800"
+                                  onClick={() => setSelectedMemoryDreamJobId(job.id)}
+                                  type="button"
+                                >
+                                  {formatAuditDate(job.createdAt, language)}
+                                </button>
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                {memoryDreamScopeLabel(job.scope, t)}
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                {memoryDreamTriggerLabel(job.triggerType, t)}
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                {job.modelId ?? t("Default")}
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                <CapabilityPill
+                                  label={memoryDreamStatusLabel(job.status, t)}
+                                  ok={job.status === "completed"}
+                                />
+                              </td>
+                              <td className="px-3 py-2 align-top text-xs text-stone-600">
+                                {t("added {count}", {
+                                  count: job.changeCounts.added,
+                                })}
+                                {", "}
+                                {t("updated {count}", {
+                                  count: job.changeCounts.updated,
+                                })}
+                                {", "}
+                                {t("superseded {count}", {
+                                  count: job.changeCounts.superseded,
+                                })}
+                                {", "}
+                                {t("expired {count}", {
+                                  count: job.changeCounts.expired,
+                                })}
+                                {", "}
+                                {t("rejected {count}", {
+                                  count: job.changeCounts.rejected,
+                                })}
+                              </td>
+                              <td className="px-3 py-2 align-top">
+                                {job.transcriptChatId && transcriptWorkspaceId ? (
+                                  <button
+                                    className="text-xs font-semibold text-teal-800 hover:text-teal-950"
+                                    onClick={() =>
+                                      onOpenChat(transcriptWorkspaceId, job.transcriptChatId!)
+                                    }
+                                    type="button"
+                                  >
+                                    {t("Open transcript")}
+                                  </button>
+                                ) : job.transcriptChatId ? (
+                                  <span className="text-xs text-stone-500">
+                                    {job.transcriptChatId}
+                                  </span>
+                                ) : (
+                                  <span className="text-xs text-stone-400">-</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {selectedMemoryDreamJob ? (
+                  <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h4 className="text-sm font-semibold text-stone-950">
+                        {t("Dream job details")}
+                      </h4>
+                      <CapabilityPill
+                        label={memoryDreamStatusLabel(
+                          selectedMemoryDreamJob.status,
+                          t,
+                        )}
+                        ok={selectedMemoryDreamJob.status === "completed"}
+                      />
+                      <CapabilityPill
+                        label={memoryDreamScopeLabel(selectedMemoryDreamJob.scope, t)}
+                        ok={selectedMemoryDreamJob.scope === "workspace"}
+                      />
+                    </div>
+                    <p className="mt-2 text-sm text-stone-600">
+                      {selectedMemoryDreamJob.summary ||
+                        selectedMemoryDreamJob.errorMessage ||
+                        t("No summary")}
+                    </p>
+                    <div className="mt-3 grid gap-3">
+                      {isLoadingMemoryDreamChanges ? (
+                        <div className="text-sm text-stone-500">
+                          {t("Loading Dream changes...")}
+                        </div>
+                      ) : memoryDreamChangesByOperation.length === 0 ? (
+                        <div className="text-sm text-stone-500">
+                          {t("No Dream changes")}
+                        </div>
+                      ) : (
+                        memoryDreamChangesByOperation.map((group) => (
+                          <div
+                            className="rounded-lg border border-stone-200 bg-white px-3 py-3"
+                            key={group.operation}
+                          >
+                            <div className="mb-3 flex flex-wrap items-center gap-2">
+                              <h5 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+                                {group.operation}
+                              </h5>
+                              <CapabilityPill
+                                label={formatNumber(group.changes.length, language)}
+                                ok
+                              />
+                            </div>
+                            <div className="grid gap-3">
+                              {group.changes.map((change) => (
+                                <div
+                                  className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-3"
+                                  key={change.id}
+                                >
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <CapabilityPill
+                                      label={change.status}
+                                      ok={change.status === "applied"}
+                                    />
+                                    <CapabilityPill
+                                      label={change.riskLevel}
+                                      ok={change.riskLevel === "low"}
+                                    />
+                                    {change.confidence !== null ? (
+                                      <span className="text-xs font-semibold text-stone-500">
+                                        {formatNumber(
+                                          Math.round(change.confidence * 100),
+                                          language,
+                                        )}
+                                        %
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                  <div className="mt-2 text-sm font-semibold text-stone-900">
+                                    {change.reason}
+                                  </div>
+                                  {change.targetFactIds.length ? (
+                                    <div className="mt-1 break-all text-xs text-stone-500">
+                                      {change.targetFactIds.join(", ")}
+                                    </div>
+                                  ) : null}
+                                  {change.errorMessage ? (
+                                    <div className="mt-2 text-sm text-rose-700">
+                                      {change.errorMessage}
+                                    </div>
+                                  ) : null}
+                                  <div className="mt-3 grid gap-3 lg:grid-cols-3">
+                                    <pre className="panel-scroll max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                      {memoryDreamJsonText(change.beforeJson)}
+                                    </pre>
+                                    <pre className="panel-scroll max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                      {memoryDreamJsonText(change.afterJson)}
+                                    </pre>
+                                    <pre className="panel-scroll max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                      {memoryDreamJsonText(change.evidence)}
+                                    </pre>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  </div>
+                ) : null}
+              </section>
 
               <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -19593,6 +20315,18 @@ function emptyMemorySettingsForm(): MemorySettingsFormState {
     extractionModelId: "",
     retrievalModelId: "",
     retentionDays: "",
+    dream: {
+      enabled: false,
+      autoEnabled: false,
+      mode: "llm",
+      modelId: "",
+      workspaceIntervalDays: "7",
+      globalIntervalDays: "30",
+      createTranscriptChat: true,
+      maxFactsPerRun: "200",
+      maxChangesPerRun: "50",
+      schedulerScanMinutes: "60",
+    },
   };
 }
 
@@ -20460,6 +21194,123 @@ function optionalPositiveInteger(value: string, label: string) {
   }
 
   return numberValue;
+}
+
+function requiredPositiveInteger(value: string, label: string) {
+  const numberValue = optionalPositiveInteger(value, label);
+
+  if (numberValue === null) {
+    throw new Error(`${label} must be a positive whole number`);
+  }
+
+  return numberValue;
+}
+
+function memoryDreamJobKey(scope: MemoryDreamScope, workspaceId: string | null) {
+  return scope === "global" ? "global" : `workspace:${workspaceId ?? ""}`;
+}
+
+function memoryDreamScopeLabel(scope: string, t: Translate) {
+  return scope === "global" ? t("Global Dream") : t("Workspace Dream");
+}
+
+function memoryDreamTriggerLabel(triggerType: string, t: Translate) {
+  if (triggerType === "auto_interval") {
+    return t("Auto interval");
+  }
+  if (triggerType === "auto_threshold") {
+    return t("Auto threshold");
+  }
+  return t("Manual");
+}
+
+function memoryDreamStatusLabel(status: string, t: Translate) {
+  if (status === "completed") {
+    return t("Completed");
+  }
+  if (status === "failed") {
+    return t("Failed");
+  }
+  if (status === "queued") {
+    return t("Queued");
+  }
+  if (status === "running") {
+    return t("Running");
+  }
+  if (status === "cancelled") {
+    return t("Cancelled");
+  }
+  if (status === "skipped") {
+    return t("Skipped");
+  }
+  return status;
+}
+
+function isActiveMemoryDreamStatus(status: string) {
+  return status === "queued" || status === "running";
+}
+
+function memoryDreamAppliedChangeCount(job: MemoryDreamJobSummary) {
+  return (
+    job.changeCounts.added +
+    job.changeCounts.updated +
+    job.changeCounts.superseded +
+    job.changeCounts.expired +
+    job.changeCounts.rejected
+  );
+}
+
+function nextMemoryDreamRunEstimate(
+  latestSuccessfulJob: MemoryDreamJobSummary | null,
+  dream: MemorySettingsFormState["dream"],
+  language: AppLanguageId,
+  t: Translate,
+) {
+  if (!dream.autoEnabled) {
+    return t("Auto Dream disabled");
+  }
+
+  if (!latestSuccessfulJob) {
+    return t("After first eligible scan");
+  }
+
+  const completedAt = latestSuccessfulJob.completedAt ?? latestSuccessfulJob.createdAt;
+  const completedAtMs = Date.parse(completedAt);
+  if (Number.isNaN(completedAtMs)) {
+    return t("After next scheduler scan");
+  }
+
+  const intervalDays =
+    latestSuccessfulJob.scope === "global"
+      ? Number(dream.globalIntervalDays)
+      : Number(dream.workspaceIntervalDays);
+  if (!Number.isFinite(intervalDays) || intervalDays <= 0) {
+    return t("After next scheduler scan");
+  }
+
+  return formatAuditDate(
+    new Date(completedAtMs + intervalDays * 24 * 60 * 60 * 1000).toISOString(),
+    language,
+  );
+}
+
+function groupMemoryDreamChanges(changes: MemoryDreamChangeSummary[]) {
+  return changes.reduce<Array<{ operation: string; changes: MemoryDreamChangeSummary[] }>>(
+    (groups, change) => {
+      const group = groups.find((item) => item.operation === change.operation);
+      if (group) {
+        group.changes.push(change);
+      } else {
+        groups.push({ operation: change.operation, changes: [change] });
+      }
+      return groups;
+    },
+    [],
+  );
+}
+
+function memoryDreamJsonText(value: JsonValue | null) {
+  return value === null ? "null" : JSON.stringify(value, null, 2);
 }
 
 function optionalNumber(value: string, label: string) {

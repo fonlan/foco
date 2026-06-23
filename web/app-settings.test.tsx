@@ -12,6 +12,8 @@ import {
   enqueueChatStreamEvent,
   enqueueChatStreamEventForRun,
   jsonResponse,
+  memoryDreamChange,
+  memoryDreamJob,
   memoryExtractionJob,
   memorySource,
   mermaidMock,
@@ -221,6 +223,16 @@ describe("app-settings verification surfaces", () => {
     changeInput(screen.getByLabelText("Retention days"), "30");
     await userEvent.selectOptions(screen.getByLabelText("Extraction model"), "gpt-test");
     await userEvent.selectOptions(screen.getByLabelText("Matching model"), "gpt-test");
+    await userEvent.click(screen.getByLabelText("Enable Dream"));
+    await userEvent.click(screen.getByLabelText("Enable Auto Dream"));
+    await userEvent.selectOptions(screen.getByLabelText("Dream mode"), "deterministic_only");
+    await userEvent.selectOptions(screen.getByLabelText("Dream model"), "gpt-test");
+    changeInput(screen.getByLabelText("Workspace interval days"), "5");
+    changeInput(screen.getByLabelText("Global interval days"), "20");
+    changeInput(screen.getByLabelText("Max facts per run"), "120");
+    changeInput(screen.getByLabelText("Max changes per run"), "25");
+    changeInput(screen.getByLabelText("Scheduler scan minutes"), "45");
+    await userEvent.click(screen.getByLabelText("Create transcript chat"));
     await userEvent.click(screen.getByRole("button", { name: "Save memory settings" }));
 
     await waitFor(() => {
@@ -235,6 +247,55 @@ describe("app-settings verification surfaces", () => {
         extractionModelId: "gpt-test",
         retrievalModelId: "gpt-test",
         retentionDays: 30,
+        dream: {
+          enabled: true,
+          autoEnabled: true,
+          mode: "deterministic_only",
+          modelId: "gpt-test",
+          workspaceIntervalDays: 5,
+          globalIntervalDays: 20,
+          createTranscriptChat: false,
+          maxFactsPerRun: 120,
+          maxChangesPerRun: 25,
+          schedulerScanMinutes: 45,
+        },
+      });
+    });
+  });
+
+  it("shows Dream history details and runs manual Dream jobs", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    expect(await screen.findByText("Dream history")).toBeInTheDocument();
+    expect(await screen.findByText(memoryDreamJob.summary!)).toBeInTheDocument();
+    expect(await screen.findByText(memoryDreamChange.reason)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open transcript" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText("Enable memory"));
+    await userEvent.click(screen.getByLabelText("Enable Dream"));
+    await userEvent.click(screen.getByRole("button", { name: "Run workspace Dream now" }));
+    await userEvent.click(screen.getByRole("button", { name: "Run global Dream now" }));
+
+    await waitFor(() => {
+      const dreamRunCalls = fetchMock.mock.calls.filter(
+        ([url]) => url === "/api/memory/dream/run",
+      );
+      expect(dreamRunCalls).toHaveLength(2);
+      expect(JSON.parse(String(dreamRunCalls[0]?.[1]?.body))).toEqual({
+        scope: "workspace",
+        workspaceId: "workspace-1",
+        triggerType: "manual",
+        mode: "llm",
+      });
+      expect(JSON.parse(String(dreamRunCalls[1]?.[1]?.body))).toEqual({
+        scope: "global",
+        triggerType: "manual",
+        mode: "llm",
       });
     });
   });

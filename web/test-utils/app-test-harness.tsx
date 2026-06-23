@@ -548,6 +548,66 @@ export const memoryExtractionJob = {
   status: "failed",
 };
 
+export const memoryDreamJob = {
+  changeCounts: {
+    added: 1,
+    expired: 1,
+    rejected: 0,
+    superseded: 2,
+    updated: 1,
+  },
+  completedAt: "2026-06-10T02:15:00Z",
+  createdAt: "2026-06-10T02:00:00Z",
+  errorMessage: null,
+  id: "dream-job-1",
+  mode: "llm",
+  modelId: "gpt-test",
+  scope: "workspace",
+  startedAt: "2026-06-10T02:00:30Z",
+  status: "completed",
+  summary: "Merged duplicate workspace preferences.",
+  transcriptChatId: "chat-1",
+  transcriptWorkspaceId: "workspace-1",
+  triggerType: "manual",
+  workspaceId: "workspace-1",
+};
+
+export const failedMemoryDreamJob = {
+  ...memoryDreamJob,
+  changeCounts: {
+    added: 0,
+    expired: 0,
+    rejected: 0,
+    superseded: 0,
+    updated: 0,
+  },
+  completedAt: "2026-06-09T02:15:00Z",
+  createdAt: "2026-06-09T02:00:00Z",
+  errorMessage: "memory Dream model unavailable",
+  id: "dream-job-failed",
+  status: "failed",
+  summary: null,
+  transcriptChatId: null,
+};
+
+export const memoryDreamChange = {
+  afterJson: { fact: "Prefer concise repo answers.", status: "active" },
+  appliedAt: "2026-06-10T02:14:00Z",
+  beforeJson: { fact: "Prefer concise answers.", status: "active" },
+  confidence: 0.91,
+  createdAt: "2026-06-10T02:12:00Z",
+  errorMessage: null,
+  evidence: [{ quote: "Use concise repo answers.", sourceId: "memory-active-1" }],
+  id: "dream-change-1",
+  jobId: "dream-job-1",
+  newFactId: null,
+  operation: "update",
+  reason: "Refined duplicate preference wording.",
+  riskLevel: "low",
+  status: "applied",
+  targetFactIds: ["memory-active-1"],
+};
+
 export const aiStatistics = {
   page: 1,
   pageSize: 20,
@@ -1898,6 +1958,9 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/settings/memory") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      dream?: typeof settings.memory.dream;
+    };
     return jsonResponse({
       ...settings,
       memory: {
@@ -1908,6 +1971,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         extractionModelId: "gpt-test",
         retrievalModelId: "gpt-test",
         retentionDays: 30,
+        dream: body.dream ?? settings.memory.dream,
       },
     });
   }
@@ -1980,6 +2044,26 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     path === "/api/memory/promote"
   ) {
     return jsonResponse({ memory: activeMemory });
+  }
+
+  if (path === "/api/memory/dream/jobs") {
+    return jsonResponse({ jobs: [memoryDreamJob, failedMemoryDreamJob] });
+  }
+
+  if (path === "/api/memory/dream/run") {
+    return jsonResponse({
+      jobId: memoryDreamJob.id,
+      status: "queued",
+      transcriptChatId: memoryDreamJob.transcriptChatId,
+    });
+  }
+
+  if (path === `/api/memory/dream/jobs/${memoryDreamJob.id}/changes`) {
+    return jsonResponse({ changes: [memoryDreamChange] });
+  }
+
+  if (path === `/api/memory/dream/jobs/${failedMemoryDreamJob.id}/changes`) {
+    return jsonResponse({ changes: [] });
   }
 
   if (path === "/api/hooks") {

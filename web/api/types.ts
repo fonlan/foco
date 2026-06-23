@@ -1062,10 +1062,19 @@ type MemoryExtractionModeSummary = {
   label: string;
 };
 
-type MemoryDreamSettingsSummary = {
+export type MemoryDreamRunMode = "deterministic_only" | "llm";
+
+export type MemoryDreamScope = "global" | "workspace";
+
+export type MemoryDreamTriggerType =
+  | "manual"
+  | "auto_interval"
+  | "auto_threshold";
+
+export type MemoryDreamSettingsSummary = {
   enabled: boolean;
   autoEnabled: boolean;
-  mode: "deterministic_only" | "llm";
+  mode: MemoryDreamRunMode;
   modelId: string | null;
   workspaceIntervalDays: number;
   globalIntervalDays: number;
@@ -1156,6 +1165,85 @@ export type MemorySettingsFormState = {
   retentionDays: string;
   extractionModelId: string;
   retrievalModelId: string;
+  dream: {
+    enabled: boolean;
+    autoEnabled: boolean;
+    mode: MemoryDreamRunMode;
+    modelId: string;
+    workspaceIntervalDays: string;
+    globalIntervalDays: string;
+    createTranscriptChat: boolean;
+    maxFactsPerRun: string;
+    maxChangesPerRun: string;
+    schedulerScanMinutes: string;
+  };
+};
+
+export type MemoryDreamJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "skipped"
+  | string;
+
+export type MemoryDreamChangeCounts = {
+  added: number;
+  updated: number;
+  superseded: number;
+  expired: number;
+  rejected: number;
+};
+
+export type MemoryDreamJobSummary = {
+  id: string;
+  scope: MemoryDreamScope;
+  workspaceId: string | null;
+  triggerType: MemoryDreamTriggerType;
+  mode: MemoryDreamRunMode;
+  status: MemoryDreamJobStatus;
+  modelId: string | null;
+  transcriptChatId: string | null;
+  transcriptWorkspaceId?: string | null;
+  errorMessage: string | null;
+  summary: string | null;
+  changeCounts: MemoryDreamChangeCounts;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+};
+
+export type MemoryDreamJobsResponse = {
+  jobs: MemoryDreamJobSummary[];
+};
+
+export type MemoryDreamRunResponse = {
+  jobId: string;
+  status: MemoryDreamJobStatus;
+  transcriptChatId: string | null;
+};
+
+export type MemoryDreamChangeSummary = {
+  id: string;
+  jobId: string;
+  operation: string;
+  targetFactIds: string[];
+  newFactId: string | null;
+  beforeJson: JsonValue | null;
+  afterJson: JsonValue | null;
+  reason: string;
+  confidence: number | null;
+  riskLevel: string;
+  status: string;
+  evidence: JsonValue;
+  errorMessage: string | null;
+  createdAt: string;
+  appliedAt: string | null;
+};
+
+export type MemoryDreamChangesResponse = {
+  changes: MemoryDreamChangeSummary[];
 };
 
 export type MemoryFilterState = {
