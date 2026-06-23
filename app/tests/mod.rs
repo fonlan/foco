@@ -2102,6 +2102,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
             .content
             .contains("Configured prompt instructions.")
     );
+    assert_eq!(extra_prompt_message.role, NeutralChatRole::System);
     assert!(
         extra_prompt_message
             .content
