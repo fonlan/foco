@@ -68,7 +68,7 @@ use foco_store::{
         NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewToolCall,
         NewToolResult, PromptContextInjectionRecord, TodoGraphRecord, TodoGraphTask,
         ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        WorkspaceDatabaseError, workspace_database_path,
+        WorkspaceDatabaseError, WorkspaceDatabaseSpaceStats, workspace_database_path,
     },
 };
 use foco_tools::{
@@ -238,6 +238,9 @@ const GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS: u32 = 256;
 const GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS: usize = 60_000;
 const API_AUDIT_CLEANUP_STARTUP_DELAY_SECS: u64 = 30;
 const API_AUDIT_CLEANUP_INTERVAL_SECS: u64 = 6 * 60 * 60;
+const API_AUDIT_VACUUM_MIN_FREE_BYTES: u64 = 256 * 1024 * 1024;
+const API_AUDIT_VACUUM_MIN_FREE_RATIO_NUMERATOR: u64 = 1;
+const API_AUDIT_VACUUM_MIN_FREE_RATIO_DENOMINATOR: u64 = 4;
 const GIT_COMMIT_MESSAGE_SYSTEM_PROMPT: &str = "\
 Generate one concise Git commit message for the staged changes only. \
 Use the submit_commit_message tool exactly once. Do not return prose. \
@@ -857,8 +860,13 @@ pub(crate) fn spawn_api_audit_cleanup_once(state: AppState, config: GlobalConfig
 
 async fn run_api_audit_cleanup_in_background(config: GlobalConfig) {
     match tokio::task::spawn_blocking(move || prune_api_audit_details_for_config(&config)).await {
-        Ok(Ok(pruned_count)) => {
-            tracing::info!(pruned_count, "API audit cleanup completed");
+        Ok(Ok(summary)) => {
+            tracing::info!(
+                pruned_count = summary.pruned_count,
+                vacuumed_workspace_count = summary.vacuumed_workspace_count,
+                vacuum_reclaimed_bytes = summary.vacuum_reclaimed_bytes,
+                "API audit cleanup completed"
+            );
         }
         Ok(Err(error)) => {
             tracing::warn!(error = %error.message, "API audit cleanup failed");
@@ -867,6 +875,13 @@ async fn run_api_audit_cleanup_in_background(config: GlobalConfig) {
             tracing::warn!(error = %error, "API audit cleanup task failed");
         }
     }
+}
+
+#[derive(Default)]
+struct ApiAuditCleanupSummary {
+    pruned_count: i64,
+    vacuumed_workspace_count: usize,
+    vacuum_reclaimed_bytes: u64,
 }
 
 async fn sleep_until_shutdown(shutdown_rx: &mut watch::Receiver<bool>, duration: Duration) -> bool {
@@ -879,9 +894,11 @@ async fn sleep_until_shutdown(shutdown_rx: &mut watch::Receiver<bool>, duration:
     }
 }
 
-fn prune_api_audit_details_for_config(config: &GlobalConfig) -> Result<i64, ApiError> {
+fn prune_api_audit_details_for_config(
+    config: &GlobalConfig,
+) -> Result<ApiAuditCleanupSummary, ApiError> {
     let cutoff = api_audit_detail_cutoff(config);
-    let mut total_pruned = 0_i64;
+    let mut summary = ApiAuditCleanupSummary::default();
 
     for workspace in &config.workspaces {
         let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
@@ -889,7 +906,7 @@ fn prune_api_audit_details_for_config(config: &GlobalConfig) -> Result<i64, ApiE
         let pruned = database
             .prune_llm_request_details_before(&cutoff)
             .map_err(ApiError::from_workspace_error)?;
-        total_pruned = total_pruned.saturating_add(pruned);
+        summary.pruned_count = summary.pruned_count.saturating_add(pruned);
         if pruned > 0 {
             tracing::info!(
                 workspace_id = %workspace.id,
@@ -899,9 +916,79 @@ fn prune_api_audit_details_for_config(config: &GlobalConfig) -> Result<i64, ApiE
                 "pruned API request details"
             );
         }
+        match vacuum_workspace_database_if_needed(&mut database, &workspace.id, &workspace.path) {
+            Ok(Some(reclaimed_bytes)) => {
+                summary.vacuumed_workspace_count =
+                    summary.vacuumed_workspace_count.saturating_add(1);
+                summary.vacuum_reclaimed_bytes = summary
+                    .vacuum_reclaimed_bytes
+                    .saturating_add(reclaimed_bytes);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    workspace_id = %workspace.id,
+                    workspace_path = %workspace.path.display(),
+                    error = %error.message,
+                    "workspace database compaction skipped"
+                );
+            }
+        }
     }
 
-    Ok(total_pruned)
+    Ok(summary)
+}
+
+fn vacuum_workspace_database_if_needed(
+    database: &mut WorkspaceDatabase,
+    workspace_id: &str,
+    workspace_path: &Path,
+) -> Result<Option<u64>, ApiError> {
+    let before = database
+        .space_stats()
+        .map_err(ApiError::from_workspace_error)?;
+    if !should_vacuum_workspace_database(before) {
+        return Ok(None);
+    }
+
+    tracing::info!(
+        workspace_id,
+        workspace_path = %workspace_path.display(),
+        database_path = %database.database_path().display(),
+        file_bytes = before.file_bytes(),
+        free_bytes = before.free_bytes(),
+        freelist_count = before.freelist_count,
+        page_count = before.page_count,
+        "compacting workspace database"
+    );
+    database.vacuum().map_err(ApiError::from_workspace_error)?;
+    let after = database
+        .space_stats()
+        .map_err(ApiError::from_workspace_error)?;
+    let reclaimed_bytes = before.file_bytes().saturating_sub(after.file_bytes());
+    tracing::info!(
+        workspace_id,
+        workspace_path = %workspace_path.display(),
+        database_path = %database.database_path().display(),
+        reclaimed_bytes,
+        file_bytes_before = before.file_bytes(),
+        file_bytes_after = after.file_bytes(),
+        free_bytes_after = after.free_bytes(),
+        "compacted workspace database"
+    );
+
+    Ok(Some(reclaimed_bytes))
+}
+
+fn should_vacuum_workspace_database(stats: WorkspaceDatabaseSpaceStats) -> bool {
+    stats.page_count > 0
+        && stats.free_bytes() >= API_AUDIT_VACUUM_MIN_FREE_BYTES
+        && stats
+            .freelist_count
+            .saturating_mul(API_AUDIT_VACUUM_MIN_FREE_RATIO_DENOMINATOR)
+            >= stats
+                .page_count
+                .saturating_mul(API_AUDIT_VACUUM_MIN_FREE_RATIO_NUMERATOR)
 }
 
 fn api_audit_detail_cutoff(config: &GlobalConfig) -> String {

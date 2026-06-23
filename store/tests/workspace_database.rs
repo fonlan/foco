@@ -2396,6 +2396,54 @@ fn prunes_llm_request_details_without_deleting_statistics() {
 }
 
 #[test]
+fn vacuum_reclaims_workspace_database_freelist_pages() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let large_input = "x".repeat(1024 * 1024);
+    let large_body = format!(r#"{{"input":"{large_input}"}}"#);
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "large-old-request",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-audit",
+            request_started_at: "2026-06-01T00:00:00.000Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: Some(&large_body),
+            response_body_json: None,
+        })
+        .expect("large old request insert");
+
+    let before_prune = database.space_stats().expect("stats before prune");
+    database
+        .prune_llm_request_details_before("2026-06-03T00:00:00.000Z")
+        .expect("prune large old request");
+    let after_prune = database.space_stats().expect("stats after prune");
+    assert!(after_prune.free_bytes() > before_prune.free_bytes());
+
+    database.vacuum().expect("vacuum workspace database");
+    let after_vacuum = database.space_stats().expect("stats after vacuum");
+    assert!(after_vacuum.file_bytes() < after_prune.file_bytes());
+    assert!(after_vacuum.free_bytes() < after_prune.free_bytes());
+}
+
+#[test]
 fn stores_prompt_context_injections_for_chat_replay() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");

@@ -19,7 +19,7 @@ use foco_store::{
     },
     workspace::{
         LlmRequestAuditFilters, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession,
+        NewTerminalSession, WorkspaceDatabaseSpaceStats,
     },
 };
 use foco_tools::{
@@ -3705,6 +3705,31 @@ fn compact_audit_events_keeps_only_final_tool_call_delta() {
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     assert_eq!(summary_only, vec![0]);
+}
+
+#[test]
+fn api_audit_vacuum_requires_large_enough_freelist() {
+    assert!(should_vacuum_workspace_database(
+        WorkspaceDatabaseSpaceStats {
+            page_size_bytes: 4096,
+            page_count: 1_770_262,
+            freelist_count: 1_437_845,
+        }
+    ));
+    assert!(!should_vacuum_workspace_database(
+        WorkspaceDatabaseSpaceStats {
+            page_size_bytes: 4096,
+            page_count: 100_000,
+            freelist_count: 20_000,
+        }
+    ));
+    assert!(!should_vacuum_workspace_database(
+        WorkspaceDatabaseSpaceStats {
+            page_size_bytes: 4096,
+            page_count: 1_000_000,
+            freelist_count: 1_000,
+        }
+    ));
 }
 
 #[test]

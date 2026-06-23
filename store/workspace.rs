@@ -172,6 +172,23 @@ pub struct WorkspaceDatabase {
     connection: Connection,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceDatabaseSpaceStats {
+    pub page_size_bytes: u64,
+    pub page_count: u64,
+    pub freelist_count: u64,
+}
+
+impl WorkspaceDatabaseSpaceStats {
+    pub fn file_bytes(self) -> u64 {
+        self.page_size_bytes.saturating_mul(self.page_count)
+    }
+
+    pub fn free_bytes(self) -> u64 {
+        self.page_size_bytes.saturating_mul(self.freelist_count)
+    }
+}
+
 impl WorkspaceDatabase {
     pub fn open_or_create(
         workspace_path: impl AsRef<Path>,
@@ -200,6 +217,25 @@ impl WorkspaceDatabase {
 
     pub fn database_path(&self) -> &Path {
         &self.database_path
+    }
+
+    pub fn space_stats(&self) -> Result<WorkspaceDatabaseSpaceStats, WorkspaceDatabaseError> {
+        let page_size_bytes = query_u64_pragma(&self.connection, &self.database_path, "page_size")?;
+        let page_count = query_u64_pragma(&self.connection, &self.database_path, "page_count")?;
+        let freelist_count =
+            query_u64_pragma(&self.connection, &self.database_path, "freelist_count")?;
+
+        Ok(WorkspaceDatabaseSpaceStats {
+            page_size_bytes,
+            page_count,
+            freelist_count,
+        })
+    }
+
+    pub fn vacuum(&mut self) -> Result<(), WorkspaceDatabaseError> {
+        self.connection
+            .execute_batch("VACUUM")
+            .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn schema_version(&self) -> Result<u32, WorkspaceDatabaseError> {
@@ -7155,6 +7191,19 @@ fn sqlite_error(database_path: &Path, source: rusqlite::Error) -> WorkspaceDatab
         path: database_path.to_path_buf(),
         source,
     }
+}
+
+fn query_u64_pragma(
+    connection: &Connection,
+    database_path: &Path,
+    pragma: &str,
+) -> Result<u64, WorkspaceDatabaseError> {
+    let value: i64 = connection
+        .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    u64::try_from(value).map_err(|_| WorkspaceDatabaseError::InvalidAuditData {
+        message: format!("workspace database PRAGMA {pragma} returned a negative value"),
+    })
 }
 
 fn open_connection(database_path: &Path) -> Result<Connection, WorkspaceDatabaseError> {
