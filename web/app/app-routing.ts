@@ -3,6 +3,7 @@ import { useCallback, type RefObject } from "react";
 import type {
   BrowserRoute,
   BrowserRouteChatTab,
+  BrowserRouteFileTab,
   SettingsSection,
   WorkspaceSummary,
 } from "../api/types";
@@ -13,6 +14,10 @@ type AppRoutingOptions = {
   activeWorkspaceIdOrNull: string | null;
   onMissingWorkspace: (message: string) => void;
   onRestoreWorkspaceChatTabs: (tabs: BrowserRouteChatTab[]) => void;
+  onRestoreWorkspaceFileTabs: (
+    files: BrowserRouteFileTab[],
+    activeFile: BrowserRouteFileTab | null,
+  ) => boolean;
   onSelectWorkspaceChat: (
     workspaceId: string,
     chatId: string,
@@ -41,6 +46,7 @@ export function useAppRouting({
   activeWorkspaceIdOrNull,
   onMissingWorkspace,
   onRestoreWorkspaceChatTabs,
+  onRestoreWorkspaceFileTabs,
   onSelectWorkspaceChat,
   onStartNewWorkspaceChat,
   setActiveChatId,
@@ -123,7 +129,15 @@ export function useAppRouting({
       setViewMode("chat");
       setIsMobileWorkspaceOpen(false);
       const routeTabs = route.tabs ?? [];
+      const routeFiles = route.files ?? [];
       onRestoreWorkspaceChatTabs(routeTabs);
+      const restoredActiveFile = onRestoreWorkspaceFileTabs(
+        routeFiles,
+        route.activeFile ?? null,
+      );
+      if (restoredActiveFile) {
+        return;
+      }
       if (!route.workspaceId) {
         setActiveChatId(null);
         activeChatKeyRef.current = null;
@@ -149,6 +163,7 @@ export function useAppRouting({
       activeChatKeyRef,
       onMissingWorkspace,
       onRestoreWorkspaceChatTabs,
+      onRestoreWorkspaceFileTabs,
       onSelectWorkspaceChat,
       onStartNewWorkspaceChat,
       setActiveChatId,

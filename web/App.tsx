@@ -121,6 +121,7 @@ import type {
   AuthStatusResponse,
   BrowserRoute,
   BrowserRouteChatTab,
+  BrowserRouteFileTab,
   ChatAttachmentPartSummary,
   ChatAttachmentPayload,
   ChatCompressionStatistics,
@@ -463,6 +464,7 @@ export function App() {
   const [openAgentTabs, setOpenAgentTabs] = useState<OpenAgentTab[]>([]);
   const [loadingChatKeys, setLoadingChatKeys] = useState<Set<string>>(() => new Set());
   const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
+  const openFileTabsRef = useRef<OpenFileTab[]>([]);
   const [workspaceFileEditors, setWorkspaceFileEditors] = useState<
     Record<string, WorkspaceFileEditorState>
   >({});
@@ -837,7 +839,11 @@ export function App() {
       }
 
       const routeWithTabs = route.viewMode === "chat"
-        ? browserRouteWithOpenChatTabs(route, openChatTabsRef.current)
+        ? browserRouteWithOpenTabs(
+          route,
+          openChatTabsRef.current,
+          openFileTabsRef.current,
+        )
         : route;
       const nextPath = browserPathForRoute(routeWithTabs);
       const currentPath = `${window.location.pathname}${window.location.search}`;
@@ -861,6 +867,10 @@ export function App() {
   useEffect(() => {
     openChatTabsRef.current = openChatTabs;
   }, [openChatTabs]);
+
+  useEffect(() => {
+    openFileTabsRef.current = openFileTabs;
+  }, [openFileTabs]);
 
   useEffect(() => {
     activeWorkspaceIdRef.current = activeWorkspaceId;
@@ -2884,25 +2894,69 @@ export function App() {
       return;
     }
 
-    const workspaceId = activeWorkspace.id;
-    const workspaceName = activeWorkspace.name;
-    const workspaceLogoUrl = activeWorkspace.logoUrl ?? null;
-    const editorKey = workspaceFileEditorKey(workspaceId, node.path);
+    const file: OpenFileTab = {
+      name: node.name,
+      path: node.path,
+      workspaceId: activeWorkspace.id,
+      workspaceLogoUrl: activeWorkspace.logoUrl ?? null,
+      workspaceName: activeWorkspace.name,
+    };
 
-    setOpenFileTabs((current) =>
-      upsertOpenFileTab(current, {
-        name: node.name,
-        path: node.path,
-        workspaceId,
-        workspaceLogoUrl,
-        workspaceName,
-      }),
-    );
-    setActiveWorkspaceId(workspaceId);
-    setExpandedWorkspaceId(workspaceId);
-    setActiveMainTab({ path: node.path, type: "file", workspaceId });
+    selectWorkspaceFileTab(file);
+    await loadWorkspaceFileEditor(file);
+  }
+
+  function restoreWorkspaceFileTabs(
+    files: BrowserRouteFileTab[],
+    activeFile: BrowserRouteFileTab | null,
+  ) {
+    const nextTabs = files.flatMap((file) => {
+      const workspace = workspaces.find((workspace) => workspace.id === file.workspaceId);
+      if (!workspace) {
+        return [];
+      }
+
+      return [browserRouteFileTabToOpenFileTab(file, workspace)];
+    });
+
+    openFileTabsRef.current = nextTabs;
+    setOpenFileTabs(nextTabs);
+
+    const selectedFile = activeFile
+      ? nextTabs.find(
+        (tab) =>
+          tab.workspaceId === activeFile.workspaceId && tab.path === activeFile.path,
+      ) ?? null
+      : null;
+    if (!selectedFile) {
+      return false;
+    }
+
+    selectWorkspaceFileTab(selectedFile, { updateUrl: false });
+    void loadWorkspaceFileEditor(selectedFile);
+    return true;
+  }
+
+  function selectWorkspaceFileTab(
+    file: OpenFileTab,
+    options: { updateUrl?: boolean } = {},
+  ) {
+    const nextTabs = upsertOpenFileTab(openFileTabsRef.current, file);
+    openFileTabsRef.current = nextTabs;
+    setOpenFileTabs(nextTabs);
+    setActiveWorkspaceId(file.workspaceId);
+    setExpandedWorkspaceId(file.workspaceId);
+    setActiveMainTab({ path: file.path, type: "file", workspaceId: file.workspaceId });
     setViewMode("chat");
     setIsMobileWorkspaceOpen(false);
+    initWorkspaceFileEditor(file.workspaceId, file.path);
+    if (options.updateUrl !== false) {
+      updateBrowserRoute(browserRouteForActiveFile(file));
+    }
+  }
+
+  function initWorkspaceFileEditor(workspaceId: string, path: string) {
+    const editorKey = workspaceFileEditorKey(workspaceId, path);
     setWorkspaceFileEditors((current) => ({
       ...current,
       [editorKey]: current[editorKey] ?? {
@@ -2914,12 +2968,16 @@ export function App() {
         lastSavedContent: "",
       },
     }));
+  }
+
+  async function loadWorkspaceFileEditor(file: OpenFileTab) {
+    const editorKey = workspaceFileEditorKey(file.workspaceId, file.path);
 
     try {
       const response = await requestJson<WorkspaceFileContentResponse>(
-        `/api/workspaces/${encodeURIComponent(workspaceId)}/files/content`,
+        `/api/workspaces/${encodeURIComponent(file.workspaceId)}/files/content`,
         {
-          body: JSON.stringify({ path: node.path }),
+          body: JSON.stringify({ path: file.path }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
@@ -2948,6 +3006,17 @@ export function App() {
         },
       }));
     }
+  }
+
+  function browserRouteForActiveFile(file: OpenFileTab): BrowserRoute {
+    return {
+      activeFile: { path: file.path, workspaceId: file.workspaceId },
+      chatId: activeWorkspaceIdRef.current === file.workspaceId
+        ? activeChatIdRef.current
+        : null,
+      viewMode: "chat",
+      workspaceId: file.workspaceId,
+    };
   }
 
   const reloadWorkspaceFileEditor = useCallback(async (file: OpenFileTab) => {
@@ -3168,11 +3237,11 @@ export function App() {
       return;
     }
 
-    setActiveWorkspaceId(tab.workspaceId);
-    setExpandedWorkspaceId(tab.workspaceId);
-    setActiveMainTab({ path: tab.path, type: "file", workspaceId: tab.workspaceId });
-    setViewMode("chat");
-    setIsMobileWorkspaceOpen(false);
+    selectWorkspaceFileTab(tab);
+    const editorKey = workspaceFileEditorKey(tab.workspaceId, tab.path);
+    if (!workspaceFileEditors[editorKey]) {
+      void loadWorkspaceFileEditor(tab);
+    }
   }
 
   function closeMainTab(tab: MainTabSummary) {
@@ -3189,11 +3258,11 @@ export function App() {
     const tabIndex = mainTabs.findIndex(
       (current) => current.type === "file" && current.workspaceId === tab.workspaceId && current.path === tab.path,
     );
-    setOpenFileTabs((current) =>
-      current.filter(
-        (current) => current.workspaceId !== tab.workspaceId || current.path !== tab.path,
-      ),
+    const nextOpenFileTabs = openFileTabsRef.current.filter(
+      (current) => current.workspaceId !== tab.workspaceId || current.path !== tab.path,
     );
+    openFileTabsRef.current = nextOpenFileTabs;
+    setOpenFileTabs(nextOpenFileTabs);
     setWorkspaceFileEditors((current) => {
       const next = { ...current };
       delete next[workspaceFileEditorKey(tab.workspaceId, tab.path)];
@@ -3205,6 +3274,15 @@ export function App() {
       activeMainTab.workspaceId !== tab.workspaceId ||
       activeMainTab.path !== tab.path
     ) {
+      if (activeMainTab.type === "file" && activeFileTab) {
+        updateBrowserRoute(browserRouteForActiveFile(activeFileTab), "replace");
+      } else {
+        updateBrowserRoute({
+          chatId: activeChatId,
+          viewMode: "chat",
+          workspaceId: activeWorkspaceId || tab.workspaceId,
+        }, "replace");
+      }
       return;
     }
 
@@ -3218,6 +3296,11 @@ export function App() {
     }
 
     setActiveMainTab({ chatId: null, type: "chat", workspaceId: activeWorkspaceId || tab.workspaceId });
+    updateBrowserRoute({
+      chatId: activeChatId,
+      viewMode: "chat",
+      workspaceId: activeWorkspaceId || tab.workspaceId,
+    }, "replace");
   }
 
   function closeAgentTab(tab: OpenAgentTab) {
@@ -4381,6 +4464,7 @@ export function App() {
     activeWorkspaceIdOrNull: activeWorkspace?.id ?? (activeWorkspaceId || null),
     onMissingWorkspace: setError,
     onRestoreWorkspaceChatTabs: restoreWorkspaceChatTabs,
+    onRestoreWorkspaceFileTabs: restoreWorkspaceFileTabs,
     onSelectWorkspaceChat: selectWorkspaceChat,
     onStartNewWorkspaceChat: startNewWorkspaceChat,
     setActiveChatId,
@@ -19897,14 +19981,34 @@ function upsertOpenChatTab(tabs: OpenChatTab[], nextTab: OpenChatTab) {
   return [...tabs, nextTab];
 }
 
+function browserRouteWithOpenTabs(
+  route: Extract<BrowserRoute, { viewMode: "chat" }>,
+  chatTabs: OpenChatTab[],
+  fileTabs: OpenFileTab[],
+): BrowserRoute {
+  const nextRoute = route.tabs
+    ? { ...route, tabs: dedupeBrowserRouteChatTabs(route.tabs) }
+    : browserRouteWithOpenChatTabs(route, chatTabs);
+
+  const routeFiles = route.files
+    ? dedupeBrowserRouteFileTabs(route.files)
+    : openFileTabsToBrowserRouteFileTabs(fileTabs);
+  if (route.activeFile) {
+    routeFiles.push(route.activeFile);
+  }
+
+  const dedupedFiles = dedupeBrowserRouteFileTabs(routeFiles);
+  return {
+    ...nextRoute,
+    ...(dedupedFiles.length ? { files: dedupedFiles } : {}),
+    ...(route.activeFile ? { activeFile: route.activeFile } : {}),
+  };
+}
+
 function browserRouteWithOpenChatTabs(
   route: Extract<BrowserRoute, { viewMode: "chat" }>,
   tabs: OpenChatTab[],
-): BrowserRoute {
-  if (route.tabs) {
-    return { ...route, tabs: dedupeBrowserRouteChatTabs(route.tabs) };
-  }
-
+): Extract<BrowserRoute, { viewMode: "chat" }> {
   const routeTabs = openChatTabsToBrowserRouteTabs(tabs);
   if (route.workspaceId && route.chatId) {
     routeTabs.push({ chatId: route.chatId, workspaceId: route.workspaceId });
@@ -19920,10 +20024,48 @@ function openChatTabsToBrowserRouteTabs(tabs: OpenChatTab[]): BrowserRouteChatTa
   }));
 }
 
+function openFileTabsToBrowserRouteFileTabs(tabs: OpenFileTab[]): BrowserRouteFileTab[] {
+  return tabs.map((tab) => ({
+    path: tab.path,
+    workspaceId: tab.workspaceId,
+  }));
+}
+
+function browserRouteFileTabToOpenFileTab(
+  file: BrowserRouteFileTab,
+  workspace: WorkspaceSummary,
+): OpenFileTab {
+  return {
+    name: fileNameFromPath(file.path),
+    path: file.path,
+    workspaceId: file.workspaceId,
+    workspaceLogoUrl: workspace.logoUrl ?? null,
+    workspaceName: workspace.name,
+  };
+}
+
+function fileNameFromPath(path: string) {
+  const normalized = path.replaceAll("\\", "/");
+  return normalized.split("/").filter(Boolean).at(-1) ?? path;
+}
+
 function dedupeBrowserRouteChatTabs(tabs: BrowserRouteChatTab[]) {
   const seen = new Set<string>();
   return tabs.filter((tab) => {
     const key = `${tab.workspaceId}\u0000${tab.chatId}`;
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupeBrowserRouteFileTabs(tabs: BrowserRouteFileTab[]) {
+  const seen = new Set<string>();
+  return tabs.filter((tab) => {
+    const key = `${tab.workspaceId}\u0000${tab.path}`;
     if (seen.has(key)) {
       return false;
     }

@@ -40,6 +40,41 @@ describe("browser route chat tabs", () => {
     );
   });
 
+  it("serializes file tabs into the route query string", () => {
+    expect(
+      browserPathForRoute({
+        activeFile: { path: "src/main.ts", workspaceId: "workspace-1" },
+        chatId: null,
+        files: [
+          { path: "README.md", workspaceId: "workspace-1" },
+          { path: "src/main.ts", workspaceId: "workspace-1" },
+        ],
+        viewMode: "chat",
+        workspaceId: "workspace-1",
+      }),
+    ).toBe(
+      "/workspace-1?file=workspace-1%2FREADME.md&file=workspace-1%2Fsrc%252Fmain.ts&activeFile=workspace-1%2Fsrc%252Fmain.ts",
+    );
+  });
+
+  it("parses file tabs from the route query string", () => {
+    expect(
+      browserRouteFromPathname(
+        "/workspace-1",
+        "?file=workspace-1%2FREADME.md&activeFile=workspace-1%2Fsrc%252Fmain.ts",
+      ),
+    ).toEqual({
+      activeFile: { path: "src/main.ts", workspaceId: "workspace-1" },
+      chatId: null,
+      files: [
+        { path: "README.md", workspaceId: "workspace-1" },
+        { path: "src/main.ts", workspaceId: "workspace-1" },
+      ],
+      viewMode: "chat",
+      workspaceId: "workspace-1",
+    });
+  });
+
   it("normalizes legacy chat routes into a restorable single-tab route", () => {
     expect(browserRouteFromPathname("/workspace-1/chat-1")).toEqual({
       chatId: "chat-1",

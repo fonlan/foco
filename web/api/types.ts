@@ -20,12 +20,19 @@ export type BrowserRouteChatTab = {
   chatId: string;
 };
 
+export type BrowserRouteFileTab = {
+  workspaceId: string;
+  path: string;
+};
+
 export type BrowserRoute =
   | {
       viewMode: "chat";
       workspaceId: string | null;
       chatId: string | null;
       tabs?: BrowserRouteChatTab[];
+      files?: BrowserRouteFileTab[];
+      activeFile?: BrowserRouteFileTab;
     }
   | { viewMode: "settings"; section: SettingsSection }
   | { viewMode: "stats"; page: number }

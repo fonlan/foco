@@ -744,6 +744,51 @@ describe("app-panels-stats verification surfaces", () => {
     expect(await screen.findByText("index.tsx")).toBeInTheDocument();
   });
 
+  it("writes file tabs to the URL and restores them after refresh", async () => {
+    const { unmount } = renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+    await userEvent.click(screen.getByText("main.ts"));
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(within(tabList).getByRole("tab", { name: /main.ts/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(new URLSearchParams(window.location.search).getAll("file")).toEqual([
+      "workspace-1/src%2Fmain.ts",
+    ]);
+    expect(new URLSearchParams(window.location.search).get("activeFile")).toBe(
+      "workspace-1/src%2Fmain.ts",
+    );
+
+    vi.mocked(fetch).mockClear();
+    unmount();
+    renderApp();
+
+    const restoredTabList = await screen.findByRole("tablist", { name: "Chat" });
+    await waitFor(() =>
+      expect(within(restoredTabList).getByRole("tab", { name: /main.ts/ })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        vi.mocked(fetch).mock.calls.some((call) => {
+          const url = String(call[0]);
+          const body = call[1]?.body;
+          return (
+            url.includes("/api/workspaces/workspace-1/files/content") &&
+            typeof body === "string" &&
+            body.includes("src/main.ts")
+          );
+        }),
+      ).toBe(true),
+    );
+  });
+
   it("copies file tree context menu values", async () => {
     renderApp();
 

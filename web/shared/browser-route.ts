@@ -1,7 +1,14 @@
-import type { BrowserRoute, BrowserRouteChatTab, SettingsSection } from "../api/types";
+import type {
+  BrowserRoute,
+  BrowserRouteChatTab,
+  BrowserRouteFileTab,
+  SettingsSection,
+} from "../api/types";
 import { SETTINGS_SECTION_IDS } from "../app/constants";
 
 const CHAT_TAB_QUERY_PARAM = "tab";
+const FILE_TAB_QUERY_PARAM = "file";
+const ACTIVE_FILE_QUERY_PARAM = "activeFile";
 const STATS_PAGE_QUERY_PARAM = "page";
 
 export function currentBrowserRoute(): BrowserRoute {
@@ -35,25 +42,31 @@ export function browserRouteFromPathname(
   }
 
   const tabs = chatTabsFromSearch(search);
+  const files = fileTabsFromSearch(search);
+  const activeFile = activeFileFromSearch(search);
 
   if (segments.length >= 2) {
     return chatRouteWithTabs({
       chatId: segments[1],
       viewMode: "chat",
       workspaceId: segments[0],
-    }, tabs);
+    }, tabs, files, activeFile);
   }
 
   if (segments.length === 1) {
     return chatRouteWithTabs(
       { chatId: null, viewMode: "chat", workspaceId: segments[0] },
       tabs,
+      files,
+      activeFile,
     );
   }
 
   return chatRouteWithTabs(
     { chatId: null, viewMode: "chat", workspaceId: null },
     tabs,
+    files,
+    activeFile,
   );
 }
 
@@ -73,7 +86,7 @@ export function browserPathForRoute(route: BrowserRoute) {
   }
 
   const path = browserPathnameForChatRoute(route);
-  const search = chatTabsSearch(route.tabs ?? []);
+  const search = chatRouteSearch(route);
   return search ? `${path}?${search}` : path;
 }
 
@@ -140,12 +153,62 @@ function chatTabFromParamValue(value: string): BrowserRouteChatTab | null {
   return { chatId, workspaceId };
 }
 
-function chatTabsSearch(tabs: BrowserRouteChatTab[]) {
-  if (!tabs.length) {
-    return "";
+function fileTabsFromSearch(search: string): BrowserRouteFileTab[] {
+  const params = new URLSearchParams(search);
+  const files: BrowserRouteFileTab[] = [];
+  const seen = new Set<string>();
+
+  for (const value of params.getAll(FILE_TAB_QUERY_PARAM)) {
+    const file = fileTabFromParamValue(value);
+    if (!file) {
+      continue;
+    }
+
+    const key = `${file.workspaceId}\u0000${file.path}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    files.push(file);
   }
 
+  return files;
+}
+
+function activeFileFromSearch(search: string) {
+  const value = new URLSearchParams(search).get(ACTIVE_FILE_QUERY_PARAM);
+  return value ? fileTabFromParamValue(value) : null;
+}
+
+function fileTabFromParamValue(value: string): BrowserRouteFileTab | null {
+  const separatorIndex = value.indexOf("/");
+  if (separatorIndex <= 0 || separatorIndex >= value.length - 1) {
+    return null;
+  }
+
+  const workspaceId = decodeTabComponent(value.slice(0, separatorIndex));
+  const path = decodeTabComponent(value.slice(separatorIndex + 1));
+  if (!workspaceId || !path) {
+    return null;
+  }
+
+  return { path, workspaceId };
+}
+
+function chatRouteSearch(route: Extract<BrowserRoute, { viewMode: "chat" }>) {
   const params = new URLSearchParams();
+  appendChatTabsSearch(params, route.tabs ?? []);
+  appendFileTabsSearch(params, route.files ?? []);
+
+  if (route.activeFile?.workspaceId && route.activeFile.path) {
+    params.set(ACTIVE_FILE_QUERY_PARAM, fileTabParamValue(route.activeFile));
+  }
+
+  return params.toString();
+}
+
+function appendChatTabsSearch(params: URLSearchParams, tabs: BrowserRouteChatTab[]) {
   const seen = new Set<string>();
   for (const tab of tabs) {
     if (!tab.workspaceId || !tab.chatId) {
@@ -163,26 +226,66 @@ function chatTabsSearch(tabs: BrowserRouteChatTab[]) {
       `${encodeURIComponent(tab.workspaceId)}/${encodeURIComponent(tab.chatId)}`,
     );
   }
+}
 
-  return params.toString();
+function appendFileTabsSearch(params: URLSearchParams, files: BrowserRouteFileTab[]) {
+  const seen = new Set<string>();
+  for (const file of files) {
+    if (!file.workspaceId || !file.path) {
+      continue;
+    }
+
+    const key = `${file.workspaceId}\u0000${file.path}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    params.append(FILE_TAB_QUERY_PARAM, fileTabParamValue(file));
+  }
+}
+
+function fileTabParamValue(file: BrowserRouteFileTab) {
+  return `${encodeURIComponent(file.workspaceId)}/${encodeURIComponent(file.path)}`;
 }
 
 function chatRouteWithTabs(
   route: Extract<BrowserRoute, { viewMode: "chat" }>,
   tabs: BrowserRouteChatTab[],
+  files: BrowserRouteFileTab[],
+  activeFile: BrowserRouteFileTab | null,
 ): BrowserRoute {
   const routeTabs = route.workspaceId && route.chatId
     ? [...tabs, { chatId: route.chatId, workspaceId: route.workspaceId }]
     : tabs;
   const dedupedRouteTabs = dedupeChatTabs(routeTabs);
+  const dedupedRouteFiles = dedupeFileTabs(activeFile ? [...files, activeFile] : files);
+  const nextRoute: Extract<BrowserRoute, { viewMode: "chat" }> = {
+    ...route,
+    ...(dedupedRouteTabs.length ? { tabs: dedupedRouteTabs } : {}),
+    ...(dedupedRouteFiles.length ? { files: dedupedRouteFiles } : {}),
+  };
 
-  return dedupedRouteTabs.length ? { ...route, tabs: dedupedRouteTabs } : route;
+  return activeFile ? { ...nextRoute, activeFile } : nextRoute;
 }
 
 function dedupeChatTabs(tabs: BrowserRouteChatTab[]) {
   const seen = new Set<string>();
   return tabs.filter((tab) => {
     const key = `${tab.workspaceId}\u0000${tab.chatId}`;
+    if (seen.has(key)) {
+      return false;
+    }
+
+    seen.add(key);
+    return true;
+  });
+}
+
+function dedupeFileTabs(files: BrowserRouteFileTab[]) {
+  const seen = new Set<string>();
+  return files.filter((file) => {
+    const key = `${file.workspaceId}\u0000${file.path}`;
     if (seen.has(key)) {
       return false;
     }
