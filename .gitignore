@@ -8,6 +8,8 @@ Auto-Dream.md
 .codegraph/
 .agents/
 .foco/
+.codex/
+openspec/
 target/
 node_modules/
 web/dist/
