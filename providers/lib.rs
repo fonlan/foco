@@ -723,8 +723,14 @@ fn genai_chat_options(
     config: &ProviderConnectionConfig,
     request: &NeutralChatRequest,
 ) -> Result<ChatOptions, ProviderConfigError> {
+    // ponytail: model-id heuristic; add provider metadata if non-Claude ids ever contain "claude".
+    let temperature = if request.model_id.to_ascii_lowercase().contains("claude") {
+        1.0
+    } else {
+        0.0
+    };
     let mut options = ChatOptions::default()
-        .with_temperature(0.0)
+        .with_temperature(temperature)
         .with_top_p(1.0)
         .with_capture_usage(true)
         .with_capture_content(true)
@@ -1397,6 +1403,31 @@ mod tests {
             Some("foco:workspace:chat")
         );
         assert_eq!(options.cache_control, Some(CacheControl::Ephemeral24h));
+    }
+
+    #[test]
+    fn uses_temperature_one_for_claude_models() {
+        let request = NeutralChatRequest {
+            model_id: "anthropic/claude-sonnet-4".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let config = ProviderConnectionConfig {
+            kind: ProviderKind::OpenAiResponses,
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+        };
+        let options = genai_chat_options(&config, &request).expect("chat options");
+
+        assert_eq!(options.temperature, Some(1.0));
+        assert_eq!(options.top_p, Some(1.0));
     }
 
     #[test]
