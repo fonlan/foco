@@ -119,10 +119,22 @@ export function useAiStatisticsData() {
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
+      if (document.hidden) {
+        return;
+      }
       void loadStats(false);
     }, AI_STATS_POLL_INTERVAL_MS);
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        void loadStats(false);
+      }
+    };
 
-    return () => window.clearInterval(intervalId);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, [loadStats]);
 
   const updateAuditFilters = useCallback((update: Partial<AiStatsFilterState>) => {

@@ -473,7 +473,7 @@ pub(crate) fn workspace_response_from_config(
     active_chat_runs: &ActiveChatRunRegistry,
 ) -> Result<Json<WorkspacesResponse>, ApiError> {
     let response_started_at = Instant::now();
-    tracing::info!(
+    tracing::debug!(
         workspace_count = config.workspaces.len(),
         "workspace response build started"
     );
@@ -481,52 +481,52 @@ pub(crate) fn workspace_response_from_config(
 
     for workspace in &config.workspaces {
         let workspace_started_at = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             workspace_path = %workspace.path.display(),
             "workspace summary build started"
         );
         let database_started_at = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             workspace_path = %workspace.path.display(),
             "workspace summary database open started"
         );
         let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
             .map_err(ApiError::from_workspace_error)?;
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             elapsed_ms = database_started_at.elapsed().as_millis() as u64,
             "workspace summary database opened"
         );
         let stats_started_at = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             "workspace summary code change stats started"
         );
         let code_change_stats_by_chat = database
             .chat_code_change_stats()
             .map_err(ApiError::from_workspace_error)?;
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             chat_count = code_change_stats_by_chat.len(),
             elapsed_ms = stats_started_at.elapsed().as_millis() as u64,
             "workspace summary code change stats completed"
         );
         let chats_started_at = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             "workspace summary chats query started"
         );
         let chat_records = database.chats().map_err(ApiError::from_workspace_error)?;
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             chat_count = chat_records.len(),
             elapsed_ms = chats_started_at.elapsed().as_millis() as u64,
             "workspace summary chats query completed"
         );
         let summaries_started_at = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             chat_count = chat_records.len(),
             "workspace summary chat summaries started"
@@ -542,19 +542,19 @@ pub(crate) fn workspace_response_from_config(
                 chat_summary(&mut database, chat, code_change_stats, active_run)
             })
             .collect::<Result<Vec<_>, ApiError>>()?;
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             chat_count = chats.len(),
             elapsed_ms = summaries_started_at.elapsed().as_millis() as u64,
             "workspace summary chat summaries completed"
         );
         let logo_started_at = Instant::now();
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             "workspace summary logo lookup started"
         );
         let logo_url = workspace_logo_url(workspace)?;
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             elapsed_ms = logo_started_at.elapsed().as_millis() as u64,
             "workspace summary logo lookup completed"
@@ -570,14 +570,14 @@ pub(crate) fn workspace_response_from_config(
             common_commands: workspace_common_command_summaries(&workspace.common_commands),
             chats,
         });
-        tracing::info!(
+        tracing::debug!(
             workspace_id = %workspace.id,
             elapsed_ms = workspace_started_at.elapsed().as_millis() as u64,
             "workspace summary build completed"
         );
     }
 
-    tracing::info!(
+    tracing::debug!(
         workspace_count = workspaces.len(),
         elapsed_ms = response_started_at.elapsed().as_millis() as u64,
         "workspace response build completed"

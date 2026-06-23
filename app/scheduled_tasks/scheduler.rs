@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
 use foco_agent::{AgentTaskId, AgentTaskStatus};
@@ -10,7 +10,7 @@ use foco_store::{
     },
 };
 use serde_json::{Value, json};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{sync::mpsc, task::JoinHandle, time};
 
 use crate::{
     http::chat::{QueueChatMessageInput, QueuedChatMessageOrigin, queue_chat_message_internal},
@@ -39,7 +39,8 @@ const TRIGGER_REASON_SCHEDULED: &str = "scheduled";
 const TRIGGER_REASON_MANUAL: &str = "manual";
 const SCHEDULED_TASK_WAKE_CAPACITY: usize = 1;
 const SCHEDULED_TASK_SCAN_LIMIT: usize = 64;
-const SCHEDULED_TASK_SCAN_INTERVAL_MS: u64 = 1_000;
+const SCHEDULED_TASK_MIN_SCAN_DELAY_MS: u64 = 1_000;
+const SCHEDULED_TASK_IDLE_SCAN_INTERVAL_SECS: u64 = 300;
 const SCHEDULED_TASK_RUN_RETENTION_DAYS: i64 = 90;
 
 #[derive(Clone)]
@@ -69,10 +70,8 @@ impl ScheduledTaskScheduler {
 
 async fn run_scheduled_task_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
     let mut shutdown_rx = state.app_shutdown_rx.clone();
-    let mut scan_tick = tokio::time::interval(std::time::Duration::from_millis(
-        SCHEDULED_TASK_SCAN_INTERVAL_MS,
-    ));
     let mut scan = true;
+    let mut scan_delay = Duration::from_millis(SCHEDULED_TASK_MIN_SCAN_DELAY_MS);
 
     loop {
         if scan {
@@ -80,7 +79,16 @@ async fn run_scheduled_task_scheduler(state: AppState, mut wake_rx: mpsc::Receiv
             if let Err(error) = dispatch_due_scheduled_tasks(&state).await {
                 tracing::error!(error = %error.message, "Scheduled task scheduler scan failed");
             }
+            scan_delay = match next_scheduled_task_scan_delay(&state) {
+                Ok(delay) => delay,
+                Err(error) => {
+                    tracing::error!(error = %error.message, "Scheduled task scheduler next scan failed");
+                    Duration::from_secs(SCHEDULED_TASK_IDLE_SCAN_INTERVAL_SECS)
+                }
+            };
         }
+        let delay = time::sleep(scan_delay);
+        tokio::pin!(delay);
 
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -94,11 +102,51 @@ async fn run_scheduled_task_scheduler(state: AppState, mut wake_rx: mpsc::Receiv
                 }
                 scan = true;
             }
-            _ = scan_tick.tick() => {
+            _ = &mut delay => {
                 scan = true;
             }
         }
     }
+}
+
+fn next_scheduled_task_scan_delay(state: &AppState) -> Result<Duration, ApiError> {
+    let config = config_snapshot(state)?;
+    let now = Utc::now();
+    let mut next_run_at: Option<DateTime<Utc>> = None;
+
+    for workspace in &config.workspaces {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)
+            .map_err(ApiError::from_workspace_error)?;
+        let Some(value) = database
+            .next_enabled_scheduled_task_run_at()
+            .map_err(ApiError::from_workspace_error)?
+        else {
+            continue;
+        };
+        let due_at = parse_utc_timestamp("scheduled task next_run_at", &value)?;
+        match next_run_at.as_ref() {
+            Some(current) if current <= &due_at => {}
+            _ => next_run_at = Some(due_at),
+        }
+    }
+
+    Ok(scheduled_task_scan_delay(now, next_run_at))
+}
+
+fn scheduled_task_scan_delay(now: DateTime<Utc>, next_run_at: Option<DateTime<Utc>>) -> Duration {
+    let idle = Duration::from_secs(SCHEDULED_TASK_IDLE_SCAN_INTERVAL_SECS);
+    let Some(next_run_at) = next_run_at else {
+        return idle;
+    };
+    if next_run_at <= now {
+        return Duration::from_millis(SCHEDULED_TASK_MIN_SCAN_DELAY_MS);
+    }
+    let millis_until_due = next_run_at.signed_duration_since(now).num_milliseconds();
+    if millis_until_due <= 0 {
+        return Duration::from_millis(SCHEDULED_TASK_MIN_SCAN_DELAY_MS);
+    }
+    // ponytail: cap long sleeps so a missed wake costs minutes, not a full schedule interval.
+    idle.min(Duration::from_millis(millis_until_due as u64))
 }
 
 pub(crate) async fn dispatch_due_scheduled_tasks(state: &AppState) -> Result<(), ApiError> {
@@ -851,4 +899,35 @@ fn parse_utc_timestamp(field: &str, value: &str) -> Result<DateTime<Utc>, ApiErr
 
 fn format_utc_timestamp(timestamp: DateTime<Utc>) -> String {
     timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheduled_task_scan_delay_caps_idle_and_uses_due_time() {
+        let now = DateTime::parse_from_rfc3339("2026-06-23T10:00:00Z")
+            .expect("now")
+            .with_timezone(&Utc);
+        let soon = now + ChronoDuration::seconds(30);
+        let later = now + ChronoDuration::minutes(10);
+
+        assert_eq!(
+            scheduled_task_scan_delay(now, None),
+            Duration::from_secs(SCHEDULED_TASK_IDLE_SCAN_INTERVAL_SECS)
+        );
+        assert_eq!(
+            scheduled_task_scan_delay(now, Some(soon)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            scheduled_task_scan_delay(now, Some(later)),
+            Duration::from_secs(SCHEDULED_TASK_IDLE_SCAN_INTERVAL_SECS)
+        );
+        assert_eq!(
+            scheduled_task_scan_delay(now, Some(now - ChronoDuration::seconds(1))),
+            Duration::from_millis(SCHEDULED_TASK_MIN_SCAN_DELAY_MS)
+        );
+    }
 }

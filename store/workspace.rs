@@ -2160,6 +2160,23 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn next_enabled_scheduled_task_run_at(
+        &self,
+    ) -> Result<Option<String>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT next_run_at
+                 FROM scheduled_tasks
+                 WHERE status = 'enabled' AND next_run_at IS NOT NULL
+                 ORDER BY next_run_at ASC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn active_scheduled_task_run_count(
         &self,
         task_id: &str,
@@ -4519,6 +4536,30 @@ impl WorkspaceDatabase {
             Some("any") => ready > 0,
             _ => false,
         })
+    }
+
+    pub fn next_waiting_agent_task_dependency_deadline(
+        &self,
+    ) -> Result<Option<String>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT MIN(dependency.deadline_at)
+                 FROM agent_task_dependencies AS dependency
+                 JOIN agent_tasks AS task
+                   ON task.team_id = dependency.team_id
+                  AND task.id = dependency.waiting_task_id
+                 JOIN agent_instances AS instance
+                   ON instance.team_id = task.team_id
+                  AND instance.id = task.owner_instance_id
+                 JOIN agent_teams AS team ON team.id = task.team_id
+                 WHERE task.status = 'waiting'
+                   AND dependency.deadline_at IS NOT NULL
+                   AND instance.status IN ('waiting', 'draining')
+                   AND team.status IN ('active', 'draining')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))
     }
 
     pub fn delete_agent_task_dependencies(

@@ -1,5 +1,6 @@
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
+use chrono::{DateTime, Utc};
 use foco_agent::{
     AgentAttemptId, AgentCollaborationTool, AgentExecutionWorkspaceMode, AgentInstanceStatus,
     AgentPermissions, AgentRole, AgentRunAssociations, AgentRunOutcome, AgentTaskId,
@@ -19,6 +20,7 @@ use serde_json::{Value, json};
 use tokio::{
     sync::{Semaphore, mpsc},
     task::{JoinHandle, JoinSet},
+    time,
 };
 
 use crate::git_backend::{agent_worktree_diff_id, git_diff_response};
@@ -33,7 +35,8 @@ pub(crate) const AGENT_MAX_INSTANCES_PER_TEAM: i64 = 10;
 pub(crate) const AGENT_MAX_CREATE_INSTANCES_PER_REQUEST: u32 = 16;
 const AGENT_SCHEDULER_WAKE_CAPACITY: usize = 1;
 const AGENT_SCHEDULER_SCAN_LIMIT: i64 = 64;
-const AGENT_SCHEDULER_DEADLINE_POLL_MS: u64 = 1_000;
+const AGENT_SCHEDULER_MIN_DEADLINE_DELAY_MS: u64 = 1_000;
+const AGENT_SCHEDULER_ERROR_RETRY_SECS: i64 = 30;
 const AGENT_GLOBAL_MAX_CONCURRENT_RUNS: usize = 4;
 const RESTART_INTERRUPTION_REASON: &str = "backend restarted while Agent attempt was active";
 const AGENT_TEAM_PROTOCOL_VERSION: u32 = 2;
@@ -108,18 +111,24 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
     let permits = Arc::new(Semaphore::new(AGENT_GLOBAL_MAX_CONCURRENT_RUNS));
     let mut runs = JoinSet::new();
     let mut shutdown_rx = state.app_shutdown_rx.clone();
-    let mut deadline_tick = tokio::time::interval(std::time::Duration::from_millis(
-        AGENT_SCHEDULER_DEADLINE_POLL_MS,
-    ));
     let mut scan = true;
+    let mut next_deadline_at: Option<DateTime<Utc>> = None;
 
     loop {
         if scan {
             scan = false;
-            if let Err(error) = schedule_runnable_tasks(&state, &permits, &mut runs).await {
-                tracing::error!(error = %error.message, "Agent scheduler scan failed");
+            match schedule_runnable_tasks(&state, &permits, &mut runs).await {
+                Ok(result) => next_deadline_at = result.next_deadline_at,
+                Err(error) => {
+                    next_deadline_at = Some(
+                        Utc::now() + chrono::Duration::seconds(AGENT_SCHEDULER_ERROR_RETRY_SECS),
+                    );
+                    tracing::error!(error = %error.message, "Agent scheduler scan failed");
+                }
             }
         }
+        let deadline_sleep = time::sleep(agent_scheduler_deadline_delay(next_deadline_at.as_ref()));
+        tokio::pin!(deadline_sleep);
 
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -139,7 +148,7 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
                 }
                 scan = true;
             }
-            _ = deadline_tick.tick() => {
+            _ = &mut deadline_sleep, if next_deadline_at.is_some() => {
                 scan = true;
             }
         }
@@ -232,12 +241,18 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
     Ok(())
 }
 
+#[derive(Default)]
+struct AgentSchedulerScan {
+    next_deadline_at: Option<DateTime<Utc>>,
+}
+
 async fn schedule_runnable_tasks(
     state: &AppState,
     permits: &Arc<Semaphore>,
     runs: &mut JoinSet<()>,
-) -> Result<(), ApiError> {
+) -> Result<AgentSchedulerScan, ApiError> {
     let config = config_snapshot(state)?;
+    let mut scan = AgentSchedulerScan::default();
     'scan: for workspace in &config.workspaces {
         loop {
             let Ok(permit) = permits.clone().try_acquire_owned() else {
@@ -265,6 +280,7 @@ async fn schedule_runnable_tasks(
                 .into_iter()
                 .next()
             else {
+                record_next_agent_deadline(&mut scan, &database)?;
                 drop(permit);
                 break;
             };
@@ -330,7 +346,48 @@ async fn schedule_runnable_tasks(
             });
         }
     }
+    Ok(scan)
+}
+
+fn record_next_agent_deadline(
+    scan: &mut AgentSchedulerScan,
+    database: &WorkspaceDatabase,
+) -> Result<(), ApiError> {
+    let Some(value) = database
+        .next_waiting_agent_task_dependency_deadline()
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    let deadline = DateTime::parse_from_rfc3339(&value)
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "Agent task dependency deadline is invalid: {source}"
+            ))
+        })?
+        .with_timezone(&Utc);
+    match scan.next_deadline_at.as_ref() {
+        Some(current) if current <= &deadline => {}
+        _ => scan.next_deadline_at = Some(deadline),
+    }
     Ok(())
+}
+
+fn agent_scheduler_deadline_delay(next_deadline_at: Option<&DateTime<Utc>>) -> Duration {
+    let Some(next_deadline_at) = next_deadline_at else {
+        return Duration::from_secs(86_400);
+    };
+    let now = Utc::now();
+    if next_deadline_at <= &now {
+        return Duration::from_millis(AGENT_SCHEDULER_MIN_DEADLINE_DELAY_MS);
+    }
+    let millis_until_deadline = next_deadline_at
+        .signed_duration_since(now)
+        .num_milliseconds();
+    if millis_until_deadline <= 0 {
+        return Duration::from_millis(AGENT_SCHEDULER_MIN_DEADLINE_DELAY_MS);
+    }
+    Duration::from_millis(millis_until_deadline as u64)
 }
 
 async fn run_coordinator_task(
@@ -1772,6 +1829,20 @@ mod tests {
         assert!(permits.clone().try_acquire_owned().is_err());
         drop(held);
         assert!(permits.try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn agent_scheduler_deadline_delay_has_idle_and_past_deadline_bounds() {
+        let past = Utc::now() - chrono::Duration::seconds(1);
+
+        assert_eq!(
+            agent_scheduler_deadline_delay(None),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            agent_scheduler_deadline_delay(Some(&past)),
+            Duration::from_millis(AGENT_SCHEDULER_MIN_DEADLINE_DELAY_MS)
+        );
     }
 
     #[test]

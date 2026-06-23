@@ -645,6 +645,12 @@ fn scheduled_task_records_round_trip_and_list_runs() {
     assert_eq!(resumed.next_run_at.as_deref(), Some("2026-06-23T10:00:00Z"));
     assert_eq!(
         database
+            .next_enabled_scheduled_task_run_at()
+            .expect("next scheduled run"),
+        Some("2026-06-23T10:00:00Z".to_string())
+    );
+    assert_eq!(
+        database
             .scheduled_tasks(None)
             .expect("all scheduled tasks")
             .len(),
@@ -3962,6 +3968,12 @@ fn phase7_waiting_tasks_resume_after_deadline() {
             deadline_at: Some("2000-01-01T00:00:00.000Z"),
         })
         .expect("deadline dependency insert");
+    assert_eq!(
+        database
+            .next_waiting_agent_task_dependency_deadline()
+            .expect("next dependency deadline"),
+        Some("2000-01-01T00:00:00.000Z".to_string())
+    );
 
     assert!(
         database
