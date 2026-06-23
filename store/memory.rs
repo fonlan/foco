@@ -1548,6 +1548,80 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))
     }
 
+    pub fn dream_candidate_facts(
+        &self,
+        scope: MemoryDreamScope,
+        workspace_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        self.validate_dream_scope(scope, workspace_id)?;
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let scope_filter = match scope {
+            MemoryDreamScope::Global => "scope = 'global'",
+            MemoryDreamScope::Workspace => "scope IN ('workspace', 'chat')",
+        };
+        let sql = format!(
+            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                    expires_at, metadata_json, created_at, updated_at
+             FROM memory_facts
+             WHERE ({scope_filter})
+               AND status IN ('active', 'pending')
+             ORDER BY
+               CASE WHEN expires_at IS NOT NULL THEN 0 WHEN status = 'pending' THEN 1 ELSE 2 END,
+               pinned DESC,
+               updated_at DESC,
+               id ASC
+             LIMIT ?1"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(params![limit], memory_fact_from_row)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn update_chain_target_facts(
+        &self,
+        source_fact_id: &str,
+    ) -> Result<Vec<MemoryFactRecord>, MemoryDatabaseError> {
+        require_non_empty("source_fact_id", source_fact_id)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "WITH RECURSIVE update_chain(fact_id) AS (
+                    SELECT target_fact_id
+                    FROM memory_edges
+                    WHERE source_fact_id = ?1 AND relation = 'updates'
+                    UNION
+                    SELECT e.target_fact_id
+                    FROM memory_edges e
+                    JOIN update_chain c ON e.source_fact_id = c.fact_id
+                    WHERE e.relation = 'updates'
+                 )
+                 SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
+                        f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                        f.updated_at
+                 FROM memory_facts f
+                 JOIN update_chain c ON c.fact_id = f.id
+                 ORDER BY f.created_at DESC, f.id ASC",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+        let rows = statement
+            .query_map(params![source_fact_id], memory_fact_from_row)
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn fact(&self, id: &str) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("id", id)?;
         self.connection

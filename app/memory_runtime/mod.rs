@@ -1,3 +1,4 @@
+pub(crate) mod dream;
 mod expiration;
 mod extraction;
 mod retrieval;
