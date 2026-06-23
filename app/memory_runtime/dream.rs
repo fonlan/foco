@@ -1,20 +1,29 @@
 // ponytail: Phase 7/8 will wire this engine; keep Phase 3 buildable without fake callers.
 #![allow(dead_code)]
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap, HashSet},
+    path::Path,
+};
 
 use chrono::{DateTime, Duration as ChronoDuration, SecondsFormat, Utc};
+use foco_providers::{
+    NeutralChatRequest, NeutralChatRole, NeutralToolDefinition, ProviderConnectionConfig,
+};
 use foco_store::{
-    config::MemoryDreamSettings,
+    config::{GlobalConfig, MemoryDreamSettings, MemorySettings, ModelSettings},
     memory::{
-        MemoryDatabase, MemoryDatabaseError, MemoryDreamChangeStatus, MemoryDreamJobRecord,
-        MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamSafetyPolicy, MemoryDreamScope,
-        MemoryDreamTriggerType, MemoryFactRecord, MemoryKind, MemoryRelationKind, MemoryScope,
+        MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MemoryDatabase, MemoryDatabaseError,
+        MemoryDreamChangeStatus, MemoryDreamJobRecord, MemoryDreamJobStatus, MemoryDreamRunMode,
+        MemoryDreamSafetyPolicy, MemoryDreamScope, MemoryDreamTriggerType, MemoryEdgeRecord,
+        MemoryFactRecord, MemoryKind, MemoryProfileRecord, MemoryRelationKind, MemoryScope,
         MemoryStatus, NewMemoryDreamChange, NewMemoryDreamJob, NewMemoryEdge, UpdateMemoryDreamJob,
         UpdateMemoryFact,
     },
+    workspace::{NewMessage, WorkspaceDatabase},
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::*;
@@ -22,6 +31,18 @@ use crate::*;
 // ponytail: no config surface yet; add a setting if users need a different pending TTL.
 const STALE_PENDING_DAYS: i64 = 30;
 const LOW_CONFIDENCE_PENDING_THRESHOLD: f64 = 0.5;
+const MEMORY_DREAM_PLANNER_TOOL_NAME: &str = "submit_memory_dream_changeset";
+const MEMORY_DREAM_PLANNER_TIMEOUT_MS: u64 = 60_000;
+const MEMORY_DREAM_PLANNER_MAX_OUTPUT_TOKENS: u32 = 2048;
+const MEMORY_DREAM_PLANNER_MAX_EDGE_RECORDS: u32 = 80;
+const MEMORY_DREAM_TRANSCRIPT_MAX_CHARS: usize = 6_000;
+const MEMORY_DREAM_PLANNER_SYSTEM_PROMPT: &str = "\
+Plan conservative Foco memory maintenance changes from the provided compact audit input. \
+Use the submit_memory_dream_changeset tool exactly once. Do not return prose. \
+Return JSON only through the tool. Never request source-code edits, shell commands, git operations, external write-capable tools, or hard deletes. \
+Every change must cite provided evidence. Prefer no change over weak evidence. \
+Global promotion is allowed only when evidence explicitly states a cross-project or user-wide preference. \
+Do not invent fact ids, source ids, edge ids, or quotes.";
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MemoryDreamJobRequest<'a> {
@@ -31,6 +52,22 @@ pub(crate) struct MemoryDreamJobRequest<'a> {
     pub(crate) mode: MemoryDreamRunMode,
     pub(crate) model_id: Option<&'a str>,
     pub(crate) settings: &'a MemoryDreamSettings,
+    pub(crate) planner: Option<MemoryDreamPlannerRequest<'a>>,
+    pub(crate) transcript: Option<MemoryDreamTranscriptRequest<'a>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemoryDreamPlannerRequest<'a> {
+    pub(crate) config: &'a GlobalConfig,
+    pub(crate) workspace_path: &'a Path,
+    pub(crate) audit_workspace_id: &'a str,
+    pub(crate) audit_chat_id: Option<&'a str>,
+    pub(crate) chat_model_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemoryDreamTranscriptRequest<'a> {
+    pub(crate) workspace_path: &'a Path,
 }
 
 #[derive(Clone, Debug)]
@@ -40,7 +77,239 @@ pub(crate) struct MemoryDreamJobResult {
     pub(crate) failed_changes: usize,
 }
 
-pub(crate) fn run_memory_dream_job(
+#[derive(Clone, Debug)]
+pub(crate) struct MemoryDreamModelSelection {
+    pub(crate) model_id: String,
+    pub(crate) provider_id: String,
+    pub(crate) provider_config: ProviderConnectionConfig,
+    pub(crate) max_output_tokens: u32,
+}
+
+pub(crate) fn resolve_memory_dream_model(
+    config: &GlobalConfig,
+    settings: &MemorySettings,
+    chat_model_id: Option<&str>,
+) -> Result<MemoryDreamModelSelection, ApiError> {
+    if let Some(model_id) = settings
+        .dream
+        .model_id
+        .as_deref()
+        .and_then(non_empty_trimmed)
+    {
+        return dream_provider_for_model(config, model_id, "memory Dream configured model");
+    }
+    if let Some(model_id) = settings
+        .extraction_model_id
+        .as_deref()
+        .and_then(non_empty_trimmed)
+    {
+        return dream_provider_for_model(config, model_id, "memory extraction fallback model");
+    }
+    if let Some(model_id) = chat_model_id.and_then(non_empty_trimmed) {
+        return dream_provider_for_model(config, model_id, "current chat fallback model");
+    }
+
+    let candidates = config
+        .models
+        .iter()
+        .filter(|model| model.enabled && model.active_provider_id.is_some())
+        .collect::<Vec<_>>();
+    if candidates.len() == 1 {
+        return dream_provider_for_model(config, &candidates[0].id, "only configured chat model");
+    }
+
+    Err(ApiError::bad_request(
+        "memory Dream model is not configured; set memory.dream.modelId or memory.extraction_model_id",
+    ))
+}
+
+fn dream_provider_for_model(
+    config: &GlobalConfig,
+    model_id: &str,
+    label: &str,
+) -> Result<MemoryDreamModelSelection, ApiError> {
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ApiError::bad_request(format!("{label} was not found: {model_id}")))?;
+    if !model.enabled {
+        return Err(ApiError::bad_request(format!(
+            "{label} '{}' is disabled",
+            model.id
+        )));
+    }
+    model.limits.as_ref().ok_or_else(|| {
+        ApiError::bad_request(format!("{label} '{}' is missing limits", model.id))
+    })?;
+    let provider_id = model.active_provider_id.as_deref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "{label} '{}' has no active provider selected",
+            model.id
+        ))
+    })?;
+    if !model.provider_ids.iter().any(|id| id == provider_id) {
+        return Err(ApiError::bad_request(format!(
+            "active provider '{}' is not associated with {label} '{}'",
+            provider_id, model.id
+        )));
+    }
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == provider_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("{label} provider '{}' was not found", provider_id))
+        })?;
+    if !provider.enabled {
+        return Err(ApiError::bad_request(format!(
+            "{label} provider '{}' is disabled",
+            provider.id
+        )));
+    }
+
+    let max_output_tokens =
+        model_max_output_tokens(model)?.min(MEMORY_DREAM_PLANNER_MAX_OUTPUT_TOKENS);
+
+    Ok(MemoryDreamModelSelection {
+        model_id: model.id.clone(),
+        provider_id: provider.id.clone(),
+        provider_config: provider_connection_config(provider)?,
+        max_output_tokens,
+    })
+}
+
+fn model_max_output_tokens(model: &ModelSettings) -> Result<u32, ApiError> {
+    let limits = model.limits.as_ref().ok_or_else(|| {
+        ApiError::bad_request(format!("enabled model '{}' is missing limits", model.id))
+    })?;
+    u32::try_from(limits.max_output_tokens).map_err(|_| {
+        ApiError::bad_request(format!(
+            "model '{}' max output tokens exceed u32: {}",
+            model.id, limits.max_output_tokens
+        ))
+    })
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+struct MemoryDreamTranscript {
+    chat_id: Option<String>,
+    database: Option<WorkspaceDatabase>,
+    next_sequence: i64,
+}
+
+impl MemoryDreamTranscript {
+    fn disabled() -> Self {
+        Self {
+            chat_id: None,
+            database: None,
+            next_sequence: 0,
+        }
+    }
+
+    fn create(
+        request: MemoryDreamJobRequest<'_>,
+        job_id: &str,
+        input_summary_json: &str,
+    ) -> Result<Self, ApiError> {
+        if !request.settings.create_transcript_chat {
+            return Ok(Self::disabled());
+        }
+        let Some(transcript_request) = request.transcript else {
+            return Ok(Self::disabled());
+        };
+
+        let mut database = WorkspaceDatabase::open_or_create(transcript_request.workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+        let chat_id = unique_id("chat");
+        let mut metadata = json!({
+            "kind": MEMORY_DREAM_TRANSCRIPT_CHAT_KIND,
+            "dreamJobId": job_id,
+            "scope": request.scope.as_str(),
+            "triggerType": request.trigger_type.as_str(),
+        });
+        if let Some(workspace_id) = request.workspace_id {
+            metadata["workspaceId"] = json!(workspace_id);
+        }
+        let metadata_json = serde_json::to_string(&metadata).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to serialize memory Dream transcript metadata: {source}"
+            ))
+        })?;
+        database
+            .insert_chat_with_metadata(
+                &chat_id,
+                &memory_dream_transcript_title(request),
+                &metadata_json,
+            )
+            .map_err(ApiError::from_workspace_error)?;
+
+        let mut transcript = Self {
+            chat_id: Some(chat_id),
+            database: Some(database),
+            next_sequence: 0,
+        };
+        transcript.record_json("job started", metadata);
+        transcript.record_json(
+            "input summary",
+            serde_json::from_str(input_summary_json).unwrap_or_else(|_| json!({})),
+        );
+        Ok(transcript)
+    }
+
+    fn chat_id(&self) -> Option<&str> {
+        self.chat_id.as_deref()
+    }
+
+    fn record_json(&mut self, title: &str, payload: Value) {
+        let Some(chat_id) = self.chat_id.as_deref() else {
+            return;
+        };
+        let Some(database) = self.database.as_mut() else {
+            return;
+        };
+        let metadata_json = serde_json::to_string(&json!({
+            "kind": "memory_dream_transcript_step",
+            "title": title,
+        }))
+        .unwrap_or_else(|_| "{}".to_string());
+        let content = memory_dream_transcript_content(title, &payload);
+        let message_id = unique_id("msg-system");
+        let inserted = database.insert_message(NewMessage {
+            id: &message_id,
+            chat_id,
+            role: "system",
+            content: &content,
+            sequence: self.next_sequence,
+            metadata_json: Some(&metadata_json),
+        });
+        if inserted.is_ok() {
+            self.next_sequence += 1;
+        }
+    }
+}
+
+fn memory_dream_transcript_title(request: MemoryDreamJobRequest<'_>) -> String {
+    format!(
+        "Memory Dream: {} {}",
+        request.scope.as_str(),
+        request.trigger_type.as_str()
+    )
+}
+
+fn memory_dream_transcript_content(title: &str, payload: &Value) -> String {
+    let payload = serde_json::to_string_pretty(payload).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "{title}\n\n{}",
+        compact_text(&payload, MEMORY_DREAM_TRANSCRIPT_MAX_CHARS)
+    )
+}
+
+pub(crate) async fn run_memory_dream_job(
     database: &mut MemoryDatabase,
     request: MemoryDreamJobRequest<'_>,
 ) -> Result<MemoryDreamJobResult, ApiError> {
@@ -53,11 +322,34 @@ pub(crate) fn run_memory_dream_job(
         .latest_successful_dream_time(request.scope, request.workspace_id)
         .map_err(ApiError::from_memory_error)?;
     let job_id = unique_id("memory-dream");
+    let mut model_resolution_error = None;
+    let model_selection = if request.mode == MemoryDreamRunMode::Llm {
+        match request.planner {
+            Some(planner) => resolve_memory_dream_model(
+                planner.config,
+                &planner.config.memory,
+                planner.chat_model_id,
+            )
+            .map(Some)
+            .unwrap_or_else(|error| {
+                model_resolution_error = Some(error.message);
+                None
+            }),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let job_model_id = model_selection
+        .as_ref()
+        .map(|selection| selection.model_id.as_str())
+        .or(request.model_id);
     let input_summary_json = json!({
         "scope": request.scope.as_str(),
         "workspaceId": request.workspace_id,
         "triggerType": request.trigger_type.as_str(),
         "mode": request.mode.as_str(),
+        "modelId": job_model_id,
         "latestSuccessfulDreamAt": latest_success_at,
         "maxFactsPerRun": request.settings.max_facts_per_run,
         "maxChangesPerRun": request.settings.max_changes_per_run,
@@ -72,7 +364,7 @@ pub(crate) fn run_memory_dream_job(
             trigger_type: request.trigger_type,
             mode: request.mode,
             status: MemoryDreamJobStatus::Running,
-            model_id: request.model_id,
+            model_id: job_model_id,
             input_summary_json: &input_summary_json,
             output_summary_json: None,
             transcript_chat_id: None,
@@ -80,7 +372,29 @@ pub(crate) fn run_memory_dream_job(
         })
         .map_err(ApiError::from_memory_error)?;
 
-    let run_result = run_memory_dream_job_inner(database, &job_id, request, &policy);
+    let mut transcript = MemoryDreamTranscript::create(request, &job_id, &input_summary_json)?;
+    if let Some(transcript_chat_id) = transcript.chat_id() {
+        database
+            .update_dream_job_status(UpdateMemoryDreamJob {
+                id: &job_id,
+                status: MemoryDreamJobStatus::Running,
+                output_summary_json: None,
+                transcript_chat_id: Some(transcript_chat_id),
+                error_message: None,
+            })
+            .map_err(ApiError::from_memory_error)?;
+    }
+
+    let run_result = run_memory_dream_job_inner(
+        database,
+        &job_id,
+        request,
+        model_selection,
+        model_resolution_error,
+        &policy,
+        &mut transcript,
+    )
+    .await;
     let output_summary_json = match run_result {
         Ok(summary) => {
             let output_summary_json = summary.to_json().to_string();
@@ -93,10 +407,24 @@ pub(crate) fn run_memory_dream_job(
                     error_message: None,
                 })
                 .map_err(ApiError::from_memory_error)?;
+            transcript.record_json(
+                "final status",
+                json!({
+                    "status": MemoryDreamJobStatus::Completed.as_str(),
+                    "summary": summary.to_json(),
+                }),
+            );
             output_summary_json
         }
         Err(error) => {
-            let error_message = error.to_string();
+            let error_message = error.message.clone();
+            transcript.record_json(
+                "final status",
+                json!({
+                    "status": MemoryDreamJobStatus::Failed.as_str(),
+                    "errorMessage": &error_message,
+                }),
+            );
             let _ = database.update_dream_job_status(UpdateMemoryDreamJob {
                 id: &job_id,
                 status: MemoryDreamJobStatus::Failed,
@@ -104,7 +432,7 @@ pub(crate) fn run_memory_dream_job(
                 transcript_chat_id: None,
                 error_message: Some(&error_message),
             });
-            return Err(ApiError::from_memory_error(error));
+            return Err(error);
         }
     };
 
@@ -130,37 +458,182 @@ pub(crate) fn run_memory_dream_job(
     })
 }
 
-fn run_memory_dream_job_inner(
+async fn run_memory_dream_job_inner(
     database: &mut MemoryDatabase,
     job_id: &str,
     request: MemoryDreamJobRequest<'_>,
+    model_selection: Option<MemoryDreamModelSelection>,
+    model_resolution_error: Option<String>,
     policy: &MemoryDreamSafetyPolicy,
-) -> Result<DreamRunSummary, MemoryDatabaseError> {
-    let candidates = database.dream_candidate_facts(
-        request.scope,
-        request.workspace_id,
-        request.settings.max_facts_per_run,
-    )?;
-    let mut changes = deterministic_changes(database, request.scope, &candidates, policy)?;
+    transcript: &mut MemoryDreamTranscript,
+) -> Result<DreamRunSummary, ApiError> {
+    let candidates = database
+        .dream_candidate_facts(
+            request.scope,
+            request.workspace_id,
+            request.settings.max_facts_per_run,
+        )
+        .map_err(ApiError::from_memory_error)?;
+    let mut changes = deterministic_changes(database, request.scope, &candidates, policy)
+        .map_err(ApiError::from_memory_error)?;
+    transcript.record_json(
+        "deterministic candidates",
+        json!({
+            "candidateCount": candidates.len(),
+            "candidateFactIds": candidates
+                .iter()
+                .take(50)
+                .map(|fact| fact.id.as_str())
+                .collect::<Vec<_>>(),
+            "deterministicChangesProposed": changes.len(),
+            "deterministicOperations": changes
+                .iter()
+                .map(DreamChange::operation)
+                .collect::<Vec<_>>(),
+        }),
+    );
 
-    policy.validate_batch_size(candidates.len(), changes.len())?;
+    policy
+        .validate_batch_size(candidates.len(), changes.len())
+        .map_err(ApiError::from_memory_error)?;
+    transcript.record_json(
+        "backend validation summary",
+        json!({
+            "stage": "deterministic",
+            "accepted": true,
+            "candidateCount": candidates.len(),
+            "changeCount": changes.len(),
+            "maxFactsPerRun": request.settings.max_facts_per_run,
+            "maxChangesPerRun": request.settings.max_changes_per_run,
+        }),
+    );
 
-    let apply_summary = apply_deterministic_changes(database, job_id, &mut changes, policy)?;
-    let profiles_refreshed = refresh_dream_profiles(database, request.scope, &apply_summary)?;
+    let mut apply_summary = apply_deterministic_changes(database, job_id, &mut changes, policy)
+        .map_err(ApiError::from_memory_error)?;
+    let mut profiles_refreshed = refresh_dream_profiles(database, request.scope, &apply_summary)
+        .map_err(ApiError::from_memory_error)?;
+    transcript.record_json(
+        "applied changes summary",
+        json!({
+            "stage": "deterministic",
+            "applied": apply_summary.applied,
+            "failed": apply_summary.failed,
+            "profilesRefreshed": profiles_refreshed,
+        }),
+    );
+    let mut llm_changes_proposed = 0;
+    let mut changes_skipped = 0;
+    let mut llm_planner = if request.mode == MemoryDreamRunMode::Llm {
+        "not_configured"
+    } else {
+        "disabled"
+    };
+    let mut llm_error = None;
+
+    if request.mode == MemoryDreamRunMode::Llm {
+        let candidate_fact_ids = candidates
+            .iter()
+            .map(|fact| fact.id.clone())
+            .collect::<Vec<_>>();
+        let candidate_edges = database
+            .edges_for_fact_ids(&candidate_fact_ids, MEMORY_DREAM_PLANNER_MAX_EDGE_RECORDS)
+            .map_err(ApiError::from_memory_error)?;
+        let source_summaries = memory_dream_source_summaries(database, &candidates)
+            .map_err(ApiError::from_memory_error)?;
+        let profiles = database
+            .profiles_for_scope(None, 8)
+            .map_err(ApiError::from_memory_error)?;
+        let llm_result = match (request.planner, model_selection.as_ref()) {
+            (Some(planner), Some(selection)) => {
+                run_memory_dream_llm_planner(
+                    planner,
+                    selection,
+                    request,
+                    &candidates,
+                    &candidate_edges,
+                    &source_summaries,
+                    &profiles,
+                    &changes,
+                    policy,
+                    transcript,
+                )
+                .await
+            }
+            _ => Err(ApiError::bad_request(
+                model_resolution_error.unwrap_or_else(|| {
+                    "memory Dream LLM planner requires a configured model and audit workspace"
+                        .to_string()
+                }),
+            )),
+        };
+
+        match llm_result {
+            Ok(validated_changes) => {
+                llm_planner = "applied";
+                llm_changes_proposed = validated_changes.len();
+                let llm_apply_summary =
+                    apply_llm_changes(database, job_id, &validated_changes, policy)
+                        .map_err(ApiError::from_memory_error)?;
+                let llm_applied = llm_apply_summary.applied;
+                let llm_failed = llm_apply_summary.failed;
+                apply_summary.applied += llm_apply_summary.applied;
+                apply_summary.failed += llm_apply_summary.failed;
+                for changed_scope in llm_apply_summary.changed_scopes {
+                    if !apply_summary.changed_scopes.contains(&changed_scope) {
+                        apply_summary.changed_scopes.push(changed_scope);
+                    }
+                }
+                profiles_refreshed =
+                    refresh_dream_profiles(database, request.scope, &apply_summary)
+                        .map_err(ApiError::from_memory_error)?;
+                transcript.record_json(
+                    "applied changes summary",
+                    json!({
+                        "stage": "llm",
+                        "applied": llm_applied,
+                        "failed": llm_failed,
+                        "profilesRefreshed": profiles_refreshed,
+                    }),
+                );
+            }
+            Err(error)
+                if request.trigger_type != MemoryDreamTriggerType::Manual
+                    || apply_summary.applied > 0 =>
+            {
+                llm_planner = "fallback_deterministic_only";
+                transcript.record_json(
+                    "LLM planner failure",
+                    json!({
+                        "fallback": llm_planner,
+                        "errorMessage": &error.message,
+                    }),
+                );
+                llm_error = Some(error.message);
+                changes_skipped = 1;
+            }
+            Err(error) => {
+                transcript.record_json(
+                    "LLM planner failure",
+                    json!({
+                        "fallback": null,
+                        "errorMessage": &error.message,
+                    }),
+                );
+                return Err(error);
+            }
+        }
+    }
 
     Ok(DreamRunSummary {
         candidates_considered: candidates.len(),
         deterministic_changes_proposed: changes.len(),
-        llm_changes_proposed: 0,
+        llm_changes_proposed,
         changes_applied: apply_summary.applied,
-        changes_skipped: 0,
+        changes_skipped,
         changes_failed: apply_summary.failed,
         profiles_refreshed,
-        llm_planner: if request.mode == MemoryDreamRunMode::Llm {
-            "deferred_to_phase_4"
-        } else {
-            "disabled"
-        },
+        llm_planner,
+        llm_error,
     })
 }
 
@@ -260,6 +733,608 @@ fn deterministic_changes(
     }
 
     Ok(changes)
+}
+
+async fn run_memory_dream_llm_planner(
+    planner: MemoryDreamPlannerRequest<'_>,
+    selection: &MemoryDreamModelSelection,
+    request: MemoryDreamJobRequest<'_>,
+    candidates: &[MemoryFactRecord],
+    candidate_edges: &[MemoryEdgeRecord],
+    source_summaries: &[Value],
+    profiles: &[MemoryProfileRecord],
+    deterministic_changes: &[DreamChange],
+    policy: &MemoryDreamSafetyPolicy,
+    transcript: &mut MemoryDreamTranscript,
+) -> Result<Vec<ValidatedDreamPlannerChange>, ApiError> {
+    let input = memory_dream_planner_input(
+        request,
+        candidates,
+        candidate_edges,
+        source_summaries,
+        profiles,
+        deterministic_changes,
+    )?;
+    transcript.record_json(
+        "LLM planner request summary",
+        json!({
+            "modelId": &selection.model_id,
+            "providerId": &selection.provider_id,
+            "candidateFacts": candidates.len(),
+            "relevantEdges": candidate_edges.len(),
+            "sourceSummaries": source_summaries.len(),
+            "memoryProfiles": profiles.len(),
+            "deterministicChanges": deterministic_changes.len(),
+        }),
+    );
+    let output = match request_memory_dream_planner_output(planner, selection, input).await {
+        Ok(output) => output,
+        Err(error) => {
+            transcript.record_json(
+                "LLM changeset parse failure",
+                json!({ "errorMessage": &error.message }),
+            );
+            return Err(error);
+        }
+    };
+    transcript.record_json(
+        "LLM changeset JSON",
+        serde_json::to_value(&output).unwrap_or_else(|_| json!({})),
+    );
+    let validated =
+        validate_memory_dream_planner_output(&output, request.scope, candidates, policy)?;
+    transcript.record_json(
+        "backend validation summary",
+        json!({
+            "stage": "llm",
+            "accepted": true,
+            "changesProposed": output.changes.len(),
+            "changesAccepted": validated.len(),
+        }),
+    );
+    Ok(validated)
+}
+
+fn memory_dream_source_summaries(
+    database: &MemoryDatabase,
+    candidates: &[MemoryFactRecord],
+) -> Result<Vec<Value>, MemoryDatabaseError> {
+    let mut summaries = Vec::new();
+    for fact in candidates.iter().take(100) {
+        for source in database.sources_for_fact(&fact.id)?.into_iter().take(2) {
+            summaries.push(json!({
+                "factId": &fact.id,
+                "sourceId": source.id,
+                "sourceType": source.source_type,
+                "title": source.title,
+                "contentSummary": compact_text(&source.content, 600),
+                "metadata": compact_json_text(&source.metadata_json),
+                "createdAt": source.created_at,
+            }));
+        }
+    }
+
+    Ok(summaries)
+}
+
+fn memory_dream_planner_input(
+    request: MemoryDreamJobRequest<'_>,
+    candidates: &[MemoryFactRecord],
+    candidate_edges: &[MemoryEdgeRecord],
+    source_summaries: &[Value],
+    profiles: &[MemoryProfileRecord],
+    deterministic_changes: &[DreamChange],
+) -> Result<Value, ApiError> {
+    let candidates_json = candidates
+        .iter()
+        .map(|fact| {
+            json!({
+                "id": &fact.id,
+                "scope": &fact.scope,
+                "chatId": &fact.chat_id,
+                "status": &fact.status,
+                "kind": &fact.kind,
+                "fact": &fact.fact,
+                "confidence": fact.confidence,
+                "pinned": fact.pinned,
+                "isLatest": fact.is_latest,
+                "expiresAt": &fact.expires_at,
+                "createdAt": &fact.created_at,
+                "updatedAt": &fact.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let edges_json = candidate_edges
+        .iter()
+        .map(|edge| {
+            json!({
+                "id": &edge.id,
+                "sourceFactId": &edge.source_fact_id,
+                "targetFactId": &edge.target_fact_id,
+                "relation": &edge.relation,
+                "metadata": compact_json_text(&edge.metadata_json),
+                "createdAt": &edge.created_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let profiles_json = profiles
+        .iter()
+        .map(|profile| {
+            json!({
+                "id": &profile.id,
+                "scope": &profile.scope,
+                "chatId": &profile.chat_id,
+                "profileText": compact_text(&profile.profile_text, 2_000),
+                "updatedAt": &profile.updated_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    let deterministic_json = deterministic_changes
+        .iter()
+        .map(|change| {
+            json!({
+                "operation": change.operation(),
+                "targetFactIds": change.target_fact_ids(),
+                "reason": change.reason(),
+                "evidence": change.evidence_json(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "job": {
+            "scope": request.scope.as_str(),
+            "workspaceId": request.workspace_id,
+            "triggerType": request.trigger_type.as_str(),
+            "mode": request.mode.as_str(),
+            "maxChangesPerRun": request.settings.max_changes_per_run,
+        },
+        "memoryProfiles": profiles_json,
+        "candidateFacts": candidates_json,
+        "relevantEdges": edges_json,
+        "sourceSummaries": source_summaries,
+        "deterministicValidation": {
+            "changesProposed": deterministic_json,
+            "changesProposedCount": deterministic_changes.len(),
+        }
+    }))
+}
+
+async fn request_memory_dream_planner_output(
+    planner: MemoryDreamPlannerRequest<'_>,
+    selection: &MemoryDreamModelSelection,
+    input: Value,
+) -> Result<MemoryDreamPlannerOutput, ApiError> {
+    let mut request = memory_dream_planner_provider_request(selection, &input)?;
+    let first_value =
+        call_memory_dream_planner_provider(planner, selection, request.clone()).await?;
+    match parse_memory_dream_planner_output(first_value.clone()) {
+        Ok(output) => Ok(output),
+        Err(first_error) => {
+            request.messages.push(neutral_text_message(
+                NeutralChatRole::Assistant,
+                serde_json::to_string(&first_value).unwrap_or_else(|_| "{}".to_string()),
+            ));
+            request.messages.push(neutral_text_message(
+                NeutralChatRole::User,
+                format!(
+                    "The previous {MEMORY_DREAM_PLANNER_TOOL_NAME} arguments were malformed: {}. Return corrected tool JSON once.",
+                    first_error.message
+                ),
+            ));
+            let repaired_value =
+                call_memory_dream_planner_provider(planner, selection, request).await?;
+            parse_memory_dream_planner_output(repaired_value).map_err(|source| {
+                ApiError::bad_request(format!(
+                    "malformed memory Dream planner JSON after repair: {}",
+                    source.message
+                ))
+            })
+        }
+    }
+}
+
+fn memory_dream_planner_provider_request(
+    selection: &MemoryDreamModelSelection,
+    input: &Value,
+) -> Result<NeutralChatRequest, ApiError> {
+    let input_json = serde_json::to_string_pretty(input).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize memory Dream planner input: {source}"
+        ))
+    })?;
+
+    Ok(NeutralChatRequest {
+        model_id: selection.model_id.clone(),
+        messages: vec![
+            neutral_text_message(
+                NeutralChatRole::System,
+                MEMORY_DREAM_PLANNER_SYSTEM_PROMPT.to_string(),
+            ),
+            neutral_text_message(
+                NeutralChatRole::User,
+                format!("Memory Dream compact input JSON:\n{input_json}"),
+            ),
+        ],
+        tools: vec![memory_dream_planner_tool_definition()],
+        thinking_level: None,
+        max_output_tokens: Some(selection.max_output_tokens),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    })
+}
+
+async fn call_memory_dream_planner_provider(
+    planner: MemoryDreamPlannerRequest<'_>,
+    selection: &MemoryDreamModelSelection,
+    request: NeutralChatRequest,
+) -> Result<Value, ApiError> {
+    audited_provider_tool_request(
+        planner.workspace_path,
+        planner.audit_workspace_id,
+        planner.audit_chat_id,
+        &selection.provider_id,
+        &selection.provider_config,
+        request,
+        "memory Dream planner",
+        MEMORY_DREAM_PLANNER_TOOL_NAME,
+        "submit changeset tool",
+        MEMORY_DREAM_PLANNER_TIMEOUT_MS,
+        0,
+    )
+    .await
+}
+
+fn memory_dream_planner_tool_definition() -> NeutralToolDefinition {
+    NeutralToolDefinition {
+        name: MEMORY_DREAM_PLANNER_TOOL_NAME.to_string(),
+        description: "Submit a conservative Foco memory Dream changeset.".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "summary": { "type": "string" },
+                "changes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "operation": {
+                                "type": "string",
+                                "enum": ["update", "supersede", "expire", "merge", "reject", "promote_to_global", "add_edge"]
+                            },
+                            "targetFactIds": {
+                                "type": "array",
+                                "items": { "type": "string" }
+                            },
+                            "newFact": {
+                                "anyOf": [
+                                    {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "fact": { "type": ["string", "null"] },
+                                            "kind": { "type": ["string", "null"] },
+                                            "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+                                            "relation": { "type": ["string", "null"] },
+                                            "expiresAt": { "type": ["string", "null"] }
+                                        },
+                                        "required": ["fact", "kind", "confidence", "relation", "expiresAt"]
+                                    },
+                                    { "type": "null" }
+                                ]
+                            },
+                            "reason": { "type": "string" },
+                            "confidence": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+                            "riskLevel": { "type": "string", "enum": ["low", "medium", "high"] },
+                            "evidence": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "sourceType": {
+                                            "type": "string",
+                                            "enum": ["memory_fact", "memory_source", "chat_summary", "edge", "profile"]
+                                        },
+                                        "sourceId": { "type": "string" },
+                                        "quote": { "type": "string" }
+                                    },
+                                    "required": ["sourceType", "sourceId", "quote"]
+                                }
+                            }
+                        },
+                        "required": ["operation", "targetFactIds", "newFact", "reason", "confidence", "riskLevel", "evidence"]
+                    }
+                }
+            },
+            "required": ["summary", "changes"]
+        }),
+        strict: true,
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MemoryDreamPlannerOutput {
+    summary: String,
+    changes: Vec<MemoryDreamPlannerChange>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MemoryDreamPlannerChange {
+    operation: String,
+    target_fact_ids: Vec<String>,
+    new_fact: Option<DreamPlannerNewFact>,
+    reason: String,
+    confidence: Option<f64>,
+    risk_level: String,
+    evidence: Vec<DreamPlannerEvidence>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DreamPlannerNewFact {
+    fact: Option<String>,
+    kind: Option<String>,
+    confidence: Option<f64>,
+    relation: Option<String>,
+    expires_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DreamPlannerEvidence {
+    source_type: String,
+    source_id: String,
+    quote: String,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedDreamPlannerChange {
+    operation: DreamPlannerOperation,
+    target_facts: Vec<MemoryFactRecord>,
+    new_fact: Option<DreamPlannerNewFact>,
+    reason: String,
+    confidence: Option<f64>,
+    risk_level: String,
+    evidence: Vec<DreamPlannerEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DreamPlannerOperation {
+    Update,
+    Supersede,
+    Expire,
+    Merge,
+    Reject,
+    PromoteToGlobal,
+    AddEdge,
+}
+
+impl DreamPlannerOperation {
+    fn parse(value: &str) -> Result<Self, ApiError> {
+        match value.trim() {
+            "update" => Ok(Self::Update),
+            "supersede" => Ok(Self::Supersede),
+            "expire" => Ok(Self::Expire),
+            "merge" => Ok(Self::Merge),
+            "reject" => Ok(Self::Reject),
+            "promote_to_global" => Ok(Self::PromoteToGlobal),
+            "add_edge" => Ok(Self::AddEdge),
+            other => Err(ApiError::bad_request(format!(
+                "memory Dream planner returned unknown operation '{other}'"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::Supersede => "supersede",
+            Self::Expire => "expire",
+            Self::Merge => "merge",
+            Self::Reject => "reject",
+            Self::PromoteToGlobal => "promote_to_global",
+            Self::AddEdge => "add_edge",
+        }
+    }
+}
+
+fn parse_memory_dream_planner_output(value: Value) -> Result<MemoryDreamPlannerOutput, ApiError> {
+    serde_json::from_value(value).map_err(|source| {
+        ApiError::bad_request(format!("malformed memory Dream planner JSON: {source}"))
+    })
+}
+
+fn validate_memory_dream_planner_output(
+    output: &MemoryDreamPlannerOutput,
+    scope: MemoryDreamScope,
+    candidates: &[MemoryFactRecord],
+    policy: &MemoryDreamSafetyPolicy,
+) -> Result<Vec<ValidatedDreamPlannerChange>, ApiError> {
+    if output.changes.len() > policy.max_changes_per_run {
+        return Err(ApiError::bad_request(format!(
+            "memory Dream planner returned {} changes; max is {}",
+            output.changes.len(),
+            policy.max_changes_per_run
+        )));
+    }
+    let candidates_by_id = candidates
+        .iter()
+        .map(|fact| (fact.id.as_str(), fact))
+        .collect::<HashMap<_, _>>();
+    let mut validated = Vec::new();
+
+    for (index, change) in output.changes.iter().enumerate() {
+        let operation = DreamPlannerOperation::parse(&change.operation)?;
+        if change.target_fact_ids.is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner change {index} must target at least one fact"
+            )));
+        }
+        let mut target_facts = Vec::new();
+        for target_id in &change.target_fact_ids {
+            let target_id = target_id.trim();
+            let fact = candidates_by_id.get(target_id).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "memory Dream planner change {index} references non-candidate fact id '{target_id}'"
+                ))
+            })?;
+            target_facts.push((*fact).clone());
+        }
+        if operation == DreamPlannerOperation::Merge && target_facts.len() < 2 {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner merge change {index} must target at least two facts"
+            )));
+        }
+        if operation == DreamPlannerOperation::AddEdge && target_facts.len() != 2 {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner add_edge change {index} must target exactly two facts"
+            )));
+        }
+        if change.reason.trim().is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner change {index} reason must not be empty"
+            )));
+        }
+        if let Some(confidence) = change.confidence
+            && !(0.0..=1.0).contains(&confidence)
+        {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner change {index} confidence must be between 0 and 1"
+            )));
+        }
+        if !matches!(change.risk_level.as_str(), "low" | "medium" | "high") {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner change {index} riskLevel is unsupported"
+            )));
+        }
+        validate_planner_evidence(index, operation, &change.evidence)?;
+        validate_operation_payload(index, operation, change.new_fact.as_ref(), scope)?;
+
+        validated.push(ValidatedDreamPlannerChange {
+            operation,
+            target_facts,
+            new_fact: change.new_fact.clone(),
+            reason: change.reason.trim().to_string(),
+            confidence: change.confidence,
+            risk_level: change.risk_level.clone(),
+            evidence: change.evidence.clone(),
+        });
+    }
+
+    Ok(validated)
+}
+
+fn validate_planner_evidence(
+    index: usize,
+    operation: DreamPlannerOperation,
+    evidence: &[DreamPlannerEvidence],
+) -> Result<(), ApiError> {
+    if evidence.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "memory Dream planner change {index} must include evidence"
+        )));
+    }
+    let mut has_cross_project_evidence = false;
+    for item in evidence {
+        if !matches!(
+            item.source_type.as_str(),
+            "memory_fact" | "memory_source" | "chat_summary" | "edge" | "profile"
+        ) {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner change {index} has unsupported evidence sourceType '{}'",
+                item.source_type
+            )));
+        }
+        if item.source_id.trim().is_empty() || item.quote.trim().is_empty() {
+            return Err(ApiError::bad_request(format!(
+                "memory Dream planner change {index} evidence must include sourceId and quote"
+            )));
+        }
+        let quote = item.quote.to_ascii_lowercase();
+        if quote.contains("cross-project")
+            || quote.contains("user-wide")
+            || quote.contains("all projects")
+            || quote.contains("across workspaces")
+            || quote.contains("global preference")
+        {
+            has_cross_project_evidence = true;
+        }
+    }
+    if operation == DreamPlannerOperation::PromoteToGlobal && !has_cross_project_evidence {
+        return Err(ApiError::bad_request(
+            "memory Dream planner global promotion requires explicit cross-project evidence",
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_operation_payload(
+    index: usize,
+    operation: DreamPlannerOperation,
+    new_fact: Option<&DreamPlannerNewFact>,
+    scope: MemoryDreamScope,
+) -> Result<(), ApiError> {
+    match operation {
+        DreamPlannerOperation::Update => {
+            let fact = new_fact
+                .and_then(|new_fact| new_fact.fact.as_deref())
+                .and_then(non_empty_trimmed)
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "memory Dream planner update change {index} requires newFact.fact"
+                    ))
+                })?;
+            if fact.len() > 4_000 {
+                return Err(ApiError::bad_request(format!(
+                    "memory Dream planner update change {index} newFact.fact is too long"
+                )));
+            }
+        }
+        DreamPlannerOperation::AddEdge => {
+            let relation = new_fact
+                .and_then(|new_fact| new_fact.relation.as_deref())
+                .and_then(non_empty_trimmed)
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "memory Dream planner add_edge change {index} requires newFact.relation"
+                    ))
+                })?;
+            relation_kind_from_str(relation).map_err(ApiError::from_memory_error)?;
+        }
+        DreamPlannerOperation::PromoteToGlobal => {
+            if scope != MemoryDreamScope::Workspace {
+                return Err(ApiError::bad_request(
+                    "memory Dream planner can only promote workspace candidates to global",
+                ));
+            }
+            return Err(ApiError::bad_request(
+                "memory Dream planner promote_to_global is reserved for Phase 9",
+            ));
+        }
+        DreamPlannerOperation::Supersede
+        | DreamPlannerOperation::Expire
+        | DreamPlannerOperation::Merge
+        | DreamPlannerOperation::Reject => {}
+    }
+
+    Ok(())
+}
+
+fn relation_kind_from_str(value: &str) -> Result<MemoryRelationKind, MemoryDatabaseError> {
+    match value.trim() {
+        "updates" => Ok(MemoryRelationKind::Updates),
+        "extends" => Ok(MemoryRelationKind::Extends),
+        "derives" => Ok(MemoryRelationKind::Derives),
+        other => Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("unknown memory relation kind: {other}"),
+        }),
+    }
 }
 
 fn duplicate_fact_groups(
@@ -390,6 +1465,211 @@ fn apply_deterministic_change(
     }
 }
 
+fn apply_llm_changes(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    changes: &[ValidatedDreamPlannerChange],
+    policy: &MemoryDreamSafetyPolicy,
+) -> Result<ApplySummary, MemoryDatabaseError> {
+    let mut summary = ApplySummary::default();
+    for change in changes {
+        match apply_llm_change(database, job_id, change, policy) {
+            Ok(applied_scopes) => {
+                summary.applied += 1;
+                for changed_scope in applied_scopes {
+                    if !summary.changed_scopes.contains(&changed_scope) {
+                        summary.changed_scopes.push(changed_scope);
+                    }
+                }
+            }
+            Err(error) => {
+                summary.failed += 1;
+                insert_failed_llm_change(database, job_id, change, &error.to_string())?;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+fn apply_llm_change(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    change: &ValidatedDreamPlannerChange,
+    policy: &MemoryDreamSafetyPolicy,
+) -> Result<Vec<(MemoryScope, Option<String>)>, MemoryDatabaseError> {
+    match change.operation {
+        DreamPlannerOperation::Expire => {
+            apply_llm_status_change(database, job_id, change, MemoryStatus::Expired, policy)
+        }
+        DreamPlannerOperation::Supersede => {
+            apply_llm_status_change(database, job_id, change, MemoryStatus::Superseded, policy)
+        }
+        DreamPlannerOperation::Reject => {
+            apply_llm_status_change(database, job_id, change, MemoryStatus::Rejected, policy)
+        }
+        DreamPlannerOperation::Update => apply_llm_update(database, job_id, change, policy),
+        DreamPlannerOperation::Merge => apply_llm_merge(database, job_id, change, policy),
+        DreamPlannerOperation::AddEdge => apply_llm_add_edge(database, job_id, change),
+        DreamPlannerOperation::PromoteToGlobal => Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "promote_to_global is reserved for Phase 9".to_string(),
+        }),
+    }
+}
+
+fn apply_llm_status_change(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    change: &ValidatedDreamPlannerChange,
+    status: MemoryStatus,
+    policy: &MemoryDreamSafetyPolicy,
+) -> Result<Vec<(MemoryScope, Option<String>)>, MemoryDatabaseError> {
+    let mut changed_scopes = Vec::new();
+    for fact in &change.target_facts {
+        let current = current_unchanged_fact(database, fact, policy)?;
+        update_fact_status(database, &fact.id, status)?;
+        let after = database
+            .fact(&fact.id)?
+            .ok_or_else(|| missing_fact(&fact.id))?;
+        insert_applied_llm_change(database, job_id, change, Some(&current), Some(&after))?;
+        changed_scopes.push((MemoryScope::parse(&after.scope)?, after.chat_id));
+    }
+
+    Ok(changed_scopes)
+}
+
+fn apply_llm_update(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    change: &ValidatedDreamPlannerChange,
+    policy: &MemoryDreamSafetyPolicy,
+) -> Result<Vec<(MemoryScope, Option<String>)>, MemoryDatabaseError> {
+    let Some(new_fact) = change.new_fact.as_ref() else {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "update change requires newFact".to_string(),
+        });
+    };
+    let fact_text = new_fact
+        .fact
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+            message: "update change requires newFact.fact".to_string(),
+        })?;
+    let kind = match new_fact.kind.as_deref().and_then(non_empty_trimmed) {
+        Some(kind) => Some(MemoryKind::parse(kind)?),
+        None => None,
+    };
+    let mut changed_scopes = Vec::new();
+
+    for fact in &change.target_facts {
+        let current = current_unchanged_fact(database, fact, policy)?;
+        let updated = database.update_fact(UpdateMemoryFact {
+            id: &fact.id,
+            kind,
+            fact: Some(fact_text),
+            confidence: new_fact.confidence,
+            expires_at: new_fact.expires_at.as_deref().and_then(non_empty_trimmed),
+            ..UpdateMemoryFact::default()
+        })?;
+        if !updated {
+            return Err(missing_fact(&fact.id));
+        }
+        let after = database
+            .fact(&fact.id)?
+            .ok_or_else(|| missing_fact(&fact.id))?;
+        insert_applied_llm_change(database, job_id, change, Some(&current), Some(&after))?;
+        changed_scopes.push((MemoryScope::parse(&after.scope)?, after.chat_id));
+    }
+
+    Ok(changed_scopes)
+}
+
+fn apply_llm_merge(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    change: &ValidatedDreamPlannerChange,
+    policy: &MemoryDreamSafetyPolicy,
+) -> Result<Vec<(MemoryScope, Option<String>)>, MemoryDatabaseError> {
+    let Some((winner, losers)) = change.target_facts.split_first() else {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "merge change requires target facts".to_string(),
+        });
+    };
+    let mut changed_scopes = Vec::new();
+
+    for loser in losers {
+        let current = current_unchanged_fact(database, loser, policy)?;
+        for source in database.sources_for_fact(&loser.id)? {
+            database.link_fact_source(&winner.id, &source.id)?;
+        }
+        database.insert_edge(NewMemoryEdge {
+            id: &unique_id("memory-edge"),
+            source_fact_id: &winner.id,
+            target_fact_id: &loser.id,
+            relation: MemoryRelationKind::Derives,
+            metadata_json: &json!({
+                "operation": "memory_dream_llm_merge",
+                "dreamJobId": job_id
+            })
+            .to_string(),
+        })?;
+        update_fact_status(database, &loser.id, MemoryStatus::Superseded)?;
+        let after = database
+            .fact(&loser.id)?
+            .ok_or_else(|| missing_fact(&loser.id))?;
+        insert_applied_llm_change(database, job_id, change, Some(&current), Some(&after))?;
+        changed_scopes.push((MemoryScope::parse(&after.scope)?, after.chat_id));
+    }
+
+    Ok(changed_scopes)
+}
+
+fn apply_llm_add_edge(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    change: &ValidatedDreamPlannerChange,
+) -> Result<Vec<(MemoryScope, Option<String>)>, MemoryDatabaseError> {
+    let Some(new_fact) = change.new_fact.as_ref() else {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "add_edge change requires newFact".to_string(),
+        });
+    };
+    let relation = new_fact
+        .relation
+        .as_deref()
+        .map(relation_kind_from_str)
+        .transpose()?
+        .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+            message: "add_edge change requires newFact.relation".to_string(),
+        })?;
+    let [source, target] = change.target_facts.as_slice() else {
+        return Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: "add_edge change requires exactly two target facts".to_string(),
+        });
+    };
+
+    database.insert_edge(NewMemoryEdge {
+        id: &unique_id("memory-edge"),
+        source_fact_id: &source.id,
+        target_fact_id: &target.id,
+        relation,
+        metadata_json: &json!({
+            "operation": "memory_dream_llm_add_edge",
+            "dreamJobId": job_id,
+            "reason": &change.reason,
+        })
+        .to_string(),
+    })?;
+    insert_applied_llm_change(database, job_id, change, None, None)?;
+
+    Ok(vec![(
+        MemoryScope::parse(&source.scope)?,
+        source.chat_id.clone(),
+    )])
+}
+
 fn apply_status_change(
     database: &mut MemoryDatabase,
     job_id: &str,
@@ -510,6 +1790,85 @@ fn insert_failed_change(
     })
 }
 
+fn insert_applied_llm_change(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    change: &ValidatedDreamPlannerChange,
+    before: Option<&MemoryFactRecord>,
+    after: Option<&MemoryFactRecord>,
+) -> Result<(), MemoryDatabaseError> {
+    let target_fact_ids_json = json!(llm_change_target_fact_ids(change)).to_string();
+    let before_json =
+        before.map(|fact| serde_json::to_string(fact).expect("memory fact record serializes"));
+    let after_json =
+        after.map(|fact| serde_json::to_string(fact).expect("memory fact record serializes"));
+    let evidence_json = serde_json::to_string(&change.evidence).map_err(|source| {
+        MemoryDatabaseError::InvalidMemoryJson {
+            field: "memory_dream_changes.evidence_json",
+            source,
+        }
+    })?;
+
+    database.insert_dream_change(NewMemoryDreamChange {
+        id: &unique_id("memory-dream-change"),
+        job_id,
+        operation: change.operation.as_str(),
+        target_fact_ids_json: &target_fact_ids_json,
+        new_fact_id: None,
+        before_json: before_json.as_deref(),
+        after_json: after_json.as_deref(),
+        reason: &change.reason,
+        confidence: change.confidence,
+        risk_level: &change.risk_level,
+        status: MemoryDreamChangeStatus::Applied,
+        evidence_json: &evidence_json,
+        error_message: None,
+    })
+}
+
+fn insert_failed_llm_change(
+    database: &mut MemoryDatabase,
+    job_id: &str,
+    change: &ValidatedDreamPlannerChange,
+    error_message: &str,
+) -> Result<(), MemoryDatabaseError> {
+    let target_fact_ids_json = json!(llm_change_target_fact_ids(change)).to_string();
+    let before_json = change
+        .target_facts
+        .first()
+        .map(|fact| serde_json::to_string(fact).expect("memory fact record serializes"));
+    let evidence_json = serde_json::to_string(&change.evidence).map_err(|source| {
+        MemoryDatabaseError::InvalidMemoryJson {
+            field: "memory_dream_changes.evidence_json",
+            source,
+        }
+    })?;
+
+    database.insert_dream_change(NewMemoryDreamChange {
+        id: &unique_id("memory-dream-change"),
+        job_id,
+        operation: change.operation.as_str(),
+        target_fact_ids_json: &target_fact_ids_json,
+        new_fact_id: None,
+        before_json: before_json.as_deref(),
+        after_json: None,
+        reason: &change.reason,
+        confidence: change.confidence,
+        risk_level: &change.risk_level,
+        status: MemoryDreamChangeStatus::Failed,
+        evidence_json: &evidence_json,
+        error_message: Some(error_message),
+    })
+}
+
+fn llm_change_target_fact_ids(change: &ValidatedDreamPlannerChange) -> Vec<&str> {
+    change
+        .target_facts
+        .iter()
+        .map(|fact| fact.id.as_str())
+        .collect()
+}
+
 fn refresh_dream_profiles(
     database: &mut MemoryDatabase,
     scope: MemoryDreamScope,
@@ -568,6 +1927,23 @@ fn normalized_duplicate_text(value: &str) -> String {
     }
 
     normalized.trim().to_string()
+}
+
+fn compact_json_text(value: &str) -> String {
+    serde_json::from_str::<Value>(value)
+        .map(|value| compact_text(&value.to_string(), 1_000))
+        .unwrap_or_else(|_| compact_text(value, 1_000))
+}
+
+fn compact_text(value: &str, max_chars: usize) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+
+    let mut truncated = compact.chars().take(max_chars).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 fn timestamp_is_due(value: &str, now: DateTime<Utc>) -> bool {
@@ -695,6 +2071,7 @@ struct DreamRunSummary {
     changes_failed: usize,
     profiles_refreshed: usize,
     llm_planner: &'static str,
+    llm_error: Option<String>,
 }
 
 impl DreamRunSummary {
@@ -708,6 +2085,7 @@ impl DreamRunSummary {
             "changesFailed": self.changes_failed,
             "profilesRefreshed": self.profiles_refreshed,
             "llmPlanner": self.llm_planner,
+            "llmError": self.llm_error,
         })
     }
 }
@@ -725,8 +2103,8 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn deterministic_dream_expires_due_facts() {
+    #[tokio::test]
+    async fn deterministic_dream_expires_due_facts() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut database =
             MemoryDatabase::open_or_create_global_at(temp_dir.path().join("memory.sqlite"))
@@ -750,6 +2128,7 @@ mod tests {
             .expect("set expiration");
 
         let result = run_memory_dream_job(&mut database, test_request(MemoryDreamScope::Global))
+            .await
             .expect("dream run");
 
         assert_eq!(result.applied_changes, 1);
@@ -771,8 +2150,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deterministic_dream_merges_exact_duplicates() {
+    #[tokio::test]
+    async fn deterministic_dream_merges_exact_duplicates() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut database =
             MemoryDatabase::open_or_create_global_at(temp_dir.path().join("memory.sqlite"))
@@ -799,6 +2178,7 @@ mod tests {
         );
 
         let result = run_memory_dream_job(&mut database, test_request(MemoryDreamScope::Global))
+            .await
             .expect("dream run");
 
         assert_eq!(result.applied_changes, 1);
@@ -820,8 +2200,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deterministic_dream_repairs_updates_chain_latest_flag() {
+    #[tokio::test]
+    async fn deterministic_dream_repairs_updates_chain_latest_flag() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let mut database =
             MemoryDatabase::open_or_create_global_at(temp_dir.path().join("memory.sqlite"))
@@ -865,6 +2245,7 @@ mod tests {
             .expect("make stale latest");
 
         let result = run_memory_dream_job(&mut database, test_request(MemoryDreamScope::Global))
+            .await
             .expect("dream run");
 
         assert_eq!(result.applied_changes, 1);
@@ -926,26 +2307,283 @@ mod tests {
         );
     }
 
-    fn test_request(scope: MemoryDreamScope) -> MemoryDreamJobRequest<'static> {
-        let settings = Box::leak(Box::new(MemoryDreamSettings {
-            enabled: true,
-            auto_enabled: false,
-            mode: "deterministic_only".to_string(),
+    #[test]
+    fn dream_planner_tool_schema_is_strict() {
+        let tool = memory_dream_planner_tool_definition();
+
+        assert!(tool.strict);
+        assert_eq!(
+            tool.input_schema.get("additionalProperties"),
+            Some(&Value::Bool(false))
+        );
+        let change_schema = tool.input_schema["properties"]["changes"]["items"]
+            .as_object()
+            .expect("change schema object");
+        assert_eq!(
+            change_schema.get("additionalProperties"),
+            Some(&Value::Bool(false))
+        );
+        assert_eq!(
+            change_schema.get("required").and_then(Value::as_array),
+            Some(
+                &[
+                    "operation",
+                    "targetFactIds",
+                    "newFact",
+                    "reason",
+                    "confidence",
+                    "riskLevel",
+                    "evidence"
+                ]
+                .into_iter()
+                .map(|value| Value::String(value.to_string()))
+                .collect::<Vec<_>>()
+            )
+        );
+    }
+
+    #[test]
+    fn dream_planner_rejects_malformed_output() {
+        let error = parse_memory_dream_planner_output(json!({
+            "summary": "bad",
+            "changes": [{"operation": "expire"}]
+        }))
+        .expect_err("malformed output should fail");
+
+        assert!(
+            error
+                .message
+                .contains("malformed memory Dream planner JSON")
+        );
+    }
+
+    #[test]
+    fn dream_planner_rejects_unknown_fact_ids() {
+        let output = planner_output("expire", vec!["fact-missing"], true);
+        let candidates = vec![test_fact_record("fact-1", MemoryScope::Global)];
+        let policy = MemoryDreamSafetyPolicy::new(10, 10).expect("policy");
+
+        let error = validate_memory_dream_planner_output(
+            &output,
+            MemoryDreamScope::Global,
+            &candidates,
+            &policy,
+        )
+        .expect_err("unknown target should fail");
+
+        assert!(error.message.contains("non-candidate fact id"));
+    }
+
+    #[test]
+    fn dream_planner_rejects_missing_evidence() {
+        let output = planner_output("expire", vec!["fact-1"], false);
+        let candidates = vec![test_fact_record("fact-1", MemoryScope::Global)];
+        let policy = MemoryDreamSafetyPolicy::new(10, 10).expect("policy");
+
+        let error = validate_memory_dream_planner_output(
+            &output,
+            MemoryDreamScope::Global,
+            &candidates,
+            &policy,
+        )
+        .expect_err("missing evidence should fail");
+
+        assert!(error.message.contains("must include evidence"));
+    }
+
+    #[tokio::test]
+    async fn automatic_llm_dream_falls_back_to_deterministic_changes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut database =
+            MemoryDatabase::open_or_create_global_at(temp_dir.path().join("memory.sqlite"))
+                .expect("global memory database");
+        insert_test_fact(
+            &mut database,
+            "fact-expired-auto",
+            MemoryScope::Global,
+            None,
+            MemoryStatus::Active,
+            MemoryKind::Preference,
+            "Temporary auto preference.",
+            Some(0.9),
+        );
+        database
+            .update_fact(UpdateMemoryFact {
+                id: "fact-expired-auto",
+                expires_at: Some(&now_minus_days(1)),
+                ..UpdateMemoryFact::default()
+            })
+            .expect("set expiration");
+        let mut request = test_request(MemoryDreamScope::Global);
+        request.mode = MemoryDreamRunMode::Llm;
+        request.trigger_type = MemoryDreamTriggerType::AutoInterval;
+
+        let result = run_memory_dream_job(&mut database, request)
+            .await
+            .expect("auto dream should fall back");
+        let output: Value = serde_json::from_str(
+            result
+                .job
+                .output_summary_json
+                .as_deref()
+                .expect("output summary"),
+        )
+        .expect("summary json");
+
+        assert_eq!(result.applied_changes, 1);
+        assert_eq!(
+            output["llmPlanner"],
+            Value::String("fallback_deterministic_only".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_llm_dream_fails_without_planner_or_deterministic_changes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut database =
+            MemoryDatabase::open_or_create_global_at(temp_dir.path().join("memory.sqlite"))
+                .expect("global memory database");
+        let mut request = test_request(MemoryDreamScope::Global);
+        request.mode = MemoryDreamRunMode::Llm;
+
+        let error = run_memory_dream_job(&mut database, request)
+            .await
+            .expect_err("manual dream without planner should fail");
+
+        assert!(error.message.contains("requires a configured model"));
+    }
+
+    #[tokio::test]
+    async fn dream_transcript_chat_is_created_and_hidden_from_normal_chat_list() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let mut database =
+            MemoryDatabase::open_or_create_global_at(temp_dir.path().join("memory.sqlite"))
+                .expect("global memory database");
+        let request = MemoryDreamJobRequest {
+            scope: MemoryDreamScope::Global,
+            workspace_id: None,
+            trigger_type: MemoryDreamTriggerType::Manual,
+            mode: MemoryDreamRunMode::DeterministicOnly,
             model_id: None,
-            workspace_interval_days: 7,
-            global_interval_days: 30,
-            create_transcript_chat: false,
-            max_facts_per_run: 100,
-            max_changes_per_run: 10,
-            scheduler_scan_minutes: 60,
-        }));
+            settings: test_settings(true),
+            planner: None,
+            transcript: Some(MemoryDreamTranscriptRequest {
+                workspace_path: &workspace_dir,
+            }),
+        };
+
+        let result = run_memory_dream_job(&mut database, request)
+            .await
+            .expect("dream run");
+        let transcript_chat_id = result
+            .job
+            .transcript_chat_id
+            .as_deref()
+            .expect("transcript chat id");
+        let workspace_database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+
+        assert!(workspace_database.chats().expect("normal chats").is_empty());
+        let dream_chats = workspace_database
+            .dream_transcript_chats()
+            .expect("dream chats");
+        assert_eq!(dream_chats.len(), 1);
+        assert_eq!(dream_chats[0].id, transcript_chat_id);
+        let metadata: Value =
+            serde_json::from_str(&dream_chats[0].metadata_json).expect("chat metadata");
+        assert_eq!(metadata["kind"], MEMORY_DREAM_TRANSCRIPT_CHAT_KIND);
+        assert_eq!(metadata["dreamJobId"], result.job.id);
+        let messages = workspace_database
+            .messages_for_chat(transcript_chat_id)
+            .expect("transcript messages");
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("job started"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.content.contains("final status"))
+        );
+    }
+
+    fn test_request(scope: MemoryDreamScope) -> MemoryDreamJobRequest<'static> {
         MemoryDreamJobRequest {
             scope,
             workspace_id: (scope == MemoryDreamScope::Workspace).then_some("workspace-1"),
             trigger_type: MemoryDreamTriggerType::Manual,
             mode: MemoryDreamRunMode::DeterministicOnly,
             model_id: None,
-            settings,
+            settings: test_settings(false),
+            planner: None,
+            transcript: None,
+        }
+    }
+
+    fn test_settings(create_transcript_chat: bool) -> &'static MemoryDreamSettings {
+        Box::leak(Box::new(MemoryDreamSettings {
+            enabled: true,
+            auto_enabled: false,
+            mode: "deterministic_only".to_string(),
+            model_id: None,
+            workspace_interval_days: 7,
+            global_interval_days: 30,
+            create_transcript_chat,
+            max_facts_per_run: 100,
+            max_changes_per_run: 10,
+            scheduler_scan_minutes: 60,
+        }))
+    }
+
+    fn planner_output(
+        operation: &str,
+        target_fact_ids: Vec<&str>,
+        include_evidence: bool,
+    ) -> MemoryDreamPlannerOutput {
+        MemoryDreamPlannerOutput {
+            summary: "summary".to_string(),
+            changes: vec![MemoryDreamPlannerChange {
+                operation: operation.to_string(),
+                target_fact_ids: target_fact_ids
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+                new_fact: None,
+                reason: "because evidence says so".to_string(),
+                confidence: Some(0.9),
+                risk_level: "low".to_string(),
+                evidence: include_evidence
+                    .then(|| {
+                        vec![DreamPlannerEvidence {
+                            source_type: "memory_fact".to_string(),
+                            source_id: "fact-1".to_string(),
+                            quote: "evidence quote".to_string(),
+                        }]
+                    })
+                    .unwrap_or_default(),
+            }],
+        }
+    }
+
+    fn test_fact_record(id: &str, scope: MemoryScope) -> MemoryFactRecord {
+        MemoryFactRecord {
+            id: id.to_string(),
+            scope: scope.as_str().to_string(),
+            chat_id: None,
+            status: MemoryStatus::Active.as_str().to_string(),
+            kind: MemoryKind::Preference.as_str().to_string(),
+            fact: "Prefer compact replies.".to_string(),
+            confidence: Some(0.9),
+            pinned: false,
+            is_latest: true,
+            expires_at: None,
+            metadata_json: "{}".to_string(),
+            created_at: "2026-06-23T00:00:00.000Z".to_string(),
+            updated_at: "2026-06-23T00:00:00.000Z".to_string(),
         }
     }
 

@@ -9,8 +9,8 @@ use foco_agent::{
 use foco_store::{
     config::{AgentDefinitionSettings, AgentModelOptions, WorkspaceConfig},
     memory::{
-        MemoryDatabase, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact,
-        NewMemorySource,
+        MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MemoryDatabase, MemoryKind, MemoryScope,
+        MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
     },
     workspace::{
         AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord, NewAgentContextEntry,
@@ -1127,6 +1127,13 @@ fn repository_helpers_round_trip_core_records() {
     database
         .insert_chat("chat-2", "Second chat")
         .expect("second chat insert");
+    database
+        .insert_chat_with_metadata(
+            "chat-dream",
+            "Memory Dream",
+            &format!(r#"{{"kind":"{MEMORY_DREAM_TRANSCRIPT_CHAT_KIND}"}}"#),
+        )
+        .expect("dream chat insert");
     assert_eq!(
         database
             .chat("chat-1")
@@ -1139,6 +1146,11 @@ fn repository_helpers_round_trip_core_records() {
     assert_eq!(chats.len(), 2);
     assert_eq!(chats[0].title, "Second chat");
     assert_eq!(chats[1].title, "First chat");
+    let dream_chats = database
+        .dream_transcript_chats()
+        .expect("dream transcript chat list");
+    assert_eq!(dream_chats.len(), 1);
+    assert_eq!(dream_chats[0].id, "chat-dream");
 
     database
         .insert_message(NewMessage {

@@ -20,7 +20,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::config::WorkspaceConfig;
-use crate::memory::{WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL};
+use crate::memory::{
+    MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, WORKSPACE_MEMORY_DREAM_SCHEMA_SQL,
+    WORKSPACE_MEMORY_SCHEMA_SQL,
+};
 #[path = "workspace_records.rs"]
 mod workspace_records;
 #[path = "workspace_schema.rs"]
@@ -297,6 +300,17 @@ impl WorkspaceDatabase {
     }
 
     pub fn chats(&self) -> Result<Vec<ChatRecord>, WorkspaceDatabaseError> {
+        self.chats_matching_kind(None)
+    }
+
+    pub fn dream_transcript_chats(&self) -> Result<Vec<ChatRecord>, WorkspaceDatabaseError> {
+        self.chats_matching_kind(Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND))
+    }
+
+    fn chats_matching_kind(
+        &self,
+        kind: Option<&str>,
+    ) -> Result<Vec<ChatRecord>, WorkspaceDatabaseError> {
         let mut statement = self
             .connection
             .prepare(
@@ -318,7 +332,16 @@ impl WorkspaceDatabase {
             })
             .map_err(|source| self.sqlite_error(source))?;
 
-        collect_rows(rows, &self.database_path)
+        collect_rows(rows, &self.database_path)?
+            .into_iter()
+            .filter_map(
+                |chat| match chat_metadata_kind_matches(&chat.metadata_json, kind) {
+                    Ok(true) => Some(Ok(chat)),
+                    Ok(false) => None,
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect()
     }
 
     pub fn chat_code_change_stats(
@@ -7198,6 +7221,18 @@ fn parse_json_object(
         .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
             message: format!("{context} must be a JSON object"),
         })
+}
+
+fn chat_metadata_kind_matches(
+    metadata_json: &str,
+    kind: Option<&str>,
+) -> Result<bool, WorkspaceDatabaseError> {
+    let metadata = parse_json_object(metadata_json, "chat metadata")?;
+    let chat_kind = metadata.get("kind").and_then(Value::as_str);
+    Ok(match kind {
+        Some(kind) => chat_kind == Some(kind),
+        None => chat_kind != Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND),
+    })
 }
 
 fn create_directory(path: &Path) -> Result<(), WorkspaceDatabaseError> {

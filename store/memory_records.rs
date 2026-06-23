@@ -70,6 +70,16 @@ pub struct NewMemoryEdge<'a> {
     pub metadata_json: &'a str,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MemoryEdgeRecord {
+    pub id: String,
+    pub source_fact_id: String,
+    pub target_fact_id: String,
+    pub relation: String,
+    pub metadata_json: String,
+    pub created_at: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewMemoryProfile<'a> {
     pub id: &'a str,

@@ -16,10 +16,11 @@ mod memory_schema;
 
 use memory_records::MemoryDatabaseKind;
 pub use memory_records::{
-    MemoryDreamChangeRecord, MemoryDreamJobRecord, MemoryExtractionJobRecord, MemoryFactRecord,
-    MemoryProfileRecord, MemorySourceRecord, NewMemoryDreamChange, NewMemoryDreamJob,
-    NewMemoryEdge, NewMemoryExtractionJob, NewMemoryFact, NewMemoryProfile, NewMemorySource,
-    UpdateMemoryDreamChange, UpdateMemoryDreamJob, UpdateMemoryFact, UpdateMemorySource,
+    MemoryDreamChangeRecord, MemoryDreamJobRecord, MemoryEdgeRecord, MemoryExtractionJobRecord,
+    MemoryFactRecord, MemoryProfileRecord, MemorySourceRecord, NewMemoryDreamChange,
+    NewMemoryDreamJob, NewMemoryEdge, NewMemoryExtractionJob, NewMemoryFact, NewMemoryProfile,
+    NewMemorySource, UpdateMemoryDreamChange, UpdateMemoryDreamJob, UpdateMemoryFact,
+    UpdateMemorySource,
 };
 use memory_schema::MemoryMigration;
 pub use memory_schema::{
@@ -1622,6 +1623,52 @@ impl MemoryDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn edges_for_fact_ids(
+        &self,
+        fact_ids: &[String],
+        limit: u32,
+    ) -> Result<Vec<MemoryEdgeRecord>, MemoryDatabaseError> {
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let mut edges = Vec::new();
+        let mut seen = HashSet::new();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, source_fact_id, target_fact_id, relation, metadata_json, created_at
+                 FROM memory_edges
+                 WHERE source_fact_id = ?1 OR target_fact_id = ?2
+                 ORDER BY created_at DESC, id ASC
+                 LIMIT ?3",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        for fact_id in fact_ids {
+            require_non_empty("fact_id", fact_id)?;
+            let remaining = limit as usize - edges.len();
+            if remaining == 0 {
+                break;
+            }
+            let rows = statement
+                .query_map(
+                    params![fact_id, fact_id, remaining as u32],
+                    memory_edge_from_row,
+                )
+                .map_err(|source| sqlite_error(&self.database_path, source))?;
+            for edge in collect_rows(rows, &self.database_path)? {
+                if seen.insert(edge.id.clone()) {
+                    edges.push(edge);
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
     pub fn fact(&self, id: &str) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
         require_non_empty("id", id)?;
         self.connection
@@ -3215,6 +3262,17 @@ fn memory_source_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemorySou
         metadata_json: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
+    })
+}
+
+fn memory_edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEdgeRecord> {
+    Ok(MemoryEdgeRecord {
+        id: row.get(0)?,
+        source_fact_id: row.get(1)?,
+        target_fact_id: row.get(2)?,
+        relation: row.get(3)?,
+        metadata_json: row.get(4)?,
+        created_at: row.get(5)?,
     })
 }
 
