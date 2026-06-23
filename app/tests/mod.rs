@@ -7573,6 +7573,7 @@ fn memory_extraction_request_includes_existing_candidates_and_strict_prompt_rule
         "chat-1",
         "run-1",
         "provider-1",
+        "zh-CN",
         512,
         &evidence,
         &existing,
@@ -7580,16 +7581,13 @@ fn memory_extraction_request_includes_existing_candidates_and_strict_prompt_rule
     .expect("memory extraction request");
 
     assert_eq!(request.messages[0].role, NeutralChatRole::System);
-    assert!(
-        request.messages[0]
-            .content
-            .contains("unlikely to change often")
-    );
-    assert!(
-        request.messages[0]
-            .content
-            .contains("duplicates or near-duplicates")
-    );
+    let system_prompt = &request.messages[0].content;
+    assert!(system_prompt.contains("Simplified Chinese"));
+    assert!(system_prompt.contains("Use the submit_memory_extraction tool exactly once"));
+    assert!(system_prompt.contains("Do not return prose"));
+    assert!(system_prompt.contains("unlikely to change often"));
+    assert!(system_prompt.contains("duplicates or near-duplicates"));
+    assert!(system_prompt.contains("provided evidenceIds"));
     assert_eq!(request.messages[1].role, NeutralChatRole::User);
     assert!(
         request.messages[1]

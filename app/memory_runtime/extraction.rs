@@ -328,6 +328,7 @@ pub(crate) async fn run_memory_extraction_job_inner(
         &task.chat_id,
         &task.run_id,
         &provider_id,
+        &task.config.app.language,
         max_output_tokens,
         &evidence_candidates,
         &existing_memory_candidates,
@@ -566,6 +567,7 @@ pub(crate) fn memory_extraction_provider_request(
     chat_id: &str,
     run_id: &str,
     provider_id: &str,
+    app_language: &str,
     max_output_tokens: u32,
     evidence: &[MemoryExtractionEvidenceCandidate],
     existing_memory_candidates: &[MemoryFactRecord],
@@ -610,14 +612,15 @@ pub(crate) fn memory_extraction_provider_request(
     .map_err(|source| {
         ApiError::internal(format!("failed to serialize extraction evidence: {source}"))
     })?;
+    let system_prompt = format!(
+        "{MEMORY_EXTRACTION_SYSTEM_PROMPT} {}",
+        memory_extraction_language_instruction(app_language)
+    );
 
     Ok(NeutralChatRequest {
         model_id: model_id.to_string(),
         messages: vec![
-            neutral_text_message(
-                NeutralChatRole::System,
-                MEMORY_EXTRACTION_SYSTEM_PROMPT.to_string(),
-            ),
+            neutral_text_message(NeutralChatRole::System, system_prompt),
             neutral_text_message(
                 NeutralChatRole::User,
                 format!(
@@ -631,6 +634,18 @@ pub(crate) fn memory_extraction_provider_request(
         prompt_cache_key: None,
         prompt_cache_retention: None,
     })
+}
+
+// ponytail: local mapping is enough for the two supported app languages; extend when adding languages.
+fn memory_extraction_language_instruction(app_language: &str) -> &'static str {
+    match app_language {
+        "zh-CN" => {
+            "Language preference: Summarize and extract memory facts in Simplified Chinese whenever possible. Preserve source quotes, code identifiers, file paths, commands, API names, and proper nouns when translation would reduce accuracy."
+        }
+        _ => {
+            "Language preference: Summarize and extract memory facts in English whenever possible. Preserve source quotes, code identifiers, file paths, commands, API names, and proper nouns when translation would reduce accuracy."
+        }
+    }
 }
 
 pub(crate) async fn call_memory_extraction_provider(
