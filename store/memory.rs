@@ -59,6 +59,185 @@ impl MemoryScope {
     }
 }
 
+// ponytail: Phase 0 is only the Dream contract; schema, API, and UI wire it in later phases.
+pub const MEMORY_DREAM_HARD_DELETE_ALLOWED: bool = false;
+pub const MEMORY_DREAM_TRANSCRIPT_CHAT_KIND: &str = "memory_dream";
+pub const MEMORY_DREAM_TRANSCRIPT_VISIBLE_IN_NORMAL_CHAT_LIST: bool = false;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryDreamScope {
+    Global,
+    Workspace,
+}
+
+impl MemoryDreamScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Workspace => "workspace",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        match value {
+            "global" => Ok(Self::Global),
+            "workspace" => Ok(Self::Workspace),
+            _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("unknown memory Dream scope: {value}"),
+            }),
+        }
+    }
+
+    pub fn allows_candidate_fact_scope(self, scope: MemoryScope) -> bool {
+        match self {
+            Self::Global => scope == MemoryScope::Global,
+            Self::Workspace => matches!(scope, MemoryScope::Workspace | MemoryScope::Chat),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryDreamTriggerType {
+    Manual,
+    AutoInterval,
+    AutoThreshold,
+}
+
+impl MemoryDreamTriggerType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::AutoInterval => "auto_interval",
+            Self::AutoThreshold => "auto_threshold",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        match value {
+            "manual" => Ok(Self::Manual),
+            "auto_interval" => Ok(Self::AutoInterval),
+            "auto_threshold" => Ok(Self::AutoThreshold),
+            _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("unknown memory Dream trigger type: {value}"),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryDreamRunMode {
+    DeterministicOnly,
+    Llm,
+}
+
+impl MemoryDreamRunMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DeterministicOnly => "deterministic_only",
+            Self::Llm => "llm",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        match value {
+            "deterministic_only" => Ok(Self::DeterministicOnly),
+            "llm" => Ok(Self::Llm),
+            _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("unknown memory Dream run mode: {value}"),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryDreamSafetyPolicy {
+    pub max_facts_per_run: usize,
+    pub max_changes_per_run: usize,
+}
+
+impl MemoryDreamSafetyPolicy {
+    pub fn new(
+        max_facts_per_run: usize,
+        max_changes_per_run: usize,
+    ) -> Result<Self, MemoryDatabaseError> {
+        if max_facts_per_run == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "memory Dream max facts per run must be greater than 0".to_string(),
+            });
+        }
+        if max_changes_per_run == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "memory Dream max changes per run must be greater than 0".to_string(),
+            });
+        }
+
+        Ok(Self {
+            max_facts_per_run,
+            max_changes_per_run,
+        })
+    }
+
+    pub fn validate_batch_size(
+        &self,
+        fact_count: usize,
+        change_count: usize,
+    ) -> Result<(), MemoryDatabaseError> {
+        if fact_count > self.max_facts_per_run {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!(
+                    "memory Dream considered {fact_count} facts, limit is {}",
+                    self.max_facts_per_run
+                ),
+            });
+        }
+        if change_count > self.max_changes_per_run {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: format!(
+                    "memory Dream proposed {change_count} changes, limit is {}",
+                    self.max_changes_per_run
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_updated_at(
+        &self,
+        expected_updated_at: &str,
+        actual_updated_at: &str,
+    ) -> Result<(), MemoryDatabaseError> {
+        if expected_updated_at != actual_updated_at {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "memory Dream target changed before apply".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+
+    pub fn allows_automatic_global_promotion(
+        &self,
+        has_explicit_cross_project_user_preference: bool,
+    ) -> bool {
+        has_explicit_cross_project_user_preference
+    }
+
+    pub fn allows_direct_expiration(
+        &self,
+        kind: MemoryKind,
+        pinned: bool,
+        operation_is_deterministic: bool,
+        has_explicit_evidence: bool,
+    ) -> bool {
+        if !pinned && kind != MemoryKind::UserNote {
+            return true;
+        }
+
+        operation_is_deterministic && has_explicit_evidence
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemoryStatus {
     Pending,
@@ -2859,6 +3038,62 @@ mod tests {
             database.schema_version().expect("schema version"),
             GLOBAL_MEMORY_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn memory_dream_phase0_contract_excludes_chat_runs() {
+        assert_eq!(
+            MemoryDreamScope::parse("global").unwrap().as_str(),
+            "global"
+        );
+        assert_eq!(
+            MemoryDreamScope::parse("workspace").unwrap().as_str(),
+            "workspace"
+        );
+        assert!(MemoryDreamScope::parse("chat").is_err());
+        assert_eq!(
+            MemoryDreamTriggerType::parse("auto_threshold")
+                .unwrap()
+                .as_str(),
+            "auto_threshold"
+        );
+        assert_eq!(
+            MemoryDreamRunMode::parse("deterministic_only")
+                .unwrap()
+                .as_str(),
+            "deterministic_only"
+        );
+
+        assert!(MemoryDreamScope::Global.allows_candidate_fact_scope(MemoryScope::Global));
+        assert!(!MemoryDreamScope::Global.allows_candidate_fact_scope(MemoryScope::Workspace));
+        assert!(MemoryDreamScope::Workspace.allows_candidate_fact_scope(MemoryScope::Workspace));
+        assert!(MemoryDreamScope::Workspace.allows_candidate_fact_scope(MemoryScope::Chat));
+        assert_eq!(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, "memory_dream");
+        assert!(!MEMORY_DREAM_TRANSCRIPT_VISIBLE_IN_NORMAL_CHAT_LIST);
+    }
+
+    #[test]
+    fn memory_dream_phase0_safety_policy_enforces_invariants() {
+        let policy = MemoryDreamSafetyPolicy::new(2, 1).expect("valid policy");
+
+        assert!(!MEMORY_DREAM_HARD_DELETE_ALLOWED);
+        assert!(MemoryDreamSafetyPolicy::new(0, 1).is_err());
+        assert!(policy.validate_batch_size(2, 1).is_ok());
+        assert!(policy.validate_batch_size(3, 1).is_err());
+        assert!(policy.validate_batch_size(2, 2).is_err());
+        assert!(
+            policy
+                .validate_updated_at("2026-06-23T00:00:00Z", "2026-06-23T00:00:00Z")
+                .is_ok()
+        );
+        assert!(policy.validate_updated_at("old", "new").is_err());
+
+        assert!(!policy.allows_automatic_global_promotion(false));
+        assert!(policy.allows_automatic_global_promotion(true));
+        assert!(policy.allows_direct_expiration(MemoryKind::ProjectFact, false, false, false));
+        assert!(!policy.allows_direct_expiration(MemoryKind::ProjectFact, true, true, false));
+        assert!(!policy.allows_direct_expiration(MemoryKind::UserNote, false, false, true));
+        assert!(policy.allows_direct_expiration(MemoryKind::UserNote, false, true, true));
     }
 
     #[test]
