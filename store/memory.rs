@@ -17,19 +17,19 @@ mod memory_schema;
 use memory_records::MemoryDatabaseKind;
 pub use memory_records::{
     MemoryDreamChangeRecord, MemoryDreamJobRecord, MemoryEdgeRecord, MemoryExtractionJobRecord,
-    MemoryFactRecord, MemoryProfileRecord, MemorySourceRecord, NewMemoryDreamChange,
-    NewMemoryDreamJob, NewMemoryEdge, NewMemoryExtractionJob, NewMemoryFact, NewMemoryProfile,
-    NewMemorySource, UpdateMemoryDreamChange, UpdateMemoryDreamJob, UpdateMemoryFact,
-    UpdateMemorySource,
+    MemoryFactRecord, MemoryProfileRecord, MemoryReferenceRecord, MemorySourceRecord,
+    NewMemoryDreamChange, NewMemoryDreamJob, NewMemoryEdge, NewMemoryExtractionJob, NewMemoryFact,
+    NewMemoryProfile, NewMemoryReference, NewMemorySource, UpdateMemoryDreamChange,
+    UpdateMemoryDreamJob, UpdateMemoryFact, UpdateMemorySource,
 };
 use memory_schema::MemoryMigration;
 pub use memory_schema::{
-    GLOBAL_MEMORY_DREAM_SCHEMA_SQL, GLOBAL_MEMORY_SCHEMA_SQL, WORKSPACE_MEMORY_DREAM_SCHEMA_SQL,
-    WORKSPACE_MEMORY_SCHEMA_SQL,
+    GLOBAL_MEMORY_DREAM_SCHEMA_SQL, GLOBAL_MEMORY_SCHEMA_SQL, MEMORY_REFERENCES_SCHEMA_SQL,
+    WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
 };
 
 pub const GLOBAL_MEMORY_DATABASE_FILE: &str = "memory.sqlite";
-pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 2;
+pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 3;
 
 const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[
     MemoryMigration {
@@ -39,6 +39,10 @@ const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[
     MemoryMigration {
         version: 2,
         sql: GLOBAL_MEMORY_DREAM_SCHEMA_SQL,
+    },
+    MemoryMigration {
+        version: 3,
+        sql: MEMORY_REFERENCES_SCHEMA_SQL,
     },
 ];
 
@@ -425,6 +429,54 @@ impl MemoryRelationKind {
             Self::Extends => "extends",
             Self::Derives => "derives",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum MemoryReferenceType {
+    FilePath,
+    Symbol,
+    Command,
+    Url,
+    WorkspaceId,
+}
+
+impl MemoryReferenceType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FilePath => "file_path",
+            Self::Symbol => "symbol",
+            Self::Command => "command",
+            Self::Url => "url",
+            Self::WorkspaceId => "workspace_id",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        memory_reference_type_from_str(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum MemoryReferenceStatus {
+    Valid,
+    Invalid,
+    Ambiguous,
+    Skipped,
+}
+
+impl MemoryReferenceStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Invalid => "invalid",
+            Self::Ambiguous => "ambiguous",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MemoryDatabaseError> {
+        memory_reference_status_from_str(value)
     }
 }
 
@@ -1719,6 +1771,115 @@ impl MemoryDatabase {
         }
 
         Ok(edges)
+    }
+
+    pub fn replace_fact_references(
+        &mut self,
+        fact_id: &str,
+        references: &[NewMemoryReference<'_>],
+    ) -> Result<(), MemoryDatabaseError> {
+        require_non_empty("fact_id", fact_id)?;
+        for reference in references {
+            validate_reference(reference)?;
+            if reference.fact_id != fact_id {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!(
+                        "memory reference '{}' belongs to fact '{}', expected '{}'",
+                        reference.id, reference.fact_id, fact_id
+                    ),
+                });
+            }
+        }
+
+        let database_path = self.database_path.clone();
+        let now = now_timestamp();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        transaction
+            .execute(
+                "DELETE FROM memory_references WHERE fact_id = ?1",
+                params![fact_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        for reference in references {
+            transaction
+                .execute(
+                    "INSERT INTO memory_references
+                        (id, fact_id, reference_type, value, normalized_value, status,
+                         metadata_json, checked_at, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        reference.id,
+                        reference.fact_id,
+                        reference.reference_type.as_str(),
+                        reference.value,
+                        reference.normalized_value,
+                        reference.status.as_str(),
+                        reference.metadata_json,
+                        reference.checked_at,
+                        now,
+                        now,
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(())
+    }
+
+    pub fn references_for_fact_ids(
+        &self,
+        fact_ids: &[String],
+        limit: u32,
+    ) -> Result<Vec<MemoryReferenceRecord>, MemoryDatabaseError> {
+        if limit == 0 {
+            return Err(MemoryDatabaseError::InvalidMemoryInput {
+                message: "limit must be greater than 0".to_string(),
+            });
+        }
+
+        let mut references = Vec::new();
+        let mut seen = HashSet::new();
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, fact_id, reference_type, value, normalized_value, status,
+                        metadata_json, checked_at, created_at, updated_at
+                 FROM memory_references
+                 WHERE fact_id = ?1
+                 ORDER BY reference_type ASC, normalized_value ASC, id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        for fact_id in fact_ids {
+            require_non_empty("fact_id", fact_id)?;
+            let remaining = limit as usize - references.len();
+            if remaining == 0 {
+                break;
+            }
+            let rows = statement
+                .query_map(
+                    params![fact_id, remaining as u32],
+                    memory_reference_from_row,
+                )
+                .map_err(|source| sqlite_error(&self.database_path, source))?;
+            for reference in collect_rows(rows, &self.database_path)? {
+                if seen.insert(reference.id.clone()) {
+                    references.push(reference);
+                }
+            }
+        }
+
+        Ok(references)
     }
 
     pub fn fact(&self, id: &str) -> Result<Option<MemoryFactRecord>, MemoryDatabaseError> {
@@ -3131,6 +3292,14 @@ fn validate_dream_change_update(
     validate_dream_change_status_payload(update.status, update.error_message)
 }
 
+fn validate_reference(reference: &NewMemoryReference<'_>) -> Result<(), MemoryDatabaseError> {
+    require_non_empty("id", reference.id)?;
+    require_non_empty("fact_id", reference.fact_id)?;
+    require_non_empty("value", reference.value)?;
+    require_non_empty("normalized_value", reference.normalized_value)?;
+    validate_json("metadata_json", reference.metadata_json)
+}
+
 fn validate_dream_change_status_payload(
     status: MemoryDreamChangeStatus,
     error_message: Option<&str>,
@@ -3325,6 +3494,21 @@ fn memory_edge_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEdgeR
         relation: row.get(3)?,
         metadata_json: row.get(4)?,
         created_at: row.get(5)?,
+    })
+}
+
+fn memory_reference_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryReferenceRecord> {
+    Ok(MemoryReferenceRecord {
+        id: row.get(0)?,
+        fact_id: row.get(1)?,
+        reference_type: row.get(2)?,
+        value: row.get(3)?,
+        normalized_value: row.get(4)?,
+        status: row.get(5)?,
+        metadata_json: row.get(6)?,
+        checked_at: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -3782,6 +3966,33 @@ fn memory_source_type_from_str(value: &str) -> Result<MemorySourceType, MemoryDa
     }
 }
 
+fn memory_reference_type_from_str(value: &str) -> Result<MemoryReferenceType, MemoryDatabaseError> {
+    match value {
+        "file_path" => Ok(MemoryReferenceType::FilePath),
+        "symbol" => Ok(MemoryReferenceType::Symbol),
+        "command" => Ok(MemoryReferenceType::Command),
+        "url" => Ok(MemoryReferenceType::Url),
+        "workspace_id" => Ok(MemoryReferenceType::WorkspaceId),
+        _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("unknown memory reference type: {value}"),
+        }),
+    }
+}
+
+fn memory_reference_status_from_str(
+    value: &str,
+) -> Result<MemoryReferenceStatus, MemoryDatabaseError> {
+    match value {
+        "valid" => Ok(MemoryReferenceStatus::Valid),
+        "invalid" => Ok(MemoryReferenceStatus::Invalid),
+        "ambiguous" => Ok(MemoryReferenceStatus::Ambiguous),
+        "skipped" => Ok(MemoryReferenceStatus::Skipped),
+        _ => Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!("unknown memory reference status: {value}"),
+        }),
+    }
+}
+
 fn promoted_source_id(promoted_fact_id: &str, index: usize) -> String {
     format!("{promoted_fact_id}:source:{index}")
 }
@@ -3842,6 +4053,7 @@ mod tests {
         let connection = Connection::open(database.database_path()).expect("open database");
         assert!(memory_table_exists(&connection, "memory_dream_jobs"));
         assert!(memory_table_exists(&connection, "memory_dream_changes"));
+        assert!(memory_table_exists(&connection, "memory_references"));
     }
 
     #[test]
@@ -3866,6 +4078,31 @@ mod tests {
         let connection = Connection::open(database.database_path()).expect("open database");
         assert!(memory_table_exists(&connection, "memory_dream_jobs"));
         assert!(memory_table_exists(&connection, "memory_dream_changes"));
+        assert!(memory_table_exists(&connection, "memory_references"));
+    }
+
+    #[test]
+    fn global_database_migrates_v2_memory_references_schema() {
+        let profile = tempfile::tempdir().expect("profile");
+        let database_path = global_memory_database_path(profile.path());
+        let connection = Connection::open(&database_path).expect("v2 memory database");
+        connection
+            .execute_batch(&format!(
+                "{GLOBAL_MEMORY_SCHEMA_SQL}
+                 {GLOBAL_MEMORY_DREAM_SCHEMA_SQL}
+                 PRAGMA user_version = 2;"
+            ))
+            .expect("v2 memory schema");
+        drop(connection);
+
+        let database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("migrated database");
+        assert_eq!(
+            database.schema_version().expect("schema version"),
+            GLOBAL_MEMORY_SCHEMA_VERSION
+        );
+        let connection = Connection::open(database.database_path()).expect("open database");
+        assert!(memory_table_exists(&connection, "memory_references"));
     }
 
     #[test]
@@ -4043,6 +4280,60 @@ mod tests {
             serde_json::from_str::<Value>(changes[0].before_json.as_deref().unwrap())
                 .expect("before json")["api_key"],
             "[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn memory_references_replace_and_list_by_fact() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        database
+            .insert_fact(NewMemoryFact {
+                id: "fact-1",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::UserNote,
+                fact: "Use app/main.rs for startup behavior.",
+                confidence: Some(0.9),
+                pinned: false,
+                source_ids: &[],
+                metadata_json: "{}",
+            })
+            .expect("fact insert");
+
+        database
+            .replace_fact_references(
+                "fact-1",
+                &[NewMemoryReference {
+                    id: "reference-1",
+                    fact_id: "fact-1",
+                    reference_type: MemoryReferenceType::FilePath,
+                    value: "app/main.rs",
+                    normalized_value: "app/main.rs",
+                    status: MemoryReferenceStatus::Valid,
+                    metadata_json: r#"{"path":"app/main.rs"}"#,
+                    checked_at: Some("2026-06-23T00:00:00Z"),
+                }],
+            )
+            .expect("replace references");
+
+        let references = database
+            .references_for_fact_ids(&["fact-1".to_string()], 10)
+            .expect("references");
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].reference_type, "file_path");
+        assert_eq!(references[0].status, "valid");
+
+        database
+            .replace_fact_references("fact-1", &[])
+            .expect("clear references");
+        assert!(
+            database
+                .references_for_fact_ids(&["fact-1".to_string()], 10)
+                .expect("references")
+                .is_empty()
         );
     }
 

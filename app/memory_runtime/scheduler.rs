@@ -317,6 +317,7 @@ async fn run_memory_dream_guarded(
             mode,
             model_id: config.memory.dream.model_id.as_deref(),
             settings: &config.memory.dream,
+            config: Some(config),
             global_memory_database_file: Some(&state.memory_database_file),
             planner,
             transcript,

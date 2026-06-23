@@ -2,8 +2,8 @@ use serde::Serialize;
 
 use crate::memory::{
     MemoryDreamChangeStatus, MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope,
-    MemoryDreamTriggerType, MemoryExtractionJobStatus, MemoryKind, MemoryRelationKind, MemoryScope,
-    MemorySourceType, MemoryStatus,
+    MemoryDreamTriggerType, MemoryExtractionJobStatus, MemoryKind, MemoryReferenceStatus,
+    MemoryReferenceType, MemoryRelationKind, MemoryScope, MemorySourceType, MemoryStatus,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +143,18 @@ pub struct NewMemoryDreamChange<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct NewMemoryReference<'a> {
+    pub id: &'a str,
+    pub fact_id: &'a str,
+    pub reference_type: MemoryReferenceType,
+    pub value: &'a str,
+    pub normalized_value: &'a str,
+    pub status: MemoryReferenceStatus,
+    pub metadata_json: &'a str,
+    pub checked_at: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpdateMemoryDreamChange<'a> {
     pub id: &'a str,
     pub status: MemoryDreamChangeStatus,
@@ -242,4 +254,18 @@ pub struct MemoryDreamChangeRecord {
     pub error_message: Option<String>,
     pub created_at: String,
     pub applied_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MemoryReferenceRecord {
+    pub id: String,
+    pub fact_id: String,
+    pub reference_type: String,
+    pub value: String,
+    pub normalized_value: String,
+    pub status: String,
+    pub metadata_json: String,
+    pub checked_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
 }

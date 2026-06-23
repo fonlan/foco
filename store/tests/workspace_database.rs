@@ -11,6 +11,7 @@ use foco_store::{
     memory::{
         MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MemoryDatabase, MemoryKind, MemoryScope,
         MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
+        WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
     },
     workspace::{
         AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord, NewAgentContextEntry,
@@ -74,6 +75,7 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "memory_extraction_jobs",
         "memory_dream_jobs",
         "memory_dream_changes",
+        "memory_references",
         "prompt_context_injections",
         "agent_teams",
         "agent_instances",
@@ -2576,6 +2578,7 @@ fn migrates_v15_memory_dream_tables() {
     let connection = Connection::open(database.database_path()).expect("open migrated database");
     assert!(table_exists(&connection, "memory_dream_jobs"));
     assert!(table_exists(&connection, "memory_dream_changes"));
+    assert!(table_exists(&connection, "memory_references"));
     assert_eq!(
         connection
             .query_row(
@@ -2586,6 +2589,31 @@ fn migrates_v15_memory_dream_tables() {
             .expect("sentinel metadata"),
         "keep"
     );
+}
+
+#[test]
+fn migrates_v16_memory_references_table() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v16 database");
+    connection
+        .execute_batch(&format!(
+            "{WORKSPACE_MEMORY_SCHEMA_SQL}
+             {WORKSPACE_MEMORY_DREAM_SCHEMA_SQL}
+             PRAGMA user_version = 16;"
+        ))
+        .expect("v16 schema");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+
+    let connection = Connection::open(database.database_path()).expect("open migrated database");
+    assert!(table_exists(&connection, "memory_references"));
 }
 
 #[test]

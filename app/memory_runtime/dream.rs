@@ -4,6 +4,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, HashMap, HashSet},
+    fs,
     path::Path,
     time::Instant,
 };
@@ -13,14 +14,15 @@ use foco_providers::{
     NeutralChatRequest, NeutralChatRole, NeutralToolDefinition, ProviderConnectionConfig,
 };
 use foco_store::{
-    config::{GlobalConfig, MemoryDreamSettings, MemorySettings, ModelSettings},
+    config::{GlobalConfig, MemoryDreamSettings, MemorySettings, ModelSettings, WorkspaceConfig},
     memory::{
         MEMORY_DREAM_TRANSCRIPT_CHAT_KIND, MemoryDatabase, MemoryDatabaseError,
         MemoryDreamChangeStatus, MemoryDreamJobRecord, MemoryDreamJobStatus, MemoryDreamRunMode,
         MemoryDreamSafetyPolicy, MemoryDreamScope, MemoryDreamTriggerType, MemoryEdgeRecord,
-        MemoryFactRecord, MemoryKind, MemoryProfileRecord, MemoryRelationKind, MemoryScope,
+        MemoryFactRecord, MemoryKind, MemoryProfileRecord, MemoryReferenceRecord,
+        MemoryReferenceStatus, MemoryReferenceType, MemoryRelationKind, MemoryScope,
         MemorySourceType, MemoryStatus, NewMemoryDreamChange, NewMemoryDreamJob, NewMemoryEdge,
-        NewMemoryFact, NewMemorySource, UpdateMemoryDreamJob, UpdateMemoryFact,
+        NewMemoryFact, NewMemoryReference, NewMemorySource, UpdateMemoryDreamJob, UpdateMemoryFact,
     },
     workspace::{NewMessage, WorkspaceDatabase},
 };
@@ -36,6 +38,8 @@ const MEMORY_DREAM_PLANNER_TOOL_NAME: &str = "submit_memory_dream_changeset";
 const MEMORY_DREAM_PLANNER_TIMEOUT_MS: u64 = 60_000;
 const MEMORY_DREAM_PLANNER_MAX_OUTPUT_TOKENS: u32 = 2048;
 const MEMORY_DREAM_PLANNER_MAX_EDGE_RECORDS: u32 = 80;
+const MEMORY_DREAM_PLANNER_MAX_REFERENCE_RECORDS: u32 = 200;
+const MEMORY_DREAM_MAX_REFERENCES_PER_FACT: usize = 12;
 const MEMORY_DREAM_TRANSCRIPT_MAX_CHARS: usize = 6_000;
 const MEMORY_DREAM_ROLLBACK_GUIDANCE: &str = "Automatic Dream never hard-deletes memory facts. \
 Recovery is status/field reversal from applied change beforeJson plus cleanup of Dream-created edges \
@@ -56,6 +60,7 @@ pub(crate) struct MemoryDreamJobRequest<'a> {
     pub(crate) mode: MemoryDreamRunMode,
     pub(crate) model_id: Option<&'a str>,
     pub(crate) settings: &'a MemoryDreamSettings,
+    pub(crate) config: Option<&'a GlobalConfig>,
     pub(crate) global_memory_database_file: Option<&'a Path>,
     pub(crate) planner: Option<MemoryDreamPlannerRequest<'a>>,
     pub(crate) transcript: Option<MemoryDreamTranscriptRequest<'a>>,
@@ -515,6 +520,9 @@ async fn run_memory_dream_job_inner(
             request.settings.max_facts_per_run,
         )
         .map_err(ApiError::from_memory_error)?;
+    let reference_validation =
+        refresh_memory_dream_reference_validation(database, request, &candidates)
+            .map_err(ApiError::from_memory_error)?;
     let mut changes = deterministic_changes(database, request.scope, &candidates, policy)
         .map_err(ApiError::from_memory_error)?;
     tracing::info!(
@@ -535,6 +543,7 @@ async fn run_memory_dream_job_inner(
                 .map(|fact| fact.id.as_str())
                 .collect::<Vec<_>>(),
             "deterministicChangesProposed": changes.len(),
+            "referenceValidation": reference_validation.to_json(),
             "deterministicOperations": changes
                 .iter()
                 .map(DreamChange::operation)
@@ -552,6 +561,9 @@ async fn run_memory_dream_job_inner(
             "accepted": true,
             "candidateCount": candidates.len(),
             "changeCount": changes.len(),
+            "referenceCount": reference_validation.total,
+            "invalidReferenceCount": reference_validation.invalid,
+            "ambiguousReferenceCount": reference_validation.ambiguous,
             "maxFactsPerRun": request.settings.max_facts_per_run,
             "maxChangesPerRun": request.settings.max_changes_per_run,
         }),
@@ -609,6 +621,7 @@ async fn run_memory_dream_job_inner(
                     request,
                     &candidates,
                     &candidate_edges,
+                    &reference_validation.references,
                     &source_summaries,
                     &profiles,
                     &changes,
@@ -714,6 +727,11 @@ async fn run_memory_dream_job_inner(
 
     Ok(DreamRunSummary {
         candidates_considered: candidates.len(),
+        references_extracted: reference_validation.total,
+        references_valid: reference_validation.valid,
+        references_invalid: reference_validation.invalid,
+        references_ambiguous: reference_validation.ambiguous,
+        references_skipped: reference_validation.skipped,
         deterministic_changes_proposed: changes.len(),
         llm_changes_proposed,
         changes_applied: apply_summary.applied,
@@ -833,6 +851,7 @@ async fn run_memory_dream_llm_planner(
     request: MemoryDreamJobRequest<'_>,
     candidates: &[MemoryFactRecord],
     candidate_edges: &[MemoryEdgeRecord],
+    candidate_references: &[MemoryReferenceRecord],
     source_summaries: &[Value],
     profiles: &[MemoryProfileRecord],
     deterministic_changes: &[DreamChange],
@@ -843,6 +862,7 @@ async fn run_memory_dream_llm_planner(
         request,
         candidates,
         candidate_edges,
+        candidate_references,
         source_summaries,
         profiles,
         deterministic_changes,
@@ -854,6 +874,7 @@ async fn run_memory_dream_llm_planner(
             "providerId": &selection.provider_id,
             "candidateFacts": candidates.len(),
             "relevantEdges": candidate_edges.len(),
+            "referenceValidation": candidate_references.len(),
             "sourceSummaries": source_summaries.len(),
             "memoryProfiles": profiles.len(),
             "deterministicChanges": deterministic_changes.len(),
@@ -909,10 +930,402 @@ fn memory_dream_source_summaries(
     Ok(summaries)
 }
 
+fn refresh_memory_dream_reference_validation(
+    database: &mut MemoryDatabase,
+    request: MemoryDreamJobRequest<'_>,
+    candidates: &[MemoryFactRecord],
+) -> Result<DreamReferenceValidationSummary, MemoryDatabaseError> {
+    if candidates.is_empty() {
+        return Ok(DreamReferenceValidationSummary::default());
+    }
+
+    let workspace = memory_dream_reference_workspace(request);
+    let (workspace_database, workspace_database_error) = match workspace {
+        Some(workspace) => match WorkspaceDatabase::open_or_create(&workspace.path) {
+            Ok(database) => (Some(database), None),
+            Err(error) => (None, Some(error.to_string())),
+        },
+        None => (None, None),
+    };
+    let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+
+    for fact in candidates {
+        let owned_references = validated_memory_references_for_fact(
+            fact,
+            request.config,
+            workspace,
+            workspace_database.as_ref(),
+            workspace_database_error.as_deref(),
+            &checked_at,
+        )?;
+        let references = owned_references
+            .iter()
+            .map(|reference| NewMemoryReference {
+                id: &reference.id,
+                fact_id: &reference.fact_id,
+                reference_type: reference.reference_type,
+                value: &reference.value,
+                normalized_value: &reference.normalized_value,
+                status: reference.status,
+                metadata_json: &reference.metadata_json,
+                checked_at: reference.checked_at.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        database.replace_fact_references(&fact.id, &references)?;
+    }
+
+    let fact_ids = candidates
+        .iter()
+        .map(|fact| fact.id.clone())
+        .collect::<Vec<_>>();
+    let references =
+        database.references_for_fact_ids(&fact_ids, MEMORY_DREAM_PLANNER_MAX_REFERENCE_RECORDS)?;
+    Ok(DreamReferenceValidationSummary::from_references(references))
+}
+
+fn memory_dream_reference_workspace<'a>(
+    request: MemoryDreamJobRequest<'a>,
+) -> Option<&'a WorkspaceConfig> {
+    if request.scope != MemoryDreamScope::Workspace {
+        return None;
+    }
+    let workspace_id = request.workspace_id?;
+    request
+        .config?
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+}
+
+fn validated_memory_references_for_fact(
+    fact: &MemoryFactRecord,
+    config: Option<&GlobalConfig>,
+    workspace: Option<&WorkspaceConfig>,
+    workspace_database: Option<&WorkspaceDatabase>,
+    workspace_database_error: Option<&str>,
+    checked_at: &str,
+) -> Result<Vec<OwnedMemoryReference>, MemoryDatabaseError> {
+    extract_memory_references(&fact.fact)
+        .into_iter()
+        .take(MEMORY_DREAM_MAX_REFERENCES_PER_FACT)
+        .enumerate()
+        .map(|(index, reference)| {
+            let validation = validate_extracted_memory_reference(
+                &reference,
+                config,
+                workspace,
+                workspace_database,
+                workspace_database_error,
+            )?;
+            Ok(OwnedMemoryReference {
+                id: format!("memory-reference:{}:{index}", fact.id),
+                fact_id: fact.id.clone(),
+                reference_type: reference.reference_type,
+                value: reference.value,
+                normalized_value: reference.normalized_value,
+                status: validation.status,
+                metadata_json: serde_json::to_string(&validation.metadata).map_err(|source| {
+                    MemoryDatabaseError::InvalidMemoryJson {
+                        field: "metadata_json",
+                        source,
+                    }
+                })?,
+                checked_at: Some(checked_at.to_string()),
+            })
+        })
+        .collect()
+}
+
+fn extract_memory_references(value: &str) -> Vec<ExtractedMemoryReference> {
+    let mut references = Vec::new();
+    let mut seen = HashSet::new();
+
+    for quoted in backtick_fragments(value) {
+        push_extracted_reference(&mut references, &mut seen, &quoted, true);
+    }
+    for token in reference_tokens(value) {
+        push_extracted_reference(&mut references, &mut seen, &token, false);
+    }
+
+    references
+}
+
+fn push_extracted_reference(
+    references: &mut Vec<ExtractedMemoryReference>,
+    seen: &mut HashSet<(MemoryReferenceType, String)>,
+    value: &str,
+    quoted: bool,
+) {
+    let Some(reference_type) = classify_memory_reference(value, quoted) else {
+        return;
+    };
+    let Some(normalized_value) = normalized_reference_value(reference_type, value) else {
+        return;
+    };
+    if seen.insert((reference_type, normalized_value.clone())) {
+        references.push(ExtractedMemoryReference {
+            reference_type,
+            value: reference_value_for_storage(reference_type, value, &normalized_value),
+            normalized_value,
+        });
+    }
+}
+
+fn classify_memory_reference(value: &str, quoted: bool) -> Option<MemoryReferenceType> {
+    let trimmed = trimmed_reference_value(value);
+    if trimmed.is_empty() {
+        return None;
+    }
+    if looks_like_url(trimmed) {
+        return Some(MemoryReferenceType::Url);
+    }
+    if looks_like_workspace_id_reference(trimmed) {
+        return Some(MemoryReferenceType::WorkspaceId);
+    }
+    if looks_like_command_reference(trimmed) {
+        return Some(MemoryReferenceType::Command);
+    }
+    if looks_like_file_reference(trimmed) {
+        return Some(MemoryReferenceType::FilePath);
+    }
+    if quoted && looks_like_symbol_reference(trimmed) {
+        return Some(MemoryReferenceType::Symbol);
+    }
+
+    None
+}
+
+fn validate_extracted_memory_reference(
+    reference: &ExtractedMemoryReference,
+    config: Option<&GlobalConfig>,
+    workspace: Option<&WorkspaceConfig>,
+    workspace_database: Option<&WorkspaceDatabase>,
+    workspace_database_error: Option<&str>,
+) -> Result<ReferenceValidation, MemoryDatabaseError> {
+    match reference.reference_type {
+        MemoryReferenceType::FilePath => Ok(validate_file_reference(reference, workspace)),
+        MemoryReferenceType::Symbol => Ok(validate_symbol_reference(
+            reference,
+            workspace_database,
+            workspace_database_error,
+        )),
+        MemoryReferenceType::Command => {
+            validate_command_reference(reference, workspace).map_err(|source| {
+                MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!("failed to validate command reference: {source}"),
+                }
+            })
+        }
+        MemoryReferenceType::Url => Ok(validate_url_reference(reference)),
+        MemoryReferenceType::WorkspaceId => Ok(validate_workspace_id_reference(reference, config)),
+    }
+}
+
+fn validate_file_reference(
+    reference: &ExtractedMemoryReference,
+    workspace: Option<&WorkspaceConfig>,
+) -> ReferenceValidation {
+    let Some(workspace) = workspace else {
+        return ReferenceValidation::skipped(json!({
+            "reason": "noWorkspaceContext",
+        }));
+    };
+    let candidate = workspace.path.join(&reference.normalized_value);
+    match fs::metadata(&candidate) {
+        Ok(_) => match path_stays_inside_workspace(&workspace.path, &candidate) {
+            true => ReferenceValidation::valid(json!({
+                "path": reference.normalized_value,
+            })),
+            false => ReferenceValidation::invalid(json!({
+                "reason": "outsideWorkspace",
+                "path": reference.normalized_value,
+            })),
+        },
+        Err(_) => {
+            let matches = moved_file_candidates(&workspace.path, &reference.normalized_value, 3);
+            match matches.len() {
+                0 => ReferenceValidation::invalid(json!({
+                    "reason": "notFound",
+                    "path": reference.normalized_value,
+                })),
+                1 => ReferenceValidation::invalid(json!({
+                    "reason": "moved",
+                    "path": reference.normalized_value,
+                    "candidatePath": matches[0],
+                })),
+                _ => ReferenceValidation::ambiguous(json!({
+                    "reason": "multipleMovedCandidates",
+                    "path": reference.normalized_value,
+                    "candidatePaths": matches,
+                })),
+            }
+        }
+    }
+}
+
+fn validate_symbol_reference(
+    reference: &ExtractedMemoryReference,
+    workspace_database: Option<&WorkspaceDatabase>,
+    workspace_database_error: Option<&str>,
+) -> ReferenceValidation {
+    let Some(database) = workspace_database else {
+        return ReferenceValidation::skipped(json!({
+            "reason": "codeGraphUnavailable",
+            "error": workspace_database_error,
+        }));
+    };
+    match database.find_code_graph_symbols(&reference.normalized_value, None, None, 3) {
+        Ok(matches) if matches.len() == 1 => ReferenceValidation::valid(json!({
+            "symbolId": matches[0].id,
+            "path": matches[0].path,
+            "name": matches[0].name,
+            "kind": matches[0].kind,
+        })),
+        Ok(matches) if matches.is_empty() => ReferenceValidation::invalid(json!({
+            "reason": "symbolNotFound",
+            "query": reference.normalized_value,
+        })),
+        Ok(matches) => ReferenceValidation::ambiguous(json!({
+            "reason": "multipleSymbols",
+            "matches": matches.into_iter().map(|symbol| json!({
+                "symbolId": symbol.id,
+                "path": symbol.path,
+                "name": symbol.name,
+                "kind": symbol.kind,
+            })).collect::<Vec<_>>(),
+        })),
+        Err(error) => ReferenceValidation::skipped(json!({
+            "reason": "codeGraphLookupFailed",
+            "error": error.to_string(),
+        })),
+    }
+}
+
+fn validate_command_reference(
+    reference: &ExtractedMemoryReference,
+    workspace: Option<&WorkspaceConfig>,
+) -> Result<ReferenceValidation, std::io::Error> {
+    let Some(workspace) = workspace else {
+        return Ok(ReferenceValidation::skipped(json!({
+            "reason": "noWorkspaceContext",
+        })));
+    };
+    let command = reference.normalized_value.as_str();
+    if let Some(common_command) = workspace.common_commands.iter().find(|common| {
+        command == normalized_command(&common.name)
+            || command == normalized_command(&common.command)
+            || command.starts_with(&(normalized_command(&common.command) + " "))
+    }) {
+        return Ok(ReferenceValidation::valid(json!({
+            "source": "workspaceCommonCommand",
+            "name": common_command.name,
+        })));
+    }
+
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    if words.first() == Some(&"cargo") && workspace.path.join("Cargo.toml").is_file() {
+        return Ok(ReferenceValidation::valid(json!({
+            "source": "Cargo.toml",
+        })));
+    }
+    if let Some(script) = package_script_from_command(&words) {
+        return Ok(match package_json_has_script(&workspace.path, script)? {
+            true => ReferenceValidation::valid(json!({
+                "source": "package.json",
+                "script": script,
+            })),
+            false => ReferenceValidation::invalid(json!({
+                "reason": "packageScriptNotFound",
+                "script": script,
+            })),
+        });
+    }
+    if matches!(words.first().copied(), Some("npm" | "pnpm" | "yarn"))
+        && workspace.path.join("package.json").is_file()
+    {
+        return Ok(ReferenceValidation::valid(json!({
+            "source": "package.json",
+        })));
+    }
+
+    Ok(ReferenceValidation::invalid(json!({
+        "reason": "notInManifestOrCommonCommands",
+    })))
+}
+
+fn validate_url_reference(reference: &ExtractedMemoryReference) -> ReferenceValidation {
+    let host = url_host(&reference.normalized_value);
+    match host {
+        Some(host) => ReferenceValidation::valid(json!({
+            "host": host,
+            "networkValidation": "skipped",
+        })),
+        None => ReferenceValidation::invalid(json!({
+            "reason": "invalidUrl",
+        })),
+    }
+}
+
+fn validate_workspace_id_reference(
+    reference: &ExtractedMemoryReference,
+    config: Option<&GlobalConfig>,
+) -> ReferenceValidation {
+    let workspace_id = workspace_id_reference_value(&reference.normalized_value);
+    let Some(config) = config else {
+        return ReferenceValidation::skipped(json!({
+            "reason": "noConfigContext",
+            "workspaceId": workspace_id,
+        }));
+    };
+    if config
+        .workspaces
+        .iter()
+        .any(|workspace| workspace.id == workspace_id)
+    {
+        ReferenceValidation::valid(json!({
+            "workspaceId": workspace_id,
+        }))
+    } else {
+        ReferenceValidation::invalid(json!({
+            "reason": "workspaceNotFound",
+            "workspaceId": workspace_id,
+        }))
+    }
+}
+
+fn memory_references_for_fact_json(
+    references: &[MemoryReferenceRecord],
+    fact_id: &str,
+) -> Vec<Value> {
+    references
+        .iter()
+        .filter(|reference| reference.fact_id == fact_id)
+        .map(memory_reference_json)
+        .collect()
+}
+
+fn memory_references_json(references: &[MemoryReferenceRecord]) -> Vec<Value> {
+    references.iter().map(memory_reference_json).collect()
+}
+
+fn memory_reference_json(reference: &MemoryReferenceRecord) -> Value {
+    json!({
+        "id": &reference.id,
+        "factId": &reference.fact_id,
+        "type": &reference.reference_type,
+        "value": &reference.value,
+        "normalizedValue": &reference.normalized_value,
+        "status": &reference.status,
+        "metadata": compact_json_text(&reference.metadata_json),
+        "checkedAt": &reference.checked_at,
+    })
+}
+
 fn memory_dream_planner_input(
     request: MemoryDreamJobRequest<'_>,
     candidates: &[MemoryFactRecord],
     candidate_edges: &[MemoryEdgeRecord],
+    candidate_references: &[MemoryReferenceRecord],
     source_summaries: &[Value],
     profiles: &[MemoryProfileRecord],
     deterministic_changes: &[DreamChange],
@@ -931,6 +1344,7 @@ fn memory_dream_planner_input(
                 "pinned": fact.pinned,
                 "isLatest": fact.is_latest,
                 "expiresAt": &fact.expires_at,
+                "references": memory_references_for_fact_json(candidate_references, &fact.id),
                 "createdAt": &fact.created_at,
                 "updatedAt": &fact.updated_at,
             })
@@ -984,6 +1398,14 @@ fn memory_dream_planner_input(
         "memoryProfiles": profiles_json,
         "candidateFacts": candidates_json,
         "relevantEdges": edges_json,
+        "referenceValidation": {
+            "records": memory_references_json(candidate_references),
+            "validCount": candidate_references.iter().filter(|reference| reference.status == MemoryReferenceStatus::Valid.as_str()).count(),
+            "invalidCount": candidate_references.iter().filter(|reference| reference.status == MemoryReferenceStatus::Invalid.as_str()).count(),
+            "ambiguousCount": candidate_references.iter().filter(|reference| reference.status == MemoryReferenceStatus::Ambiguous.as_str()).count(),
+            "skippedCount": candidate_references.iter().filter(|reference| reference.status == MemoryReferenceStatus::Skipped.as_str()).count(),
+            "rule": "Do not expire or reject a memory solely because one path reference is invalid."
+        },
         "sourceSummaries": source_summaries,
         "deterministicValidation": {
             "changesProposed": deterministic_json,
@@ -2389,6 +2811,421 @@ fn text_mentions_project_specific_path(value: &str) -> bool {
     false
 }
 
+fn backtick_fragments(value: &str) -> Vec<String> {
+    let mut fragments = Vec::new();
+    let mut start = None;
+    for (index, character) in value.char_indices() {
+        if character != '`' {
+            continue;
+        }
+        if let Some(fragment_start) = start.take() {
+            if fragment_start < index {
+                fragments.push(value[fragment_start..index].to_string());
+            }
+        } else {
+            start = Some(index + character.len_utf8());
+        }
+    }
+    fragments
+}
+
+fn reference_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                )
+        })
+        .map(trimmed_reference_value)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn trimmed_reference_value(value: &str) -> &str {
+    value.trim().trim_matches(|character: char| {
+        matches!(
+            character,
+            '"' | '\'' | '`' | '.' | ':' | '!' | '?' | '<' | '>' | ',' | ';'
+        )
+    })
+}
+
+fn looks_like_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn looks_like_workspace_id_reference(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("workspace:")
+        || lower.starts_with("workspace_id=")
+        || lower.starts_with("workspaceid=")
+}
+
+fn looks_like_command_reference(value: &str) -> bool {
+    let lower = normalized_command(value);
+    matches!(
+        lower.split_whitespace().next(),
+        Some(
+            "cargo"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "git"
+                | "node"
+                | "python"
+                | "python3"
+                | "powershell"
+                | "cmd"
+                | "bash"
+                | "rg"
+        )
+    )
+}
+
+fn looks_like_file_reference(value: &str) -> bool {
+    if looks_like_url(value) {
+        return false;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.contains('/') || lower.contains('\\') || lower.starts_with("./") {
+        return true;
+    }
+    matches!(
+        lower.as_str(),
+        "cargo.toml"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "yarn.lock"
+            | "tsconfig.json"
+            | "vite.config.ts"
+            | "auto-dream.md"
+            | "agents.md"
+    ) || known_file_extension(&lower)
+}
+
+fn known_file_extension(value: &str) -> bool {
+    let path = value.split(['#', '?']).next().unwrap_or(value);
+    let path = strip_line_suffix(path);
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some(
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "py"
+                | "go"
+                | "java"
+                | "cs"
+                | "cpp"
+                | "c"
+                | "h"
+                | "md"
+                | "json"
+                | "toml"
+                | "yaml"
+                | "yml"
+                | "css"
+                | "html"
+                | "vue"
+                | "lock"
+        )
+    )
+}
+
+fn looks_like_symbol_reference(value: &str) -> bool {
+    let value = value.trim_end_matches("()");
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '_' | ':' | '.' | '#' | '<' | '>' | '-')
+        })
+        && value
+            .chars()
+            .any(|character| character.is_ascii_alphabetic())
+}
+
+fn normalized_reference_value(reference_type: MemoryReferenceType, value: &str) -> Option<String> {
+    let trimmed = trimmed_reference_value(value);
+    match reference_type {
+        MemoryReferenceType::FilePath => {
+            let path = strip_line_suffix(trimmed.split('#').next().unwrap_or(trimmed))
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_string();
+            (!path.is_empty()).then_some(path)
+        }
+        MemoryReferenceType::Symbol => {
+            let symbol = trimmed.trim_end_matches("()").to_string();
+            (!symbol.is_empty()).then_some(symbol)
+        }
+        MemoryReferenceType::Command => Some(normalized_command(trimmed)),
+        MemoryReferenceType::Url => normalized_url_reference(trimmed),
+        MemoryReferenceType::WorkspaceId => Some(workspace_id_reference_value(trimmed).to_string()),
+    }
+}
+
+fn reference_value_for_storage(
+    reference_type: MemoryReferenceType,
+    value: &str,
+    normalized_value: &str,
+) -> String {
+    if reference_type == MemoryReferenceType::Url {
+        normalized_value.to_string()
+    } else {
+        trimmed_reference_value(value).to_string()
+    }
+}
+
+fn strip_line_suffix(value: &str) -> &str {
+    if let Some((head, tail)) = value.rsplit_once(':')
+        && !head.is_empty()
+        && tail.chars().all(|character| character.is_ascii_digit())
+    {
+        return head;
+    }
+    value
+}
+
+fn normalized_command(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn normalized_url_reference(value: &str) -> Option<String> {
+    let lower = value.to_ascii_lowercase();
+    let scheme = if lower.starts_with("https://") {
+        "https"
+    } else if lower.starts_with("http://") {
+        "http"
+    } else {
+        return None;
+    };
+    let after_scheme = value.split_once("://")?.1;
+    let without_fragment = after_scheme
+        .split(['#', '?'])
+        .next()
+        .unwrap_or(after_scheme);
+    let host_and_path = without_fragment
+        .split_once('/')
+        .unwrap_or((without_fragment, ""));
+    let host = host_and_path
+        .0
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(host_and_path.0)
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let path = host_and_path.1.trim_end_matches('/');
+    if path.is_empty() {
+        Some(format!("{scheme}://{host}"))
+    } else {
+        Some(format!("{scheme}://{host}/{path}"))
+    }
+}
+
+fn url_host(value: &str) -> Option<&str> {
+    value
+        .split_once("://")?
+        .1
+        .split('/')
+        .next()
+        .filter(|host| !host.is_empty())
+}
+
+fn workspace_id_reference_value(value: &str) -> &str {
+    value
+        .split_once(':')
+        .map(|(_, workspace_id)| workspace_id)
+        .or_else(|| value.split_once('=').map(|(_, workspace_id)| workspace_id))
+        .unwrap_or(value)
+        .trim()
+}
+
+fn path_stays_inside_workspace(workspace_path: &Path, candidate: &Path) -> bool {
+    let Ok(workspace_path) = workspace_path.canonicalize() else {
+        return false;
+    };
+    let Ok(candidate) = candidate.canonicalize() else {
+        return false;
+    };
+    candidate.starts_with(workspace_path)
+}
+
+fn moved_file_candidates(
+    workspace_path: &Path,
+    normalized_path: &str,
+    limit: usize,
+) -> Vec<String> {
+    let Some(file_name) = Path::new(normalized_path)
+        .file_name()
+        .and_then(|file_name| file_name.to_str())
+    else {
+        return Vec::new();
+    };
+    let mut matches = Vec::new();
+    let mut remaining_dirs = 256usize;
+    collect_moved_file_candidates(
+        workspace_path,
+        workspace_path,
+        file_name,
+        limit,
+        &mut remaining_dirs,
+        &mut matches,
+    );
+    matches
+}
+
+fn collect_moved_file_candidates(
+    workspace_path: &Path,
+    directory: &Path,
+    file_name: &str,
+    limit: usize,
+    remaining_dirs: &mut usize,
+    matches: &mut Vec<String>,
+) {
+    if matches.len() >= limit || *remaining_dirs == 0 {
+        return;
+    }
+    *remaining_dirs -= 1;
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if matches.len() >= limit {
+            break;
+        }
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if is_ignored_reference_search_dir(&path) {
+                continue;
+            }
+            collect_moved_file_candidates(
+                workspace_path,
+                &path,
+                file_name,
+                limit,
+                remaining_dirs,
+                matches,
+            );
+        } else if file_type.is_file()
+            && path.file_name().and_then(|name| name.to_str()) == Some(file_name)
+            && let Ok(relative) = path.strip_prefix(workspace_path)
+        {
+            matches.push(relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
+fn is_ignored_reference_search_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".git" | ".foco" | ".codegraph" | ".mem" | "node_modules" | "target" | "dist")
+    )
+}
+
+fn package_script_from_command<'a>(words: &'a [&'a str]) -> Option<&'a str> {
+    match words {
+        ["npm" | "pnpm", "run", script, ..] => Some(*script),
+        ["yarn", "run", script, ..] => Some(*script),
+        ["yarn", script, ..]
+            if !matches!(
+                *script,
+                "add" | "install" | "remove" | "upgrade" | "dlx" | "exec"
+            ) =>
+        {
+            Some(*script)
+        }
+        _ => None,
+    }
+}
+
+fn package_json_has_script(workspace_path: &Path, script: &str) -> Result<bool, std::io::Error> {
+    let package_json = workspace_path.join("package.json");
+    let content = match fs::read_to_string(package_json) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return Ok(false);
+    };
+    Ok(value
+        .get("scripts")
+        .and_then(Value::as_object)
+        .is_some_and(|scripts| scripts.get(script).and_then(Value::as_str).is_some()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExtractedMemoryReference {
+    reference_type: MemoryReferenceType,
+    value: String,
+    normalized_value: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OwnedMemoryReference {
+    id: String,
+    fact_id: String,
+    reference_type: MemoryReferenceType,
+    value: String,
+    normalized_value: String,
+    status: MemoryReferenceStatus,
+    metadata_json: String,
+    checked_at: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ReferenceValidation {
+    status: MemoryReferenceStatus,
+    metadata: Value,
+}
+
+impl ReferenceValidation {
+    fn valid(metadata: Value) -> Self {
+        Self {
+            status: MemoryReferenceStatus::Valid,
+            metadata,
+        }
+    }
+
+    fn invalid(metadata: Value) -> Self {
+        Self {
+            status: MemoryReferenceStatus::Invalid,
+            metadata,
+        }
+    }
+
+    fn ambiguous(metadata: Value) -> Self {
+        Self {
+            status: MemoryReferenceStatus::Ambiguous,
+            metadata,
+        }
+    }
+
+    fn skipped(metadata: Value) -> Self {
+        Self {
+            status: MemoryReferenceStatus::Skipped,
+            metadata,
+        }
+    }
+}
+
 fn promoted_fact_metadata_json(
     metadata_json: &str,
     job_id: &str,
@@ -2579,8 +3416,64 @@ struct AppliedChange {
     chat_id: Option<String>,
 }
 
+#[derive(Default)]
+struct DreamReferenceValidationSummary {
+    references: Vec<MemoryReferenceRecord>,
+    total: usize,
+    valid: usize,
+    invalid: usize,
+    ambiguous: usize,
+    skipped: usize,
+}
+
+impl DreamReferenceValidationSummary {
+    fn from_references(references: Vec<MemoryReferenceRecord>) -> Self {
+        let valid = references
+            .iter()
+            .filter(|reference| reference.status == MemoryReferenceStatus::Valid.as_str())
+            .count();
+        let invalid = references
+            .iter()
+            .filter(|reference| reference.status == MemoryReferenceStatus::Invalid.as_str())
+            .count();
+        let ambiguous = references
+            .iter()
+            .filter(|reference| reference.status == MemoryReferenceStatus::Ambiguous.as_str())
+            .count();
+        let skipped = references
+            .iter()
+            .filter(|reference| reference.status == MemoryReferenceStatus::Skipped.as_str())
+            .count();
+        Self {
+            total: references.len(),
+            references,
+            valid,
+            invalid,
+            ambiguous,
+            skipped,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "total": self.total,
+            "valid": self.valid,
+            "invalid": self.invalid,
+            "ambiguous": self.ambiguous,
+            "skipped": self.skipped,
+            "sample": self.references.iter().take(20).map(memory_reference_json).collect::<Vec<_>>(),
+            "rule": "Never expire a fact solely because one path reference is invalid.",
+        })
+    }
+}
+
 struct DreamRunSummary {
     candidates_considered: usize,
+    references_extracted: usize,
+    references_valid: usize,
+    references_invalid: usize,
+    references_ambiguous: usize,
+    references_skipped: usize,
     deterministic_changes_proposed: usize,
     llm_changes_proposed: usize,
     changes_applied: usize,
@@ -2597,6 +3490,11 @@ impl DreamRunSummary {
     fn failed(error: &ApiError) -> Self {
         Self {
             candidates_considered: 0,
+            references_extracted: 0,
+            references_valid: 0,
+            references_invalid: 0,
+            references_ambiguous: 0,
+            references_skipped: 0,
             deterministic_changes_proposed: 0,
             llm_changes_proposed: 0,
             changes_applied: 0,
@@ -2622,6 +3520,11 @@ impl DreamRunSummary {
         json!({
             "summary": summary,
             "candidatesConsidered": self.candidates_considered,
+            "referencesExtracted": self.references_extracted,
+            "referencesValid": self.references_valid,
+            "referencesInvalid": self.references_invalid,
+            "referencesAmbiguous": self.references_ambiguous,
+            "referencesSkipped": self.references_skipped,
             "deterministicChangesProposed": self.deterministic_changes_proposed,
             "llmChangesProposed": self.llm_changes_proposed,
             "changesApplied": self.changes_applied,
@@ -2683,8 +3586,11 @@ fn now_minus_days(days: i64) -> String {
 #[cfg(test)]
 mod tests {
     use foco_store::{
+        config::WorkspaceCommonCommand,
         memory::{MemorySourceType, NewMemoryFact, NewMemorySource},
-        workspace::{WorkspaceDatabase, workspace_database_path},
+        workspace::{
+            NewCodeGraphFileIndex, NewCodeGraphSymbol, WorkspaceDatabase, workspace_database_path,
+        },
     };
 
     use super::*;
@@ -3274,6 +4180,7 @@ mod tests {
             mode: MemoryDreamRunMode::DeterministicOnly,
             model_id: None,
             settings: test_settings(true),
+            config: None,
             global_memory_database_file: None,
             planner: None,
             transcript: Some(MemoryDreamTranscriptRequest {
@@ -3317,6 +4224,178 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn memory_dream_extracts_and_validates_references() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(workspace_dir.join("app")).expect("app dir");
+        std::fs::create_dir_all(workspace_dir.join("web")).expect("web dir");
+        std::fs::create_dir_all(workspace_dir.join("a")).expect("a dir");
+        std::fs::create_dir_all(workspace_dir.join("b")).expect("b dir");
+        std::fs::write(workspace_dir.join("app/main.rs"), "fn public_api() {}\n")
+            .expect("main file");
+        std::fs::write(
+            workspace_dir.join("web/App.tsx"),
+            "export function App() {}\n",
+        )
+        .expect("moved file");
+        std::fs::write(workspace_dir.join("a/ambiguous.rs"), "").expect("ambiguous a");
+        std::fs::write(workspace_dir.join("b/ambiguous.rs"), "").expect("ambiguous b");
+        std::fs::write(
+            workspace_dir.join("package.json"),
+            r#"{"scripts":{"test":"vitest"}}"#,
+        )
+        .expect("package json");
+
+        let mut workspace_database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let main_symbols = [
+            NewCodeGraphSymbol {
+                name: "public_api",
+                kind: "function",
+                start_line: Some(1),
+                start_column: Some(1),
+                end_line: Some(1),
+                end_column: Some(16),
+                signature: Some("fn public_api()"),
+                documentation: None,
+            },
+            NewCodeGraphSymbol {
+                name: "duplicate_symbol",
+                kind: "function",
+                start_line: Some(3),
+                start_column: Some(1),
+                end_line: Some(3),
+                end_column: Some(20),
+                signature: Some("fn duplicate_symbol()"),
+                documentation: None,
+            },
+        ];
+        workspace_database
+            .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                path: "app/main.rs",
+                language: Some("rust"),
+                size_bytes: Some(64),
+                modified_at: Some("2026-06-23T00:00:00Z"),
+                content_hash: "main-hash",
+                parse_status: "parsed",
+                parse_error_message: None,
+                symbols: &main_symbols,
+                imports: &[],
+                references: &[],
+                edges: &[],
+                fts_body: "fn public_api() {} fn duplicate_symbol() {}",
+            })
+            .expect("main index");
+        let other_symbols = [NewCodeGraphSymbol {
+            name: "duplicate_symbol",
+            kind: "function",
+            start_line: Some(1),
+            start_column: Some(1),
+            end_line: Some(1),
+            end_column: Some(20),
+            signature: Some("fn duplicate_symbol()"),
+            documentation: None,
+        }];
+        workspace_database
+            .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                path: "web/lib.rs",
+                language: Some("rust"),
+                size_bytes: Some(32),
+                modified_at: Some("2026-06-23T00:00:00Z"),
+                content_hash: "other-hash",
+                parse_status: "parsed",
+                parse_error_message: None,
+                symbols: &other_symbols,
+                imports: &[],
+                references: &[],
+                edges: &[],
+                fts_body: "fn duplicate_symbol() {}",
+            })
+            .expect("other index");
+        drop(workspace_database);
+
+        let mut config = GlobalConfig::first_run(workspace_dir.clone());
+        config.workspaces[0].id = "workspace-1".to_string();
+        config.workspaces[0]
+            .common_commands
+            .push(WorkspaceCommonCommand {
+                name: "test".to_string(),
+                command: "npm run test".to_string(),
+            });
+
+        let mut database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        insert_test_fact(
+            &mut database,
+            "fact-references",
+            MemoryScope::Workspace,
+            None,
+            MemoryStatus::Active,
+            MemoryKind::ProjectFact,
+            "Use `app/main.rs`, `missing.rs`, `old/App.tsx`, `old/ambiguous.rs`, \
+             `public_api`, `duplicate_symbol`, https://user:secret@example.com/path?token=secret#frag, \
+             and run `npm run test`.",
+            Some(0.9),
+        );
+
+        let result = run_memory_dream_job(
+            &mut database,
+            MemoryDreamJobRequest {
+                scope: MemoryDreamScope::Workspace,
+                workspace_id: Some("workspace-1"),
+                trigger_type: MemoryDreamTriggerType::Manual,
+                mode: MemoryDreamRunMode::DeterministicOnly,
+                model_id: None,
+                settings: test_settings(false),
+                config: Some(&config),
+                global_memory_database_file: None,
+                planner: None,
+                transcript: None,
+            },
+        )
+        .await
+        .expect("dream run");
+
+        let references = database
+            .references_for_fact_ids(&["fact-references".to_string()], 20)
+            .expect("references");
+        let reference = |reference_type: &str, normalized_value: &str| {
+            references
+                .iter()
+                .find(|reference| {
+                    reference.reference_type == reference_type
+                        && reference.normalized_value == normalized_value
+                })
+                .unwrap_or_else(|| panic!("missing reference {reference_type}:{normalized_value}"))
+        };
+
+        assert_eq!(reference("file_path", "app/main.rs").status, "valid");
+        assert_eq!(reference("file_path", "missing.rs").status, "invalid");
+        let moved = reference("file_path", "old/App.tsx");
+        assert_eq!(moved.status, "invalid");
+        assert!(moved.metadata_json.contains(r#""reason":"moved""#));
+        assert_eq!(
+            reference("file_path", "old/ambiguous.rs").status,
+            "ambiguous"
+        );
+        assert_eq!(reference("symbol", "public_api").status, "valid");
+        assert_eq!(reference("symbol", "duplicate_symbol").status, "ambiguous");
+        assert_eq!(reference("command", "npm run test").status, "valid");
+        let url = reference("url", "https://example.com/path");
+        assert_eq!(url.status, "valid");
+        assert!(!url.value.contains("secret"));
+        assert!(!url.value.contains("token"));
+
+        let summary: Value =
+            serde_json::from_str(result.job.output_summary_json.as_deref().unwrap())
+                .expect("summary json");
+        assert!(summary["referencesExtracted"].as_u64().unwrap() >= 8);
+        assert!(summary["referencesInvalid"].as_u64().unwrap() >= 2);
+        assert!(summary["referencesAmbiguous"].as_u64().unwrap() >= 2);
+    }
+
     fn test_request(scope: MemoryDreamScope) -> MemoryDreamJobRequest<'static> {
         MemoryDreamJobRequest {
             scope,
@@ -3325,6 +4404,7 @@ mod tests {
             mode: MemoryDreamRunMode::DeterministicOnly,
             model_id: None,
             settings: test_settings(false),
+            config: None,
             global_memory_database_file: None,
             planner: None,
             transcript: None,

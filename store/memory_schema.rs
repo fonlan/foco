@@ -189,6 +189,26 @@ CREATE INDEX memory_dream_changes_target_fact_ids_idx
 CREATE INDEX memory_dream_changes_new_fact_idx ON memory_dream_changes (new_fact_id);
 "#;
 
+pub const MEMORY_REFERENCES_SCHEMA_SQL: &str = r#"
+CREATE TABLE memory_references (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    fact_id TEXT NOT NULL REFERENCES memory_facts(id) ON DELETE CASCADE,
+    reference_type TEXT NOT NULL CHECK (reference_type IN ('file_path', 'symbol', 'command', 'url', 'workspace_id')),
+    value TEXT NOT NULL CHECK (length(value) > 0),
+    normalized_value TEXT NOT NULL CHECK (length(normalized_value) > 0),
+    status TEXT NOT NULL CHECK (status IN ('valid', 'invalid', 'ambiguous', 'skipped')),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    checked_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (fact_id, reference_type, normalized_value)
+);
+
+CREATE INDEX memory_references_fact_idx ON memory_references (fact_id);
+CREATE INDEX memory_references_type_status_idx ON memory_references (reference_type, status);
+CREATE INDEX memory_references_normalized_idx ON memory_references (normalized_value);
+"#;
+
 pub const GLOBAL_MEMORY_SCHEMA_SQL: &str = r#"
 CREATE TABLE memory_sources (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
