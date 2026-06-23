@@ -26,6 +26,7 @@ type AppRoutingOptions = {
   setIsMobileWorkspaceOpen: (isOpen: boolean) => void;
   setMessages: (messages: []) => void;
   setSettingsSection: (section: SettingsSection) => void;
+  setStatsRoutePage: (page: number) => void;
   setViewMode: (viewMode: BrowserRoute["viewMode"]) => void;
   updateBrowserRoute: (
     route: BrowserRoute,
@@ -46,6 +47,7 @@ export function useAppRouting({
   setIsMobileWorkspaceOpen,
   setMessages,
   setSettingsSection,
+  setStatsRoutePage,
   setViewMode,
   updateBrowserRoute,
   workspaces,
@@ -74,10 +76,16 @@ export function useAppRouting({
   );
 
   const openStatsView = useCallback(() => {
+    setStatsRoutePage(1);
     setViewMode("stats");
     setIsMobileWorkspaceOpen(false);
-    updateBrowserRoute({ viewMode: "stats" });
-  }, [setIsMobileWorkspaceOpen, setViewMode, updateBrowserRoute]);
+    updateBrowserRoute({ page: 1, viewMode: "stats" });
+  }, [
+    setIsMobileWorkspaceOpen,
+    setStatsRoutePage,
+    setViewMode,
+    updateBrowserRoute,
+  ]);
 
   const openScheduledTasksView = useCallback(() => {
     setViewMode("scheduled");
@@ -100,6 +108,7 @@ export function useAppRouting({
       }
 
       if (route.viewMode === "stats") {
+        setStatsRoutePage(route.page);
         setViewMode("stats");
         setIsMobileWorkspaceOpen(false);
         return;
@@ -146,6 +155,7 @@ export function useAppRouting({
       setIsMobileWorkspaceOpen,
       setMessages,
       setSettingsSection,
+      setStatsRoutePage,
       setViewMode,
       workspaces,
     ],

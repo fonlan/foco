@@ -28,7 +28,7 @@ export type BrowserRoute =
       tabs?: BrowserRouteChatTab[];
     }
   | { viewMode: "settings"; section: SettingsSection }
-  | { viewMode: "stats" }
+  | { viewMode: "stats"; page: number }
   | { viewMode: "scheduled" };
 
 export type Translate = (

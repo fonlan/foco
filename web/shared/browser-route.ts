@@ -2,6 +2,7 @@ import type { BrowserRoute, BrowserRouteChatTab, SettingsSection } from "../api/
 import { SETTINGS_SECTION_IDS } from "../app/constants";
 
 const CHAT_TAB_QUERY_PARAM = "tab";
+const STATS_PAGE_QUERY_PARAM = "page";
 
 export function currentBrowserRoute(): BrowserRoute {
   if (typeof window === "undefined") {
@@ -26,7 +27,7 @@ export function browserRouteFromPathname(
   }
 
   if (segments[0] === "stats") {
-    return { viewMode: "stats" };
+    return { page: positivePageFromSearch(search), viewMode: "stats" };
   }
 
   if (segments[0] === "scheduled") {
@@ -62,7 +63,9 @@ export function browserPathForRoute(route: BrowserRoute) {
   }
 
   if (route.viewMode === "stats") {
-    return "/stats";
+    const params = new URLSearchParams();
+    params.set(STATS_PAGE_QUERY_PARAM, String(positivePage(route.page)));
+    return `/stats?${params.toString()}`;
   }
 
   if (route.viewMode === "scheduled") {
@@ -111,6 +114,15 @@ function chatTabsFromSearch(search: string): BrowserRouteChatTab[] {
   }
 
   return tabs;
+}
+
+function positivePageFromSearch(search: string) {
+  const rawPage = new URLSearchParams(search).get(STATS_PAGE_QUERY_PARAM);
+  return positivePage(Number(rawPage));
+}
+
+function positivePage(value: number) {
+  return Number.isSafeInteger(value) && value > 0 ? value : 1;
 }
 
 function chatTabFromParamValue(value: string): BrowserRouteChatTab | null {

@@ -10,11 +10,11 @@ import type {
 
 const AI_STATS_POLL_INTERVAL_MS = 5000;
 
-export function emptyAiStatsFilters(): AiStatsFilterState {
+export function emptyAiStatsFilters(page = 1): AiStatsFilterState {
   return {
     chatId: "",
     modelId: "",
-    page: "1",
+    page: String(positivePage(page)),
     pageSize: "20",
     providerId: "",
     startedAfter: "",
@@ -24,9 +24,9 @@ export function emptyAiStatsFilters(): AiStatsFilterState {
   };
 }
 
-export function useAiStatisticsData() {
+export function useAiStatisticsData(initialPage = 1) {
   const [filters, setFilters] = useState<AiStatsFilterState>(
-    emptyAiStatsFilters,
+    () => emptyAiStatsFilters(initialPage),
   );
   const [stats, setStats] = useState<AiStatisticsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -37,7 +37,11 @@ export function useAiStatisticsData() {
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const selectedRequestRef = useRef<AiRequestAuditSummary | null>(null);
+  const filtersRef = useRef(filters);
   const isStatsRequestInFlightRef = useRef(false);
+  const shouldReloadStatsAfterCurrentRequestRef = useRef(false);
+
+  filtersRef.current = filters;
 
   const loadRequestDetail = useCallback(
     async (request: AiRequestAuditSummary, showLoading: boolean) => {
@@ -67,8 +71,11 @@ export function useAiStatisticsData() {
   );
 
   const loadStats = useCallback(
-    async (showLoading = true) => {
+    async (showLoading = true, queueIfInFlight = false) => {
       if (isStatsRequestInFlightRef.current) {
+        if (queueIfInFlight) {
+          shouldReloadStatsAfterCurrentRequestRef.current = true;
+        }
         return;
       }
 
@@ -79,7 +86,7 @@ export function useAiStatisticsData() {
       setError(null);
 
       try {
-        const query = aiStatsQuery(filters);
+        const query = aiStatsQuery(filtersRef.current);
         const data = await requestJson<AiStatisticsResponse>(
           `/api/ai-statistics${query ? `?${query}` : ""}`,
         );
@@ -108,14 +115,18 @@ export function useAiStatisticsData() {
         if (showLoading) {
           setIsLoading(false);
         }
+        if (shouldReloadStatsAfterCurrentRequestRef.current) {
+          shouldReloadStatsAfterCurrentRequestRef.current = false;
+          void loadStats(false);
+        }
       }
     },
-    [filters, loadRequestDetail],
+    [loadRequestDetail],
   );
 
   useEffect(() => {
-    void loadStats();
-  }, [loadStats]);
+    void loadStats(true, true);
+  }, [filters, loadStats]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
@@ -147,10 +158,19 @@ export function useAiStatisticsData() {
 
   const goToAuditPage = useCallback((page: number, totalPages: number) => {
     const maxPage = Math.max(1, totalPages);
+    const nextPage = Math.min(maxPage, positivePage(page));
     setFilters((current) => ({
       ...current,
-      page: String(Math.min(maxPage, Math.max(1, page))),
+      page: String(nextPage),
     }));
+    return nextPage;
+  }, []);
+
+  const setAuditPage = useCallback((page: number) => {
+    const nextPageText = String(positivePage(page));
+    setFilters((current) =>
+      current.page === nextPageText ? current : { ...current, page: nextPageText },
+    );
   }, []);
 
   const openRequestDetail = useCallback(
@@ -196,9 +216,14 @@ export function useAiStatisticsData() {
     loadStats,
     openRequestDetail,
     selectedRequestId,
+    setAuditPage,
     stats,
     updateAuditFilters,
   };
+}
+
+function positivePage(value: number) {
+  return Number.isSafeInteger(value) && value > 0 ? value : 1;
 }
 
 function aiStatsQuery(filters: AiStatsFilterState) {

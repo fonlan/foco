@@ -55,4 +55,23 @@ describe("browser route chat tabs", () => {
     });
     expect(browserPathForRoute({ viewMode: "scheduled" })).toBe("/scheduled");
   });
+
+  it("parses and serializes stats page numbers", () => {
+    expect(browserRouteFromPathname("/stats", "?page=3")).toEqual({
+      page: 3,
+      viewMode: "stats",
+    });
+    expect(browserPathForRoute({ page: 3, viewMode: "stats" })).toBe(
+      "/stats?page=3",
+    );
+  });
+
+  it("falls back to stats page 1 for invalid page values", () => {
+    for (const search of ["", "?page=0", "?page=-1", "?page=abc", "?page=1.5"]) {
+      expect(browserRouteFromPathname("/stats", search)).toEqual({
+        page: 1,
+        viewMode: "stats",
+      });
+    }
+  });
 });

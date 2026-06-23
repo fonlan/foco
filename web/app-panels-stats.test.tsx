@@ -34,6 +34,22 @@ import {
 describe("app-panels-stats verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
+  function aiStatisticsCallUrls() {
+    const fetchMock = vi.mocked(fetch);
+    return fetchMock.mock.calls
+      .map((call) => {
+        const rawPath =
+          typeof call[0] === "string"
+            ? call[0]
+            : call[0] instanceof URL
+              ? call[0].toString()
+              : call[0].url;
+
+        return new URL(rawPath, "http://localhost");
+      })
+      .filter((url) => url.pathname === "/api/ai-statistics");
+  }
+
   it("shows git file names before muted directories in the diff panel", async () => {
     appTestState.workspaceGitDiffResponse = generatedGitDiff;
 
@@ -444,21 +460,6 @@ describe("app-panels-stats verification surfaces", () => {
   });
 
   it("loads API overview for the active workspace first", async () => {
-    const fetchMock = vi.mocked(fetch);
-    const aiStatisticsCallUrls = () =>
-      fetchMock.mock.calls
-        .map((call) => {
-          const rawPath =
-            typeof call[0] === "string"
-              ? call[0]
-              : call[0] instanceof URL
-                ? call[0].toString()
-                : call[0].url;
-
-          return new URL(rawPath, "http://localhost");
-        })
-        .filter((url) => url.pathname === "/api/ai-statistics");
-
     renderApp();
 
     expect(await screen.findByText("API overview")).toBeInTheDocument();
@@ -541,6 +542,86 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       screen.queryByRole("dialog", { name: "Request details" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("loads API details from the stats URL page", async () => {
+    window.history.replaceState(null, "", "/stats?page=2");
+
+    renderApp();
+
+    expect(await screen.findByText("API details")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        aiStatisticsCallUrls().some(
+          (url) =>
+            url.searchParams.get("page") === "2" &&
+            url.searchParams.get("pageSize") === "20",
+        ),
+      ).toBe(true),
+    );
+    expect(screen.getByRole("button", { name: "Go to page 2" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+  });
+
+  it("updates the stats URL when request audit pagination changes", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    expect(await screen.findByText("API details")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(window.location.pathname + window.location.search).toBe(
+        "/stats?page=1",
+      ),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Go to page 2" }));
+
+    await waitFor(() =>
+      expect(window.location.pathname + window.location.search).toBe(
+        "/stats?page=2",
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        aiStatisticsCallUrls().some((url) => url.searchParams.get("page") === "2"),
+      ).toBe(true),
+    );
+  });
+
+  it("updates request audit pagination when browser navigation changes stats page", async () => {
+    window.history.replaceState(null, "", "/stats?page=1");
+
+    renderApp();
+
+    expect(await screen.findByText("API details")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        aiStatisticsCallUrls().some((url) => url.searchParams.get("page") === "1"),
+      ).toBe(true),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Go to page 1" })).toHaveAttribute(
+        "aria-current",
+        "page",
+      ),
+    );
+
+    await act(async () => {
+      window.history.pushState(null, "", "/stats?page=3");
+      fireEvent.popState(window);
+    });
+
+    await waitFor(() =>
+      expect(
+        aiStatisticsCallUrls().some((url) => url.searchParams.get("page") === "3"),
+      ).toBe(true),
+    );
+    expect(screen.getByRole("button", { name: "Go to page 3" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
   });
 
   it("localizes running status in API request details", async () => {

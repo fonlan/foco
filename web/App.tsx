@@ -110,6 +110,7 @@ import type {
   AiStatisticsProviderBreakdown,
   AiStatisticsResponse,
   AiStatisticsSummary,
+  AiStatsFilterState,
   AgentDefinitionInput,
   AgentDefinitionSettings,
   AgentDefinitionsResponse,
@@ -434,6 +435,9 @@ export function App() {
     initialBrowserRoute.viewMode === "settings"
       ? initialBrowserRoute.section
       : "general",
+  );
+  const [statsRoutePage, setStatsRoutePage] = useState(
+    initialBrowserRoute.viewMode === "stats" ? initialBrowserRoute.page : 1,
   );
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
   const [workspaceDialogRevision, setWorkspaceDialogRevision] = useState(0);
@@ -4330,11 +4334,19 @@ export function App() {
     setIsMobileWorkspaceOpen,
     setMessages,
     setSettingsSection,
+    setStatsRoutePage,
     setViewMode,
     updateBrowserRoute,
     workspaces,
   });
 
+  const updateStatsRoutePage = useCallback(
+    (page: number) => {
+      setStatsRoutePage((current) => (current === page ? current : page));
+      updateBrowserRoute({ page, viewMode: "stats" });
+    },
+    [updateBrowserRoute],
+  );
 
   function handleHomeNavClick() {
     if (viewMode !== "chat") {
@@ -6438,6 +6450,8 @@ export function App() {
                 />
               ) : (
                 <ApiStatsPanel
+                  onRoutePageChange={updateStatsRoutePage}
+                  routePage={statsRoutePage}
                   settings={settings}
                   workspaces={workspaces}
                 />
@@ -8643,9 +8657,13 @@ function ChartEmptyState({ label }: { label: string }) {
 }
 
 function ApiStatsPanel({
+  onRoutePageChange,
+  routePage,
   settings,
   workspaces,
 }: {
+  onRoutePageChange: (page: number) => void;
+  routePage: number;
   settings: SettingsResponse | null;
   workspaces: WorkspaceSummary[];
 }) {
@@ -8664,9 +8682,10 @@ function ApiStatsPanel({
     loadStats,
     openRequestDetail,
     selectedRequestId,
+    setAuditPage,
     stats,
     updateAuditFilters,
-  } = useAiStatisticsData();
+  } = useAiStatisticsData(routePage);
   const [visibleColumnIds, setVisibleColumnIds] = useState<
     Set<AiStatsColumnId>
   >(readAiStatsVisibleColumnIds);
@@ -8848,7 +8867,13 @@ function ApiStatsPanel({
   );
 
   function goToAuditPage(page: number) {
-    updateAuditPage(page, totalPages);
+    const nextPage = updateAuditPage(page, totalPages);
+    onRoutePageChange(nextPage);
+  }
+
+  function updateFilters(update: Partial<AiStatsFilterState>) {
+    updateAuditFilters(update);
+    onRoutePageChange(1);
   }
 
   function toggleAiStatsColumn(columnId: AiStatsColumnId) {
@@ -8871,6 +8896,10 @@ function ApiStatsPanel({
   useEffect(() => {
     writeAiStatsVisibleColumnIds(visibleColumnIds);
   }, [visibleColumnIds]);
+
+  useEffect(() => {
+    setAuditPage(routePage);
+  }, [routePage, setAuditPage]);
 
   return (
     <div className="panel-scroll h-full min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
@@ -8981,7 +9010,7 @@ function ApiStatsPanel({
             <FilterSelect
               label={t("Workspace")}
               onChange={(value) =>
-                updateAuditFilters({
+                updateFilters({
                   chatId: "",
                   workspaceId: value,
                 })
@@ -8995,28 +9024,28 @@ function ApiStatsPanel({
             />
             <FilterSelect
               label={t("Chat")}
-              onChange={(value) => updateAuditFilters({ chatId: value })}
+              onChange={(value) => updateFilters({ chatId: value })}
               options={chatOptions}
               placeholder={t("All chats")}
               value={filters.chatId}
             />
             <FilterSelect
               label={t("Provider")}
-              onChange={(value) => updateAuditFilters({ providerId: value })}
+              onChange={(value) => updateFilters({ providerId: value })}
               options={providerOptions}
               placeholder={t("All providers")}
               value={filters.providerId}
             />
             <FilterSelect
               label={t("Model")}
-              onChange={(value) => updateAuditFilters({ modelId: value })}
+              onChange={(value) => updateFilters({ modelId: value })}
               options={modelOptions}
               placeholder={t("All models")}
               value={filters.modelId}
             />
             <FilterSelect
               label={t("Status")}
-              onChange={(value) => updateAuditFilters({ status: value })}
+              onChange={(value) => updateFilters({ status: value })}
               options={statusOptions}
               placeholder={t("All statuses")}
               value={filters.status}
@@ -9028,7 +9057,7 @@ function ApiStatsPanel({
               <input
                 className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                 onChange={(event) =>
-                  updateAuditFilters({
+                  updateFilters({
                     startedAfter: event.target.value,
                   })
                 }
@@ -9043,7 +9072,7 @@ function ApiStatsPanel({
               <input
                 className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                 onChange={(event) =>
-                  updateAuditFilters({
+                  updateFilters({
                     startedBefore: event.target.value,
                   })
                 }
@@ -9115,7 +9144,7 @@ function ApiStatsPanel({
                   max={500}
                   min={1}
                   onChange={(event) =>
-                    updateAuditFilters({ pageSize: event.target.value })
+                    updateFilters({ pageSize: event.target.value })
                   }
                   type="number"
                   value={filters.pageSize}

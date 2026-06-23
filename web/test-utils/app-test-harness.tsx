@@ -2158,7 +2158,18 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/ai-statistics") {
-    return jsonResponse(aiStatistics);
+    const page = Number(requestUrl.searchParams.get("page") ?? aiStatistics.page);
+    const pageSize = Number(
+      requestUrl.searchParams.get("pageSize") ?? aiStatistics.pageSize,
+    );
+    return jsonResponse({
+      ...aiStatistics,
+      page: Number.isSafeInteger(page) && page > 0 ? page : aiStatistics.page,
+      pageSize:
+        Number.isSafeInteger(pageSize) && pageSize > 0
+          ? pageSize
+          : aiStatistics.pageSize,
+    });
   }
 
   if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
