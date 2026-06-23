@@ -1371,6 +1371,7 @@ describe("app-chat-stream verification surfaces", () => {
 
   it("schedules a new workspace chat until the current workspace run finishes", async () => {
     const fetchMock = vi.mocked(fetch);
+    const consoleErrorSpy = vi.spyOn(console, "error");
     fetchMock.mockImplementation(async (input, init) => {
       const url = typeof input === "string" ? input : input.toString();
       const path = url.startsWith("http://127.0.0.1")
@@ -1532,6 +1533,14 @@ describe("app-chat-stream verification surfaces", () => {
     }
     expect(await within(scheduledMessageList).findByText("Scheduled task")).toBeInTheDocument();
     expect(await within(scheduledMessageList).findByText("Scheduled answer.")).toBeInTheDocument();
+    expect(
+      consoleErrorSpy.mock.calls
+        .flat()
+        .some((entry) =>
+          String(entry).includes("Encountered two children with the same key") &&
+          String(entry).includes("queued-chat-2"),
+        ),
+    ).toBe(false);
 
     await act(async () => {
       appTestState.chatStreamControllers.get("request-stream-2")?.close();

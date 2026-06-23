@@ -6731,15 +6731,13 @@ export function App() {
                       const configuredVisibleChatCount =
                         workspaceChatVisibleCounts[workspace.id] ??
                         WORKSPACE_CHAT_HISTORY_PAGE_SIZE;
-                      const persistedQueuedChatIds = new Set(
-                        workspace.chats
-                          .filter((chat) => chat.queuedRun?.status === "queued")
-                          .map((chat) => chat.id),
+                      const persistedWorkspaceChatIds = new Set(
+                        workspace.chats.map((chat) => chat.id),
                       );
                       const scheduledChats = scheduledWorkspaceRunsFor(
                         workspace.id,
                       )
-                        .filter((run) => !persistedQueuedChatIds.has(run.chatId))
+                        .filter((run) => !persistedWorkspaceChatIds.has(run.chatId))
                         .map(
                           (run): WorkspaceChatListItem => ({
                             activeRun: null,
