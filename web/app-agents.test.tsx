@@ -203,11 +203,11 @@ describe("app agents verification surfaces", () => {
           createdAt: "2026-06-05T10:00:03Z",
           eventType: "tool_call",
           payload: {
-            assistantMessageId: "agent-task-1-assistant",
-            toolCall: {
+            assistant_message_id: "agent-task-1-assistant",
+            tool_call: {
               id: "tool-read-file",
               input: { path: "notes.md" },
-              isError: false,
+              is_error: false,
               name: "read_file",
               output: null,
               status: "running",
@@ -278,19 +278,11 @@ describe("app agents verification surfaces", () => {
     expect(screen.queryByText("Inspection complete.")).not.toBeInTheDocument();
 
     snapshot = secondSnapshot;
-    await act(async () => {
-      enqueueChatStreamEvent({
-        chatId: "chat-1",
-        instanceId: "agent-instance-worker",
-        reason: "text_delta",
-        revealPanel: false,
-        teamId: "agent-team-1",
-        type: "agentTeamRefresh",
-        workspaceId: "workspace-1",
-      });
-    });
 
-    expect(await screen.findByText("Still inspecting.")).toBeInTheDocument();
+    await waitFor(
+      () => expect(screen.getByText("Still inspecting.")).toBeInTheDocument(),
+      { timeout: 2500 },
+    );
   });
 
   it("reveals the Agents panel and refreshes when an Agent instance is created", async () => {

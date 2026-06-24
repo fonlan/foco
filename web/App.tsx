@@ -527,6 +527,7 @@ type AiStatsColumn = {
 };
 
 const LIVE_REASONING_DURATION_REFRESH_MS = 250;
+const AGENT_TEAM_RUNNING_REFRESH_MS = 1000;
 const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
 const MEMORY_DREAM_DEFAULT_PAGE_SIZE = 10;
 const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
@@ -1237,6 +1238,66 @@ export function App() {
 
     void loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
   }, [activeChatId, activeMainTab.type, activeWorkspaceId, canUseApp, loadAgentTeamSnapshot]);
+
+  const visibleAgentSnapshotTarget = useMemo(() => {
+    if (activeMainTab.type === "agent" && activeAgentTab) {
+      return {
+        chatId: activeAgentTab.chatId,
+        workspaceId: activeAgentTab.workspaceId,
+      };
+    }
+
+    if (
+      isContextPanelOpen &&
+      contextPanelTab === "agents" &&
+      activeWorkspaceId &&
+      activeChatId &&
+      !isPendingChatId(activeChatId)
+    ) {
+      return { chatId: activeChatId, workspaceId: activeWorkspaceId };
+    }
+
+    return null;
+  }, [
+    activeAgentTab,
+    activeChatId,
+    activeMainTab.type,
+    activeWorkspaceId,
+    contextPanelTab,
+    isContextPanelOpen,
+  ]);
+
+  const visibleAgentSnapshotHasRunningTask = Boolean(
+    visibleAgentSnapshotTarget &&
+      agentTeamSnapshot?.team.chatId === visibleAgentSnapshotTarget.chatId &&
+      agentTeamSnapshot.tasks.some((task) => task.status === "running"),
+  );
+
+  useEffect(() => {
+    if (
+      !canUseApp ||
+      !visibleAgentSnapshotTarget ||
+      !visibleAgentSnapshotHasRunningTask ||
+      isLoadingAgentTeam
+    ) {
+      return;
+    }
+
+    const refreshTimer = window.setTimeout(() => {
+      void loadAgentTeamSnapshot(
+        visibleAgentSnapshotTarget.workspaceId,
+        visibleAgentSnapshotTarget.chatId,
+      );
+    }, AGENT_TEAM_RUNNING_REFRESH_MS);
+
+    return () => window.clearTimeout(refreshTimer);
+  }, [
+    canUseApp,
+    isLoadingAgentTeam,
+    loadAgentTeamSnapshot,
+    visibleAgentSnapshotHasRunningTask,
+    visibleAgentSnapshotTarget,
+  ]);
 
   async function createAgentDefinition(definition: AgentDefinitionInput) {
     setAgentDefinitionOperationKey("agent-definition-save");

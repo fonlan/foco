@@ -428,7 +428,7 @@ function taskRunTranscriptItem(
     }
 
     if (type === "toolCall") {
-      const toolCall = chatToolCallSummary(payload.toolCall);
+      const toolCall = chatToolCallSummary(jsonField(payload, "toolCall", "tool_call"));
       if (toolCall) {
         parts = upsertToolCallPart(parts, toolCall);
         if (!status) {
@@ -439,9 +439,9 @@ function taskRunTranscriptItem(
     }
 
     if (type === "toolResult") {
-      const toolCallId = jsonRawStringField(payload, "toolCallId");
+      const toolCallId = jsonRawStringField(payload, "toolCallId", "tool_call_id");
       const output = payload.output;
-      const isError = jsonBooleanField(payload, "isError") ?? false;
+      const isError = jsonBooleanField(payload, "isError", "is_error") ?? false;
       if (toolCallId && isJsonValue(output)) {
         parts = applyToolResultToParts(parts, toolCallId, output, isError);
       }
@@ -449,7 +449,7 @@ function taskRunTranscriptItem(
     }
 
     if (type === "toolOutputDelta") {
-      const toolCallId = jsonRawStringField(payload, "toolCallId");
+      const toolCallId = jsonRawStringField(payload, "toolCallId", "tool_call_id");
       const stream = jsonRawStringField(payload, "stream");
       const delta = jsonRawStringField(payload, "delta") ?? "";
       if (toolCallId && (stream === "stdout" || stream === "stderr")) {
@@ -463,7 +463,7 @@ function taskRunTranscriptItem(
       parts = partsFromRunSnapshot(
         content,
         optionalJsonString(payload.reasoning),
-        jsonArrayField(payload, "toolCalls")
+        jsonArrayField(payload, "toolCalls", "tool_calls")
           .map(chatToolCallSummary)
           .filter((toolCall): toolCall is ChatToolCallSummary => Boolean(toolCall)),
       );
@@ -696,7 +696,7 @@ function chatToolCallSummary(value: JsonValue | undefined): ChatToolCallSummary 
     return null;
   }
   const output = record.output;
-  const liveOutput = jsonRecord(record.liveOutput);
+  const liveOutput = jsonRecord(jsonField(record, "liveOutput", "live_output"));
   const stdout = liveOutput ? jsonRawStringField(liveOutput, "stdout") ?? "" : "";
   const stderr = liveOutput ? jsonRawStringField(liveOutput, "stderr") ?? "" : "";
   return {
@@ -705,7 +705,7 @@ function chatToolCallSummary(value: JsonValue | undefined): ChatToolCallSummary 
     status: jsonRawStringField(record, "status") ?? "running",
     input: isJsonValue(record.input) ? record.input : {},
     output: isJsonValue(output) ? output : null,
-    isError: jsonBooleanField(record, "isError") ?? false,
+    isError: jsonBooleanField(record, "isError", "is_error") ?? false,
     liveOutput: stdout || stderr ? { stdout, stderr } : undefined,
   };
 }
@@ -800,24 +800,33 @@ function jsonMessageText(value: JsonValue) {
   );
 }
 
-function jsonStringField(record: Record<string, JsonValue>, key: string) {
-  const value = record[key];
+function jsonStringField(record: Record<string, JsonValue>, ...keys: string[]) {
+  const value = jsonField(record, ...keys);
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function jsonRawStringField(record: Record<string, JsonValue>, key: string) {
-  const value = record[key];
+function jsonRawStringField(record: Record<string, JsonValue>, ...keys: string[]) {
+  const value = jsonField(record, ...keys);
   return typeof value === "string" ? value : null;
 }
 
-function jsonBooleanField(record: Record<string, JsonValue>, key: string) {
-  const value = record[key];
+function jsonBooleanField(record: Record<string, JsonValue>, ...keys: string[]) {
+  const value = jsonField(record, ...keys);
   return typeof value === "boolean" ? value : null;
 }
 
-function jsonArrayField(record: Record<string, JsonValue>, key: string) {
-  const value = record[key];
+function jsonArrayField(record: Record<string, JsonValue>, ...keys: string[]) {
+  const value = jsonField(record, ...keys);
   return Array.isArray(value) ? value : [];
+}
+
+function jsonField(record: Record<string, JsonValue>, ...keys: string[]) {
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(record, key)) {
+      return record[key];
+    }
+  }
+  return undefined;
 }
 
 function optionalJsonString(value: JsonValue | undefined) {
