@@ -189,6 +189,16 @@ export const settings = {
     ],
     retentionDays: null,
   },
+  spec: {
+    autoEnabled: true,
+    generationModelId: null,
+    generationSystemPrompt: null,
+    updateSystemPrompt: null,
+    defaultGenerationSystemPrompt:
+      "Generate a concise Project Spec Markdown document from provided evidence.",
+    defaultUpdateSystemPrompt:
+      "Decide whether the Project Spec needs an update after the latest completed chat turn.",
+  },
   prompts: {
     defaultSystemPrompt: "You are Foco, a local coding agent.",
     extraText: "",
@@ -2139,6 +2149,20 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         retrievalModelId: "gpt-test",
         retentionDays: 30,
         dream: body.dream ?? settings.memory.dream,
+      },
+    });
+  }
+
+  if (path === "/api/settings/spec") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as typeof settings.spec;
+    return jsonResponse({
+      ...settings,
+      spec: {
+        ...settings.spec,
+        autoEnabled: body.autoEnabled,
+        generationModelId: body.generationModelId ?? null,
+        generationSystemPrompt: body.generationSystemPrompt ?? null,
+        updateSystemPrompt: body.updateSystemPrompt ?? null,
       },
     });
   }

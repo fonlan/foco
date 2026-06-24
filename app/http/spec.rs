@@ -168,7 +168,10 @@ pub(crate) async fn generate_workspace_spec(
         )));
     }
 
-    let model_id = request.model_id.and_then(non_empty_text);
+    let model_id = request
+        .model_id
+        .and_then(non_empty_text)
+        .or_else(|| config.spec.generation_model_id.clone());
     let trigger_type = if spec.content_markdown.trim().is_empty() {
         WorkspaceSpecTriggerType::ManualInitial
     } else {

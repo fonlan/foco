@@ -50,6 +50,10 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByText("Prompt files")).toBeInTheDocument();
     expect(screen.getByText("No prompt files")).toBeInTheDocument();
 
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+    expect(screen.getByText("Spec settings")).toBeInTheDocument();
+    expect(screen.getByText("Auto Spec")).toBeInTheDocument();
+
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
     expect(screen.getByText("Configured providers")).toBeInTheDocument();
     const providersSection = screen.getByText("Configured providers").closest("section");
@@ -86,6 +90,40 @@ describe("app-settings verification surfaces", () => {
     ).not.toBeInTheDocument();
     expect(screen.getByText("Global skill")).toBeInTheDocument();
     expect(screen.getAllByText("gitmemo")).not.toHaveLength(0);
+  });
+
+  it("localizes the Spec settings surface", async () => {
+    const zhSettings = {
+      ...settings,
+      general: { ...settings.general, language: "zh-CN" },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        return path === "/api/settings"
+          ? jsonResponse(zhSettings)
+          : mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "设置" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "设置" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    expect(await screen.findByRole("heading", { name: "Spec 设置" })).toBeInTheDocument();
+    expect(screen.getByText("自动 Spec")).toBeInTheDocument();
+    expect(screen.getByText("自动化")).toBeInTheDocument();
+    expect(screen.getByText("成功聊天轮次结束后更新已启用的工作区 Spec。")).toBeInTheDocument();
+    expect(screen.getByLabelText("Spec 生成模型")).toBeInTheDocument();
+    expect(screen.getByLabelText("Spec 生成系统提示词")).toBeInTheDocument();
+    expect(screen.getByLabelText("Spec 更新系统提示词")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存 Spec 设置" })).toBeInTheDocument();
   });
 
   it("refreshes configured provider model support", async () => {
@@ -241,6 +279,41 @@ describe("app-settings verification surfaces", () => {
           method: "POST",
         }),
       );
+    });
+  });
+
+  it("saves spec settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    expect(await screen.findByText("Spec settings")).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText("Enable Auto Spec"));
+    await userEvent.selectOptions(screen.getByLabelText("Spec generation model"), "gpt-test");
+    changeInput(
+      screen.getByLabelText("Spec generation system prompt"),
+      "Generate the workspace spec from evidence.",
+    );
+    changeInput(
+      screen.getByLabelText("Spec update system prompt"),
+      "Update the workspace spec after durable changes.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Save spec settings" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/settings/spec",
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
+        autoEnabled: false,
+        generationModelId: "gpt-test",
+        generationSystemPrompt: "Generate the workspace spec from evidence.",
+        updateSystemPrompt: "Update the workspace spec after durable changes.",
+      });
     });
   });
 

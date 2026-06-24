@@ -11,7 +11,7 @@ use foco_providers::{
     test_provider_connection,
 };
 use foco_store::{
-    config::PromptSettings,
+    config::{PromptSettings, SpecSettings},
     model_metadata::{
         MODELS_DEV_API_URL, parse_models_dev_metadata, read_model_metadata_cache,
         write_model_metadata_cache,
@@ -444,6 +444,25 @@ pub(crate) async fn save_memory_settings(
         extraction_model_id,
         retrieval_model_id,
         dream,
+    };
+    config
+        .validate(Some(&state.config_file))
+        .map_err(ApiError::from_config_error)?;
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
+pub(crate) async fn save_spec_settings(
+    State(state): State<AppState>,
+    Json(request): Json<ManualSpecSettingsRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    config.spec = SpecSettings {
+        auto_enabled: request.auto_enabled,
+        generation_model_id: optional_trimmed_string(request.generation_model_id),
+        generation_system_prompt: optional_trimmed_string(request.generation_system_prompt),
+        update_system_prompt: optional_trimmed_string(request.update_system_prompt),
     };
     config
         .validate(Some(&state.config_file))

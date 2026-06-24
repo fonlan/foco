@@ -7271,6 +7271,48 @@ fn workspace_spec_runtime_uses_evidence_language_and_writes_revision() {
 }
 
 #[test]
+fn workspace_spec_runtime_uses_configured_generation_model_and_prompt() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = prompt_test_config(workspace.path().to_path_buf());
+    config.spec.generation_model_id = Some("model".to_string());
+    config.spec.generation_system_prompt = Some(
+        "Custom spec generation prompt. Use the submit_workspace_spec tool exactly once."
+            .to_string(),
+    );
+    let workspace_id = config.workspaces[0].id.clone();
+    let job_id = "workspace-spec-configured-job";
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, false)
+            .expect("spec settings");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: job_id,
+                trigger_type: "manual_initial",
+                chat_id: None,
+                run_id: None,
+                model_id: None,
+                base_revision: Some(0),
+                input_summary_json: None,
+            })
+            .expect("spec job");
+    }
+
+    let prepared =
+        prepare_workspace_spec_job(&config, &workspace_id, &config.workspaces[0], job_id)
+            .expect("prepare spec job")
+            .expect("prepared job");
+
+    assert_eq!(prepared.request.model_id, "model");
+    assert_eq!(
+        prepared.request.messages[0].content,
+        "Custom spec generation prompt. Use the submit_workspace_spec tool exactly once."
+    );
+}
+
+#[test]
 fn workspace_spec_successful_primary_turn_queues_update_job() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-update-queue-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -7329,6 +7371,37 @@ fn workspace_spec_successful_primary_turn_queues_update_job() {
             .as_str()
             .unwrap()
             .contains("Existing spec")
+    );
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn workspace_spec_auto_disabled_does_not_queue_update_job() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-auto-disabled-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    seed_workspace_spec_update_chat(&workspace_dir, false);
+    let mut context = workspace_spec_update_test_context(workspace_dir.clone());
+    context.global_config.spec.auto_enabled = false;
+
+    persist_chat_result(
+        &context,
+        "2026-06-06T09:00:00Z",
+        test_chat_outcome("succeeded"),
+        &[],
+        Some("Added the spec update scheduler hook."),
+        None,
+        &[],
+    )
+    .expect("persist chat result");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    assert!(
+        database
+            .workspace_spec_jobs(10)
+            .expect("workspace spec jobs")
+            .is_empty()
     );
 
     drop(database);

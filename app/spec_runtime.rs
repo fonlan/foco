@@ -4,7 +4,7 @@ use foco_providers::{
     NeutralChatRequest, NeutralChatRole, NeutralToolDefinition, ProviderConnectionConfig,
 };
 use foco_store::{
-    config::{GlobalConfig, ModelSettings},
+    config::{GlobalConfig, ModelSettings, SpecSettings},
     memory::MemoryDatabase,
     workspace::{
         CodeChangeStats, CodeGraphFileSummaryRecord, CodeGraphSymbolRecord, NewWorkspaceSpecJob,
@@ -183,6 +183,9 @@ pub(crate) fn queue_workspace_spec_update_job(
     if final_state != "succeeded" || !context.agent_primary_chat_output {
         return Ok(());
     }
+    if !context.global_config.spec.auto_enabled {
+        return Ok(());
+    }
 
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
@@ -228,7 +231,12 @@ pub(crate) fn queue_workspace_spec_update_job(
             trigger_type: WorkspaceSpecTriggerType::ChatCompleted.as_str(),
             chat_id: Some(&context.chat_id),
             run_id: Some(&context.llm_request_id),
-            model_id: Some(&context.model_id),
+            model_id: context
+                .global_config
+                .spec
+                .generation_model_id
+                .as_deref()
+                .or(Some(context.model_id.as_str())),
             base_revision: Some(spec.revision),
             input_summary_json: Some(&input_summary_json),
         })
@@ -399,6 +407,7 @@ async fn run_workspace_spec_update_job_inner(
     let request = workspace_spec_update_provider_request(
         &model.model_id,
         &config.app.language,
+        &config.spec,
         model.max_output_tokens,
         &input_summary,
     )?;
@@ -526,6 +535,7 @@ fn prepare_workspace_spec_generation_job(
     let request = workspace_spec_provider_request(
         &model.model_id,
         &config.app.language,
+        &config.spec,
         model.max_output_tokens,
         &input_summary,
     )?;
@@ -727,6 +737,7 @@ fn root_source_files(workspace_path: &std::path::Path) -> Vec<WorkspaceSpecSourc
 fn workspace_spec_provider_request(
     model_id: &str,
     app_language: &str,
+    spec_settings: &SpecSettings,
     max_output_tokens: u32,
     input_summary: &WorkspaceSpecGenerationInput,
 ) -> Result<NeutralChatRequest, ApiError> {
@@ -735,11 +746,9 @@ fn workspace_spec_provider_request(
             "failed to serialize workspace spec evidence: {source}"
         ))
     })?;
-    let system_prompt = format!(
-        "Generate a concise Project Spec Markdown document from provided evidence. \
-Use exactly these sections: # Project Spec, ## Purpose, ## Product Surface, ## Architecture, ## Data And Persistence, ## Runtime Flows, ## UI Contracts, ## Agent And Tool Contracts, ## Operational Constraints, ## Open Questions. \
-Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Put unknowns under Open Questions. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. {} Use the submit_workspace_spec tool exactly once.",
-        workspace_spec_language_instruction(app_language)
+    let system_prompt = workspace_spec_system_prompt(
+        spec_settings.generation_system_prompt.as_deref(),
+        default_workspace_spec_generation_system_prompt(app_language),
     );
 
     Ok(NeutralChatRequest {
@@ -762,6 +771,7 @@ Prefer facts evidenced by code graph summaries, workspace memory profiles, or ro
 fn workspace_spec_update_provider_request(
     model_id: &str,
     app_language: &str,
+    spec_settings: &SpecSettings,
     max_output_tokens: u32,
     input_summary: &WorkspaceSpecUpdateInput,
 ) -> Result<NeutralChatRequest, ApiError> {
@@ -770,11 +780,9 @@ fn workspace_spec_update_provider_request(
             "failed to serialize workspace spec update input: {source}"
         ))
     })?;
-    let system_prompt = format!(
-        "Decide whether the Project Spec needs an update after the latest completed chat turn. \
-If the turn did not change durable product behavior, architecture, runtime flows, data contracts, commands, settings, or operational constraints, submit updateNeeded=false and contentMarkdown=null. \
-If an update is needed, submit a full replacement Project Spec Markdown document using the existing section shape. Preserve accurate existing facts unless the turn supersedes them. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. {} Use the submit_workspace_spec_update tool exactly once.",
-        workspace_spec_language_instruction(app_language)
+    let system_prompt = workspace_spec_system_prompt(
+        spec_settings.update_system_prompt.as_deref(),
+        default_workspace_spec_update_system_prompt(app_language),
     );
 
     Ok(NeutralChatRequest {
@@ -834,6 +842,31 @@ fn workspace_spec_update_tool_definition() -> NeutralToolDefinition {
             "required": ["updateNeeded", "contentMarkdown"]
         }),
     }
+}
+
+pub(crate) fn default_workspace_spec_generation_system_prompt(app_language: &str) -> String {
+    format!(
+        "Generate a concise Project Spec Markdown document from provided evidence. \
+Use exactly these sections: # Project Spec, ## Purpose, ## Product Surface, ## Architecture, ## Data And Persistence, ## Runtime Flows, ## UI Contracts, ## Agent And Tool Contracts, ## Operational Constraints, ## Open Questions. \
+Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Put unknowns under Open Questions. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. {} Use the submit_workspace_spec tool exactly once.",
+        workspace_spec_language_instruction(app_language)
+    )
+}
+
+pub(crate) fn default_workspace_spec_update_system_prompt(app_language: &str) -> String {
+    format!(
+        "Decide whether the Project Spec needs an update after the latest completed chat turn. \
+If the turn did not change durable product behavior, architecture, runtime flows, data contracts, commands, settings, or operational constraints, submit updateNeeded=false and contentMarkdown=null. \
+If an update is needed, submit a full replacement Project Spec Markdown document using the existing section shape. Preserve accurate existing facts unless the turn supersedes them. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. {} Use the submit_workspace_spec_update tool exactly once.",
+        workspace_spec_language_instruction(app_language)
+    )
+}
+
+fn workspace_spec_system_prompt(custom: Option<&str>, default_prompt: String) -> String {
+    custom
+        .and_then(non_empty_trimmed)
+        .map(str::to_string)
+        .unwrap_or(default_prompt)
 }
 
 // ponytail: local mapping is enough for the two supported app languages; extend with SUPPORTED_APP_LANGUAGES.

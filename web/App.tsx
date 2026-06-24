@@ -227,6 +227,7 @@ import type {
   SettingsResponse,
   SettingsSection,
   ShellMessage,
+  SpecSettingsFormState,
   SystemPromptSummary,
   TaskStatus,
   TerminalCommandRun,
@@ -12148,6 +12149,8 @@ function SettingsPanel({
   );
   const [promptSettingsForm, setPromptSettingsForm] =
     useState<PromptSettingsFormState>(() => emptyPromptSettingsForm());
+  const [specSettingsForm, setSpecSettingsForm] =
+    useState<SpecSettingsFormState>(() => emptySpecSettingsForm());
   const [memorySettingsForm, setMemorySettingsForm] =
     useState<MemorySettingsFormState>(() => emptyMemorySettingsForm());
   const [memoryFilter, setMemoryFilter] = useState<MemoryFilterState>(() =>
@@ -12231,6 +12234,7 @@ function SettingsPanel({
   const [isSavingGeneral, setIsSavingGeneral] = useState(false);
   const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
   const [isSavingPromptSettings, setIsSavingPromptSettings] = useState(false);
+  const [isSavingSpecSettings, setIsSavingSpecSettings] = useState(false);
   const [isSelectingPromptFile, setIsSelectingPromptFile] = useState(false);
   const [isSavingMemorySettings, setIsSavingMemorySettings] = useState(false);
   const [isLoadingMemories, setIsLoadingMemories] = useState(false);
@@ -12601,6 +12605,15 @@ function SettingsPanel({
     });
   }
 
+  function syncSpecSettingsForm(data: SettingsResponse) {
+    setSpecSettingsForm({
+      autoEnabled: data.spec.autoEnabled,
+      generationModelId: data.spec.generationModelId ?? "",
+      generationSystemPrompt: data.spec.generationSystemPrompt ?? "",
+      updateSystemPrompt: data.spec.updateSystemPrompt ?? "",
+    });
+  }
+
   function syncMemorySettingsForm(data: SettingsResponse) {
     setMemorySettingsForm({
       enabled: data.memory.enabled,
@@ -12661,6 +12674,7 @@ function SettingsPanel({
       syncGeneralForm(data);
       syncWebSearchForm(data);
       syncPromptSettingsForm(data);
+      syncSpecSettingsForm(data);
       syncMemorySettingsForm(data);
       setProviderForm((current) => ({
         ...current,
@@ -13335,6 +13349,33 @@ function SettingsPanel({
       setError(errorMessage(requestError));
     } finally {
       setIsSavingPromptSettings(false);
+    }
+  }
+
+  async function saveSpecSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSavingSpecSettings(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings/spec", {
+        body: JSON.stringify({
+          autoEnabled: specSettingsForm.autoEnabled,
+          generationModelId: specSettingsForm.generationModelId.trim() || null,
+          generationSystemPrompt:
+            specSettingsForm.generationSystemPrompt.trim() || null,
+          updateSystemPrompt: specSettingsForm.updateSystemPrompt.trim() || null,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncSpecSettingsForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingSpecSettings(false);
     }
   }
 
@@ -15180,6 +15221,12 @@ function SettingsPanel({
               onClick={() => onActiveSectionChange("prompts")}
             />
             <SettingsNavButton
+              active={activeSection === "spec"}
+              icon={FileText}
+              label={t("Spec")}
+              onClick={() => onActiveSectionChange("spec")}
+            />
+            <SettingsNavButton
               active={activeSection === "web-search"}
               icon={Search}
               label={t("Web Search")}
@@ -16221,6 +16268,130 @@ function SettingsPanel({
                     {t("Save")}
                   </button>
                 </div>
+              </form>
+            </section>
+          ) : null}
+
+          {activeSection === "spec" ? (
+            <section className="grid gap-4">
+              <form
+                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+                onSubmit={(event) => void saveSpecSettings(event)}
+              >
+                <div className="flex items-center gap-2">
+                  <FileText aria-hidden="true" className="size-5 text-teal-700" />
+                  <h3 className="text-sm font-semibold text-stone-950">
+                    {t("Auto Spec")}
+                  </h3>
+                </div>
+                <div className="mt-4 grid gap-3">
+                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                      {t("Automation")}
+                    </legend>
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <p className="text-sm font-semibold text-stone-800">
+                          {t("Enable Auto Spec")}
+                        </p>
+                        <p className="mt-1 text-xs text-stone-500">
+                          {t("Updates enabled workspace specs after successful chat turns.")}
+                        </p>
+                      </div>
+                      <label
+                        aria-label={t("Enable Auto Spec")}
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                      >
+                        <input
+                          checked={specSettingsForm.autoEnabled}
+                          className="size-4 accent-teal-700"
+                          onChange={(event) =>
+                            setSpecSettingsForm((current) => ({
+                              ...current,
+                              autoEnabled: event.target.checked,
+                            }))
+                          }
+                          type="checkbox"
+                        />
+                      </label>
+                    </div>
+                  </fieldset>
+
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Spec generation model")}
+                    </span>
+                    <select
+                      aria-label={t("Spec generation model")}
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setSpecSettingsForm((current) => ({
+                          ...current,
+                          generationModelId: event.target.value,
+                        }))
+                      }
+                      value={specSettingsForm.generationModelId}
+                    >
+                      <option value="">{t("Automatic")}</option>
+                      {configuredModelsByName.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.displayName}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Spec generation system prompt")}
+                    </span>
+                    <textarea
+                      aria-label={t("Spec generation system prompt")}
+                      className="min-h-44 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setSpecSettingsForm((current) => ({
+                          ...current,
+                          generationSystemPrompt: event.target.value,
+                        }))
+                      }
+                      placeholder={settings?.spec.defaultGenerationSystemPrompt ?? ""}
+                      value={specSettingsForm.generationSystemPrompt}
+                    />
+                  </label>
+
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Spec update system prompt")}
+                    </span>
+                    <textarea
+                      aria-label={t("Spec update system prompt")}
+                      className="min-h-44 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) =>
+                        setSpecSettingsForm((current) => ({
+                          ...current,
+                          updateSystemPrompt: event.target.value,
+                        }))
+                      }
+                      placeholder={settings?.spec.defaultUpdateSystemPrompt ?? ""}
+                      value={specSettingsForm.updateSystemPrompt}
+                    />
+                  </label>
+                </div>
+
+                <button
+                  aria-label={t("Save spec settings")}
+                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                  disabled={isSavingSpecSettings}
+                  title={t("Save spec settings")}
+                  type="submit"
+                >
+                  {isSavingSpecSettings ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <CheckCircle2 aria-hidden="true" className="size-4" />
+                  )}
+                  {t("Save")}
+                </button>
               </form>
             </section>
           ) : null}
@@ -21221,6 +21392,10 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
     return t("Prompt settings");
   }
 
+  if (section === "spec") {
+    return t("Spec settings");
+  }
+
   if (section === "agents") {
     return t("Agent settings");
   }
@@ -21263,6 +21438,10 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
 
   if (section === "prompts") {
     return t("System prompt, prompt files, and extra instructions");
+  }
+
+  if (section === "spec") {
+    return t("Auto Spec model and prompts");
   }
 
   if (section === "agents") {
@@ -21708,6 +21887,15 @@ function emptyPromptSettingsForm(): PromptSettingsFormState {
     pendingSystemPromptRename: "",
     renamingSystemPromptName: null,
     systemPrompts: [],
+  };
+}
+
+function emptySpecSettingsForm(): SpecSettingsFormState {
+  return {
+    autoEnabled: true,
+    generationModelId: "",
+    generationSystemPrompt: "",
+    updateSystemPrompt: "",
   };
 }
 

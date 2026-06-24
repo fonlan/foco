@@ -152,6 +152,39 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText(/Latest job: Completed/)).toBeInTheDocument();
   });
 
+  it("localizes the Project Spec tab in the right panel", async () => {
+    const zhSettings = {
+      ...settings,
+      general: { ...settings.general, language: "zh-CN" },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        return path === "/api/settings"
+          ? jsonResponse(zhSettings)
+          : mockFetch(input, init);
+      }),
+    );
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Spec" }));
+
+    expect(await screen.findByRole("heading", { name: "项目 Spec" })).toBeInTheDocument();
+    expect(screen.getByLabelText("项目 Spec Markdown")).toHaveValue(
+      workspaceSpec.contentMarkdown,
+    );
+    expect(screen.getByRole("checkbox", { name: "启用项目 Spec" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "注入新会话" })).toBeChecked();
+    expect(screen.getAllByText(/修订 3/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/最近任务: 已完成 · 手动刷新/)).toBeInTheDocument();
+  });
+
   it("saves Project Spec settings from the right panel", async () => {
     const fetchMock = vi.mocked(fetch);
     appTestState.workspaceSpecResponse = {

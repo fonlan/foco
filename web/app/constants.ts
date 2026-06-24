@@ -23,6 +23,7 @@ export const SAVED_PASSWORD_MASK = "********";
 export const SETTINGS_SECTION_IDS: SettingsSection[] = [
   "general",
   "prompts",
+  "spec",
   "web-search",
   "workspaces",
   "hooks",

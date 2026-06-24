@@ -6,6 +6,7 @@ export type SettingsSection =
   | "general"
   | "agents"
   | "prompts"
+  | "spec"
   | "web-search"
   | "hooks"
   | "memory"
@@ -1115,6 +1116,22 @@ export type PromptSettingsFormState = {
   renamingSystemPromptName: string | null;
 };
 
+type SpecSettingsSummary = {
+  autoEnabled: boolean;
+  generationModelId: string | null;
+  generationSystemPrompt: string | null;
+  updateSystemPrompt: string | null;
+  defaultGenerationSystemPrompt: string;
+  defaultUpdateSystemPrompt: string;
+};
+
+export type SpecSettingsFormState = {
+  autoEnabled: boolean;
+  generationModelId: string;
+  generationSystemPrompt: string;
+  updateSystemPrompt: string;
+};
+
 export type TerminalShellSummary = {
   shell: string;
   label: string;
@@ -1885,6 +1902,7 @@ export type SettingsResponse = {
   nativeTools: NativeToolsSummary;
   webSearch: WebSearchSettingsSummary;
   memory: MemorySettingsSummary;
+  spec: SpecSettingsSummary;
   prompts: PromptSettingsSummary;
   workspaces: ConfiguredWorkspaceSummary[];
   terminalShells: TerminalShellSummary[];

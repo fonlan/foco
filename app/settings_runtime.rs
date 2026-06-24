@@ -126,6 +126,20 @@ pub(crate) async fn settings_response(
                 },
             ],
         },
+        spec: SpecSettingsSummary {
+            auto_enabled: config.spec.auto_enabled,
+            generation_model_id: config.spec.generation_model_id.clone(),
+            generation_system_prompt: config.spec.generation_system_prompt.clone(),
+            update_system_prompt: config.spec.update_system_prompt.clone(),
+            default_generation_system_prompt:
+                crate::spec_runtime::default_workspace_spec_generation_system_prompt(
+                    &config.app.language,
+                ),
+            default_update_system_prompt:
+                crate::spec_runtime::default_workspace_spec_update_system_prompt(
+                    &config.app.language,
+                ),
+        },
         prompts: PromptSettingsSummary {
             system_prompt: config.prompts.system_prompt.clone(),
             default_system_prompt: default_system_prompt.clone(),

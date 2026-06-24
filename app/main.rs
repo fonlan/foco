@@ -1147,6 +1147,10 @@ fn app_router(state: AppState) -> Router {
             post(crate::http::settings::save_memory_settings),
         )
         .route(
+            "/api/settings/spec",
+            post(crate::http::settings::save_spec_settings),
+        )
+        .route(
             "/api/settings/prompts",
             post(crate::http::settings::save_prompt_settings),
         )
@@ -2285,6 +2289,15 @@ struct ManualMemoryDreamSettingsRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ManualSpecSettingsRequest {
+    auto_enabled: bool,
+    generation_model_id: Option<String>,
+    generation_system_prompt: Option<String>,
+    update_system_prompt: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ManualPromptSettingsRequest {
     system_prompts: Option<Vec<ManualSystemPromptRequest>>,
     system_prompt: Option<String>,
@@ -2663,6 +2676,7 @@ struct SettingsResponse {
     native_tools: NativeToolsSummary,
     web_search: WebSearchSettingsSummary,
     memory: MemorySettingsSummary,
+    spec: SpecSettingsSummary,
     prompts: PromptSettingsSummary,
     workspaces: Vec<ConfiguredWorkspaceSummary>,
     terminal_shells: Vec<TerminalShellSummary>,
@@ -2789,6 +2803,17 @@ struct MemoryDreamSettingsSummary {
 struct MemoryExtractionModeSummary {
     value: &'static str,
     label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpecSettingsSummary {
+    auto_enabled: bool,
+    generation_model_id: Option<String>,
+    generation_system_prompt: Option<String>,
+    update_system_prompt: Option<String>,
+    default_generation_system_prompt: String,
+    default_update_system_prompt: String,
 }
 
 #[derive(Serialize)]
