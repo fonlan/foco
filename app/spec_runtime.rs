@@ -201,22 +201,6 @@ pub(crate) fn queue_workspace_spec_update_job(
         .running_workspace_spec_job()
         .map_err(ApiError::from_workspace_error)?
         .is_some();
-    if let Some(job) = database
-        .queued_workspace_spec_update_job()
-        .map_err(ApiError::from_workspace_error)?
-    {
-        let job_id = job.id;
-        drop(database);
-        if !running_job_exists {
-            spawn_workspace_spec_job(
-                context.global_config.clone(),
-                context.workspace_id.clone(),
-                context.workspace_path.clone(),
-                job_id,
-            );
-        }
-        return Ok(());
-    }
 
     let input =
         workspace_spec_update_input(context, &database, spec.revision, &spec.content_markdown)?;

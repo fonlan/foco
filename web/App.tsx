@@ -251,6 +251,7 @@ import type {
   WorkspaceFileTreeNode,
   WorkspaceFormState,
   WorkspaceIconDraft,
+  WorkspaceSpecJobsResponse,
   WorkspaceSpecResponse,
   WorkspaceSummary,
   WorkspacesResponse,
@@ -2879,6 +2880,52 @@ export function App() {
         (run) => run.workspaceId === workspaceId && run.status === "starting",
       )
     );
+  }
+  async function refreshMessagesAfterSpecJobSettles(
+    workspaceId: string,
+    chatId: string,
+    runId: string | null,
+  ) {
+    if (!runId) {
+      return;
+    }
+
+    const attempts = [1000, 2000, 4000, 8000, 15000, 30000, 45000, 60000];
+    try {
+      for (const delayMs of attempts) {
+        await delay(delayMs);
+        const jobsResponse = await requestJson<WorkspaceSpecJobsResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs?limit=24`,
+        );
+        const job = jobsResponse.jobs.find(
+          (candidate) =>
+            candidate.chatId === chatId &&
+            candidate.runId === runId &&
+            candidate.triggerType === "chat_completed",
+        );
+        if (!job) {
+          continue;
+        }
+        if (job.status === "queued" || job.status === "running") {
+          continue;
+        }
+        if (job.status === "completed") {
+          await loadChatMessages(workspaceId, chatId);
+          if (activeWorkspaceIdRef.current === workspaceId) {
+            await loadWorkspaceSpec(workspaceId);
+          }
+        }
+        return;
+      }
+    } catch {
+      return;
+    }
+  }
+
+  function delay(durationMs: number) {
+    return new Promise<void>((resolve) => {
+      window.setTimeout(resolve, durationMs);
+    });
   }
 
   function selectScheduledWorkspaceRun(run: ScheduledWorkspaceRun) {
@@ -5647,7 +5694,6 @@ export function App() {
           );
           return;
         }
-
         if (streamEvent.type === "memoryResolved") {
           setMessagesForChatKey(chatKey, (current) =>
             current.map((message) =>
@@ -5666,6 +5712,11 @@ export function App() {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
           refreshActiveAgentTeamSnapshot(activeRun.workspaceId, activeRun.chatId);
+          void refreshMessagesAfterSpecJobSettles(
+            activeRun.workspaceId,
+            activeRun.chatId,
+            activeRun.runId,
+          );
           return;
         }
 
@@ -6579,11 +6630,17 @@ export function App() {
           );
           return;
         }
+
         if (streamEvent.type === "streamEnd") {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
           if (requestChatId) {
             refreshActiveAgentTeamSnapshot(request.workspaceId, requestChatId);
+            void refreshMessagesAfterSpecJobSettles(
+              request.workspaceId,
+              requestChatId,
+              activeRunId,
+            );
           }
           return;
         }

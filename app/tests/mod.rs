@@ -7445,7 +7445,7 @@ fn workspace_spec_failed_or_cancelled_turn_does_not_queue_update_job() {
 }
 
 #[test]
-fn workspace_spec_update_triggers_coalesce_while_job_running() {
+fn workspace_spec_update_queues_each_chat_completed_job_while_job_running() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-update-coalesce-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     seed_workspace_spec_update_chat(&workspace_dir, true);
@@ -7479,7 +7479,7 @@ fn workspace_spec_update_triggers_coalesce_while_job_running() {
         jobs.iter()
             .filter(|job| job.trigger_type == "chat_completed")
             .count(),
-        1
+        2
     );
     assert!(
         jobs.iter()
