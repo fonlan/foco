@@ -176,6 +176,28 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
             if expected_status != AgentTaskStatus::Running {
                 continue;
             }
+            if database
+                .suspend_running_agent_task_with_wait_dependencies(
+                    &record.task.team_id,
+                    &record.task.id,
+                )
+                .map_err(ApiError::from_workspace_error)?
+            {
+                insert_agent_event(
+                    &mut database,
+                    &record.task.team_id,
+                    "task_suspended",
+                    Some(&record.task.owner_instance_id),
+                    Some(&record.task.id),
+                    Some(&record.attempt.id),
+                    json!({ "reason": "startup_wait_dependency_recovery" }),
+                )?;
+                crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
+                    &workspace.path,
+                    &record.task.id,
+                )?;
+                continue;
+            }
             database
                 .update_agent_task_state(AgentTaskStateUpdate {
                     team_id: &record.task.team_id,
@@ -262,6 +284,23 @@ async fn schedule_runnable_tasks(
             };
             let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
                 .map_err(ApiError::from_workspace_error)?;
+            for recovered_task in database
+                .recover_interrupted_agent_wait_tasks(
+                    RESTART_INTERRUPTION_REASON,
+                    AGENT_SCHEDULER_SCAN_LIMIT,
+                )
+                .map_err(ApiError::from_workspace_error)?
+            {
+                insert_agent_event(
+                    &mut database,
+                    &recovered_task.team_id,
+                    "task_suspended",
+                    Some(&recovered_task.owner_instance_id),
+                    Some(&recovered_task.id),
+                    None,
+                    json!({ "reason": "interrupted_wait_dependency_recovery" }),
+                )?;
+            }
             for resumed_task in database
                 .resume_satisfied_agent_tasks(AGENT_SCHEDULER_SCAN_LIMIT)
                 .map_err(ApiError::from_workspace_error)?

@@ -5346,6 +5346,181 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn suspend_running_agent_task_with_wait_dependencies(
+        &mut self,
+        team_id: &AgentTeamId,
+        task_id: &AgentTaskId,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let owner_instance_id = transaction
+            .query_row(
+                "SELECT task.owner_instance_id
+                 FROM agent_tasks AS task
+                 WHERE task.id = ?1
+                   AND task.team_id = ?2
+                   AND task.status = 'running'
+                   AND EXISTS (
+                        SELECT 1 FROM agent_task_dependencies AS dependency
+                        WHERE dependency.team_id = task.team_id
+                          AND dependency.waiting_task_id = task.id
+                   )",
+                params![task_id.as_str(), team_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(owner_instance_id) = owner_instance_id else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        };
+        let updated = transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'waiting', updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2 AND status = 'running'",
+                params![task_id.as_str(), team_id.as_str(), now.as_str()],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated != 1 {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        }
+        let attempt_updated = transaction
+            .execute(
+                "UPDATE agent_attempts
+                 SET status = 'suspended'
+                 WHERE task_id = ?1 AND team_id = ?2 AND status = 'running'",
+                params![task_id.as_str(), team_id.as_str()],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if attempt_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "task '{task_id}' has no running attempt to suspend during reconciliation"
+                ),
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE agent_instances
+                 SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE 'waiting' END,
+                     updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2 AND status IN ('running', 'draining')",
+                params![owner_instance_id, team_id.as_str(), now.as_str()],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
+    }
+
+    pub fn recover_interrupted_agent_wait_tasks(
+        &mut self,
+        interruption_reason: &str,
+        limit: i64,
+    ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
+        if limit <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "interrupted Agent wait recovery limit must be greater than 0".to_string(),
+            });
+        }
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let task_ids = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT DISTINCT task.id, task.team_id, task.owner_instance_id
+                     FROM agent_tasks AS task
+                     JOIN agent_attempts AS attempt
+                       ON attempt.team_id = task.team_id
+                      AND attempt.task_id = task.id
+                     JOIN agent_instances AS instance
+                       ON instance.team_id = task.team_id
+                      AND instance.id = task.owner_instance_id
+                     JOIN agent_teams AS team ON team.id = task.team_id
+                     WHERE task.status = 'interrupted'
+                       AND attempt.status = 'interrupted'
+                       AND attempt.interruption_reason = ?1
+                       AND instance.status IN ('paused', 'idle', 'waiting', 'draining')
+                       AND team.status IN ('active', 'draining')
+                       AND EXISTS (
+                            SELECT 1 FROM agent_task_dependencies AS dependency
+                            WHERE dependency.team_id = task.team_id
+                              AND dependency.waiting_task_id = task.id
+                       )
+                     ORDER BY task.updated_at, task.team_id, task.owner_instance_id, task.sequence
+                     LIMIT ?2",
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let rows = statement
+                .query_map(params![interruption_reason, limit], |row| {
+                    Ok((
+                        agent_id_from_row::<AgentTaskId>(row, 0)?,
+                        agent_id_from_row::<AgentTeamId>(row, 1)?,
+                        agent_id_from_row::<AgentInstanceId>(row, 2)?,
+                    ))
+                })
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            collect_rows(rows, &database_path)?
+        };
+
+        for (task_id, team_id, owner_instance_id) in &task_ids {
+            transaction
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'waiting', error_json = NULL, completed_at = NULL, updated_at = ?3
+                     WHERE id = ?1 AND team_id = ?2 AND status = 'interrupted'",
+                    params![task_id.as_str(), team_id.as_str(), now.as_str()],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            transaction
+                .execute(
+                    "UPDATE agent_attempts
+                     SET status = 'suspended', completed_at = NULL, interruption_reason = NULL
+                     WHERE task_id = ?1 AND team_id = ?2
+                       AND status = 'interrupted'
+                       AND interruption_reason = ?3",
+                    params![task_id.as_str(), team_id.as_str(), interruption_reason],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            transaction
+                .execute(
+                    "UPDATE agent_instances
+                     SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE 'waiting' END,
+                         updated_at = ?3
+                     WHERE id = ?1 AND team_id = ?2
+                       AND status IN ('paused', 'idle', 'waiting', 'draining')",
+                    params![owner_instance_id.as_str(), team_id.as_str(), now.as_str()],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let mut tasks = Vec::with_capacity(task_ids.len());
+        for (task_id, _, _) in task_ids {
+            if let Some(task) = self.agent_task(&task_id)? {
+                tasks.push(task);
+            }
+        }
+        Ok(tasks)
+    }
+
     pub fn append_agent_event(
         &mut self,
         event: NewAgentEvent<'_>,

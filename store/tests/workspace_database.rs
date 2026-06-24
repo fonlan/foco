@@ -3783,6 +3783,273 @@ fn agent_task_state_updates_are_conditional_and_attempts_are_durable() {
 }
 
 #[test]
+fn running_agent_task_with_wait_dependencies_recovers_as_waiting() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-agent-wait-recovery", "wait-recovery");
+    let worker_id = AgentInstanceId::new("agent-instance-wait-recovery-worker").expect("worker id");
+    let worker_definition = phase8_agent_definition("wait-recovery-worker", 1, 1);
+    database
+        .create_agent_instances_with_limits(
+            &[NewAgentInstance {
+                id: &worker_id,
+                team_id: &team_id,
+                definition: &worker_definition,
+                role: AgentRole::Worker,
+                execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                execution_root_path: None,
+                worktree_base_revision: None,
+                worktree_branch: None,
+                worktree_status: None,
+            }],
+            2,
+            1,
+        )
+        .expect("create worker");
+    let parent_task = AgentTaskId::new("agent-task-wait-recovery-parent").expect("parent task");
+    let child_task = AgentTaskId::new("agent-task-wait-recovery-child").expect("child task");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &parent_task,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue parent");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &child_task,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&parent_task),
+            input_json: "{}",
+        })
+        .expect("enqueue child");
+    let parent_attempt =
+        AgentAttemptId::new("agent-attempt-wait-recovery-parent").expect("parent attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &parent_task, &parent_attempt)
+        .expect("claim parent")
+        .expect("claimed parent");
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &team_id,
+            waiting_task_id: &parent_task,
+            dependency_task_id: &child_task,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-recovery"),
+            deadline_at: None,
+        })
+        .expect("insert dependency");
+
+    assert!(
+        database
+            .suspend_running_agent_task_with_wait_dependencies(&team_id, &parent_task)
+            .expect("recover wait dependency")
+    );
+    assert_eq!(
+        database
+            .agent_task(&parent_task)
+            .expect("parent task")
+            .expect("parent task")
+            .status,
+        AgentTaskStatus::Waiting
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&parent_task)
+            .expect("parent attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Suspended
+    );
+    assert_eq!(
+        database
+            .agent_instance(&coordinator_id)
+            .expect("coordinator")
+            .expect("coordinator")
+            .status,
+        AgentInstanceStatus::Waiting
+    );
+    assert!(
+        database
+            .resume_satisfied_agent_tasks(10)
+            .expect("resume before child done")
+            .is_empty()
+    );
+
+    let child_attempt =
+        AgentAttemptId::new("agent-attempt-wait-recovery-child").expect("child attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &child_task, &child_attempt)
+        .expect("claim child")
+        .expect("claimed child");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &child_task,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"verified"}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete child");
+
+    let resumed = database
+        .resume_satisfied_agent_tasks(10)
+        .expect("resume after child done");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].id, parent_task);
+    assert_eq!(resumed[0].status, AgentTaskStatus::Queued);
+    assert_eq!(
+        database
+            .agent_instance(&coordinator_id)
+            .expect("coordinator")
+            .expect("coordinator")
+            .status,
+        AgentInstanceStatus::Idle
+    );
+}
+
+#[test]
+fn interrupted_agent_wait_task_recovers_when_dependency_finishes() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (team_id, coordinator_id) = create_test_agent_team(
+        &mut database,
+        "chat-agent-interrupted-wait-recovery",
+        "interrupted-wait-recovery",
+    );
+    let worker_id =
+        AgentInstanceId::new("agent-instance-interrupted-wait-recovery-worker").expect("worker id");
+    let worker_definition = phase8_agent_definition("interrupted-wait-recovery-worker", 1, 1);
+    database
+        .create_agent_instances_with_limits(
+            &[NewAgentInstance {
+                id: &worker_id,
+                team_id: &team_id,
+                definition: &worker_definition,
+                role: AgentRole::Worker,
+                execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                execution_root_path: None,
+                worktree_base_revision: None,
+                worktree_branch: None,
+                worktree_status: None,
+            }],
+            2,
+            1,
+        )
+        .expect("create worker");
+    let parent_task =
+        AgentTaskId::new("agent-task-interrupted-wait-recovery-parent").expect("parent task");
+    let child_task =
+        AgentTaskId::new("agent-task-interrupted-wait-recovery-child").expect("child task");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &parent_task,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue parent");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &child_task,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&parent_task),
+            input_json: "{}",
+        })
+        .expect("enqueue child");
+    let parent_attempt = AgentAttemptId::new("agent-attempt-interrupted-wait-recovery-parent")
+        .expect("parent attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &parent_task, &parent_attempt)
+        .expect("claim parent")
+        .expect("claimed parent");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &parent_task,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Interrupt,
+            result_json: None,
+            error_json: Some(r#"{"message":"backend restarted while Agent attempt was active"}"#),
+            interruption_reason: Some("backend restarted while Agent attempt was active"),
+        })
+        .expect("interrupt parent");
+    database
+        .transition_agent_instance_status(&coordinator_id, AgentInstanceStatus::Paused)
+        .expect("pause coordinator");
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &team_id,
+            waiting_task_id: &parent_task,
+            dependency_task_id: &child_task,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-interrupted-wait-recovery"),
+            deadline_at: None,
+        })
+        .expect("insert dependency");
+
+    let child_attempt = AgentAttemptId::new("agent-attempt-interrupted-wait-recovery-child")
+        .expect("child attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &child_task, &child_attempt)
+        .expect("claim child")
+        .expect("claimed child");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &child_task,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"verified"}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete child");
+
+    let recovered = database
+        .recover_interrupted_agent_wait_tasks(
+            "backend restarted while Agent attempt was active",
+            10,
+        )
+        .expect("recover interrupted wait");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].id, parent_task);
+    assert_eq!(recovered[0].status, AgentTaskStatus::Waiting);
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&parent_task)
+            .expect("parent attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Suspended
+    );
+    let resumed = database
+        .resume_satisfied_agent_tasks(10)
+        .expect("resume recovered wait");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].id, parent_task);
+    assert_eq!(resumed[0].status, AgentTaskStatus::Queued);
+    assert_eq!(
+        database
+            .agent_instance(&coordinator_id)
+            .expect("coordinator")
+            .expect("coordinator")
+            .status,
+        AgentInstanceStatus::Idle
+    );
+}
+
+#[test]
 fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
