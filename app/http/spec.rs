@@ -9,7 +9,7 @@ use foco_store::workspace::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::spec_runtime::run_workspace_spec_job;
+use crate::spec_runtime::{log_workspace_spec_job_status, run_workspace_spec_job};
 use crate::*;
 
 const DEFAULT_SPEC_JOB_LIMIT: i64 = 50;
@@ -185,6 +185,7 @@ pub(crate) async fn generate_workspace_spec(
             input_summary_json: None,
         })
         .map_err(spec_workspace_error)?;
+    log_workspace_spec_job_status(&workspace_id, &job);
     let response = workspace_spec_job_summary(job.clone())?;
     let runtime_state = state.clone();
     let runtime_workspace_id = workspace_id.clone();

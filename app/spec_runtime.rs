@@ -8,9 +8,9 @@ use foco_store::{
     memory::MemoryDatabase,
     workspace::{
         CodeChangeStats, CodeGraphFileSummaryRecord, CodeGraphSymbolRecord, NewWorkspaceSpecJob,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabase, WorkspaceSpecJobRecord,
-        WorkspaceSpecJobStatus, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
-        workspace_database_path,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        WorkspaceDatabase, WorkspaceSpecJobRecord, WorkspaceSpecJobStatus,
+        WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision, workspace_database_path,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -233,6 +233,7 @@ pub(crate) fn queue_workspace_spec_update_job(
             input_summary_json: Some(&input_summary_json),
         })
         .map_err(ApiError::from_workspace_error)?;
+    log_workspace_spec_job_status(&context.workspace_id, &job);
     let job_id = job.id;
     drop(database);
 
@@ -289,7 +290,12 @@ async fn run_workspace_spec_jobs(
         let result =
             run_workspace_spec_job_inner(&config, &workspace_id, &workspace_path, &job_id).await;
         if let Err(error) = &result {
-            mark_workspace_spec_job_failed_at_path(&workspace_path, &job_id, &error.message);
+            mark_workspace_spec_job_failed_at_path(
+                &workspace_path,
+                &workspace_id,
+                &job_id,
+                &error.message,
+            );
             return result;
         }
 
@@ -335,12 +341,16 @@ async fn run_workspace_spec_job_inner(
     )
     .await?;
     let content_markdown = parse_workspace_spec_output(tool_arguments)?;
-    apply_workspace_spec_job_output(
+    let result = apply_workspace_spec_job_output(
         &prepared.workspace_path,
         &prepared.job_id,
         prepared.base_revision,
         &content_markdown,
-    )
+    );
+    if result.is_ok() {
+        log_workspace_spec_job_status_at_path(workspace_path, workspace_id, &prepared.job_id);
+    }
+    result
 }
 
 async fn run_workspace_spec_update_job_inner(
@@ -359,6 +369,7 @@ async fn run_workspace_spec_update_job_inner(
         database
             .mark_workspace_spec_job_skipped(&job.id, "workspace_spec_disabled")
             .map_err(ApiError::from_workspace_error)?;
+        log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
         return Ok(());
     };
     let base_revision = job.base_revision.unwrap_or(spec.revision);
@@ -368,6 +379,7 @@ async fn run_workspace_spec_update_job_inner(
         database
             .mark_workspace_spec_job_skipped(&job.id, "stale_revision")
             .map_err(ApiError::from_workspace_error)?;
+        log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
         return Ok(());
     }
 
@@ -380,6 +392,7 @@ async fn run_workspace_spec_update_job_inner(
     database
         .mark_workspace_spec_job_running(&job.id)
         .map_err(ApiError::from_workspace_error)?;
+    log_workspace_spec_job_status_from_database(&database, workspace_id, &job.id);
     drop(database);
 
     let model = resolve_workspace_spec_model(config, job.model_id.as_deref())?;
@@ -405,7 +418,16 @@ async fn run_workspace_spec_update_job_inner(
     )
     .await?;
 
-    apply_workspace_spec_update_job_output(workspace_path, &job.id, base_revision, tool_arguments)
+    let result = apply_workspace_spec_update_job_output(
+        workspace_path,
+        &job.id,
+        base_revision,
+        tool_arguments,
+    );
+    if result.is_ok() {
+        log_workspace_spec_job_status_at_path(workspace_path, workspace_id, &job.id);
+    }
+    result
 }
 
 pub(crate) fn apply_workspace_spec_update_job_output(
@@ -471,6 +493,7 @@ fn prepare_workspace_spec_generation_job(
         database
             .mark_workspace_spec_job_skipped(job_id, "workspace_spec_disabled")
             .map_err(ApiError::from_workspace_error)?;
+        log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
         return Ok(None);
     };
     let base_revision = job.base_revision.unwrap_or(spec.revision);
@@ -480,12 +503,14 @@ fn prepare_workspace_spec_generation_job(
         database
             .mark_workspace_spec_job_skipped(job_id, "stale_revision")
             .map_err(ApiError::from_workspace_error)?;
+        log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
         return Ok(None);
     }
 
     database
         .mark_workspace_spec_job_running(job_id)
         .map_err(ApiError::from_workspace_error)?;
+    log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
     let input_summary =
         collect_workspace_spec_input(config, workspace_id, workspace_path, base_revision)?;
     let input_summary_json = serde_json::to_string(&input_summary).map_err(|source| {
@@ -989,6 +1014,7 @@ fn queued_workspace_spec_job_id(
 
 fn mark_workspace_spec_job_failed_at_path(
     workspace_path: &std::path::Path,
+    workspace_id: &str,
     job_id: &str,
     error_message: &str,
 ) {
@@ -1001,6 +1027,62 @@ fn mark_workspace_spec_job_failed_at_path(
             error = %error,
             "failed to mark workspace spec job failed"
         );
+    }
+    log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
+}
+
+pub(crate) fn log_workspace_spec_job_status(workspace_id: &str, job: &WorkspaceSpecJobRecord) {
+    let skip_reason = job
+        .status
+        .eq(WorkspaceSpecJobStatus::Skipped.as_str())
+        .then(|| job.error_message.as_deref())
+        .flatten()
+        .unwrap_or("");
+    let stale_skip_reason = if skip_reason == WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON {
+        skip_reason
+    } else {
+        ""
+    };
+    tracing::info!(
+        workspace_id = %workspace_id,
+        job_id = %job.id,
+        trigger_type = %job.trigger_type,
+        status = %job.status,
+        skip_reason = %skip_reason,
+        stale_skip_reason = %stale_skip_reason,
+        "workspace spec job status"
+    );
+}
+
+fn log_workspace_spec_job_status_at_path(
+    workspace_path: &std::path::Path,
+    workspace_id: &str,
+    job_id: &str,
+) {
+    let Ok(database) = WorkspaceDatabase::open_or_create(workspace_path) else {
+        return;
+    };
+    log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
+}
+
+fn log_workspace_spec_job_status_from_database(
+    database: &WorkspaceDatabase,
+    workspace_id: &str,
+    job_id: &str,
+) {
+    match database.workspace_spec_job(job_id) {
+        Ok(Some(job)) => log_workspace_spec_job_status(workspace_id, &job),
+        Ok(None) => tracing::warn!(
+            workspace_id = %workspace_id,
+            job_id = %job_id,
+            "workspace spec job status could not be logged because the job was not found"
+        ),
+        Err(error) => tracing::warn!(
+            workspace_id = %workspace_id,
+            job_id = %job_id,
+            error = %error,
+            "workspace spec job status could not be logged"
+        ),
     }
 }
 

@@ -7168,6 +7168,9 @@ async fn workspace_spec_http_queues_manual_generate_job() {
             .expect("spec jobs");
     let jobs_response = serde_json::to_value(jobs_response).expect("jobs response json");
     assert_eq!(jobs_response["jobs"][0]["id"], job_id);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    assert!(database.chats().expect("normal chats").is_empty());
 }
 
 #[test]

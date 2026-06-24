@@ -20,9 +20,9 @@ use foco_store::{
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
         NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
         NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession, NewToolCall, NewToolResult, ScheduledTaskDueRunClaim,
-        ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
-        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
+        ScheduledTaskDueRunClaim, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
+        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
         WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
         WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
         WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
@@ -265,6 +265,93 @@ fn workspace_spec_content_update_rejects_stale_revision() {
 }
 
 #[test]
+fn workspace_spec_jobs_redact_audit_json_fields() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    let job = database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-1",
+            trigger_type: "manual_initial",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(0),
+            input_summary_json: Some(
+                r#"{"headers":{"authorization":"Bearer sk-test"},"safe":"ok","nested":{"api_key":"secret"}}"#,
+            ),
+        })
+        .expect("spec job insert");
+    let input: Value = serde_json::from_str(&job.input_summary_json).expect("input json");
+    assert_eq!(input["headers"]["authorization"], "[REDACTED]");
+    assert_eq!(input["nested"]["api_key"], "[REDACTED]");
+    assert_eq!(input["safe"], "ok");
+
+    database
+        .update_workspace_spec_job_input_summary(
+            "spec-job-1",
+            r#"{"cookie":"session=secret","sourceFiles":[{"content":"password in source text stays as evidence"}]}"#,
+        )
+        .expect("update input");
+    database
+        .mark_workspace_spec_job_completed(
+            "spec-job-1",
+            Some(r#"{"response":{"password":"secret"},"contentBytes":12}"#),
+        )
+        .expect("complete job");
+    let job = database
+        .workspace_spec_job("spec-job-1")
+        .expect("job lookup")
+        .expect("spec job");
+    let input: Value = serde_json::from_str(&job.input_summary_json).expect("updated input json");
+    assert_eq!(input["cookie"], "[REDACTED]");
+    assert_eq!(
+        input["sourceFiles"][0]["content"],
+        "password in source text stays as evidence"
+    );
+    let output: Value =
+        serde_json::from_str(job.output_json.as_deref().expect("output json")).expect("output");
+    assert_eq!(output["response"]["password"], "[REDACTED]");
+    assert_eq!(output["contentBytes"], 12);
+}
+
+#[test]
+fn delete_chat_cascades_spec_snapshot_but_preserves_workspace_spec() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .insert_chat("chat-1", "Spec snapshot chat")
+        .expect("chat insert");
+    database
+        .upsert_workspace_spec_settings(true, true)
+        .expect("spec settings");
+    database
+        .update_workspace_spec_content(0, "# Project Spec\n\nWorkspace spec survives.")
+        .expect("workspace spec")
+        .expect("workspace spec saved");
+    database
+        .insert_chat_spec_snapshot("chat-1", 1, "# Project Spec\n\nChat snapshot")
+        .expect("snapshot insert");
+
+    assert!(database.delete_chat("chat-1").expect("chat delete"));
+    assert!(
+        database
+            .chat_spec_snapshot("chat-1")
+            .expect("snapshot lookup")
+            .is_none()
+    );
+    let spec = database
+        .workspace_spec()
+        .expect("workspace spec lookup")
+        .expect("workspace spec");
+    assert_eq!(spec.revision, 1);
+    assert!(spec.content_markdown.contains("Workspace spec survives"));
+}
+
+#[test]
 fn workspace_connections_wait_for_concurrent_writer_lock() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let workspace_path = workspace.path().to_path_buf();
@@ -370,6 +457,45 @@ fn backs_up_existing_database_before_migration() {
         .expect("backup entries");
     assert_eq!(backups.len(), 1);
     assert!(backups[0].path().is_file());
+}
+
+#[test]
+fn migrates_v17_workspace_spec_tables_and_creates_backup() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v17 database");
+    connection
+        .execute_batch(
+            "CREATE TABLE chats (
+                id TEXT PRIMARY KEY NOT NULL,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+             );
+             PRAGMA user_version = 17;",
+        )
+        .expect("v17 schema");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+
+    let connection = Connection::open(database.database_path()).expect("open migrated database");
+    assert!(table_exists(&connection, "workspace_specs"));
+    assert!(table_exists(&connection, "workspace_spec_jobs"));
+    assert!(table_exists(&connection, "chat_spec_snapshots"));
+    let backups = fs::read_dir(workspace.path().join(".foco").join("backups"))
+        .expect("backup directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("backup entries");
+    assert_eq!(backups.len(), 1);
 }
 
 #[test]

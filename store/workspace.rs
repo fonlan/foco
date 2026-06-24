@@ -648,7 +648,8 @@ impl WorkspaceDatabase {
     ) -> Result<WorkspaceSpecJobRecord, WorkspaceDatabaseError> {
         WorkspaceSpecTriggerType::parse(job.trigger_type)?;
         let input_summary_json = job.input_summary_json.unwrap_or("{}");
-        validate_workspace_spec_json_object(input_summary_json, "input_summary_json")?;
+        let input_summary_json =
+            redact_workspace_spec_json_object(input_summary_json, "input_summary_json")?;
         let base_revision = job
             .base_revision
             .map(|revision| workspace_spec_revision_to_i64(revision, "base_revision"))
@@ -772,7 +773,8 @@ impl WorkspaceDatabase {
         id: &str,
         input_summary_json: &str,
     ) -> Result<bool, WorkspaceDatabaseError> {
-        validate_workspace_spec_json_object(input_summary_json, "input_summary_json")?;
+        let input_summary_json =
+            redact_workspace_spec_json_object(input_summary_json, "input_summary_json")?;
         self.connection
             .execute(
                 "UPDATE workspace_spec_jobs
@@ -806,7 +808,7 @@ impl WorkspaceDatabase {
         id: &str,
         output_json: Option<&str>,
     ) -> Result<bool, WorkspaceDatabaseError> {
-        validate_optional_workspace_spec_json(output_json, "output_json")?;
+        let output_json = redact_optional_workspace_spec_json(output_json, "output_json")?;
         let now = now_timestamp();
         self.connection
             .execute(
@@ -7060,34 +7062,45 @@ fn validate_agent_definition_snapshot(value: &str) -> Result<(), WorkspaceDataba
     Ok(())
 }
 
-fn validate_workspace_spec_json_object(
+fn redact_workspace_spec_json_object(
     value: &str,
     field: &str,
-) -> Result<(), WorkspaceDatabaseError> {
-    let parsed = serde_json::from_str::<Value>(value).map_err(|source| {
+) -> Result<String, WorkspaceDatabaseError> {
+    let mut parsed = parse_workspace_spec_json(value, field)?;
+    if !parsed.is_object() {
+        return Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
+            message: format!("{field} must be a JSON object"),
+        });
+    }
+    redact_json_value(&mut parsed);
+    serde_json::to_string(&parsed).map_err(|source| WorkspaceDatabaseError::InvalidWorkspaceSpec {
+        message: format!("{field} could not be serialized after redaction: {source}"),
+    })
+}
+
+fn redact_optional_workspace_spec_json(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, WorkspaceDatabaseError> {
+    value
+        .map(|value| redact_workspace_spec_json(value, field))
+        .transpose()
+}
+
+fn redact_workspace_spec_json(value: &str, field: &str) -> Result<String, WorkspaceDatabaseError> {
+    let mut parsed = parse_workspace_spec_json(value, field)?;
+    redact_json_value(&mut parsed);
+    serde_json::to_string(&parsed).map_err(|source| WorkspaceDatabaseError::InvalidWorkspaceSpec {
+        message: format!("{field} could not be serialized after redaction: {source}"),
+    })
+}
+
+fn parse_workspace_spec_json(value: &str, field: &str) -> Result<Value, WorkspaceDatabaseError> {
+    serde_json::from_str::<Value>(value).map_err(|source| {
         WorkspaceDatabaseError::InvalidWorkspaceSpec {
             message: format!("{field} must be valid JSON: {source}"),
         }
-    })?;
-    if parsed.is_object() {
-        Ok(())
-    } else {
-        Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
-            message: format!("{field} must be a JSON object"),
-        })
-    }
-}
-
-fn validate_optional_workspace_spec_json(
-    value: Option<&str>,
-    field: &str,
-) -> Result<(), WorkspaceDatabaseError> {
-    let Some(value) = value else { return Ok(()) };
-    serde_json::from_str::<Value>(value)
-        .map(|_| ())
-        .map_err(|source| WorkspaceDatabaseError::InvalidWorkspaceSpec {
-            message: format!("{field} must be valid JSON: {source}"),
-        })
+    })
 }
 
 fn validate_scheduled_task_status(status: &str) -> Result<(), WorkspaceDatabaseError> {
