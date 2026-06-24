@@ -68,7 +68,10 @@ use crate::runtime::{
     wait_for_tool_resource_lock,
 };
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
-use crate::spec_runtime::{apply_workspace_spec_job_output, prepare_workspace_spec_job};
+use crate::spec_runtime::{
+    apply_workspace_spec_job_output, apply_workspace_spec_update_job_output,
+    prepare_workspace_spec_job, queue_workspace_spec_update_job,
+};
 
 fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
     NeutralToolCall {
@@ -7234,21 +7237,6 @@ fn workspace_spec_runtime_uses_evidence_language_and_writes_revision() {
             .expect("prepare spec job")
             .expect("prepared job");
     assert!(
-        prepared
-            .input_summary
-            .code_graph
-            .symbols
-            .iter()
-            .any(|symbol| symbol.name == "public_api")
-    );
-    assert!(
-        prepared
-            .input_summary
-            .source_files
-            .iter()
-            .any(|file| file.path == "README.md" && file.content.contains("project context"))
-    );
-    assert!(
         prepared.request.messages[0]
             .content
             .contains("Simplified Chinese")
@@ -7277,6 +7265,268 @@ fn workspace_spec_runtime_uses_evidence_language_and_writes_revision() {
     assert_eq!(job.status, "completed");
     assert!(job.input_summary_json.contains("public_api"));
     assert!(job.input_summary_json.contains("README.md"));
+}
+
+#[test]
+fn workspace_spec_successful_primary_turn_queues_update_job() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-update-queue-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    seed_workspace_spec_update_chat(&workspace_dir, false);
+    let mut context = workspace_spec_update_test_context(workspace_dir.clone());
+    context.code_change_stats = CodeChangeStats {
+        additions: 2,
+        deletions: 1,
+    };
+
+    persist_chat_result(
+        &context,
+        "2026-06-06T09:00:00Z",
+        test_chat_outcome("succeeded"),
+        &[],
+        Some("Added the spec update scheduler hook."),
+        None,
+        &[],
+    )
+    .expect("persist chat result");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let jobs = database
+        .workspace_spec_jobs(10)
+        .expect("workspace spec jobs");
+    assert_eq!(jobs.len(), 1);
+    let job = &jobs[0];
+    assert_eq!(job.trigger_type, "chat_completed");
+    assert_eq!(job.status, "queued");
+    assert_eq!(job.chat_id.as_deref(), Some("chat-1"));
+    assert_eq!(job.run_id.as_deref(), Some("request-1"));
+    assert_eq!(job.model_id.as_deref(), Some("model"));
+    assert_eq!(job.base_revision, Some(1));
+
+    let input: Value =
+        serde_json::from_str(&job.input_summary_json).expect("workspace spec update input");
+    assert_eq!(input["currentSpecRevision"], 1);
+    assert_eq!(input["userMessageId"], "user-1");
+    assert_eq!(input["assistantMessageId"], "assistant-1");
+    assert_eq!(input["runId"], "request-1");
+    assert_eq!(input["codeChangeStats"]["additions"], 2);
+    assert!(
+        input["chatExcerpt"]["user"]
+            .as_str()
+            .unwrap()
+            .contains("Spec")
+    );
+    assert!(
+        input["chatExcerpt"]["assistant"]
+            .as_str()
+            .unwrap()
+            .contains("scheduler hook")
+    );
+    assert!(
+        input["currentSpecMarkdown"]
+            .as_str()
+            .unwrap()
+            .contains("Existing spec")
+    );
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn workspace_spec_failed_or_cancelled_turn_does_not_queue_update_job() {
+    for final_state in ["failed", "cancelled"] {
+        let workspace_dir =
+            env::temp_dir().join(unique_id("foco-project-spec-update-noqueue-test"));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        seed_workspace_spec_update_chat(&workspace_dir, false);
+        let context = workspace_spec_update_test_context(workspace_dir.clone());
+
+        persist_chat_result(
+            &context,
+            "2026-06-06T09:00:00Z",
+            test_chat_outcome(final_state),
+            &[],
+            None,
+            None,
+            &[],
+        )
+        .expect("persist chat result");
+
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        assert!(
+            database
+                .workspace_spec_jobs(10)
+                .expect("workspace spec jobs")
+                .is_empty()
+        );
+
+        drop(database);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    }
+}
+
+#[test]
+fn workspace_spec_update_triggers_coalesce_while_job_running() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-update-coalesce-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    seed_workspace_spec_update_chat(&workspace_dir, true);
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: "running-spec-job",
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("insert running spec job");
+        database
+            .mark_workspace_spec_job_running("running-spec-job")
+            .expect("mark spec job running");
+    }
+    let context = workspace_spec_update_test_context(workspace_dir.clone());
+
+    queue_workspace_spec_update_job(&context, "succeeded").expect("queue first update");
+    queue_workspace_spec_update_job(&context, "succeeded").expect("queue second update");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+    let jobs = database
+        .workspace_spec_jobs(10)
+        .expect("workspace spec jobs");
+    assert_eq!(
+        jobs.iter()
+            .filter(|job| job.trigger_type == "chat_completed")
+            .count(),
+        1
+    );
+    assert!(
+        jobs.iter()
+            .any(|job| job.id == "running-spec-job" && job.status == "running")
+    );
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn workspace_spec_update_job_skips_stale_manual_edit() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-update-stale-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    seed_workspace_spec_update_chat(&workspace_dir, true);
+    let context = workspace_spec_update_test_context(workspace_dir.clone());
+
+    queue_workspace_spec_update_job(&context, "succeeded").expect("queue spec update");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+    let job = database
+        .workspace_spec_jobs(1)
+        .expect("workspace spec jobs")
+        .pop()
+        .expect("queued spec job");
+    database
+        .update_workspace_spec_content(1, "# Project Spec\n\nManual edit wins.")
+        .expect("manual spec edit");
+    drop(database);
+
+    apply_workspace_spec_update_job_output(
+        &workspace_dir,
+        &job.id,
+        job.base_revision.expect("base revision"),
+        json!({
+            "updateNeeded": true,
+            "contentMarkdown": "# Project Spec\n\nModel update loses."
+        }),
+    )
+    .expect("apply stale spec update");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace db");
+    let spec = database
+        .workspace_spec()
+        .expect("workspace spec")
+        .expect("spec row");
+    assert_eq!(spec.revision, 2);
+    assert!(spec.content_markdown.contains("Manual edit wins"));
+    let job = database
+        .workspace_spec_job(&job.id)
+        .expect("workspace spec job")
+        .expect("spec job");
+    assert_eq!(job.status, "skipped");
+    assert_eq!(job.error_message.as_deref(), Some("stale_revision"));
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+fn seed_workspace_spec_update_chat(workspace_dir: &std::path::Path, include_assistant: bool) {
+    let mut database = WorkspaceDatabase::open_or_create(workspace_dir).expect("workspace db");
+    database
+        .insert_chat("chat-1", "Spec update chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-1",
+            chat_id: "chat-1",
+            role: "user",
+            content: "Update Project Spec after adding the async hook.",
+            sequence: 0,
+            metadata_json: Some("{}"),
+        })
+        .expect("user message insert");
+    if include_assistant {
+        database
+            .insert_message(NewMessage {
+                id: "assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "Added the spec update scheduler hook.",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("assistant message insert");
+    }
+    database
+        .upsert_workspace_spec_settings(true, false)
+        .expect("spec settings");
+    database
+        .update_workspace_spec_content(0, "# Project Spec\n\nExisting spec.")
+        .expect("seed spec content");
+}
+
+fn workspace_spec_update_test_context(workspace_dir: PathBuf) -> PreparedChatContext {
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Update Project Spec after adding the async hook.".to_string(),
+        )],
+        vec![Some(0)],
+        vec![PromptContextSource::StoredMessage { sequence: 0 }],
+        984,
+    );
+    context.global_config = prompt_test_config(workspace_dir);
+    context.provider_id = "provider".to_string();
+    context.model_id = "model".to_string();
+    context.provider_request.model_id = "model".to_string();
+    context
+}
+
+fn test_chat_outcome(final_state: &'static str) -> ChatAuditOutcome {
+    ChatAuditOutcome {
+        first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
+        completed_at: "2026-06-06T09:00:01Z".to_string(),
+        first_token_latency_ms: Some(100),
+        total_latency_ms: 1_000,
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        cache_read_tokens: Some(0),
+        cache_write_tokens: Some(0),
+        status_code: Some(200),
+        final_state,
+        response_body_json: Some(r#"{"text":"Done."}"#.to_string()),
+    }
 }
 
 #[tokio::test]

@@ -726,6 +726,47 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn queued_workspace_spec_job(
+        &self,
+    ) -> Result<Option<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                        input_summary_json, output_json, error_message, created_at,
+                        started_at, completed_at
+                 FROM workspace_spec_jobs
+                 WHERE status = ?1
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT 1",
+                params![WorkspaceSpecJobStatus::Queued.as_str()],
+                workspace_spec_job_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn queued_workspace_spec_update_job(
+        &self,
+    ) -> Result<Option<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                        input_summary_json, output_json, error_message, created_at,
+                        started_at, completed_at
+                 FROM workspace_spec_jobs
+                 WHERE status = ?1 AND trigger_type = ?2
+                 ORDER BY created_at ASC, id ASC
+                 LIMIT 1",
+                params![
+                    WorkspaceSpecJobStatus::Queued.as_str(),
+                    WorkspaceSpecTriggerType::ChatCompleted.as_str()
+                ],
+                workspace_spec_job_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn update_workspace_spec_job_input_summary(
         &mut self,
         id: &str,

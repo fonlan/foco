@@ -1550,8 +1550,11 @@ pub(crate) fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
+    drop(database);
+
     if context.agent_primary_chat_output {
         queue_memory_extraction_job(context, final_state)?;
+        crate::spec_runtime::queue_workspace_spec_update_job(context, final_state)?;
     }
 
     Ok(())
