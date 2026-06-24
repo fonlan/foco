@@ -7528,6 +7528,7 @@ export function App() {
               ) : activeMainTab.type === "agent" && activeAgentTab ? (
                 <AgentTranscriptPanel
                   error={agentTeamError}
+                  helpers={chatPanelHelpers}
                   instanceId={activeAgentTab.instanceId}
                   isLoading={isLoadingAgentTeam}
                   onOpenMainChat={() =>

@@ -1,13 +1,21 @@
-import { ArrowLeft, Bot, ListChecks, RefreshCw, User } from "lucide-react";
+import { ArrowLeft, Bot, ListChecks, LoaderCircle, RefreshCw, User } from "lucide-react";
 import { useMemo } from "react";
 
 import type {
   AgentInstanceView,
   AgentMessageView,
+  AgentRunEventView,
   AgentTaskView,
   AgentTeamSnapshotResponse,
+  ChatMessagePart,
+  ChatReplyMetrics,
+  ChatToolCallSummary,
   JsonValue,
 } from "../../api/types";
+import {
+  MessagePartBlock,
+  type ChatPanelHelpers,
+} from "../chat/ChatPanel";
 import { MarkdownContent } from "../chat/MarkdownContent";
 import { useI18n } from "../../shared/i18n";
 
@@ -17,7 +25,10 @@ type AgentTranscriptItem = {
   createdAt: string;
   id: string;
   kind: string;
+  metrics: ChatReplyMetrics | null;
+  parts: ChatMessagePart[];
   role: "assistant" | "user";
+  status?: "error" | "streaming";
   taskStatus: string | null;
 };
 
@@ -25,6 +36,7 @@ const noSelectedSkillPrefix = () => null;
 
 export function AgentTranscriptPanel({
   error,
+  helpers,
   instanceId,
   isLoading,
   onOpenMainChat,
@@ -32,6 +44,7 @@ export function AgentTranscriptPanel({
   snapshot,
 }: {
   error: string | null;
+  helpers: ChatPanelHelpers;
   instanceId: string;
   isLoading: boolean;
   onOpenMainChat: () => void;
@@ -131,7 +144,7 @@ export function AgentTranscriptPanel({
           ) : null}
 
           {items.map((item) => (
-            <AgentTranscriptBubble item={item} key={item.id} />
+            <AgentTranscriptBubble helpers={helpers} item={item} key={item.id} />
           ))}
         </div>
       </div>
@@ -139,9 +152,19 @@ export function AgentTranscriptPanel({
   );
 }
 
-function AgentTranscriptBubble({ item }: { item: AgentTranscriptItem }) {
+function AgentTranscriptBubble({
+  helpers,
+  item,
+}: {
+  helpers: ChatPanelHelpers;
+  item: AgentTranscriptItem;
+}) {
   const { t } = useI18n();
   const isUser = item.role === "user";
+  const isStreaming = item.status === "streaming";
+  const reasoningPartCount = item.parts.filter(
+    (part) => part.type === "reasoning",
+  ).length;
 
   return (
     <div
@@ -195,11 +218,35 @@ function AgentTranscriptBubble({ item }: { item: AgentTranscriptItem }) {
                 </time>
               </span>
             </div>
-            <MarkdownContent
-              content={item.content}
-              isUser={isUser}
-              selectedSkillPrefix={noSelectedSkillPrefix}
-            />
+            {item.parts.length ? (
+              item.parts.map((part, partIndex) => (
+                <MessagePartBlock
+                  helpers={helpers}
+                  isError={item.status === "error"}
+                  isStreaming={isStreaming}
+                  isStreamingTail={partIndex === item.parts.length - 1}
+                  isUser={isUser}
+                  key={`${item.id}-part-${partIndex}`}
+                  part={part}
+                  reasoningDurationFallbackMs={
+                    reasoningPartCount === 1
+                      ? item.metrics?.totalLatencyMs ?? null
+                      : null
+                  }
+                />
+              ))
+            ) : isStreaming ? (
+              <LoaderCircle
+                aria-hidden="true"
+                className="size-4 animate-spin"
+              />
+            ) : (
+              <MarkdownContent
+                content={item.content}
+                isUser={isUser}
+                selectedSkillPrefix={noSelectedSkillPrefix}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -233,6 +280,12 @@ function buildAgentTranscriptItems(
       )
       .map((message) => message.relatedTaskId as string),
   );
+  const runEventsByTaskId = new Map<string, AgentRunEventView[]>();
+  for (const event of snapshot.runEvents ?? []) {
+    const events = runEventsByTaskId.get(event.runId) ?? [];
+    events.push(event);
+    runEventsByTaskId.set(event.runId, events);
+  }
   const items: AgentTranscriptItem[] = [];
 
   for (const task of snapshot.tasks) {
@@ -252,22 +305,35 @@ function buildAgentTranscriptItems(
         createdAt: task.createdAt,
         id: `task:${task.id}:input`,
         kind: "Task input",
+        metrics: null,
+        parts: [],
         role: "user",
         taskStatus: task.status,
       });
     }
 
-    const output = taskOutputContent(task);
-    if (output) {
-      items.push({
-        author: instance.definitionSnapshot.name,
-        content: output.content,
-        createdAt: task.completedAt ?? task.updatedAt,
-        id: `task:${task.id}:output`,
-        kind: output.kind,
-        role: "assistant",
-        taskStatus: task.status,
-      });
+    const runItem = taskRunTranscriptItem(
+      task,
+      runEventsByTaskId.get(task.id) ?? [],
+      instance.definitionSnapshot.name,
+    );
+    if (runItem) {
+      items.push(runItem);
+    } else {
+      const output = taskOutputContent(task);
+      if (output) {
+        items.push({
+          author: instance.definitionSnapshot.name,
+          content: output.content,
+          createdAt: task.completedAt ?? task.updatedAt,
+          id: `task:${task.id}:output`,
+          kind: output.kind,
+          metrics: null,
+          parts: [],
+          role: "assistant",
+          taskStatus: task.status,
+        });
+      }
     }
   }
 
@@ -296,12 +362,378 @@ function buildAgentTranscriptItems(
       createdAt: message.createdAt,
       id: `message:${message.id}`,
       kind: messageKindLabel(message),
+      metrics: null,
+      parts: [],
       role: isOutgoing ? "assistant" : "user",
       taskStatus: relatedTask?.status ?? null,
     });
   }
 
   return items.sort(compareTranscriptItems);
+}
+
+function taskRunTranscriptItem(
+  task: AgentTaskView,
+  events: AgentRunEventView[],
+  author: string,
+): AgentTranscriptItem | null {
+  const sortedEvents = [...events].sort(compareRunEvents);
+  if (!sortedEvents.length) {
+    if (task.status !== "running") {
+      return null;
+    }
+    return {
+      author,
+      content: "",
+      createdAt: task.startedAt ?? task.updatedAt,
+      id: `task:${task.id}:run`,
+      kind: "Task run",
+      metrics: null,
+      parts: [],
+      role: "assistant",
+      status: "streaming",
+      taskStatus: task.status,
+    };
+  }
+
+  let content = "";
+  let metrics: ChatReplyMetrics | null = null;
+  let parts: ChatMessagePart[] = [];
+  let status: AgentTranscriptItem["status"] = task.status === "running" ? "streaming" : undefined;
+
+  for (const event of sortedEvents) {
+    const payload = jsonRecord(event.payload);
+    const type = payload ? jsonRawStringField(payload, "type") : null;
+    if (!payload || !type) {
+      continue;
+    }
+
+    if (type === "textDelta") {
+      const delta = jsonRawStringField(payload, "delta") ?? "";
+      content += delta;
+      parts = appendTextPart(parts, delta);
+      if (!status) {
+        status = "streaming";
+      }
+      continue;
+    }
+
+    if (type === "reasoningDelta") {
+      const delta = jsonRawStringField(payload, "delta") ?? "";
+      parts = appendReasoningPart(parts, delta);
+      if (!status) {
+        status = "streaming";
+      }
+      continue;
+    }
+
+    if (type === "toolCall") {
+      const toolCall = chatToolCallSummary(payload.toolCall);
+      if (toolCall) {
+        parts = upsertToolCallPart(parts, toolCall);
+        if (!status) {
+          status = "streaming";
+        }
+      }
+      continue;
+    }
+
+    if (type === "toolResult") {
+      const toolCallId = jsonRawStringField(payload, "toolCallId");
+      const output = payload.output;
+      const isError = jsonBooleanField(payload, "isError") ?? false;
+      if (toolCallId && isJsonValue(output)) {
+        parts = applyToolResultToParts(parts, toolCallId, output, isError);
+      }
+      continue;
+    }
+
+    if (type === "toolOutputDelta") {
+      const toolCallId = jsonRawStringField(payload, "toolCallId");
+      const stream = jsonRawStringField(payload, "stream");
+      const delta = jsonRawStringField(payload, "delta") ?? "";
+      if (toolCallId && (stream === "stdout" || stream === "stderr")) {
+        parts = applyToolOutputDeltaToParts(parts, toolCallId, stream, delta);
+      }
+      continue;
+    }
+
+    if (type === "streamReset") {
+      content = jsonRawStringField(payload, "text") ?? "";
+      parts = partsFromRunSnapshot(
+        content,
+        optionalJsonString(payload.reasoning),
+        jsonArrayField(payload, "toolCalls")
+          .map(chatToolCallSummary)
+          .filter((toolCall): toolCall is ChatToolCallSummary => Boolean(toolCall)),
+      );
+      status = "streaming";
+      continue;
+    }
+
+    if (type === "complete") {
+      const finalText = jsonRawStringField(payload, "text") ?? content;
+      const finalReasoning = optionalJsonString(payload.reasoning);
+      parts = appendMissingReasoning(parts, finalReasoning);
+      parts = appendMissingText(parts, content, finalText);
+      content = finalText;
+      metrics = chatReplyMetrics(payload.metrics);
+      status = undefined;
+      continue;
+    }
+
+    if (type === "error") {
+      parts = appendErrorPart(
+        parts,
+        jsonRawStringField(payload, "message") ?? "Unknown error",
+      );
+      status = "error";
+    }
+  }
+
+  const terminalOutput = task.status !== "running" ? taskOutputContent(task) : null;
+  if (terminalOutput?.kind === "Task error" && !hasPartType(parts, "error")) {
+    parts = appendErrorPart(parts, terminalOutput.content);
+    status = "error";
+  } else if (terminalOutput?.kind === "Task result" && !content) {
+    content = terminalOutput.content;
+    parts = appendTextPart(parts, terminalOutput.content);
+  }
+
+  if (!parts.length && !content && task.status !== "running") {
+    return null;
+  }
+
+  return {
+    author,
+    content,
+    createdAt: sortedEvents[0]?.createdAt ?? task.startedAt ?? task.updatedAt,
+    id: `task:${task.id}:run`,
+    kind: status === "streaming" ? "Task run" : status === "error" ? "Task error" : "Task result",
+    metrics,
+    parts,
+    role: "assistant",
+    status,
+    taskStatus: task.status,
+  };
+}
+
+function appendTextPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
+  if (!text) {
+    return parts;
+  }
+  const lastPart = parts[parts.length - 1];
+  if (lastPart?.type !== "text") {
+    return [...parts, { type: "text", text }];
+  }
+  return [...parts.slice(0, -1), { ...lastPart, text: lastPart.text + text }];
+}
+
+function appendReasoningPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
+  if (!text) {
+    return parts;
+  }
+  const lastPart = parts[parts.length - 1];
+  if (lastPart?.type !== "reasoning") {
+    return [...parts, { type: "reasoning", text }];
+  }
+  return [...parts.slice(0, -1), { ...lastPart, text: lastPart.text + text }];
+}
+
+function appendErrorPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
+  if (!text) {
+    return parts;
+  }
+  const lastPart = parts[parts.length - 1];
+  if (lastPart?.type !== "error") {
+    return [...parts, { type: "error", text }];
+  }
+  return [...parts.slice(0, -1), { ...lastPart, text: lastPart.text + text }];
+}
+
+function appendMissingText(
+  parts: ChatMessagePart[],
+  current: string,
+  finalText: string,
+): ChatMessagePart[] {
+  const suffix = missingFinalSuffix(current, finalText);
+  return suffix ? appendTextPart(parts, suffix) : parts;
+}
+
+function appendMissingReasoning(
+  parts: ChatMessagePart[],
+  finalReasoning: string | null,
+): ChatMessagePart[] {
+  if (!finalReasoning) {
+    return parts;
+  }
+  const existing = parts
+    .filter((part): part is Extract<ChatMessagePart, { type: "reasoning" }> =>
+      part.type === "reasoning",
+    )
+    .map((part) => part.text)
+    .join("");
+  const suffix = missingFinalSuffix(existing, finalReasoning);
+  return suffix ? appendReasoningPart(parts, suffix) : parts;
+}
+
+function hasPartType(parts: ChatMessagePart[], type: ChatMessagePart["type"]) {
+  return parts.some((part) => part.type === type);
+}
+
+function missingFinalSuffix(current: string, next: string) {
+  if (!next || current === next) {
+    return "";
+  }
+  return next.startsWith(current) ? next.slice(current.length) : "";
+}
+
+function partsFromRunSnapshot(
+  text: string,
+  reasoning: string | null,
+  toolCalls: ChatToolCallSummary[],
+): ChatMessagePart[] {
+  const parts: ChatMessagePart[] = [];
+  if (reasoning) {
+    parts.push({ type: "reasoning", text: reasoning });
+  }
+  if (text) {
+    parts.push({ type: "text", text });
+  }
+  parts.push(...toolCalls.map((toolCall) => ({ type: "toolCall" as const, toolCall })));
+  return parts;
+}
+
+function upsertToolCallPart(
+  parts: ChatMessagePart[],
+  nextToolCall: ChatToolCallSummary,
+): ChatMessagePart[] {
+  const existingIndex = parts.findIndex(
+    (part) => part.type === "toolCall" && part.toolCall.id === nextToolCall.id,
+  );
+  if (existingIndex === -1) {
+    return [...parts, { type: "toolCall", toolCall: nextToolCall }];
+  }
+  return parts.map((part, index) =>
+    index === existingIndex && part.type === "toolCall"
+      ? {
+          type: "toolCall",
+          toolCall: {
+            ...part.toolCall,
+            ...nextToolCall,
+            liveOutput: nextToolCall.liveOutput ?? part.toolCall.liveOutput,
+          },
+        }
+      : part,
+  );
+}
+
+function applyToolResultToParts(
+  parts: ChatMessagePart[],
+  toolCallId: string,
+  output: JsonValue,
+  isError: boolean,
+): ChatMessagePart[] {
+  return parts.map((part) =>
+    part.type === "toolCall" && part.toolCall.id === toolCallId
+      ? {
+          type: "toolCall",
+          toolCall: {
+            ...part.toolCall,
+            output,
+            isError,
+            status: isError ? "error" : "completed",
+            liveOutput: undefined,
+          },
+        }
+      : part,
+  );
+}
+
+function applyToolOutputDeltaToParts(
+  parts: ChatMessagePart[],
+  toolCallId: string,
+  stream: "stdout" | "stderr",
+  delta: string,
+): ChatMessagePart[] {
+  return parts.map((part) =>
+    part.type === "toolCall" &&
+    part.toolCall.id === toolCallId &&
+    part.toolCall.output === null
+      ? {
+          type: "toolCall",
+          toolCall: {
+            ...part.toolCall,
+            liveOutput: appendToolLiveOutput(part.toolCall.liveOutput, stream, delta),
+          },
+        }
+      : part,
+  );
+}
+
+function appendToolLiveOutput(
+  liveOutput: ChatToolCallSummary["liveOutput"],
+  stream: "stdout" | "stderr",
+  delta: string,
+) {
+  return {
+    stdout: (liveOutput?.stdout ?? "") + (stream === "stdout" ? delta : ""),
+    stderr: (liveOutput?.stderr ?? "") + (stream === "stderr" ? delta : ""),
+  };
+}
+
+function chatToolCallSummary(value: JsonValue | undefined): ChatToolCallSummary | null {
+  if (!isJsonValue(value)) {
+    return null;
+  }
+  const record = jsonRecord(value);
+  if (!record) {
+    return null;
+  }
+  const id = jsonRawStringField(record, "id");
+  const name = jsonRawStringField(record, "name");
+  if (!id || !name) {
+    return null;
+  }
+  const output = record.output;
+  const liveOutput = jsonRecord(record.liveOutput);
+  const stdout = liveOutput ? jsonRawStringField(liveOutput, "stdout") ?? "" : "";
+  const stderr = liveOutput ? jsonRawStringField(liveOutput, "stderr") ?? "" : "";
+  return {
+    id,
+    name,
+    status: jsonRawStringField(record, "status") ?? "running",
+    input: isJsonValue(record.input) ? record.input : {},
+    output: isJsonValue(output) ? output : null,
+    isError: jsonBooleanField(record, "isError") ?? false,
+    liveOutput: stdout || stderr ? { stdout, stderr } : undefined,
+  };
+}
+
+function chatReplyMetrics(value: JsonValue | undefined): ChatReplyMetrics | null {
+  if (!isJsonValue(value)) {
+    return null;
+  }
+  const record = jsonRecord(value);
+  const modelId = record ? jsonRawStringField(record, "modelId") : null;
+  const providerId = record ? jsonRawStringField(record, "providerId") : null;
+  if (!record || !modelId || !providerId) {
+    return null;
+  }
+  return {
+    modelId,
+    providerId,
+    totalLatencyMs: nullableJsonNumber(record.totalLatencyMs),
+    firstTokenLatencyMs: nullableJsonNumber(record.firstTokenLatencyMs),
+    outputTokens: nullableJsonNumber(record.outputTokens),
+  };
+}
+
+function compareRunEvents(left: AgentRunEventView, right: AgentRunEventView) {
+  if (left.sequence !== right.sequence) {
+    return left.sequence - right.sequence;
+  }
+  return left.createdAt.localeCompare(right.createdAt);
 }
 
 function instanceName(
@@ -373,7 +805,48 @@ function jsonStringField(record: Record<string, JsonValue>, key: string) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function jsonRecord(value: JsonValue): Record<string, JsonValue> | null {
+function jsonRawStringField(record: Record<string, JsonValue>, key: string) {
+  const value = record[key];
+  return typeof value === "string" ? value : null;
+}
+
+function jsonBooleanField(record: Record<string, JsonValue>, key: string) {
+  const value = record[key];
+  return typeof value === "boolean" ? value : null;
+}
+
+function jsonArrayField(record: Record<string, JsonValue>, key: string) {
+  const value = record[key];
+  return Array.isArray(value) ? value : [];
+}
+
+function optionalJsonString(value: JsonValue | undefined) {
+  return typeof value === "string" ? value : null;
+}
+
+function nullableJsonNumber(value: JsonValue | undefined) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function isJsonValue(value: unknown): value is JsonValue {
+  if (
+    value === null ||
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return true;
+  }
+  if (Array.isArray(value)) {
+    return value.every(isJsonValue);
+  }
+  if (typeof value === "object") {
+    return Object.values(value as Record<string, unknown>).every(isJsonValue);
+  }
+  return false;
+}
+
+function jsonRecord(value: JsonValue | undefined): Record<string, JsonValue> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value
     : null;

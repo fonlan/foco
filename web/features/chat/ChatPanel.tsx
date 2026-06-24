@@ -1554,7 +1554,7 @@ function ReasoningBlock({
   );
 }
 
-function MessagePartBlock({
+export function MessagePartBlock({
   helpers,
   isError,
   isStreaming,

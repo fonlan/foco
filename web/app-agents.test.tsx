@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   agentDefinitions as agentDefinitionFixtures,
+  agentTeamSnapshot,
   appTestState,
   defaultComposerPlaceholder,
   enqueueChatStreamEvent,
@@ -181,6 +182,115 @@ describe("app agents verification surfaces", () => {
       "aria-selected",
       "true",
     );
+  });
+
+  it("renders worker LLM run events while the Agent task is still running", async () => {
+    const firstSnapshot = {
+      ...agentTeamSnapshot,
+      runEvents: [
+        {
+          createdAt: "2026-06-05T10:00:02Z",
+          eventType: "reasoning_delta",
+          payload: {
+            assistantMessageId: "agent-task-1-assistant",
+            delta: "Checking workspace state.",
+            type: "reasoningDelta",
+          },
+          runId: "agent-task-1",
+          sequence: 0,
+        },
+        {
+          createdAt: "2026-06-05T10:00:03Z",
+          eventType: "tool_call",
+          payload: {
+            assistantMessageId: "agent-task-1-assistant",
+            toolCall: {
+              id: "tool-read-file",
+              input: { path: "notes.md" },
+              isError: false,
+              name: "read_file",
+              output: null,
+              status: "running",
+            },
+            type: "toolCall",
+          },
+          runId: "agent-task-1",
+          sequence: 1,
+        },
+      ],
+      tasks: agentTeamSnapshot.tasks.map((task) =>
+        task.id === "agent-task-1"
+          ? {
+              ...task,
+              completedAt: null,
+              result: null,
+              status: "running",
+              updatedAt: "2026-06-05T10:00:03Z",
+            }
+          : task,
+      ),
+    };
+    const secondSnapshot = {
+      ...firstSnapshot,
+      runEvents: [
+        ...firstSnapshot.runEvents,
+        {
+          createdAt: "2026-06-05T10:00:04Z",
+          eventType: "text_delta",
+          payload: {
+            assistantMessageId: "agent-task-1-assistant",
+            delta: "Still inspecting.",
+            type: "textDelta",
+          },
+          runId: "agent-task-1",
+          sequence: 2,
+        },
+      ],
+    };
+    let snapshot = firstSnapshot;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(snapshot);
+        }
+        return mockFetch(input, init);
+      }),
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "trigger refresh",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+
+    expect(await screen.findByText("Checking workspace state.")).toBeInTheDocument();
+    expect(screen.getByText("read_file")).toBeInTheDocument();
+    expect(screen.queryByText("Inspection complete.")).not.toBeInTheDocument();
+
+    snapshot = secondSnapshot;
+    await act(async () => {
+      enqueueChatStreamEvent({
+        chatId: "chat-1",
+        instanceId: "agent-instance-worker",
+        reason: "text_delta",
+        revealPanel: false,
+        teamId: "agent-team-1",
+        type: "agentTeamRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
+
+    expect(await screen.findByText("Still inspecting.")).toBeInTheDocument();
   });
 
   it("reveals the Agents panel and refreshes when an Agent instance is created", async () => {

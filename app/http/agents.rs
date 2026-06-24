@@ -11,7 +11,7 @@ use foco_agent::{
 use foco_store::workspace::{
     AgentEventRecord, AgentInstanceRecord, AgentMessageRecord, AgentTaskDependencyRecord,
     AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, NewAgentInstance, NewAgentTeam,
-    WorkspaceDatabase,
+    RunEventRecord, WorkspaceDatabase,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -113,6 +113,7 @@ pub(crate) struct AgentTeamSnapshotResponse {
     dependencies: Vec<AgentTaskDependencyView>,
     messages: Vec<AgentMessageView>,
     events: Vec<AgentEventView>,
+    run_events: Vec<AgentRunEventView>,
     mutation_lease_owners: Vec<AgentMutationLeaseOwnerView>,
     #[serde(skip_serializing_if = "Option::is_none")]
     worktree_action: Option<serde_json::Value>,
@@ -272,6 +273,16 @@ struct AgentEventView {
     task_id: Option<AgentTaskId>,
     attempt_id: Option<AgentAttemptId>,
     message_id: Option<AgentMessageId>,
+    payload: serde_json::Value,
+    created_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRunEventView {
+    run_id: String,
+    sequence: i64,
+    event_type: String,
     payload: serde_json::Value,
     created_at: String,
 }
@@ -1079,6 +1090,7 @@ fn agent_team_snapshot_from_database(
         .collect();
     let mut tasks = Vec::new();
     let mut dependencies = Vec::new();
+    let mut run_events = Vec::new();
     for task in database
         .agent_tasks_for_team(team_id)
         .map_err(ApiError::from_workspace_error)?
@@ -1102,6 +1114,14 @@ fn agent_team_snapshot_from_database(
                 .map_err(ApiError::from_workspace_error)?
                 .into_iter()
                 .map(AgentTaskDependencyView::from),
+        );
+        run_events.extend(
+            database
+                .run_events_for_run(task.id.as_str())
+                .map_err(ApiError::from_workspace_error)?
+                .into_iter()
+                .map(AgentRunEventView::try_from)
+                .collect::<Result<Vec<_>, _>>()?,
         );
         tasks.push(AgentTaskView::from_record(task, attempts)?);
     }
@@ -1148,6 +1168,7 @@ fn agent_team_snapshot_from_database(
         dependencies,
         messages,
         events,
+        run_events,
         mutation_lease_owners,
         worktree_action: None,
     })
@@ -1265,6 +1286,26 @@ impl TryFrom<AgentEventRecord> for AgentEventView {
             payload: redact_agent_json(serde_json::from_str(&event.payload_json).map_err(
                 |source| {
                     ApiError::internal(format!("invalid persisted Agent event payload: {source}"))
+                },
+            )?),
+            created_at: event.created_at,
+        })
+    }
+}
+
+impl TryFrom<RunEventRecord> for AgentRunEventView {
+    type Error = ApiError;
+
+    fn try_from(event: RunEventRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            run_id: event.run_id,
+            sequence: event.sequence,
+            event_type: event.event_type,
+            payload: redact_agent_json(serde_json::from_str(&event.payload_json).map_err(
+                |source| {
+                    ApiError::internal(format!(
+                        "invalid persisted Agent run event payload: {source}"
+                    ))
                 },
             )?),
             created_at: event.created_at,

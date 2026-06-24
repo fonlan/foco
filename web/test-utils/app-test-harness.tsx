@@ -484,6 +484,7 @@ export const agentTeamSnapshot = {
     },
   ],
   mutationLeaseOwners: [],
+  runEvents: [],
   observability: {
     cancelledTasks: 0,
     failedTasks: 0,

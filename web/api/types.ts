@@ -884,6 +884,14 @@ export type AgentEventView = {
   createdAt: string;
 };
 
+export type AgentRunEventView = {
+  runId: string;
+  sequence: number;
+  eventType: string;
+  payload: JsonValue;
+  createdAt: string;
+};
+
 export type AgentMutationLeaseOwnerView = {
   instanceId: string | null;
   taskId: string | null;
@@ -925,6 +933,7 @@ export type AgentTeamSnapshotResponse = {
   dependencies: AgentTaskDependencyView[];
   messages: AgentMessageView[];
   events: AgentEventView[];
+  runEvents: AgentRunEventView[];
   mutationLeaseOwners: AgentMutationLeaseOwnerView[];
   worktreeAction?: JsonValue | null;
 };
