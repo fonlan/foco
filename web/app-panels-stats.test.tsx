@@ -249,7 +249,7 @@ describe("app-panels-stats verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     await openSpecPanel();
 
-    await userEvent.click(screen.getByRole("button", { name: "Refresh spec" }));
+    await userEvent.click(screen.getByRole("button", { name: "Regenerate spec" }));
 
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(
@@ -266,7 +266,7 @@ describe("app-panels-stats verification surfaces", () => {
     appTestState.workspaceSpecGenerateCompletes = true;
     await openSpecPanel();
 
-    await userEvent.click(screen.getByRole("button", { name: "Refresh spec" }));
+    await userEvent.click(screen.getByRole("button", { name: "Regenerate spec" }));
 
     await waitFor(
       () => {

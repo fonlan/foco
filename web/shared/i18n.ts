@@ -415,7 +415,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "ToDo graph": "待办事项",
     "Project Spec": "项目 Spec",
     "Workspace spec": "工作区 Spec",
-    "Refresh spec": "刷新 Spec",
+    "Regenerate spec": "重新生成 Spec",
     "Generate spec": "生成 Spec",
     "Reload spec": "重新加载 Spec",
     "Enable Project Spec": "启用项目 Spec",

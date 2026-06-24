@@ -11354,7 +11354,7 @@ function ContextSpecTab({
   const latestJob = spec?.latestJob ?? null;
   const canEdit = enabled && spec !== null;
   const generateLabel = contentDraft.trim()
-    ? t("Refresh spec")
+    ? t("Regenerate spec")
     : t("Generate spec");
 
   if (isLoading && !spec) {
