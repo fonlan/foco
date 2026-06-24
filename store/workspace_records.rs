@@ -940,6 +940,15 @@ pub struct CodeGraphContextRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphFileSummaryRecord {
+    pub path: String,
+    pub language: Option<String>,
+    pub symbol_count: i64,
+    pub import_count: i64,
+    pub import_modules: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeGraphSymbolRecord {
     pub id: i64,
     pub path: String,

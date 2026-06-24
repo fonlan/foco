@@ -19,8 +19,9 @@ use foco_store::{
         NewMemoryExtractionJob, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
     },
     workspace::{
-        LlmRequestAuditFilters, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession, WorkspaceDatabaseSpaceStats,
+        LlmRequestAuditFilters, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphSymbol,
+        NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession,
+        NewWorkspaceSpecJob, WorkspaceDatabaseSpaceStats,
     },
 };
 use foco_tools::{
@@ -67,6 +68,7 @@ use crate::runtime::{
     wait_for_tool_resource_lock,
 };
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
+use crate::spec_runtime::{apply_workspace_spec_job_output, prepare_workspace_spec_job};
 
 fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> NeutralToolCall {
     NeutralToolCall {
@@ -7163,6 +7165,118 @@ async fn workspace_spec_http_queues_manual_generate_job() {
             .expect("spec jobs");
     let jobs_response = serde_json::to_value(jobs_response).expect("jobs response json");
     assert_eq!(jobs_response["jobs"][0]["id"], job_id);
+}
+
+#[test]
+fn workspace_spec_runtime_uses_evidence_language_and_writes_revision() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("README.md"),
+        "Foco is a local coding workspace with chat and project context.",
+    )
+    .expect("write README");
+    let mut config = prompt_test_config(workspace.path().to_path_buf());
+    config.app.language = "zh-CN".to_string();
+    let workspace_id = config.workspaces[0].id.clone();
+    let job_id = "workspace-spec-runtime-job";
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, false)
+            .expect("spec settings");
+        database
+            .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                path: "lib.rs",
+                language: Some("rust"),
+                size_bytes: Some(80),
+                modified_at: Some("2026-06-24T00:00:00.000Z"),
+                content_hash: "lib-hash",
+                parse_status: "parsed",
+                parse_error_message: None,
+                symbols: &[NewCodeGraphSymbol {
+                    name: "public_api",
+                    kind: "function",
+                    start_line: Some(1),
+                    start_column: Some(1),
+                    end_line: Some(3),
+                    end_column: Some(1),
+                    signature: Some("fn public_api()"),
+                    documentation: None,
+                }],
+                imports: &[NewCodeGraphImport {
+                    module: "crate::workspace",
+                    imported_symbol: None,
+                    alias: None,
+                    start_line: Some(1),
+                    start_column: Some(1),
+                }],
+                references: &[],
+                edges: &[],
+                fts_body: "fn public_api() {}",
+            })
+            .expect("code graph index");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: job_id,
+                trigger_type: "manual_initial",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(0),
+                input_summary_json: None,
+            })
+            .expect("spec job");
+    }
+
+    let prepared =
+        prepare_workspace_spec_job(&config, &workspace_id, &config.workspaces[0], job_id)
+            .expect("prepare spec job")
+            .expect("prepared job");
+    assert!(
+        prepared
+            .input_summary
+            .code_graph
+            .symbols
+            .iter()
+            .any(|symbol| symbol.name == "public_api")
+    );
+    assert!(
+        prepared
+            .input_summary
+            .source_files
+            .iter()
+            .any(|file| file.path == "README.md" && file.content.contains("project context"))
+    );
+    assert!(
+        prepared.request.messages[0]
+            .content
+            .contains("Simplified Chinese")
+    );
+
+    apply_workspace_spec_job_output(
+        &prepared.workspace_path,
+        &prepared.job_id,
+        prepared.base_revision,
+        "# Project Spec\n\n## Purpose\n\n基于 public_api 和 README 生成。",
+    )
+    .expect("apply generated spec");
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let spec = database
+        .workspace_spec()
+        .expect("workspace spec")
+        .expect("spec row");
+    assert_eq!(spec.revision, 1);
+    assert!(spec.generated_at.is_some());
+    assert!(spec.content_markdown.contains("public_api"));
+    let job = database
+        .workspace_spec_job(job_id)
+        .expect("spec job lookup")
+        .expect("spec job");
+    assert_eq!(job.status, "completed");
+    assert!(job.input_summary_json.contains("public_api"));
+    assert!(job.input_summary_json.contains("README.md"));
 }
 
 #[tokio::test]

@@ -144,6 +144,7 @@ mod runtime;
 mod scheduled_tasks;
 mod settings_runtime;
 mod skills;
+mod spec_runtime;
 mod terminal;
 #[cfg(test)]
 use foco_store::config::{SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE};
@@ -6606,7 +6607,7 @@ pub(crate) async fn generate_git_commit_message(
     Ok(GitCommitMessageResponse { message })
 }
 
-async fn audited_provider_tool_request(
+pub(crate) async fn audited_provider_tool_request(
     workspace_path: &Path,
     workspace_id: &str,
     chat_id: Option<&str>,
@@ -6978,7 +6979,7 @@ fn persist_audited_provider_events(
     Ok(())
 }
 
-fn neutral_text_message(role: NeutralChatRole, content: String) -> NeutralChatMessage {
+pub(crate) fn neutral_text_message(role: NeutralChatRole, content: String) -> NeutralChatMessage {
     NeutralChatMessage {
         role,
         content,
@@ -8799,7 +8800,7 @@ fn model_metadata_response(
     }
 }
 
-fn provider_connection_config(
+pub(crate) fn provider_connection_config(
     provider: &ProviderSettings,
 ) -> Result<ProviderConnectionConfig, ApiError> {
     Ok(ProviderConnectionConfig {

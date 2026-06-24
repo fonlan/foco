@@ -33,22 +33,22 @@ pub use workspace_records::{
     AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
     AgentInstanceRecord, AgentMessageRecord, AgentReconciliationRecord, AgentTaskDependencyRecord,
     AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, ChatRecord, ChatSpecSnapshotRecord,
-    CodeChangeStats, CodeGraphContextRecord, CodeGraphReferenceRecord, CodeGraphRelatedFileRecord,
-    CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord,
-    HookRunRecord, LlmRequestAuditFilters, LlmRequestAuditModelBreakdown,
-    LlmRequestAuditProviderBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
-    LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord,
-    MessageRecord, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
-    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
-    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-    PromptContextInjectionRecord, RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskRecord,
-    ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TerminalSessionRecord,
-    TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
-    WorkspaceSpecRecord,
+    CodeChangeStats, CodeGraphContextRecord, CodeGraphFileSummaryRecord, CodeGraphReferenceRecord,
+    CodeGraphRelatedFileRecord, CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord,
+    ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
+    LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
+    LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
+    LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, NewAgentContextEntry,
+    NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
+    NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
+    NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot,
+    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection,
+    NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
+    NewToolResult, NewWorkspaceSpecJob, PromptContextInjectionRecord, RunEventRecord,
+    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
+    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
+    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -546,6 +546,23 @@ impl WorkspaceDatabase {
         expected_revision: u64,
         content_markdown: &str,
     ) -> Result<Option<WorkspaceSpecRecord>, WorkspaceDatabaseError> {
+        self.update_workspace_spec_content_inner(expected_revision, content_markdown, false)
+    }
+
+    pub fn update_workspace_spec_generated_content(
+        &mut self,
+        expected_revision: u64,
+        content_markdown: &str,
+    ) -> Result<Option<WorkspaceSpecRecord>, WorkspaceDatabaseError> {
+        self.update_workspace_spec_content_inner(expected_revision, content_markdown, true)
+    }
+
+    fn update_workspace_spec_content_inner(
+        &mut self,
+        expected_revision: u64,
+        content_markdown: &str,
+        generated: bool,
+    ) -> Result<Option<WorkspaceSpecRecord>, WorkspaceDatabaseError> {
         WORKSPACE_SPEC_V1_OUTPUT_STRATEGY.validate_markdown_size(content_markdown)?;
         let expected_revision = workspace_spec_revision_to_i64(expected_revision, "revision")?;
         let now = now_timestamp();
@@ -582,6 +599,7 @@ impl WorkspaceDatabase {
                         "UPDATE workspace_specs
                          SET content_markdown = ?2,
                              revision = ?3,
+                             generated_at = CASE WHEN ?6 THEN ?4 ELSE generated_at END,
                              updated_at = ?4
                          WHERE id = ?1 AND revision = ?5",
                         params![
@@ -589,7 +607,8 @@ impl WorkspaceDatabase {
                             content_markdown,
                             next_revision,
                             now,
-                            current_revision
+                            current_revision,
+                            sql_bool(generated)
                         ],
                     )
                     .map_err(|source| sqlite_error(&database_path, source))?;
@@ -605,8 +624,13 @@ impl WorkspaceDatabase {
                     .execute(
                         "INSERT INTO workspace_specs
                             (id, enabled, inject_enabled, content_markdown, revision, generated_at, updated_at)
-                         VALUES (?1, 0, 0, ?2, 1, NULL, ?3)",
-                        params![WORKSPACE_SPEC_DEFAULT_ID, content_markdown, now],
+                         VALUES (?1, 0, 0, ?2, 1, ?4, ?3)",
+                        params![
+                            WORKSPACE_SPEC_DEFAULT_ID,
+                            content_markdown,
+                            now,
+                            generated.then_some(now.as_str())
+                        ],
                     )
                     .map_err(|source| sqlite_error(&database_path, source))?;
             }
@@ -699,6 +723,23 @@ impl WorkspaceDatabase {
                 workspace_spec_job_from_row,
             )
             .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn update_workspace_spec_job_input_summary(
+        &mut self,
+        id: &str,
+        input_summary_json: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        validate_workspace_spec_json_object(input_summary_json, "input_summary_json")?;
+        self.connection
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET input_summary_json = ?2
+                 WHERE id = ?1",
+                params![id, input_summary_json],
+            )
+            .map(|updated| updated > 0)
             .map_err(|source| self.sqlite_error(source))
     }
 
@@ -830,7 +871,7 @@ impl WorkspaceDatabase {
         })
     }
 
-    fn workspace_spec_job(
+    pub fn workspace_spec_job(
         &self,
         id: &str,
     ) -> Result<Option<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
@@ -5922,6 +5963,39 @@ impl WorkspaceDatabase {
         })
     }
 
+    pub fn code_graph_file_summaries(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<CodeGraphFileSummaryRecord>, WorkspaceDatabaseError> {
+        if limit <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidCodeGraphInput {
+                message: "code graph file summary limit must be positive".to_string(),
+            });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    file.path,
+                    file.language,
+                    COUNT(DISTINCT symbol.id) AS symbol_count,
+                    COUNT(DISTINCT imp.id) AS import_count,
+                    COALESCE(GROUP_CONCAT(DISTINCT imp.module), '') AS import_modules
+                 FROM code_graph_files file
+                 LEFT JOIN code_graph_symbols symbol ON symbol.file_id = file.id
+                 LEFT JOIN code_graph_imports imp ON imp.file_id = file.id
+                 GROUP BY file.id, file.path, file.language
+                 ORDER BY symbol_count DESC, import_count DESC, file.path ASC
+                 LIMIT ?1",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![limit], code_graph_file_summary_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn find_code_graph_symbols(
         &self,
         query: &str,
@@ -7373,6 +7447,24 @@ impl std::error::Error for WorkspaceDatabaseError {
 
 fn code_graph_symbol_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeGraphSymbolRecord> {
     code_graph_symbol_from_row_offset(row, 0)
+}
+
+fn code_graph_file_summary_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<CodeGraphFileSummaryRecord> {
+    let modules: String = row.get(4)?;
+    Ok(CodeGraphFileSummaryRecord {
+        path: row.get(0)?,
+        language: row.get(1)?,
+        symbol_count: row.get(2)?,
+        import_count: row.get(3)?,
+        import_modules: modules
+            .split(',')
+            .map(str::trim)
+            .filter(|module| !module.is_empty())
+            .map(str::to_string)
+            .collect(),
+    })
 }
 
 fn code_graph_symbol_from_row_offset(
