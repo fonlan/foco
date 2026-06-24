@@ -16567,7 +16567,12 @@ function SettingsPanel({
             <section className="grid gap-4">
               {isMemoryDialogOpen ? (
                 <>
-                  <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+                  <button
+                    aria-label={t("Close memory dialog backdrop")}
+                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    onClick={closeMemoryDialog}
+                    type="button"
+                  />
                   <form
                     aria-label={
                       memoryDialogMode === "create"
@@ -17651,7 +17656,12 @@ function SettingsPanel({
 
                 {memoryDreamDetailJob ? (
                   <>
-                    <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+                    <button
+                      aria-label={t("Close Dream job details backdrop")}
+                      className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                      onClick={closeMemoryDreamDetailDialog}
+                      type="button"
+                    />
                     <div
                       aria-labelledby="memory-dream-detail-title"
                       aria-modal="true"
@@ -18206,7 +18216,12 @@ function SettingsPanel({
             <section className="grid gap-4">
               {isWorkspaceDialogOpen ? (
                 <>
-                  <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+                  <button
+                    aria-label={t("Close workspace configuration backdrop")}
+                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    onClick={() => setIsWorkspaceDialogOpen(false)}
+                    type="button"
+                  />
                   <form
                     aria-label={t("Workspace configuration")}
                     className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
@@ -18637,7 +18652,12 @@ function SettingsPanel({
             <section className="grid gap-4">
               {hookRunDetail ? (
                 <>
-                  <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+                  <button
+                    aria-label={t("Close hook run detail backdrop")}
+                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    onClick={() => setHookRunDetail(null)}
+                    type="button"
+                  />
                   <div
                     aria-label={t("Hook run detail")}
                     className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,46rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
@@ -18705,7 +18725,12 @@ function SettingsPanel({
 
               {isHookDialogOpen ? (
                 <>
-                  <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+                  <button
+                    aria-label={t("Close hook configuration backdrop")}
+                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    onClick={() => setIsHookDialogOpen(false)}
+                    type="button"
+                  />
                   <form
                     aria-label={t("Hook configuration")}
                     className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,40rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
@@ -20299,7 +20324,12 @@ function SettingsPanel({
             <section className="grid gap-4">
               {isMcpDialogOpen ? (
                 <>
-                  <div className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm" />
+                  <button
+                    aria-label={t("Close MCP server configuration backdrop")}
+                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    onClick={() => setIsMcpDialogOpen(false)}
+                    type="button"
+                  />
                   <form
                     aria-label={t("MCP server configuration")}
                     className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
