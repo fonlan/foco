@@ -38,6 +38,11 @@ use crate::http::{
         associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
         filter_provider_model_ids,
     },
+    spec::{
+        GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
+        generate_workspace_spec, save_workspace_spec, save_workspace_spec_settings, workspace_spec,
+        workspace_spec_jobs,
+    },
     terminal::create_terminal_session,
     workspaces::add_workspace,
 };
@@ -7029,6 +7034,134 @@ fn memory_list_summarizes_failed_extraction_jobs() {
 
     drop(memory_database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn workspace_spec_http_reads_empty_default_state() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let Json(response) = workspace_spec(State(state), AxumPath(workspace_id))
+        .await
+        .expect("workspace spec");
+    let response = serde_json::to_value(response).expect("spec response json");
+
+    assert_eq!(response["settings"]["enabled"], false);
+    assert_eq!(response["settings"]["injectEnabled"], false);
+    assert_eq!(response["contentMarkdown"], "");
+    assert_eq!(response["revision"], 0);
+    assert!(response["latestJob"].is_null());
+}
+
+#[tokio::test]
+async fn workspace_spec_http_saves_settings() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let request: WorkspaceSpecSettingsRequest =
+        serde_json::from_value(json!({ "enabled": true, "injectEnabled": true }))
+            .expect("settings request");
+
+    let Json(response) =
+        save_workspace_spec_settings(State(state), AxumPath(workspace_id), Json(request))
+            .await
+            .expect("save settings");
+    let response = serde_json::to_value(response).expect("settings response json");
+
+    assert_eq!(response["settings"]["enabled"], true);
+    assert_eq!(response["settings"]["injectEnabled"], true);
+    assert_eq!(response["revision"], 0);
+}
+
+#[tokio::test]
+async fn workspace_spec_http_rejects_manual_edit_conflict() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let settings_request: WorkspaceSpecSettingsRequest =
+        serde_json::from_value(json!({ "enabled": true, "injectEnabled": true }))
+            .expect("settings request");
+    let _ = save_workspace_spec_settings(
+        State(state.clone()),
+        AxumPath(workspace_id.clone()),
+        Json(settings_request),
+    )
+    .await
+    .expect("save settings");
+
+    let first_save: SaveWorkspaceSpecRequest = serde_json::from_value(json!({
+        "expectedRevision": 0,
+        "contentMarkdown": "# Project Spec\n\nFirst"
+    }))
+    .expect("first save request");
+    let _ = save_workspace_spec(
+        State(state.clone()),
+        AxumPath(workspace_id.clone()),
+        Json(first_save),
+    )
+    .await
+    .expect("first save");
+
+    let stale_save: SaveWorkspaceSpecRequest = serde_json::from_value(json!({
+        "expectedRevision": 0,
+        "contentMarkdown": "# Project Spec\n\nStale"
+    }))
+    .expect("stale save request");
+    let error = save_workspace_spec(State(state), AxumPath(workspace_id), Json(stale_save))
+        .await
+        .expect_err("stale save should fail");
+
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert!(error.message.contains("revision changed"));
+}
+
+#[tokio::test]
+async fn workspace_spec_http_queues_manual_generate_job() {
+    let profile = tempfile::tempdir().expect("profile");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let settings_request: WorkspaceSpecSettingsRequest =
+        serde_json::from_value(json!({ "enabled": true, "injectEnabled": false }))
+            .expect("settings request");
+    let _ = save_workspace_spec_settings(
+        State(state.clone()),
+        AxumPath(workspace_id.clone()),
+        Json(settings_request),
+    )
+    .await
+    .expect("save settings");
+
+    let generate_request: GenerateWorkspaceSpecRequest =
+        serde_json::from_value(json!({})).expect("generate request");
+    let Json(response) = generate_workspace_spec(
+        State(state.clone()),
+        AxumPath(workspace_id.clone()),
+        Json(generate_request),
+    )
+    .await
+    .expect("generate spec");
+    let response = serde_json::to_value(response).expect("generate response json");
+    let job_id = response["job"]["id"].as_str().expect("job id").to_string();
+    assert_eq!(response["job"]["triggerType"], "manual_initial");
+    assert_eq!(response["job"]["status"], "queued");
+    assert_eq!(response["job"]["baseRevision"], 0);
+
+    let query = serde_json::from_value(json!({ "limit": 10 })).expect("jobs query");
+    let Json(jobs_response) =
+        workspace_spec_jobs(State(state), AxumPath(workspace_id), Query(query))
+            .await
+            .expect("spec jobs");
+    let jobs_response = serde_json::to_value(jobs_response).expect("jobs response json");
+    assert_eq!(jobs_response["jobs"][0]["id"], job_id);
 }
 
 #[tokio::test]

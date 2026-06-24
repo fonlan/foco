@@ -7,5 +7,6 @@ pub mod hooks;
 pub mod memory;
 pub mod scheduled_tasks;
 pub mod settings;
+pub mod spec;
 pub mod terminal;
 pub mod workspaces;

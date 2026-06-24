@@ -22,7 +22,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware,
     response::{IntoResponse, Response, sse::Event},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
@@ -1267,6 +1267,22 @@ fn app_router(state: AppState) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/scheduled-task-runs/{scheduled_run_id}/cancel",
             post(crate::http::scheduled_tasks::cancel_scheduled_task_run),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/spec",
+            get(crate::http::spec::workspace_spec).put(crate::http::spec::save_workspace_spec),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/spec/settings",
+            put(crate::http::spec::save_workspace_spec_settings),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/spec/generate",
+            post(crate::http::spec::generate_workspace_spec),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/spec/jobs",
+            get(crate::http::spec::workspace_spec_jobs),
         )
         .route(
             "/api/workspaces/{workspace_id}/hooks/runs",

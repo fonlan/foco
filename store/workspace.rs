@@ -657,6 +657,51 @@ impl WorkspaceDatabase {
         })
     }
 
+    pub fn workspace_spec_jobs(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        if limit <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                message: "workspace spec job limit must be positive".to_string(),
+            });
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                        input_summary_json, output_json, error_message, created_at,
+                        started_at, completed_at
+                 FROM workspace_spec_jobs
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?1",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![limit], workspace_spec_job_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn running_workspace_spec_job(
+        &self,
+    ) -> Result<Option<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                        input_summary_json, output_json, error_message, created_at,
+                        started_at, completed_at
+                 FROM workspace_spec_jobs
+                 WHERE status = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![WorkspaceSpecJobStatus::Running.as_str()],
+                workspace_spec_job_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn mark_workspace_spec_job_running(
         &mut self,
         id: &str,
