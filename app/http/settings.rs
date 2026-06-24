@@ -4,6 +4,7 @@ use axum::{
     http::header,
     response::{IntoResponse, Response},
 };
+use fancy_regex::Regex;
 use foco_agent::build_default_system_prompt;
 use foco_providers::{
     ProviderConfigError, fetch_provider_model_ids, normalized_base_url, parse_provider_kind,
@@ -16,7 +17,6 @@ use foco_store::{
         write_model_metadata_cache,
     },
 };
-use regex::Regex;
 
 use crate::*;
 
@@ -779,10 +779,16 @@ pub(crate) fn filter_provider_model_ids(
 
     let regex = Regex::new(pattern)
         .map_err(|source| ApiError::bad_request(format!("invalid model sync regex: {source}")))?;
-    Ok(model_ids
-        .into_iter()
-        .filter(|model_id| regex.is_match(model_id))
-        .collect())
+    let mut filtered_model_ids = Vec::new();
+    for model_id in model_ids {
+        if regex.is_match(&model_id).map_err(|source| {
+            ApiError::bad_request(format!("model sync regex match failed: {source}"))
+        })? {
+            filtered_model_ids.push(model_id);
+        }
+    }
+
+    Ok(filtered_model_ids)
 }
 
 fn validate_provider_model_sync_filter(pattern: Option<&str>) -> Result<(), ApiError> {

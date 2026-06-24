@@ -1729,6 +1729,30 @@ fn provider_model_sync_filter_regex_limits_association_changes() {
 }
 
 #[test]
+fn provider_model_sync_filter_regex_supports_negative_lookahead() {
+    let provider = ProviderSettings {
+        id: "filtered-provider".to_string(),
+        name: "Filtered".to_string(),
+        kind: "openai-chat".to_string(),
+        enabled: true,
+        base_url: None,
+        api_key: None,
+        auto_sync_models: true,
+        model_sync_filter_regex: Some("^(?!gpt).*".to_string()),
+        request_overrides: Vec::new(),
+        api_proxy: ApiProxySettings::default(),
+    };
+
+    let provider_models = filter_provider_model_ids(
+        &provider,
+        vec!["gpt-4.1".to_string(), "text-embedding-3-large".to_string()],
+    )
+    .expect("filter provider models");
+
+    assert_eq!(provider_models, vec!["text-embedding-3-large"]);
+}
+
+#[test]
 fn new_provider_save_ignores_model_list_connection_failures() {
     let missing_models = foco_providers::ProviderConfigError::Connection {
         message: "not found".to_string(),

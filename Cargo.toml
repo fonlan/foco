@@ -26,6 +26,7 @@ foco-mcp = { path = "mcp" }
 foco-providers = { path = "providers" }
 foco-store = { path = "store" }
 foco-tools = { path = "tools" }
+fancy-regex = "0.18.0"
 futures-util = { version = "0.3.31", features = ["sink"] }
 genai = { version = "0.6.4", default-features = true }
 getrandom = "0.3.4"

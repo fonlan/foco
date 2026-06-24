@@ -5,13 +5,13 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use fancy_regex::Regex;
 use foco_agent::{AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions};
 use foco_mcp::{McpServerDefinition, McpTransportKind, validate_server_definitions};
 use foco_providers::{
     HTTP_PROXY_KIND, ProviderRequestOverride, SOCKS_PROXY_KIND, normalized_base_url,
     normalized_proxy_url, parse_provider_kind,
 };
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -2746,6 +2746,31 @@ mod tests {
                 .to_string()
                 .contains("model_sync_filter_regex is invalid")
         );
+    }
+
+    #[test]
+    fn load_accepts_provider_model_sync_filter_regex_with_negative_lookahead() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.providers.push(ProviderSettings {
+            id: "openai".to_string(),
+            name: "OpenAI".to_string(),
+            kind: "openai-chat".to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            auto_sync_models: true,
+            model_sync_filter_regex: Some("^(?!gpt).*".to_string()),
+            request_overrides: Vec::new(),
+            api_proxy: ApiProxySettings::default(),
+        });
+
+        save_global_config(&paths.config_file, &config)
+            .expect("negative lookahead provider model sync regex should save");
     }
 
     #[test]
