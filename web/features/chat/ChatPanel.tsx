@@ -782,7 +782,7 @@ export function ChatPanel({
                         ) : message.status === "streaming" ? (
                           <LoaderCircle
                             aria-hidden="true"
-                            className="size-4 animate-spin"
+                            className="message-waiting-spinner size-4 animate-spin"
                           />
                         ) : null}
                         {!isUser ? (

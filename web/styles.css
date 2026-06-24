@@ -3654,6 +3654,17 @@ summary:focus-visible {
   color: var(--foco-primary);
 }
 
+.message-waiting-spinner {
+  animation: message-waiting-spinner-spin 1s linear infinite;
+  transform-origin: center;
+}
+
+@keyframes message-waiting-spinner-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .message-author-row {
   color: var(--foco-text);
 }
@@ -3969,7 +3980,8 @@ summary:focus-visible {
     transition-duration: 0.01ms !important;
   }
 
-  .chat-tab-running-spinner {
+  .chat-tab-running-spinner,
+  .message-waiting-spinner {
     animation-duration: 1s !important;
     animation-iteration-count: infinite !important;
   }
