@@ -125,6 +125,24 @@ describe("app-settings verification surfaces", () => {
     ).toHaveLength(singleProviderFetchCount);
   });
 
+  it("prefills provider protocol and base URL from the service menu", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add provider" }));
+
+    expect(screen.getByLabelText("Protocol")).toHaveValue("openai-responses");
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.openai.com/v1");
+
+    await userEvent.click(screen.getByRole("button", { name: /^DeepSeek/ }));
+
+    expect(screen.getByLabelText("Name")).toHaveValue("DeepSeek");
+    expect(screen.getByLabelText("Protocol")).toHaveValue("deepseek");
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.deepseek.com/v1");
+  });
+
   it("toggles the app theme from the nav rail", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

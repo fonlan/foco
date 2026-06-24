@@ -10,6 +10,7 @@ use axum::{
 use foco_agent::{
     ToolResource, ToolResourceAccess, ToolResourceLock, context_compression_trigger_tokens,
 };
+use foco_providers::OPENAI_CHAT_KIND;
 use foco_store::{
     config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PromptSettings, WebSearchSettings},
     memory::{
@@ -33,7 +34,9 @@ use crate::http::{
         MemoryDreamChangesQuery, MemoryDreamJobsQuery, MemoryDreamRunRequest, memory_dream_changes,
         memory_dream_job, memory_dream_jobs, memory_extraction_job_summaries, run_memory_dream,
     },
-    settings::associate_provider_with_local_models,
+    settings::{
+        associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
+    },
     terminal::create_terminal_session,
     workspaces::add_workspace,
 };
@@ -66,6 +69,11 @@ fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> Neutra
         arguments,
         thought_signatures: None,
     }
+}
+
+fn test_provider_kind() -> foco_providers::ProviderKind {
+    foco_providers::parse_provider_kind(foco_providers::OPENAI_RESPONSES_KIND)
+        .expect("responses provider kind")
 }
 
 fn insert_waiting_coordinator_task(
@@ -288,7 +296,7 @@ fn test_prepared_chat_context(
         agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
-            kind: foco_providers::ProviderKind::OpenAiResponses,
+            kind: test_provider_kind(),
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
@@ -674,7 +682,7 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
         &HookConfig::default(),
         true,
         &ProviderConnectionConfig {
-            kind: foco_providers::ProviderKind::OpenAiResponses,
+            kind: test_provider_kind(),
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
@@ -1681,6 +1689,26 @@ fn provider_model_refresh_removes_stale_local_model_associations() {
         vec!["fallback", "refreshed-provider"]
     );
     assert_eq!(models[1].active_provider_id.as_deref(), Some("fallback"));
+}
+
+#[test]
+fn new_provider_save_ignores_model_list_connection_failures() {
+    let missing_models = foco_providers::ProviderConfigError::Connection {
+        message: "not found".to_string(),
+        status_code: Some(404),
+    };
+    let unauthorized = foco_providers::ProviderConfigError::Connection {
+        message: "unauthorized".to_string(),
+        status_code: Some(401),
+    };
+
+    assert!(can_save_new_provider_after_model_list_error(
+        &missing_models
+    ));
+    assert!(can_save_new_provider_after_model_list_error(&unauthorized));
+    assert!(!can_save_new_provider_after_model_list_error(
+        &foco_providers::ProviderConfigError::MissingApiKey,
+    ));
 }
 
 fn test_agent_definition_input() -> AgentDefinitionInput {
@@ -5553,7 +5581,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
-            kind: foco_providers::ProviderKind::OpenAiResponses,
+            kind: test_provider_kind(),
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
@@ -6109,7 +6137,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
-            kind: foco_providers::ProviderKind::OpenAiResponses,
+            kind: test_provider_kind(),
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,
@@ -6450,7 +6478,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         agent_primary_chat_output: true,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
-            kind: foco_providers::ProviderKind::OpenAiResponses,
+            kind: test_provider_kind(),
             base_url: None,
             api_key: Some("test-key".to_string()),
             proxy_url: None,

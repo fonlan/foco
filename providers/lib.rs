@@ -17,37 +17,227 @@ use serde_json::{Map, Value};
 
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
 pub const OPENAI_RESPONSES_KIND: &str = "openai-responses";
+pub const GEMINI_KIND: &str = "gemini";
+pub const ANTHROPIC_KIND: &str = "anthropic";
+pub const FIREWORKS_KIND: &str = "fireworks";
+pub const TOGETHER_KIND: &str = "together";
+pub const GROQ_KIND: &str = "groq";
+pub const AIHUBMIX_KIND: &str = "aihubmix";
+pub const MIMO_KIND: &str = "mimo";
+pub const MOONSHOT_KIND: &str = "moonshot";
+pub const NEBIUS_KIND: &str = "nebius";
+pub const XAI_KIND: &str = "xai";
+pub const DEEPSEEK_KIND: &str = "deepseek";
+pub const ZAI_KIND: &str = "zai";
+pub const BIGMODEL_KIND: &str = "bigmodel";
+pub const ALIYUN_KIND: &str = "aliyun";
+pub const BAIDU_KIND: &str = "baidu";
+pub const COHERE_KIND: &str = "cohere";
+pub const OLLAMA_KIND: &str = "ollama";
+pub const OLLAMA_CLOUD_KIND: &str = "ollama-cloud";
+pub const VERTEX_KIND: &str = "vertex";
+pub const GITHUB_COPILOT_KIND: &str = "github-copilot";
+pub const OPENCODE_GO_KIND: &str = "opencode-go";
+pub const BEDROCK_API_KIND: &str = "bedrock-api";
+pub const OPEN_ROUTER_KIND: &str = "open-router";
+pub const MINIMAX_KIND: &str = "minimax";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1/";
 pub const HTTP_PROXY_KIND: &str = "http";
 pub const SOCKS_PROXY_KIND: &str = "socks";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProviderKind {
-    OpenAiChat,
-    OpenAiResponses,
+pub struct ProviderKind {
+    kind: &'static str,
+    label: &'static str,
+    adapter_kind: AdapterKind,
+    default_base_url: &'static str,
+    requires_api_key: bool,
 }
 
 impl ProviderKind {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::OpenAiChat => OPENAI_CHAT_KIND,
-            Self::OpenAiResponses => OPENAI_RESPONSES_KIND,
-        }
+        self.kind
     }
 
     pub fn adapter_kind(self) -> AdapterKind {
-        match self {
-            Self::OpenAiChat => AdapterKind::OpenAI,
-            Self::OpenAiResponses => AdapterKind::OpenAIResp,
-        }
+        self.adapter_kind
+    }
+
+    pub fn label(self) -> &'static str {
+        self.label
+    }
+
+    pub fn default_base_url(self) -> &'static str {
+        self.default_base_url
+    }
+
+    pub fn requires_api_key(self) -> bool {
+        self.requires_api_key
     }
 
     fn adapter_label(self) -> &'static str {
-        match self {
-            Self::OpenAiChat => "OpenAI",
-            Self::OpenAiResponses => "OpenAIResp",
-        }
+        self.adapter_kind.as_str()
     }
+}
+
+macro_rules! provider_kind {
+    ($kind:ident, $label:literal, $adapter_kind:ident, $base_url:expr) => {
+        ProviderKind {
+            kind: $kind,
+            label: $label,
+            adapter_kind: AdapterKind::$adapter_kind,
+            default_base_url: $base_url,
+            requires_api_key: true,
+        }
+    };
+    ($kind:ident, $label:literal, $adapter_kind:ident, $base_url:expr, no_api_key) => {
+        ProviderKind {
+            kind: $kind,
+            label: $label,
+            adapter_kind: AdapterKind::$adapter_kind,
+            default_base_url: $base_url,
+            requires_api_key: false,
+        }
+    };
+}
+
+pub const SUPPORTED_PROVIDER_KINDS: &[ProviderKind] = &[
+    provider_kind!(
+        OPENAI_CHAT_KIND,
+        "OpenAI Chat",
+        OpenAI,
+        DEFAULT_OPENAI_BASE_URL
+    ),
+    provider_kind!(
+        OPENAI_RESPONSES_KIND,
+        "OpenAI Responses",
+        OpenAIResp,
+        DEFAULT_OPENAI_BASE_URL
+    ),
+    provider_kind!(
+        GEMINI_KIND,
+        "Gemini",
+        Gemini,
+        "https://generativelanguage.googleapis.com/v1beta/"
+    ),
+    provider_kind!(
+        ANTHROPIC_KIND,
+        "Anthropic",
+        Anthropic,
+        "https://api.anthropic.com/v1/"
+    ),
+    provider_kind!(
+        FIREWORKS_KIND,
+        "Fireworks",
+        Fireworks,
+        "https://api.fireworks.ai/inference/v1/"
+    ),
+    provider_kind!(
+        TOGETHER_KIND,
+        "Together",
+        Together,
+        "https://api.together.xyz/v1/"
+    ),
+    provider_kind!(GROQ_KIND, "Groq", Groq, "https://api.groq.com/openai/v1/"),
+    provider_kind!(
+        AIHUBMIX_KIND,
+        "AIHubMix",
+        Aihubmix,
+        "https://aihubmix.com/v1/"
+    ),
+    provider_kind!(MIMO_KIND, "Mimo", Mimo, "https://api.xiaomimimo.com/v1/"),
+    provider_kind!(
+        MOONSHOT_KIND,
+        "Moonshot",
+        Moonshot,
+        "https://api.moonshot.cn/v1/"
+    ),
+    provider_kind!(
+        NEBIUS_KIND,
+        "Nebius",
+        Nebius,
+        "https://api.studio.nebius.ai/v1/"
+    ),
+    provider_kind!(XAI_KIND, "xAI", Xai, "https://api.x.ai/v1/"),
+    provider_kind!(
+        DEEPSEEK_KIND,
+        "DeepSeek",
+        DeepSeek,
+        "https://api.deepseek.com/v1/"
+    ),
+    provider_kind!(ZAI_KIND, "ZAI", Zai, "https://api.z.ai/api/paas/v4/"),
+    provider_kind!(
+        BIGMODEL_KIND,
+        "BigModel",
+        BigModel,
+        "https://open.bigmodel.cn/api/paas/v4/"
+    ),
+    provider_kind!(
+        ALIYUN_KIND,
+        "Aliyun",
+        Aliyun,
+        "https://dashscope.aliyuncs.com/compatible-mode/v1/"
+    ),
+    provider_kind!(
+        BAIDU_KIND,
+        "Baidu",
+        Baidu,
+        "https://qianfan.baidubce.com/v2/"
+    ),
+    provider_kind!(COHERE_KIND, "Cohere", Cohere, "https://api.cohere.com/v1/"),
+    provider_kind!(
+        OLLAMA_KIND,
+        "Ollama",
+        Ollama,
+        "http://localhost:11434/",
+        no_api_key
+    ),
+    provider_kind!(
+        OLLAMA_CLOUD_KIND,
+        "Ollama Cloud",
+        OllamaCloud,
+        "https://ollama.com/"
+    ),
+    provider_kind!(
+        VERTEX_KIND,
+        "Vertex AI",
+        Vertex,
+        "https://aiplatform.googleapis.com/v1/projects/PROJECT_ID/locations/global/"
+    ),
+    provider_kind!(
+        GITHUB_COPILOT_KIND,
+        "GitHub Copilot",
+        GithubCopilot,
+        "https://models.github.ai/inference/"
+    ),
+    provider_kind!(
+        OPENCODE_GO_KIND,
+        "OpenCode Go",
+        OpenCodeGo,
+        "https://opencode.ai/zen/go/v1/"
+    ),
+    provider_kind!(
+        BEDROCK_API_KIND,
+        "Bedrock API",
+        BedrockApi,
+        "https://bedrock-runtime.us-east-1.amazonaws.com/"
+    ),
+    provider_kind!(
+        OPEN_ROUTER_KIND,
+        "OpenRouter",
+        OpenRouter,
+        "https://openrouter.ai/api/v1/"
+    ),
+    provider_kind!(
+        MINIMAX_KIND,
+        "MiniMax",
+        MiniMax,
+        "https://api.minimax.io/anthropic/v1/"
+    ),
+];
+
+pub fn supported_provider_kinds() -> &'static [ProviderKind] {
+    SUPPORTED_PROVIDER_KINDS
 }
 
 const REQUEST_OVERRIDE_TARGET_HEADER: &str = "header";
@@ -153,14 +343,16 @@ impl ProviderConnectionConfig {
     }
 
     pub fn genai_client(&self) -> Result<Client, ProviderConfigError> {
-        let endpoint = Endpoint::from_owned(self.endpoint_url()?);
         let auth = self.auth_data()?;
-        let resolver_endpoint = endpoint.clone();
         let resolver_auth = auth.clone();
+        let endpoint = self.custom_endpoint()?;
+        let resolver_endpoint = endpoint.clone();
         let mut builder = Client::builder()
             .with_adapter_kind(self.kind.adapter_kind())
             .with_service_target_resolver_fn(move |mut target: genai::ServiceTarget| {
-                target.endpoint = resolver_endpoint.clone();
+                if let Some(endpoint) = resolver_endpoint.clone() {
+                    target.endpoint = endpoint;
+                }
                 target.auth = resolver_auth.clone();
                 Ok(target)
             });
@@ -173,47 +365,43 @@ impl ProviderConnectionConfig {
         Ok(builder.build())
     }
 
-    fn reqwest_client(&self) -> Result<reqwest::Client, ProviderConfigError> {
-        let mut builder = reqwest::Client::builder();
+    pub fn genai_provider_config(&self) -> Result<ProviderConfig, ProviderConfigError> {
+        let mut config = ProviderConfig::default().with_auth(self.auth_data()?);
 
-        if let Some(proxy_url) = self.proxy_url.as_deref() {
-            let proxy = self.reqwest_proxy(proxy_url)?;
-            builder = builder.proxy(proxy);
+        if let Some(endpoint) = self.custom_endpoint()? {
+            config = config.with_endpoint(endpoint);
         }
 
-        builder
-            .build()
-            .map_err(|source| ProviderConfigError::InvalidRequest(source.to_string()))
+        Ok(config)
     }
 
-    pub fn genai_provider_config(&self) -> Result<ProviderConfig, ProviderConfigError> {
-        Ok(ProviderConfig::default()
-            .with_endpoint(Endpoint::from_owned(self.endpoint_url()?))
-            .with_auth(self.auth_data()?))
+    fn custom_endpoint(&self) -> Result<Option<Endpoint>, ProviderConfigError> {
+        self.base_url
+            .as_deref()
+            .map(normalized_base_url)
+            .map(|result| result.map(Endpoint::from_owned))
+            .transpose()
     }
 
-    fn endpoint_url(&self) -> Result<String, ProviderConfigError> {
-        let base_url = self.base_url.as_deref().unwrap_or(DEFAULT_OPENAI_BASE_URL);
-        normalized_base_url(base_url)
+    fn diagnostic_endpoint_url(&self) -> Result<String, ProviderConfigError> {
+        normalized_base_url(
+            self.base_url
+                .as_deref()
+                .unwrap_or_else(|| self.kind.default_base_url()),
+        )
     }
 
     fn auth_data(&self) -> Result<AuthData, ProviderConfigError> {
-        let api_key = self
+        match self
             .api_key
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or(ProviderConfigError::MissingApiKey)?;
-
-        Ok(AuthData::from_single(api_key.to_string()))
-    }
-
-    fn api_key(&self) -> Result<&str, ProviderConfigError> {
-        self.api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or(ProviderConfigError::MissingApiKey)
+        {
+            Some(api_key) => Ok(AuthData::from_single(api_key.to_string())),
+            None if !self.kind.requires_api_key() => Ok(AuthData::None),
+            None => Err(ProviderConfigError::MissingApiKey),
+        }
     }
 
     fn reqwest_proxy(&self, proxy_url: &str) -> Result<reqwest::Proxy, ProviderConfigError> {
@@ -227,50 +415,82 @@ impl ProviderConnectionConfig {
 pub async fn fetch_provider_model_ids(
     config: &ProviderConnectionConfig,
 ) -> Result<Vec<String>, ProviderConfigError> {
-    let url = format!("{}models", config.endpoint_url()?);
-    let response = config
-        .reqwest_client()?
-        .get(url)
-        .bearer_auth(config.api_key()?)
-        .send()
-        .await
-        .map_err(ProviderConfigError::from_reqwest_error)?;
-    let status = response.status();
+    match fetch_provider_model_ids_once(config, "models").await {
+        Ok(models) => Ok(models),
+        Err(source) if should_retry_model_list_with_v1_endpoint(config, &source) => {
+            let Some(retry_config) = model_list_v1_retry_config(config)? else {
+                return Err(source);
+            };
 
-    if !status.is_success() {
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|source| format!("failed to read error response body: {source}"));
-        return Err(ProviderConfigError::Connection {
-            message: format!("provider model list failed with status {status}: {body}"),
-            status_code: Some(status.as_u16()),
-        });
+            fetch_provider_model_ids_once(&retry_config, "v1/models").await
+        }
+        Err(source) => Err(source),
+    }
+}
+
+async fn fetch_provider_model_ids_once(
+    config: &ProviderConnectionConfig,
+    diagnostic_model_id: &str,
+) -> Result<Vec<String>, ProviderConfigError> {
+    let client = config.genai_client()?;
+    let context = config.provider_error_context("listing provider models", diagnostic_model_id)?;
+    let models = client
+        .all_model_names(config.kind.adapter_kind(), config.genai_provider_config()?)
+        .await
+        .map_err(|source| ProviderConfigError::from_genai_error_with_context(source, &context))?;
+
+    Ok(unique_sorted_model_ids(models))
+}
+
+fn should_retry_model_list_with_v1_endpoint(
+    config: &ProviderConnectionConfig,
+    error: &ProviderConfigError,
+) -> bool {
+    config.base_url.is_some() && matches!(error, ProviderConfigError::Connection { .. })
+}
+
+fn model_list_v1_retry_config(
+    config: &ProviderConnectionConfig,
+) -> Result<Option<ProviderConnectionConfig>, ProviderConfigError> {
+    let Some(base_url) = config.base_url.as_deref() else {
+        return Ok(None);
+    };
+    let normalized = normalized_base_url(base_url)?;
+    let mut url =
+        reqwest::Url::parse(&normalized).map_err(|source| ProviderConfigError::InvalidBaseUrl {
+            value: base_url.to_string(),
+            source: source.to_string(),
+        })?;
+    let already_v1 = url
+        .path_segments()
+        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        == Some("v1");
+
+    if already_v1 {
+        return Ok(None);
     }
 
-    let body = response
-        .json::<serde_json::Value>()
-        .await
-        .map_err(ProviderConfigError::from_reqwest_error)?;
-    let models = body
-        .get("data")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| ProviderConfigError::MissingRequiredField("models.data".to_string()))?;
+    {
+        let mut segments =
+            url.path_segments_mut()
+                .map_err(|_| ProviderConfigError::InvalidBaseUrl {
+                    value: base_url.to_string(),
+                    source: "base URL cannot be used as a path base".to_string(),
+                })?;
+        segments.pop_if_empty();
+        segments.push("v1");
+    }
 
+    let mut retry_config = config.clone();
+    retry_config.base_url = Some(normalized_base_url(url.as_str())?);
+    Ok(Some(retry_config))
+}
+
+fn unique_sorted_model_ids(mut models: Vec<String>) -> Vec<String> {
+    models.retain(|model| !model.trim().is_empty());
+    models.sort();
+    models.dedup();
     models
-        .iter()
-        .enumerate()
-        .map(|(index, model)| {
-            model
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .filter(|id| !id.trim().is_empty())
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    ProviderConfigError::MissingRequiredField(format!("models.data[{index}].id"))
-                })
-        })
-        .collect()
 }
 
 pub async fn test_provider_connection(
@@ -415,10 +635,6 @@ pub async fn stream_chat(
     config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
 ) -> Result<NeutralChatStream, ProviderConfigError> {
-    match config.kind {
-        ProviderKind::OpenAiChat | ProviderKind::OpenAiResponses => {}
-    }
-
     let client = config.genai_client()?;
     let chat_request = genai_chat_request(&request)?;
     let error_context =
@@ -439,11 +655,12 @@ pub async fn stream_chat(
 }
 
 pub fn parse_provider_kind(value: &str) -> Result<ProviderKind, ProviderConfigError> {
-    match value.trim() {
-        OPENAI_CHAT_KIND => Ok(ProviderKind::OpenAiChat),
-        OPENAI_RESPONSES_KIND => Ok(ProviderKind::OpenAiResponses),
-        other => Err(ProviderConfigError::UnsupportedKind(other.to_string())),
-    }
+    let value = value.trim();
+    supported_provider_kinds()
+        .iter()
+        .copied()
+        .find(|kind| kind.as_str() == value)
+        .ok_or_else(|| ProviderConfigError::UnsupportedKind(value.to_string()))
 }
 
 pub fn normalized_proxy_url(proxy_type: &str, value: &str) -> Result<String, ProviderConfigError> {
@@ -969,7 +1186,8 @@ impl fmt::Display for ProviderErrorContext {
 
 impl ProviderConnectionConfig {
     fn diagnostic_base_url(&self) -> String {
-        let Ok(mut url) = reqwest::Url::parse(&self.endpoint_url().unwrap_or_default()) else {
+        let Ok(mut url) = reqwest::Url::parse(&self.diagnostic_endpoint_url().unwrap_or_default())
+        else {
             return "<invalid>".to_string();
         };
         let _ = url.set_username("");
@@ -1027,13 +1245,6 @@ impl ProviderConfigError {
             status_code,
         }
     }
-
-    fn from_reqwest_error(source: reqwest::Error) -> Self {
-        Self::Connection {
-            status_code: source.status().map(|status| status.as_u16()),
-            message: source.to_string(),
-        }
-    }
 }
 
 impl fmt::Display for ProviderConfigError {
@@ -1063,7 +1274,12 @@ impl fmt::Display for ProviderConfigError {
             Self::MissingApiKey => write!(formatter, "provider API key must not be empty"),
             Self::UnsupportedKind(kind) => write!(
                 formatter,
-                "unsupported provider kind '{kind}'; expected '{OPENAI_CHAT_KIND}' or '{OPENAI_RESPONSES_KIND}'"
+                "unsupported provider kind '{kind}'; expected one of: {}",
+                supported_provider_kinds()
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Self::UnsupportedProxyKind(kind) => write!(
                 formatter,
@@ -1124,15 +1340,47 @@ fn webc_error_status_code(source: &genai::webc::Error) -> Option<StatusCode> {
 mod tests {
     use super::*;
 
+    fn openai_responses_kind() -> ProviderKind {
+        parse_provider_kind(OPENAI_RESPONSES_KIND).expect("responses kind")
+    }
+
     #[test]
     fn parses_supported_provider_kinds() {
         assert_eq!(
-            parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind"),
-            ProviderKind::OpenAiChat
+            parse_provider_kind(OPENAI_CHAT_KIND)
+                .expect("chat kind")
+                .adapter_kind(),
+            AdapterKind::OpenAI
         );
         assert_eq!(
-            parse_provider_kind(OPENAI_RESPONSES_KIND).expect("responses kind"),
-            ProviderKind::OpenAiResponses
+            parse_provider_kind(OPENAI_RESPONSES_KIND)
+                .expect("responses kind")
+                .adapter_kind(),
+            AdapterKind::OpenAIResp
+        );
+        assert_eq!(
+            parse_provider_kind(ANTHROPIC_KIND)
+                .expect("anthropic kind")
+                .adapter_kind(),
+            AdapterKind::Anthropic
+        );
+        assert_eq!(
+            parse_provider_kind(GEMINI_KIND)
+                .expect("gemini kind")
+                .adapter_kind(),
+            AdapterKind::Gemini
+        );
+        assert_eq!(
+            parse_provider_kind(XAI_KIND)
+                .expect("xai kind")
+                .adapter_kind(),
+            AdapterKind::Xai
+        );
+        assert_eq!(
+            parse_provider_kind(DEEPSEEK_KIND)
+                .expect("deepseek kind")
+                .adapter_kind(),
+            AdapterKind::DeepSeek
         );
     }
 
@@ -1144,10 +1392,65 @@ mod tests {
     }
 
     #[test]
+    fn provider_kind_catalog_exposes_genai_adapters() {
+        let kinds = supported_provider_kinds()
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(kinds.contains(&ANTHROPIC_KIND));
+        assert!(kinds.contains(&GEMINI_KIND));
+        assert!(kinds.contains(&XAI_KIND));
+        assert!(kinds.contains(&DEEPSEEK_KIND));
+        assert!(kinds.contains(&OLLAMA_KIND));
+        assert!(
+            !parse_provider_kind(OLLAMA_KIND)
+                .expect("ollama kind")
+                .requires_api_key()
+        );
+    }
+
+    #[test]
     fn normalizes_base_url_for_genai_joining() {
         assert_eq!(
             normalized_base_url("https://api.openai.com/v1").expect("base url"),
             DEFAULT_OPENAI_BASE_URL
+        );
+    }
+
+    #[test]
+    fn builds_v1_retry_base_url_for_missing_model_list_endpoint() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(ANTHROPIC_KIND).expect("anthropic kind"),
+            base_url: Some("https://api.krill-ai.com/coding/".to_string()),
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+        };
+
+        let retry_config = model_list_v1_retry_config(&config)
+            .expect("retry config")
+            .expect("custom base url retry");
+
+        assert_eq!(
+            retry_config.base_url.as_deref(),
+            Some("https://api.krill-ai.com/coding/v1/")
+        );
+    }
+
+    #[test]
+    fn skips_v1_retry_when_base_url_already_ends_with_v1() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(ANTHROPIC_KIND).expect("anthropic kind"),
+            base_url: Some("https://api.anthropic.com/v1/".to_string()),
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+        };
+
+        assert_eq!(
+            model_list_v1_retry_config(&config).expect("retry config"),
+            None
         );
     }
 
@@ -1171,7 +1474,7 @@ mod tests {
     #[test]
     fn provider_error_context_redacts_url_credentials_query_and_fragment() {
         let config = ProviderConnectionConfig {
-            kind: ProviderKind::OpenAiResponses,
+            kind: openai_responses_kind(),
             base_url: Some("https://user:secret@example.test/v1?api_key=hidden#frag".to_string()),
             api_key: Some("sk-test".to_string()),
             proxy_url: Some("http://127.0.0.1:7890".to_string()),
@@ -1388,7 +1691,7 @@ mod tests {
         };
 
         let config = ProviderConnectionConfig {
-            kind: ProviderKind::OpenAiResponses,
+            kind: openai_responses_kind(),
             base_url: None,
             api_key: Some("sk-test".to_string()),
             proxy_url: None,
@@ -1418,7 +1721,7 @@ mod tests {
         };
 
         let config = ProviderConnectionConfig {
-            kind: ProviderKind::OpenAiResponses,
+            kind: openai_responses_kind(),
             base_url: None,
             api_key: Some("sk-test".to_string()),
             proxy_url: None,
@@ -1443,7 +1746,7 @@ mod tests {
         };
 
         let config = ProviderConnectionConfig {
-            kind: ProviderKind::OpenAiResponses,
+            kind: openai_responses_kind(),
             base_url: None,
             api_key: Some("sk-test".to_string()),
             proxy_url: None,

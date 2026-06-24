@@ -236,6 +236,26 @@ export const settings = {
       kind: "openai-responses",
       label: "OpenAI Responses",
     },
+    {
+      defaultBaseUrl: "https://api.anthropic.com/v1",
+      kind: "anthropic",
+      label: "Anthropic",
+    },
+    {
+      defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
+      kind: "gemini",
+      label: "Gemini",
+    },
+    {
+      defaultBaseUrl: "https://api.x.ai/v1",
+      kind: "xai",
+      label: "xAI",
+    },
+    {
+      defaultBaseUrl: "https://api.deepseek.com/v1",
+      kind: "deepseek",
+      label: "DeepSeek",
+    },
   ],
   providers: [
     {

@@ -933,6 +933,7 @@ export type ProviderFormState = {
   kind: string;
   name: string;
   requestOverrides: ProviderRequestOverrideFormState[];
+  serviceId: string;
 };
 
 export type ProviderTestResponse = {

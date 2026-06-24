@@ -337,6 +337,106 @@ type WorkspaceChatContextMenuState = {
 
 const OPENAI_RESPONSES_PROVIDER_KIND = "openai-responses";
 
+type ProviderServicePreset = {
+  id: string;
+  label: string;
+  kindIds: string[];
+  defaultKindId: string;
+};
+
+const PROVIDER_SERVICE_PRESETS: ProviderServicePreset[] = [
+  {
+    id: "openai",
+    label: "OpenAI",
+    kindIds: [OPENAI_RESPONSES_PROVIDER_KIND, "openai-chat"],
+    defaultKindId: OPENAI_RESPONSES_PROVIDER_KIND,
+  },
+  {
+    id: "anthropic",
+    label: "Anthropic",
+    kindIds: ["anthropic"],
+    defaultKindId: "anthropic",
+  },
+  { id: "gemini", label: "Gemini", kindIds: ["gemini"], defaultKindId: "gemini" },
+  { id: "xai", label: "xAI", kindIds: ["xai"], defaultKindId: "xai" },
+  {
+    id: "deepseek",
+    label: "DeepSeek",
+    kindIds: ["deepseek"],
+    defaultKindId: "deepseek",
+  },
+  { id: "groq", label: "Groq", kindIds: ["groq"], defaultKindId: "groq" },
+  {
+    id: "open-router",
+    label: "OpenRouter",
+    kindIds: ["open-router"],
+    defaultKindId: "open-router",
+  },
+  {
+    id: "fireworks",
+    label: "Fireworks",
+    kindIds: ["fireworks"],
+    defaultKindId: "fireworks",
+  },
+  {
+    id: "together",
+    label: "Together",
+    kindIds: ["together"],
+    defaultKindId: "together",
+  },
+  {
+    id: "moonshot",
+    label: "Moonshot",
+    kindIds: ["moonshot"],
+    defaultKindId: "moonshot",
+  },
+  { id: "zai", label: "ZAI", kindIds: ["zai"], defaultKindId: "zai" },
+  {
+    id: "bigmodel",
+    label: "BigModel",
+    kindIds: ["bigmodel"],
+    defaultKindId: "bigmodel",
+  },
+  { id: "aliyun", label: "Aliyun", kindIds: ["aliyun"], defaultKindId: "aliyun" },
+  { id: "baidu", label: "Baidu", kindIds: ["baidu"], defaultKindId: "baidu" },
+  { id: "cohere", label: "Cohere", kindIds: ["cohere"], defaultKindId: "cohere" },
+  { id: "ollama", label: "Ollama", kindIds: ["ollama"], defaultKindId: "ollama" },
+  {
+    id: "ollama-cloud",
+    label: "Ollama Cloud",
+    kindIds: ["ollama-cloud"],
+    defaultKindId: "ollama-cloud",
+  },
+  { id: "vertex", label: "Vertex AI", kindIds: ["vertex"], defaultKindId: "vertex" },
+  {
+    id: "github-copilot",
+    label: "GitHub Copilot",
+    kindIds: ["github-copilot"],
+    defaultKindId: "github-copilot",
+  },
+  {
+    id: "opencode-go",
+    label: "OpenCode Go",
+    kindIds: ["opencode-go"],
+    defaultKindId: "opencode-go",
+  },
+  {
+    id: "bedrock-api",
+    label: "Bedrock API",
+    kindIds: ["bedrock-api"],
+    defaultKindId: "bedrock-api",
+  },
+  {
+    id: "aihubmix",
+    label: "AIHubMix",
+    kindIds: ["aihubmix"],
+    defaultKindId: "aihubmix",
+  },
+  { id: "mimo", label: "Mimo", kindIds: ["mimo"], defaultKindId: "mimo" },
+  { id: "nebius", label: "Nebius", kindIds: ["nebius"], defaultKindId: "nebius" },
+  { id: "minimax", label: "MiniMax", kindIds: ["minimax"], defaultKindId: "minimax" },
+];
+
 type OpenFileTab = {
   workspaceId: string;
   path: string;
@@ -11904,6 +12004,24 @@ function SettingsPanel({
   const selectedProviderKind = providerKinds.find(
     (kind) => kind.kind === providerForm.kind,
   );
+  const providerServices = useMemo(
+    () => providerServicesForKinds(providerKinds),
+    [providerKinds],
+  );
+  const selectedProviderServiceId =
+    providerForm.serviceId ||
+    providerServiceIdForKind(providerForm.kind) ||
+    providerServiceIdForKind(defaultProviderKind(providerKinds)) ||
+    providerServices[0]?.id ||
+    "";
+  const selectedProviderService =
+    providerServices.find((service) => service.id === selectedProviderServiceId) ??
+    null;
+  const providerProtocolKinds = selectedProviderService
+    ? providerKinds.filter((kind) =>
+      selectedProviderService.kindIds.includes(kind.kind),
+    )
+    : providerKinds;
   const editingProvider =
     providers.find((provider) => provider.id === providerForm.id) ?? null;
   const apiProxyTypes = editingProvider?.apiProxy.supportedTypes ??
@@ -12062,6 +12180,12 @@ function SettingsPanel({
       setProviderForm((current) => ({
         ...current,
         kind: current.kind || defaultProviderKind(data.providerKinds),
+        serviceId:
+          current.serviceId ||
+          providerServiceIdForKind(
+            current.kind || defaultProviderKind(data.providerKinds),
+          ) ||
+          "",
       }));
       setMcpForm((current) => ({
         ...current,
@@ -12405,18 +12529,58 @@ function SettingsPanel({
             ? Boolean(overrideRule.value)
             : String(overrideRule.value),
       })),
+      serviceId: providerServiceIdForKind(provider.kind) || "",
     });
     setIsProviderApiKeyVisible(false);
     setIsProviderDialogOpen(true);
   }
 
   function startAddingProvider() {
+    const kind = defaultProviderKind(providerKinds);
     setProviderForm({
       ...emptyProviderForm(),
-      kind: defaultProviderKind(providerKinds),
+      baseUrl: providerKindDefaultBaseUrl(providerKinds, kind),
+      kind,
+      serviceId: providerServiceIdForKind(kind) || "",
     });
     setIsProviderApiKeyVisible(false);
     setIsProviderDialogOpen(true);
+  }
+
+  function applyProviderService(serviceId: string) {
+    const service = providerServices.find((item) => item.id === serviceId);
+
+    if (!service) {
+      return;
+    }
+
+    const kind = providerDefaultKindForService(service, providerKinds);
+    const baseUrl = providerKindDefaultBaseUrl(providerKinds, kind);
+
+    setProviderForm((current) => {
+      const previousService = providerServices.find(
+        (item) => item.id === current.serviceId,
+      );
+      const shouldFillName =
+        !current.name.trim() || current.name === previousService?.label;
+
+      return {
+        ...current,
+        baseUrl,
+        kind,
+        name: shouldFillName ? service.label : current.name,
+        serviceId,
+      };
+    });
+  }
+
+  function updateProviderProtocol(kind: string) {
+    setProviderForm((current) => ({
+      ...current,
+      baseUrl: providerKindDefaultBaseUrl(providerKinds, kind),
+      kind,
+      serviceId: providerServiceIdForKind(kind) || current.serviceId,
+    }));
   }
 
   function editConfiguredMcpServer(server: ConfiguredMcpServerSummary) {
@@ -18480,7 +18644,7 @@ function SettingsPanel({
                   />
                   <form
                     aria-label={t("Provider configuration")}
-                    className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] w-[min(96vw,58rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] w-[min(96vw,72rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
                     onSubmit={(event) => void saveProvider(event)}
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
@@ -18537,7 +18701,37 @@ function SettingsPanel({
                         </button>
                       </div>
                     </div>
-                    <div className="space-y-3">
+                    <div className="grid gap-4 lg:grid-cols-[13rem_minmax(0,1fr)]">
+                      <div className="flex h-full min-h-0 flex-col rounded-xl border border-stone-200 bg-stone-50/70 p-2">
+                          <div className="px-2 pb-2 text-xs font-semibold text-stone-600">
+                            {t("Service provider")}
+                          </div>
+                          <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
+                            {providerServices.map((service) => (
+                              <button
+                                aria-pressed={selectedProviderServiceId === service.id}
+                                className={`flex min-h-9 w-full items-center justify-between gap-2 rounded-lg px-2 py-2 text-left text-sm font-semibold transition ${selectedProviderServiceId === service.id
+                                    ? "bg-teal-700 text-white"
+                                    : "text-stone-700 hover:bg-white hover:text-teal-800"
+                                  }`}
+                                key={service.id}
+                                onClick={() => applyProviderService(service.id)}
+                                type="button"
+                              >
+                                <span className="min-w-0 truncate">{service.label}</span>
+                                <span
+                                  className={`rounded-md px-1.5 py-0.5 text-[11px] ${selectedProviderServiceId === service.id
+                                      ? "bg-white/15 text-white"
+                                      : "bg-stone-200 text-stone-600"
+                                    }`}
+                                >
+                                  {formatNumber(service.kindIds.length, language)}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      <div className="space-y-3">
                       <TextField
                         label={t("Name")}
                         onChange={(value) =>
@@ -18556,14 +18750,11 @@ function SettingsPanel({
                         <select
                           className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                           onChange={(event) =>
-                            setProviderForm((current) => ({
-                              ...current,
-                              kind: event.target.value,
-                            }))
+                            updateProviderProtocol(event.target.value)
                           }
                           value={providerForm.kind || defaultProviderKind(providerKinds)}
                         >
-                          {providerKinds.map((kind) => (
+                          {providerProtocolKinds.map((kind) => (
                             <option key={kind.kind} value={kind.kind}>
                               {kind.label}
                             </option>
@@ -18874,6 +19065,7 @@ function SettingsPanel({
                           <KeyRound aria-hidden="true" className="size-4" />
                         )}
                       </button>
+                    </div>
                     </div>
                   </form>
                 </>
@@ -20821,6 +21013,7 @@ function emptyProviderForm(): ProviderFormState {
     kind: "",
     name: "",
     requestOverrides: [],
+    serviceId: "",
   };
 }
 
@@ -21425,6 +21618,44 @@ function defaultProviderKind(providerKinds: SettingsResponse["providerKinds"]) {
     providerKinds[0]?.kind ??
     OPENAI_RESPONSES_PROVIDER_KIND
   );
+}
+
+function providerServicesForKinds(
+  providerKinds: SettingsResponse["providerKinds"],
+): ProviderServicePreset[] {
+  const supportedKindIds = new Set(providerKinds.map((kind) => kind.kind));
+
+  return PROVIDER_SERVICE_PRESETS.map((service) => ({
+    ...service,
+    kindIds: service.kindIds.filter((kindId) => supportedKindIds.has(kindId)),
+  })).filter((service) => service.kindIds.length > 0);
+}
+
+function providerServiceIdForKind(kindId: string) {
+  return PROVIDER_SERVICE_PRESETS.find((service) =>
+    service.kindIds.includes(kindId),
+  )?.id;
+}
+
+function providerDefaultKindForService(
+  service: ProviderServicePreset,
+  providerKinds: SettingsResponse["providerKinds"],
+) {
+  const supportedKindIds = new Set(providerKinds.map((kind) => kind.kind));
+
+  if (supportedKindIds.has(service.defaultKindId)) {
+    return service.defaultKindId;
+  }
+
+  return service.kindIds.find((kindId) => supportedKindIds.has(kindId)) ??
+    defaultProviderKind(providerKinds);
+}
+
+function providerKindDefaultBaseUrl(
+  providerKinds: SettingsResponse["providerKinds"],
+  kindId: string,
+) {
+  return providerKinds.find((kind) => kind.kind === kindId)?.defaultBaseUrl ?? "";
 }
 
 function nextProviderId(

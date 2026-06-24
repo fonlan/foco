@@ -37,7 +37,7 @@ use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
-    NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
+    NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
     OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig, ProviderRequestOverride,
     normalized_proxy_url, parse_provider_kind, stream_chat,
 };
@@ -8591,21 +8591,26 @@ fn mcp_transport_label(transport: &str) -> &'static str {
 
 fn provider_warnings(provider: &ProviderSettings) -> Vec<String> {
     let mut warnings = Vec::new();
+    let provider_kind = parse_provider_kind(&provider.kind);
 
     if !provider.enabled {
         warnings.push("Provider is disabled.".to_string());
     }
 
-    if provider
-        .api_key
-        .as_deref()
-        .map(|value| value.trim().is_empty())
+    if provider_kind
+        .as_ref()
+        .map(|kind| kind.requires_api_key())
         .unwrap_or(true)
+        && provider
+            .api_key
+            .as_deref()
+            .map(|value| value.trim().is_empty())
+            .unwrap_or(true)
     {
         warnings.push("Provider has no API key.".to_string());
     }
 
-    if parse_provider_kind(&provider.kind).is_err() {
+    if provider_kind.is_err() {
         warnings.push(format!("Provider kind '{}' is unsupported.", provider.kind));
     }
 
@@ -9030,11 +9035,9 @@ fn model_warnings(
 }
 
 fn provider_kind_label(kind: &str) -> &'static str {
-    match kind {
-        OPENAI_CHAT_KIND => "OpenAI Chat",
-        OPENAI_RESPONSES_KIND => "OpenAI Responses",
-        _ => "Unsupported",
-    }
+    parse_provider_kind(kind)
+        .map(|kind| kind.label())
+        .unwrap_or("Unsupported")
 }
 
 fn optional_trimmed_string(value: Option<String>) -> Option<String> {

@@ -2,7 +2,7 @@ use std::{collections::HashSet, path::Path, time::Instant};
 
 use axum::Json;
 use foco_agent::build_default_system_prompt;
-use foco_providers::{DEFAULT_OPENAI_BASE_URL, OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND};
+use foco_providers::supported_provider_kinds;
 use foco_store::{
     config::{
         GlobalConfig, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig, ModelSettings,
@@ -148,18 +148,14 @@ pub(crate) async fn settings_response(
             .map(configured_workspace_summary)
             .collect::<Result<Vec<_>, _>>()?,
         terminal_shells: terminal_shell_summaries(),
-        provider_kinds: vec![
-            ProviderKindSummary {
-                kind: OPENAI_CHAT_KIND,
-                label: "OpenAI Chat",
-                default_base_url: DEFAULT_OPENAI_BASE_URL,
-            },
-            ProviderKindSummary {
-                kind: OPENAI_RESPONSES_KIND,
-                label: "OpenAI Responses",
-                default_base_url: DEFAULT_OPENAI_BASE_URL,
-            },
-        ],
+        provider_kinds: supported_provider_kinds()
+            .iter()
+            .map(|kind| ProviderKindSummary {
+                kind: kind.as_str(),
+                label: kind.label(),
+                default_base_url: kind.default_base_url(),
+            })
+            .collect(),
         thinking_levels: vec![
             ThinkingLevelSummary {
                 value: "minimal",

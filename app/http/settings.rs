@@ -6,7 +6,8 @@ use axum::{
 };
 use foco_agent::build_default_system_prompt;
 use foco_providers::{
-    fetch_provider_model_ids, normalized_base_url, parse_provider_kind, test_provider_connection,
+    ProviderConfigError, fetch_provider_model_ids, normalized_base_url, parse_provider_kind,
+    test_provider_connection,
 };
 use foco_store::{
     config::PromptSettings,
@@ -597,10 +598,20 @@ pub(crate) async fn save_manual_provider(
     };
 
     if is_new_provider {
-        let model_ids = fetch_provider_model_ids(&provider_connection_config(&provider)?)
-            .await
-            .map_err(ApiError::from_provider_config_error)?;
-        associate_provider_with_local_models(&mut config.models, &provider.id, &model_ids);
+        match fetch_provider_model_ids(&provider_connection_config(&provider)?).await {
+            Ok(model_ids) => {
+                associate_provider_with_local_models(&mut config.models, &provider.id, &model_ids);
+            }
+            Err(source) if can_save_new_provider_after_model_list_error(&source) => {
+                tracing::warn!(
+                    provider_id = %provider.id,
+                    provider_kind = %provider.kind,
+                    error = ?source,
+                    "saving new provider without model associations because model list could not be fetched"
+                );
+            }
+            Err(source) => return Err(ApiError::from_provider_config_error(source)),
+        }
     }
 
     if let Some(stored_provider) = config
@@ -646,6 +657,10 @@ pub(crate) fn associate_provider_with_local_models(
             }
         }
     }
+}
+
+pub(crate) fn can_save_new_provider_after_model_list_error(error: &ProviderConfigError) -> bool {
+    matches!(error, ProviderConfigError::Connection { .. })
 }
 
 pub(crate) async fn refresh_provider_models(
