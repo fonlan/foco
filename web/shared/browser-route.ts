@@ -44,6 +44,8 @@ export function browserRouteFromPathname(
   const tabs = chatTabsFromSearch(search);
   const files = fileTabsFromSearch(search);
   const activeFile = activeFileFromSearch(search);
+  // ponytail: last tab is active; add an explicit activeChat param if tab order stops carrying selection.
+  const queryActiveChat = tabs.at(-1) ?? null;
 
   if (segments.length >= 2) {
     return chatRouteWithTabs({
@@ -55,7 +57,11 @@ export function browserRouteFromPathname(
 
   if (segments.length === 1) {
     return chatRouteWithTabs(
-      { chatId: null, viewMode: "chat", workspaceId: segments[0] },
+      {
+        chatId: queryActiveChat?.chatId ?? null,
+        viewMode: "chat",
+        workspaceId: queryActiveChat?.workspaceId ?? segments[0],
+      },
       tabs,
       files,
       activeFile,
@@ -63,7 +69,11 @@ export function browserRouteFromPathname(
   }
 
   return chatRouteWithTabs(
-    { chatId: null, viewMode: "chat", workspaceId: null },
+    {
+      chatId: queryActiveChat?.chatId ?? null,
+      viewMode: "chat",
+      workspaceId: queryActiveChat?.workspaceId ?? null,
+    },
     tabs,
     files,
     activeFile,
@@ -93,17 +103,11 @@ export function browserPathForRoute(route: BrowserRoute) {
 function browserPathnameForChatRoute(
   route: Extract<BrowserRoute, { viewMode: "chat" }>,
 ) {
-  if (route.workspaceId && route.chatId) {
-    return `/${encodeURIComponent(route.workspaceId)}/${encodeURIComponent(
-      route.chatId,
-    )}`;
+  if (route.chatId || route.tabs?.length || route.files?.length || route.activeFile) {
+    return "/";
   }
 
-  if (route.workspaceId) {
-    return `/${encodeURIComponent(route.workspaceId)}`;
-  }
-
-  return "/";
+  return route.workspaceId ? `/${encodeURIComponent(route.workspaceId)}` : "/";
 }
 
 function chatTabsFromSearch(search: string): BrowserRouteChatTab[] {
@@ -198,7 +202,7 @@ function fileTabFromParamValue(value: string): BrowserRouteFileTab | null {
 
 function chatRouteSearch(route: Extract<BrowserRoute, { viewMode: "chat" }>) {
   const params = new URLSearchParams();
-  appendChatTabsSearch(params, route.tabs ?? []);
+  appendChatTabsSearch(params, activeChatLast(route));
   appendFileTabsSearch(params, route.files ?? []);
 
   if (route.activeFile?.workspaceId && route.activeFile.path) {
@@ -206,6 +210,19 @@ function chatRouteSearch(route: Extract<BrowserRoute, { viewMode: "chat" }>) {
   }
 
   return params.toString();
+}
+
+function activeChatLast(route: Extract<BrowserRoute, { viewMode: "chat" }>) {
+  if (!route.workspaceId || !route.chatId) {
+    return route.tabs ?? [];
+  }
+
+  return [
+    ...(route.tabs ?? []).filter(
+      (tab) => tab.workspaceId !== route.workspaceId || tab.chatId !== route.chatId,
+    ),
+    { chatId: route.chatId, workspaceId: route.workspaceId },
+  ];
 }
 
 function appendChatTabsSearch(params: URLSearchParams, tabs: BrowserRouteChatTab[]) {

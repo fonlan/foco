@@ -29,6 +29,10 @@ import {
   workspaceMemory,
 } from "./test-utils/app-test-harness";
 
+function currentChatTabs() {
+  return new URLSearchParams(window.location.search).getAll("tab");
+}
+
 describe("app-shell verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
@@ -450,7 +454,7 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(screen.getAllByRole("button", { name: "Open chat" })[0]!);
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
-    expect(window.location.pathname).toBe("/workspace-1/chat-1");
+    expect(currentChatTabs()).toEqual(["workspace-1/chat-1"]);
   });
 
   it("opens a chat from the URL and writes chat selection changes back to the URL", async () => {
@@ -458,12 +462,12 @@ describe("app-shell verification surfaces", () => {
     renderApp();
 
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
-    expect(window.location.pathname).toBe("/workspace-1/chat-1");
+    expect(currentChatTabs()).toEqual(["workspace-1/chat-1"]);
 
     await userEvent.click(screen.getByText("Second chat"));
 
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
-    expect(window.location.pathname).toBe("/workspace-1/chat-2");
+    expect(currentChatTabs()).toEqual(["workspace-1/chat-1", "workspace-1/chat-2"]);
   });
 
   it("resizes the workspace sidebar from the panel splitter", async () => {
@@ -992,8 +996,7 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(screen.getByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
-    expect(window.location.pathname).toBe("/workspace-1/chat-2");
-    expect(new URLSearchParams(window.location.search).getAll("tab")).toEqual([
+    expect(currentChatTabs()).toEqual([
       "workspace-1/chat-1",
       "workspace-1/chat-2",
     ]);
@@ -1012,7 +1015,7 @@ describe("app-shell verification surfaces", () => {
     expect(
       within(tabList).queryByRole("tab", { name: /Tool run/ }),
     ).not.toBeInTheDocument();
-    expect(new URLSearchParams(window.location.search).getAll("tab")).toEqual([
+    expect(currentChatTabs()).toEqual([
       "workspace-1/chat-2",
     ]);
     expect(
@@ -1038,7 +1041,7 @@ describe("app-shell verification surfaces", () => {
     window.history.replaceState(
       null,
       "",
-      "/workspace-1/chat-2?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2",
+      "/?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2",
     );
 
     renderApp();
@@ -1050,7 +1053,7 @@ describe("app-shell verification surfaces", () => {
       "aria-selected",
       "true",
     );
-    expect(new URLSearchParams(window.location.search).getAll("tab")).toEqual([
+    expect(currentChatTabs()).toEqual([
       "workspace-1/chat-1",
       "workspace-1/chat-2",
     ]);

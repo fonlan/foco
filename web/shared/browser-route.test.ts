@@ -9,14 +9,13 @@ describe("browser route chat tabs", () => {
   it("parses chat tabs from repeated query params and keeps the active chat", () => {
     expect(
       browserRouteFromPathname(
-        "/workspace-1/chat-2",
-        "?tab=workspace-1%2Fchat-1&tab=workspace-2%2Fside-chat-1",
+        "/",
+        "?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2",
       ),
     ).toEqual({
       chatId: "chat-2",
       tabs: [
         { chatId: "chat-1", workspaceId: "workspace-1" },
-        { chatId: "side-chat-1", workspaceId: "workspace-2" },
         { chatId: "chat-2", workspaceId: "workspace-1" },
       ],
       viewMode: "chat",
@@ -36,7 +35,7 @@ describe("browser route chat tabs", () => {
         workspaceId: "workspace-1",
       }),
     ).toBe(
-      "/workspace-1/chat-2?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2",
+      "/?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2",
     );
   });
 
@@ -53,7 +52,7 @@ describe("browser route chat tabs", () => {
         workspaceId: "workspace-1",
       }),
     ).toBe(
-      "/workspace-1?file=workspace-1%2FREADME.md&file=workspace-1%2Fsrc%252Fmain.ts&activeFile=workspace-1%2Fsrc%252Fmain.ts",
+      "/?file=workspace-1%2FREADME.md&file=workspace-1%2Fsrc%252Fmain.ts&activeFile=workspace-1%2Fsrc%252Fmain.ts",
     );
   });
 
