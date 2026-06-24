@@ -58,6 +58,9 @@ use workspace_schema::{
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_SCHEMA_VERSION: u32 = 17;
+pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
+pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
+pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -171,6 +174,221 @@ pub struct WorkspaceDatabase {
     database_path: PathBuf,
     connection: Connection,
 }
+
+// ponytail: Phase 0 only codifies Project Spec behavior; storage, HTTP, prompt wiring, and UI land later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WorkspaceSpecSettings {
+    pub enabled: bool,
+    pub inject_enabled: bool,
+}
+
+impl WorkspaceSpecSettings {
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            inject_enabled: false,
+        }
+    }
+
+    pub const fn enabled(inject_enabled: bool) -> Self {
+        Self {
+            enabled: true,
+            inject_enabled,
+        }
+    }
+
+    pub const fn allows_generation(self) -> bool {
+        self.enabled
+    }
+
+    pub const fn allows_update(self) -> bool {
+        self.enabled
+    }
+
+    pub const fn allows_injection(self) -> bool {
+        self.enabled && self.inject_enabled
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceSpecPromptPlan {
+    UseChatSnapshot,
+    ReadWorkspaceSpecAndSaveSnapshot,
+    SkipDisabled,
+    SkipInjectionDisabled,
+}
+
+impl WorkspaceSpecPromptPlan {
+    pub const fn for_chat(settings: WorkspaceSpecSettings, chat_snapshot_exists: bool) -> Self {
+        if chat_snapshot_exists {
+            return Self::UseChatSnapshot;
+        }
+        if !settings.enabled {
+            return Self::SkipDisabled;
+        }
+        if !settings.inject_enabled {
+            return Self::SkipInjectionDisabled;
+        }
+
+        Self::ReadWorkspaceSpecAndSaveSnapshot
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceSpecTriggerType {
+    ManualInitial,
+    ManualRefresh,
+    ChatCompleted,
+}
+
+impl WorkspaceSpecTriggerType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ManualInitial => "manual_initial",
+            Self::ManualRefresh => "manual_refresh",
+            Self::ChatCompleted => "chat_completed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, WorkspaceDatabaseError> {
+        match value {
+            "manual_initial" => Ok(Self::ManualInitial),
+            "manual_refresh" => Ok(Self::ManualRefresh),
+            "chat_completed" => Ok(Self::ChatCompleted),
+            _ => Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                message: format!("unknown workspace spec trigger type: {value}"),
+            }),
+        }
+    }
+
+    pub const fn is_manual(self) -> bool {
+        matches!(self, Self::ManualInitial | Self::ManualRefresh)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceSpecJobStatus {
+    Queued,
+    Running,
+    Completed,
+    Skipped,
+    Failed,
+}
+
+impl WorkspaceSpecJobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, WorkspaceDatabaseError> {
+        match value {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "skipped" => Ok(Self::Skipped),
+            "failed" => Ok(Self::Failed),
+            _ => Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                message: format!("unknown workspace spec job status: {value}"),
+            }),
+        }
+    }
+
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Skipped | Self::Failed)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceSpecJobEnqueueDecision {
+    QueueNow,
+    QueuePendingRefresh,
+    AlreadyPendingRefresh,
+    RejectAlreadyRunning,
+}
+
+impl WorkspaceSpecJobEnqueueDecision {
+    pub const fn for_trigger(
+        trigger: WorkspaceSpecTriggerType,
+        running_job_exists: bool,
+        pending_refresh_exists: bool,
+    ) -> Self {
+        if !running_job_exists {
+            return Self::QueueNow;
+        }
+        if trigger.is_manual() {
+            return Self::RejectAlreadyRunning;
+        }
+        if pending_refresh_exists {
+            return Self::AlreadyPendingRefresh;
+        }
+
+        Self::QueuePendingRefresh
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceSpecWriteDecision {
+    WriteFullReplacement,
+    SkipStaleRevision { reason: &'static str },
+}
+
+impl WorkspaceSpecWriteDecision {
+    pub const fn for_job_output(base_revision: u64, current_revision: u64) -> Self {
+        if base_revision == current_revision {
+            Self::WriteFullReplacement
+        } else {
+            Self::SkipStaleRevision {
+                reason: WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkspaceSpecOutputStrategy {
+    FullReplacementMarkdown,
+}
+
+impl WorkspaceSpecOutputStrategy {
+    pub const fn uses_patch_parser(self) -> bool {
+        match self {
+            Self::FullReplacementMarkdown => false,
+        }
+    }
+
+    pub const fn allows_stale_merge(self) -> bool {
+        match self {
+            Self::FullReplacementMarkdown => false,
+        }
+    }
+
+    pub fn validate_markdown_size(self, content: &str) -> Result<(), WorkspaceDatabaseError> {
+        match self {
+            Self::FullReplacementMarkdown => {
+                if content.len() > WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
+                    return Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                        message: format!(
+                            "workspace spec Markdown is {} bytes, limit is {}",
+                            content.len(),
+                            WORKSPACE_SPEC_MAX_MARKDOWN_BYTES
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+pub const WORKSPACE_SPEC_V1_OUTPUT_STRATEGY: WorkspaceSpecOutputStrategy =
+    WorkspaceSpecOutputStrategy::FullReplacementMarkdown;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkspaceDatabaseSpaceStats {
@@ -6505,6 +6723,9 @@ pub enum WorkspaceDatabaseError {
     InvalidScheduledTaskData {
         message: String,
     },
+    InvalidWorkspaceSpec {
+        message: String,
+    },
     InvalidToolCall {
         message: String,
     },
@@ -6584,6 +6805,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             }
             Self::InvalidScheduledTaskData { message } => {
                 write!(formatter, "invalid scheduled task data: {message}")
+            }
+            Self::InvalidWorkspaceSpec { message } => {
+                write!(formatter, "invalid workspace spec: {message}")
             }
             Self::InvalidToolCall { message } => {
                 write!(formatter, "invalid tool call data: {message}")
@@ -6668,6 +6892,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::InvalidCodeGraphInput { .. }
             | Self::InvalidMessageMetadata { .. }
             | Self::InvalidScheduledTaskData { .. }
+            | Self::InvalidWorkspaceSpec { .. }
             | Self::InvalidToolCall { .. }
             | Self::InvalidTodoGraph { .. }
             | Self::MissingDatabaseParent { .. }

@@ -22,8 +22,12 @@ use foco_store::{
         NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
         NewTerminalSession, NewToolCall, NewToolResult, ScheduledTaskDueRunClaim,
         ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask,
-        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WorkspaceDatabase,
-        WorkspaceDatabaseError, initialize_workspace_databases, workspace_database_path,
+        TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        WorkspaceSpecWriteDecision, initialize_workspace_databases, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -94,6 +98,124 @@ fn creates_workspace_foco_database_and_runs_migrations() {
             "{table} table should exist"
         );
     }
+}
+
+#[test]
+fn workspace_spec_phase0_contract_defines_lifecycle_and_prompt_snapshot() {
+    let disabled = WorkspaceSpecSettings::disabled();
+    assert!(!disabled.allows_generation());
+    assert!(!disabled.allows_update());
+    assert!(!disabled.allows_injection());
+
+    let enabled_without_injection = WorkspaceSpecSettings::enabled(false);
+    assert!(enabled_without_injection.allows_generation());
+    assert!(enabled_without_injection.allows_update());
+    assert!(!enabled_without_injection.allows_injection());
+
+    let enabled_with_injection = WorkspaceSpecSettings::enabled(true);
+    assert!(enabled_with_injection.allows_injection());
+    assert_eq!(
+        WorkspaceSpecPromptPlan::for_chat(enabled_with_injection, false),
+        WorkspaceSpecPromptPlan::ReadWorkspaceSpecAndSaveSnapshot
+    );
+    assert_eq!(
+        WorkspaceSpecPromptPlan::for_chat(enabled_without_injection, false),
+        WorkspaceSpecPromptPlan::SkipInjectionDisabled
+    );
+    assert_eq!(
+        WorkspaceSpecPromptPlan::for_chat(disabled, false),
+        WorkspaceSpecPromptPlan::SkipDisabled
+    );
+    assert_eq!(
+        WorkspaceSpecPromptPlan::for_chat(disabled, true),
+        WorkspaceSpecPromptPlan::UseChatSnapshot
+    );
+
+    assert_eq!(
+        WorkspaceSpecTriggerType::parse("manual_initial")
+            .unwrap()
+            .as_str(),
+        "manual_initial"
+    );
+    assert_eq!(
+        WorkspaceSpecTriggerType::parse("chat_completed")
+            .unwrap()
+            .as_str(),
+        "chat_completed"
+    );
+    assert!(WorkspaceSpecTriggerType::ManualRefresh.is_manual());
+    assert!(WorkspaceSpecTriggerType::parse("manual_cancel").is_err());
+}
+
+#[test]
+fn workspace_spec_phase0_contract_defines_jobs_stale_writes_and_v1_output() {
+    assert_eq!(
+        WorkspaceSpecJobStatus::parse("queued").unwrap().as_str(),
+        "queued"
+    );
+    assert!(WorkspaceSpecJobStatus::Completed.is_terminal());
+    assert!(!WorkspaceSpecJobStatus::Running.is_terminal());
+
+    assert_eq!(
+        WorkspaceSpecJobEnqueueDecision::for_trigger(
+            WorkspaceSpecTriggerType::ManualInitial,
+            false,
+            false,
+        ),
+        WorkspaceSpecJobEnqueueDecision::QueueNow
+    );
+    assert_eq!(
+        WorkspaceSpecJobEnqueueDecision::for_trigger(
+            WorkspaceSpecTriggerType::ManualRefresh,
+            true,
+            false,
+        ),
+        WorkspaceSpecJobEnqueueDecision::RejectAlreadyRunning
+    );
+    assert_eq!(
+        WorkspaceSpecJobEnqueueDecision::for_trigger(
+            WorkspaceSpecTriggerType::ChatCompleted,
+            true,
+            false,
+        ),
+        WorkspaceSpecJobEnqueueDecision::QueuePendingRefresh
+    );
+    assert_eq!(
+        WorkspaceSpecJobEnqueueDecision::for_trigger(
+            WorkspaceSpecTriggerType::ChatCompleted,
+            true,
+            true,
+        ),
+        WorkspaceSpecJobEnqueueDecision::AlreadyPendingRefresh
+    );
+
+    assert_eq!(
+        WorkspaceSpecWriteDecision::for_job_output(7, 7),
+        WorkspaceSpecWriteDecision::WriteFullReplacement
+    );
+    assert_eq!(
+        WorkspaceSpecWriteDecision::for_job_output(7, 8),
+        WorkspaceSpecWriteDecision::SkipStaleRevision {
+            reason: WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        }
+    );
+
+    assert_eq!(
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
+        WorkspaceSpecOutputStrategy::FullReplacementMarkdown
+    );
+    assert!(!WORKSPACE_SPEC_V1_OUTPUT_STRATEGY.uses_patch_parser());
+    assert!(!WORKSPACE_SPEC_V1_OUTPUT_STRATEGY.allows_stale_merge());
+    assert!(
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY
+            .validate_markdown_size("# Project Spec\n")
+            .is_ok()
+    );
+    assert!(
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY
+            .validate_markdown_size(&"x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1))
+            .is_err()
+    );
 }
 
 #[test]
