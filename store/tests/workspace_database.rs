@@ -92,6 +92,9 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "agent_context_snapshots",
         "scheduled_tasks",
         "scheduled_task_runs",
+        "workspace_specs",
+        "workspace_spec_jobs",
+        "chat_spec_snapshots",
     ] {
         assert!(
             table_exists(&connection, table),
@@ -216,6 +219,49 @@ fn workspace_spec_phase0_contract_defines_jobs_stale_writes_and_v1_output() {
             .validate_markdown_size(&"x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1))
             .is_err()
     );
+}
+
+#[test]
+fn workspace_spec_content_update_rejects_stale_revision() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    assert!(database.workspace_spec().expect("initial spec").is_none());
+
+    let settings = database
+        .upsert_workspace_spec_settings(true, true)
+        .expect("settings save");
+    assert!(settings.enabled);
+    assert!(settings.inject_enabled);
+    assert_eq!(settings.revision, 0);
+    assert_eq!(settings.content_markdown, "");
+
+    let saved = database
+        .update_workspace_spec_content(0, "# Project Spec\n\nFirst")
+        .expect("first save")
+        .expect("saved spec");
+    assert_eq!(saved.revision, 1);
+    assert_eq!(saved.content_markdown, "# Project Spec\n\nFirst");
+
+    let stale = database
+        .update_workspace_spec_content(0, "# Project Spec\n\nStale")
+        .expect("stale save");
+    assert!(stale.is_none());
+
+    let current = database
+        .workspace_spec()
+        .expect("current spec")
+        .expect("current spec row");
+    assert_eq!(current.revision, 1);
+    assert_eq!(current.content_markdown, "# Project Spec\n\nFirst");
+
+    let updated = database
+        .update_workspace_spec_content(1, "# Project Spec\n\nSecond")
+        .expect("second save")
+        .expect("updated spec");
+    assert_eq!(updated.revision, 2);
+    assert_eq!(updated.content_markdown, "# Project Spec\n\nSecond");
 }
 
 #[test]

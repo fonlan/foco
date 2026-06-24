@@ -366,6 +366,52 @@ pub struct ScheduledTaskRunRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceSpecRecord {
+    pub enabled: bool,
+    pub inject_enabled: bool,
+    pub content_markdown: String,
+    pub revision: u64,
+    pub generated_at: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewWorkspaceSpecJob<'a> {
+    pub id: &'a str,
+    pub trigger_type: &'a str,
+    pub chat_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    pub base_revision: Option<u64>,
+    pub input_summary_json: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceSpecJobRecord {
+    pub id: String,
+    pub trigger_type: String,
+    pub status: String,
+    pub chat_id: Option<String>,
+    pub run_id: Option<String>,
+    pub model_id: Option<String>,
+    pub base_revision: Option<u64>,
+    pub input_summary_json: String,
+    pub output_json: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatSpecSnapshotRecord {
+    pub chat_id: String,
+    pub spec_revision: u64,
+    pub content_markdown: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatRecord {
     pub id: String,
     pub title: String,

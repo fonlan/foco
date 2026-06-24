@@ -869,6 +869,41 @@ CREATE INDEX scheduled_task_runs_agent_task_idx
 ON scheduled_task_runs(agent_task_id);
 "#;
 
+pub(crate) const MIGRATION_018: &str = r#"
+CREATE TABLE workspace_specs (
+    id TEXT PRIMARY KEY NOT NULL CHECK (id = 'default'),
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    inject_enabled INTEGER NOT NULL CHECK (inject_enabled IN (0, 1)),
+    content_markdown TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    generated_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE workspace_spec_jobs (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    trigger_type TEXT NOT NULL CHECK (trigger_type IN ('manual_initial', 'manual_refresh', 'chat_completed')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'skipped', 'failed')),
+    chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+    run_id TEXT CHECK (run_id IS NULL OR length(run_id) > 0),
+    model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
+    base_revision INTEGER CHECK (base_revision IS NULL OR base_revision >= 0),
+    input_summary_json TEXT NOT NULL DEFAULT '{}',
+    output_json TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+);
+
+CREATE TABLE chat_spec_snapshots (
+    chat_id TEXT PRIMARY KEY NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    spec_revision INTEGER NOT NULL CHECK (spec_revision >= 0),
+    content_markdown TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

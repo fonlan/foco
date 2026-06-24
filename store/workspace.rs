@@ -32,8 +32,8 @@ mod workspace_schema;
 pub use workspace_records::{
     AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
     AgentInstanceRecord, AgentMessageRecord, AgentReconciliationRecord, AgentTaskDependencyRecord,
-    AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, ChatRecord, CodeChangeStats,
-    CodeGraphContextRecord, CodeGraphReferenceRecord, CodeGraphRelatedFileRecord,
+    AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, ChatRecord, ChatSpecSnapshotRecord,
+    CodeChangeStats, CodeGraphContextRecord, CodeGraphReferenceRecord, CodeGraphRelatedFileRecord,
     CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord,
     HookRunRecord, LlmRequestAuditFilters, LlmRequestAuditModelBreakdown,
     LlmRequestAuditProviderBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
@@ -43,21 +43,22 @@ pub use workspace_records::{
     NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
     NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
     NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-    NewTerminalSession, NewToolCall, NewToolResult, PromptContextInjectionRecord, RunEventRecord,
-    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
-    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
-    UpdateLlmRequestOutcome,
+    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
+    PromptContextInjectionRecord, RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskRecord,
+    ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TerminalSessionRecord,
+    TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
+    WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
-    MIGRATION_014, MIGRATION_015, Migration,
+    MIGRATION_014, MIGRATION_015, MIGRATION_018, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 17;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 18;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -133,6 +134,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 17,
         sql: MEMORY_REFERENCES_SCHEMA_SQL,
+    },
+    Migration {
+        version: 18,
+        sql: MIGRATION_018,
     },
 ];
 
@@ -487,6 +492,312 @@ impl WorkspaceDatabase {
                 "SELECT value FROM workspace_metadata WHERE key = ?1",
                 params![key],
                 |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn workspace_spec(&self) -> Result<Option<WorkspaceSpecRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT enabled, inject_enabled, content_markdown, revision, generated_at, updated_at
+                 FROM workspace_specs
+                 WHERE id = ?1",
+                params![WORKSPACE_SPEC_DEFAULT_ID],
+                workspace_spec_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn upsert_workspace_spec_settings(
+        &mut self,
+        enabled: bool,
+        inject_enabled: bool,
+    ) -> Result<WorkspaceSpecRecord, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO workspace_specs
+                    (id, enabled, inject_enabled, content_markdown, revision, generated_at, updated_at)
+                 VALUES (?1, ?2, ?3, '', 0, NULL, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    inject_enabled = excluded.inject_enabled,
+                    updated_at = excluded.updated_at",
+                params![
+                    WORKSPACE_SPEC_DEFAULT_ID,
+                    sql_bool(enabled),
+                    sql_bool(inject_enabled),
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        self.workspace_spec()?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                message: "workspace spec row was not found after settings save".to_string(),
+            })
+    }
+
+    pub fn update_workspace_spec_content(
+        &mut self,
+        expected_revision: u64,
+        content_markdown: &str,
+    ) -> Result<Option<WorkspaceSpecRecord>, WorkspaceDatabaseError> {
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY.validate_markdown_size(content_markdown)?;
+        let expected_revision = workspace_spec_revision_to_i64(expected_revision, "revision")?;
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let current_revision = transaction
+            .query_row(
+                "SELECT revision FROM workspace_specs WHERE id = ?1",
+                params![WORKSPACE_SPEC_DEFAULT_ID],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        match current_revision {
+            Some(current_revision) if current_revision != expected_revision => {
+                transaction
+                    .commit()
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                return Ok(None);
+            }
+            Some(current_revision) => {
+                let next_revision = current_revision.checked_add(1).ok_or_else(|| {
+                    WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                        message: "workspace spec revision is too large".to_string(),
+                    }
+                })?;
+                transaction
+                    .execute(
+                        "UPDATE workspace_specs
+                         SET content_markdown = ?2,
+                             revision = ?3,
+                             updated_at = ?4
+                         WHERE id = ?1 AND revision = ?5",
+                        params![
+                            WORKSPACE_SPEC_DEFAULT_ID,
+                            content_markdown,
+                            next_revision,
+                            now,
+                            current_revision
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
+            None if expected_revision != 0 => {
+                transaction
+                    .commit()
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                return Ok(None);
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO workspace_specs
+                            (id, enabled, inject_enabled, content_markdown, revision, generated_at, updated_at)
+                         VALUES (?1, 0, 0, ?2, 1, NULL, ?3)",
+                        params![WORKSPACE_SPEC_DEFAULT_ID, content_markdown, now],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        self.workspace_spec()
+    }
+
+    pub fn insert_workspace_spec_job(
+        &mut self,
+        job: NewWorkspaceSpecJob<'_>,
+    ) -> Result<WorkspaceSpecJobRecord, WorkspaceDatabaseError> {
+        WorkspaceSpecTriggerType::parse(job.trigger_type)?;
+        let input_summary_json = job.input_summary_json.unwrap_or("{}");
+        validate_workspace_spec_json_object(input_summary_json, "input_summary_json")?;
+        let base_revision = job
+            .base_revision
+            .map(|revision| workspace_spec_revision_to_i64(revision, "base_revision"))
+            .transpose()?;
+        let now = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO workspace_spec_jobs
+                    (id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                     input_summary_json, created_at)
+                 VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    job.id,
+                    job.trigger_type,
+                    job.chat_id,
+                    job.run_id,
+                    job.model_id,
+                    base_revision,
+                    input_summary_json,
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        self.workspace_spec_job(job.id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                message: format!("workspace spec job '{}' was not found after insert", job.id),
+            }
+        })
+    }
+
+    pub fn mark_workspace_spec_job_running(
+        &mut self,
+        id: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET status = ?2,
+                     started_at = ?3
+                 WHERE id = ?1",
+                params![id, WorkspaceSpecJobStatus::Running.as_str(), now],
+            )
+            .map(|updated| updated > 0)
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn mark_workspace_spec_job_completed(
+        &mut self,
+        id: &str,
+        output_json: Option<&str>,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        validate_optional_workspace_spec_json(output_json, "output_json")?;
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET status = ?2,
+                     output_json = ?3,
+                     error_message = NULL,
+                     completed_at = ?4
+                 WHERE id = ?1",
+                params![
+                    id,
+                    WorkspaceSpecJobStatus::Completed.as_str(),
+                    output_json,
+                    now
+                ],
+            )
+            .map(|updated| updated > 0)
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn mark_workspace_spec_job_skipped(
+        &mut self,
+        id: &str,
+        reason: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET status = ?2,
+                     error_message = ?3,
+                     completed_at = ?4
+                 WHERE id = ?1",
+                params![id, WorkspaceSpecJobStatus::Skipped.as_str(), reason, now],
+            )
+            .map(|updated| updated > 0)
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn mark_workspace_spec_job_failed(
+        &mut self,
+        id: &str,
+        error_message: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET status = ?2,
+                     error_message = ?3,
+                     completed_at = ?4
+                 WHERE id = ?1",
+                params![
+                    id,
+                    WorkspaceSpecJobStatus::Failed.as_str(),
+                    error_message,
+                    now
+                ],
+            )
+            .map(|updated| updated > 0)
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn chat_spec_snapshot(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<ChatSpecSnapshotRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT chat_id, spec_revision, content_markdown, created_at
+                 FROM chat_spec_snapshots
+                 WHERE chat_id = ?1",
+                params![chat_id],
+                chat_spec_snapshot_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn insert_chat_spec_snapshot(
+        &mut self,
+        chat_id: &str,
+        revision: u64,
+        content_markdown: &str,
+    ) -> Result<ChatSpecSnapshotRecord, WorkspaceDatabaseError> {
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY.validate_markdown_size(content_markdown)?;
+        let revision = workspace_spec_revision_to_i64(revision, "spec_revision")?;
+        let now = now_timestamp();
+
+        self.connection
+            .execute(
+                "INSERT INTO chat_spec_snapshots
+                    (chat_id, spec_revision, content_markdown, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![chat_id, revision, content_markdown, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        self.chat_spec_snapshot(chat_id)?.ok_or_else(|| {
+            WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                message: format!("chat spec snapshot for '{chat_id}' was not found after insert"),
+            }
+        })
+    }
+
+    fn workspace_spec_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                        input_summary_json, output_json, error_message, created_at,
+                        started_at, completed_at
+                 FROM workspace_spec_jobs
+                 WHERE id = ?1",
+                params![id],
+                workspace_spec_job_from_row,
             )
             .optional()
             .map_err(|source| self.sqlite_error(source))
@@ -6199,6 +6510,82 @@ const AGENT_MESSAGE_SELECT_BY_ID: &str =
             reply_to_message_id, kind, content, sequence, created_at, consumed_at
      FROM agent_messages WHERE id = ?1";
 
+fn sql_bool(value: bool) -> i64 {
+    if value { 1 } else { 0 }
+}
+
+fn workspace_spec_revision_to_i64(
+    revision: u64,
+    field: &str,
+) -> Result<i64, WorkspaceDatabaseError> {
+    i64::try_from(revision).map_err(|_| WorkspaceDatabaseError::InvalidWorkspaceSpec {
+        message: format!("{field} is too large"),
+    })
+}
+
+fn u64_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(source),
+        )
+    })
+}
+
+fn optional_u64_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(|value| {
+            u64::try_from(value).map_err(|source| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Integer,
+                    Box::new(source),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn workspace_spec_from_row(row: &Row<'_>) -> rusqlite::Result<WorkspaceSpecRecord> {
+    Ok(WorkspaceSpecRecord {
+        enabled: row.get::<_, i64>(0)? != 0,
+        inject_enabled: row.get::<_, i64>(1)? != 0,
+        content_markdown: row.get(2)?,
+        revision: u64_from_row(row, 3)?,
+        generated_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn workspace_spec_job_from_row(row: &Row<'_>) -> rusqlite::Result<WorkspaceSpecJobRecord> {
+    Ok(WorkspaceSpecJobRecord {
+        id: row.get(0)?,
+        trigger_type: row.get(1)?,
+        status: row.get(2)?,
+        chat_id: row.get(3)?,
+        run_id: row.get(4)?,
+        model_id: row.get(5)?,
+        base_revision: optional_u64_from_row(row, 6)?,
+        input_summary_json: row.get(7)?,
+        output_json: row.get(8)?,
+        error_message: row.get(9)?,
+        created_at: row.get(10)?,
+        started_at: row.get(11)?,
+        completed_at: row.get(12)?,
+    })
+}
+
+fn chat_spec_snapshot_from_row(row: &Row<'_>) -> rusqlite::Result<ChatSpecSnapshotRecord> {
+    Ok(ChatSpecSnapshotRecord {
+        chat_id: row.get(0)?,
+        spec_revision: u64_from_row(row, 1)?,
+        content_markdown: row.get(2)?,
+        created_at: row.get(3)?,
+    })
+}
+
 fn scheduled_task_from_row(row: &Row<'_>) -> rusqlite::Result<ScheduledTaskRecord> {
     Ok(ScheduledTaskRecord {
         id: row.get(0)?,
@@ -6511,6 +6898,36 @@ fn validate_agent_definition_snapshot(value: &str) -> Result<(), WorkspaceDataba
         });
     }
     Ok(())
+}
+
+fn validate_workspace_spec_json_object(
+    value: &str,
+    field: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    let parsed = serde_json::from_str::<Value>(value).map_err(|source| {
+        WorkspaceDatabaseError::InvalidWorkspaceSpec {
+            message: format!("{field} must be valid JSON: {source}"),
+        }
+    })?;
+    if parsed.is_object() {
+        Ok(())
+    } else {
+        Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
+            message: format!("{field} must be a JSON object"),
+        })
+    }
+}
+
+fn validate_optional_workspace_spec_json(
+    value: Option<&str>,
+    field: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    let Some(value) = value else { return Ok(()) };
+    serde_json::from_str::<Value>(value)
+        .map(|_| ())
+        .map_err(|source| WorkspaceDatabaseError::InvalidWorkspaceSpec {
+            message: format!("{field} must be valid JSON: {source}"),
+        })
 }
 
 fn validate_scheduled_task_status(status: &str) -> Result<(), WorkspaceDatabaseError> {
