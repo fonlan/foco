@@ -994,6 +994,9 @@ describe("app-shell verification surfaces", () => {
     );
     expect(within(tabList).getByText("Default")).toBeInTheDocument();
 
+    const scrollIntoView = vi.mocked(HTMLElement.prototype.scrollIntoView);
+    scrollIntoView.mockClear();
+
     await userEvent.click(screen.getByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
     expect(currentChatTabs()).toEqual([
@@ -1003,6 +1006,10 @@ describe("app-shell verification surfaces", () => {
     expect(
       within(tabList).getByRole("tab", { name: /Second chat/ }),
     ).toHaveAttribute("aria-selected", "true");
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      block: "nearest",
+      inline: "nearest",
+    });
     expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toBeInTheDocument();
 
     await userEvent.click(within(tabList).getByRole("tab", { name: /Tool run/ }));

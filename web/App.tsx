@@ -7867,6 +7867,9 @@ function MainTabBar({
   const { t } = useI18n();
   const tabsContainerRef = useRef<HTMLDivElement>(null);
   const tabListRef = useRef<HTMLDivElement>(null);
+  const tabItemRefs = useRef(new Map<string, HTMLDivElement>());
+  const hasTrackedTabKeysRef = useRef(false);
+  const previousTabKeysRef = useRef<string[]>([]);
   const [scrollState, setScrollState] = useState({
     canScrollLeft: false,
     canScrollRight: false,
@@ -7908,6 +7911,29 @@ function MainTabBar({
   }, []);
 
   useLayoutEffect(() => {
+    updateScrollState();
+  }, [tabs, updateScrollState]);
+
+  useLayoutEffect(() => {
+    const nextKeys = tabs.map(mainTabKey);
+    if (!hasTrackedTabKeysRef.current) {
+      hasTrackedTabKeysRef.current = true;
+      previousTabKeysRef.current = nextKeys;
+      return;
+    }
+
+    const previousKeys = new Set(previousTabKeysRef.current);
+    const addedKey = nextKeys.find((key) => !previousKeys.has(key));
+    previousTabKeysRef.current = nextKeys;
+
+    if (!addedKey) {
+      return;
+    }
+
+    tabItemRefs.current.get(addedKey)?.scrollIntoView?.({
+      block: "nearest",
+      inline: "nearest",
+    });
     updateScrollState();
   }, [tabs, updateScrollState]);
 
@@ -8019,6 +8045,13 @@ function MainTabBar({
                     : "border-stone-200 bg-stone-50/80 text-stone-600 hover:border-stone-300 hover:bg-white"
                   }`}
                 key={key}
+                ref={(element) => {
+                  if (element) {
+                    tabItemRefs.current.set(key, element);
+                  } else {
+                    tabItemRefs.current.delete(key);
+                  }
+                }}
               >
                 <button
                   aria-selected={isActive}
