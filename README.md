@@ -4,7 +4,7 @@
 
 <img src="foco.svg" alt="Foco" width="96" />
 
-**Your local AI coding agent — precise execution, strict safety, long-term solutions.**
+**A local-first AI coding workspace with agents, tools, memory, and project automation.**
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org/)
@@ -17,89 +17,106 @@
 
 ---
 
-Foco is a **local-first AI coding agent** that runs inside your browser-based workspace. It combines a high-performance Rust backend with a modern React/TypeScript frontend, giving you a desktop-grade IDE experience directly in the browser. Foco reads, writes, and edits your code, executes shell commands, indexes your codebase into a semantic graph, and integrates with external tools through the Model Context Protocol (MCP).
+Foco is a local AI coding workspace that pairs a Rust backend with a React/TypeScript frontend. It runs on your machine, serves a browser UI, keeps workspace data in SQLite, and gives coding agents controlled access to files, commands, code search, memory, MCP tools, hooks, terminals, Git state, and scheduled automation.
 
-## ✨ Key Features
+## What It Does
 
-- **🖥️ Browser-Native Desktop Experience** — Runs locally (default `127.0.0.1:33210`), serves the frontend from embedded assets. Works on Windows, macOS, and Linux with a Windows system tray on release builds.
-- **🧠 Full Agent Loop** — Multi-turn conversational agent with tool calling, reasoning display, streaming responses via SSE, and an interactive todo graph.
-- **📊 Semantic Code Graph** — Indexes your workspace with tree-sitter parsers for 12 languages (C, C#, C++, Go, Java, JavaScript, JSON, Python, Rust, TOML, TypeScript, and more). In-file symbol search, call graph navigation, and related-file discovery.
-- **🔧 Rich Built-in Tools** — `read_file`, `write_file`, `edit_file`, `find_files`, `search_text` (ripgrep), `run_command`, `web_search`, `web_fetch`, `graph_*` (6 code graph tools), `create_todo_graph`, `update_todo_graph`, `get_todo_graph`, `ask_question`, `sleep`.
-- **🔌 MCP Support** — Extend Foco with any Model Context Protocol server (stdio or streamable-http). Windows stdio MCP uses Job Objects for clean process tree management.
-- **💾 Persistent Memory** — Three scopes (global, workspace, chat). Automatic extraction and retrieval via LLM. FTS and LLM-based memory selection. Paginated memory browsing in the UI.
-- **🪝 Claude Code-Compatible Hooks** — Configure `PreToolUse`, `PostToolUse`, `Stop`, `SubagentStop`, and more. Global and per-workspace hooks with audit logging.
-- **📋 Skills System** — Discoverable skill files (YAML frontmatter + instructions) from shared and workspace-local directories. Skills inject context into new chats.
-- **🖥️ Integrated Terminal** — Browser-based terminal panel via xterm.js + WebSocket, with session management, shell selection (powershell/cmd/bash/zsh), and WebSocket heartbeat keepalive.
-- **📈 AI Statistics Dashboard** — Request audit trail with paginated detail views, trend charts (Recharts), model/provider breakdowns, and configurable columns.
-- **🔐 Secure by Default** — Optional browser password auth, sanitized audit logs (no API keys/credentials stored), workspace-scoped file access, strict path validation.
-- **🎨 Modern UI** — Tailwind CSS, Lucide icons, dark theme. Responsive layout with mobile support. Mermaid diagram rendering in chat. Real-time markdown streaming.
-- **📦 Multi-Workspace** — Manage multiple projects with per-workspace SQLite databases, configs, hooks, skills, and memory. Workspace logos with SVG support.
+- **Chat-driven coding agent**: streaming chat runs, tool calls, attachments, task state, cancellation, context usage, and chat-level statistics.
+- **Agent teams**: configurable agent definitions, instances, delegated tasks, queues, team snapshots, and permission-scoped tools.
+- **Workspace tools**: file reads/writes/edits, ripgrep search, shell command execution, web search/fetch, todo graphs, blocking questions, sleep, and code graph queries.
+- **Semantic code graph**: tree-sitter indexing for common languages including Rust, TypeScript, JavaScript, Python, Go, Java, C/C++, C#, JSON, TOML, YAML, CSS, Bash, PHP, Ruby, Swift, Kotlin, Lua, Vue, and container files.
+- **Model and provider management**: provider configuration, model metadata refresh, retry settings, request overrides, per-provider proxy support, and OpenAI Responses support.
+- **Persistent memory**: global, workspace, and chat memory with manual notes, extraction jobs, retrieval, sources, expiration, and memory dream review workflows.
+- **Project spec support**: automatic or manual workspace spec generation and updates that can be injected into chat context.
+- **MCP integration**: stdio and streamable HTTP MCP servers, exposed as tool proxies for agents.
+- **Hooks and skills**: Claude Code-style hooks, hook audit logs, imported hook config, and skill files discovered from global and workspace roots.
+- **Integrated work surfaces**: multi-workspace management, browser terminal, Git status/diff/branch tools, scheduled tasks, AI request statistics, and light/dark UI.
 
-## 🏗️ Architecture
+## Architecture
 
 ```mermaid
 graph LR
-    Browser["Browser (React 19)"] -->|SSE| Backend["Axum Server"]
-    Backend --> Agent["Agent Loop (foco-agent)"]
-    Agent --> Providers["LLM Providers (foco-providers)"]
-    Agent --> Tools["Built-in Tools (foco-tools)"]
-    Agent --> MCP["MCP Runtime (foco-mcp)"]
-    Backend --> Graph["Code Graph (foco-graph)"]
-    Backend --> Store["SQLite Store (foco-store)"]
-    Store --> SQLite[("Workspace SQLite")]
-    Store --> MemDB[("Global Memory SQLite")]
+    Browser["Browser UI (React 19 + Vite)"] -->|HTTP / SSE / WebSocket| App["foco-app (Axum)"]
+    App --> Agent["foco-agent"]
+    App --> Store["foco-store (SQLite)"]
+    App --> Graph["foco-graph (tree-sitter)"]
+    App --> MCP["foco-mcp"]
+    Agent --> Providers["foco-providers"]
+    Agent --> Tools["foco-tools"]
+    Store --> WorkspaceDB[("Workspace SQLite")]
+    Store --> MemoryDB[("Global Memory SQLite")]
 ```
 
 | Crate | Purpose |
 |---|---|
-| `foco-app` | HTTP server (axum), routes, config, tray icon, entrypoint |
-| `foco-agent` | Agent loop, prompt assembly, tool execution planning |
-| `foco-providers` | LLM provider abstraction via `genai`, proxy support, error diagnostics |
-| `foco-tools` | Built-in tool definitions and execution (files, search, git, web, todo) |
-| `foco-graph` | Code graph indexing with tree-sitter, incremental updates via content hash |
-| `foco-mcp` | Model Context Protocol client, process management, tool proxies |
-| `foco-store` | SQLite persistence, migrations, audit, memory CRUD |
+| `foco-app` | Axum HTTP server, routing, SSE/WebSocket runtime, settings, terminal, Git, hooks, memory, scheduled tasks, and app entrypoint |
+| `foco-agent` | Agent run planning, context packing, prompt budgeting, team/task execution, and event emission |
+| `foco-providers` | LLM provider abstraction, streaming, request overrides, proxy handling, and diagnostics |
+| `foco-tools` | Built-in tool definitions and execution for files, commands, search, web, graph, todo, and agent teams |
+| `foco-graph` | Tree-sitter code graph indexing, symbol search, references, callers/callees, and related files |
+| `foco-mcp` | MCP client runtime, stdio/streamable HTTP transport, server state, and tool definitions |
+| `foco-store` | Global config, workspace SQLite databases, migrations, audit records, memory, and model metadata |
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (stable, edition 2024)
+- [Rust](https://rustup.rs/) stable with edition 2024 support
 - [Node.js](https://nodejs.org/) 20+ and npm
-- Windows: PowerShell 5.1+ or PowerShell Core
+- `ripgrep` is recommended; the app can also use its configured native tool installer/status flow
+- Windows: PowerShell 5.1+ or PowerShell Core for the default terminal shell
 
-### Setup
+### Install
 
 ```bash
-# Clone the repository
 git clone https://github.com/your-org/foco.git
 cd foco
-
-# Install frontend dependencies
 npm install
-
-# Build the frontend (required even for development)
-npm run build -w web
 ```
 
 ### Development
 
+Start the backend. This builds the frontend once, runs `cargo run -p foco-app`, and restarts when Rust sources change.
+
 ```bash
-# Start backend (default port 33210, config dir ~/.foco-dev)
 npm run backend
-
-# Start frontend dev server (Vite, port 5174)
-npm run frontend
-
-# Or on Windows — one-click dual-process launch:
-start-dev.bat
 ```
 
-### Full Verification
+Start the Vite frontend in another terminal. It proxies `/api` and WebSocket traffic to the configured backend endpoint.
 
 ```bash
-# Run all tests (Rust workspace + frontend tests + typecheck)
+npm run frontend
+```
+
+Defaults:
+
+- App backend: `http://127.0.0.1:3210`
+- Vite frontend: `http://127.0.0.1:5173` unless Vite selects another free port
+- Config directory: `~/.foco` or `%USERPROFILE%\.foco`
+
+You can override the backend endpoint and config directory:
+
+```bash
+npm run backend -- --port 33210 --config-dir ~/.foco-dev
+npm run frontend -- --backend-port 33210 --config-dir ~/.foco-dev --port 16000
+```
+
+On Windows, `start-dev.bat` launches both processes with the development defaults `33210`, `%USERPROFILE%\.foco-dev`, and frontend port `16000`.
+
+### Verification
+
+```bash
 npm test
+```
+
+This runs the Rust workspace tests, frontend Vitest suite, and TypeScript typecheck.
+
+Useful focused commands:
+
+```bash
+cargo test --workspace
+npm run test -w web
+npm run typecheck -w web
 ```
 
 ### Release Build
@@ -108,122 +125,80 @@ npm test
 npm run build:release
 ```
 
-On Windows, this produces a standalone binary with system tray support.
+This builds the web assets and then runs `cargo build --release -p foco-app`. On Windows release builds, the app uses the Windows subsystem setting and embeds the app icon resource.
 
-## 🛠️ Built-in Tools Reference
+## Configuration And Data
 
-| Tool | Description |
-|---|---|
-| `read_file` | Read a file with optional line range |
-| `write_file` | Create or overwrite a file, or replace a line range |
-| `edit_file` | Precise string replacement in existing files |
-| `find_files` | Recursive file listing with glob include/exclude |
-| `search_text` | Ripgrep-powered full-text search |
-| `run_command` | Execute shell commands with live output streaming |
-| `web_search` | Web search via configured search API |
-| `web_fetch` | Fetch and parse web pages with line-range support |
-| `graph_explore` | Read source context around indexed symbols |
-| `graph_find_symbols` | Search code graph symbols by name |
-| `graph_find_callers` | Find callers of a symbol |
-| `graph_find_callees` | Find callees of a symbol |
-| `graph_find_references` | Find all references to a symbol |
-| `graph_related_files` | Discover files related by imports or graph edges |
-| `create_todo_graph` | Create a structured task graph |
-| `update_todo_graph` | Patch a single task in the graph |
-| `get_todo_graph` | Read the current todo graph |
-| `ask_question` | Ask the user one or more blocking questions |
-| `sleep` | Pause tool execution |
+Foco stores global config and app-level data under the configured root directory. By default that is `~/.foco` on Unix-like systems and `%USERPROFILE%\.foco` on Windows. Set `FOCO_CONFIG_DIR` to use a different root.
 
-## 🔧 Configuration
-
-Foco uses a strict JSON schema for its global configuration. On first launch, it creates:
-
-```
+```text
 ~/.foco/
-├── config.json          # Global config (providers, models, hooks, workspaces, memory settings)
+├── config.json          # Global app config: server, providers, models, workspaces, memory, hooks, skills, agents, prompts
 ├── memory.sqlite        # Global memory database
-├── logs/
-│   └── foco-YYYY-MM-DD.log
-└── (workspaces)
+├── logs/                # Daily app logs
+└── workspace/           # Default managed workspace root used by first-run config
 ```
 
-Each workspace has:
+Each project workspace can also contain workspace-local Foco data:
 
-```
+```text
 <workspace>/.foco/
-├── foco.sqlite          # Chats, messages, tool calls, code graph, LLM audit
-├── hooks.json           # Per-workspace hooks
-└── backups/             # SQLite pre-migration backups
+├── foco.sqlite          # Chats, messages, tool calls, code graph, LLM audit, specs, scheduled tasks
+├── hooks.json           # Workspace hooks
+└── backups/             # SQLite backups created before migrations
 ```
 
-### Environment Variables
+Environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `FOCO_HOST` | `127.0.0.1` | Server bind address |
-| `FOCO_PORT` | `33210` | Server listen port |
-| `FOCO_CONFIG_DIR` | `%USERPROFILE%\.foco` | Configuration root directory |
+| `FOCO_HOST` | `127.0.0.1` | One-start override for the backend listen host |
+| `FOCO_PORT` | `3210` | One-start override for the backend listen port |
+| `FOCO_CONFIG_DIR` | user profile `/.foco` | Global configuration and data root |
 
-### Provider Proxy
+The same values can be passed to the npm development scripts with `--host`, `--port` / `--backend-port`, and `--config-dir`.
 
-Per-provider HTTP/SOCKS proxy configuration with strict validation of scheme, URL, and credentials.
+## Built-in Agent Tools
 
-## 📁 Project Layout
+Foco exposes a strict set of built-in tools to chat runs:
 
-```
+- Files and search: `read_file`, `write_file`, `edit_file`, `find_files`, `search_text`
+- Commands and timing: `run_command`, `sleep`
+- Web: `web_search`, `web_fetch`
+- Code graph: `graph_explore`, `graph_find_symbols`, `graph_find_callers`, `graph_find_callees`, `graph_find_references`, `graph_related_files`
+- Task state: `create_todo_graph`, `update_todo_graph`, `get_todo_graph`, `ask_question`
+- Agent teams: `agent_list`, `agent_get_task`, `agent_send_message`, `agent_delegate_task`, `agent_cancel_task`, `agent_wait_tasks`, `agent_transfer_task`, `agent_create_instances`
+- Memory tools are added by the app runtime when memory is enabled.
+
+## Project Layout
+
+```text
 .
-├── app/                 # foco-app — axum server, routes, CLI entrypoint
-│   ├── main.rs          # Server startup, routes, SSE streaming, chat API
-│   └── build.rs         # Windows icon resource embedding
-├── agent/               # foco-agent — agent loop, prompt assembly, tool planning
-│   └── lib.rs
-├── providers/           # foco-providers — LLM abstraction, stream, proxy
-│   └── lib.rs
-├── tools/               # foco-tools — built-in tool definitions and execution
-│   └── lib.rs
-├── graph/               # foco-graph — tree-sitter code indexing, watcher
-│   └── lib.rs
-├── mcp/                 # foco-mcp — MCP client, process lifecycle
-│   └── lib.rs
-├── store/               # foco-store — SQLite persistence, migrations, memory
-│   └── lib.rs
-├── web/                 # React 19 + TypeScript + Tailwind frontend
-│   ├── App.tsx          # Main application component
-│   ├── main.tsx         # React entry point
-│   ├── styles.css       # Global styles
-│   └── dist/            # Built frontend (embedded by rust-embed)
-├── scripts/             # Dev helpers (backend, frontend, smoke tests)
-├── start-dev.bat        # Windows dual-process launcher
+├── app/                 # Axum app, HTTP routes, runtime orchestration, terminal, Git, memory, hooks, spec, scheduled tasks
+├── agent/               # Agent planning, context handling, team/task runtime primitives
+├── providers/           # LLM provider abstraction and streaming requests
+├── tools/               # Built-in tool schemas and local execution
+├── graph/               # Tree-sitter code graph indexing and queries
+├── mcp/                 # MCP client runtime and transports
+├── store/               # Config, SQLite schemas, migrations, memory and workspace persistence
+├── web/                 # React 19 frontend, Vite config, tests, feature panels, shared API types
+├── scripts/             # Development and release smoke-test helpers
+├── start-dev.bat        # Windows two-process development launcher
 ├── Cargo.toml           # Rust workspace root
 ├── package.json         # npm workspace root
 └── foco.svg             # Application icon
 ```
 
-## 🧪 Technology Stack
+## Frontend Stack
 
-**Backend:**
-- [Rust](https://www.rust-lang.org/) (edition 2024)
-- [axum](https://github.com/tokio-rs/axum) — HTTP framework with WebSocket support
-- [tokio](https://tokio.rs/) — Async runtime
-- [rusqlite](https://github.com/rusqlite/rusqlite) — SQLite (bundled)
-- [gix](https://github.com/GitoxideLabs/gitoxide) — Pure Rust Git implementation
-- [tree-sitter](https://tree-sitter.github.io/) — Incremental parsing for code graph
-- [genai](https://github.com/jeremychone/rust-genai) — LLM provider abstraction
-- [rmcp](https://crates.io/crates/rmcp) — Model Context Protocol client
-- [portable-pty](https://github.com/oconnor663/portable-pty.rs) — Cross-platform PTY
+- React 19, TypeScript, Vite, Tailwind CSS
+- Lucide React icons
+- xterm.js terminal
+- Recharts statistics views
+- Monaco Editor for rich text/code editing surfaces
+- react-markdown, remark-gfm, remark-math, rehype-katex, Mermaid, and KaTeX for chat rendering
+- Vitest and Testing Library for frontend tests
 
-**Frontend:**
-- [React 19](https://react.dev/)
-- [TypeScript](https://www.typescriptlang.org/)
-- [Tailwind CSS](https://tailwindcss.com/)
-- [Vite](https://vitejs.dev/)
-- [xterm.js](https://xtermjs.org/) — Terminal emulator
-- [Mermaid](https://mermaid.js.org/) — Diagram rendering
-- [Recharts](https://recharts.org/) — Statistics charts
-- [Lucide](https://lucide.dev/) — Icons
-- [react-markdown](https://github.com/remarkjs/react-markdown) — Markdown rendering
-- [Vitest](https://vitest.dev/) — Testing
-
-## 📄 License
+## License
 
 MIT
