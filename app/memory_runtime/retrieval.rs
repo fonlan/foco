@@ -922,6 +922,7 @@ fn prompt_context_source_is_stable_for_cache(source: &PromptContextSource) -> bo
             | PromptContextSource::AgentDefinition
             | PromptContextSource::AgentTeamProtocol
             | PromptContextSource::StableInjection
+            | PromptContextSource::ProjectSpec
             | PromptContextSource::TodoGraph
             | PromptContextSource::CompressionSnapshot
             | PromptContextSource::TurnMemory { .. }

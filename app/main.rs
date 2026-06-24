@@ -68,7 +68,8 @@ use foco_store::{
         NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewToolCall,
         NewToolResult, PromptContextInjectionRecord, TodoGraphRecord, TodoGraphTask,
         ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        WorkspaceDatabaseError, WorkspaceDatabaseSpaceStats, workspace_database_path,
+        WorkspaceDatabaseError, WorkspaceDatabaseSpaceStats, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, workspace_database_path,
     },
 };
 use foco_tools::{
@@ -212,6 +213,8 @@ const MEMORY_PROFILE_REFRESH_FACT_LIMIT: u32 = 32;
 const MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX: &str = "Foco retrieved memory context:";
 // Prefix used to identify injected current chat todo graph state.
 const TODO_GRAPH_CONTEXT_MESSAGE_PREFIX: &str = "Current chat todo graph:";
+// Prefix used to identify the per-chat Project Spec snapshot.
+const PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX: &str = "Project Spec snapshot for this chat:";
 // Confidence at or above this value makes a first-turn memory part of the stable chat prefix.
 const STABLE_MEMORY_CONFIDENCE_THRESHOLD: f64 = 0.85;
 // OpenAI prompt cache retention requested for main chat runs.
@@ -3741,6 +3744,7 @@ struct PreparedPromptContext {
     next_message_sequence: i64,
     pending_context_injections: Vec<PendingPromptContextInjection>,
     pending_memory_retrieval: Option<PendingMemoryRetrieval>,
+    pending_spec_snapshot: Option<PendingChatSpecSnapshot>,
 }
 
 #[derive(Clone)]
@@ -3765,6 +3769,11 @@ struct PendingPromptContextInjection {
     memory_keys: Vec<String>,
 }
 
+struct PendingChatSpecSnapshot {
+    revision: u64,
+    content_markdown: String,
+}
+
 #[derive(Clone, Copy)]
 enum PromptAssemblyPurpose {
     ChatRun,
@@ -3781,6 +3790,10 @@ impl PromptAssemblyPurpose {
     }
 
     fn allows_code_graph_initialization(self) -> bool {
+        matches!(self, Self::ChatRun)
+    }
+
+    fn allows_spec_snapshot_persistence(self) -> bool {
         matches!(self, Self::ChatRun)
     }
 }
@@ -3836,6 +3849,7 @@ enum PromptContextSource {
     AgentDefinition,
     AgentTeamProtocol,
     StableInjection,
+    ProjectSpec,
     TodoGraph,
     CompressionSnapshot,
     AgentPrivateContext,
@@ -3866,6 +3880,7 @@ enum PromptContextSourceBucket {
     AgentDefinition,
     AgentTeamProtocol,
     StableInjection,
+    ProjectSpec,
     TodoGraph,
     CompressionSnapshot,
     AgentPrivateContext,
@@ -6114,6 +6129,11 @@ async fn prepare_chat_context(
             .ok_or_else(|| ApiError::bad_request("chat id must not be empty"))?;
         (chat_id, false)
     };
+    persist_pending_chat_spec_snapshot(
+        &mut database,
+        &chat_id,
+        prompt_context.pending_spec_snapshot.as_ref(),
+    )?;
     let session_start_summary = state
         .hook_runtime
         .run_hooks(HookRunRequest {
@@ -6263,6 +6283,21 @@ async fn prepare_chat_context(
         code_change_stats: CodeChangeStats::default(),
         pending_memory_retrieval,
     })
+}
+
+fn persist_pending_chat_spec_snapshot(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    pending: Option<&PendingChatSpecSnapshot>,
+) -> Result<(), ApiError> {
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+
+    database
+        .insert_chat_spec_snapshot(chat_id, pending.revision, &pending.content_markdown)
+        .map(|_| ())
+        .map_err(ApiError::from_workspace_error)
 }
 
 impl PreparedChatContext {

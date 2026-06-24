@@ -170,6 +170,11 @@ pub(crate) async fn queue_chat_message_internal(
     let requested_thinking_level = thinking_level.clone();
     let requested_skill_ids = skill_ids.clone().unwrap_or_default();
     let origin_metadata = origin.metadata_value();
+    let preallocated_chat_id = if chat_id.is_none() {
+        Some(unique_id("chat"))
+    } else {
+        None
+    };
     let prompt_context = prepare_prompt_context(
         state,
         &config,
@@ -186,7 +191,7 @@ pub(crate) async fn queue_chat_message_internal(
             assistant_draft_reasoning: None,
             attachments,
         },
-        None,
+        preallocated_chat_id,
         PromptAssemblyPurpose::ChatRun,
     )
     .await?;
@@ -224,7 +229,10 @@ pub(crate) async fn queue_chat_message_internal(
     )?;
 
     let (chat_id, chat_title) = if prompt_context.is_new_chat {
-        let chat_id = unique_id("chat");
+        let chat_id = prompt_context
+            .chat_id
+            .clone()
+            .ok_or_else(|| ApiError::internal("new chat is missing preallocated id"))?;
         let title = chat_title_for_prompt(raw_message, &prompt_context.attachments);
         let chat_metadata_json = queued_chat_metadata_json(
             &user_message_id,
@@ -252,6 +260,11 @@ pub(crate) async fn queue_chat_message_internal(
             .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
         (chat_id, chat.title)
     };
+    persist_pending_chat_spec_snapshot(
+        &mut database,
+        &chat_id,
+        prompt_context.pending_spec_snapshot.as_ref(),
+    )?;
 
     if team.is_none() {
         let definition = match agent_definition_id.as_deref() {

@@ -204,6 +204,7 @@ pub(crate) async fn prepare_prompt_context(
             None => None,
         }
     };
+    let project_spec_context = project_spec_prompt_context(&database, chat_id.as_deref(), purpose)?;
     let user_sequence = if is_new_chat {
         0
     } else {
@@ -389,6 +390,7 @@ pub(crate) async fn prepare_prompt_context(
         existing_messages.len()
             + compression_snapshots.len()
             + stable_context_messages.len()
+            + usize::from(project_spec_context.message.is_some())
             + usize::from(extra_prompt_message.is_some())
             + usize::from(todo_graph_context_message.is_some())
             + existing_turn_memory_messages.len()
@@ -419,6 +421,11 @@ pub(crate) async fn prepare_prompt_context(
         neutral_messages.push(stable_context_message);
         message_source_sequences.push(None);
         message_context_sources.push(PromptContextSource::StableInjection);
+    }
+    if let Some(project_spec_message) = project_spec_context.message {
+        neutral_messages.push(project_spec_message);
+        message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::ProjectSpec);
     }
     if let Some(todo_graph_context_message) = todo_graph_context_message {
         neutral_messages.push(todo_graph_context_message);
@@ -537,5 +544,90 @@ pub(crate) async fn prepare_prompt_context(
         next_message_sequence: user_sequence,
         pending_context_injections,
         pending_memory_retrieval,
+        pending_spec_snapshot: project_spec_context.pending_snapshot,
     })
+}
+
+struct ProjectSpecPromptContext {
+    message: Option<NeutralChatMessage>,
+    pending_snapshot: Option<PendingChatSpecSnapshot>,
+}
+
+fn project_spec_prompt_context(
+    database: &WorkspaceDatabase,
+    chat_id: Option<&str>,
+    purpose: PromptAssemblyPurpose,
+) -> Result<ProjectSpecPromptContext, ApiError> {
+    if let Some(snapshot) = chat_id
+        .map(|chat_id| database.chat_spec_snapshot(chat_id))
+        .transpose()
+        .map_err(ApiError::from_workspace_error)?
+        .flatten()
+    {
+        return Ok(ProjectSpecPromptContext {
+            message: project_spec_context_message(
+                snapshot.spec_revision,
+                &snapshot.content_markdown,
+            ),
+            pending_snapshot: None,
+        });
+    }
+
+    let spec = database
+        .workspace_spec()
+        .map_err(ApiError::from_workspace_error)?;
+    let settings = spec
+        .as_ref()
+        .map(|spec| WorkspaceSpecSettings {
+            enabled: spec.enabled,
+            inject_enabled: spec.inject_enabled,
+        })
+        .unwrap_or_else(WorkspaceSpecSettings::disabled);
+
+    if WorkspaceSpecPromptPlan::for_chat(settings, false)
+        != WorkspaceSpecPromptPlan::ReadWorkspaceSpecAndSaveSnapshot
+    {
+        return Ok(ProjectSpecPromptContext {
+            message: None,
+            pending_snapshot: None,
+        });
+    }
+
+    let Some(spec) = spec else {
+        return Ok(ProjectSpecPromptContext {
+            message: None,
+            pending_snapshot: None,
+        });
+    };
+    let message = project_spec_context_message(spec.revision, &spec.content_markdown);
+    let pending_snapshot =
+        if message.is_some() && purpose.allows_spec_snapshot_persistence() && chat_id.is_some() {
+            Some(PendingChatSpecSnapshot {
+                revision: spec.revision,
+                content_markdown: spec.content_markdown,
+            })
+        } else {
+            None
+        };
+
+    Ok(ProjectSpecPromptContext {
+        message,
+        pending_snapshot,
+    })
+}
+
+fn project_spec_context_message(
+    revision: u64,
+    content_markdown: &str,
+) -> Option<NeutralChatMessage> {
+    if content_markdown.trim().is_empty() {
+        return None;
+    }
+
+    Some(neutral_text_message(
+        NeutralChatRole::System,
+        format!(
+            "{PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX}\nrevision: {revision}\n\n{content_markdown}"
+        ),
+    ))
 }

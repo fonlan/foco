@@ -815,6 +815,7 @@ fn agent_team_protocol_insert_index(chat_context: &PreparedChatContext) -> usize
                 PromptContextSource::ReservedPrompt
                     | PromptContextSource::AgentDefinition
                     | PromptContextSource::StableInjection
+                    | PromptContextSource::ProjectSpec
             )
         })
         .unwrap_or(chat_context.active_tool_start_index)

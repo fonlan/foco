@@ -2346,6 +2346,7 @@ fn context_token_breakdown_handles_every_source_bucket() {
     for bucket in [
         PromptContextSourceBucket::ReservedPrompt,
         PromptContextSourceBucket::StableInjection,
+        PromptContextSourceBucket::ProjectSpec,
         PromptContextSourceBucket::TodoGraph,
         PromptContextSourceBucket::CompressionSnapshot,
         PromptContextSourceBucket::PersistedHistory,
@@ -9900,6 +9901,340 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
             .prompt_cache_key
             .expect("second cache key")
     );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-snapshot-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-project-spec-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("spec settings");
+        database
+            .update_workspace_spec_content(0, "# Project Spec\n\nVersion one")
+            .expect("spec content");
+    }
+
+    let first_context = prepare_chat_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: "start with the spec".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("first chat context");
+    let first_spec_index = first_context
+        .provider_request
+        .messages
+        .iter()
+        .position(|message| {
+            message
+                .content
+                .contains(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX)
+        })
+        .expect("project spec message");
+    assert_eq!(
+        first_context.message_context_sources[first_spec_index],
+        PromptContextSource::ProjectSpec
+    );
+    assert!(
+        first_context.provider_request.messages[first_spec_index]
+            .content
+            .contains("Version one")
+    );
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let snapshot = database
+            .chat_spec_snapshot(&first_context.chat_id)
+            .expect("chat spec snapshot")
+            .expect("snapshot exists");
+        assert_eq!(snapshot.spec_revision, 1);
+        assert!(snapshot.content_markdown.contains("Version one"));
+        database
+            .update_workspace_spec_content(1, "# Project Spec\n\nVersion two")
+            .expect("spec update");
+    }
+
+    let second_context = prepare_chat_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: Some(first_context.chat_id.clone()),
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: "follow up".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("second chat context");
+    let second_spec = second_context
+        .provider_request
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .content
+                .contains(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX)
+        })
+        .expect("project spec message");
+    assert!(second_spec.content.contains("Version one"));
+    assert!(!second_spec.content.contains("Version two"));
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prepare_chat_context_skips_project_spec_when_injection_disabled() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-disabled-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-project-spec-disabled-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, false)
+            .expect("spec settings");
+        database
+            .update_workspace_spec_content(0, "# Project Spec\n\nHidden")
+            .expect("spec content");
+    }
+
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: "no spec please".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("chat context");
+
+    assert!(context.provider_request.messages.iter().all(|message| {
+        !message
+            .content
+            .contains(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX)
+    }));
+    {
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        assert!(
+            database
+                .chat_spec_snapshot(&context.chat_id)
+                .expect("chat spec snapshot")
+                .is_none()
+        );
+    }
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prepare_prompt_context_preview_uses_saved_project_spec_snapshot() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-preview-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-project-spec-preview-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-spec-preview", "Spec preview")
+            .expect("chat insert");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("spec settings");
+        database
+            .update_workspace_spec_content(0, "# Project Spec\n\nLatest spec")
+            .expect("spec content");
+        database
+            .insert_chat_spec_snapshot("chat-spec-preview", 1, "# Project Spec\n\nSaved spec")
+            .expect("snapshot insert");
+    }
+
+    let context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: Some("chat-spec-preview".to_string()),
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: Some("preview".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ContextPreview,
+    )
+    .await
+    .expect("prompt context");
+    let spec_message = context
+        .provider_request
+        .messages
+        .iter()
+        .find(|message| {
+            message
+                .content
+                .contains(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX)
+        })
+        .expect("project spec message");
+
+    assert!(spec_message.content.contains("Saved spec"));
+    assert!(!spec_message.content.contains("Latest spec"));
+    assert!(context.pending_spec_snapshot.is_none());
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prompt_cache_key_changes_when_new_chat_project_spec_snapshot_changes() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-cache-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-project-spec-cache-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("spec settings");
+        database
+            .update_workspace_spec_content(0, "# Project Spec\n\nCache A")
+            .expect("spec content");
+    }
+
+    let first_context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: Some("same user text".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        Some("chat-project-spec-cache".to_string()),
+        PromptAssemblyPurpose::ContextPreview,
+    )
+    .await
+    .expect("first prompt context");
+    let first_key = prompt_cache_key(
+        &first_context.workspace_id,
+        "chat-project-spec-cache",
+        &first_context.provider_id,
+        &first_context.model_id,
+        &first_context.provider_request,
+        &first_context.message_source_sequences,
+        &first_context.message_context_sources,
+    )
+    .expect("first cache key");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .update_workspace_spec_content(1, "# Project Spec\n\nCache B")
+            .expect("spec update");
+    }
+
+    let second_context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            message: Some("same user text".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        Some("chat-project-spec-cache".to_string()),
+        PromptAssemblyPurpose::ContextPreview,
+    )
+    .await
+    .expect("second prompt context");
+    let second_key = prompt_cache_key(
+        &second_context.workspace_id,
+        "chat-project-spec-cache",
+        &second_context.provider_id,
+        &second_context.model_id,
+        &second_context.provider_request,
+        &second_context.message_source_sequences,
+        &second_context.message_context_sources,
+    )
+    .expect("second cache key");
+
+    assert_ne!(first_key, second_key);
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
