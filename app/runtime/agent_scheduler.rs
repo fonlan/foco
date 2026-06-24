@@ -68,6 +68,8 @@ pub(crate) struct CoordinatorTaskInput {
     #[serde(default = "default_collaboration_tools_enabled")]
     pub(crate) collaboration_tools_enabled: bool,
     #[serde(default)]
+    pub(crate) defer_until_workspace_idle: bool,
+    #[serde(default)]
     pub(crate) delegated_input: Option<Value>,
     #[serde(default)]
     pub(crate) correlation_id: Option<String>,
@@ -2137,6 +2139,7 @@ mod tests {
             attachments: Vec::new(),
             skill_ids: Vec::new(),
             collaboration_tools_enabled: false,
+            defer_until_workspace_idle: false,
             delegated_input: None,
             correlation_id: None,
         };

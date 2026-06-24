@@ -67,6 +67,7 @@ pub(crate) struct QueueChatMessageInput {
     pub(crate) skill_ids: Option<Vec<String>>,
     pub(crate) message: String,
     pub(crate) team_mode_enabled: bool,
+    pub(crate) defer_start: bool,
     pub(crate) attachments: Vec<ChatAttachmentInput>,
     pub(crate) agent_definition_id: Option<String>,
     pub(crate) origin: QueuedChatMessageOrigin,
@@ -101,6 +102,7 @@ pub(crate) async fn queue_chat_message(
             skill_ids: request.skill_ids,
             message: request.message,
             team_mode_enabled: request.team_mode_enabled,
+            defer_start: request.defer_start,
             attachments: request.attachments,
             agent_definition_id: None,
             origin: QueuedChatMessageOrigin::User,
@@ -137,6 +139,7 @@ pub(crate) async fn queue_chat_message_internal(
         skill_ids,
         message: task_message,
         team_mode_enabled,
+        defer_start,
         attachments,
         agent_definition_id,
         origin,
@@ -297,6 +300,7 @@ pub(crate) async fn queue_chat_message_internal(
             attachments: task_attachments,
             skill_ids: requested_skill_ids.clone(),
             collaboration_tools_enabled: team_mode_enabled,
+            defer_until_workspace_idle: defer_start,
             delegated_input: None,
             correlation_id: None,
         })
@@ -343,7 +347,7 @@ pub(crate) async fn queue_chat_message_internal(
             metadata_json: Some(&user_metadata_json),
         })
         .map_err(ApiError::from_workspace_error)?;
-    if agent_task_id.is_some() {
+    if agent_task_id.is_some() && !defer_start {
         state.agent_scheduler.wake()?;
     }
     let chat = database

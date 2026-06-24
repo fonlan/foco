@@ -2423,6 +2423,8 @@ struct QueueChatMessageRequest {
     #[serde(default)]
     team_mode_enabled: bool,
     #[serde(default)]
+    defer_start: bool,
+    #[serde(default)]
     attachments: Vec<ChatAttachmentInput>,
 }
 

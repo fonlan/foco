@@ -648,6 +648,7 @@ fn scheduled_queue_input(
                 skill_ids: Some(skill_ids),
                 message: prompt,
                 team_mode_enabled: collaboration_tools_enabled,
+                defer_start: false,
                 attachments: Vec::new(),
                 agent_definition_id,
                 origin: QueuedChatMessageOrigin::ScheduledTask {

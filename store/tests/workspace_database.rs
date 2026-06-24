@@ -2918,6 +2918,79 @@ fn two_schedulers_cannot_claim_the_same_agent_task() {
 }
 
 #[test]
+fn deferred_workspace_agent_task_waits_for_earlier_active_task() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let (first_team_id, first_instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-defer-first", "defer-first");
+    let (deferred_team_id, deferred_instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-defer-second", "defer-second");
+    let first_task = AgentTaskId::new("agent-task-defer-first").expect("task id");
+    let deferred_task = AgentTaskId::new("agent-task-defer-second").expect("task id");
+
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &first_task,
+            team_id: &first_team_id,
+            owner_instance_id: &first_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("first enqueue");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &deferred_task,
+            team_id: &deferred_team_id,
+            owner_instance_id: &deferred_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"deferUntilWorkspaceIdle":true}"#,
+        })
+        .expect("deferred enqueue");
+
+    database
+        .claim_runnable_agent_task(
+            &first_team_id,
+            &first_task,
+            &AgentAttemptId::new("agent-attempt-defer-first").expect("attempt id"),
+        )
+        .expect("claim first task")
+        .expect("first task claimed");
+    assert!(
+        database
+            .claim_runnable_agent_task(
+                &deferred_team_id,
+                &deferred_task,
+                &AgentAttemptId::new("agent-attempt-defer-second-early").expect("attempt id"),
+            )
+            .expect("early deferred claim")
+            .is_none(),
+        "deferred task must wait while an earlier workspace task is active"
+    );
+
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &first_team_id,
+            task_id: &first_task,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Complete,
+            result_json: Some(r#"{"ok":true}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete first task");
+    database
+        .claim_runnable_agent_task(
+            &deferred_team_id,
+            &deferred_task,
+            &AgentAttemptId::new("agent-attempt-defer-second").expect("attempt id"),
+        )
+        .expect("claim deferred task")
+        .expect("deferred task claimed");
+}
+
+#[test]
 fn agent_team_max_concurrent_runs_blocks_second_instance_claim() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");

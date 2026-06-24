@@ -1428,12 +1428,26 @@ describe("app-chat-stream verification surfaces", () => {
       ctrlKey: true,
     });
 
+    const queueCall = fetchMock.mock.calls.find(
+      ([url, init]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/queue" &&
+        typeof init?.body === "string" &&
+        JSON.parse(init.body).message === "Scheduled task",
+    );
+    expect(queueCall).toBeDefined();
+    expect(JSON.parse(String(queueCall?.[1]?.body))).toMatchObject({
+      deferStart: true,
+      message: "Scheduled task",
+    });
+
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
     const scheduledHistoryTitle = await within(workspaceList).findByText(
       "Scheduled task",
     );
+    expect(within(workspaceList).getAllByText("Scheduled task")).toHaveLength(1);
     const scheduledHistoryButton = scheduledHistoryTitle.closest("button");
     if (!scheduledHistoryButton) {
       throw new Error("Expected scheduled chat history item button");
@@ -1450,6 +1464,13 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       within(scheduledMessageRow as HTMLElement).getByText("Queued"),
     ).toBeInTheDocument();
+
+    const queuedTabList = await screen.findByRole("tablist", { name: "Chat" });
+    const queuedTabs = within(queuedTabList).getAllByRole("tab", {
+      name: /Scheduled task/,
+    });
+    expect(queuedTabs).toHaveLength(1);
+    expect(queuedTabs[0]).toHaveAttribute("aria-selected", "true");
 
     const tabListBeforeComplete = await screen.findByRole("tablist", { name: "Chat" });
     await userEvent.click(
@@ -1575,6 +1596,19 @@ describe("app-chat-stream verification surfaces", () => {
     );
     fireEvent.click(sendButton);
     fireEvent.keyUp(window, { ctrlKey: false, key: "Control" });
+
+    const heldCtrlQueueCall = fetchMock.mock.calls.find(
+      ([url, init]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/queue" &&
+        typeof init?.body === "string" &&
+        JSON.parse(init.body).message === "Held Ctrl scheduled task",
+    );
+    expect(heldCtrlQueueCall).toBeDefined();
+    expect(JSON.parse(String(heldCtrlQueueCall?.[1]?.body))).toMatchObject({
+      deferStart: true,
+      message: "Held Ctrl scheduled task",
+    });
 
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",

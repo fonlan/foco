@@ -3944,6 +3944,14 @@ impl WorkspaceDatabase {
                           AND earlier_task.status IN ('queued', 'running', 'waiting')
                    )
                    AND (
+                        json_extract(task.input_json, '$.deferUntilWorkspaceIdle') IS NOT 1
+                        OR NOT EXISTS (
+                            SELECT 1 FROM agent_tasks AS earlier_workspace_task
+                            WHERE earlier_workspace_task.rowid < task.rowid
+                              AND earlier_workspace_task.status IN ('queued', 'running', 'waiting')
+                        )
+                   )
+                   AND (
                         NOT EXISTS (
                             SELECT 1 FROM agent_task_dependencies AS dependency
                             WHERE dependency.waiting_task_id = task.id
@@ -4025,6 +4033,14 @@ impl WorkspaceDatabase {
                         WHERE earlier_task.owner_instance_id = task.owner_instance_id
                           AND earlier_task.sequence < task.sequence
                           AND earlier_task.status IN ('queued', 'running', 'waiting')
+                   )
+                   AND (
+                        json_extract(task.input_json, '$.deferUntilWorkspaceIdle') IS NOT 1
+                        OR NOT EXISTS (
+                            SELECT 1 FROM agent_tasks AS earlier_workspace_task
+                            WHERE earlier_workspace_task.rowid < task.rowid
+                              AND earlier_workspace_task.status IN ('queued', 'running', 'waiting')
+                        )
                    )
                    AND (
                         NOT EXISTS (

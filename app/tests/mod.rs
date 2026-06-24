@@ -4345,6 +4345,7 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
             skill_ids: None,
             message: "First Coordinator task".to_string(),
             team_mode_enabled: false,
+            defer_start: false,
             attachments: Vec::new(),
         }),
     )
@@ -4543,6 +4544,7 @@ async fn queue_chat_message_creates_default_team_for_normal_send() {
             skill_ids: None,
             message: "Normal send".to_string(),
             team_mode_enabled: false,
+            defer_start: false,
             attachments: Vec::new(),
         }),
     )
@@ -4604,6 +4606,59 @@ async fn queue_chat_message_creates_default_team_for_normal_send() {
 }
 
 #[tokio::test]
+async fn queue_chat_message_defer_start_does_not_wake_scheduler() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-deferred-queue-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-agent-deferred-queue-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (scheduler, mut scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = scheduler;
+
+    let queued = crate::http::chat::queue_chat_message(
+        State(state.clone()),
+        AxumPath(workspace_id.clone()),
+        Json(QueueChatMessageRequest {
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            skill_ids: None,
+            message: "Deferred send".to_string(),
+            team_mode_enabled: false,
+            defer_start: true,
+            attachments: Vec::new(),
+        }),
+    )
+    .await
+    .expect("queue deferred message")
+    .0;
+
+    assert!(queued.agent_task_id.is_some());
+    assert!(
+        timeout(Duration::from_millis(50), scheduler_rx.recv())
+            .await
+            .is_err()
+    );
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let task = database
+        .agent_task(&queued.agent_task_id.expect("Agent task id"))
+        .expect("task lookup")
+        .expect("Coordinator task");
+    assert_eq!(task.status, foco_agent::AgentTaskStatus::Queued);
+    let input = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json)
+        .expect("Coordinator task input");
+    assert!(input.defer_until_workspace_idle);
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn queue_chat_message_internal_marks_scheduled_origin() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-queue-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-queue-profile"));
@@ -4627,6 +4682,7 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
             skill_ids: None,
             message: "Scheduled prompt".to_string(),
             team_mode_enabled: false,
+            defer_start: false,
             attachments: Vec::new(),
             agent_definition_id: None,
             origin: crate::http::chat::QueuedChatMessageOrigin::ScheduledTask {
@@ -5320,6 +5376,7 @@ async fn queue_chat_message_resumes_paused_coordinator_without_active_work() {
             skill_ids: None,
             message: "Continue after restart".to_string(),
             team_mode_enabled: false,
+            defer_start: false,
             attachments: Vec::new(),
         }),
     )

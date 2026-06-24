@@ -1668,7 +1668,7 @@ export function App() {
         );
       }
     })();
-  }, [runningChatKeys, scheduledWorkspaceRuns]);
+  }, [runningChatKeys, scheduledWorkspaceRuns, workspaces]);
 
   useEffect(() => {
     setOpenChatTabs((current) => {
@@ -2577,6 +2577,11 @@ export function App() {
       [...runningChatKeys].some(
         (chatKey) => chatKeyWorkspaceId(chatKey) === workspaceId,
       ) ||
+      workspaces.some(
+        (workspace) =>
+          workspace.id === workspaceId &&
+          workspace.chats.some((chat) => Boolean(chat.activeRun)),
+      ) ||
       scheduledWorkspaceRunsRef.current.some(
         (run) => run.workspaceId === workspaceId && run.status === "starting",
       )
@@ -3174,15 +3179,15 @@ export function App() {
     fallbackTitle: string,
   ) {
     const workspace = workspaces.find((workspace) => workspace.id === workspaceId);
+    const nextTabs = upsertOpenChatTab(openChatTabsRef.current, {
+      workspaceId,
+      chatId,
+      fallbackTitle,
+      fallbackWorkspaceName: workspace?.name ?? t("Workspace"),
+    });
 
-    setOpenChatTabs((current) =>
-      upsertOpenChatTab(current, {
-        workspaceId,
-        chatId,
-        fallbackTitle,
-        fallbackWorkspaceName: workspace?.name ?? t("Workspace"),
-      }),
-    );
+    openChatTabsRef.current = nextTabs;
+    setOpenChatTabs(nextTabs);
   }
 
   function replacePendingChatTab(
@@ -4090,6 +4095,7 @@ export function App() {
 
   async function persistQueuedRunRequest(
     request: RetryRunRequest,
+    options: { deferStart?: boolean } = {},
   ): Promise<QueueChatMessageResponse> {
     return requestJson<QueueChatMessageResponse>(
       `/api/workspaces/${encodeURIComponent(request.workspaceId)}/chat/queue`,
@@ -4102,6 +4108,7 @@ export function App() {
           providerId: request.providerId,
           skillIds: request.skillIds.length ? request.skillIds : null,
           teamModeEnabled: request.teamModeEnabled ?? false,
+          deferStart: options.deferStart ?? false,
           thinkingLevel: request.thinkingLevel || null,
         }),
         headers: { "Content-Type": "application/json" },
@@ -4156,12 +4163,18 @@ export function App() {
     setError(null);
 
     try {
-      const queued = await persistQueuedRunRequest(request);
+      const queued = await persistQueuedRunRequest(request, { deferStart: true });
       const chatKey = chatRunKey(request.workspaceId, queued.chatId);
       const createdAt = queued.createdAt;
 
       setActiveWorkspaceId(request.workspaceId);
       setActiveChatId(queued.chatId);
+      setActiveMainTab({
+        chatId: queued.chatId,
+        type: "chat",
+        workspaceId: request.workspaceId,
+      });
+      openPendingChatTab(request.workspaceId, queued.chatId, queued.chatTitle);
       setExpandedWorkspaceId(request.workspaceId);
       activeWorkspaceIdRef.current = request.workspaceId;
       activeChatIdRef.current = queued.chatId;
