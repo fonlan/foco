@@ -65,7 +65,7 @@ describe("app-settings verification surfaces", () => {
       }),
     );
     expect(await within(providersSection as HTMLElement).findByText("gpt-4.1")).toBeInTheDocument();
-    expect(within(providersSection as HTMLElement).getByText("gpt-4.1-mini")).toBeInTheDocument();
+    expect(within(providersSection as HTMLElement).queryByText("gpt-4.1-mini")).toBeNull();
 
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
     expect(screen.getByText("Model settings")).toBeInTheDocument();

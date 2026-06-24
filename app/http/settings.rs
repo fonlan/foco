@@ -1012,6 +1012,7 @@ pub(crate) async fn provider_models(
     let models = fetch_provider_model_ids(&connection_config)
         .await
         .map_err(ApiError::from_provider_config_error)?;
+    let models = filter_provider_model_ids(provider, models)?;
 
     Ok(Json(ProviderModelsResponse {
         provider_id: provider.id.clone(),

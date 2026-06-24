@@ -2202,7 +2202,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   if (path === "/api/providers/models") {
     return jsonResponse({
       providerId: "openai",
-      models: ["gpt-4.1", "gpt-4.1-mini"],
+      models: ["gpt-4.1"],
     });
   }
 
