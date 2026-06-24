@@ -198,8 +198,12 @@ pub(crate) async fn memory_prompt_context(
                 query_text,
             )?,
             "llm" => {
-                let candidates =
-                    llm_memory_retrieval_candidates(&global_memory, &workspace_memory, chat_id)?;
+                let candidates = llm_memory_retrieval_candidates(
+                    &global_memory,
+                    &workspace_memory,
+                    chat_id,
+                    query_text,
+                )?;
                 drop(workspace_memory);
                 drop(global_memory);
                 relevant_memory_facts_llm(
@@ -422,21 +426,93 @@ pub(crate) fn llm_memory_retrieval_candidates(
     global_memory: &MemoryDatabase,
     workspace_memory: &MemoryDatabase,
     chat_id: Option<&str>,
+    query_text: Option<&str>,
 ) -> Result<Vec<MemoryFactRecord>, ApiError> {
-    let workspace_facts = workspace_memory
-        .list_active_facts_for_scope(chat_id, MEMORY_RETRIEVAL_LLM_FACT_LIMIT.saturating_add(1))
-        .map_err(ApiError::from_memory_error)?;
-    let global_facts = global_memory
-        .list_active_facts_for_scope(None, MEMORY_RETRIEVAL_LLM_FACT_LIMIT.saturating_add(1))
-        .map_err(ApiError::from_memory_error)?;
-    let total = workspace_facts.len().saturating_add(global_facts.len());
-    if total > MEMORY_RETRIEVAL_LLM_FACT_LIMIT as usize {
-        return Err(ApiError::bad_request(format!(
-            "model-based memory retrieval supports at most {MEMORY_RETRIEVAL_LLM_FACT_LIMIT} active memories, found {total}; use SQLite FTS or reduce active memories"
-        )));
+    let limit = MEMORY_RETRIEVAL_LLM_FACT_LIMIT as usize;
+    let mut candidates = Vec::with_capacity(limit);
+    let mut seen = HashSet::new();
+
+    if let Some(search) = query_text.and_then(memory_prompt_search) {
+        let workspace_facts = workspace_memory
+            .search_active_facts_for_scope(
+                &search.fts_query,
+                chat_id,
+                None,
+                MEMORY_RETRIEVAL_LLM_FACT_LIMIT,
+            )
+            .map_err(ApiError::from_memory_error)?;
+        let workspace_containing_facts = workspace_memory
+            .find_active_facts_containing_any_for_scope(
+                &search.contains_terms,
+                chat_id,
+                MEMORY_RETRIEVAL_LLM_FACT_LIMIT,
+            )
+            .map_err(ApiError::from_memory_error)?;
+        push_llm_memory_candidates(
+            merged_relevant_memory_search_matches(
+                workspace_facts,
+                workspace_containing_facts,
+                &search.contains_terms,
+            ),
+            &mut seen,
+            &mut candidates,
+            limit,
+        );
+
+        let global_facts = global_memory
+            .search_active_facts_for_scope(
+                &search.fts_query,
+                None,
+                None,
+                MEMORY_RETRIEVAL_LLM_FACT_LIMIT,
+            )
+            .map_err(ApiError::from_memory_error)?;
+        let global_containing_facts = global_memory
+            .find_active_facts_containing_any_for_scope(
+                &search.contains_terms,
+                None,
+                MEMORY_RETRIEVAL_LLM_FACT_LIMIT,
+            )
+            .map_err(ApiError::from_memory_error)?;
+        push_llm_memory_candidates(
+            merged_relevant_memory_search_matches(
+                global_facts,
+                global_containing_facts,
+                &search.contains_terms,
+            ),
+            &mut seen,
+            &mut candidates,
+            limit,
+        );
     }
 
-    Ok(workspace_facts.into_iter().chain(global_facts).collect())
+    let workspace_facts = workspace_memory
+        .list_active_facts_for_scope(chat_id, MEMORY_RETRIEVAL_LLM_FACT_LIMIT)
+        .map_err(ApiError::from_memory_error)?;
+    push_llm_memory_candidates(workspace_facts, &mut seen, &mut candidates, limit);
+
+    let global_facts = global_memory
+        .list_active_facts_for_scope(None, MEMORY_RETRIEVAL_LLM_FACT_LIMIT)
+        .map_err(ApiError::from_memory_error)?;
+    push_llm_memory_candidates(global_facts, &mut seen, &mut candidates, limit);
+
+    Ok(candidates)
+}
+
+fn push_llm_memory_candidates(
+    facts: Vec<MemoryFactRecord>,
+    seen: &mut HashSet<(String, String)>,
+    candidates: &mut Vec<MemoryFactRecord>,
+    limit: usize,
+) {
+    for fact in facts {
+        if candidates.len() >= limit {
+            break;
+        }
+        if seen.insert((fact.scope.clone(), fact.id.clone())) {
+            candidates.push(fact);
+        }
+    }
 }
 
 fn finish_relevant_memory_facts(

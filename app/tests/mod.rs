@@ -11530,8 +11530,8 @@ fn memory_retrieval_query_text_includes_latest_assistant_response_for_followup()
 }
 
 #[test]
-fn model_memory_retrieval_rejects_too_many_active_memories() {
-    let workspace_dir = env::temp_dir().join(unique_id("foco-memory-llm-limit-test"));
+fn model_memory_retrieval_prioritizes_query_matches_before_backfill() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-memory-llm-hybrid-test"));
 
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let workspace_database =
@@ -11543,23 +11543,109 @@ fn model_memory_retrieval_rejects_too_many_active_memories() {
         MemoryDatabase::open_or_create_global_at(workspace_dir.join("global-memory.sqlite"))
             .expect("global memory database");
 
-    for index in 0..=MEMORY_RETRIEVAL_LLM_FACT_LIMIT {
+    for index in 0..MEMORY_RETRIEVAL_LLM_FACT_LIMIT {
         insert_test_memory_fact(
             &mut workspace_memory,
-            &format!("source-llm-limit-{index}"),
-            &format!("fact-llm-limit-{index}"),
+            &format!("source-llm-backfill-{index}"),
+            &format!("fact-llm-backfill-{index}"),
             MemoryScope::Workspace,
             None,
-            &format!("LLM retrieval limit memory {index}."),
-            false,
+            &format!("LLM retrieval backfill memory {index}."),
+            true,
         );
     }
+    insert_test_memory_fact(
+        &mut workspace_memory,
+        "source-llm-hybrid-target",
+        "fact-llm-hybrid-target",
+        MemoryScope::Workspace,
+        None,
+        "Hybrid target memory should be considered for recall.",
+        false,
+    );
 
-    let error = llm_memory_retrieval_candidates(&global_memory, &workspace_memory, None)
-        .expect_err("too many active memories should fail");
+    let candidates = llm_memory_retrieval_candidates(
+        &global_memory,
+        &workspace_memory,
+        None,
+        Some("hybrid target recall"),
+    )
+    .expect("hybrid LLM retrieval candidates");
 
-    assert!(error.message.contains("at most"));
-    assert!(error.message.contains("use SQLite FTS"));
+    assert_eq!(candidates.len(), MEMORY_RETRIEVAL_LLM_FACT_LIMIT as usize);
+    assert_eq!(candidates[0].id, "fact-llm-hybrid-target");
+    assert_eq!(
+        candidates
+            .iter()
+            .filter(|fact| fact.id == "fact-llm-hybrid-target")
+            .count(),
+        1
+    );
+
+    drop(workspace_memory);
+    drop(global_memory);
+    drop(workspace_database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn model_memory_retrieval_keeps_all_small_candidate_sets() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-memory-llm-small-hybrid-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let workspace_database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let mut workspace_memory =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+    let mut global_memory =
+        MemoryDatabase::open_or_create_global_at(workspace_dir.join("global-memory.sqlite"))
+            .expect("global memory database");
+
+    insert_test_memory_fact(
+        &mut workspace_memory,
+        "source-small-backfill",
+        "fact-small-backfill",
+        MemoryScope::Workspace,
+        None,
+        "Candidate backfill record.",
+        true,
+    );
+    insert_test_memory_fact(
+        &mut workspace_memory,
+        "source-small-target",
+        "fact-small-target",
+        MemoryScope::Workspace,
+        None,
+        "Needle target memory should be first.",
+        false,
+    );
+    insert_test_memory_fact(
+        &mut global_memory,
+        "source-small-global",
+        "fact-small-global",
+        MemoryScope::Global,
+        None,
+        "Global record survives backfill.",
+        false,
+    );
+
+    let candidates = llm_memory_retrieval_candidates(
+        &global_memory,
+        &workspace_memory,
+        None,
+        Some("needle target"),
+    )
+    .expect("small hybrid LLM retrieval candidates");
+    let candidate_ids = candidates
+        .iter()
+        .map(|fact| fact.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(candidate_ids.len(), 3);
+    assert_eq!(candidate_ids[0], "fact-small-target");
+    assert!(candidate_ids.contains(&"fact-small-backfill"));
+    assert!(candidate_ids.contains(&"fact-small-global"));
 
     drop(workspace_memory);
     drop(global_memory);
