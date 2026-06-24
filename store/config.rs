@@ -11,6 +11,7 @@ use foco_providers::{
     HTTP_PROXY_KIND, ProviderRequestOverride, SOCKS_PROXY_KIND, normalized_base_url,
     normalized_proxy_url, parse_provider_kind,
 };
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -452,6 +453,11 @@ impl GlobalConfig {
                         message: source.to_string(),
                     })?;
             }
+            validate_provider_model_sync_filter(
+                config_path,
+                &provider.id,
+                provider.model_sync_filter_regex.as_deref(),
+            )?;
         }
 
         validate_unique_named_items(
@@ -1055,6 +1061,10 @@ pub struct ProviderSettings {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     #[serde(default)]
+    pub auto_sync_models: bool,
+    #[serde(default)]
+    pub model_sync_filter_regex: Option<String>,
+    #[serde(default)]
     pub request_overrides: Vec<ProviderRequestOverride>,
     #[serde(default)]
     pub api_proxy: ApiProxySettings,
@@ -1401,6 +1411,23 @@ fn validate_api_proxy_settings(
             message: source.to_string(),
         })?;
     }
+
+    Ok(())
+}
+
+fn validate_provider_model_sync_filter(
+    config_path: Option<&Path>,
+    provider_id: &str,
+    pattern: Option<&str>,
+) -> Result<(), ConfigError> {
+    let Some(pattern) = pattern.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+
+    Regex::new(pattern).map_err(|source| ConfigError::Validation {
+        path: config_path.map(Path::to_path_buf),
+        message: format!("provider '{provider_id}' model_sync_filter_regex is invalid: {source}"),
+    })?;
 
     Ok(())
 }
@@ -2660,6 +2687,8 @@ mod tests {
             enabled: true,
             base_url: None,
             api_key: None,
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
             request_overrides: Vec::new(),
             api_proxy: ApiProxySettings {
                 enabled: true,
@@ -2687,6 +2716,36 @@ mod tests {
         let error = save_global_config(&paths.config_file, &config)
             .expect_err("proxy URL type mismatch should fail");
         assert!(error.to_string().contains("does not match proxy type"));
+    }
+
+    #[test]
+    fn load_rejects_invalid_provider_model_sync_filter_regex() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.providers.push(ProviderSettings {
+            id: "openai".to_string(),
+            name: "OpenAI".to_string(),
+            kind: "openai-chat".to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            auto_sync_models: true,
+            model_sync_filter_regex: Some("(".to_string()),
+            request_overrides: Vec::new(),
+            api_proxy: ApiProxySettings::default(),
+        });
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("invalid provider model sync regex should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("model_sync_filter_regex is invalid")
+        );
     }
 
     #[test]
@@ -2938,6 +2997,8 @@ mod tests {
             enabled: true,
             base_url: None,
             api_key: Some("sk-test-secret".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
             request_overrides: Vec::new(),
             api_proxy: ApiProxySettings::default(),
         });
@@ -3289,6 +3350,8 @@ mod tests {
             enabled: true,
             base_url: None,
             api_key: Some("secret-key".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
             request_overrides: Vec::new(),
             api_proxy: ApiProxySettings::default(),
         });

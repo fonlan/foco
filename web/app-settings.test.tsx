@@ -55,6 +55,10 @@ describe("app-settings verification surfaces", () => {
     const providersSection = screen.getByText("Configured providers").closest("section");
     expect(providersSection).not.toBeNull();
     expect(within(providersSection as HTMLElement).getByText("OpenAI")).toBeInTheDocument();
+    expect(within(providersSection as HTMLElement).getByText("auto sync")).toBeInTheDocument();
+    expect(
+      within(providersSection as HTMLElement).getByText("sync regex ^gpt-4"),
+    ).toBeInTheDocument();
     await userEvent.click(
       within(providersSection as HTMLElement).getByRole("button", {
         name: "Load provider models for OpenAI",
@@ -939,6 +943,8 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Add provider" }));
     expect(screen.getByLabelText("Protocol")).toHaveValue("openai-responses");
     await userEvent.type(screen.getByLabelText("Name"), "Test Provider");
+    await userEvent.click(screen.getByRole("checkbox", { name: "Auto sync provider models" }));
+    await userEvent.type(screen.getByLabelText("Model sync filter regex"), "^gpt-4");
     await userEvent.click(screen.getByRole("checkbox", { name: "Enable AI API proxy" }));
     await userEvent.selectOptions(screen.getByLabelText("Proxy type"), "socks");
     await userEvent.type(screen.getByLabelText("Proxy server"), "127.0.0.1:7891");
@@ -966,6 +972,20 @@ describe("app-settings verification surfaces", () => {
       "/api/providers/manual",
       expect.objectContaining({
         body: expect.stringContaining('"kind":"openai-responses"'),
+        method: "POST",
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/providers/manual",
+      expect.objectContaining({
+        body: expect.stringContaining('"autoSyncModels":true'),
+        method: "POST",
+      }),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/providers/manual",
+      expect.objectContaining({
+        body: expect.stringContaining('"modelSyncFilterRegex":"^gpt-4"'),
         method: "POST",
       }),
     );

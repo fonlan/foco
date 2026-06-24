@@ -12,6 +12,7 @@ chrono.workspace = true
 foco-agent.workspace = true
 foco-mcp.workspace = true
 foco-providers.workspace = true
+regex.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

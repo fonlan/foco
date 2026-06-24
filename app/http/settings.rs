@@ -16,6 +16,7 @@ use foco_store::{
         write_model_metadata_cache,
     },
 };
+use regex::Regex;
 
 use crate::*;
 
@@ -577,6 +578,8 @@ pub(crate) async fn save_manual_provider(
         ),
         None => None,
     };
+    let model_sync_filter_regex = optional_trimmed_string(request.model_sync_filter_regex);
+    validate_provider_model_sync_filter(model_sync_filter_regex.as_deref())?;
     let current_api_proxy = existing_provider
         .map(|provider| provider.api_proxy.clone())
         .unwrap_or_default();
@@ -593,6 +596,8 @@ pub(crate) async fn save_manual_provider(
         enabled: request.enabled,
         base_url: normalized_base_url,
         api_key,
+        auto_sync_models: request.auto_sync_models,
+        model_sync_filter_regex,
         request_overrides: request.request_overrides,
         api_proxy,
     };
@@ -600,6 +605,7 @@ pub(crate) async fn save_manual_provider(
     if is_new_provider {
         match fetch_provider_model_ids(&provider_connection_config(&provider)?).await {
             Ok(model_ids) => {
+                let model_ids = filter_provider_model_ids(&provider, model_ids)?;
                 associate_provider_with_local_models(&mut config.models, &provider.id, &model_ids);
             }
             Err(source) if can_save_new_provider_after_model_list_error(&source) => {
@@ -668,12 +674,59 @@ pub(crate) async fn refresh_provider_models(
 ) -> Result<Json<ProviderModelsRefreshResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
     let providers = config.providers.clone();
+    let refreshed_providers = sync_provider_model_associations(&mut config, providers).await?;
+
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    save_config(&state, config.clone())?;
+
+    let Json(settings) = settings_response(&state, &config).await?;
+    Ok(Json(ProviderModelsRefreshResponse {
+        providers: refreshed_providers,
+        settings,
+    }))
+}
+
+pub(crate) async fn sync_auto_provider_models_once(state: &AppState) -> Result<usize, ApiError> {
+    let mut config = config_snapshot(state)?;
+    let providers = config
+        .providers
+        .iter()
+        .filter(|provider| provider.enabled && provider.auto_sync_models)
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if providers.is_empty() {
+        return Ok(0);
+    }
+
+    let provider_count = providers.len();
+    let previous_providers = config.providers.clone();
+    let previous_models = config.models.clone();
+    sync_provider_model_associations(&mut config, providers).await?;
+
+    if config.providers != previous_providers || config.models != previous_models {
+        config
+            .validate(Some(&state.config_file))
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        save_config(state, config)?;
+    }
+
+    Ok(provider_count)
+}
+
+async fn sync_provider_model_associations(
+    config: &mut GlobalConfig,
+    providers: Vec<ProviderSettings>,
+) -> Result<Vec<ProviderModelsResponse>, ApiError> {
     let mut refreshed_providers = Vec::new();
 
     for provider in providers {
         let models = match provider_connection_config(&provider) {
             Ok(connection_config) => match fetch_provider_model_ids(&connection_config).await {
                 Ok(model_ids) => {
+                    let model_ids = filter_provider_model_ids(&provider, model_ids)?;
                     associate_provider_with_local_models(
                         &mut config.models,
                         &provider.id,
@@ -685,7 +738,7 @@ pub(crate) async fn refresh_provider_models(
                     tracing::warn!(
                         provider_id = %provider.id,
                         error = ?source,
-                        "disabling provider after model list refresh failed"
+                        "disabling provider after model list sync failed"
                     );
                     disable_provider(&mut config.providers, &provider.id);
                     Vec::new()
@@ -708,16 +761,38 @@ pub(crate) async fn refresh_provider_models(
         });
     }
 
-    config
-        .validate(Some(&state.config_file))
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    save_config(&state, config.clone())?;
+    Ok(refreshed_providers)
+}
 
-    let Json(settings) = settings_response(&state, &config).await?;
-    Ok(Json(ProviderModelsRefreshResponse {
-        providers: refreshed_providers,
-        settings,
-    }))
+pub(crate) fn filter_provider_model_ids(
+    provider: &ProviderSettings,
+    model_ids: Vec<String>,
+) -> Result<Vec<String>, ApiError> {
+    let Some(pattern) = provider
+        .model_sync_filter_regex
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(model_ids);
+    };
+
+    let regex = Regex::new(pattern)
+        .map_err(|source| ApiError::bad_request(format!("invalid model sync regex: {source}")))?;
+    Ok(model_ids
+        .into_iter()
+        .filter(|model_id| regex.is_match(model_id))
+        .collect())
+}
+
+fn validate_provider_model_sync_filter(pattern: Option<&str>) -> Result<(), ApiError> {
+    if let Some(pattern) = pattern.map(str::trim).filter(|value| !value.is_empty()) {
+        Regex::new(pattern).map_err(|source| {
+            ApiError::bad_request(format!("invalid model sync regex: {source}"))
+        })?;
+    }
+
+    Ok(())
 }
 
 fn disable_provider(providers: &mut [ProviderSettings], provider_id: &str) {

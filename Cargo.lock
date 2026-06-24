@@ -880,6 +880,7 @@ dependencies = [
  "foco-agent",
  "foco-mcp",
  "foco-providers",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

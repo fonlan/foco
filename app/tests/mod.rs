@@ -36,6 +36,7 @@ use crate::http::{
     },
     settings::{
         associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
+        filter_provider_model_ids,
     },
     terminal::create_terminal_session,
     workspaces::add_workspace,
@@ -1688,6 +1689,42 @@ fn provider_model_refresh_removes_stale_local_model_associations() {
         models[1].provider_ids,
         vec!["fallback", "refreshed-provider"]
     );
+    assert_eq!(models[1].active_provider_id.as_deref(), Some("fallback"));
+}
+
+#[test]
+fn provider_model_sync_filter_regex_limits_association_changes() {
+    let provider = ProviderSettings {
+        id: "filtered-provider".to_string(),
+        name: "Filtered".to_string(),
+        kind: "openai-chat".to_string(),
+        enabled: true,
+        base_url: None,
+        api_key: None,
+        auto_sync_models: true,
+        model_sync_filter_regex: Some("^gpt-4".to_string()),
+        request_overrides: Vec::new(),
+        api_proxy: ApiProxySettings::default(),
+    };
+    let mut models = vec![
+        test_model_settings("gpt-4.1"),
+        ModelSettings {
+            provider_ids: vec!["filtered-provider".to_string(), "fallback".to_string()],
+            active_provider_id: Some("filtered-provider".to_string()),
+            ..test_model_settings("text-embedding-3-large")
+        },
+    ];
+    let provider_models = filter_provider_model_ids(
+        &provider,
+        vec!["gpt-4.1".to_string(), "text-embedding-3-large".to_string()],
+    )
+    .expect("filter provider models");
+
+    associate_provider_with_local_models(&mut models, &provider.id, &provider_models);
+
+    assert_eq!(provider_models, vec!["gpt-4.1"]);
+    assert_eq!(models[0].provider_ids, vec!["filtered-provider"]);
+    assert_eq!(models[1].provider_ids, vec!["fallback"]);
     assert_eq!(models[1].active_provider_id.as_deref(), Some("fallback"));
 }
 
@@ -8585,6 +8622,8 @@ Search memory before repo work.
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -8851,6 +8890,8 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -8967,6 +9008,8 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -9059,6 +9102,8 @@ Use the existing product UI conventions.
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -9144,6 +9189,8 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -9296,6 +9343,8 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -9493,6 +9542,8 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -9592,6 +9643,8 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -9711,6 +9764,8 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -9918,6 +9973,8 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -10183,6 +10240,8 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -10391,6 +10450,8 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -10588,6 +10649,8 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -10718,6 +10781,8 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });
@@ -11170,6 +11235,8 @@ fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
         enabled: true,
         base_url: None,
         api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
         request_overrides: Vec::new(),
         api_proxy: ApiProxySettings::default(),
     });

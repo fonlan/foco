@@ -12549,6 +12549,8 @@ function SettingsPanel({
       enabled: provider.enabled,
       id: provider.id,
       kind: provider.kind,
+      autoSyncModels: provider.autoSyncModels,
+      modelSyncFilterRegex: provider.modelSyncFilterRegex ?? "",
       name: provider.name,
       requestOverrides: provider.requestOverrides.map((overrideRule) => ({
         target: overrideRule.target,
@@ -13996,6 +13998,8 @@ function SettingsPanel({
             enabled: providerForm.enabled,
             id: providerId,
             kind: providerForm.kind,
+            autoSyncModels: providerForm.autoSyncModels,
+            modelSyncFilterRegex: providerForm.modelSyncFilterRegex || null,
             name: providerForm.name,
             requestOverrides: providerForm.requestOverrides.map((overrideRule) => ({
               ...overrideRule,
@@ -18974,6 +18978,52 @@ function SettingsPanel({
                       <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
                           <div className="flex items-center gap-2">
+                            <RefreshCw aria-hidden="true" className="size-4 text-teal-700" />
+                            <h4 className="text-sm font-semibold text-stone-950">
+                              {t("Model sync")}
+                            </h4>
+                          </div>
+                          <CapabilityPill
+                            label={
+                              providerForm.autoSyncModels
+                                ? t("auto sync")
+                                : t("manual sync")
+                            }
+                            ok={providerForm.autoSyncModels}
+                          />
+                        </div>
+                        <div className="mt-3 grid gap-3">
+                          <label className="inline-flex items-center gap-2 text-sm font-semibold text-stone-700">
+                            <input
+                              aria-label={t("Auto sync provider models")}
+                              checked={providerForm.autoSyncModels}
+                              className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-200"
+                              onChange={(event) =>
+                                setProviderForm((current) => ({
+                                  ...current,
+                                  autoSyncModels: event.target.checked,
+                                }))
+                              }
+                              type="checkbox"
+                            />
+                            {t("Auto sync provider models")}
+                          </label>
+                          <TextField
+                            label={t("Model sync filter regex")}
+                            onChange={(value) =>
+                              setProviderForm((current) => ({
+                                ...current,
+                                modelSyncFilterRegex: value,
+                              }))
+                            }
+                            placeholder="^gpt-4|^o"
+                            value={providerForm.modelSyncFilterRegex}
+                          />
+                        </div>
+                      </div>
+                      <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex items-center gap-2">
                             <PlugZap aria-hidden="true" className="size-4 text-teal-700" />
                             <h4 className="text-sm font-semibold text-stone-950">
                               {t("AI API proxy")}
@@ -19288,10 +19338,25 @@ function SettingsPanel({
                                     }
                                     ok={provider.hasApiKey}
                                   />
+                                  <CapabilityPill
+                                    label={
+                                      provider.autoSyncModels
+                                        ? t("auto sync")
+                                        : t("manual sync")
+                                    }
+                                    ok={provider.autoSyncModels}
+                                  />
                                 </div>
                                 <div className="mt-1 truncate text-xs font-medium text-stone-500">
                                   {provider.id} / {provider.kindLabel}
                                 </div>
+                                {provider.modelSyncFilterRegex ? (
+                                  <div className="mt-1 truncate font-mono text-xs text-stone-500">
+                                    {t("sync regex {pattern}", {
+                                      pattern: provider.modelSyncFilterRegex,
+                                    })}
+                                  </div>
+                                ) : null}
                                 {provider.baseUrl ? (
                                   <div className="mt-1 truncate text-xs text-stone-500">
                                     {provider.baseUrl}
@@ -21141,6 +21206,8 @@ function emptyProviderForm(): ProviderFormState {
     enabled: true,
     id: "",
     kind: "",
+    autoSyncModels: false,
+    modelSyncFilterRegex: "",
     name: "",
     requestOverrides: [],
     serviceId: "",

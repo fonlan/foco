@@ -238,6 +238,8 @@ const GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS: u32 = 256;
 const GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS: usize = 60_000;
 const API_AUDIT_CLEANUP_STARTUP_DELAY_SECS: u64 = 30;
 const API_AUDIT_CLEANUP_INTERVAL_SECS: u64 = 6 * 60 * 60;
+const PROVIDER_MODEL_SYNC_STARTUP_DELAY_SECS: u64 = 60;
+const PROVIDER_MODEL_SYNC_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const API_AUDIT_VACUUM_MIN_FREE_BYTES: u64 = 256 * 1024 * 1024;
 const API_AUDIT_VACUUM_MIN_FREE_RATIO_NUMERATOR: u64 = 1;
 const API_AUDIT_VACUUM_MIN_FREE_RATIO_DENOMINATOR: u64 = 4;
@@ -732,6 +734,7 @@ async fn run_server_until_shutdown(
         scheduled_task_scheduler.spawn(state.clone(), scheduled_task_scheduler_wake_rx);
     let memory_dream_scheduler_task = memory_dream_scheduler.spawn(state.clone());
     let api_audit_cleanup_task = spawn_api_audit_cleanup_scheduler(state.clone());
+    let provider_model_sync_task = spawn_provider_model_sync_scheduler(state.clone());
     agent_scheduler
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
@@ -776,11 +779,13 @@ async fn run_server_until_shutdown(
         scheduled_task_scheduler_task.abort();
         memory_dream_scheduler_task.abort();
         api_audit_cleanup_task.abort();
+        provider_model_sync_task.abort();
     }
     let _ = agent_scheduler_task.await;
     let _ = scheduled_task_scheduler_task.await;
     let _ = memory_dream_scheduler_task.await;
     let _ = api_audit_cleanup_task.await;
+    let _ = provider_model_sync_task.await;
     server_result?;
 
     Ok(())
@@ -844,6 +849,40 @@ fn spawn_api_audit_cleanup_scheduler(state: AppState) -> tokio::task::JoinHandle
             if sleep_until_shutdown(
                 &mut shutdown_rx,
                 Duration::from_secs(API_AUDIT_CLEANUP_INTERVAL_SECS),
+            )
+            .await
+            {
+                return;
+            }
+        }
+    })
+}
+
+fn spawn_provider_model_sync_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut shutdown_rx = state.app_shutdown_rx.clone();
+        if sleep_until_shutdown(
+            &mut shutdown_rx,
+            Duration::from_secs(PROVIDER_MODEL_SYNC_STARTUP_DELAY_SECS),
+        )
+        .await
+        {
+            return;
+        }
+
+        loop {
+            match crate::http::settings::sync_auto_provider_models_once(&state).await {
+                Ok(provider_count) if provider_count > 0 => {
+                    tracing::info!(provider_count, "provider model sync completed");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(error = %error.message, "provider model sync failed");
+                }
+            }
+            if sleep_until_shutdown(
+                &mut shutdown_rx,
+                Duration::from_secs(PROVIDER_MODEL_SYNC_INTERVAL_SECS),
             )
             .await
             {
@@ -2316,6 +2355,9 @@ struct ManualProviderRequest {
     base_url: Option<String>,
     api_key: Option<String>,
     clear_api_key: Option<bool>,
+    #[serde(default)]
+    auto_sync_models: bool,
+    model_sync_filter_regex: Option<String>,
     request_overrides: Vec<ProviderRequestOverride>,
 }
 
@@ -2844,6 +2886,8 @@ struct ConfiguredProviderSummary {
     enabled: bool,
     base_url: Option<String>,
     has_api_key: bool,
+    auto_sync_models: bool,
+    model_sync_filter_regex: Option<String>,
     request_overrides: Vec<ProviderRequestOverride>,
     warnings: Vec<String>,
 }

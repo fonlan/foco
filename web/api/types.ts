@@ -917,6 +917,8 @@ export type ConfiguredProviderSummary = {
   enabled: boolean;
   baseUrl: string | null;
   hasApiKey: boolean;
+  autoSyncModels: boolean;
+  modelSyncFilterRegex: string | null;
   requestOverrides: ProviderRequestOverride[];
   warnings: string[];
 };
@@ -931,6 +933,8 @@ export type ProviderFormState = {
   enabled: boolean;
   id: string;
   kind: string;
+  autoSyncModels: boolean;
+  modelSyncFilterRegex: string;
   name: string;
   requestOverrides: ProviderRequestOverrideFormState[];
   serviceId: string;

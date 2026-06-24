@@ -294,6 +294,8 @@ pub(crate) fn configured_provider_summary(
             .as_deref()
             .map(|value| !value.trim().is_empty())
             .unwrap_or(false),
+        auto_sync_models: provider.auto_sync_models,
+        model_sync_filter_regex: provider.model_sync_filter_regex.clone(),
         request_overrides: provider.request_overrides.clone(),
         warnings: provider_warnings(provider),
     }
