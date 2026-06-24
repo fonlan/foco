@@ -58,6 +58,7 @@ textarea,
 summary {
   letter-spacing: 0;
   -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
 button {
@@ -202,6 +203,7 @@ summary:focus-visible {
 
 .panel-scroll {
   scrollbar-gutter: stable;
+  overscroll-behavior: contain;
 }
 
 .panel-scroll::-webkit-scrollbar {
@@ -1713,6 +1715,7 @@ body,
   color: var(--foco-foreground);
   font-size: 1rem;
   font-weight: 700;
+  text-wrap: balance;
 }
 
 .workspace-file-reload-dialog p {
@@ -1807,6 +1810,7 @@ body,
 .message-list {
   background: var(--foco-canvas);
   padding: 1rem 1.5rem;
+  overscroll-behavior: contain;
 }
 
 .message-stack {
@@ -2160,6 +2164,7 @@ body,
   color: var(--foco-text);
   font-size: var(--foco-font-ui);
   font-weight: 650;
+  text-wrap: balance;
 }
 
 .context-empty-state p,
@@ -3932,6 +3937,7 @@ summary:focus-visible {
   background: var(--foco-panel);
   color: var(--foco-text);
   box-shadow: var(--foco-shadow-raised);
+  overscroll-behavior: contain;
 }
 
 .app-root .bg-stone-950\/35 {
