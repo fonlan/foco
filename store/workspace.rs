@@ -5462,6 +5462,29 @@ impl WorkspaceDatabase {
                             WHERE dependency.team_id = task.team_id
                               AND dependency.waiting_task_id = task.id
                        )
+                       AND NOT EXISTS (
+                            SELECT 1 FROM agent_tasks AS active_task
+                            WHERE active_task.owner_instance_id = task.owner_instance_id
+                              AND active_task.id <> task.id
+                              AND active_task.status IN ('running', 'waiting')
+                       )
+                       AND NOT EXISTS (
+                            SELECT 1
+                            FROM agent_tasks AS earlier_task
+                            JOIN agent_attempts AS earlier_attempt
+                              ON earlier_attempt.team_id = earlier_task.team_id
+                             AND earlier_attempt.task_id = earlier_task.id
+                            WHERE earlier_task.owner_instance_id = task.owner_instance_id
+                              AND earlier_task.status = 'interrupted'
+                              AND earlier_attempt.status = 'interrupted'
+                              AND earlier_attempt.interruption_reason = ?1
+                              AND earlier_task.sequence < task.sequence
+                              AND EXISTS (
+                                    SELECT 1 FROM agent_task_dependencies AS dependency
+                                    WHERE dependency.team_id = earlier_task.team_id
+                                      AND dependency.waiting_task_id = earlier_task.id
+                              )
+                       )
                      ORDER BY task.updated_at, task.team_id, task.owner_instance_id, task.sequence
                      LIMIT ?2",
                 )
