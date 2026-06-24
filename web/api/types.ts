@@ -221,6 +221,21 @@ export type ChatExtractedMemorySummary = {
   fact: string;
 };
 
+export type ChatSpecUpdateDiffLine = {
+  kind: "added" | "removed";
+  text: string;
+};
+
+export type ChatSpecUpdateSummary = {
+  id: string;
+  jobId: string;
+  baseRevision: number;
+  revision: number;
+  completedAt: string;
+  lines: ChatSpecUpdateDiffLine[];
+  truncated: boolean;
+};
+
 export type ChatToolLiveOutput = {
   stdout: string;
   stderr: string;
@@ -307,6 +322,7 @@ export type ChatMessageSummary = {
   metrics: ChatReplyMetrics | null;
   memoriesUsed: ChatMemoryUsedSummary[];
   extractedMemories: ChatExtractedMemorySummary[];
+  specUpdates: ChatSpecUpdateSummary[];
 };
 
 export type ChatMessagesChatSummary = {
@@ -1724,6 +1740,7 @@ export type ShellMessage = {
   metrics: ChatReplyMetrics | null;
   memoriesUsed: ChatMemoryUsedSummary[];
   extractedMemories: ChatExtractedMemorySummary[];
+  specUpdates: ChatSpecUpdateSummary[];
   runBadges?: ChatRunBadge[];
 };
 

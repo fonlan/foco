@@ -3506,6 +3506,7 @@ struct ChatMessageSummary {
     metrics: Option<ChatReplyMetrics>,
     memories_used: Vec<ChatMemoryUsedSummary>,
     extracted_memories: Vec<ChatExtractedMemorySummary>,
+    spec_updates: Vec<ChatSpecUpdateSummary>,
 }
 
 #[derive(Serialize)]
@@ -3582,6 +3583,32 @@ struct ChatExtractedMemorySummary {
     status: String,
     kind: String,
     fact: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatSpecUpdateSummary {
+    id: String,
+    job_id: String,
+    base_revision: u64,
+    revision: u64,
+    completed_at: String,
+    lines: Vec<ChatSpecUpdateDiffLine>,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatSpecUpdateDiffLine {
+    kind: ChatSpecUpdateDiffLineKind,
+    text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ChatSpecUpdateDiffLineKind {
+    Added,
+    Removed,
 }
 
 #[derive(Serialize)]
@@ -10265,6 +10292,165 @@ fn assistant_memories_used_from_metadata(
     })
 }
 
+fn assistant_spec_updates_from_metadata(
+    metadata_json: &str,
+) -> Result<Vec<ChatSpecUpdateSummary>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
+    let Some(spec_updates) = metadata.get("specUpdates") else {
+        return Ok(Vec::new());
+    };
+
+    if spec_updates.is_null() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_value::<Vec<ChatSpecUpdateSummary>>(spec_updates.clone()).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to parse assistant message metadata.specUpdates: {source}"
+        ))
+    })
+}
+
+const CHAT_SPEC_UPDATE_DIFF_LINE_LIMIT: usize = 120;
+
+pub(crate) fn append_assistant_spec_update_summary(
+    workspace_path: &Path,
+    assistant_message_id: &str,
+    summary: ChatSpecUpdateSummary,
+) -> Result<(), ApiError> {
+    if summary.lines.is_empty() {
+        return Ok(());
+    }
+
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let Some(message) = database
+        .message(assistant_message_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+
+    let metadata = parse_json_value(&message.metadata_json, "assistant message metadata")?;
+    let mut metadata = metadata
+        .as_object()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("assistant message metadata must be a JSON object"))?;
+    let mut spec_updates = metadata
+        .get("specUpdates")
+        .map(|value| serde_json::from_value::<Vec<ChatSpecUpdateSummary>>(value.clone()))
+        .transpose()
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to parse assistant message metadata.specUpdates: {source}"
+            ))
+        })?
+        .unwrap_or_default();
+    if let Some(existing) = spec_updates
+        .iter_mut()
+        .find(|update| update.id == summary.id)
+    {
+        *existing = summary;
+    } else {
+        spec_updates.push(summary);
+    }
+    metadata.insert("specUpdates".to_string(), json!(spec_updates));
+    let metadata_json = serde_json::to_string(&Value::Object(metadata)).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize assistant message metadata: {source}"
+        ))
+    })?;
+
+    database
+        .update_message_metadata(assistant_message_id, &metadata_json)
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
+pub(crate) fn chat_spec_update_summary(
+    job_id: &str,
+    base_revision: u64,
+    revision: u64,
+    completed_at: &str,
+    previous_markdown: &str,
+    next_markdown: &str,
+) -> ChatSpecUpdateSummary {
+    let (lines, truncated) = chat_spec_update_diff_lines(
+        previous_markdown,
+        next_markdown,
+        CHAT_SPEC_UPDATE_DIFF_LINE_LIMIT,
+    );
+    ChatSpecUpdateSummary {
+        id: format!("{job_id}-{revision}"),
+        job_id: job_id.to_string(),
+        base_revision,
+        revision,
+        completed_at: completed_at.to_string(),
+        lines,
+        truncated,
+    }
+}
+
+fn chat_spec_update_diff_lines(
+    previous_markdown: &str,
+    next_markdown: &str,
+    limit: usize,
+) -> (Vec<ChatSpecUpdateDiffLine>, bool) {
+    let old_lines = previous_markdown.lines().collect::<Vec<_>>();
+    let new_lines = next_markdown.lines().collect::<Vec<_>>();
+    let old_len = old_lines.len();
+    let new_len = new_lines.len();
+    let mut lcs = vec![vec![0usize; new_len + 1]; old_len + 1];
+
+    for old_index in (0..old_len).rev() {
+        for new_index in (0..new_len).rev() {
+            lcs[old_index][new_index] = if old_lines[old_index] == new_lines[new_index] {
+                lcs[old_index + 1][new_index + 1] + 1
+            } else {
+                lcs[old_index + 1][new_index].max(lcs[old_index][new_index + 1])
+            };
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut truncated = false;
+    let mut old_index = 0;
+    let mut new_index = 0;
+    while old_index < old_len || new_index < new_len {
+        if old_index < old_len
+            && new_index < new_len
+            && old_lines[old_index] == new_lines[new_index]
+        {
+            old_index += 1;
+            new_index += 1;
+        } else if new_index < new_len
+            && (old_index == old_len
+                || lcs[old_index][new_index + 1] >= lcs[old_index + 1][new_index])
+        {
+            if lines.len() >= limit {
+                truncated = true;
+                break;
+            }
+            lines.push(ChatSpecUpdateDiffLine {
+                kind: ChatSpecUpdateDiffLineKind::Added,
+                text: new_lines[new_index].to_string(),
+            });
+            new_index += 1;
+        } else if old_index < old_len {
+            if lines.len() >= limit {
+                truncated = true;
+                break;
+            }
+            lines.push(ChatSpecUpdateDiffLine {
+                kind: ChatSpecUpdateDiffLineKind::Removed,
+                text: old_lines[old_index].to_string(),
+            });
+            old_index += 1;
+        }
+    }
+
+    (lines, truncated)
+}
 fn assistant_parts_from_metadata(
     metadata_json: &str,
     tool_calls: &[ChatToolCallSummary],
@@ -11195,6 +11381,11 @@ fn chat_message_summaries_for_chat(
         let extracted_memories = extracted_memories_by_message
             .remove(&message.id)
             .unwrap_or_default();
+        let spec_updates = if is_assistant_message {
+            assistant_spec_updates_from_metadata(&message.metadata_json)?
+        } else {
+            Vec::new()
+        };
 
         summaries.push(ChatMessageSummary {
             id: message.id,
@@ -11209,6 +11400,7 @@ fn chat_message_summaries_for_chat(
             metrics,
             memories_used,
             extracted_memories,
+            spec_updates,
         });
     }
 

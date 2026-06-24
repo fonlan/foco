@@ -132,6 +132,7 @@ import type {
   ChatMessagesResponse,
   ChatReplyMetrics,
   ChatRunBadge,
+  ChatSpecUpdateSummary,
   ChatStatisticsResponse,
   ChatStreamEvent,
   ChatSummary,
@@ -2514,6 +2515,7 @@ export function App() {
         metrics: null,
         memoriesUsed: [],
         extractedMemories: [],
+        specUpdates: [],
       },
     ]);
   }
@@ -4493,6 +4495,7 @@ export function App() {
           metrics: null,
           memoriesUsed: [],
           extractedMemories: [],
+        specUpdates: [],
         },
       ]);
 
@@ -4580,6 +4583,7 @@ export function App() {
           metrics: null,
           memoriesUsed: [],
           extractedMemories: [],
+        specUpdates: [],
         },
       ]);
 
@@ -4993,6 +4997,7 @@ export function App() {
               metrics: null,
               memoriesUsed: [],
               extractedMemories: [],
+        specUpdates: [],
             },
           ]),
         {
@@ -5007,6 +5012,7 @@ export function App() {
           metrics: null,
           memoriesUsed: [],
           extractedMemories: [],
+        specUpdates: [],
         },
       ];
     });
@@ -5845,6 +5851,7 @@ export function App() {
         metrics: null,
         memoriesUsed: [],
         extractedMemories: [],
+        specUpdates: [],
         runBadges: [],
       };
 
@@ -5882,6 +5889,7 @@ export function App() {
           metrics: null,
           memoriesUsed: [],
           extractedMemories: [],
+        specUpdates: [],
         },
         assistantMessage,
       ];
@@ -23350,6 +23358,7 @@ function assistantMessageWithAppendedError(
     metrics: null,
     memoriesUsed: [],
     extractedMemories: [],
+        specUpdates: [],
     status: hasVisibleContent ? undefined : "error",
   };
 }
@@ -25617,6 +25626,75 @@ function parseChatExtractedMemorySummary(
     status,
   };
 }
+function parseChatSpecUpdates(value: unknown): ChatSpecUpdateSummary[] | false {
+  if (typeof value === "undefined" || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return false;
+  }
+
+  const updates = value.map(parseChatSpecUpdateSummary);
+  return updates.some((update) => update === null)
+    ? false
+    : (updates as ChatSpecUpdateSummary[]);
+}
+
+function parseChatSpecUpdateSummary(value: unknown): ChatSpecUpdateSummary | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const id = stringField(value, "id");
+  const jobId = stringField(value, "jobId", "job_id");
+  const baseRevision = fieldValue(value, "baseRevision", "base_revision");
+  const revision = fieldValue(value, "revision");
+  const completedAt = stringField(value, "completedAt", "completed_at");
+  const linesValue = fieldValue(value, "lines");
+  const truncated = fieldValue(value, "truncated");
+
+  if (
+    !id ||
+    !jobId ||
+    typeof baseRevision !== "number" ||
+    typeof revision !== "number" ||
+    !completedAt ||
+    !Array.isArray(linesValue) ||
+    typeof truncated !== "boolean"
+  ) {
+    return null;
+  }
+
+  const lines = linesValue.map(parseChatSpecUpdateDiffLine);
+  if (lines.some((line) => line === null)) {
+    return null;
+  }
+
+  return {
+    baseRevision,
+    completedAt,
+    id,
+    jobId,
+    lines: lines as ChatSpecUpdateSummary["lines"],
+    revision,
+    truncated,
+  };
+}
+
+function parseChatSpecUpdateDiffLine(
+  value: unknown,
+): ChatSpecUpdateSummary["lines"][number] | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+
+  const kind = stringField(value, "kind");
+  const text = stringField(value, "text");
+  if ((kind !== "added" && kind !== "removed") || text === null) {
+    return null;
+  }
+  return { kind, text };
+}
 
 function streamingAssistantMessage(
   id: string,
@@ -25634,6 +25712,7 @@ function streamingAssistantMessage(
     metrics: null,
     memoriesUsed,
     extractedMemories: [],
+        specUpdates: [],
     runBadges: [],
   };
 }
@@ -25686,6 +25765,12 @@ function normalizeChatMessageSummary(
   if (extractedMemories === false) {
     throw new Error("chat message extractedMemories are invalid");
   }
+  const specUpdates = parseChatSpecUpdates(
+    fieldValue(message, "specUpdates", "spec_updates"),
+  );
+  if (specUpdates === false) {
+    throw new Error("chat message specUpdates are invalid");
+  }
 
   const toolCalls = Array.isArray(message.toolCalls)
     ? message.toolCalls.map(normalizedToolCallSummary)
@@ -25707,6 +25792,7 @@ function normalizeChatMessageSummary(
     pendingMode,
     queuedRun,
     runBadges: [],
+    specUpdates,
     toolCalls,
     parts,
   };

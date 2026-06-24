@@ -39,6 +39,7 @@ import type {
   ChatMemoryUsedSummary,
   ChatMessagePart,
   ChatReplyMetrics,
+  ChatSpecUpdateSummary,
   ChatToolCallSummary,
   ChatToolLiveOutput,
   ComposerAttachment,
@@ -788,6 +789,9 @@ export function ChatPanel({
                           <ExtractedMemoriesBlock
                             memories={message.extractedMemories}
                           />
+                        ) : null}
+                        {!isUser ? (
+                          <SpecUpdatesBlock updates={message.specUpdates} />
                         ) : null}
                         {!isUser && message.metrics ? (
                           <ChatReplyMetricsLine helpers={helpers} metrics={message.metrics} />
@@ -1794,6 +1798,59 @@ function ExtractedMemoriesBlock({
             </div>
             <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-stone-700">
               {memory.fact}
+            </div>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
+  const { t } = useI18n();
+  if (!updates.length) {
+    return null;
+  }
+
+  const lineCount = updates.reduce((count, update) => count + update.lines.length, 0);
+
+  return (
+    <details className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-2 text-xs text-stone-600">
+      <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-stone-600 marker:hidden">
+        <FileText aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <span>{t("Spec updated")}</span>
+        <span className="rounded-full bg-white px-1.5 py-0.5 text-[10px] text-stone-500">
+          {lineCount}
+        </span>
+        <ChevronDown aria-hidden="true" className="ml-auto size-3.5 shrink-0" />
+      </summary>
+      <div className="mt-2 space-y-2">
+        {updates.map((update) => (
+          <div
+            className="min-w-0 overflow-hidden rounded-md border border-stone-100 bg-white"
+            key={update.id}
+          >
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 border-b border-stone-100 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-normal text-stone-400">
+              <span>
+                {t("Revision")} {update.baseRevision} -&gt; {update.revision}
+              </span>
+              {update.truncated ? <span>{t("Truncated")}</span> : null}
+            </div>
+            <div className="panel-scroll max-h-56 overflow-auto py-1 font-mono text-[11px] leading-5">
+              {update.lines.map((line, index) => (
+                <div
+                  className={`whitespace-pre-wrap break-words px-2.5 ${line.kind === "added"
+                    ? "bg-emerald-50 text-emerald-800"
+                    : "bg-rose-50 text-rose-800"
+                    }`}
+                  key={`${update.id}-${index}`}
+                >
+                  <span className="select-none pr-1 font-semibold">
+                    {line.kind === "added" ? "+" : "-"}
+                  </span>
+                  <span>{line.text}</span>
+                </div>
+              ))}
             </div>
           </div>
         ))}

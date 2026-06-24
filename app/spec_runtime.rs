@@ -573,6 +573,7 @@ pub(crate) fn apply_workspace_spec_job_output(
         }
     }
 
+    let previous_markdown = current.content_markdown;
     let Some(updated) = database
         .update_workspace_spec_generated_content(base_revision, content_markdown)
         .map_err(ApiError::from_workspace_error)?
@@ -591,9 +592,47 @@ pub(crate) fn apply_workspace_spec_job_output(
         .mark_workspace_spec_job_completed(job_id, Some(&output_json))
         .map_err(ApiError::from_workspace_error)?;
 
+    let Some(job) = database
+        .workspace_spec_job(job_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    if job.trigger_type == WorkspaceSpecTriggerType::ChatCompleted.as_str() {
+        let assistant_message_id = workspace_spec_update_assistant_message_id(&job)?;
+        let completed_at = job
+            .completed_at
+            .as_deref()
+            .unwrap_or(updated.updated_at.as_str());
+        let summary = crate::chat_spec_update_summary(
+            job_id,
+            base_revision,
+            updated.revision,
+            completed_at,
+            &previous_markdown,
+            content_markdown,
+        );
+        crate::append_assistant_spec_update_summary(
+            workspace_path,
+            &assistant_message_id,
+            summary,
+        )?;
+    }
+
     Ok(())
 }
 
+fn workspace_spec_update_assistant_message_id(
+    job: &WorkspaceSpecJobRecord,
+) -> Result<String, ApiError> {
+    let input: WorkspaceSpecUpdateInput =
+        serde_json::from_str(&job.input_summary_json).map_err(|source| {
+            ApiError::internal(format!(
+                "invalid persisted workspace spec update input: {source}"
+            ))
+        })?;
+    Ok(input.assistant_message_id)
+}
 fn collect_workspace_spec_input(
     config: &GlobalConfig,
     workspace_id: &str,
