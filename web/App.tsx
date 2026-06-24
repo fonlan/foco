@@ -1489,6 +1489,43 @@ export function App() {
     }
   }, []);
 
+  // ponytail: poll a queued spec job until it settles, then reload spec content.
+  // Ceiling: fixed backoff schedule (~165s total); upgrade path is an SSE/job push.
+  const pollWorkspaceSpecJobUntilSettled = useCallback(
+    async (workspaceId: string, jobId: string) => {
+      const attempts = [1000, 2000, 4000, 8000, 15000, 30000, 45000, 60000];
+      try {
+        for (const delayMs of attempts) {
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, delayMs);
+          });
+          if (activeWorkspaceIdRef.current !== workspaceId) {
+            return;
+          }
+          const jobsResponse = await requestJson<WorkspaceSpecJobsResponse>(
+            `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs?limit=24`,
+          );
+          const job = jobsResponse.jobs.find(
+            (candidate) => candidate.id === jobId,
+          );
+          if (!job) {
+            continue;
+          }
+          if (job.status === "queued" || job.status === "running") {
+            continue;
+          }
+          if (job.status === "completed" && activeWorkspaceIdRef.current === workspaceId) {
+            await loadWorkspaceSpec(workspaceId);
+          }
+          return;
+        }
+      } catch {
+        return;
+      }
+    },
+    [loadWorkspaceSpec],
+  );
+
   const saveWorkspaceSpecSettings = useCallback(
     async (
       workspaceId: string,
@@ -1574,6 +1611,7 @@ export function App() {
     if (!activeWorkspace?.id) {
       return false;
     }
+    const workspaceId = activeWorkspace.id;
 
     setWorkspaceSpecOperationKey("generate");
     setWorkspaceSpecError(null);
@@ -1581,7 +1619,7 @@ export function App() {
 
     try {
       const data = await requestJson<GenerateWorkspaceSpecResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/spec/generate`,
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/generate`,
         {
           body: JSON.stringify({ modelId: null }),
           headers: { "Content-Type": "application/json" },
@@ -1591,6 +1629,10 @@ export function App() {
       setWorkspaceSpec((current) =>
         current ? { ...current, latestJob: data.job } : current,
       );
+      // ponytail: poll the queued job to completion, then reload spec content so
+      // the panel updates without a manual refresh. Ceiling: fixed backoff
+      // schedule (~165s total); upgrade path is an SSE/job-event push.
+      void pollWorkspaceSpecJobUntilSettled(workspaceId, data.job.id);
       return true;
     } catch (requestError) {
       setWorkspaceSpecError(errorMessage(requestError));
@@ -1600,7 +1642,7 @@ export function App() {
         current === "generate" ? null : current,
       );
     }
-  }, [activeWorkspace?.id]);
+  }, [activeWorkspace?.id, pollWorkspaceSpecJobUntilSettled]);
 
   const forgetContextMemory = useCallback(
     async (memory: MemoryFactRecord) => {
