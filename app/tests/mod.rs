@@ -9249,7 +9249,7 @@ async fn prepare_prompt_context_rejects_memory_dream_transcript_chat() {
             .contains("memory Dream transcript chats are read-only")
     );
 
-    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&workspace_dir);
     remove_dir_if_exists(&profile_dir);
 }
 
@@ -10931,9 +10931,29 @@ fn workspace_ids(workspaces: &[WorkspaceConfig]) -> Vec<&str> {
 }
 
 fn remove_dir_if_exists(path: &Path) {
-    if path.exists() {
-        fs::remove_dir_all(path).expect("remove test directory");
+    if !path.exists() {
+        return;
     }
+
+    let mut last_error = None;
+    for attempt in 0..10 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if !path.exists() => return,
+            Err(error) => {
+                last_error = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1)));
+            }
+        }
+    }
+
+    panic!(
+        "remove test directory '{}': {}",
+        path.display(),
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    );
 }
 
 fn assert_strict_schema_object(tool_name: &str, schema: &Value) {

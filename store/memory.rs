@@ -1635,28 +1635,60 @@ impl MemoryDatabase {
         }
 
         let scope_filter = match scope {
-            MemoryDreamScope::Global => "scope = 'global'",
-            MemoryDreamScope::Workspace => "scope IN ('workspace', 'chat')",
+            MemoryDreamScope::Global => "f.scope = 'global'",
+            MemoryDreamScope::Workspace => "f.scope IN ('workspace', 'chat')",
         };
+        let now = now_timestamp();
         let sql = format!(
-            "SELECT id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
-                    expires_at, metadata_json, created_at, updated_at
-             FROM memory_facts
+            "WITH source_counts AS (
+                 SELECT fact_id, COUNT(*) AS source_count
+                 FROM memory_fact_sources
+                 GROUP BY fact_id
+             ), reference_counts AS (
+                 SELECT fact_id,
+                        SUM(CASE WHEN status = 'invalid' THEN 1 ELSE 0 END) AS invalid_count,
+                        SUM(CASE WHEN status = 'ambiguous' THEN 1 ELSE 0 END) AS ambiguous_count,
+                        SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_count
+                 FROM memory_references
+                 GROUP BY fact_id
+             )
+             SELECT f.id, f.scope, f.chat_id, f.status, f.kind, f.fact, f.confidence,
+                    f.pinned, f.is_latest, f.expires_at, f.metadata_json, f.created_at,
+                    f.updated_at
+             FROM memory_facts f
+             LEFT JOIN source_counts sc ON sc.fact_id = f.id
+             LEFT JOIN reference_counts rc ON rc.fact_id = f.id
              WHERE ({scope_filter})
-               AND status IN ('active', 'pending')
+               AND f.status IN ('active', 'pending')
              ORDER BY
-               CASE WHEN expires_at IS NOT NULL THEN 0 WHEN status = 'pending' THEN 1 ELSE 2 END,
-               pinned DESC,
-               updated_at DESC,
-               id ASC
-             LIMIT ?1"
+               CASE
+                 WHEN f.expires_at IS NOT NULL AND f.expires_at <= ?1 THEN 0
+                 WHEN f.status = 'pending'
+                      AND COALESCE(f.confidence, 0) >= 0.85
+                      AND COALESCE(sc.source_count, 0) > 0
+                      AND COALESCE(rc.invalid_count, 0) = 0
+                      AND COALESCE(rc.ambiguous_count, 0) = 0
+                      AND COALESCE(rc.skipped_count, 0) = 0 THEN 1
+                 WHEN COALESCE(rc.invalid_count, 0) > 0
+                      OR COALESCE(rc.ambiguous_count, 0) > 0
+                      OR COALESCE(rc.skipped_count, 0) > 0 THEN 2
+                 WHEN f.expires_at IS NOT NULL THEN 3
+                 WHEN f.status = 'pending' THEN 4
+                 ELSE 5
+               END,
+               f.pinned DESC,
+               COALESCE(sc.source_count, 0) DESC,
+               COALESCE(f.confidence, -1) DESC,
+               f.updated_at DESC,
+               f.id ASC
+             LIMIT ?2"
         );
         let mut statement = self
             .connection
             .prepare(&sql)
             .map_err(|source| sqlite_error(&self.database_path, source))?;
         let rows = statement
-            .query_map(params![limit], memory_fact_from_row)
+            .query_map(params![now, limit], memory_fact_from_row)
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
         collect_rows(rows, &self.database_path)
@@ -4159,6 +4191,99 @@ mod tests {
         assert!(!policy.allows_direct_expiration(MemoryKind::ProjectFact, true, true, false));
         assert!(!policy.allows_direct_expiration(MemoryKind::UserNote, false, false, true));
         assert!(policy.allows_direct_expiration(MemoryKind::UserNote, false, true, true));
+    }
+
+    #[test]
+    fn memory_dream_candidates_use_maintenance_buckets() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+
+        for (id, status, confidence) in [
+            ("fact-active", MemoryStatus::Active, Some(0.5)),
+            ("fact-pending", MemoryStatus::Pending, Some(0.4)),
+            ("fact-future-expiry", MemoryStatus::Active, Some(0.7)),
+            ("fact-reference-issue", MemoryStatus::Active, Some(0.6)),
+            ("fact-high-pending", MemoryStatus::Pending, Some(0.9)),
+            ("fact-due-expiry", MemoryStatus::Active, Some(0.8)),
+        ] {
+            let source_id = format!("{id}-source");
+            database
+                .insert_source(NewMemorySource {
+                    id: &source_id,
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    source_type: MemorySourceType::ManualNote,
+                    source_id: None,
+                    title: "Candidate source",
+                    content: id,
+                    metadata_json: "{}",
+                })
+                .expect("source insert");
+            database
+                .insert_fact(NewMemoryFact {
+                    id,
+                    scope: MemoryScope::Global,
+                    chat_id: None,
+                    status,
+                    kind: MemoryKind::Preference,
+                    fact: id,
+                    confidence,
+                    pinned: false,
+                    source_ids: &[source_id.as_str()],
+                    metadata_json: "{}",
+                })
+                .expect("fact insert");
+        }
+        database
+            .update_fact(UpdateMemoryFact {
+                id: "fact-due-expiry",
+                expires_at: Some("2000-01-01T00:00:00.000Z"),
+                ..UpdateMemoryFact::default()
+            })
+            .expect("due expiry");
+        database
+            .update_fact(UpdateMemoryFact {
+                id: "fact-future-expiry",
+                expires_at: Some("2999-01-01T00:00:00.000Z"),
+                ..UpdateMemoryFact::default()
+            })
+            .expect("future expiry");
+        database
+            .replace_fact_references(
+                "fact-reference-issue",
+                &[NewMemoryReference {
+                    id: "reference-invalid",
+                    fact_id: "fact-reference-issue",
+                    reference_type: MemoryReferenceType::FilePath,
+                    value: "missing.rs",
+                    normalized_value: "missing.rs",
+                    status: MemoryReferenceStatus::Invalid,
+                    metadata_json: r#"{"reason":"notFound"}"#,
+                    checked_at: Some("2026-06-23T00:00:00Z"),
+                }],
+            )
+            .expect("reference issue");
+
+        let candidates = database
+            .dream_candidate_facts(MemoryDreamScope::Global, None, 10)
+            .expect("candidate facts");
+        let ids = candidates
+            .iter()
+            .map(|fact| fact.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            vec![
+                "fact-due-expiry",
+                "fact-high-pending",
+                "fact-reference-issue",
+                "fact-future-expiry",
+                "fact-pending",
+                "fact-active",
+            ]
+        );
     }
 
     #[test]

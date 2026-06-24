@@ -34,6 +34,7 @@ use crate::*;
 // ponytail: no config surface yet; add a setting if users need a different pending TTL.
 const STALE_PENDING_DAYS: i64 = 30;
 const LOW_CONFIDENCE_PENDING_THRESHOLD: f64 = 0.5;
+const HIGH_CONFIDENCE_PENDING_THRESHOLD: f64 = 0.85;
 const MEMORY_DREAM_PLANNER_TOOL_NAME: &str = "submit_memory_dream_changeset";
 const MEMORY_DREAM_PLANNER_TIMEOUT_MS: u64 = 60_000;
 const MEMORY_DREAM_PLANNER_MAX_OUTPUT_TOKENS: u32 = 2048;
@@ -800,6 +801,18 @@ fn deterministic_changes(
         if changes.len() >= policy.max_changes_per_run {
             break;
         }
+        if fact.status == MemoryStatus::Pending.as_str()
+            && high_confidence_pending_is_promotable(database, fact, now)?
+            && changed_fact_ids.insert(fact.id.clone())
+        {
+            changes.push(DreamChange::ActivatePending { fact: fact.clone() });
+        }
+    }
+
+    for fact in candidates {
+        if changes.len() >= policy.max_changes_per_run {
+            break;
+        }
         if fact.status != MemoryStatus::Active.as_str() {
             continue;
         }
@@ -1386,6 +1399,8 @@ fn memory_dream_planner_input(
             })
         })
         .collect::<Vec<_>>();
+    let audit_hints_json =
+        memory_dream_audit_hints_json(candidates, candidate_references, deterministic_changes);
 
     Ok(json!({
         "job": {
@@ -1407,11 +1422,97 @@ fn memory_dream_planner_input(
             "rule": "Do not expire or reject a memory solely because one path reference is invalid."
         },
         "sourceSummaries": source_summaries,
+        "auditHints": audit_hints_json,
         "deterministicValidation": {
             "changesProposed": deterministic_json,
             "changesProposedCount": deterministic_changes.len(),
         }
     }))
+}
+
+fn memory_dream_audit_hints_json(
+    candidates: &[MemoryFactRecord],
+    candidate_references: &[MemoryReferenceRecord],
+    deterministic_changes: &[DreamChange],
+) -> Value {
+    let duplicate_groups = duplicate_fact_groups(candidates)
+        .into_values()
+        .take(20)
+        .map(|facts| {
+            let first = facts.first();
+            json!({
+                "factIds": facts.iter().map(|fact| fact.id.as_str()).collect::<Vec<_>>(),
+                "scope": first.map(|fact| fact.scope.as_str()),
+                "kind": first.map(|fact| fact.kind.as_str()),
+                "reason": "normalized duplicate text",
+            })
+        })
+        .collect::<Vec<_>>();
+    let pending_transitions = deterministic_changes
+        .iter()
+        .filter_map(|change| match change {
+            DreamChange::ActivatePending { fact } => Some(json!({
+                "operation": "activate",
+                "factId": &fact.id,
+                "confidence": fact.confidence,
+                "reason": change.reason(),
+            })),
+            DreamChange::RejectPending { fact } => Some(json!({
+                "operation": "reject",
+                "factId": &fact.id,
+                "confidence": fact.confidence,
+                "reason": change.reason(),
+            })),
+            _ => None,
+        })
+        .take(30)
+        .collect::<Vec<_>>();
+    let mut references_by_fact: BTreeMap<&str, Vec<&MemoryReferenceRecord>> = BTreeMap::new();
+    for reference in candidate_references.iter().filter(|reference| {
+        reference.status == MemoryReferenceStatus::Invalid.as_str()
+            || reference.status == MemoryReferenceStatus::Ambiguous.as_str()
+            || reference.status == MemoryReferenceStatus::Skipped.as_str()
+    }) {
+        references_by_fact
+            .entry(reference.fact_id.as_str())
+            .or_default()
+            .push(reference);
+    }
+    let reference_issues = references_by_fact
+        .into_iter()
+        .take(30)
+        .map(|(fact_id, references)| {
+            json!({
+                "factId": fact_id,
+                "references": references
+                    .into_iter()
+                    .take(5)
+                    .map(memory_reference_json)
+                    .collect::<Vec<_>>(),
+                "rule": "Do not expire or reject a fact solely because one reference is invalid.",
+            })
+        })
+        .collect::<Vec<_>>();
+    let update_chain_issues = deterministic_changes
+        .iter()
+        .filter_map(|change| match change {
+            DreamChange::RepairUpdatesChain { source, target } => Some(json!({
+                "sourceFactId": &source.id,
+                "targetFactId": &target.id,
+                "reason": change.reason(),
+            })),
+            _ => None,
+        })
+        .take(20)
+        .collect::<Vec<_>>();
+
+    json!({
+        "duplicateGroups": duplicate_groups,
+        "pendingTransitions": pending_transitions,
+        "referenceIssues": reference_issues,
+        "updateChainIssues": update_chain_issues,
+        "rule": "Audit hints are advisory; every proposed LLM change still needs explicit evidence from the provided records.",
+    })
 }
 
 async fn request_memory_dream_planner_output(
@@ -2035,6 +2136,40 @@ fn duplicate_rank(fact: &MemoryFactRecord) -> (bool, bool, i32, String, String) 
     )
 }
 
+fn high_confidence_pending_is_promotable(
+    database: &MemoryDatabase,
+    fact: &MemoryFactRecord,
+    now: DateTime<Utc>,
+) -> Result<bool, MemoryDatabaseError> {
+    if fact.status != MemoryStatus::Pending.as_str()
+        || fact.kind == MemoryKind::UserNote.as_str()
+        || fact.confidence.unwrap_or(0.0) < HIGH_CONFIDENCE_PENDING_THRESHOLD
+        || fact
+            .expires_at
+            .as_deref()
+            .is_some_and(|expires_at| timestamp_is_due(expires_at, now))
+    {
+        return Ok(false);
+    }
+
+    let sources = database.sources_for_fact(&fact.id)?;
+    if sources.is_empty()
+        || !sources.iter().any(|source| {
+            matches!(
+                source.source_type.as_str(),
+                "chat_message" | "tool_call" | "tool_result" | "context_snapshot" | "manual_note"
+            )
+        })
+    {
+        return Ok(false);
+    }
+
+    let references = database.references_for_fact_ids(std::slice::from_ref(&fact.id), 16)?;
+    Ok(references
+        .iter()
+        .all(|reference| reference.status == MemoryReferenceStatus::Valid.as_str()))
+}
+
 fn apply_deterministic_changes(
     database: &mut MemoryDatabase,
     job_id: &str,
@@ -2086,6 +2221,33 @@ fn apply_deterministic_change(
             "rejected stale low-confidence pending memory fact",
             policy,
         ),
+        DreamChange::ActivatePending { fact } => {
+            let current = current_unchanged_fact(database, fact, policy)?;
+            let updated = database.update_fact(UpdateMemoryFact {
+                id: &fact.id,
+                status: Some(MemoryStatus::Active),
+                is_latest: Some(true),
+                ..UpdateMemoryFact::default()
+            })?;
+            if !updated {
+                return Err(missing_fact(&fact.id));
+            }
+            let after = database
+                .fact(&fact.id)?
+                .ok_or_else(|| missing_fact(&fact.id))?;
+            insert_applied_change_with_reason(
+                database,
+                job_id,
+                change,
+                &current,
+                &after,
+                "activated high-confidence pending memory fact with supporting evidence",
+            )?;
+            Ok(AppliedChange {
+                scope: MemoryScope::parse(&after.scope)?,
+                chat_id: after.chat_id,
+            })
+        }
         DreamChange::RepairUpdatesChain { target, .. } => apply_status_change(
             database,
             job_id,
@@ -3332,6 +3494,9 @@ enum DreamChange {
         source: MemoryFactRecord,
         target: MemoryFactRecord,
     },
+    ActivatePending {
+        fact: MemoryFactRecord,
+    },
     RejectPending {
         fact: MemoryFactRecord,
     },
@@ -3343,6 +3508,7 @@ impl DreamChange {
             Self::Expire { .. } => "expire",
             Self::MergeDuplicate { .. } => "merge",
             Self::RepairUpdatesChain { .. } => "repair_updates_chain",
+            Self::ActivatePending { .. } => "activate",
             Self::RejectPending { .. } => "reject",
         }
     }
@@ -3352,13 +3518,20 @@ impl DreamChange {
             Self::Expire { .. } => "memory fact expires_at is due",
             Self::MergeDuplicate { .. } => "exact duplicate memory fact",
             Self::RepairUpdatesChain { .. } => "updates chain target should not be latest",
+            Self::ActivatePending { .. } => {
+                "high-confidence pending memory fact has supporting evidence"
+            }
             Self::RejectPending { .. } => "stale low-confidence pending memory fact",
         }
     }
 
     fn target_fact_ids(&self) -> Vec<&str> {
         match self {
-            Self::Expire { fact } | Self::RejectPending { fact } => vec![fact.id.as_str()],
+            Self::Expire { fact }
+            | Self::RejectPending { fact }
+            | Self::ActivatePending { fact } => {
+                vec![fact.id.as_str()]
+            }
             Self::MergeDuplicate { winner, loser } => vec![winner.id.as_str(), loser.id.as_str()],
             Self::RepairUpdatesChain { source, target } => {
                 vec![source.id.as_str(), target.id.as_str()]
@@ -3368,7 +3541,9 @@ impl DreamChange {
 
     fn primary_fact(&self) -> Option<&MemoryFactRecord> {
         match self {
-            Self::Expire { fact } | Self::RejectPending { fact } => Some(fact),
+            Self::Expire { fact }
+            | Self::RejectPending { fact }
+            | Self::ActivatePending { fact } => Some(fact),
             Self::MergeDuplicate { loser, .. } => Some(loser),
             Self::RepairUpdatesChain { target, .. } => Some(target),
         }
@@ -3395,6 +3570,13 @@ impl DreamChange {
                 {"sourceType": "memory_fact", "sourceId": target.id, "quote": target.fact}
             ]),
             Self::RejectPending { fact } => json!([{
+                "sourceType": "memory_fact",
+                "sourceId": fact.id,
+                "quote": fact.fact,
+                "confidence": fact.confidence,
+                "createdAt": fact.created_at,
+            }]),
+            Self::ActivatePending { fact } => json!([{
                 "sourceType": "memory_fact",
                 "sourceId": fact.id,
                 "quote": fact.fact,
@@ -3790,6 +3972,70 @@ mod tests {
                 .expect("changes");
 
         assert!(matches!(changes[0], DreamChange::RejectPending { .. }));
+    }
+
+    #[tokio::test]
+    async fn deterministic_dream_activates_high_confidence_pending_facts() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let workspace_dir = temp_dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace dir");
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let mut database =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        insert_test_fact(
+            &mut database,
+            "fact-pending-strong",
+            MemoryScope::Workspace,
+            None,
+            MemoryStatus::Pending,
+            MemoryKind::ProjectFact,
+            "The project uses Vitest for frontend tests.",
+            Some(0.92),
+        );
+
+        let result = run_memory_dream_job(&mut database, test_request(MemoryDreamScope::Workspace))
+            .await
+            .expect("dream run");
+
+        assert_eq!(result.applied_changes, 1);
+        let fact = database
+            .fact("fact-pending-strong")
+            .expect("fact")
+            .expect("fact exists");
+        assert_eq!(fact.status, "active");
+        assert!(fact.is_latest);
+        let changes = database
+            .dream_changes_for_job(&result.job.id, Some(MemoryDreamChangeStatus::Applied), 10)
+            .expect("changes");
+        assert_eq!(changes[0].operation, "activate");
+    }
+
+    #[test]
+    fn audit_hints_surface_reference_issues_and_pending_transitions() {
+        let mut pending = test_fact_record("fact-pending", MemoryScope::Workspace);
+        pending.status = MemoryStatus::Pending.as_str().to_string();
+        pending.confidence = Some(0.9);
+        let reference = MemoryReferenceRecord {
+            id: "reference-1".to_string(),
+            fact_id: "fact-pending".to_string(),
+            reference_type: MemoryReferenceType::FilePath.as_str().to_string(),
+            value: "missing.rs".to_string(),
+            normalized_value: "missing.rs".to_string(),
+            status: MemoryReferenceStatus::Invalid.as_str().to_string(),
+            metadata_json: r#"{"reason":"notFound"}"#.to_string(),
+            checked_at: Some("2026-06-23T00:00:00Z".to_string()),
+            created_at: "2026-06-23T00:00:00Z".to_string(),
+            updated_at: "2026-06-23T00:00:00Z".to_string(),
+        };
+        let hints = memory_dream_audit_hints_json(
+            &[pending.clone()],
+            &[reference],
+            &[DreamChange::ActivatePending { fact: pending }],
+        );
+
+        assert_eq!(hints["pendingTransitions"][0]["operation"], "activate");
+        assert_eq!(hints["referenceIssues"][0]["factId"], "fact-pending");
     }
 
     #[test]
