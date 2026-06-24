@@ -378,13 +378,14 @@ impl ProviderConnectionConfig {
     fn custom_endpoint(&self) -> Result<Option<Endpoint>, ProviderConfigError> {
         self.base_url
             .as_deref()
-            .map(normalized_base_url)
+            .map(|base_url| normalized_genai_endpoint_url(self.kind, base_url))
             .map(|result| result.map(Endpoint::from_owned))
             .transpose()
     }
 
     fn diagnostic_endpoint_url(&self) -> Result<String, ProviderConfigError> {
-        normalized_base_url(
+        normalized_genai_endpoint_url(
+            self.kind,
             self.base_url
                 .as_deref()
                 .unwrap_or_else(|| self.kind.default_base_url()),
@@ -744,6 +745,50 @@ pub fn normalized_base_url(value: &str) -> Result<String, ProviderConfigError> {
     }
 
     Ok(url.to_string())
+}
+
+fn normalized_genai_endpoint_url(
+    kind: ProviderKind,
+    value: &str,
+) -> Result<String, ProviderConfigError> {
+    let normalized = normalized_base_url(value)?;
+    if kind.adapter_kind() != AdapterKind::Anthropic {
+        return Ok(normalized);
+    }
+
+    append_v1_path_segment(&normalized, value)
+}
+
+fn append_v1_path_segment(
+    value: &str,
+    original_value: &str,
+) -> Result<String, ProviderConfigError> {
+    let mut url =
+        reqwest::Url::parse(value).map_err(|source| ProviderConfigError::InvalidBaseUrl {
+            value: original_value.to_string(),
+            source: source.to_string(),
+        })?;
+    let already_v1 = url
+        .path_segments()
+        .and_then(|segments| segments.filter(|segment| !segment.is_empty()).next_back())
+        == Some("v1");
+
+    if already_v1 {
+        return Ok(value.to_string());
+    }
+
+    {
+        let mut segments =
+            url.path_segments_mut()
+                .map_err(|_| ProviderConfigError::InvalidBaseUrl {
+                    value: original_value.to_string(),
+                    source: "base URL cannot be used as a path base".to_string(),
+                })?;
+        segments.pop_if_empty();
+        segments.push("v1");
+    }
+
+    normalized_base_url(url.as_str())
 }
 
 fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, ProviderConfigError> {
@@ -1416,6 +1461,42 @@ mod tests {
             normalized_base_url("https://api.openai.com/v1").expect("base url"),
             DEFAULT_OPENAI_BASE_URL
         );
+    }
+
+    #[test]
+    fn anthropic_custom_endpoint_adds_v1_for_genai() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(ANTHROPIC_KIND).expect("anthropic kind"),
+            base_url: Some("https://api.krill-ai.com/".to_string()),
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+        };
+
+        let endpoint = config
+            .custom_endpoint()
+            .expect("custom endpoint")
+            .expect("configured endpoint");
+
+        assert_eq!(endpoint.base_url(), "https://api.krill-ai.com/v1/");
+    }
+
+    #[test]
+    fn anthropic_custom_endpoint_keeps_existing_v1_for_genai() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(ANTHROPIC_KIND).expect("anthropic kind"),
+            base_url: Some("https://api.krill-ai.com/coding/v1/".to_string()),
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+        };
+
+        let endpoint = config
+            .custom_endpoint()
+            .expect("custom endpoint")
+            .expect("configured endpoint");
+
+        assert_eq!(endpoint.base_url(), "https://api.krill-ai.com/coding/v1/");
     }
 
     #[test]
