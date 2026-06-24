@@ -29,6 +29,8 @@ import {
   todoGraph,
   workspace,
   workspaceMemory,
+  workspaceSpec,
+  workspaceSpecQueuedJob,
 } from "./test-utils/app-test-harness";
 
 describe("app-panels-stats verification surfaces", () => {
@@ -131,6 +133,121 @@ describe("app-panels-stats verification surfaces", () => {
       expect(screen.queryByText("connected")).not.toBeInTheDocument();
     });
   }, 10000);
+
+  async function openSpecPanel() {
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Spec" }));
+    return screen.findByRole("heading", { name: "Project Spec" });
+  }
+
+  it("loads the Project Spec tab in the right panel", async () => {
+    await openSpecPanel();
+
+    expect(screen.getByLabelText("Project Spec Markdown")).toHaveValue(
+      workspaceSpec.contentMarkdown,
+    );
+    expect(screen.getAllByText(/Revision 3/).length).toBeGreaterThan(0);
+    expect(screen.getByText(/Latest job: Completed/)).toBeInTheDocument();
+  });
+
+  it("saves Project Spec settings from the right panel", async () => {
+    const fetchMock = vi.mocked(fetch);
+    appTestState.workspaceSpecResponse = {
+      ...workspaceSpec,
+      contentMarkdown: "",
+      revision: 0,
+      settings: { enabled: false, injectEnabled: false },
+    };
+
+    await openSpecPanel();
+
+    await userEvent.click(screen.getByRole("checkbox", { name: "Enable Project Spec" }));
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/spec/settings",
+      );
+      expect(call).toBeDefined();
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({
+        enabled: true,
+        injectEnabled: false,
+      });
+    });
+
+    await userEvent.click(screen.getByRole("checkbox", { name: "Inject into new chats" }));
+    await waitFor(() => {
+      const calls = fetchMock.mock.calls.filter(
+        ([url]) => url === "/api/workspaces/workspace-1/spec/settings",
+      );
+      expect(JSON.parse(String(calls.at(-1)?.[1]?.body))).toEqual({
+        enabled: true,
+        injectEnabled: true,
+      });
+    });
+  });
+
+  it("saves Project Spec Markdown with the current revision", async () => {
+    const fetchMock = vi.mocked(fetch);
+    await openSpecPanel();
+
+    changeInput(
+      screen.getByLabelText("Project Spec Markdown"),
+      "# Project Spec\n\n## Purpose\n\nUpdated from the right panel.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          url === "/api/workspaces/workspace-1/spec" && init?.method === "PUT",
+      );
+      expect(call).toBeDefined();
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({
+        contentMarkdown: "# Project Spec\n\n## Purpose\n\nUpdated from the right panel.",
+        expectedRevision: 3,
+      });
+    });
+    expect((await screen.findAllByText(/Revision 4/)).length).toBeGreaterThan(0);
+  });
+
+  it("queues Project Spec generation from the right panel", async () => {
+    const fetchMock = vi.mocked(fetch);
+    await openSpecPanel();
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh spec" }));
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/spec/generate",
+      );
+      expect(call).toBeDefined();
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({ modelId: null });
+    });
+    expect(await screen.findByText(new RegExp(workspaceSpecQueuedJob.id))).toBeInTheDocument();
+    expect(screen.getByText(/Latest job: Queued/)).toBeInTheDocument();
+  });
+
+  it("shows Project Spec save conflicts with a reload action", async () => {
+    appTestState.workspaceSpecSaveConflict = true;
+    await openSpecPanel();
+
+    changeInput(
+      screen.getByLabelText("Project Spec Markdown"),
+      "# Project Spec\n\n## Purpose\n\nConflicting edit.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(
+      await screen.findByText("workspace spec revision changed; reload and retry"),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getAllByRole("button", { name: "Reload spec" })[1]);
+    await waitFor(() => {
+      expect(screen.getByLabelText("Project Spec Markdown")).toHaveValue(
+        workspaceSpec.contentMarkdown,
+      );
+    });
+  });
 
   it("keeps workspace terminals mounted while switching workspaces", async () => {
     const fetchMock = vi.mocked(fetch);

@@ -104,6 +104,46 @@ export type WorkspaceFileChildrenResponse = {
   children: WorkspaceFileTreeNode[];
 };
 
+// Project Spec types
+
+export type WorkspaceSpecSettings = {
+  enabled: boolean;
+  injectEnabled: boolean;
+};
+
+export type WorkspaceSpecJobSummary = {
+  id: string;
+  triggerType: string;
+  status: string;
+  chatId: string | null;
+  runId: string | null;
+  modelId: string | null;
+  baseRevision: number | null;
+  inputSummary: JsonValue;
+  output: JsonValue | null;
+  errorMessage: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+};
+
+export type WorkspaceSpecResponse = {
+  settings: WorkspaceSpecSettings;
+  contentMarkdown: string;
+  revision: number;
+  generatedAt: string | null;
+  updatedAt: string | null;
+  latestJob: WorkspaceSpecJobSummary | null;
+};
+
+export type GenerateWorkspaceSpecResponse = {
+  job: WorkspaceSpecJobSummary;
+};
+
+export type WorkspaceSpecJobsResponse = {
+  jobs: WorkspaceSpecJobSummary[];
+};
+
 // JSON types
 
 export type JsonValue =

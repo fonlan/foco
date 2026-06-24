@@ -154,6 +154,7 @@ import type {
   EffectiveHookSummary,
   GeneralFormState,
   GeneralSettingsSummary,
+  GenerateWorkspaceSpecResponse,
   GitBranchesResponse,
   GitCommitMessageResponse,
   GitDiffLineStats,
@@ -248,6 +249,7 @@ import type {
   WorkspaceFileTreeNode,
   WorkspaceFormState,
   WorkspaceIconDraft,
+  WorkspaceSpecResponse,
   WorkspaceSummary,
   WorkspacesResponse,
 } from "./api/types";
@@ -322,7 +324,7 @@ import {
 import { ScheduledTasksPage } from "./features/scheduled-tasks/ScheduledTasksPage";
 
 type ViewMode = BrowserRoute["viewMode"];
-type ContextPanelTab = "todo" | "files" | "git" | "memory" | "stats" | "agents";
+type ContextPanelTab = "todo" | "files" | "git" | "memory" | "stats" | "agents" | "spec";
 type ProviderModelListState = {
   message: string | null;
   models: string[];
@@ -663,6 +665,15 @@ export function App() {
   );
   const [deletingContextMemoryId, setDeletingContextMemoryId] = useState<
     string | null
+  >(null);
+  const [workspaceSpec, setWorkspaceSpec] = useState<WorkspaceSpecResponse | null>(null);
+  const [workspaceSpecDraft, setWorkspaceSpecDraft] = useState("");
+  const [isLoadingWorkspaceSpec, setIsLoadingWorkspaceSpec] = useState(false);
+  const [workspaceSpecError, setWorkspaceSpecError] = useState<string | null>(null);
+  const [workspaceSpecConflictMessage, setWorkspaceSpecConflictMessage] = useState<string | null>(null);
+  const [workspaceSpecPreviewEnabled, setWorkspaceSpecPreviewEnabled] = useState(false);
+  const [workspaceSpecOperationKey, setWorkspaceSpecOperationKey] = useState<
+    "generate" | "save" | "settings" | null
   >(null);
   const [runningChatKeys, setRunningChatKeys] = useState<Set<string>>(
     () => new Set(),
@@ -1434,6 +1445,147 @@ export function App() {
     }
   }, [contextMemoryPages]);
 
+  const loadWorkspaceSpec = useCallback(async (workspaceId: string) => {
+    setIsLoadingWorkspaceSpec(true);
+    setWorkspaceSpecError(null);
+    setWorkspaceSpecConflictMessage(null);
+
+    try {
+      const data = await requestJson<WorkspaceSpecResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/spec`,
+      );
+      if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+        return null;
+      }
+      setWorkspaceSpec(data);
+      setWorkspaceSpecDraft(data.contentMarkdown);
+      return data;
+    } catch (requestError) {
+      setWorkspaceSpec(null);
+      setWorkspaceSpecDraft("");
+      setWorkspaceSpecError(errorMessage(requestError));
+      return null;
+    } finally {
+      setIsLoadingWorkspaceSpec(false);
+    }
+  }, []);
+
+  const saveWorkspaceSpecSettings = useCallback(
+    async (
+      workspaceId: string,
+      enabled: boolean,
+      injectEnabled: boolean,
+    ) => {
+      const hasUnsavedDraft =
+        workspaceSpec !== null &&
+        workspaceSpecDraft !== workspaceSpec.contentMarkdown;
+      setWorkspaceSpecOperationKey("settings");
+      setWorkspaceSpecError(null);
+      setWorkspaceSpecConflictMessage(null);
+
+      try {
+        const data = await requestJson<WorkspaceSpecResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/settings`,
+          {
+            body: JSON.stringify({ enabled, injectEnabled }),
+            headers: { "Content-Type": "application/json" },
+            method: "PUT",
+          },
+        );
+        setWorkspaceSpec(data);
+        if (!hasUnsavedDraft) {
+          setWorkspaceSpecDraft(data.contentMarkdown);
+        }
+        return true;
+      } catch (requestError) {
+        setWorkspaceSpecError(errorMessage(requestError));
+        return false;
+      } finally {
+        setWorkspaceSpecOperationKey((current) =>
+          current === "settings" ? null : current,
+        );
+      }
+    },
+    [workspaceSpec, workspaceSpecDraft],
+  );
+
+  const saveWorkspaceSpecContent = useCallback(async () => {
+    if (!activeWorkspace?.id || !workspaceSpec) {
+      return false;
+    }
+
+    setWorkspaceSpecOperationKey("save");
+    setWorkspaceSpecError(null);
+    setWorkspaceSpecConflictMessage(null);
+
+    try {
+      const response = await fetch(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/spec`,
+        {
+          body: JSON.stringify({
+            contentMarkdown: workspaceSpecDraft,
+            expectedRevision: workspaceSpec.revision,
+          }),
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          method: "PUT",
+        },
+      );
+      if (response.status === 409) {
+        setWorkspaceSpecConflictMessage(await responseErrorMessage(response));
+        return false;
+      }
+      if (!response.ok) {
+        throw new Error(await responseErrorMessage(response));
+      }
+
+      const data = (await response.json()) as WorkspaceSpecResponse;
+      setWorkspaceSpec(data);
+      setWorkspaceSpecDraft(data.contentMarkdown);
+      return true;
+    } catch (requestError) {
+      setWorkspaceSpecError(errorMessage(requestError));
+      return false;
+    } finally {
+      setWorkspaceSpecOperationKey((current) =>
+        current === "save" ? null : current,
+      );
+    }
+  }, [activeWorkspace?.id, workspaceSpec, workspaceSpecDraft]);
+
+  const generateWorkspaceSpec = useCallback(async () => {
+    if (!activeWorkspace?.id) {
+      return false;
+    }
+
+    setWorkspaceSpecOperationKey("generate");
+    setWorkspaceSpecError(null);
+    setWorkspaceSpecConflictMessage(null);
+
+    try {
+      const data = await requestJson<GenerateWorkspaceSpecResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/spec/generate`,
+        {
+          body: JSON.stringify({ modelId: null }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      setWorkspaceSpec((current) =>
+        current ? { ...current, latestJob: data.job } : current,
+      );
+      return true;
+    } catch (requestError) {
+      setWorkspaceSpecError(errorMessage(requestError));
+      return false;
+    } finally {
+      setWorkspaceSpecOperationKey((current) =>
+        current === "generate" ? null : current,
+      );
+    }
+  }, [activeWorkspace?.id]);
+
   const forgetContextMemory = useCallback(
     async (memory: MemoryFactRecord) => {
       if (!activeWorkspace?.id) {
@@ -1723,10 +1875,25 @@ export function App() {
   }, [activeWorkspace?.id, contextPanelTab, loadContextMemories]);
 
   useEffect(() => {
+    if (contextPanelTab !== "spec" || !activeWorkspace?.id) {
+      return;
+    }
+
+    void loadWorkspaceSpec(activeWorkspace.id);
+  }, [activeWorkspace?.id, contextPanelTab, loadWorkspaceSpec]);
+
+  useEffect(() => {
     setContextMemoryPages({
       global: { page: 1, pageSize: 10 },
       workspace: { page: 1, pageSize: 10 },
     });
+  }, [activeWorkspace?.id]);
+
+  useEffect(() => {
+    setWorkspaceSpec(null);
+    setWorkspaceSpecDraft("");
+    setWorkspaceSpecError(null);
+    setWorkspaceSpecConflictMessage(null);
   }, [activeWorkspace?.id]);
 
   useEffect(() => {
@@ -7489,6 +7656,7 @@ export function App() {
                     isLoadingDiff={isLoadingDiff}
                     isLoadingContextMemories={isLoadingContextMemories}
                     isLoadingTodoGraph={isLoadingTodoGraph}
+                    isLoadingWorkspaceSpec={isLoadingWorkspaceSpec}
                     isLoadingWorkspaceFiles={isLoadingWorkspaceFiles}
                     onGitCommit={handleGitCommit}
                     onGenerateGitCommitMessage={() => void handleGenerateGitCommitMessage()}
@@ -7522,6 +7690,24 @@ export function App() {
                     }}
                     onForgetContextMemory={(memory) => void forgetContextMemory(memory)}
                     onMemoryPageChange={goToContextMemoryPage}
+                    onReloadWorkspaceSpec={() => {
+                      if (activeWorkspace?.id) {
+                        void loadWorkspaceSpec(activeWorkspace.id);
+                      }
+                    }}
+                    onSaveWorkspaceSpec={() => void saveWorkspaceSpecContent()}
+                    onGenerateWorkspaceSpec={() => void generateWorkspaceSpec()}
+                    onWorkspaceSpecContentChange={setWorkspaceSpecDraft}
+                    onWorkspaceSpecPreviewChange={setWorkspaceSpecPreviewEnabled}
+                    onWorkspaceSpecSettingsChange={(enabled, injectEnabled) => {
+                      if (activeWorkspace?.id) {
+                        void saveWorkspaceSpecSettings(
+                          activeWorkspace.id,
+                          enabled,
+                          injectEnabled,
+                        );
+                      }
+                    }}
                     onSelectDiffFile={setSelectedDiffPath}
                     onTabChange={(tab) => {
                       setContextPanelTab(tab);
@@ -7529,6 +7715,12 @@ export function App() {
                     }}
                     selectedPath={selectedDiffPath}
                     todoGraph={todoGraph}
+                    workspaceSpec={workspaceSpec}
+                    workspaceSpecConflictMessage={workspaceSpecConflictMessage}
+                    workspaceSpecDraft={workspaceSpecDraft}
+                    workspaceSpecError={workspaceSpecError}
+                    workspaceSpecOperationKey={workspaceSpecOperationKey}
+                    workspaceSpecPreviewEnabled={workspaceSpecPreviewEnabled}
                     workspaceFiles={workspaceFiles}
                     workspaceFileOperationKey={workspaceFileOperationKey}
                     workspaceFilesError={workspaceFilesError}
@@ -9842,23 +10034,36 @@ function ContextPanel({
   loadingWorkspaceDirectoryPaths,
   isLoadingDiff,
   isLoadingTodoGraph,
+  isLoadingWorkspaceSpec,
   isLoadingWorkspaceFiles,
   onForgetContextMemory,
   onGenerateGitCommitMessage,
+  onGenerateWorkspaceSpec,
   onGitCommit,
   onGitCommitMessageChange,
   onGitFileOperation,
   onMemoryPageChange,
+  onReloadWorkspaceSpec,
   onRefreshDiff,
   onRefreshWorkspaceFiles,
+  onSaveWorkspaceSpec,
   onToggleFileTreePath,
   onOpenWorkspaceFile,
   onOpenWorkspaceFileMenu,
   onSelectDiffFile,
   onTabChange,
+  onWorkspaceSpecContentChange,
+  onWorkspaceSpecPreviewChange,
+  onWorkspaceSpecSettingsChange,
   selectedPath,
   todoGraph,
   todoGraphError,
+  workspaceSpec,
+  workspaceSpecConflictMessage,
+  workspaceSpecDraft,
+  workspaceSpecError,
+  workspaceSpecOperationKey,
+  workspaceSpecPreviewEnabled,
   workspaceFiles,
   workspaceFileOperationKey,
   workspaceFilesError,
@@ -9882,23 +10087,36 @@ function ContextPanel({
   loadingWorkspaceDirectoryPaths: Set<string>;
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
+  isLoadingWorkspaceSpec: boolean;
   isLoadingWorkspaceFiles: boolean;
   onForgetContextMemory: (memory: MemoryFactRecord) => void;
   onGenerateGitCommitMessage: () => void;
+  onGenerateWorkspaceSpec: () => void;
   onGitCommit: (event: FormEvent<HTMLFormElement>) => void;
   onGitCommitMessageChange: (message: string) => void;
   onGitFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
+  onReloadWorkspaceSpec: () => void;
   onRefreshDiff: () => void;
   onRefreshWorkspaceFiles: () => void;
+  onSaveWorkspaceSpec: () => void;
   onToggleFileTreePath: (node: WorkspaceFileTreeNode) => void | Promise<void>;
   onOpenWorkspaceFile: (node: WorkspaceFileTreeNode) => void;
   onOpenWorkspaceFileMenu: (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => void;
   onSelectDiffFile: (path: string | null) => void;
   onTabChange: (tab: ContextPanelTab) => void;
+  onWorkspaceSpecContentChange: (content: string) => void;
+  onWorkspaceSpecPreviewChange: (enabled: boolean) => void;
+  onWorkspaceSpecSettingsChange: (enabled: boolean, injectEnabled: boolean) => void;
   selectedPath: string | null;
   todoGraph: TodoGraphResponse | null;
   todoGraphError: string | null;
+  workspaceSpec: WorkspaceSpecResponse | null;
+  workspaceSpecConflictMessage: string | null;
+  workspaceSpecDraft: string;
+  workspaceSpecError: string | null;
+  workspaceSpecOperationKey: "generate" | "save" | "settings" | null;
+  workspaceSpecPreviewEnabled: boolean;
   workspaceFiles: WorkspaceFilesResponse | null;
   workspaceFileOperationKey: string | null;
   workspaceFilesError: string | null;
@@ -9910,6 +10128,7 @@ function ContextPanel({
     { id: "git", label: "Git", icon: GitCompare },
     { id: "agents", label: "Agents", icon: Bot },
     { id: "memory", label: "Memory", icon: Brain },
+    { id: "spec", label: "Spec", icon: ScrollText },
     { id: "stats", label: "Stats", icon: BarChart3 },
   ];
 
@@ -9990,6 +10209,24 @@ function ContextPanel({
             memories={contextMemories}
             onForgetMemory={onForgetContextMemory}
             onPageChange={onMemoryPageChange}
+          />
+        ) : null}
+
+        {activeTab === "spec" ? (
+          <ContextSpecTab
+            conflictMessage={workspaceSpecConflictMessage}
+            contentDraft={workspaceSpecDraft}
+            error={workspaceSpecError}
+            isLoading={isLoadingWorkspaceSpec}
+            onContentChange={onWorkspaceSpecContentChange}
+            onGenerate={onGenerateWorkspaceSpec}
+            onPreviewChange={onWorkspaceSpecPreviewChange}
+            onReload={onReloadWorkspaceSpec}
+            onSave={onSaveWorkspaceSpec}
+            onSettingsChange={onWorkspaceSpecSettingsChange}
+            operationKey={workspaceSpecOperationKey}
+            previewEnabled={workspaceSpecPreviewEnabled}
+            spec={workspaceSpec}
           />
         ) : null}
 
@@ -10883,6 +11120,224 @@ function ContextMemoryGroup({
       ) : (
         <div className="context-empty-inline">{emptyLabel}</div>
       )}
+    </div>
+  );
+}
+
+function ContextSpecTab({
+  conflictMessage,
+  contentDraft,
+  error,
+  isLoading,
+  onContentChange,
+  onGenerate,
+  onPreviewChange,
+  onReload,
+  onSave,
+  onSettingsChange,
+  operationKey,
+  previewEnabled,
+  spec,
+}: {
+  conflictMessage: string | null;
+  contentDraft: string;
+  error: string | null;
+  isLoading: boolean;
+  onContentChange: (content: string) => void;
+  onGenerate: () => void;
+  onPreviewChange: (enabled: boolean) => void;
+  onReload: () => void;
+  onSave: () => void;
+  onSettingsChange: (enabled: boolean, injectEnabled: boolean) => void;
+  operationKey: "generate" | "save" | "settings" | null;
+  previewEnabled: boolean;
+  spec: WorkspaceSpecResponse | null;
+}) {
+  const { language, t } = useI18n();
+  const enabled = spec?.settings.enabled ?? false;
+  const injectEnabled = spec?.settings.injectEnabled ?? false;
+  const isDirty = spec !== null && contentDraft !== spec.contentMarkdown;
+  const isBusy = operationKey !== null;
+  const latestJob = spec?.latestJob ?? null;
+  const canEdit = enabled && spec !== null;
+  const generateLabel = contentDraft.trim()
+    ? t("Refresh spec")
+    : t("Generate spec");
+
+  if (isLoading && !spec) {
+    return (
+      <div className="context-empty-state">
+        <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+        <h2>{t("Project Spec")}</h2>
+        <p>{t("Loading...")}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full min-h-0 min-w-0 flex-col bg-[#f8f8f8]">
+      <div className="flex min-h-[var(--foco-header-height)] items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
+            <ScrollText aria-hidden="true" className="size-4" />
+          </span>
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold">{t("Project Spec")}</h2>
+            <p className="truncate text-xs font-medium text-stone-500">
+              {spec
+                ? `${t("Revision")} ${formatNumber(spec.revision, language)}`
+                : t("Workspace spec")}
+            </p>
+          </div>
+        </div>
+        <button
+          aria-label={t("Reload spec")}
+          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-stone-600 hover:bg-stone-200/80 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-400"
+          disabled={isLoading}
+          onClick={onReload}
+          title={t("Reload spec")}
+          type="button"
+        >
+          <RefreshCw aria-hidden="true" className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
+        </button>
+      </div>
+
+      <div className="panel-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-3 py-3">
+        {error ? (
+          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+            {error}
+          </div>
+        ) : null}
+
+        <div className="grid gap-2 rounded-md border border-stone-200 bg-white px-3 py-3">
+          <label className="flex min-w-0 items-center justify-between gap-3 text-sm font-medium text-stone-800">
+            <span>{t("Enable Project Spec")}</span>
+            <input
+              checked={enabled}
+              disabled={isBusy || isLoading}
+              onChange={(event) =>
+                onSettingsChange(
+                  event.target.checked,
+                  event.target.checked ? injectEnabled : false,
+                )
+              }
+              type="checkbox"
+            />
+          </label>
+          <label className="flex min-w-0 items-center justify-between gap-3 text-sm font-medium text-stone-800">
+            <span>{t("Inject into new chats")}</span>
+            <input
+              checked={enabled && injectEnabled}
+              disabled={!enabled || isBusy || isLoading}
+              onChange={(event) => onSettingsChange(enabled, event.target.checked)}
+              type="checkbox"
+            />
+          </label>
+        </div>
+
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <button
+            className="inline-flex min-h-9 items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:text-stone-500"
+            disabled={!enabled || isBusy || isLoading}
+            onClick={onGenerate}
+            type="button"
+          >
+            {operationKey === "generate" ? (
+              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+            ) : (
+              <Sparkles aria-hidden="true" className="size-4" />
+            )}
+            {generateLabel}
+          </button>
+          <button
+            className="inline-flex min-h-9 items-center justify-center gap-2 rounded-md border border-stone-200 bg-white px-3 py-2 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+            disabled={!canEdit || !isDirty || isBusy || isLoading}
+            onClick={onSave}
+            type="button"
+          >
+            {operationKey === "save" ? (
+              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+            ) : (
+              <Save aria-hidden="true" className="size-4" />
+            )}
+            {t("Save")}
+          </button>
+          <button
+            aria-pressed={previewEnabled}
+            className="inline-flex min-h-9 items-center justify-center gap-2 rounded-md border border-stone-200 bg-white px-3 py-2 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+            onClick={() => onPreviewChange(!previewEnabled)}
+            type="button"
+          >
+            {previewEnabled ? (
+              <EyeOff aria-hidden="true" className="size-4" />
+            ) : (
+              <Eye aria-hidden="true" className="size-4" />
+            )}
+            {previewEnabled ? t("Edit markdown") : t("Preview markdown")}
+          </button>
+        </div>
+
+        {conflictMessage ? (
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+            <div>{conflictMessage}</div>
+            <button
+              className="mt-2 inline-flex items-center gap-2 rounded-md border border-amber-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100"
+              onClick={onReload}
+              type="button"
+            >
+              <RefreshCw aria-hidden="true" className="size-3.5" />
+              {t("Reload spec")}
+            </button>
+          </div>
+        ) : null}
+
+        <div className="min-h-0 flex-1">
+          {previewEnabled ? (
+            <div className="min-h-[20rem] rounded-md border border-stone-200 bg-white px-4 py-3">
+              {contentDraft.trim() ? (
+                <MarkdownContent
+                  content={contentDraft}
+                  isUser={false}
+                  selectedSkillPrefix={selectedSkillPrefix}
+                />
+              ) : (
+                <div className="context-empty-inline">{t("No spec content")}</div>
+              )}
+            </div>
+          ) : (
+            <textarea
+              aria-label={t("Project Spec Markdown")}
+              className="min-h-[20rem] w-full resize-y rounded-md border border-stone-300 bg-white px-3 py-2 font-mono text-[13px] leading-5 text-stone-900 shadow-inner outline-none placeholder:text-stone-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
+              disabled={!canEdit || isLoading}
+              onChange={(event) => onContentChange(event.target.value)}
+              placeholder={t("Generate or paste a Project Spec Markdown document.")}
+              value={contentDraft}
+            />
+          )}
+        </div>
+
+        <div className="rounded-md border border-stone-200 bg-white px-3 py-2 text-xs leading-5 text-stone-600">
+          {spec ? (
+            <>
+              <div>
+                {t("Revision")} {formatNumber(spec.revision, language)}
+                {spec.updatedAt ? ` · ${t("Updated")} ${formatTodoGraphDate(spec.updatedAt, language)}` : ""}
+                {spec.generatedAt ? ` · ${t("Generated")} ${formatTodoGraphDate(spec.generatedAt, language)}` : ""}
+              </div>
+              <div>
+                {latestJob
+                  ? `${t("Latest job")}: ${t(workspaceSpecJobStatusLabel(latestJob.status))} · ${t(workspaceSpecTriggerLabel(latestJob.triggerType))} · ${latestJob.id}`
+                  : t("No spec jobs")}
+              </div>
+              {latestJob?.errorMessage ? (
+                <div className="break-words text-rose-700">{latestJob.errorMessage}</div>
+              ) : null}
+            </>
+          ) : (
+            t("No spec loaded")
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -23844,6 +24299,36 @@ function jsonChildPath(path: string, segment: string | number) {
 
 function jsonContainerSummary(kind: "array" | "object", count: number) {
   return kind === "array" ? `... ${count} items ` : `... ${count} keys `;
+}
+
+function workspaceSpecJobStatusLabel(status: string) {
+  switch (status) {
+    case "queued":
+      return "Queued";
+    case "running":
+      return "Running";
+    case "completed":
+      return "Completed";
+    case "skipped":
+      return "Skipped";
+    case "failed":
+      return "Failed";
+    default:
+      return status;
+  }
+}
+
+function workspaceSpecTriggerLabel(triggerType: string) {
+  switch (triggerType) {
+    case "manual_initial":
+      return "Manual initial";
+    case "manual_refresh":
+      return "Manual refresh";
+    case "chat_completed":
+      return "Chat completed";
+    default:
+      return triggerType;
+  }
 }
 
 function formatAuditDate(value: string, language: AppLanguageId = "en") {

@@ -1,6 +1,8 @@
 import { fireEvent, render, type RenderOptions } from "@testing-library/react";
 import { vi } from "vitest";
 
+import type { WorkspaceSpecJobSummary, WorkspaceSpecResponse } from "../api/types";
+
 export const mermaidMock = {
   initialize: vi.fn(),
   render: vi.fn(async () => ({
@@ -637,6 +639,48 @@ export const memoryDreamChange = {
   status: "applied",
   targetFactIds: ["memory-active-1"],
 };
+
+export const workspaceSpecJob: WorkspaceSpecJobSummary = {
+  baseRevision: 3,
+  chatId: null,
+  completedAt: "2026-06-11T03:01:00Z",
+  createdAt: "2026-06-11T03:00:00Z",
+  errorMessage: null,
+  id: "workspace-spec-job-1",
+  inputSummary: {},
+  modelId: "gpt-test",
+  output: null,
+  runId: null,
+  startedAt: "2026-06-11T03:00:10Z",
+  status: "completed",
+  triggerType: "manual_refresh",
+};
+
+export const workspaceSpecQueuedJob: WorkspaceSpecJobSummary = {
+  ...workspaceSpecJob,
+  completedAt: null,
+  createdAt: "2026-06-11T03:05:00Z",
+  id: "workspace-spec-job-queued",
+  startedAt: null,
+  status: "queued",
+};
+
+export const workspaceSpec: WorkspaceSpecResponse = {
+  contentMarkdown:
+    "# Project Spec\n\n## Purpose\n\nDescribe the current workspace.",
+  generatedAt: "2026-06-11T03:01:00Z",
+  latestJob: workspaceSpecJob,
+  revision: 3,
+  settings: {
+    enabled: true,
+    injectEnabled: true,
+  },
+  updatedAt: "2026-06-11T03:01:00Z",
+};
+
+function clonedWorkspaceSpec(): WorkspaceSpecResponse {
+  return JSON.parse(JSON.stringify(workspaceSpec)) as WorkspaceSpecResponse;
+}
 
 export const aiStatistics = {
   page: 1,
@@ -1515,6 +1559,8 @@ export const appTestState: {
   chatQueueCounter: number;
   scheduledTaskRunsByTaskId: Record<string, ScheduledTaskRunFixture[]>;
   scheduledTasksResponse: typeof scheduledTasks;
+  workspaceSpecResponse: typeof workspaceSpec;
+  workspaceSpecSaveConflict: boolean;
   workspaceGitDiffResponse: typeof gitDiff;
   workspaceResponseWorkspaces: unknown[];
 } = {
@@ -1525,6 +1571,8 @@ export const appTestState: {
   chatQueueCounter: 0,
   scheduledTaskRunsByTaskId,
   scheduledTasksResponse: scheduledTasks,
+  workspaceSpecResponse: clonedWorkspaceSpec(),
+  workspaceSpecSaveConflict: false,
   workspaceGitDiffResponse: gitDiff,
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
 };
@@ -1594,6 +1642,8 @@ export function resetAppTestEnvironment() {
     "scheduled-task-1": [...scheduledTaskRunsByTaskId["scheduled-task-1"]],
   };
   appTestState.scheduledTasksResponse = scheduledTasks;
+  appTestState.workspaceSpecResponse = clonedWorkspaceSpec();
+  appTestState.workspaceSpecSaveConflict = false;
   appTestState.workspaceGitDiffResponse = gitDiff;
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
   window.history.replaceState(null, "", "/");
@@ -2018,6 +2068,56 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     path === "/api/workspaces/workspace-1/agent-tasks/agent-task-1/action"
   ) {
     return jsonResponse(agentTeamSnapshot);
+  }
+
+  if (path === "/api/workspaces/workspace-1/spec") {
+    if (init?.method === "PUT") {
+      if (appTestState.workspaceSpecSaveConflict) {
+        return jsonResponse(
+          { error: "workspace spec revision changed; reload and retry" },
+          { status: 409 },
+        );
+      }
+      const body = JSON.parse(String(init.body ?? "{}")) as {
+        contentMarkdown: string;
+        expectedRevision: number;
+      };
+      appTestState.workspaceSpecResponse = {
+        ...appTestState.workspaceSpecResponse,
+        contentMarkdown: body.contentMarkdown,
+        latestJob: appTestState.workspaceSpecResponse.latestJob,
+        revision: body.expectedRevision + 1,
+        updatedAt: "2026-06-11T03:10:00Z",
+      };
+    }
+    return jsonResponse(appTestState.workspaceSpecResponse);
+  }
+
+  if (path === "/api/workspaces/workspace-1/spec/settings") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      enabled: boolean;
+      injectEnabled: boolean;
+    };
+    appTestState.workspaceSpecResponse = {
+      ...appTestState.workspaceSpecResponse,
+      settings: {
+        enabled: body.enabled,
+        injectEnabled: body.injectEnabled,
+      },
+    };
+    return jsonResponse(appTestState.workspaceSpecResponse);
+  }
+
+  if (path === "/api/workspaces/workspace-1/spec/generate") {
+    appTestState.workspaceSpecResponse = {
+      ...appTestState.workspaceSpecResponse,
+      latestJob: workspaceSpecQueuedJob,
+    };
+    return jsonResponse({ job: workspaceSpecQueuedJob });
+  }
+
+  if (path === "/api/workspaces/workspace-1/spec/jobs") {
+    return jsonResponse({ jobs: [appTestState.workspaceSpecResponse.latestJob] });
   }
 
   if (path === "/api/settings/general") {
