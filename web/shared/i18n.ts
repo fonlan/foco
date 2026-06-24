@@ -645,6 +645,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Clear filtered chat memories": "清空当前筛选的会话记忆",
     "Clear filtered memories confirmation": "确定要清空当前筛选范围内的记忆吗？",
     "Memory pagination": "记忆分页",
+    "Dream history pagination": "Dream 历史分页",
     "Memory scope": "记忆范围",
     "Memory status": "记忆状态",
     "Search memories": "搜索记忆",

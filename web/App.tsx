@@ -508,6 +508,8 @@ type AiStatsColumn = {
 
 const LIVE_REASONING_DURATION_REFRESH_MS = 250;
 const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
+const MEMORY_DREAM_DEFAULT_PAGE_SIZE = 10;
+const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
 
 type ComposerDefaultSelection = {
   modelId: string;
@@ -11720,6 +11722,10 @@ function SettingsPanel({
   const [memoryDreamJobs, setMemoryDreamJobs] = useState<MemoryDreamJobSummary[]>(
     [],
   );
+  const [memoryDreamPage, setMemoryDreamPage] = useState(1);
+  const [memoryDreamPageSize, setMemoryDreamPageSize] = useState(
+    MEMORY_DREAM_DEFAULT_PAGE_SIZE,
+  );
   const [memoryDreamChanges, setMemoryDreamChanges] = useState<
     MemoryDreamChangeSummary[]
   >([]);
@@ -11881,6 +11887,30 @@ function SettingsPanel({
       ),
     [memoryDreamJobs],
   );
+  const memoryDreamTotalPages = sortedMemoryDreamJobs.length
+    ? Math.ceil(sortedMemoryDreamJobs.length / memoryDreamPageSize)
+    : 0;
+  const currentMemoryDreamPage =
+    memoryDreamTotalPages === 0
+      ? 1
+      : Math.min(memoryDreamPage, memoryDreamTotalPages);
+  const paginatedMemoryDreamJobs = sortedMemoryDreamJobs.slice(
+    (currentMemoryDreamPage - 1) * memoryDreamPageSize,
+    currentMemoryDreamPage * memoryDreamPageSize,
+  );
+  const memoryDreamPaginationItems = auditPaginationItems(
+    currentMemoryDreamPage,
+    memoryDreamTotalPages,
+  );
+  const memoryDreamPageStart = paginatedMemoryDreamJobs.length
+    ? (currentMemoryDreamPage - 1) * memoryDreamPageSize + 1
+    : 0;
+  const memoryDreamPageEnd = paginatedMemoryDreamJobs.length
+    ? Math.min(
+      sortedMemoryDreamJobs.length,
+      memoryDreamPageStart + paginatedMemoryDreamJobs.length - 1,
+    )
+    : 0;
   const memoryDreamDetailJob =
     sortedMemoryDreamJobs.find((job) => job.id === memoryDreamDetailJobId) ??
     null;
@@ -13233,6 +13263,21 @@ function SettingsPanel({
       ...patch,
       page: 1,
     }));
+  }
+
+  function goToMemoryDreamPage(page: number) {
+    const maxPage = memoryDreamTotalPages || 1;
+    setMemoryDreamPage(Math.min(Math.max(1, page), maxPage));
+  }
+
+  function updateMemoryDreamPageSize(value: string) {
+    setMemoryDreamPage(1);
+    setMemoryDreamPageSize((current) =>
+      Math.min(
+        MEMORY_DREAM_MAX_PAGE_SIZE,
+        positiveIntegerText(value, current),
+      ),
+    );
   }
 
   function goToMemoryPage(page: number) {
@@ -16624,7 +16669,7 @@ function SettingsPanel({
                           </td>
                         </tr>
                       ) : (
-                        sortedMemoryDreamJobs.map((job) => {
+                        paginatedMemoryDreamJobs.map((job) => {
                           const transcriptWorkspaceId =
                             job.transcriptWorkspaceId ?? job.workspaceId;
                           const scopeLabel =
@@ -16720,6 +16765,91 @@ function SettingsPanel({
                       )}
                     </tbody>
                   </table>
+                </div>
+
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 pt-3 text-sm">
+                  <div className="text-stone-500">
+                    {t("Showing {start}-{end} of {total}", {
+                      end: formatNumber(memoryDreamPageEnd, language),
+                      start: formatNumber(memoryDreamPageStart, language),
+                      total: formatNumber(sortedMemoryDreamJobs.length, language),
+                    })}
+                  </div>
+                  <div className="flex flex-wrap items-center justify-end gap-3">
+                    <label className="flex items-center gap-2 text-xs font-semibold text-stone-500">
+                      <span>{t("Page size")}</span>
+                      <input
+                        className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        max={MEMORY_DREAM_MAX_PAGE_SIZE}
+                        min={1}
+                        onChange={(event) => updateMemoryDreamPageSize(event.target.value)}
+                        type="number"
+                        value={memoryDreamPageSize}
+                      />
+                    </label>
+                    <nav
+                      aria-label={t("Dream history pagination")}
+                      className="flex items-center gap-1"
+                    >
+                      <button
+                        aria-label={t("Previous page")}
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        disabled={isLoadingMemoryDreamJobs || currentMemoryDreamPage <= 1}
+                        onClick={() => goToMemoryDreamPage(currentMemoryDreamPage - 1)}
+                        title={t("Previous page")}
+                        type="button"
+                      >
+                        <ChevronLeft aria-hidden="true" className="size-4" />
+                      </button>
+                      {memoryDreamPaginationItems.map((item, index) =>
+                        item === "ellipsis" ? (
+                          <span
+                            aria-hidden="true"
+                            className="inline-flex size-9 items-center justify-center text-stone-400"
+                            key={`memory-dream-ellipsis-${index}`}
+                          >
+                            ...
+                          </span>
+                        ) : (
+                          <button
+                            aria-current={
+                              item === currentMemoryDreamPage ? "page" : undefined
+                            }
+                            aria-label={t("Go to page {page}", {
+                              page: formatNumber(item, language),
+                            })}
+                            className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === currentMemoryDreamPage
+                                ? "border-teal-700 bg-teal-700 text-white"
+                                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                              }`}
+                            disabled={isLoadingMemoryDreamJobs}
+                            key={item}
+                            onClick={() => goToMemoryDreamPage(item)}
+                            title={t("Go to page {page}", {
+                              page: formatNumber(item, language),
+                            })}
+                            type="button"
+                          >
+                            {formatNumber(item, language)}
+                          </button>
+                        ),
+                      )}
+                      <button
+                        aria-label={t("Next page")}
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        disabled={
+                          isLoadingMemoryDreamJobs ||
+                          memoryDreamTotalPages === 0 ||
+                          currentMemoryDreamPage >= memoryDreamTotalPages
+                        }
+                        onClick={() => goToMemoryDreamPage(currentMemoryDreamPage + 1)}
+                        title={t("Next page")}
+                        type="button"
+                      >
+                        <ChevronRight aria-hidden="true" className="size-4" />
+                      </button>
+                    </nav>
+                  </div>
                 </div>
 
                 {memoryDreamDetailJob ? (
