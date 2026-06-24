@@ -2948,6 +2948,21 @@ body,
   font-size: var(--foco-font-compact);
 }
 
+.message-composer-control-row .composer-select-popover .panel-scroll button,
+.message-composer-control-row .composer-select-popover .composer-model-provider-summary {
+  /* ponytail: 显式 alpha=0 基础色，使 hover 过渡只在 alpha 0→1 间插值，
+     避免从 transparent(=透明黑) 过渡到不透明色时穿过黑色产生脏色中间帧。 */
+  background-color: rgba(245, 245, 244, 0);
+  transition: background-color 180ms ease, color 180ms ease;
+}
+
+/* stone-50(#fafaf9) 在白色 popover 上对比度极低；用 stone-100(#f5f5f4) 提升可见度。
+   选择器特异性高于 Tailwind hover:bg-stone-50 单类，确保覆盖。 */
+.message-composer-control-row .composer-select-popover .panel-scroll button:not(:disabled):hover,
+.message-composer-control-row .composer-select-popover .composer-model-provider-summary:hover {
+  background-color: rgba(245, 245, 244, 1);
+}
+
 .composer-model-select,
 .composer-provider-select {
   width: 9.25rem;
