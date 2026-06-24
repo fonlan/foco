@@ -748,7 +748,8 @@ fn workspace_spec_provider_request(
     })?;
     let system_prompt = workspace_spec_system_prompt(
         spec_settings.generation_system_prompt.as_deref(),
-        default_workspace_spec_generation_system_prompt(app_language),
+        default_workspace_spec_generation_system_prompt(),
+        app_language,
     );
 
     Ok(NeutralChatRequest {
@@ -782,7 +783,8 @@ fn workspace_spec_update_provider_request(
     })?;
     let system_prompt = workspace_spec_system_prompt(
         spec_settings.update_system_prompt.as_deref(),
-        default_workspace_spec_update_system_prompt(app_language),
+        default_workspace_spec_update_system_prompt(),
+        app_language,
     );
 
     Ok(NeutralChatRequest {
@@ -844,40 +846,50 @@ fn workspace_spec_update_tool_definition() -> NeutralToolDefinition {
     }
 }
 
-pub(crate) fn default_workspace_spec_generation_system_prompt(app_language: &str) -> String {
+pub(crate) fn default_workspace_spec_generation_system_prompt() -> String {
     format!(
         "Generate a concise Project Spec Markdown document from provided evidence. \
 Use exactly these sections: # Project Spec, ## Purpose, ## Product Surface, ## Architecture, ## Data And Persistence, ## Runtime Flows, ## UI Contracts, ## Agent And Tool Contracts, ## Operational Constraints, ## Open Questions. \
-Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Put unknowns under Open Questions. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. {} Use the submit_workspace_spec tool exactly once.",
-        workspace_spec_language_instruction(app_language)
+Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Put unknowns under Open Questions. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec tool exactly once."
     )
 }
 
-pub(crate) fn default_workspace_spec_update_system_prompt(app_language: &str) -> String {
+pub(crate) fn default_workspace_spec_update_system_prompt() -> String {
     format!(
         "Decide whether the Project Spec needs an update after the latest completed chat turn. \
 If the turn did not change durable product behavior, architecture, runtime flows, data contracts, commands, settings, or operational constraints, submit updateNeeded=false and contentMarkdown=null. \
-If an update is needed, submit a full replacement Project Spec Markdown document using the existing section shape. Preserve accurate existing facts unless the turn supersedes them. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. {} Use the submit_workspace_spec_update tool exactly once.",
+If an update is needed, submit a full replacement Project Spec Markdown document using the existing section shape. Preserve accurate existing facts unless the turn supersedes them. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec_update tool exactly once."
+    )
+}
+
+fn workspace_spec_system_prompt(
+    custom: Option<&str>,
+    default_prompt: String,
+    app_language: &str,
+) -> String {
+    let prompt = custom
+        .and_then(non_empty_trimmed)
+        .map(str::to_string)
+        .unwrap_or(default_prompt);
+    format!(
+        "{}\n\n{}",
+        prompt.trim_end(),
         workspace_spec_language_instruction(app_language)
     )
 }
 
-fn workspace_spec_system_prompt(custom: Option<&str>, default_prompt: String) -> String {
-    custom
-        .and_then(non_empty_trimmed)
-        .map(str::to_string)
-        .unwrap_or(default_prompt)
+fn workspace_spec_language_instruction(app_language: &str) -> String {
+    format!(
+        "Language preference: follow the current Foco app language setting ({app_language}); write Project Spec prose in {}. Preserve code identifiers, file paths, commands, API names, and proper nouns when translation would reduce accuracy.",
+        workspace_spec_language_name(app_language)
+    )
 }
 
 // ponytail: local mapping is enough for the two supported app languages; extend with SUPPORTED_APP_LANGUAGES.
-fn workspace_spec_language_instruction(app_language: &str) -> &'static str {
+fn workspace_spec_language_name(app_language: &str) -> &'static str {
     match app_language {
-        "zh-CN" => {
-            "Write the generated Project Spec in Simplified Chinese. Preserve code identifiers, file paths, commands, API names, and proper nouns when translation would reduce accuracy."
-        }
-        _ => {
-            "Write the generated Project Spec in English. Preserve code identifiers, file paths, commands, API names, and proper nouns when translation would reduce accuracy."
-        }
+        "zh-CN" => "Simplified Chinese",
+        _ => "English",
     }
 }
 
@@ -1152,4 +1164,45 @@ fn compact_text(value: &str, max_chars: usize) -> (String, bool) {
 fn non_empty_trimmed(value: &str) -> Option<&str> {
     let value = value.trim();
     (!value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_spec_update_prompt_appends_current_language_to_custom_prompt() {
+        let settings = SpecSettings {
+            update_system_prompt: Some(
+                "Custom update prompt. Use the submit_workspace_spec_update tool exactly once."
+                    .to_string(),
+            ),
+            ..SpecSettings::default()
+        };
+        let input = WorkspaceSpecUpdateInput {
+            workspace_id: "workspace-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            current_spec_revision: 1,
+            user_message_id: "user-1".to_string(),
+            assistant_message_id: "assistant-1".to_string(),
+            run_id: "run-1".to_string(),
+            code_change_stats: Some(CodeChangeStats::default()),
+            chat_excerpt: WorkspaceSpecChatExcerptInput {
+                user: "Update the scheduler.".to_string(),
+                user_truncated: false,
+                assistant: "Scheduler updated.".to_string(),
+                assistant_truncated: false,
+            },
+            current_spec_markdown: "# Project Spec\n\nExisting spec.".to_string(),
+        };
+
+        let request =
+            workspace_spec_update_provider_request("model", "zh-CN", &settings, 1_024, &input)
+                .expect("workspace spec update request");
+        let system_prompt = &request.messages[0].content;
+
+        assert!(system_prompt.contains("Custom update prompt."));
+        assert!(system_prompt.contains("current Foco app language setting (zh-CN)"));
+        assert!(system_prompt.contains("write Project Spec prose in Simplified Chinese"));
+    }
 }

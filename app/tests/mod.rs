@@ -7306,10 +7306,12 @@ fn workspace_spec_runtime_uses_configured_generation_model_and_prompt() {
             .expect("prepared job");
 
     assert_eq!(prepared.request.model_id, "model");
-    assert_eq!(
-        prepared.request.messages[0].content,
+    let system_prompt = &prepared.request.messages[0].content;
+    assert!(system_prompt.contains(
         "Custom spec generation prompt. Use the submit_workspace_spec tool exactly once."
-    );
+    ));
+    assert!(system_prompt.contains("current Foco app language setting (en)"));
+    assert!(system_prompt.contains("write Project Spec prose in English"));
 }
 
 #[test]

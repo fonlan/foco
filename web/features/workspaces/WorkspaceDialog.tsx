@@ -1,4 +1,4 @@
-import { FolderPlus, FolderSearch, LoaderCircle, Trash2, Upload, X } from "lucide-react";
+import { FolderPlus, FolderSearch, LoaderCircle, ScrollText, Trash2, Upload, X } from "lucide-react";
 import { ChangeEvent as ReactChangeEvent, FormEvent } from "react";
 
 import type { WorkspaceIconDraft } from "../../api/types";
@@ -18,8 +18,10 @@ export function WorkspaceDialog({
   onNameChange,
   onPathChange,
   onSelectPath,
+  onSpecEnabledChange,
   onSubmit,
   path,
+  specEnabled,
 }: {
   canUseNativePicker: boolean;
   iconDraft: WorkspaceIconDraft | null;
@@ -33,8 +35,10 @@ export function WorkspaceDialog({
   onNameChange: (value: string) => void;
   onPathChange: (value: string) => void;
   onSelectPath: () => void;
+  onSpecEnabledChange: (enabled: boolean) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   path: string;
+  specEnabled: boolean;
 }) {
   const { language, t } = useI18n();
   const title = t("Add workspace");
@@ -126,6 +130,22 @@ export function WorkspaceDialog({
               </button>
             </div>
           </label>
+          <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+            <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-stone-700">
+              <ScrollText
+                aria-hidden="true"
+                className="size-4 shrink-0 text-teal-700"
+              />
+              <span className="truncate">{t("Enable Project Spec")}</span>
+            </span>
+            <input
+              checked={specEnabled}
+              className="size-4 accent-teal-700"
+              disabled={isSaving}
+              onChange={(event) => onSpecEnabledChange(event.target.checked)}
+              type="checkbox"
+            />
+          </label>
           <div className="rounded-lg border border-stone-200 bg-stone-50/80 p-3">
             <div className="mb-3 flex items-center justify-between gap-3">
               <div className="flex min-w-0 items-center gap-2">
@@ -207,4 +227,3 @@ export function WorkspaceDialog({
     </div>
   );
 }
-

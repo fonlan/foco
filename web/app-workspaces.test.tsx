@@ -26,6 +26,7 @@ import {
   todoGraph,
   workspace,
   workspaceMemory,
+  workspaceSpec,
 } from "./test-utils/app-test-harness";
 
 describe("app-workspaces verification surfaces", () => {
@@ -433,6 +434,9 @@ describe("app-workspaces verification surfaces", () => {
       expect(within(dialog).getByText("workspace-logo.png")).toBeInTheDocument();
     });
 
+    await userEvent.click(
+      within(dialog).getByRole("checkbox", { name: "Enable Project Spec" }),
+    );
     await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
 
     await waitFor(() => {
@@ -444,6 +448,16 @@ describe("app-workspaces verification surfaces", () => {
         contentBase64: expect.any(String),
         name: "NewWorkspace",
         path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+      });
+      const specSettingsCall = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          url === "/api/workspaces/new-workspace/spec/settings" &&
+          init?.method === "PUT",
+      );
+      expect(specSettingsCall).toBeDefined();
+      expect(JSON.parse(String(specSettingsCall?.[1]?.body))).toEqual({
+        enabled: true,
+        injectEnabled: false,
       });
     });
 
@@ -486,6 +500,42 @@ describe("app-workspaces verification surfaces", () => {
         "/api/workspaces/workspace-1/logo",
         expect.objectContaining({ method: "DELETE" }),
       );
+    });
+  });
+
+  it("saves Project Spec enablement from workspace settings", async () => {
+    const fetchMock = vi.mocked(fetch);
+    appTestState.workspaceSpecResponse = {
+      ...workspaceSpec,
+      settings: { enabled: false, injectEnabled: false },
+    };
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Workspaces" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit workspace Default" }),
+    );
+
+    const specCheckbox = await screen.findByRole("checkbox", {
+      name: "Enable Project Spec",
+    });
+    await waitFor(() => expect(specCheckbox).toBeEnabled());
+    expect(specCheckbox).not.toBeChecked();
+    await userEvent.click(specCheckbox);
+    await userEvent.click(screen.getByRole("button", { name: "Save workspace" }));
+
+    await waitFor(() => {
+      const specSettingsCall = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          url === "/api/workspaces/workspace-1/spec/settings" &&
+          init?.method === "PUT",
+      );
+      expect(specSettingsCall).toBeDefined();
+      expect(JSON.parse(String(specSettingsCall?.[1]?.body))).toEqual({
+        enabled: true,
+        injectEnabled: false,
+      });
     });
   });
 

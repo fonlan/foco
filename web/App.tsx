@@ -340,6 +340,21 @@ type WorkspaceChatContextMenuState = {
 
 const OPENAI_RESPONSES_PROVIDER_KIND = "openai-responses";
 
+function saveWorkspaceSpecSettingsRequest(
+  workspaceId: string,
+  enabled: boolean,
+  injectEnabled: boolean,
+) {
+  return requestJson<WorkspaceSpecResponse>(
+    `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/settings`,
+    {
+      body: JSON.stringify({ enabled, injectEnabled }),
+      headers: { "Content-Type": "application/json" },
+      method: "PUT",
+    },
+  );
+}
+
 type ProviderServicePreset = {
   id: string;
   label: string;
@@ -549,6 +564,7 @@ export function App() {
   const [workspaceDialogRevision, setWorkspaceDialogRevision] = useState(0);
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
+  const [workspaceSpecEnabled, setWorkspaceSpecEnabled] = useState(false);
   const [workspaceIconDraft, setWorkspaceIconDraft] =
     useState<WorkspaceIconDraft | null>(null);
   const workspaceIconInputRef = useRef<HTMLInputElement | null>(null);
@@ -1485,13 +1501,10 @@ export function App() {
       setWorkspaceSpecConflictMessage(null);
 
       try {
-        const data = await requestJson<WorkspaceSpecResponse>(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/settings`,
-          {
-            body: JSON.stringify({ enabled, injectEnabled }),
-            headers: { "Content-Type": "application/json" },
-            method: "PUT",
-          },
+        const data = await saveWorkspaceSpecSettingsRequest(
+          workspaceId,
+          enabled,
+          injectEnabled,
         );
         setWorkspaceSpec(data);
         if (!hasUnsavedDraft) {
@@ -2275,8 +2288,16 @@ export function App() {
         viewMode: "chat",
         workspaceId: createdWorkspace?.id ?? data.activeWorkspaceId,
       });
+      if (workspaceSpecEnabled && createdWorkspace?.id) {
+        try {
+          await saveWorkspaceSpecSettingsRequest(createdWorkspace.id, true, false);
+        } catch (specError) {
+          setError(errorMessage(specError));
+        }
+      }
       setWorkspaceName("");
       setWorkspacePath("");
+      setWorkspaceSpecEnabled(false);
       closeWorkspaceDialog();
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -7746,8 +7767,10 @@ export function App() {
             onNameChange={setWorkspaceName}
             onPathChange={setWorkspacePath}
             onSelectPath={handleSelectWorkspacePath}
+            onSpecEnabledChange={setWorkspaceSpecEnabled}
             onSubmit={handleWorkspaceSubmit}
             path={workspacePath}
+            specEnabled={workspaceSpecEnabled}
           />
         ) : null}
         {isBranchDialogOpen ? (
@@ -11203,44 +11226,19 @@ function ContextSpecTab({
         </button>
       </div>
 
-      <div className="panel-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-3 py-3">
+      <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden px-3 py-3">
         {error ? (
           <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
             {error}
           </div>
         ) : null}
 
-        <div className="grid gap-2 rounded-md border border-stone-200 bg-white px-3 py-3">
-          <label className="flex min-w-0 items-center justify-between gap-3 text-sm font-medium text-stone-800">
-            <span>{t("Enable Project Spec")}</span>
-            <input
-              checked={enabled}
-              disabled={isBusy || isLoading}
-              onChange={(event) =>
-                onSettingsChange(
-                  event.target.checked,
-                  event.target.checked ? injectEnabled : false,
-                )
-              }
-              type="checkbox"
-            />
-          </label>
-          <label className="flex min-w-0 items-center justify-between gap-3 text-sm font-medium text-stone-800">
-            <span>{t("Inject into new chats")}</span>
-            <input
-              checked={enabled && injectEnabled}
-              disabled={!enabled || isBusy || isLoading}
-              onChange={(event) => onSettingsChange(enabled, event.target.checked)}
-              type="checkbox"
-            />
-          </label>
-        </div>
-
-        <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_2.25rem_2.25rem_2.25rem] items-center gap-2">
           <button
-            className="inline-flex min-h-9 items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:text-stone-500"
+            className="inline-flex min-h-9 min-w-0 items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-teal-900/45 disabled:text-white/70"
             disabled={!enabled || isBusy || isLoading}
             onClick={onGenerate}
+            title={generateLabel}
             type="button"
           >
             {operationKey === "generate" ? (
@@ -11248,12 +11246,14 @@ function ContextSpecTab({
             ) : (
               <Sparkles aria-hidden="true" className="size-4" />
             )}
-            {generateLabel}
+            <span className="truncate">{generateLabel}</span>
           </button>
           <button
-            className="inline-flex min-h-9 items-center justify-center gap-2 rounded-md border border-stone-200 bg-white px-3 py-2 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+            aria-label={t("Save")}
+            className="inline-flex size-9 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
             disabled={!canEdit || !isDirty || isBusy || isLoading}
             onClick={onSave}
+            title={t("Save")}
             type="button"
           >
             {operationKey === "save" ? (
@@ -11261,12 +11261,16 @@ function ContextSpecTab({
             ) : (
               <Save aria-hidden="true" className="size-4" />
             )}
-            {t("Save")}
           </button>
           <button
+            aria-label={previewEnabled ? t("Edit markdown") : t("Preview markdown")}
             aria-pressed={previewEnabled}
-            className="inline-flex min-h-9 items-center justify-center gap-2 rounded-md border border-stone-200 bg-white px-3 py-2 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+            className={`inline-flex size-9 items-center justify-center rounded-md border shadow-sm ${previewEnabled
+                ? "border-teal-300 bg-teal-700 text-white hover:bg-teal-800"
+                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+              }`}
             onClick={() => onPreviewChange(!previewEnabled)}
+            title={previewEnabled ? t("Edit markdown") : t("Preview markdown")}
             type="button"
           >
             {previewEnabled ? (
@@ -11274,7 +11278,24 @@ function ContextSpecTab({
             ) : (
               <Eye aria-hidden="true" className="size-4" />
             )}
-            {previewEnabled ? t("Edit markdown") : t("Preview markdown")}
+          </button>
+          <button
+            aria-label={t("Inject into new chats")}
+            aria-pressed={injectEnabled}
+            className={`inline-flex size-9 items-center justify-center rounded-md border shadow-sm disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400 ${injectEnabled
+                ? "border-teal-300 bg-teal-700 text-white hover:bg-teal-800"
+                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+              }`}
+            disabled={!enabled || isBusy || isLoading}
+            onClick={() => onSettingsChange(enabled, !injectEnabled)}
+            title={t("Inject into new chats")}
+            type="button"
+          >
+            {operationKey === "settings" ? (
+              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+            ) : (
+              <MessageSquare aria-hidden="true" className="size-4" />
+            )}
           </button>
         </div>
 
@@ -11294,7 +11315,7 @@ function ContextSpecTab({
 
         <div className="min-h-0 flex-1">
           {previewEnabled ? (
-            <div className="min-h-[20rem] rounded-md border border-stone-200 bg-white px-4 py-3">
+            <div className="h-full min-h-0 overflow-y-auto rounded-md border border-stone-200 bg-white px-4 py-3">
               {contentDraft.trim() ? (
                 <MarkdownContent
                   content={contentDraft}
@@ -11308,7 +11329,7 @@ function ContextSpecTab({
           ) : (
             <textarea
               aria-label={t("Project Spec Markdown")}
-              className="min-h-[20rem] w-full resize-y rounded-md border border-stone-300 bg-white px-3 py-2 font-mono text-[13px] leading-5 text-stone-900 shadow-inner outline-none placeholder:text-stone-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
+              className="h-full min-h-0 w-full resize-none rounded-md border border-stone-300 bg-white px-3 py-2 font-mono text-[13px] leading-5 text-stone-900 shadow-inner outline-none placeholder:text-stone-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
               disabled={!canEdit || isLoading}
               onChange={(event) => onContentChange(event.target.value)}
               placeholder={t("Generate or paste a Project Spec Markdown document.")}
@@ -12196,6 +12217,10 @@ function SettingsPanel({
   const [workspaceForm, setWorkspaceForm] = useState<WorkspaceFormState>(() =>
     emptyWorkspaceForm(),
   );
+  const [isLoadingWorkspaceSpecSettings, setIsLoadingWorkspaceSpecSettings] =
+    useState(false);
+  const [isWorkspaceSpecSettingsLoaded, setIsWorkspaceSpecSettingsLoaded] =
+    useState(false);
   const [mcpForm, setMcpForm] = useState<McpServerFormState>(() =>
     emptyMcpServerForm(),
   );
@@ -13097,16 +13122,39 @@ function SettingsPanel({
     setIsMcpDialogOpen(true);
   }
 
-  function editConfiguredWorkspace(workspace: ConfiguredWorkspaceSummary) {
+  async function editConfiguredWorkspace(workspace: ConfiguredWorkspaceSummary) {
     setWorkspaceForm({
       commonCommands: workspace.commonCommands.map((command) => ({ ...command })),
       id: workspace.id,
       name: workspace.name,
       path: workspace.path,
       pinned: workspace.pinned,
+      specEnabled: false,
+      specInjectEnabled: false,
       terminalShell: workspace.terminalShell,
     });
+    setIsWorkspaceSpecSettingsLoaded(false);
     setIsWorkspaceDialogOpen(true);
+    setIsLoadingWorkspaceSpecSettings(true);
+    try {
+      const data = await requestJson<WorkspaceSpecResponse>(
+        `/api/workspaces/${encodeURIComponent(workspace.id)}/spec`,
+      );
+      setWorkspaceForm((current) =>
+        current.id === workspace.id
+          ? {
+            ...current,
+            specEnabled: data.settings.enabled,
+            specInjectEnabled: data.settings.injectEnabled,
+          }
+          : current,
+      );
+      setIsWorkspaceSpecSettingsLoaded(true);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsLoadingWorkspaceSpecSettings(false);
+    }
   }
 
   function startAddingMcpServer() {
@@ -14154,6 +14202,17 @@ function SettingsPanel({
       setSettings(finalData);
       onSettingsChange(finalData);
       await onWorkspacesChange();
+      if (editingWorkspace && isWorkspaceSpecSettingsLoaded) {
+        try {
+          await saveWorkspaceSpecSettingsRequest(
+            workspaceForm.id,
+            workspaceForm.specEnabled,
+            workspaceForm.specEnabled ? workspaceForm.specInjectEnabled : false,
+          );
+        } catch (specError) {
+          setError(errorMessage(specError));
+        }
+      }
       setIsWorkspaceDialogOpen(false);
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -18286,11 +18345,39 @@ function SettingsPanel({
                           type="checkbox"
                         />
                       </label>
+                      <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
+                        <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-stone-700">
+                          <ScrollText
+                            aria-hidden="true"
+                            className="size-4 shrink-0 text-teal-700"
+                          />
+                          <span className="truncate">{t("Enable Project Spec")}</span>
+                        </span>
+                        <input
+                          checked={workspaceForm.specEnabled}
+                          className="size-4 accent-teal-700"
+                          disabled={
+                            isLoadingWorkspaceSpecSettings ||
+                            !isWorkspaceSpecSettingsLoaded
+                          }
+                          onChange={(event) =>
+                            setWorkspaceForm((current) => ({
+                              ...current,
+                              specEnabled: event.target.checked,
+                              specInjectEnabled: event.target.checked
+                                ? current.specInjectEnabled
+                                : false,
+                            }))
+                          }
+                          type="checkbox"
+                        />
+                      </label>
                       <button
                         aria-label={t("Save workspace")}
                         className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
                         disabled={
                           isSavingWorkspace ||
+                          isLoadingWorkspaceSpecSettings ||
                           !workspaceForm.name.trim() ||
                           !workspaceForm.path.trim()
                         }
@@ -18419,7 +18506,7 @@ function SettingsPanel({
                               name: workspace.name,
                             })}
                             className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                            onClick={() => editConfiguredWorkspace(workspace)}
+                            onClick={() => void editConfiguredWorkspace(workspace)}
                             title={t("Edit workspace")}
                             type="button"
                           >
@@ -21980,6 +22067,8 @@ function emptyWorkspaceForm(): WorkspaceFormState {
     name: "",
     path: "",
     pinned: false,
+    specEnabled: false,
+    specInjectEnabled: false,
     terminalShell: "",
   };
 }

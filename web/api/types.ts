@@ -643,6 +643,8 @@ export type WorkspaceFormState = {
   name: string;
   path: string;
   pinned: boolean;
+  specEnabled: boolean;
+  specInjectEnabled: boolean;
   terminalShell: string;
   commonCommands: WorkspaceCommonCommandSummary[];
 };

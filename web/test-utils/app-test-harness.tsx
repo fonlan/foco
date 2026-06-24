@@ -2103,7 +2103,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     return jsonResponse(appTestState.workspaceSpecResponse);
   }
 
-  if (path === "/api/workspaces/workspace-1/spec/settings") {
+  if (path.match(/^\/api\/workspaces\/[^/]+\/spec\/settings$/)) {
     const body = JSON.parse(String(init?.body ?? "{}")) as {
       enabled: boolean;
       injectEnabled: boolean;

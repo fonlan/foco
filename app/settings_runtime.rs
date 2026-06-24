@@ -132,13 +132,9 @@ pub(crate) async fn settings_response(
             generation_system_prompt: config.spec.generation_system_prompt.clone(),
             update_system_prompt: config.spec.update_system_prompt.clone(),
             default_generation_system_prompt:
-                crate::spec_runtime::default_workspace_spec_generation_system_prompt(
-                    &config.app.language,
-                ),
+                crate::spec_runtime::default_workspace_spec_generation_system_prompt(),
             default_update_system_prompt:
-                crate::spec_runtime::default_workspace_spec_update_system_prompt(
-                    &config.app.language,
-                ),
+                crate::spec_runtime::default_workspace_spec_update_system_prompt(),
         },
         prompts: PromptSettingsSummary {
             system_prompt: config.prompts.system_prompt.clone(),

@@ -179,24 +179,25 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByLabelText("项目 Spec Markdown")).toHaveValue(
       workspaceSpec.contentMarkdown,
     );
-    expect(screen.getByRole("checkbox", { name: "启用项目 Spec" })).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "注入新会话" })).toBeChecked();
+    expect(screen.queryByRole("checkbox", { name: "启用项目 Spec" })).toBeNull();
+    expect(screen.getByRole("button", { name: "注入新会话" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
     expect(screen.getAllByText(/修订 3/).length).toBeGreaterThan(0);
     expect(screen.getByText(/最近任务: 已完成 · 手动刷新/)).toBeInTheDocument();
   });
 
-  it("saves Project Spec settings from the right panel", async () => {
+  it("toggles Project Spec chat injection from the right panel", async () => {
     const fetchMock = vi.mocked(fetch);
     appTestState.workspaceSpecResponse = {
       ...workspaceSpec,
-      contentMarkdown: "",
-      revision: 0,
-      settings: { enabled: false, injectEnabled: false },
+      settings: { enabled: true, injectEnabled: false },
     };
 
     await openSpecPanel();
 
-    await userEvent.click(screen.getByRole("checkbox", { name: "Enable Project Spec" }));
+    await userEvent.click(screen.getByRole("button", { name: "Inject into new chats" }));
     await waitFor(() => {
       const call = fetchMock.mock.calls.find(
         ([url]) => url === "/api/workspaces/workspace-1/spec/settings",
@@ -204,18 +205,18 @@ describe("app-panels-stats verification surfaces", () => {
       expect(call).toBeDefined();
       expect(JSON.parse(String(call?.[1]?.body))).toEqual({
         enabled: true,
-        injectEnabled: false,
+        injectEnabled: true,
       });
     });
 
-    await userEvent.click(screen.getByRole("checkbox", { name: "Inject into new chats" }));
+    await userEvent.click(screen.getByRole("button", { name: "Inject into new chats" }));
     await waitFor(() => {
       const calls = fetchMock.mock.calls.filter(
         ([url]) => url === "/api/workspaces/workspace-1/spec/settings",
       );
       expect(JSON.parse(String(calls.at(-1)?.[1]?.body))).toEqual({
         enabled: true,
-        injectEnabled: true,
+        injectEnabled: false,
       });
     });
   });
