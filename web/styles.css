@@ -61,17 +61,53 @@ summary {
   touch-action: manipulation;
 }
 
-button {
+:where(
+  button.app-error-toast-close,
+  button.audit-json-copy-button,
+  button.audit-json-icon-button,
+  button.chat-tab-item,
+  button.chat-tab-scroll-button,
+  button.chat-toolbar-button,
+  button.chat-toolbar-profile,
+  button.composer-run-button,
+  button.composer-tool-button,
+  button.context-memory-delete-button,
+  button.diff-file-button,
+  button.foco-nav-logo-button,
+  button.foco-nav-rail-button,
+  button.message-action-menu,
+  button.mobile-sidebar-close,
+  button.terminal-toolbar-button,
+  button.workspace-file-editor-toolbar-button,
+  summary.composer-select-summary
+) {
   transition:
     transform 180ms ease,
     border-color 180ms ease,
     background-color 180ms ease,
-    color 180ms ease,
-    box-shadow 180ms ease;
+    color 180ms ease;
 }
 
-button:not(:disabled):active {
-  transform: translateY(1px) scale(0.99);
+:where(
+  button.app-error-toast-close,
+  button.audit-json-copy-button,
+  button.audit-json-icon-button,
+  button.chat-tab-item,
+  button.chat-tab-scroll-button,
+  button.chat-toolbar-button,
+  button.chat-toolbar-profile,
+  button.composer-run-button,
+  button.composer-tool-button,
+  button.context-memory-delete-button,
+  button.diff-file-button,
+  button.foco-nav-logo-button,
+  button.foco-nav-rail-button,
+  button.message-action-menu,
+  button.mobile-sidebar-close,
+  button.terminal-toolbar-button,
+  button.workspace-file-editor-toolbar-button
+):not(:disabled):active {
+  transform: translateY(1px);
 }
 
 button:focus-visible,
@@ -3558,9 +3594,7 @@ summary:focus-visible {
   background: transparent;
   transition:
     border-color 150ms ease,
-    background-color 150ms ease,
-    box-shadow 150ms ease,
-    transform 150ms ease;
+    background-color 150ms ease;
 }
 
 .workspace-menu:hover {
@@ -3621,8 +3655,7 @@ summary:focus-visible {
   transition:
     border-color 150ms ease,
     background-color 150ms ease,
-    color 150ms ease,
-    box-shadow 150ms ease;
+    color 150ms ease;
 }
 
 .chat-item:hover {
@@ -3706,9 +3739,13 @@ summary:focus-visible {
 }
 
 .app-main-panel,
-.message-list,
 .global-main-panel {
   background: var(--foco-main-panel-gradient), var(--foco-canvas);
+}
+
+.message-list {
+  /* ponytail: flat scroll surface avoids repainting a gradient behind every long chat row. */
+  background: var(--foco-canvas);
 }
 
 .message-stack {
@@ -3722,7 +3759,7 @@ summary:focus-visible {
 .message-bubble {
   border-color: var(--foco-border);
   background: var(--foco-panel);
-  box-shadow: var(--foco-shadow-soft);
+  box-shadow: none;
 }
 
 .message-bubble-assistant {
@@ -3733,7 +3770,7 @@ summary:focus-visible {
 .message-bubble-user {
   border-color: var(--foco-user-border);
   background: var(--foco-user-surface);
-  box-shadow: var(--foco-shadow-accent);
+  box-shadow: none;
 }
 
 .message-bubble-user .message-avatar {
@@ -3926,10 +3963,8 @@ summary:focus-visible {
 .context-sidebar,
 .diff-sidebar {
   border-left-color: var(--foco-border);
-  background:
-    linear-gradient(180deg, var(--foco-panel), var(--foco-panel-soft)),
-    var(--foco-panel);
-  box-shadow: -10px 0 30px rgba(17, 32, 51, 0.055);
+  background: var(--foco-panel);
+  box-shadow: none;
 }
 
 .context-sidebar-splitter:hover {
