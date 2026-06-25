@@ -831,6 +831,35 @@ describe("app-shell verification surfaces", () => {
     expect(screen.queryByRole("button", { name: "New chat" })).not.toBeInTheDocument();
   });
 
+  it("switches the API overview to the clicked workspace when starting a new chat", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    expect(await screen.findByText("API overview")).toBeInTheDocument();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "New chat in Side project" }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Side project" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByPlaceholderText(sideProjectComposerPlaceholder),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([url]) => {
+          if (typeof url !== "string" || !url.startsWith("/api/ai-statistics")) {
+            return false;
+          }
+          return new URL(url, "http://127.0.0.1").searchParams.get("workspaceId") ===
+            secondaryWorkspace.id;
+        }),
+      ).toBe(true),
+    );
+  });
+
   it("sends a workspace plus chat as a new chat request", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

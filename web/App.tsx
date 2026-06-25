@@ -9343,7 +9343,7 @@ function ApiOverviewPanel({
   );
 
   useEffect(() => {
-    if (hasAppliedInitialWorkspace || preferredWorkspaceId === "") {
+    if (preferredWorkspaceId === "") {
       return;
     }
 
@@ -9352,7 +9352,7 @@ function ApiOverviewPanel({
       workspaceId: preferredWorkspaceId,
     }));
     setHasAppliedInitialWorkspace(true);
-  }, [hasAppliedInitialWorkspace, preferredWorkspaceId]);
+  }, [preferredWorkspaceId]);
 
   useEffect(() => {
     void loadOverview();
