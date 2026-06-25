@@ -23,6 +23,7 @@ export const MAX_CHAT_ATTACHMENT_TOTAL_BYTES = 24 * 1024 * 1024;
 export const SAVED_PASSWORD_MASK = "********";
 export const SETTINGS_SECTION_IDS: SettingsSection[] = [
   "general",
+  "agents",
   "prompts",
   "spec",
   "web-search",

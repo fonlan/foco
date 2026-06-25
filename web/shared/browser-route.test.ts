@@ -90,6 +90,16 @@ describe("browser route chat tabs", () => {
     expect(browserPathForRoute({ viewMode: "scheduled" })).toBe("/scheduled");
   });
 
+  it("parses and serializes the Agents settings route", () => {
+    expect(browserRouteFromPathname("/settings/agents")).toEqual({
+      section: "agents",
+      viewMode: "settings",
+    });
+    expect(browserPathForRoute({ section: "agents", viewMode: "settings" })).toBe(
+      "/settings/agents",
+    );
+  });
+
   it("parses and serializes stats page numbers", () => {
     expect(browserRouteFromPathname("/stats", "?page=3")).toEqual({
       page: 3,
