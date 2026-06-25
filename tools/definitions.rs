@@ -310,7 +310,7 @@ fn graph_explore_definition() -> ToolDefinition {
 fn search_text_definition() -> ToolDefinition {
     ToolDefinition {
         name: SEARCH_TEXT_TOOL,
-        description: "Search workspace text and return matching lines. Powered by ripgrep/rg; the query uses rg pattern syntax.",
+        description: "Search workspace text and return matching lines. Powered by ripgrep/rg; the query uses rg pattern syntax. When there are too many matches the response is truncated to the first matches with truncated=true; the complete results are written to a workspace file reported as fullResultPath, which you can read with read_file (or refine the query/path) to see every match.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

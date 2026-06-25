@@ -65,6 +65,10 @@ const MAX_FIND_ENTRIES: usize = 200;
 const MAX_SEARCH_MATCHES: usize = 200;
 const MAX_SEARCH_TEXT_LINE_BYTES: usize = 4 * 1024;
 const MAX_SEARCH_TEXT_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
+const SEARCH_RESULTS_DIR: &str = "search-results";
+const MAX_SEARCH_RESULT_FILES: usize = 20;
+const SEARCH_RESULT_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_GRAPH_RESULT_LIMIT: usize = 20;
 const MAX_GRAPH_RESULT_LIMIT: usize = 50;
@@ -1424,6 +1428,50 @@ mod tests {
         assert_eq!(matches[0]["path"], "note.txt");
         assert_eq!(matches[0]["line"], 2);
         assert_eq!(matches[0]["text"], "beta");
+    }
+
+    #[test]
+    fn search_text_truncates_large_results_to_a_workspace_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let total = MAX_SEARCH_MATCHES + 50;
+        let mut content = String::new();
+        for index in 0..total {
+            content.push_str(&format!("needle {index}\n"));
+        }
+        fs::write(workspace.path().join("big.txt"), content).expect("write big");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({ "query": "needle", "path": ".", "timeoutMs": null }),
+        );
+
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(
+            result.output["totalMatches"].as_u64().expect("total"),
+            total as u64
+        );
+        assert_eq!(
+            result.output["matches"].as_array().expect("matches").len(),
+            MAX_SEARCH_MATCHES
+        );
+
+        let full_path = result.output["fullResultPath"]
+            .as_str()
+            .expect("full result path");
+        assert!(full_path.starts_with(".foco/search-results/"));
+
+        // The model can read the complete results back through read_file.
+        let read_back = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": full_path, "startLine": null, "endLine": null }),
+        );
+
+        assert!(!read_back.is_error, "{:?}", read_back.output);
+        let read_content = read_back.output["content"].as_str().expect("content");
+        assert!(read_content.contains(&format!("needle {}", total - 1)));
     }
 
     #[test]

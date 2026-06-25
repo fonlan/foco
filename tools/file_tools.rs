@@ -1,5 +1,11 @@
-use std::{fs, io, path::Path, time::Duration};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
+use foco_store::workspace::{WORKSPACE_FOCO_DIR, workspace_foco_dir};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -8,7 +14,8 @@ use crate::{
     CommandOutputLimits, DEFAULT_FILE_TOOL_TIMEOUT_MS, DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
     DEFAULT_WRITE_FILE_TIMEOUT_MS, LineRange, MAX_FIND_ENTRIES, MAX_FULL_READ_BYTES,
     MAX_RANGED_READ_OUTPUT_BYTES, MAX_RANGED_READ_SOURCE_BYTES, MAX_SEARCH_MATCHES,
-    MAX_SEARCH_TEXT_LINE_BYTES, MAX_SEARCH_TEXT_OUTPUT_BYTES, RIPGREP_PATH, TextEncoding,
+    MAX_SEARCH_RESULT_FILES, MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES, MAX_SEARCH_TEXT_LINE_BYTES,
+    MAX_SEARCH_TEXT_OUTPUT_BYTES, RIPGREP_PATH, SEARCH_RESULT_TTL, SEARCH_RESULTS_DIR, TextEncoding,
     ToolCancellationToken, count_text_lines, decode_text_file, encode_text_file,
     errors::{ToolRuntimeError, tool_timeout_ms},
     normalize_read_line_range, normalize_workspace_path_text, numbered_content, parse_arguments,
@@ -350,8 +357,6 @@ pub(crate) fn search_text(
     let rg_args = vec![
         "--json".to_string(),
         "--line-number".to_string(),
-        "--max-count".to_string(),
-        (MAX_SEARCH_MATCHES + 1).to_string(),
         "--max-columns".to_string(),
         MAX_SEARCH_TEXT_LINE_BYTES.to_string(),
         pattern.to_string(),
@@ -366,8 +371,8 @@ pub(crate) fn search_text(
         cancellation_token,
         None,
         Some(CommandOutputLimits {
-            stdout_bytes: Some(MAX_SEARCH_TEXT_OUTPUT_BYTES),
-            stderr_bytes: Some(MAX_SEARCH_TEXT_OUTPUT_BYTES),
+            stdout_bytes: Some(MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES),
+            stderr_bytes: Some(MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES),
         }),
     ) {
         Ok(output) => output,
@@ -380,13 +385,6 @@ pub(crate) fn search_text(
         }
         Err(error) => return Err(error),
     };
-    if output.stdout.len() > MAX_SEARCH_TEXT_OUTPUT_BYTES {
-        return Err(search_text_too_many_matches_error(
-            pattern,
-            &input_path,
-            Some(output.stdout.len()),
-        ));
-    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if output.status.code() == Some(1) {
@@ -407,8 +405,7 @@ pub(crate) fn search_text(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut matches = Vec::new();
-    let mut output_bytes = 0usize;
+    let mut entries = Vec::new();
     for line in stdout.lines() {
         let event: Value =
             serde_json::from_str(line).map_err(|source| ToolRuntimeError::InvalidToolOutput {
@@ -418,13 +415,6 @@ pub(crate) fn search_text(
 
         if event.get("type").and_then(Value::as_str) != Some("match") {
             continue;
-        }
-        if matches.len() >= MAX_SEARCH_MATCHES {
-            return Err(search_text_too_many_matches_error(
-                pattern,
-                &input_path,
-                None,
-            ));
         }
 
         let data = event.get("data").ok_or_else(|| {
@@ -446,32 +436,182 @@ pub(crate) fn search_text(
             .trim_end_matches(['\r', '\n'])
             .to_string();
         let relative_path = relative_workspace_path(workspace_path, Path::new(absolute_path))?;
-        output_bytes = output_bytes
-            .saturating_add(relative_path.len())
-            .saturating_add(text.len())
-            .saturating_add(32);
-        if output_bytes > MAX_SEARCH_TEXT_OUTPUT_BYTES {
-            return Err(search_text_too_many_matches_error(
-                pattern,
-                &input_path,
-                Some(output_bytes),
-            ));
-        }
 
-        matches.push(json!({
-            "path": relative_path,
-            "line": line_number,
-            "text": text
+        entries.push(SearchMatch {
+            path: relative_path,
+            line: line_number,
+            text,
+        });
+    }
+
+    let total_matches = entries.len();
+    // Keep as many leading matches as fit within the response budget; the rest
+    // (if any) are still preserved in full on disk below.
+    let mut returned = 0usize;
+    let mut output_bytes = 0usize;
+    for entry in &entries {
+        if returned >= MAX_SEARCH_MATCHES {
+            break;
+        }
+        let next_bytes = output_bytes
+            .saturating_add(entry.path.len())
+            .saturating_add(entry.text.len())
+            .saturating_add(32);
+        if next_bytes > MAX_SEARCH_TEXT_OUTPUT_BYTES {
+            break;
+        }
+        output_bytes = next_bytes;
+        returned += 1;
+    }
+
+    let matches = entries[..returned]
+        .iter()
+        .map(SearchMatch::to_json)
+        .collect::<Vec<_>>();
+
+    if returned == total_matches {
+        return Ok(json!({
+            "query": pattern,
+            "path": input_path,
+            "matches": matches,
+            "truncated": false,
+            "timeoutMs": timeout_ms
         }));
     }
+
+    // The response was truncated; persist the complete result set so the model
+    // can read it on demand via read_file instead of re-running a broad search.
+    let full_results = render_search_results(&entries);
+    let full_result_path = write_search_results_file(workspace_path, &full_results)?;
+    let note = format!(
+        "Results truncated: showing the first {returned} of {total_matches} matches. The complete \
+         result set was saved to '{full_result_path}'. Call read_file on that path (use a line \
+         range if the file is large) to see every match, or refine the query or path to narrow the \
+         search."
+    );
 
     Ok(json!({
         "query": pattern,
         "path": input_path,
         "matches": matches,
-        "truncated": false,
+        "truncated": true,
+        "totalMatches": total_matches,
+        "returnedMatches": returned,
+        "fullResultPath": full_result_path,
+        "note": note,
         "timeoutMs": timeout_ms
     }))
+}
+
+struct SearchMatch {
+    path: String,
+    line: Option<u64>,
+    text: String,
+}
+
+impl SearchMatch {
+    fn to_json(&self) -> Value {
+        json!({
+            "path": self.path,
+            "line": self.line,
+            "text": self.text
+        })
+    }
+}
+
+fn render_search_results(entries: &[SearchMatch]) -> String {
+    let mut rendered = String::new();
+    for entry in entries {
+        rendered.push_str(&entry.path);
+        if let Some(line) = entry.line {
+            rendered.push(':');
+            rendered.push_str(&line.to_string());
+        }
+        rendered.push_str(": ");
+        rendered.push_str(&entry.text);
+        rendered.push('\n');
+    }
+    rendered
+}
+
+static SEARCH_RESULTS_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Writes the complete search results into `.foco/search-results/` and returns
+/// the workspace-relative path so the model can read it back with read_file.
+fn write_search_results_file(
+    workspace_path: &Path,
+    contents: &str,
+) -> Result<String, ToolRuntimeError> {
+    let results_dir = workspace_foco_dir(workspace_path).join(SEARCH_RESULTS_DIR);
+    fs::create_dir_all(&results_dir).map_err(|source| ToolRuntimeError::Io {
+        path: results_dir.clone(),
+        source,
+    })?;
+    prune_search_results_dir(&results_dir);
+
+    let file_name = next_search_results_file_name();
+    let file_path = results_dir.join(&file_name);
+    fs::write(&file_path, contents).map_err(|source| ToolRuntimeError::Io {
+        path: file_path.clone(),
+        source,
+    })?;
+
+    Ok(format!("{WORKSPACE_FOCO_DIR}/{SEARCH_RESULTS_DIR}/{file_name}"))
+}
+
+fn next_search_results_file_name() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let counter = SEARCH_RESULTS_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("search-{nanos}-{counter}.txt")
+}
+
+/// Best-effort cleanup of stale search-result files: drops anything past the
+/// retention window and caps the directory so a single new file can be added
+/// without exceeding the limit. All failures are ignored intentionally.
+fn prune_search_results_dir(results_dir: &Path) {
+    let Ok(read_dir) = fs::read_dir(results_dir) else {
+        return;
+    };
+
+    let now = SystemTime::now();
+    let mut files: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let is_result_file = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("search-") && name.ends_with(".txt"));
+        if !is_result_file {
+            continue;
+        }
+
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > SEARCH_RESULT_TTL)
+        {
+            let _ = fs::remove_file(&path);
+            continue;
+        }
+
+        files.push((path, modified));
+    }
+
+    if files.len() < MAX_SEARCH_RESULT_FILES {
+        return;
+    }
+
+    files.sort_by_key(|(_, modified)| *modified);
+    let remove_count = files.len() + 1 - MAX_SEARCH_RESULT_FILES;
+    for (path, _) in files.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn search_text_too_many_matches_error(
