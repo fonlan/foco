@@ -1965,6 +1965,30 @@ async fn agent_definitions_api_creates_default_agent_when_empty() {
             .allowed_agent_definition_ids
             .is_empty()
     );
+    assert!(
+        listed
+            .default_role_prompts
+            .get(&default_definition_id)
+            .is_some_and(|prompt| prompt.contains("Foco's default coding agent"))
+    );
+
+    let delete_default_error = match crate::http::settings::delete_agent_definition(
+        State(state.clone()),
+        Json(DeleteAgentDefinitionRequest {
+            id: default_definition_id.clone(),
+        }),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("built-in default agent deletion should fail"),
+    };
+    assert_eq!(delete_default_error.status, StatusCode::BAD_REQUEST);
+    assert!(
+        delete_default_error
+            .message
+            .contains("built-in agent definition")
+    );
 
     let listed_again = crate::http::settings::agent_definitions(State(state))
         .await
@@ -2019,26 +2043,13 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         .await
         .expect("settings response before listing agents")
         .0;
-    let prompt_settings_image_prompt = prompt_settings
-        .prompts
-        .system_prompts
-        .iter()
-        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
-        .expect("image agent prompt in settings before listing agents");
-    assert!(prompt_settings_image_prompt.content.contains("gpt-image-2"));
-    let default_prompt_index = prompt_settings
-        .prompts
-        .system_prompts
-        .iter()
-        .position(|prompt| prompt.name == DEFAULT_SYSTEM_PROMPT_NAME)
-        .expect("default prompt index");
-    let image_prompt_index = prompt_settings
-        .prompts
-        .system_prompts
-        .iter()
-        .position(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
-        .expect("image prompt index");
-    assert_eq!(image_prompt_index, default_prompt_index + 1);
+    assert!(
+        prompt_settings
+            .prompts
+            .system_prompts
+            .iter()
+            .all(|prompt| prompt.name != IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+    );
 
     let saved_before_agents = crate::http::settings::save_prompt_settings(
         State(state.clone()),
@@ -2059,17 +2070,14 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         }),
     )
     .await
-    .expect("save synthesized image agent prompt")
+    .expect("save prompt settings with stale image agent prompt")
     .0;
-    let saved_before_agents_prompt = saved_before_agents
-        .prompts
-        .system_prompts
-        .iter()
-        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
-        .expect("saved synthesized image agent prompt");
-    assert_eq!(
-        saved_before_agents_prompt.content,
-        "Prompt edited before listing agents."
+    assert!(
+        saved_before_agents
+            .prompts
+            .system_prompts
+            .iter()
+            .all(|prompt| prompt.name != IMAGE_AGENT_SYSTEM_PROMPT_NAME)
     );
 
     let listed = crate::http::settings::agent_definitions(State(state.clone()))
@@ -2078,6 +2086,12 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         .0;
     let image_definition_id =
         AgentDefinitionId::new("agent-definition-image-gen").expect("image definition id");
+    assert!(
+        listed
+            .default_role_prompts
+            .get(&image_definition_id)
+            .is_some_and(|prompt| prompt.contains("Use image_gen with model \"gpt-image-2\""))
+    );
     let image_definition = listed
         .agent_definitions
         .iter()
@@ -2091,9 +2105,33 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
             .iter()
             .any(|tool| tool == foco_tools::IMAGE_GEN_TOOL)
     );
-    assert_eq!(
-        image_definition.system_prompt,
-        "Prompt edited before listing agents."
+    assert!(
+        image_definition
+            .system_prompt
+            .contains("image generation agent")
+    );
+    assert!(
+        image_definition
+            .system_prompt
+            .contains("Use image_gen with model \"gpt-image-2\"")
+    );
+
+    let delete_image_error = match crate::http::settings::delete_agent_definition(
+        State(state.clone()),
+        Json(DeleteAgentDefinitionRequest {
+            id: image_definition_id.clone(),
+        }),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("built-in image agent deletion should fail"),
+    };
+    assert_eq!(delete_image_error.status, StatusCode::BAD_REQUEST);
+    assert!(
+        delete_image_error
+            .message
+            .contains("built-in agent definition")
     );
 
     let mut custom_input = agent_definition_input_from_settings(image_definition);
@@ -2134,13 +2172,13 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         .await
         .expect("settings response")
         .0;
-    let listed_prompt = settings
-        .prompts
-        .system_prompts
-        .iter()
-        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
-        .expect("image agent prompt in settings");
-    assert_eq!(listed_prompt.content, "Custom image agent prompt.");
+    assert!(
+        settings
+            .prompts
+            .system_prompts
+            .iter()
+            .all(|prompt| prompt.name != IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+    );
 
     let saved = crate::http::settings::save_prompt_settings(
         State(state.clone()),
@@ -2163,22 +2201,22 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
     .await
     .expect("save prompt settings")
     .0;
-    let saved_prompt = saved
-        .prompts
-        .system_prompts
-        .iter()
-        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
-        .expect("saved image agent prompt in settings");
-    assert_eq!(saved_prompt.content, "Prompt edited from prompt settings.");
+    assert!(
+        saved
+            .prompts
+            .system_prompts
+            .iter()
+            .all(|prompt| prompt.name != IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+    );
 
     let config = state.config.lock().expect("config lock");
-    let stored_prompt = config
-        .prompts
-        .system_prompts
-        .iter()
-        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
-        .expect("stored image generation prompt");
-    assert_eq!(stored_prompt.content, "Prompt edited from prompt settings.");
+    assert!(
+        config
+            .prompts
+            .system_prompts
+            .iter()
+            .all(|prompt| prompt.name != IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+    );
     let stored_image_definition = config
         .agent_definitions
         .iter()
@@ -2186,7 +2224,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         .expect("stored image agent");
     assert_eq!(
         stored_image_definition.system_prompt,
-        "Prompt edited from prompt settings."
+        "Custom image agent prompt."
     );
     assert_eq!(stored_image_definition.model_id, "gpt-alt");
 }
@@ -2217,7 +2255,7 @@ async fn image_output_model_can_be_saved_without_text_limits() {
             output_modalities: Some(vec!["image".to_string()]),
             thinking_level: None,
             clear_thinking_level: Some(true),
-            system_prompt_name: Some(IMAGE_AGENT_SYSTEM_PROMPT_NAME.to_string()),
+            system_prompt_name: Some(DEFAULT_SYSTEM_PROMPT_NAME.to_string()),
         }),
     )
     .await
@@ -2233,10 +2271,7 @@ async fn image_output_model_can_be_saved_without_text_limits() {
     assert_eq!(image_model.max_output_tokens, None);
     assert!(image_model.can_enable);
     assert_eq!(image_model.output_modalities, vec!["image"]);
-    assert_eq!(
-        image_model.system_prompt_name,
-        IMAGE_AGENT_SYSTEM_PROMPT_NAME
-    );
+    assert_eq!(image_model.system_prompt_name, DEFAULT_SYSTEM_PROMPT_NAME);
 }
 
 fn agent_definition_input_from_settings(

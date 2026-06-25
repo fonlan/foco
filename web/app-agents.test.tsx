@@ -14,7 +14,6 @@ import {
   resetAppTestEnvironment,
   settings,
 } from "./test-utils/app-test-harness";
-import { IMAGE_AGENT_SYSTEM_PROMPT_NAME } from "./app/constants";
 
 function stubDefaultAgentComposerDefaults() {
   const baseModel = settings.configuredModels[0]!;
@@ -44,6 +43,9 @@ function stubDefaultAgentComposerDefaults() {
       },
       ...agentDefinitionFixtures.agentDefinitions,
     ],
+    defaultRolePrompts: {
+      "agent-definition-default": "Default built-in prompt.",
+    },
   };
 
   vi.stubGlobal(
@@ -76,7 +78,7 @@ function stubImageAgentSettings() {
     outputModalities: ["image"],
     providerIds: ["openai"],
     supportsThinking: false,
-    systemPromptName: IMAGE_AGENT_SYSTEM_PROMPT_NAME,
+    systemPromptName: "Default",
   };
   const altImageModel = {
     ...imageModel,
@@ -100,9 +102,8 @@ function stubImageAgentSettings() {
     },
     providerId: textModel.activeProviderId!,
     revision: 1,
-    systemPrompt: `You are Foco's image generation agent. Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.
-
-Use image_gen with model "gpt-image-2" unless the user explicitly asks for another configured image model.`,
+    systemPrompt:
+      "You are Foco's image generation agent. Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.\n\nUse image_gen with model \"gpt-image-2\" unless the user explicitly asks for another configured image model.",
   };
   const settingsWithImageModels = {
     ...settings,
@@ -110,6 +111,9 @@ Use image_gen with model "gpt-image-2" unless the user explicitly asks for anoth
   };
   const definitionsWithImageAgent = {
     agentDefinitions: [...agentDefinitionFixtures.agentDefinitions, imageAgentDefinition],
+    defaultRolePrompts: {
+      "agent-definition-image-gen": imageAgentDefinition.systemPrompt,
+    },
   };
 
   vi.stubGlobal(
@@ -136,6 +140,7 @@ Use image_gen with model "gpt-image-2" unless the user explicitly asks for anoth
               ? { ...body.definition, id: body.id, revision: 2 }
               : definition,
           ),
+          defaultRolePrompts: definitionsWithImageAgent.defaultRolePrompts,
         });
       }
       return mockFetch(input, init);
@@ -167,7 +172,7 @@ describe("app agents verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Edit agent Coordinator" }));
     const editDialog = screen.getByRole("dialog", { name: "Edit agent" });
-    const promptContent = within(editDialog).getByLabelText("System prompt content");
+    const promptContent = within(editDialog).getByLabelText("Agent role prompt");
     expect(promptContent).toHaveValue("Coordinate the team.");
     await userEvent.clear(promptContent);
     await userEvent.type(promptContent, "Custom coordinator prompt.");
@@ -176,13 +181,44 @@ describe("app agents verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Add agent definition" }));
     const dialog = screen.getByRole("dialog", { name: "Create agent" });
-    expect(within(dialog).getByLabelText("System prompt")).toHaveValue("Default");
+    expect(within(dialog).queryByLabelText("System prompt")).not.toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Agent role prompt")).toHaveValue("");
     await userEvent.click(within(dialog).getByText("Allowed tools"));
     await userEvent.click(within(dialog).getByRole("checkbox", { name: "read_file" }));
     expect(within(dialog).getByText("1 selected")).toBeInTheDocument();
   });
 
-  it("lets the image generation agent pick an image-output model", async () => {
+  it("hides built-in agent deletion and restores its default role prompt", async () => {
+    stubDefaultAgentComposerDefaults();
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Agents" }));
+
+    expect(
+      await screen.findByRole("button", { name: "Edit agent Default agent" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Delete agent Default agent" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete agent Coordinator" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit agent Default agent" }));
+    const dialog = screen.getByRole("dialog", { name: "Edit agent" });
+    const promptContent = within(dialog).getByLabelText("Agent role prompt");
+    await userEvent.clear(promptContent);
+    await userEvent.type(promptContent, "Custom default agent role.");
+    await userEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Restore default Agent role prompt",
+      }),
+    );
+
+    expect(promptContent).toHaveValue("Default built-in prompt.");
+  });
+
+  it("edits the image generation agent without embedding an image model in the role prompt", async () => {
     stubImageAgentSettings();
     const fetchMock = vi.mocked(fetch);
     renderApp();
@@ -192,25 +228,45 @@ describe("app agents verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Agents" }));
     const imageAgentCard = (await screen.findByText("Image generation agent")).closest("article");
     expect(imageAgentCard).not.toBeNull();
-    expect(within(imageAgentCard!).getByText("GPT Image 2", { exact: false })).toBeInTheDocument();
+    expect(within(imageAgentCard!).getByText("GPT Test", { exact: false })).toBeInTheDocument();
 
     await userEvent.click(
       await screen.findByRole("button", { name: "Edit agent Image generation agent" }),
     );
     const dialog = screen.getByRole("dialog", { name: "Edit agent" });
     const modelSelect = within(dialog).getByLabelText("Model");
-    expect(within(dialog).getByRole("option", { name: "GPT Image 2" })).toBeInTheDocument();
-    expect(within(dialog).getByRole("option", { name: "GPT Image 3" })).toBeInTheDocument();
-    expect(within(dialog).queryByRole("option", { name: "GPT Test" })).not.toBeInTheDocument();
-    expect(modelSelect).toHaveValue("gpt-image-2");
+    expect(within(dialog).queryByRole("option", { name: "GPT Image 2" })).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("option", { name: "GPT Image 3" })).not.toBeInTheDocument();
+    expect(within(dialog).getByRole("option", { name: "GPT Test" })).toBeInTheDocument();
+    expect(modelSelect).toHaveValue("gpt-test");
+    expect(
+      within(dialog).getByText(
+        "Uses the current chat workspace directly. Simpler, but file changes land in the shared workspace.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        "Creates a Foco-managed Git worktree for the instance. File changes stay isolated until you explicitly merge or delete them.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Delete agent Image generation agent" }),
+    ).not.toBeInTheDocument();
 
-    await userEvent.selectOptions(modelSelect, "gpt-image-3");
-    const promptContent = within(dialog).getByLabelText("System prompt content");
-    await waitFor(() => {
-      expect((promptContent as HTMLTextAreaElement).value).toContain(
-        'Use image_gen with model "gpt-image-3"',
-      );
-    });
+    const promptContent = within(dialog).getByLabelText("Agent role prompt");
+    expect((promptContent as HTMLTextAreaElement).value).toContain(
+      'Use image_gen with model "gpt-image-2"',
+    );
+    await userEvent.clear(promptContent);
+    await userEvent.type(promptContent, "Custom image role prompt.");
+    await userEvent.click(
+      within(dialog).getByRole("button", {
+        name: "Restore default Agent role prompt",
+      }),
+    );
+    expect((promptContent as HTMLTextAreaElement).value).toContain(
+      'Use image_gen with model "gpt-image-2"',
+    );
 
     await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
 
@@ -227,13 +283,15 @@ describe("app agents verification surfaces", () => {
       expect(body.id).toBe("agent-definition-image-gen");
       expect(body.definition.modelId).toBe("gpt-test");
       expect(body.definition.providerId).toBe("openai");
-      expect(body.definition.systemPrompt).toContain('Use image_gen with model "gpt-image-3"');
+      expect(body.definition.systemPrompt).toContain(
+        'Use image_gen with model "gpt-image-2"',
+      );
     });
     await waitFor(() => {
       const updatedImageAgentCard = screen.getByText("Image generation agent").closest("article");
       expect(updatedImageAgentCard).not.toBeNull();
       expect(
-        within(updatedImageAgentCard!).getByText("GPT Image 3", { exact: false }),
+        within(updatedImageAgentCard!).getByText("GPT Test", { exact: false }),
       ).toBeInTheDocument();
     });
   });

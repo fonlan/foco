@@ -509,8 +509,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Allowed tools": "允许的工具",
     "{count} selected": "已选择 {count} 项",
     "No tools available": "暂无可用工具",
-    "Current custom prompt": "当前自定义提示词",
-    "No system prompts configured": "尚未配置系统提示词",
+    "Agent role prompt": "智能体角色提示词",
+    "Restore default Agent role prompt": "恢复默认智能体角色提示词",
     Permissions: "权限",
     "Can delegate tasks": "允许委派任务",
     "Can create instances": "允许创建实例",
@@ -555,7 +555,11 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Shared: "共享工作区",
     "Workspace isolation mode": "工作区隔离模式",
     "Shared workspace": "共享工作区",
+    "Uses the current chat workspace directly. Simpler, but file changes land in the shared workspace.":
+      "直接使用当前聊天工作区。更简单，但文件改动会落在共享工作区。",
     "Isolated workspace": "隔离工作区",
+    "Creates a Foco-managed Git worktree for the instance. File changes stay isolated until you explicitly merge or delete them.":
+      "为实例创建受 Foco 管理的 Git worktree。文件改动先隔离，之后再显式合并或删除。",
     "Isolated worktree": "隔离工作区",
     shared: "共享",
     isolated: "已隔离",

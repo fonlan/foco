@@ -1042,11 +1042,13 @@ pub fn default_system_prompt_body() -> String {
          - Prefer code graph tools before text search when locating symbols, callers, callees, references, or related files.\n\
          - Use search_text for literal text, config keys, and error messages when available; it is powered by ripgrep/rg. Use find_files for glob-based file discovery when available.\n\
          - Use only tools that are actually available in the current run. The next system message lists the current tool names and descriptions.\n\
+         - Treat MCP tools in the available-tool list as first-class tools. Use them when they directly match an external system, service, or data source needed for the task.\n\
          - Built-in file tools use workspace-relative paths. Use \".\" for the workspace root.\n\
          - Command execution tools run a command plus args directly. Put the executable in command and each argument in args. Do not concatenate shell commands into one string unless you explicitly invoke the detected shell.\n\
          - Parallelize independent tool calls whenever the current model/tool interface supports multiple calls in one turn. Foco executes compatible tool calls concurrently, but conflicting writes to the same resource must not be batched.\n\n\
          ## Foco context\n\n\
          - Workspace instructions, selected skills, memories, hook feedback, environment details, and context-compression snapshots may be injected into the conversation. Follow them when they do not conflict with higher-priority instructions or the user's latest request.\n\
+         - When skill front matter is injected and a task matches a skill description, use that skill's instructions before improvising your own workflow.\n\
          - Treat Foco memory as useful but possibly stale. Verify against current workspace evidence when it affects code or current behavior.\n\
          - Treat hook feedback, blocking decisions, additional context, and permission prompts as the user's configured workspace policy.\n\
          - For complex multi-step work, use todo graph tools instead of plain todo lists when those tools are available. Keep task statuses current. Do not create a todo graph for trivial one-step work.\n\
@@ -1111,10 +1113,15 @@ pub fn build_available_tools_prompt(tools: Vec<ToolPromptInfo>) -> Option<String
     }
 
     let graph_guidance = available_graph_tool_guidance(&tools);
+    let mcp_guidance = available_mcp_tool_guidance(&tools);
     let mut prompt = String::from("Available tools:");
     if let Some(graph_guidance) = graph_guidance {
         prompt.push('\n');
         prompt.push_str(graph_guidance);
+    }
+    if let Some(mcp_guidance) = mcp_guidance {
+        prompt.push('\n');
+        prompt.push_str(mcp_guidance);
     }
     for tool in tools {
         prompt.push_str("\n- ");
@@ -1140,6 +1147,20 @@ fn available_graph_tool_guidance(tools: &[ToolPromptInfo]) -> Option<&'static st
          - Need a candidate list or a symbolId for an ambiguous name: use graph_find_symbols.\n\
          - Need relationships: use graph_find_callers, graph_find_callees, or graph_find_references.\n\
          - Need adjacent files: use graph_related_files.",
+    )
+}
+
+fn available_mcp_tool_guidance(tools: &[ToolPromptInfo]) -> Option<&'static str> {
+    if !tools
+        .iter()
+        .any(|tool| tool.name.starts_with(MCP_TOOL_NAME_PREFIX))
+    {
+        return None;
+    }
+
+    Some(
+        "MCP tool routing:\n\
+         - Use MCP tools when they directly match the requested external system, service, or data source.",
     )
 }
 
@@ -2320,6 +2341,8 @@ mod tests {
 
         assert!(prompt.contains("You are Foco, a local coding agent"));
         assert!(prompt.contains("Prefer code graph tools before text search"));
+        assert!(prompt.contains("Treat MCP tools in the available-tool list as first-class tools"));
+        assert!(prompt.contains("When skill front matter is injected"));
         assert!(!prompt.contains("Available tools:"));
         assert!(!prompt.contains("graph_find_symbols: Find symbols."));
         assert!(!prompt.contains("workspace-1"));
@@ -2346,6 +2369,19 @@ mod tests {
             prompt,
             "Available tools:\n- read_file: Read a file.\n- run_command: Run a command."
         );
+    }
+
+    #[test]
+    fn available_tools_prompt_routes_mcp_tools_when_available() {
+        let prompt = build_available_tools_prompt(vec![ToolPromptInfo {
+            name: "mcp__notes__search".to_string(),
+            description: "Search notes.".to_string(),
+        }])
+        .expect("available tools prompt");
+
+        assert!(prompt.contains("MCP tool routing:"));
+        assert!(prompt.contains("Use MCP tools when they directly match"));
+        assert!(prompt.contains("- mcp__notes__search: Search notes."));
     }
 
     #[test]

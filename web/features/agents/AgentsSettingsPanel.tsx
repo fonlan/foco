@@ -15,7 +15,6 @@ import type {
   AgentExecutionWorkspaceMode,
   ConfiguredModelSummary,
   ConfiguredProviderSummary,
-  SystemPromptSummary,
   ThinkingLevelSummary,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
@@ -24,8 +23,8 @@ const AGENT_EXECUTION_WORKSPACE_MODES: AgentExecutionWorkspaceMode[] = [
   "shared",
   "isolated_worktree",
 ];
+const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
 const IMAGE_AGENT_DEFINITION_ID = "agent-definition-image-gen";
-const IMAGE_GEN_MODEL_INSTRUCTION_PATTERN = /Use image_gen with model "([^"]+)"/;
 
 type AgentDefinitionDraft = {
   allowedTools: string[];
@@ -45,6 +44,7 @@ type AgentDefinitionDraft = {
 
 export function AgentsSettingsPanel({
   agentTools,
+  defaultRolePrompts,
   defaultTeamModeEnabled,
   definitions,
   error,
@@ -57,10 +57,10 @@ export function AgentsSettingsPanel({
   onDeleteDefinition,
   onUpdateDefinition,
   providers,
-  systemPrompts,
   thinkingLevels,
 }: {
   agentTools: string[];
+  defaultRolePrompts: Record<string, string>;
   defaultTeamModeEnabled: boolean;
   definitions: AgentDefinitionSettings[];
   error: string | null;
@@ -76,7 +76,6 @@ export function AgentsSettingsPanel({
     definition: AgentDefinitionInput,
   ) => Promise<boolean>;
   providers: ConfiguredProviderSummary[];
-  systemPrompts: SystemPromptSummary[];
   thinkingLevels: ThinkingLevelSummary[];
 }) {
   const { t } = useI18n();
@@ -92,18 +91,6 @@ export function AgentsSettingsPanel({
       ),
     [models],
   );
-  const imageModels = useMemo(
-    () =>
-      models.filter(
-        (model) =>
-          model.enabled &&
-          model.canEnable &&
-          modelOutputsImage(model) &&
-          model.activeProviderId !== null &&
-          model.providerIds.length > 0,
-      ),
-    [models],
-  );
   const providerNameById = useMemo(
     () => new Map(providers.map((provider) => [provider.id, provider.name])),
     [providers],
@@ -112,25 +99,13 @@ export function AgentsSettingsPanel({
     () => new Map(models.map((model) => [model.id, model.displayName])),
     [models],
   );
-  const modelById = useMemo(() => new Map(models.map((model) => [model.id, model])), [models]);
   const [dialogMode, setDialogMode] = useState<"create" | "edit" | null>(null);
   const [editingDefinitionId, setEditingDefinitionId] = useState<string | null>(null);
   const [draft, setDraft] = useState<AgentDefinitionDraft>(() =>
-    emptyAgentDefinitionDraft(enabledModels[0], systemPrompts[0]),
+    emptyAgentDefinitionDraft(enabledModels[0]),
   );
   const editingDefinition =
     definitions.find((definition) => definition.id === editingDefinitionId) ?? null;
-  const editingImageGenerationAgent =
-    editingDefinition?.id === IMAGE_AGENT_DEFINITION_ID;
-  const selectedImageModelId = imageModelIdFromSystemPrompt(draft.systemPrompt);
-  const selectedImageModel =
-    editingImageGenerationAgent && selectedImageModelId
-      ? imageModels.find((model) => model.id === selectedImageModelId) ?? null
-      : null;
-  const modelSelectModels = editingImageGenerationAgent ? imageModels : enabledModels;
-  const modelSelectValue = editingImageGenerationAgent
-    ? (selectedImageModel?.id ?? "")
-    : draft.modelId;
   const selectedModel = enabledModels.find((model) => model.id === draft.modelId) ?? null;
   const selectableProviders = selectedModel
     ? selectedModel.providerIds
@@ -139,8 +114,10 @@ export function AgentsSettingsPanel({
     () => [...new Set([...agentTools, ...draft.allowedTools])].sort(),
     [agentTools, draft.allowedTools],
   );
-  const selectedSystemPromptName =
-    systemPrompts.find((prompt) => prompt.content === draft.systemPrompt)?.name ?? null;
+  const defaultRolePrompt =
+    editingDefinition && isBuiltinAgentDefinition(editingDefinition.id)
+      ? defaultRolePrompts[editingDefinition.id]
+      : null;
   const canSubmit =
     draft.name.trim().length > 0 &&
     draft.description.trim().length > 0 &&
@@ -171,7 +148,7 @@ export function AgentsSettingsPanel({
 
   function openCreateDialog() {
     setEditingDefinitionId(null);
-    setDraft(emptyAgentDefinitionDraft(enabledModels[0], systemPrompts[0]));
+    setDraft(emptyAgentDefinitionDraft(enabledModels[0]));
     setDialogMode("create");
   }
 
@@ -188,20 +165,19 @@ export function AgentsSettingsPanel({
   }
 
   function selectModel(modelId: string) {
-    if (editingImageGenerationAgent) {
-      if (!modelId) {
-        return;
-      }
-      updateDraft({
-        systemPrompt: imageGenerationPromptWithModel(draft.systemPrompt, modelId),
-      });
-      return;
-    }
-
     const model = enabledModels.find((item) => item.id === modelId) ?? null;
     updateDraft({
       modelId,
       providerId: model?.activeProviderId ?? model?.providerIds[0] ?? "",
+    });
+  }
+
+  function restoreDefaultRolePrompt() {
+    if (!defaultRolePrompt) {
+      return;
+    }
+    updateDraft({
+      systemPrompt: defaultRolePrompt,
     });
   }
 
@@ -298,14 +274,7 @@ export function AgentsSettingsPanel({
 
       <div className="mt-4 grid gap-2">
         {definitions.map((definition) => {
-          const imageModelId =
-            definition.id === IMAGE_AGENT_DEFINITION_ID
-              ? imageModelIdFromSystemPrompt(definition.systemPrompt)
-              : null;
-          const displayModelId = imageModelId ?? definition.modelId;
-          const imageModel = imageModelId ? modelById.get(imageModelId) : null;
-          const displayProviderId =
-            imageModel?.activeProviderId ?? imageModel?.providerIds[0] ?? definition.providerId;
+          const isBuiltin = isBuiltinAgentDefinition(definition.id);
 
           return (
             <article
@@ -318,9 +287,9 @@ export function AgentsSettingsPanel({
                     {definition.name}
                   </h4>
                   <span className="truncate text-xs font-medium text-stone-500">
-                    {modelNameById.get(displayModelId) ?? displayModelId}
+                    {modelNameById.get(definition.modelId) ?? definition.modelId}
                     <span aria-hidden="true"> · </span>
-                    {providerNameById.get(displayProviderId) ?? displayProviderId}
+                    {providerNameById.get(definition.providerId) ?? definition.providerId}
                   </span>
                 </div>
                 <p className="mt-1 text-sm leading-5 text-stone-600">
@@ -338,16 +307,18 @@ export function AgentsSettingsPanel({
                 >
                   <Pencil aria-hidden="true" className="size-4" />
                 </button>
-                <button
-                  aria-label={t("Delete agent {name}", { name: definition.name })}
-                  className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 transition hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:text-stone-300"
-                  disabled={operationKey !== null}
-                  onClick={() => void deleteDefinition(definition)}
-                  title={t("Delete")}
-                  type="button"
-                >
-                  <Trash2 aria-hidden="true" className="size-4" />
-                </button>
+                {!isBuiltin ? (
+                  <button
+                    aria-label={t("Delete agent {name}", { name: definition.name })}
+                    className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 transition hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:text-stone-300"
+                    disabled={operationKey !== null}
+                    onClick={() => void deleteDefinition(definition)}
+                    title={t("Delete")}
+                    type="button"
+                  >
+                    <Trash2 aria-hidden="true" className="size-4" />
+                  </button>
+                ) : null}
               </div>
             </article>
           );
@@ -435,9 +406,9 @@ export function AgentsSettingsPanel({
                   value={draft.description}
                 />
               </label>
-              <AgentSelect label={t("Model")} value={modelSelectValue} onChange={selectModel}>
+              <AgentSelect label={t("Model")} value={draft.modelId} onChange={selectModel}>
                 <option value="">{t("Select model")}</option>
-                {modelSelectModels.map((model) => (
+                {enabledModels.map((model) => (
                   <option key={model.id} value={model.id}>
                     {model.displayName}
                   </option>
@@ -477,43 +448,29 @@ export function AgentsSettingsPanel({
                 type="number"
                 value={draft.maxOutputTokens}
               />
-              <label className="block md:col-span-2">
-                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                  {t("System prompt")}
-                </span>
-                <select
-                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) => {
-                    const prompt = systemPrompts.find(
-                      (item) => item.name === event.target.value,
-                    );
-                    updateDraft({ systemPrompt: prompt?.content ?? draft.systemPrompt });
-                  }}
-                  value={selectedSystemPromptName ?? "__current"}
-                >
-                  {selectedSystemPromptName === null && draft.systemPrompt ? (
-                    <option value="__current">{t("Current custom prompt")}</option>
+              <div className="block md:col-span-2">
+                <span className="mb-1.5 flex items-center justify-between gap-3">
+                  <span className="text-xs font-semibold text-stone-600">
+                    {t("Agent role prompt")}
+                  </span>
+                  {defaultRolePrompt ? (
+                    <button
+                      className="inline-flex h-8 items-center justify-center rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-600 transition hover:bg-stone-50 hover:text-teal-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 disabled:cursor-not-allowed disabled:text-stone-300"
+                      disabled={operationKey !== null}
+                      onClick={restoreDefaultRolePrompt}
+                      type="button"
+                    >
+                      {t("Restore default Agent role prompt")}
+                    </button>
                   ) : null}
-                  {!systemPrompts.length ? (
-                    <option value="__current">{t("No system prompts configured")}</option>
-                  ) : null}
-                  {systemPrompts.map((prompt) => (
-                    <option key={prompt.name} value={prompt.name}>
-                      {prompt.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="block md:col-span-2">
-                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                  {t("System prompt content")}
                 </span>
                 <textarea
+                  aria-label={t("Agent role prompt")}
                   className="min-h-40 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                   onChange={(event) => updateDraft({ systemPrompt: event.target.value })}
                   value={draft.systemPrompt}
                 />
-              </label>
+              </div>
               <details className="group/tools relative md:col-span-2">
                 <summary className="flex h-10 cursor-pointer list-none items-center justify-between rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition marker:content-none focus-visible:border-teal-700 focus-visible:ring-2 focus-visible:ring-teal-100">
                   <span className="font-medium">{t("Allowed tools")}</span>
@@ -543,14 +500,20 @@ export function AgentsSettingsPanel({
               <legend className="px-1 text-xs font-semibold text-stone-600">
                 {t("Workspace isolation mode")}
               </legend>
-              <div className="grid gap-3 md:grid-cols-2">
+              <div className="grid gap-2">
                 <AgentCheckbox
                   checked={draft.allowedExecutionWorkspaceModes.includes("shared")}
+                  description={t(
+                    "Uses the current chat workspace directly. Simpler, but file changes land in the shared workspace.",
+                  )}
                   label={t("Shared workspace")}
                   onChange={(checked) => toggleAllowedExecutionWorkspaceMode("shared", checked)}
                 />
                 <AgentCheckbox
                   checked={draft.allowedExecutionWorkspaceModes.includes("isolated_worktree")}
+                  description={t(
+                    "Creates a Foco-managed Git worktree for the instance. File changes stay isolated until you explicitly merge or delete them.",
+                  )}
                   label={t("Isolated workspace")}
                   onChange={(checked) =>
                     toggleAllowedExecutionWorkspaceMode("isolated_worktree", checked)
@@ -680,19 +643,28 @@ function AgentSelect({
 
 function AgentCheckbox({
   checked,
+  description,
   label,
   onChange,
 }: {
   checked: boolean;
+  description?: string;
   label: string;
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <label className="flex min-w-0 cursor-pointer items-center justify-between gap-3 rounded-lg px-3 py-2 text-sm text-stone-800 transition hover:bg-stone-50">
-      <span className="truncate font-medium">{label}</span>
+    <label className="flex min-w-0 cursor-pointer items-start justify-between gap-3 rounded-lg px-3 py-2 text-sm text-stone-800 transition hover:bg-stone-50">
+      <span className="min-w-0">
+        <span className="block truncate font-medium">{label}</span>
+        {description ? (
+          <span className="mt-1 block text-xs leading-5 text-stone-500">
+            {description}
+          </span>
+        ) : null}
+      </span>
       <input
         checked={checked}
-        className="size-4 shrink-0 accent-teal-700"
+        className="mt-0.5 size-4 shrink-0 accent-teal-700"
         onChange={(event) => onChange(event.target.checked)}
         type="checkbox"
       />
@@ -702,7 +674,6 @@ function AgentCheckbox({
 
 function emptyAgentDefinitionDraft(
   model: ConfiguredModelSummary | undefined,
-  systemPrompt: SystemPromptSummary | undefined,
 ): AgentDefinitionDraft {
   return {
     allowedAgentDefinitionIds: [],
@@ -716,33 +687,17 @@ function emptyAgentDefinitionDraft(
     modelId: model?.id ?? "",
     name: "",
     providerId: model?.activeProviderId ?? model?.providerIds[0] ?? "",
-    systemPrompt: systemPrompt?.content ?? "",
+    systemPrompt: "",
     thinkingLevel: "",
   };
 }
 
+function isBuiltinAgentDefinition(id: string) {
+  return id === DEFAULT_AGENT_DEFINITION_ID || id === IMAGE_AGENT_DEFINITION_ID;
+}
+
 function modelOutputsText(model: ConfiguredModelSummary) {
   return model.outputModalities.length === 0 || model.outputModalities.includes("text");
-}
-
-function modelOutputsImage(model: ConfiguredModelSummary) {
-  return model.outputModalities.includes("image");
-}
-
-function imageModelIdFromSystemPrompt(prompt: string) {
-  return IMAGE_GEN_MODEL_INSTRUCTION_PATTERN.exec(prompt)?.[1] ?? null;
-}
-
-function imageGenerationPromptWithModel(prompt: string, modelId: string) {
-  const instruction = `Use image_gen with model "${modelId}" unless the user explicitly asks for another configured image model.`;
-  if (IMAGE_GEN_MODEL_INSTRUCTION_PATTERN.test(prompt)) {
-    return prompt.replace(
-      IMAGE_GEN_MODEL_INSTRUCTION_PATTERN,
-      `Use image_gen with model "${modelId}"`,
-    );
-  }
-  const trimmedPrompt = prompt.trimEnd();
-  return trimmedPrompt ? `${trimmedPrompt}\n\n${instruction}` : instruction;
 }
 
 function agentDefinitionToDraft(

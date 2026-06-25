@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use axum::{
     Json,
     extract::State,
@@ -24,7 +26,7 @@ const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 pub(crate) const IMAGE_AGENT_DEFINITION_ID: &str = "agent-definition-image-gen";
 pub(crate) const IMAGE_AGENT_SYSTEM_PROMPT_NAME: &str = IMAGE_GENERATION_SYSTEM_PROMPT_NAME;
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.";
-const IMAGE_AGENT_SYSTEM_PROMPT: &str = "You are Foco's image generation agent. Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.";
+const IMAGE_AGENT_SYSTEM_PROMPT: &str = "You are Foco's image generation agent. Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.\n\nUse image_gen with model \"gpt-image-2\" unless the user explicitly asks for another configured image model.";
 
 pub(crate) fn default_image_generation_system_prompt() -> String {
     IMAGE_AGENT_SYSTEM_PROMPT.to_string()
@@ -81,21 +83,6 @@ fn default_agent_definition_id() -> Result<AgentDefinitionId, ApiError> {
 fn image_agent_definition_id() -> Result<AgentDefinitionId, ApiError> {
     AgentDefinitionId::new(IMAGE_AGENT_DEFINITION_ID)
         .map_err(|error| ApiError::internal(error.message().to_string()))
-}
-
-pub(crate) fn image_agent_system_prompt_for_config(
-    config: &GlobalConfig,
-) -> Result<Option<String>, ApiError> {
-    let image_id = image_agent_definition_id()?;
-    if let Some(definition) = config
-        .agent_definitions
-        .iter()
-        .find(|definition| definition.id == image_id)
-    {
-        return Ok(Some(definition.system_prompt.clone()));
-    }
-    Ok(image_agent_definition_for_config(config, image_id)
-        .map(|definition| definition.system_prompt))
 }
 
 pub(crate) fn default_image_agent_system_prompt_for_config(
@@ -237,16 +224,13 @@ fn image_agent_definition_for_config(
     config: &GlobalConfig,
     id: AgentDefinitionId,
 ) -> Option<AgentDefinitionSettings> {
-    let image_model = config
+    if !config
         .models
         .iter()
-        .find(|model| model.id == "gpt-image-2" && image_model_available(config, model))
-        .or_else(|| {
-            config
-                .models
-                .iter()
-                .find(|model| image_model_available(config, model))
-        })?;
+        .any(|model| image_model_available(config, model))
+    {
+        return None;
+    }
     let model = default_agent_runner_model(config)?;
     let provider_id = model.active_provider_id.clone()?;
     let allowed_tools = [
@@ -271,10 +255,7 @@ fn image_agent_definition_for_config(
             thinking_level: model.thinking_level.clone(),
             max_output_tokens: None,
         },
-        system_prompt: format!(
-            "{IMAGE_AGENT_SYSTEM_PROMPT}\n\nUse image_gen with model \"{}\" unless the user explicitly asks for another configured image model.",
-            image_model.id
-        ),
+        system_prompt: IMAGE_AGENT_SYSTEM_PROMPT.to_string(),
         allowed_tools,
         max_instances: 1,
         allowed_execution_workspace_modes: vec![foco_agent::AgentExecutionWorkspaceMode::Shared],
@@ -370,11 +351,6 @@ pub(crate) async fn update_agent_definition(
     let mut config = config_snapshot(&state)?;
     let image_id = image_agent_definition_id()?;
     let updates_image_agent = request.id == image_id;
-    let image_agent_prompt = if updates_image_agent {
-        Some(request.definition.system_prompt.clone())
-    } else {
-        None
-    };
     let stored_index = config
         .agent_definitions
         .iter()
@@ -396,9 +372,6 @@ pub(crate) async fn update_agent_definition(
         ));
     }
     refresh_builtin_agent_definitions(&mut config)?;
-    if let Some(prompt) = image_agent_prompt {
-        upsert_image_generation_system_prompt(&mut config.prompts, prompt);
-    }
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -411,6 +384,13 @@ pub(crate) async fn delete_agent_definition(
 ) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
     let default_id = default_agent_definition_id()?;
+    let image_id = image_agent_definition_id()?;
+    if request.id == default_id || request.id == image_id {
+        return Err(ApiError::bad_request(format!(
+            "built-in agent definition '{}' cannot be deleted",
+            request.id
+        )));
+    }
     if let Some(dependent) = config.agent_definitions.iter().find(|definition| {
         definition.id != default_id
             && definition
@@ -513,7 +493,21 @@ pub(crate) async fn known_agent_tool_names(
 fn agent_definitions_response(config: &GlobalConfig) -> Json<AgentDefinitionsResponse> {
     Json(AgentDefinitionsResponse {
         agent_definitions: config.agent_definitions.clone(),
+        default_role_prompts: default_agent_role_prompts(config),
     })
+}
+
+fn default_agent_role_prompts(config: &GlobalConfig) -> BTreeMap<AgentDefinitionId, String> {
+    let mut prompts = BTreeMap::new();
+    if let Ok(default_id) = default_agent_definition_id() {
+        prompts.insert(default_id, DEFAULT_AGENT_SYSTEM_PROMPT.to_string());
+    }
+    if let Ok(image_id) = image_agent_definition_id() {
+        if let Some(definition) = image_agent_definition_for_config(config, image_id.clone()) {
+            prompts.insert(image_id, definition.system_prompt);
+        }
+    }
+    prompts
 }
 
 pub(crate) async fn save_general_settings(
@@ -716,7 +710,10 @@ pub(crate) async fn save_prompt_settings(
         request.system_prompt,
         &build_default_system_prompt(),
     )?;
-    let image_agent_prompt = image_generation_system_prompt_content(&system_prompts);
+    let system_prompts = system_prompts
+        .into_iter()
+        .filter(|prompt| prompt.name != IMAGE_GENERATION_SYSTEM_PROMPT_NAME)
+        .collect();
 
     config.prompts = PromptSettings {
         system_prompts,
@@ -725,54 +722,12 @@ pub(crate) async fn save_prompt_settings(
         extra_text: request.extra_text.trim().to_string(),
     };
     refresh_builtin_agent_definitions(&mut config)?;
-    if let Some(prompt) = image_agent_prompt {
-        update_image_agent_system_prompt(&mut config, prompt)?;
-    }
     config
         .validate(Some(&state.config_file))
         .map_err(ApiError::from_config_error)?;
     save_config(&state, config.clone())?;
 
     settings_response(&state, &config).await
-}
-
-fn image_generation_system_prompt_content(
-    system_prompts: &[SystemPromptSettings],
-) -> Option<String> {
-    system_prompts
-        .iter()
-        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
-        .map(|prompt| prompt.content.clone())
-}
-
-fn upsert_image_generation_system_prompt(settings: &mut PromptSettings, content: String) {
-    if let Some(prompt) = settings
-        .system_prompts
-        .iter_mut()
-        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
-    {
-        prompt.content = content;
-        return;
-    }
-    settings.system_prompts.push(SystemPromptSettings {
-        name: IMAGE_AGENT_SYSTEM_PROMPT_NAME.to_string(),
-        content,
-    });
-}
-
-fn update_image_agent_system_prompt(
-    config: &mut GlobalConfig,
-    prompt: String,
-) -> Result<(), ApiError> {
-    let image_id = image_agent_definition_id()?;
-    if let Some(definition) = config
-        .agent_definitions
-        .iter_mut()
-        .find(|definition| definition.id == image_id)
-    {
-        definition.system_prompt = prompt;
-    }
-    Ok(())
 }
 
 #[cfg(all(windows, not(debug_assertions)))]

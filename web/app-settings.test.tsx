@@ -866,10 +866,6 @@ describe("app-settings verification surfaces", () => {
                 name: "Default",
               },
               {
-                content: "Generate images with image_gen.",
-                name: "Image Generation",
-              },
-              {
                 name: "Review",
                 content: "Review as senior engineer.",
               },
@@ -881,7 +877,7 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
-  it("shows the image agent system prompt as a fixed prompt", async () => {
+  it("hides the built-in image agent role prompt from prompt settings", async () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
@@ -889,36 +885,12 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
 
     const defaultPromptButton = screen.getByRole("button", { name: "Default" });
-    const imagePromptButton = screen.getByRole("button", { name: "Image Generation" });
-    expect(
-      defaultPromptButton.compareDocumentPosition(imagePromptButton) &
-        Node.DOCUMENT_POSITION_FOLLOWING,
-    ).toBeTruthy();
-
-    await userEvent.click(imagePromptButton);
-    expect(screen.getByLabelText("System prompt")).toHaveValue(
-      "Generate images with image_gen.",
-    );
+    expect(defaultPromptButton).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Image Generation" })).not.toBeInTheDocument();
     const restoreButtons = screen.getAllByRole("button", {
       name: "Restore default system prompt",
     });
-    expect(restoreButtons).toHaveLength(2);
-    await userEvent.clear(screen.getByLabelText("System prompt"));
-    await userEvent.type(screen.getByLabelText("System prompt"), "Custom image prompt.");
-    await userEvent.click(restoreButtons[1]);
-    expect(screen.getByLabelText("System prompt")).toHaveValue(
-      "Generate images with image_gen.",
-    );
-    expect(
-      screen.queryByRole("button", {
-        name: "Rename system prompt Image Generation",
-      }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", {
-        name: "Remove system prompt Image Generation",
-      }),
-    ).not.toBeInTheDocument();
+    expect(restoreButtons).toHaveLength(1);
   });
 
   it("renames user system prompts before saving prompt settings", async () => {
@@ -962,10 +934,6 @@ describe("app-settings verification surfaces", () => {
                 name: "Default",
               },
               {
-                content: "Generate images with image_gen.",
-                name: "Image Generation",
-              },
-              {
                 name: "Reviewer",
                 content: "Review as senior engineer.",
               },
@@ -1006,10 +974,6 @@ describe("app-settings verification surfaces", () => {
               {
                 content: "You are Foco, a local coding agent.",
                 name: "Default",
-              },
-              {
-                content: "Generate images with image_gen.",
-                name: "Image Generation",
               },
             ],
           }),
@@ -1185,7 +1149,6 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Add model" }));
     await userEvent.type(screen.getByLabelText("Model id"), "gpt-image-2");
     await userEvent.type(screen.getByLabelText("Display name"), "GPT Image 2");
-    await userEvent.selectOptions(screen.getByLabelText("System prompt"), "Image Generation");
     await userEvent.click(screen.getByRole("checkbox", { name: "Enable model" }));
 
     const outputTypes = screen.getByRole("group", { name: "Output types" });
@@ -1205,7 +1168,7 @@ describe("app-settings verification surfaces", () => {
         contextWindow: null,
         maxOutputTokens: null,
         outputModalities: ["image"],
-        systemPromptName: "Image Generation",
+        systemPromptName: "Default",
       });
     });
   });

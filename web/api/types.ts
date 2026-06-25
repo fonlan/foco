@@ -784,6 +784,7 @@ export type AgentDefinitionSettings = AgentDefinitionInput & {
 
 export type AgentDefinitionsResponse = {
   agentDefinitions: AgentDefinitionSettings[];
+  defaultRolePrompts?: Record<string, string>;
 };
 
 export type AgentDefinitionRuntimeView = Omit<

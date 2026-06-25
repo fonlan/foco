@@ -642,6 +642,7 @@ export function App() {
   }
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionSettings[]>([]);
+  const [defaultAgentRolePrompts, setDefaultAgentRolePrompts] = useState<Record<string, string>>({});
   const [isTeamModeEnabled, setIsTeamModeEnabled] = useState(false);
   const [isLoadingAgentDefinitions, setIsLoadingAgentDefinitions] = useState(false);
   const [agentDefinitionsError, setAgentDefinitionsError] = useState<string | null>(null);
@@ -1220,6 +1221,7 @@ export function App() {
         "/api/agent-definitions",
       );
       setAgentDefinitions(data.agentDefinitions);
+      setDefaultAgentRolePrompts(data.defaultRolePrompts ?? {});
       return data.agentDefinitions;
     } catch (requestError) {
       setAgentDefinitionsError(errorMessage(requestError));
@@ -1380,6 +1382,7 @@ export function App() {
         },
       );
       setAgentDefinitions(data.agentDefinitions);
+      setDefaultAgentRolePrompts(data.defaultRolePrompts ?? {});
       return true;
     } catch (requestError) {
       setAgentDefinitionsError(errorMessage(requestError));
@@ -1406,6 +1409,7 @@ export function App() {
         },
       );
       setAgentDefinitions(data.agentDefinitions);
+      setDefaultAgentRolePrompts(data.defaultRolePrompts ?? {});
       return true;
     } catch (requestError) {
       setAgentDefinitionsError(errorMessage(requestError));
@@ -1429,6 +1433,7 @@ export function App() {
         },
       );
       setAgentDefinitions(data.agentDefinitions);
+      setDefaultAgentRolePrompts(data.defaultRolePrompts ?? {});
     } catch (requestError) {
       setAgentDefinitionsError(errorMessage(requestError));
     } finally {
@@ -7535,6 +7540,7 @@ export function App() {
                   agentDefinitionOperationKey={agentDefinitionOperationKey}
                   agentDefinitions={agentDefinitions}
                   agentDefinitionsError={agentDefinitionsError}
+                  defaultAgentRolePrompts={defaultAgentRolePrompts}
                   canLogout={canLogout}
                   canUseNativePicker={canUseNativePicker}
                   activeSection={settingsSection}
@@ -11656,6 +11662,7 @@ function SettingsPanel({
   agentDefinitionOperationKey,
   agentDefinitions,
   agentDefinitionsError,
+  defaultAgentRolePrompts,
   canLogout,
   canUseNativePicker,
   isLoadingAgentDefinitions,
@@ -11675,6 +11682,7 @@ function SettingsPanel({
   agentDefinitionOperationKey: string | null;
   agentDefinitions: AgentDefinitionSettings[];
   agentDefinitionsError: string | null;
+  defaultAgentRolePrompts: Record<string, string>;
   canLogout: boolean;
   canUseNativePicker: boolean;
   isLoadingAgentDefinitions: boolean;
@@ -13161,9 +13169,6 @@ function SettingsPanel({
     }
     if (name === DEFAULT_SYSTEM_PROMPT_NAME) {
       return settings.prompts.defaultSystemPrompt;
-    }
-    if (name === IMAGE_AGENT_SYSTEM_PROMPT_NAME) {
-      return settings.prompts.defaultImageGenerationSystemPrompt ?? null;
     }
     return null;
   }
@@ -15628,6 +15633,7 @@ function SettingsPanel({
             <AgentsSettingsPanel
               agentTools={settings?.agentTools ?? []}
               defaultTeamModeEnabled={settings?.general.defaultTeamModeEnabled ?? false}
+              defaultRolePrompts={defaultAgentRolePrompts}
               definitions={agentDefinitions}
               error={agentDefinitionsError}
               isLoading={isLoadingAgentDefinitions}
@@ -15639,7 +15645,6 @@ function SettingsPanel({
               onUpdateDefinition={onUpdateAgentDefinition}
               operationKey={agentDefinitionOperationKey}
               providers={providers}
-              systemPrompts={savedSystemPrompts}
               thinkingLevels={thinkingLevels}
             />
           ) : null}
@@ -21704,8 +21709,12 @@ function normalizedSystemPromptSummaries(
       },
     ];
 
-  if (systemPrompts.some((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)) {
-    return systemPrompts;
+  const filteredPrompts = systemPrompts.filter(
+    (prompt) => prompt.name !== IMAGE_AGENT_SYSTEM_PROMPT_NAME,
+  );
+
+  if (filteredPrompts.some((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)) {
+    return filteredPrompts;
   }
 
   return [
@@ -21713,15 +21722,12 @@ function normalizedSystemPromptSummaries(
       name: DEFAULT_SYSTEM_PROMPT_NAME,
       content: prompts.defaultSystemPrompt,
     },
-    ...systemPrompts,
+    ...filteredPrompts,
   ];
 }
 
 function isSystemPromptFixed(name: string): boolean {
-  return (
-    name === DEFAULT_SYSTEM_PROMPT_NAME ||
-    name === IMAGE_AGENT_SYSTEM_PROMPT_NAME
-  );
+  return name === DEFAULT_SYSTEM_PROMPT_NAME;
 }
 
 function emptyMemorySettingsForm(): MemorySettingsFormState {

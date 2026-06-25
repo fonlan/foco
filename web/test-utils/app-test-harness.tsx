@@ -203,7 +203,6 @@ export const settings = {
   },
   prompts: {
     defaultSystemPrompt: "You are Foco, a local coding agent.",
-    defaultImageGenerationSystemPrompt: "Generate images with image_gen.",
     extraText: "",
     files: [],
     systemPrompt: null,
@@ -211,10 +210,6 @@ export const settings = {
       {
         content: "You are Foco, a local coding agent.",
         name: "Default",
-      },
-      {
-        content: "Generate images with image_gen.",
-        name: "Image Generation",
       },
     ],
   },
@@ -2220,8 +2215,6 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       ...settings,
       prompts: {
         defaultSystemPrompt: settings.prompts.defaultSystemPrompt,
-        defaultImageGenerationSystemPrompt:
-          settings.prompts.defaultImageGenerationSystemPrompt,
         extraText: body.extraText ?? "Keep replies concise.",
         files: body.files ?? ["C:/Users/fonla/.codex/AGENTS.md"],
         systemPrompt: null,

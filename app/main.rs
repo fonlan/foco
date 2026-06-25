@@ -2707,6 +2707,7 @@ struct SettingsResponse {
 #[serde(rename_all = "camelCase")]
 struct AgentDefinitionsResponse {
     agent_definitions: Vec<AgentDefinitionSettings>,
+    default_role_prompts: BTreeMap<AgentDefinitionId, String>,
 }
 
 #[derive(Serialize)]

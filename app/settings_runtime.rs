@@ -5,17 +5,17 @@ use foco_agent::build_default_system_prompt;
 use foco_providers::supported_provider_kinds;
 use foco_store::{
     config::{
-        DEFAULT_SYSTEM_PROMPT_NAME, GlobalConfig, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig,
-        ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
-        SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS, WEB_SEARCH_PROVIDER_BRAVE,
-        WEB_SEARCH_PROVIDER_TAVILY, WebSearchSettings, WorkspaceCommonCommand, WorkspaceConfig,
+        GlobalConfig, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig, ModelSettings,
+        ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
+        SUPPORTED_TERMINAL_SHELLS, WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY,
+        WebSearchSettings, WorkspaceCommonCommand, WorkspaceConfig,
     },
     workspace::WorkspaceDatabase,
 };
 
 use crate::http::settings::{
     IMAGE_AGENT_SYSTEM_PROMPT_NAME, default_image_agent_system_prompt_for_config,
-    image_agent_system_prompt_for_config, known_agent_tool_names,
+    known_agent_tool_names,
 };
 use crate::*;
 
@@ -229,25 +229,7 @@ fn settings_system_prompt_summaries(
     default_system_prompt: &str,
 ) -> Result<Vec<SystemPromptSummary>, ApiError> {
     let mut summaries = system_prompt_summaries(&config.prompts, default_system_prompt);
-    let image_prompt = summaries
-        .iter()
-        .position(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
-        .map(|index| summaries.remove(index));
-    let image_prompt = match image_prompt {
-        Some(prompt) => Some(prompt),
-        None => image_agent_system_prompt_for_config(config)?.map(|content| SystemPromptSummary {
-            name: IMAGE_AGENT_SYSTEM_PROMPT_NAME.to_string(),
-            content,
-        }),
-    };
-    if let Some(prompt) = image_prompt {
-        let insert_index = summaries
-            .iter()
-            .position(|prompt| prompt.name == DEFAULT_SYSTEM_PROMPT_NAME)
-            .map(|index| index + 1)
-            .unwrap_or(summaries.len());
-        summaries.insert(insert_index, prompt);
-    }
+    summaries.retain(|prompt| prompt.name != IMAGE_AGENT_SYSTEM_PROMPT_NAME);
     Ok(summaries)
 }
 
