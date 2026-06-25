@@ -1564,6 +1564,7 @@ function ReasoningBlock({
           <MarkdownContent
             content={reasoning}
             isUser={false}
+            renderMode={isStreaming ? "streaming" : "full"}
             selectedSkillPrefix={helpers.selectedSkillPrefix}
             variant="reasoning"
           />
@@ -1630,6 +1631,7 @@ function MessagePartBlockComponent({
       content={part.text}
       isError={isError}
       isUser={isUser}
+      renderMode={!isUser && isStreaming && isStreamingTail ? "streaming" : "full"}
       selectedSkillPrefix={helpers.selectedSkillPrefix}
     />
   );

@@ -1,6 +1,7 @@
 import {
   Children,
   isValidElement,
+  memo,
   useEffect,
   useId,
   useRef,
@@ -27,6 +28,8 @@ export type SelectedSkillPrefixResolver = (
   content: string,
   isUser: boolean,
 ) => SelectedSkillPrefix | null;
+
+type MarkdownRenderMode = "full" | "streaming";
 
 type MermaidRuntime = {
   initialize: (config: Record<string, unknown>) => void;
@@ -75,23 +78,27 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 };
 
-export function MarkdownContent({
+export const MarkdownContent = memo(function MarkdownContent({
   content,
   isError = false,
   isUser,
+  renderMode = "full",
   selectedSkillPrefix,
   variant = "message",
 }: {
   content: string;
   isError?: boolean;
   isUser: boolean;
+  renderMode?: MarkdownRenderMode;
   selectedSkillPrefix: SelectedSkillPrefixResolver;
   variant?: "message" | "reasoning";
 }) {
   const skillPrefix = selectedSkillPrefix(content, isUser);
-  const markdownContent = deferIncompleteMermaidBlocks(
-    skillPrefix?.remaining ?? content,
-  );
+  const displayContent = skillPrefix?.remaining ?? content;
+  const markdownContent =
+    renderMode === "streaming"
+      ? displayContent
+      : deferIncompleteMermaidBlocks(displayContent);
 
   return (
     <div
@@ -115,7 +122,10 @@ export function MarkdownContent({
           ))}
         </div>
       ) : null}
-      {markdownContent ? (
+      {markdownContent ? renderMode === "streaming" ? (
+        // ponytail: plain streaming tail skips plugin churn; use tail-only markdown parsing if this becomes too limited.
+        <div className="whitespace-pre-wrap break-words">{markdownContent}</div>
+      ) : (
         <ReactMarkdown
           components={MARKDOWN_COMPONENTS}
           rehypePlugins={[rehypeKatex]}
@@ -127,7 +137,7 @@ export function MarkdownContent({
       ) : null}
     </div>
   );
-}
+});
 
 function MermaidDiagram({ definition }: { definition: string }) {
   const { t } = useI18n();

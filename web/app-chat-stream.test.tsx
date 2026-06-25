@@ -485,7 +485,9 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       within(guidanceRow as HTMLElement).queryByText("Guidance pending"),
     ).not.toBeInTheDocument();
-    const interruptedAssistantRow = initialAnswer.closest(".message-row");
+    const interruptedAssistantRow = screen
+      .getByText("Initial answer.")
+      .closest(".message-row");
     expect(interruptedAssistantRow).not.toBeNull();
     expect(
       within(interruptedAssistantRow as HTMLElement).getByText("Model: gpt-test"),
@@ -523,7 +525,9 @@ describe("app-chat-stream verification surfaces", () => {
     // the original assistant message id.
     const guidedAnswerRow = guidedAnswer.closest(".message-row");
     expect(guidedAnswerRow).not.toBeNull();
-    const initialAnswerRow = initialAnswer.closest(".message-row");
+    const initialAnswerRow = screen
+      .getByText("Initial answer.")
+      .closest(".message-row");
     expect(initialAnswerRow).not.toBeNull();
     expect(
       within(initialAnswerRow as HTMLElement).queryByText("Adjusted answer."),
@@ -1962,7 +1966,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("waits for a streaming Mermaid fence to close before rendering", async () => {
+  it("defers streaming Mermaid rendering until the message completes", async () => {
     renderApp();
 
     await userEvent.click(await screen.findByText("Second chat"));
@@ -1978,7 +1982,7 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    expect(await screen.findByText("flowchart TD")).toBeInTheDocument();
+    expect(await screen.findByText(/flowchart TD/)).toBeInTheDocument();
     expect(screen.queryByText("Mermaid diagram failed to render.")).not.toBeInTheDocument();
     expect(mermaidMock.render).not.toHaveBeenCalled();
 
@@ -1990,11 +1994,107 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
+    expect(await screen.findByText(/A --> B/)).toBeInTheDocument();
+    expect(mermaidMock.render).not.toHaveBeenCalled();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-2",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 12,
+          providerId: "provider-1",
+          totalLatencyMs: 100,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "```mermaid\nflowchart TD\n  A --> B\n```",
+        type: "complete",
+        usage: null,
+      });
+    });
+
     expect(await screen.findByTestId("mermaid-svg")).toBeInTheDocument();
     expect(mermaidMock.render).toHaveBeenCalledWith(
       expect.stringMatching(/^foco-mermaid-/),
       "flowchart TD\n  A --> B",
     );
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("renders streaming markdown as plain text and full markdown after complete", async () => {
+    renderApp();
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "markdown",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    const markdown = [
+      "Here is [docs](https://example.com).",
+      "",
+      "```ts",
+      "console.log(1)",
+      "```",
+      "",
+      "| A | B |",
+      "| - | - |",
+      "| 1 | 2 |",
+      "",
+      "$x^2$",
+    ].join("\n");
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: markdown,
+        type: "textDelta",
+      });
+    });
+
+    const rawMarkdown = await screen.findByText(/\[docs\]\(https:\/\/example\.com\)/);
+    const streamingBubble = rawMarkdown.closest(".message-bubble") as HTMLElement;
+    expect(streamingBubble).not.toBeNull();
+    expect(
+      within(streamingBubble).queryByRole("link", { name: "docs" }),
+    ).toBeNull();
+    expect(streamingBubble.querySelector("pre code")).toBeNull();
+    expect(streamingBubble.querySelector("table")).toBeNull();
+    expect(streamingBubble.querySelector(".katex")).toBeNull();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 30,
+          providerId: "provider-1",
+          totalLatencyMs: 100,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: markdown,
+        type: "complete",
+        usage: null,
+      });
+    });
+
+    const link = await screen.findByRole("link", { name: "docs" });
+    const completeBubble = link.closest(".message-bubble") as HTMLElement;
+    expect(link).toHaveAttribute("href", "https://example.com");
+    expect(completeBubble.querySelector("pre code")).not.toBeNull();
+    expect(completeBubble.querySelector("table")).not.toBeNull();
+    expect(completeBubble.querySelector(".katex")).not.toBeNull();
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();

@@ -602,9 +602,24 @@ export function App() {
     useState<WorkspaceChatContextMenuState | null>(null);
   const [workspaceFileContextMenu, setWorkspaceFileContextMenu] =
     useState<WorkspaceFileContextMenuState | null>(null);
-  const [chatMessagesByKey, setChatMessagesByKey] = useState<
+  const [, setChatMessagesByKeyState] = useState<
     Record<string, ShellMessage[]>
   >({});
+  const chatMessagesByKeyRef = useRef<Record<string, ShellMessage[]>>({});
+  function setChatMessagesByKey(
+    updater:
+      | Record<string, ShellMessage[]>
+      | ((
+        current: Record<string, ShellMessage[]>,
+      ) => Record<string, ShellMessage[]>),
+  ) {
+    const next =
+      typeof updater === "function"
+        ? updater(chatMessagesByKeyRef.current)
+        : updater;
+    chatMessagesByKeyRef.current = next;
+    setChatMessagesByKeyState(next);
+  }
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionSettings[]>([]);
   const [isTeamModeEnabled, setIsTeamModeEnabled] = useState(false);
@@ -2507,13 +2522,13 @@ export function App() {
       return;
     }
 
-    setChatMessagesByKey((current) => {
-      const next = resolveNext(current[chatKey] ?? []);
-      return { ...current, [chatKey]: next };
-    });
+    const currentByKey = chatMessagesByKeyRef.current;
+    const nextForKey = resolveNext(currentByKey[chatKey] ?? []);
+    const nextByKey = { ...currentByKey, [chatKey]: nextForKey };
+    setChatMessagesByKey(nextByKey);
 
     if (activeChatKeyRef.current === chatKey) {
-      setMessages((current) => resolveNext(current));
+      setMessages(nextForKey);
     }
   }
 
@@ -3142,7 +3157,7 @@ export function App() {
   }
 
   function selectScheduledWorkspaceRun(run: ScheduledWorkspaceRun) {
-    const cachedMessages = chatMessagesByKey[run.chatKey] ?? [];
+    const cachedMessages = chatMessagesByKeyRef.current[run.chatKey] ?? [];
     setActiveWorkspaceId(run.workspaceId);
     setActiveChatId(run.chatId);
     setActiveMainTab({ chatId: run.chatId, type: "chat", workspaceId: run.workspaceId });
@@ -3241,7 +3256,7 @@ export function App() {
         return;
       }
       const chatKey = chatRunKey(workspaceId, chatId);
-      const cachedMessages = chatMessagesByKey[chatKey] ?? [];
+      const cachedMessages = chatMessagesByKeyRef.current[chatKey] ?? [];
       setActiveWorkspaceId(workspaceId);
       setActiveChatId(chatId);
       setActiveMainTab({ chatId, type: "chat", workspaceId });
@@ -3263,7 +3278,7 @@ export function App() {
         controller.abort();
       }
     }
-    const cachedMessages = chatMessagesByKey[chatKey];
+    const cachedMessages = chatMessagesByKeyRef.current[chatKey];
 
     if (!cachedMessages) {
       setActiveWorkspaceId(workspaceId);
@@ -3391,7 +3406,7 @@ export function App() {
 
   function selectAgentTab(tab: OpenAgentTab) {
     const chatKey = chatRunKey(tab.workspaceId, tab.chatId);
-    const cachedMessages = chatMessagesByKey[chatKey];
+    const cachedMessages = chatMessagesByKeyRef.current[chatKey];
 
     setActiveWorkspaceId(tab.workspaceId);
     setActiveChatId(tab.chatId);
