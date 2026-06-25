@@ -220,6 +220,32 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("shows context compression badges from stream side events", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        kind: "rule",
+        snapshotId: "snapshot-rule-1",
+        type: "contextCompression",
+      });
+    });
+
+    expect(await screen.findByText("Rule compressed")).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("keeps context usage isolated between open chats", async () => {
     renderApp();
 

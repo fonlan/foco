@@ -79,6 +79,7 @@ import {
   Suspense,
   lazy,
   memo,
+  startTransition,
   useCallback,
   useEffect,
   useId,
@@ -507,6 +508,12 @@ const MEMORY_DREAM_DEFAULT_PAGE_SIZE = 10;
 const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
 const EMPTY_CONFIGURED_PROVIDERS: ConfiguredProviderSummary[] = [];
 const EMPTY_GIT_STATUS_FILES: GitStatusFileSummary[] = [];
+
+function deferStreamSideUpdate(update: () => void) {
+  // ponytail: transition is enough for sparse side events; add a real queue only
+  // if profiler shows usage/tool/context storms.
+  startTransition(update);
+}
 
 type ComposerDefaultSelection = {
   modelId: string;
@@ -5127,10 +5134,12 @@ export function App() {
     contextUsageAbortByChatKeyRef.current.get(chatKey)?.abort();
     const abortController = new AbortController();
     contextUsageAbortByChatKeyRef.current.set(chatKey, abortController);
-    setContextUsageLoadingByChatKey((current) => ({
-      ...current,
-      [chatKey]: true,
-    }));
+    deferStreamSideUpdate(() => {
+      setContextUsageLoadingByChatKey((current) => ({
+        ...current,
+        [chatKey]: true,
+      }));
+    });
 
     try {
       const data = await requestJson<ContextUsageResponse>(
@@ -5151,7 +5160,9 @@ export function App() {
       );
 
       if (contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId) {
-        setContextUsageByChatKey((current) => ({ ...current, [chatKey]: data }));
+        deferStreamSideUpdate(() => {
+          setContextUsageByChatKey((current) => ({ ...current, [chatKey]: data }));
+        });
       }
     } catch (requestError) {
       const wasCancelled =
@@ -5167,10 +5178,12 @@ export function App() {
         contextUsageAbortByChatKeyRef.current.delete(chatKey);
       }
       if (contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId) {
-        setContextUsageLoadingByChatKey((current) => ({
-          ...current,
-          [chatKey]: false,
-        }));
+        deferStreamSideUpdate(() => {
+          setContextUsageLoadingByChatKey((current) => ({
+            ...current,
+            [chatKey]: false,
+          }));
+        });
       }
     }
   }
@@ -5663,13 +5676,15 @@ export function App() {
         }
 
         if (streamEvent.type === "contextCompression") {
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? addChatRunBadge(message, contextCompressionBadge(streamEvent.kind))
-                : message,
-            ),
-          );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                  ? addChatRunBadge(message, contextCompressionBadge(streamEvent.kind))
+                  : message,
+              ),
+            );
+          });
           return;
         }
 
@@ -5680,11 +5695,13 @@ export function App() {
               streamEvent.usage.outputTokens !== null
               ? streamEvent.usage
               : null;
-          updateLiveChatStatistics(chatKey, {
-            modelId: selectedModelIdRef.current,
-            providerId: selectedProviderIdRef.current,
-            startedAtMs: liveStartedAtMs,
-            usage: latestResponseUsage,
+          deferStreamSideUpdate(() => {
+            updateLiveChatStatistics(chatKey, {
+              modelId: selectedModelIdRef.current,
+              providerId: selectedProviderIdRef.current,
+              startedAtMs: liveStartedAtMs,
+              usage: latestResponseUsage,
+            });
           });
           refreshRunContextUsage();
           return;
@@ -5755,22 +5772,24 @@ export function App() {
           );
           const messageOwnsToolCall = (message: ShellMessage) =>
             messageHasToolCall(message, streamEvent.toolCall.id);
-          setMessagesForChatKey(chatKey, (current) => {
-            const updateExistingToolCall = current.some(messageOwnsToolCall);
-            return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                ? {
-                  ...message,
-                  parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
-                  toolCalls: upsertToolCall(
-                    message.toolCalls,
-                    streamEvent.toolCall,
-                  ),
-                }
-                : message,
-            );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(chatKey, (current) => {
+              const updateExistingToolCall = current.some(messageOwnsToolCall);
+              return current.map((message) =>
+                (updateExistingToolCall
+                  ? messageOwnsToolCall(message)
+                  : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
+                  ? {
+                    ...message,
+                    parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
+                    toolCalls: upsertToolCall(
+                      message.toolCalls,
+                      streamEvent.toolCall,
+                    ),
+                  }
+                  : message,
+              );
+            });
           });
           return;
         }
@@ -5778,29 +5797,31 @@ export function App() {
         if (streamEvent.type === "toolResult") {
           const messageOwnsToolCall = (message: ShellMessage) =>
             messageHasToolCall(message, streamEvent.toolCallId);
-          setMessagesForChatKey(chatKey, (current) => {
-            const updateExistingToolCall = current.some(messageOwnsToolCall);
-            return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                ? {
-                  ...message,
-                  parts: applyToolResultToParts(
-                    message.parts,
-                    streamEvent.toolCallId,
-                    streamEvent.output,
-                    streamEvent.isError,
-                  ),
-                  toolCalls: applyToolResult(
-                    message.toolCalls,
-                    streamEvent.toolCallId,
-                    streamEvent.output,
-                    streamEvent.isError,
-                  ),
-                }
-                : message,
-            );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(chatKey, (current) => {
+              const updateExistingToolCall = current.some(messageOwnsToolCall);
+              return current.map((message) =>
+                (updateExistingToolCall
+                  ? messageOwnsToolCall(message)
+                  : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
+                  ? {
+                    ...message,
+                    parts: applyToolResultToParts(
+                      message.parts,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                    ),
+                    toolCalls: applyToolResult(
+                      message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                    ),
+                  }
+                  : message,
+              );
+            });
           });
           return;
         }
@@ -5808,29 +5829,31 @@ export function App() {
         if (streamEvent.type === "toolOutputDelta") {
           const messageOwnsToolCall = (message: ShellMessage) =>
             messageHasToolCall(message, streamEvent.toolCallId);
-          setMessagesForChatKey(chatKey, (current) => {
-            const updateExistingToolCall = current.some(messageOwnsToolCall);
-            return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                ? {
-                  ...message,
-                  parts: applyToolOutputDeltaToParts(
-                    message.parts,
-                    streamEvent.toolCallId,
-                    streamEvent.stream,
-                    streamEvent.delta,
-                  ),
-                  toolCalls: applyToolOutputDelta(
-                    message.toolCalls,
-                    streamEvent.toolCallId,
-                    streamEvent.stream,
-                    streamEvent.delta,
-                  ),
-                }
-                : message,
-            );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(chatKey, (current) => {
+              const updateExistingToolCall = current.some(messageOwnsToolCall);
+              return current.map((message) =>
+                (updateExistingToolCall
+                  ? messageOwnsToolCall(message)
+                  : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
+                  ? {
+                    ...message,
+                    parts: applyToolOutputDeltaToParts(
+                      message.parts,
+                      streamEvent.toolCallId,
+                      streamEvent.stream,
+                      streamEvent.delta,
+                    ),
+                    toolCalls: applyToolOutputDelta(
+                      message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.stream,
+                      streamEvent.delta,
+                    ),
+                  }
+                  : message,
+              );
+            });
           });
           return;
         }
@@ -5846,19 +5869,21 @@ export function App() {
           if (streamEvent.notification.level === "error") {
             setError(streamEvent.notification.message);
           }
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? {
-                  ...message,
-                  parts: appendTextPart(
-                    message.parts,
-                    `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
-                  ),
-                }
-                : message,
-            ),
-          );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                  ? {
+                    ...message,
+                    parts: appendTextPart(
+                      message.parts,
+                      `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
+                    ),
+                  }
+                  : message,
+              ),
+            );
+          });
           return;
         }
 
@@ -5866,12 +5891,14 @@ export function App() {
           if (isContextPanelOpen && contextPanelTab === "git") {
             void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
           }
-          updateLiveChatStatistics(chatKey, {
-            codeChangeStats: streamEvent.codeChangeStats,
-            modelId: selectedModelIdRef.current,
-            providerId: selectedProviderIdRef.current,
-            startedAtMs: liveStartedAtMs,
-            usage: latestResponseUsage,
+          deferStreamSideUpdate(() => {
+            updateLiveChatStatistics(chatKey, {
+              codeChangeStats: streamEvent.codeChangeStats,
+              modelId: selectedModelIdRef.current,
+              providerId: selectedProviderIdRef.current,
+              startedAtMs: liveStartedAtMs,
+              usage: latestResponseUsage,
+            });
           });
           void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           return;
@@ -5898,29 +5925,33 @@ export function App() {
 
         if (streamEvent.type === "memoryExtractionComplete") {
           void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? assistantMessageWithExtractedMemories(
-                  message,
-                  streamEvent.extractedMemories,
-                )
-                : message,
-            ),
-          );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                  ? assistantMessageWithExtractedMemories(
+                    message,
+                    streamEvent.extractedMemories,
+                  )
+                  : message,
+              ),
+            );
+          });
           return;
         }
         if (streamEvent.type === "memoryResolved") {
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? assistantMessageWithMemoriesUsed(
-                  message,
-                  streamEvent.memoriesUsed,
-                )
-                : message,
-            ),
-          );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                  ? assistantMessageWithMemoriesUsed(
+                    message,
+                    streamEvent.memoriesUsed,
+                  )
+                  : message,
+              ),
+            );
+          });
           return;
         }
 
@@ -6575,13 +6606,15 @@ export function App() {
         }
 
         if (streamEvent.type === "contextCompression") {
-          setMessagesForChatKey(runMessagesKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? addChatRunBadge(message, contextCompressionBadge(streamEvent.kind))
-                : message,
-            ),
-          );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(runMessagesKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                  ? addChatRunBadge(message, contextCompressionBadge(streamEvent.kind))
+                  : message,
+              ),
+            );
+          });
           return;
         }
 
@@ -6592,11 +6625,13 @@ export function App() {
               streamEvent.usage.outputTokens !== null
               ? streamEvent.usage
               : null;
-          updateLiveChatStatistics(runMessagesKey, {
-            modelId: request.modelId,
-            providerId: request.providerId,
-            startedAtMs: liveStartedAtMs,
-            usage: latestResponseUsage,
+          deferStreamSideUpdate(() => {
+            updateLiveChatStatistics(runMessagesKey, {
+              modelId: request.modelId,
+              providerId: request.providerId,
+              startedAtMs: liveStartedAtMs,
+              usage: latestResponseUsage,
+            });
           });
           refreshRunContextUsage();
           return;
@@ -6672,22 +6707,24 @@ export function App() {
           );
           const messageOwnsToolCall = (message: ShellMessage) =>
             messageHasToolCall(message, streamEvent.toolCall.id);
-          setMessagesForChatKey(runMessagesKey, (current) => {
-            const updateExistingToolCall = current.some(messageOwnsToolCall);
-            return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                ? {
-                  ...message,
-                  toolCalls: upsertToolCall(
-                    message.toolCalls,
-                    streamEvent.toolCall,
-                  ),
-                  parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
-                }
-                : message,
-            );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(runMessagesKey, (current) => {
+              const updateExistingToolCall = current.some(messageOwnsToolCall);
+              return current.map((message) =>
+                (updateExistingToolCall
+                  ? messageOwnsToolCall(message)
+                  : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
+                  ? {
+                    ...message,
+                    toolCalls: upsertToolCall(
+                      message.toolCalls,
+                      streamEvent.toolCall,
+                    ),
+                    parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
+                  }
+                  : message,
+              );
+            });
           });
           return;
         }
@@ -6698,29 +6735,31 @@ export function App() {
           );
           const messageOwnsToolCall = (message: ShellMessage) =>
             messageHasToolCall(message, streamEvent.toolCallId);
-          setMessagesForChatKey(runMessagesKey, (current) => {
-            const updateExistingToolCall = current.some(messageOwnsToolCall);
-            return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                ? {
-                  ...message,
-                  toolCalls: applyToolResult(
-                    message.toolCalls,
-                    streamEvent.toolCallId,
-                    streamEvent.output,
-                    streamEvent.isError,
-                  ),
-                  parts: applyToolResultToParts(
-                    message.parts,
-                    streamEvent.toolCallId,
-                    streamEvent.output,
-                    streamEvent.isError,
-                  ),
-                }
-                : message,
-            );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(runMessagesKey, (current) => {
+              const updateExistingToolCall = current.some(messageOwnsToolCall);
+              return current.map((message) =>
+                (updateExistingToolCall
+                  ? messageOwnsToolCall(message)
+                  : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
+                  ? {
+                    ...message,
+                    toolCalls: applyToolResult(
+                      message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                    ),
+                    parts: applyToolResultToParts(
+                      message.parts,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                    ),
+                  }
+                  : message,
+              );
+            });
           });
           return;
         }
@@ -6731,29 +6770,31 @@ export function App() {
           );
           const messageOwnsToolCall = (message: ShellMessage) =>
             messageHasToolCall(message, streamEvent.toolCallId);
-          setMessagesForChatKey(runMessagesKey, (current) => {
-            const updateExistingToolCall = current.some(messageOwnsToolCall);
-            return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                ? {
-                  ...message,
-                  toolCalls: applyToolOutputDelta(
-                    message.toolCalls,
-                    streamEvent.toolCallId,
-                    streamEvent.stream,
-                    streamEvent.delta,
-                  ),
-                  parts: applyToolOutputDeltaToParts(
-                    message.parts,
-                    streamEvent.toolCallId,
-                    streamEvent.stream,
-                    streamEvent.delta,
-                  ),
-                }
-                : message,
-            );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(runMessagesKey, (current) => {
+              const updateExistingToolCall = current.some(messageOwnsToolCall);
+              return current.map((message) =>
+                (updateExistingToolCall
+                  ? messageOwnsToolCall(message)
+                  : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
+                  ? {
+                    ...message,
+                    toolCalls: applyToolOutputDelta(
+                      message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.stream,
+                      streamEvent.delta,
+                    ),
+                    parts: applyToolOutputDeltaToParts(
+                      message.parts,
+                      streamEvent.toolCallId,
+                      streamEvent.stream,
+                      streamEvent.delta,
+                    ),
+                  }
+                  : message,
+              );
+            });
           });
           return;
         }
@@ -6769,19 +6810,21 @@ export function App() {
           if (streamEvent.notification.level === "error") {
             setError(streamEvent.notification.message);
           }
-          setMessagesForChatKey(runMessagesKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? {
-                  ...message,
-                  parts: appendTextPart(
-                    message.parts,
-                    `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
-                  ),
-                }
-                : message,
-            ),
-          );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(runMessagesKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                  ? {
+                    ...message,
+                    parts: appendTextPart(
+                      message.parts,
+                      `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
+                    ),
+                  }
+                  : message,
+              ),
+            );
+          });
           return;
         }
 
@@ -6789,12 +6832,14 @@ export function App() {
           if (isContextPanelOpen && contextPanelTab === "git") {
             void loadGitDiff(streamEvent.workspaceId, selectedDiffPath);
           }
-          updateLiveChatStatistics(runMessagesKey, {
-            codeChangeStats: streamEvent.codeChangeStats,
-            modelId: request.modelId,
-            providerId: request.providerId,
-            startedAtMs: liveStartedAtMs,
-            usage: latestResponseUsage,
+          deferStreamSideUpdate(() => {
+            updateLiveChatStatistics(runMessagesKey, {
+              codeChangeStats: streamEvent.codeChangeStats,
+              modelId: request.modelId,
+              providerId: request.providerId,
+              startedAtMs: liveStartedAtMs,
+              usage: latestResponseUsage,
+            });
           });
           if (requestChatId) {
             void loadChatStatistics(request.workspaceId, requestChatId);
@@ -6825,30 +6870,34 @@ export function App() {
           if (requestChatId) {
             void loadChatStatistics(request.workspaceId, requestChatId);
           }
-          setMessagesForChatKey(runMessagesKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? assistantMessageWithExtractedMemories(
-                  message,
-                  streamEvent.extractedMemories,
-                )
-                : message,
-            ),
-          );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(runMessagesKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                  ? assistantMessageWithExtractedMemories(
+                    message,
+                    streamEvent.extractedMemories,
+                  )
+                  : message,
+              ),
+            );
+          });
           return;
         }
 
         if (streamEvent.type === "memoryResolved") {
-          setMessagesForChatKey(runMessagesKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? assistantMessageWithMemoriesUsed(
-                  message,
-                  streamEvent.memoriesUsed,
-                )
-                : message,
-            ),
-          );
+          deferStreamSideUpdate(() => {
+            setMessagesForChatKey(runMessagesKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+                  ? assistantMessageWithMemoriesUsed(
+                    message,
+                    streamEvent.memoriesUsed,
+                  )
+                  : message,
+              ),
+            );
+          });
           return;
         }
 
