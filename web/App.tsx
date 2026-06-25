@@ -5190,6 +5190,18 @@ export function App() {
     setIsWorkspaceSidebarOpen((current) => !current);
   }
 
+  function handleLogoNavClick() {
+    setViewMode("chat");
+    setIsMobileWorkspaceOpen(false);
+    updateBrowserRoute({
+      chatId: null,
+      files: [],
+      tabs: [],
+      viewMode: "chat",
+      workspaceId: null,
+    });
+  }
+
   applyBrowserRouteRef.current = applyBrowserRoute;
 
   useInitialBrowserRouteEffect({
@@ -7509,7 +7521,7 @@ export function App() {
               onOpenScheduledTasks={openScheduledTasksView}
               onOpenSettings={() => openSettingsSection("general")}
               onOpenStats={openStatsView}
-              onReturnHome={openCurrentChatView}
+              onReturnHome={handleLogoNavClick}
               onToggleTheme={() =>
                 void saveAppTheme(theme === "dark" ? "light" : "dark")
               }
@@ -7603,7 +7615,7 @@ export function App() {
               onOpenSettings={() => openSettingsSection("general")}
               onOpenStats={openStatsView}
               onHomeClick={handleHomeNavClick}
-              onReturnHome={openCurrentChatView}
+              onReturnHome={handleLogoNavClick}
               onToggleTheme={() =>
                 void saveAppTheme(theme === "dark" ? "light" : "dark")
               }

@@ -381,6 +381,11 @@ describe("app-shell verification surfaces", () => {
       ),
     ).toBe(true);
 
+    await userEvent.click(screen.getByRole("button", { name: "Foco" }));
+
+    expect(window.location.pathname).toBe("/");
+    expect(window.location.search).toBe("");
+
     window.history.pushState(null, "", "/");
     fireEvent.popState(window);
     window.history.pushState(null, "", "/scheduled");
