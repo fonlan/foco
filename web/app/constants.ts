@@ -73,6 +73,9 @@ export const ANALYTICS_CHART_COLORS = [
   "#475569",
   "#db2777",
 ];
+export function chartColor(index: number) {
+  return ANALYTICS_CHART_COLORS[index % ANALYTICS_CHART_COLORS.length];
+}
 export const chartTooltipStyle: CSSProperties = {
   backgroundColor: "#ffffff",
   border: "1px solid #e7e5e4",

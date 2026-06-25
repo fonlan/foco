@@ -17,8 +17,8 @@ export default defineConfig({
         codeSplitting: {
           groups: [
             {
-              name: "vendor-charts",
-              test: /node_modules[\\/]recharts[\\/]/,
+              name: "vendor-react",
+              test: /vite[\\/]preload-helper/,
             },
             {
               name: "vendor-markdown",
