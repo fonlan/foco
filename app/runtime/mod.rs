@@ -1,4 +1,5 @@
 mod agent_scheduler;
+mod image_tools;
 mod questions;
 mod subscriptions;
 mod tool_events;
@@ -13,6 +14,9 @@ pub(crate) use agent_scheduler::{
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, CoordinatorTaskInput, insert_agent_event,
     validate_agent_snapshot_for_workspace,
+};
+pub(crate) use image_tools::{
+    execute_image_tool, image_model_available, image_tool_timeout_ms, is_image_tool_name,
 };
 pub(crate) use questions::{
     AskQuestionInput, QuestionAnswer, QuestionAnswerResponse, QuestionItem, QuestionItemAnswer,

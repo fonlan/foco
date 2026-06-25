@@ -39,6 +39,7 @@ pub const WEB_SEARCH_PROVIDER_BRAVE: &str = "brave";
 pub const SUPPORTED_WEB_SEARCH_PROVIDERS: &[&str] =
     &[WEB_SEARCH_PROVIDER_TAVILY, WEB_SEARCH_PROVIDER_BRAVE];
 pub const DEFAULT_SYSTEM_PROMPT_NAME: &str = "Default";
+pub const IMAGE_GENERATION_SYSTEM_PROMPT_NAME: &str = "Image Generation";
 pub const AGENT_DEFINITION_INITIAL_REVISION: u64 = 1;
 pub const AGENT_DEFINITION_NAME_MAX_CHARS: usize = 80;
 pub const AGENT_DEFINITION_DESCRIPTION_MAX_CHARS: usize = 500;
@@ -493,7 +494,7 @@ impl GlobalConfig {
                 )?;
             }
 
-            if model.enabled {
+            if model.enabled && model_outputs_text(model) {
                 let limits = model
                     .limits
                     .as_ref()
@@ -1114,6 +1115,10 @@ pub struct ModelSettings {
     pub metadata_source_url: Option<String>,
     pub metadata_refreshed_at: Option<String>,
     pub limits: Option<ModelLimits>,
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    #[serde(default)]
+    pub output_modalities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1683,6 +1688,15 @@ fn validate_agent_definitions(
                 ),
             );
         }
+        if !model_outputs_text(model) {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.modelId references model '{}' without text output",
+                    model.id
+                ),
+            );
+        }
         let limits = model
             .limits
             .as_ref()
@@ -1827,6 +1841,14 @@ fn validate_agent_definitions(
     }
 
     Ok(())
+}
+
+fn model_outputs_text(model: &ModelSettings) -> bool {
+    model.output_modalities.is_empty()
+        || model
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "text")
 }
 
 pub fn validate_agent_definition_tool_references(
@@ -2128,6 +2150,7 @@ fn validate_prompt_settings(
 
 fn prompt_settings_contains_system_prompt(settings: &PromptSettings, name: &str) -> bool {
     name == DEFAULT_SYSTEM_PROMPT_NAME
+        || name == IMAGE_GENERATION_SYSTEM_PROMPT_NAME
         || settings
             .system_prompts
             .iter()
@@ -3038,6 +3061,8 @@ mod tests {
             metadata_source_url: None,
             metadata_refreshed_at: None,
             limits: None,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
         });
 
         let error = save_global_config(&loaded.paths.config_file, &loaded.config)
@@ -3048,6 +3073,32 @@ mod tests {
                 .to_string()
                 .contains("system_prompt_name 'Missing' references missing system prompt")
         );
+    }
+
+    #[test]
+    fn image_generation_system_prompt_is_builtin_for_models() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.models.push(ModelSettings {
+            id: "image-model".to_string(),
+            display_name: "Image Model".to_string(),
+            enabled: false,
+            provider_ids: Vec::new(),
+            active_provider_id: None,
+            thinking_level: None,
+            system_prompt_name: IMAGE_GENERATION_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: None,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["image".to_string()],
+        });
+
+        save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect("image generation system prompt should be builtin");
     }
 
     #[test]
@@ -3462,6 +3513,8 @@ mod tests {
                 context_window: 128_000,
                 max_output_tokens: 16_384,
             }),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
         }
     }
 
@@ -3503,6 +3556,8 @@ mod tests {
             metadata_source_url: None,
             metadata_refreshed_at: None,
             limits: None,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
         });
 
         save_global_config(&loaded.paths.config_file, &loaded.config)
@@ -3527,6 +3582,8 @@ mod tests {
             metadata_source_url: None,
             metadata_refreshed_at: None,
             limits: None,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
         });
 
         let error = save_global_config(&loaded.paths.config_file, &loaded.config)
@@ -3564,6 +3621,8 @@ mod tests {
                 context_window: 128_000,
                 max_output_tokens: 16_384,
             }),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
         });
         config.agent_definitions.push(AgentDefinitionSettings {
             id: AgentDefinitionId::new("agent-definition-coordinator")

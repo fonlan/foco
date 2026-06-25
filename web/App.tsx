@@ -278,6 +278,7 @@ import {
   CONTEXT_PANEL_MIN_WIDTH,
   CREATE_BRANCH_OPTION_VALUE,
   DEFAULT_SYSTEM_PROMPT_NAME,
+  IMAGE_AGENT_SYSTEM_PROMPT_NAME,
   MAX_CHAT_ATTACHMENTS,
   MAX_CHAT_ATTACHMENT_BYTES,
   MAX_CHAT_ATTACHMENT_TOTAL_BYTES,
@@ -12483,6 +12484,24 @@ function SettingsPanel({
       null,
     [metadata, selectedMetadataKey],
   );
+  const inputModalityOptions = useMemo(
+    () =>
+      modelModalityOptions(
+        metadata?.models ?? [],
+        "inputModalities",
+        form.inputModalities,
+      ),
+    [form.inputModalities, metadata],
+  );
+  const outputModalityOptions = useMemo(
+    () =>
+      modelModalityOptions(
+        metadata?.models ?? [],
+        "outputModalities",
+        form.outputModalities,
+      ),
+    [form.outputModalities, metadata],
+  );
   const filteredModels = useMemo(() => {
     const query = modelSearch.trim().toLowerCase();
     const models = metadata?.models ?? [];
@@ -12506,8 +12525,10 @@ function SettingsPanel({
       )
       .slice(0, 80);
   }, [metadata, modelSearch]);
+  const modelOutputsText = form.outputModalities.includes("text");
   const enabledNeedsLimits =
     form.enabled &&
+    modelOutputsText &&
     (!form.contextWindow.trim() || !form.maxOutputTokens.trim());
   const providerKinds = settings?.providerKinds ?? [];
   const providers = settings?.providers ?? [];
@@ -13119,12 +13140,17 @@ function SettingsPanel({
 
     setForm({
       displayName: model.name,
-      enabled: model.contextWindow !== null && model.maxOutputTokens !== null,
+      enabled:
+        outputModalitiesRequireLimits(defaultModalities(model.outputModalities)) ?
+          model.contextWindow !== null && model.maxOutputTokens !== null
+        : true,
       modelId: model.modelId,
       contextWindow: numberInputValue(model.contextWindow),
       maxOutputTokens: numberInputValue(model.maxOutputTokens),
       providerIds: [],
       activeProviderId: "",
+      inputModalities: defaultModalities(model.inputModalities),
+      outputModalities: defaultModalities(model.outputModalities),
       thinkingLevel: "",
       systemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
     });
@@ -13162,10 +13188,15 @@ function SettingsPanel({
       return {
         ...current,
         displayName: model.name,
-        enabled: model.contextWindow !== null && model.maxOutputTokens !== null,
+        enabled:
+          outputModalitiesRequireLimits(defaultModalities(model.outputModalities)) ?
+            model.contextWindow !== null && model.maxOutputTokens !== null
+          : true,
         modelId: model.modelId,
         contextWindow: numberInputValue(model.contextWindow),
         maxOutputTokens: numberInputValue(model.maxOutputTokens),
+        inputModalities: defaultModalities(model.inputModalities),
+        outputModalities: defaultModalities(model.outputModalities),
       };
     });
   }
@@ -13180,6 +13211,8 @@ function SettingsPanel({
       maxOutputTokens: numberInputValue(model.maxOutputTokens),
       providerIds: model.providerIds,
       activeProviderId: model.activeProviderId ?? "",
+      inputModalities: defaultModalities(model.inputModalities),
+      outputModalities: defaultModalities(model.outputModalities),
       thinkingLevel: model.thinkingLevel ?? "",
       systemPromptName: model.systemPromptName || DEFAULT_SYSTEM_PROMPT_NAME,
     });
@@ -13633,7 +13666,7 @@ function SettingsPanel({
   }
 
   function removeSystemPrompt(name: string) {
-    if (name === DEFAULT_SYSTEM_PROMPT_NAME) {
+    if (isSystemPromptFixed(name)) {
       return;
     }
 
@@ -13666,7 +13699,7 @@ function SettingsPanel({
   }
 
   function startRenameSystemPrompt(name: string) {
-    if (name === DEFAULT_SYSTEM_PROMPT_NAME) {
+    if (isSystemPromptFixed(name)) {
       return;
     }
 
@@ -13687,7 +13720,7 @@ function SettingsPanel({
   }
 
   function submitRenameSystemPrompt(name: string) {
-    if (name === DEFAULT_SYSTEM_PROMPT_NAME) {
+    if (isSystemPromptFixed(name)) {
       return;
     }
 
@@ -13748,32 +13781,52 @@ function SettingsPanel({
     });
   }
 
-  function restoreDefaultSystemPrompt() {
-    setPromptSettingsForm((current) => {
-      if (!settings) {
-        return current;
-      }
+  function defaultSystemPromptContent(name: string) {
+    if (!settings) {
+      return null;
+    }
+    if (name === DEFAULT_SYSTEM_PROMPT_NAME) {
+      return settings.prompts.defaultSystemPrompt;
+    }
+    if (name === IMAGE_AGENT_SYSTEM_PROMPT_NAME) {
+      return settings.prompts.defaultImageGenerationSystemPrompt ?? null;
+    }
+    return null;
+  }
 
-      const defaultContent = settings.prompts.defaultSystemPrompt;
-      const systemPrompts = current.systemPrompts.length
-        ? current.systemPrompts.map((prompt) =>
-          prompt.name === DEFAULT_SYSTEM_PROMPT_NAME
+  function restoreSystemPromptDefault(name: string) {
+    const defaultContent = defaultSystemPromptContent(name);
+    if (defaultContent === null) {
+      return;
+    }
+
+    setPromptSettingsForm((current) => {
+      const currentSystemPrompts = current.systemPrompts.length
+        ? current.systemPrompts
+        : settings
+          ? normalizedSystemPromptSummaries(settings.prompts)
+          : [];
+      const hasPrompt = currentSystemPrompts.some((prompt) => prompt.name === name);
+      const systemPrompts = hasPrompt
+        ? currentSystemPrompts.map((prompt) =>
+          prompt.name === name
             ? {
               ...prompt,
               content: defaultContent,
             }
             : prompt,
-        )
+          )
         : [
+          ...currentSystemPrompts,
           {
             content: defaultContent,
-            name: DEFAULT_SYSTEM_PROMPT_NAME,
+            name,
           },
         ];
 
       return {
         ...current,
-        activeSystemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
+        activeSystemPromptName: name,
         systemPrompts,
       };
     });
@@ -14282,16 +14335,20 @@ function SettingsPanel({
             enabled: form.enabled,
             metadataKey: selectedMetadataKey || null,
             modelId: form.modelId,
-            contextWindow: optionalPositiveInteger(
+            contextWindow: optionalModelLimit(
               form.contextWindow,
               "Context window",
+              modelOutputsText,
             ),
-            maxOutputTokens: optionalPositiveInteger(
+            maxOutputTokens: optionalModelLimit(
               form.maxOutputTokens,
               "Max output tokens",
+              modelOutputsText,
             ),
             providerIds: form.providerIds,
             activeProviderId: form.activeProviderId,
+            inputModalities: normalizeModalities(form.inputModalities),
+            outputModalities: normalizeModalities(form.outputModalities),
             thinkingLevel: form.thinkingLevel || null,
             clearThinkingLevel: !form.thinkingLevel,
             systemPromptName: form.systemPromptName,
@@ -15356,6 +15413,23 @@ function SettingsPanel({
     });
   }
 
+  function toggleModelModality(
+    field: "inputModalities" | "outputModalities",
+    modality: string,
+    checked: boolean,
+  ) {
+    setForm((current) => {
+      const values = checked
+        ? [...current[field], modality]
+        : current[field].filter((value) => value !== modality);
+
+      return {
+        ...current,
+        [field]: normalizeModalities(values),
+      };
+    });
+  }
+
   function toggleSkill(skillId: string, checked: boolean) {
     const next = new Set(enabledSkillIds);
 
@@ -16221,6 +16295,7 @@ function SettingsPanel({
                           prompt.name === promptSettingsForm.activeSystemPromptName;
                         const isRenaming =
                           prompt.name === promptSettingsForm.renamingSystemPromptName;
+                        const isFixed = isSystemPromptFixed(prompt.name);
 
                         return (
                           <div
@@ -16294,18 +16369,18 @@ function SettingsPanel({
                                 >
                                   {prompt.name}
                                 </button>
-                                {prompt.name === DEFAULT_SYSTEM_PROMPT_NAME ? (
+                                {defaultSystemPromptContent(prompt.name) !== null ? (
                                   <button
                                     aria-label={t("Restore default system prompt")}
                                     className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
                                     disabled={isLoadingSettings || !settings}
-                                    onClick={restoreDefaultSystemPrompt}
+                                    onClick={() => restoreSystemPromptDefault(prompt.name)}
                                     title={t("Restore default system prompt")}
                                     type="button"
                                   >
                                     <RefreshCw aria-hidden="true" className="size-4" />
                                   </button>
-                                ) : (
+                                ) : isFixed ? null : (
                                   <>
                                     <button
                                       aria-label={t("Rename system prompt {name}", {
@@ -21015,6 +21090,62 @@ function SettingsPanel({
                           value={form.maxOutputTokens}
                         />
                       </div>
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                          <legend className="px-1 text-xs font-semibold text-stone-600">
+                            {t("Input types")}
+                          </legend>
+                          <div className="grid gap-2">
+                            {inputModalityOptions.map((modality) => (
+                              <label
+                                className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 text-sm font-medium text-stone-700"
+                                key={modality}
+                              >
+                                <span>{t(modality)}</span>
+                                <input
+                                  checked={form.inputModalities.includes(modality)}
+                                  className="size-4 accent-teal-700"
+                                  onChange={(event) =>
+                                    toggleModelModality(
+                                      "inputModalities",
+                                      modality,
+                                      event.target.checked,
+                                    )
+                                  }
+                                  type="checkbox"
+                                />
+                              </label>
+                            ))}
+                          </div>
+                        </fieldset>
+                        <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                          <legend className="px-1 text-xs font-semibold text-stone-600">
+                            {t("Output types")}
+                          </legend>
+                          <div className="grid gap-2">
+                            {outputModalityOptions.map((modality) => (
+                              <label
+                                className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 text-sm font-medium text-stone-700"
+                                key={modality}
+                              >
+                                <span>{t(modality)}</span>
+                                <input
+                                  checked={form.outputModalities.includes(modality)}
+                                  className="size-4 accent-teal-700"
+                                  onChange={(event) =>
+                                    toggleModelModality(
+                                      "outputModalities",
+                                      modality,
+                                      event.target.checked,
+                                    )
+                                  }
+                                  type="checkbox"
+                                />
+                              </label>
+                            ))}
+                          </div>
+                        </fieldset>
+                      </div>
                       <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
                         <span className="text-sm font-semibold text-stone-700">
                           {t("Enable model")}
@@ -22110,6 +22241,8 @@ function emptyModelForm(): ModelFormState {
     contextWindow: "",
     providerIds: [],
     activeProviderId: "",
+    inputModalities: ["text"],
+    outputModalities: ["text"],
     thinkingLevel: "",
     systemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
   };
@@ -22208,6 +22341,13 @@ function normalizedSystemPromptSummaries(
     },
     ...systemPrompts,
   ];
+}
+
+function isSystemPromptFixed(name: string): boolean {
+  return (
+    name === DEFAULT_SYSTEM_PROMPT_NAME ||
+    name === IMAGE_AGENT_SYSTEM_PROMPT_NAME
+  );
 }
 
 function emptyMemorySettingsForm(): MemorySettingsFormState {
@@ -23111,12 +23251,42 @@ function skillScopeLabel(skill: ConfiguredSkillSummary, t: Translate) {
     : t("Workspace skill");
 }
 
+const MODEL_MODALITY_OPTIONS = ["text", "image", "audio", "video"];
+
+type ModelModalityField = "inputModalities" | "outputModalities";
+
+function modelModalityOptions(
+  models: ModelMetadataRecord[],
+  field: ModelModalityField,
+  selected: string[],
+) {
+  const values = normalizeModalities([
+    ...MODEL_MODALITY_OPTIONS,
+    ...models.flatMap((model) => model[field]),
+    ...selected,
+  ]);
+
+  return values;
+}
+
+function normalizeModalities(modalities: string[]) {
+  return modalities
+    .map((modality) => modality.trim().toLowerCase())
+    .filter(Boolean)
+    .filter(uniqueString);
+}
+
+function defaultModalities(modalities: string[], fallback = ["text"]) {
+  const normalized = normalizeModalities(modalities);
+  return normalized.length ? normalized : fallback;
+}
+
 function uniqueString(value: string, index: number, values: string[]) {
   return values.indexOf(value) === index;
 }
 
 function numberInputValue(value: number | null) {
-  return value === null ? "" : String(value);
+  return value === null || value === 0 ? "" : String(value);
 }
 
 function optionalPositiveInteger(value: string, label: string) {
@@ -23137,6 +23307,20 @@ function optionalPositiveInteger(value: string, label: string) {
   }
 
   return numberValue;
+}
+
+function optionalModelLimit(value: string, label: string, required: boolean) {
+  const trimmed = value.trim();
+
+  if (!trimmed || (!required && trimmed === "0")) {
+    return null;
+  }
+
+  return optionalPositiveInteger(value, label);
+}
+
+function outputModalitiesRequireLimits(outputModalities: string[]) {
+  return outputModalities.length === 0 || outputModalities.includes("text");
 }
 
 function requiredPositiveInteger(value: string, label: string) {

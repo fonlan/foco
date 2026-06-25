@@ -11,7 +11,7 @@ use foco_providers::{
     test_provider_connection,
 };
 use foco_store::{
-    config::{PromptSettings, SpecSettings},
+    config::{IMAGE_GENERATION_SYSTEM_PROMPT_NAME, PromptSettings, SpecSettings},
     model_metadata::{
         MODELS_DEV_API_URL, parse_models_dev_metadata, read_model_metadata_cache,
         write_model_metadata_cache,
@@ -21,7 +21,14 @@ use foco_store::{
 use crate::*;
 
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
+pub(crate) const IMAGE_AGENT_DEFINITION_ID: &str = "agent-definition-image-gen";
+pub(crate) const IMAGE_AGENT_SYSTEM_PROMPT_NAME: &str = IMAGE_GENERATION_SYSTEM_PROMPT_NAME;
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.";
+const IMAGE_AGENT_SYSTEM_PROMPT: &str = "You are Foco's image generation agent. Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.";
+
+pub(crate) fn default_image_generation_system_prompt() -> String {
+    IMAGE_AGENT_SYSTEM_PROMPT.to_string()
+}
 
 pub(crate) async fn settings(
     State(state): State<AppState>,
@@ -41,31 +48,150 @@ pub(crate) async fn agent_definitions(
 
 async fn ensure_default_agent_definition(state: &AppState) -> Result<GlobalConfig, ApiError> {
     let mut config = config_snapshot(state)?;
+    let mut changed = false;
     let default_id = default_agent_definition_id()?;
-    if config
+
+    if !config
         .agent_definitions
         .iter()
         .any(|definition| definition.id == default_id)
     {
-        if refresh_default_agent_permissions(&mut config)? {
-            validate_agent_definition_update(state, &config).await?;
-            save_config(state, config.clone())?;
+        if let Some(definition) = default_agent_definition_for_config(&config, default_id.clone()) {
+            config.agent_definitions.insert(0, definition);
+            changed = true;
         }
-        return Ok(config);
     }
 
-    let Some(definition) = default_agent_definition_for_config(&config, default_id) else {
-        return Ok(config);
-    };
-    config.agent_definitions.insert(0, definition);
-    validate_agent_definition_update(state, &config).await?;
-    save_config(state, config.clone())?;
+    if refresh_builtin_agent_definitions(&mut config)? {
+        changed = true;
+    }
+
+    if changed {
+        validate_agent_definition_update(state, &config).await?;
+        save_config(state, config.clone())?;
+    }
     Ok(config)
 }
 
 fn default_agent_definition_id() -> Result<AgentDefinitionId, ApiError> {
     AgentDefinitionId::new(DEFAULT_AGENT_DEFINITION_ID)
         .map_err(|error| ApiError::internal(error.message().to_string()))
+}
+
+fn image_agent_definition_id() -> Result<AgentDefinitionId, ApiError> {
+    AgentDefinitionId::new(IMAGE_AGENT_DEFINITION_ID)
+        .map_err(|error| ApiError::internal(error.message().to_string()))
+}
+
+pub(crate) fn image_agent_system_prompt_for_config(
+    config: &GlobalConfig,
+) -> Result<Option<String>, ApiError> {
+    let image_id = image_agent_definition_id()?;
+    if let Some(definition) = config
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == image_id)
+    {
+        return Ok(Some(definition.system_prompt.clone()));
+    }
+    Ok(image_agent_definition_for_config(config, image_id)
+        .map(|definition| definition.system_prompt))
+}
+
+pub(crate) fn default_image_agent_system_prompt_for_config(
+    config: &GlobalConfig,
+) -> Result<Option<String>, ApiError> {
+    let image_id = image_agent_definition_id()?;
+    Ok(image_agent_definition_for_config(config, image_id)
+        .map(|definition| definition.system_prompt))
+}
+
+fn ensure_image_agent_definition(config: &mut GlobalConfig) -> Result<bool, ApiError> {
+    let image_id = image_agent_definition_id()?;
+    let image_definition = image_agent_definition_for_config(config, image_id.clone());
+
+    match image_definition {
+        Some(mut definition) => {
+            if let Some(stored_index) = config
+                .agent_definitions
+                .iter()
+                .position(|definition| definition.id == image_id)
+            {
+                let stored = &config.agent_definitions[stored_index];
+                let preserve_runner = image_agent_runner_selection_valid(config, stored);
+                let stored_provider_id = stored.provider_id.clone();
+                let stored_model_id = stored.model_id.clone();
+                let stored_model_options = stored.model_options.clone();
+                let stored_revision = stored.revision;
+                let stored_system_prompt = stored.system_prompt.clone();
+
+                let stored = &mut config.agent_definitions[stored_index];
+                if !stored.system_prompt.trim().is_empty() {
+                    definition.system_prompt = stored_system_prompt;
+                }
+                if preserve_runner {
+                    definition.provider_id = stored_provider_id;
+                    definition.model_id = stored_model_id;
+                    definition.model_options = stored_model_options;
+                    definition.revision = stored_revision;
+                }
+                if stored != &definition {
+                    *stored = definition;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            } else {
+                let default_id = default_agent_definition_id()?;
+                let insert_index = config
+                    .agent_definitions
+                    .iter()
+                    .position(|definition| definition.id != default_id)
+                    .unwrap_or(config.agent_definitions.len());
+                config.agent_definitions.insert(insert_index, definition);
+                Ok(true)
+            }
+        }
+        None => {
+            let definition_count = config.agent_definitions.len();
+            config
+                .agent_definitions
+                .retain(|definition| definition.id != image_id);
+            Ok(config.agent_definitions.len() != definition_count)
+        }
+    }
+}
+
+fn image_agent_runner_selection_valid(
+    config: &GlobalConfig,
+    definition: &AgentDefinitionSettings,
+) -> bool {
+    let Some(model) = config
+        .models
+        .iter()
+        .find(|model| model.id == definition.model_id)
+    else {
+        return false;
+    };
+    model.enabled
+        && model.limits.is_some()
+        && model_outputs_text(model)
+        && model
+            .provider_ids
+            .iter()
+            .any(|provider_id| provider_id == &definition.provider_id)
+        && config
+            .providers
+            .iter()
+            .any(|provider| provider.enabled && provider.id == definition.provider_id)
+}
+
+fn refresh_builtin_agent_definitions(config: &mut GlobalConfig) -> Result<bool, ApiError> {
+    let mut changed = ensure_image_agent_definition(config)?;
+    if refresh_default_agent_permissions(config)? {
+        changed = true;
+    }
+    Ok(changed)
 }
 
 fn refresh_default_agent_permissions(config: &mut GlobalConfig) -> Result<bool, ApiError> {
@@ -107,24 +233,59 @@ fn default_agent_allowed_definition_ids(
         .collect()
 }
 
+fn image_agent_definition_for_config(
+    config: &GlobalConfig,
+    id: AgentDefinitionId,
+) -> Option<AgentDefinitionSettings> {
+    let image_model = config
+        .models
+        .iter()
+        .find(|model| model.id == "gpt-image-2" && image_model_available(config, model))
+        .or_else(|| {
+            config
+                .models
+                .iter()
+                .find(|model| image_model_available(config, model))
+        })?;
+    let model = default_agent_runner_model(config)?;
+    let provider_id = model.active_provider_id.clone()?;
+    let allowed_tools = [
+        foco_tools::IMAGE_GEN_TOOL,
+        foco_tools::ASK_QUESTION_TOOL,
+        foco_tools::READ_FILE_TOOL,
+        foco_tools::FIND_FILES_TOOL,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    Some(AgentDefinitionSettings {
+        id,
+        revision: AGENT_DEFINITION_INITIAL_REVISION,
+        name: "Image generation agent".to_string(),
+        description: "Built-in agent dedicated to generating images with an image-output model."
+            .to_string(),
+        provider_id,
+        model_id: model.id.clone(),
+        model_options: AgentModelOptions {
+            thinking_level: model.thinking_level.clone(),
+            max_output_tokens: None,
+        },
+        system_prompt: format!(
+            "{IMAGE_AGENT_SYSTEM_PROMPT}\n\nUse image_gen with model \"{}\" unless the user explicitly asks for another configured image model.",
+            image_model.id
+        ),
+        allowed_tools,
+        max_instances: 1,
+        allowed_execution_workspace_modes: vec![foco_agent::AgentExecutionWorkspaceMode::Shared],
+        permissions: AgentPermissions::default(),
+    })
+}
 fn default_agent_definition_for_config(
     config: &GlobalConfig,
     id: AgentDefinitionId,
 ) -> Option<AgentDefinitionSettings> {
-    let model = config.models.iter().find(|model| {
-        model.enabled
-            && model.limits.is_some()
-            && model
-                .active_provider_id
-                .as_ref()
-                .is_some_and(|provider_id| {
-                    model.provider_ids.iter().any(|id| id == provider_id)
-                        && config
-                            .providers
-                            .iter()
-                            .any(|provider| provider.enabled && provider.id == *provider_id)
-                })
-    })?;
+    let model = default_agent_runner_model(config)?;
     let provider_id = model.active_provider_id.clone()?;
     let mut allowed_tools = foco_tools::builtin_tool_definitions()
         .into_iter()
@@ -157,6 +318,32 @@ fn default_agent_definition_for_config(
     })
 }
 
+fn default_agent_runner_model(config: &GlobalConfig) -> Option<&ModelSettings> {
+    config.models.iter().find(|model| {
+        model.enabled
+            && model.limits.is_some()
+            && model_outputs_text(model)
+            && model
+                .active_provider_id
+                .as_ref()
+                .is_some_and(|provider_id| {
+                    model.provider_ids.iter().any(|id| id == provider_id)
+                        && config
+                            .providers
+                            .iter()
+                            .any(|provider| provider.enabled && provider.id == *provider_id)
+                })
+    })
+}
+
+fn model_outputs_text(model: &ModelSettings) -> bool {
+    model.output_modalities.is_empty()
+        || model
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "text")
+}
+
 pub(crate) async fn create_agent_definition(
     State(state): State<AppState>,
     Json(request): Json<CreateAgentDefinitionRequest>,
@@ -169,7 +356,7 @@ pub(crate) async fn create_agent_definition(
         AGENT_DEFINITION_INITIAL_REVISION,
         request.definition,
     ));
-    refresh_default_agent_permissions(&mut config)?;
+    refresh_builtin_agent_definitions(&mut config)?;
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -181,19 +368,37 @@ pub(crate) async fn update_agent_definition(
     Json(request): Json<UpdateAgentDefinitionRequest>,
 ) -> Result<Json<AgentDefinitionsResponse>, ApiError> {
     let mut config = config_snapshot(&state)?;
-    let stored = config
+    let image_id = image_agent_definition_id()?;
+    let updates_image_agent = request.id == image_id;
+    let image_agent_prompt = if updates_image_agent {
+        Some(request.definition.system_prompt.clone())
+    } else {
+        None
+    };
+    let stored_index = config
         .agent_definitions
-        .iter_mut()
-        .find(|definition| definition.id == request.id)
+        .iter()
+        .position(|definition| definition.id == request.id)
         .ok_or_else(|| {
             ApiError::bad_request(format!("agent definition was not found: {}", request.id))
         })?;
-    let revision = stored
+    let revision = config.agent_definitions[stored_index]
         .revision
         .checked_add(1)
         .ok_or_else(|| ApiError::internal("agent definition revision overflow"))?;
-    *stored = agent_definition_from_input(request.id, revision, request.definition);
-    refresh_default_agent_permissions(&mut config)?;
+    config.agent_definitions[stored_index] =
+        agent_definition_from_input(request.id, revision, request.definition);
+    if updates_image_agent
+        && !image_agent_runner_selection_valid(&config, &config.agent_definitions[stored_index])
+    {
+        return Err(ApiError::bad_request(
+            "Image generation agent requires an enabled text-output runner model with an enabled provider",
+        ));
+    }
+    refresh_builtin_agent_definitions(&mut config)?;
+    if let Some(prompt) = image_agent_prompt {
+        upsert_image_generation_system_prompt(&mut config.prompts, prompt);
+    }
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -237,7 +442,7 @@ pub(crate) async fn delete_agent_definition(
             config.agent_definitions.insert(0, definition);
         }
     }
-    refresh_default_agent_permissions(&mut config)?;
+    refresh_builtin_agent_definitions(&mut config)?;
     validate_agent_definition_update(&state, &config).await?;
     save_config(&state, config.clone())?;
 
@@ -511,6 +716,7 @@ pub(crate) async fn save_prompt_settings(
         request.system_prompt,
         &build_default_system_prompt(),
     )?;
+    let image_agent_prompt = image_generation_system_prompt_content(&system_prompts);
 
     config.prompts = PromptSettings {
         system_prompts,
@@ -518,12 +724,55 @@ pub(crate) async fn save_prompt_settings(
         files: normalize_prompt_file_paths(request.files)?,
         extra_text: request.extra_text.trim().to_string(),
     };
+    refresh_builtin_agent_definitions(&mut config)?;
+    if let Some(prompt) = image_agent_prompt {
+        update_image_agent_system_prompt(&mut config, prompt)?;
+    }
     config
         .validate(Some(&state.config_file))
         .map_err(ApiError::from_config_error)?;
     save_config(&state, config.clone())?;
 
     settings_response(&state, &config).await
+}
+
+fn image_generation_system_prompt_content(
+    system_prompts: &[SystemPromptSettings],
+) -> Option<String> {
+    system_prompts
+        .iter()
+        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+        .map(|prompt| prompt.content.clone())
+}
+
+fn upsert_image_generation_system_prompt(settings: &mut PromptSettings, content: String) {
+    if let Some(prompt) = settings
+        .system_prompts
+        .iter_mut()
+        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+    {
+        prompt.content = content;
+        return;
+    }
+    settings.system_prompts.push(SystemPromptSettings {
+        name: IMAGE_AGENT_SYSTEM_PROMPT_NAME.to_string(),
+        content,
+    });
+}
+
+fn update_image_agent_system_prompt(
+    config: &mut GlobalConfig,
+    prompt: String,
+) -> Result<(), ApiError> {
+    let image_id = image_agent_definition_id()?;
+    if let Some(definition) = config
+        .agent_definitions
+        .iter_mut()
+        .find(|definition| definition.id == image_id)
+    {
+        definition.system_prompt = prompt;
+    }
+    Ok(())
 }
 
 #[cfg(all(windows, not(debug_assertions)))]
@@ -649,6 +898,8 @@ pub(crate) async fn save_manual_provider(
         config.providers.push(provider);
     }
 
+    refresh_builtin_agent_definitions(&mut config)?;
+
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -726,6 +977,7 @@ pub(crate) async fn sync_auto_provider_models_once(state: &AppState) -> Result<u
     sync_provider_model_associations(&mut config, providers).await?;
 
     if config.providers != previous_providers || config.models != previous_models {
+        refresh_builtin_agent_definitions(&mut config)?;
         config
             .validate(Some(&state.config_file))
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
@@ -840,10 +1092,11 @@ pub(crate) async fn delete_provider(
         return Err(ApiError::bad_request("provider id must not be empty"));
     }
 
+    let image_id = image_agent_definition_id()?;
     if let Some(definition) = config
         .agent_definitions
         .iter()
-        .find(|definition| definition.provider_id == id)
+        .find(|definition| definition.id != image_id && definition.provider_id == id)
     {
         return Err(ApiError::bad_request(format!(
             "provider '{id}' is referenced by agent definition '{}'",
@@ -867,6 +1120,10 @@ pub(crate) async fn delete_provider(
         }
     }
 
+    refresh_builtin_agent_definitions(&mut config)?;
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     save_config(&state, config.clone())?;
 
     settings_response(&state, &config).await
@@ -1093,10 +1350,12 @@ pub(crate) async fn save_manual_model(
     let mut config = config_snapshot(&state)?;
     let model_id = request.model_id.trim();
     let display_name = request.display_name.trim();
-    let context_window = request.context_window;
-    let max_output_tokens = request.max_output_tokens;
+    let context_window = request.context_window.filter(|value| *value > 0);
+    let max_output_tokens = request.max_output_tokens.filter(|value| *value > 0);
     let requested_provider_ids = request.provider_ids;
     let requested_active_provider_id = request.active_provider_id;
+    let requested_input_modalities = request.input_modalities;
+    let requested_output_modalities = request.output_modalities;
     let requested_thinking_level = request.thinking_level;
     let clear_thinking_level = request.clear_thinking_level.unwrap_or(false);
     let requested_system_prompt_name = request.system_prompt_name;
@@ -1127,9 +1386,31 @@ pub(crate) async fn save_manual_model(
         )));
     }
 
-    if request.enabled && (context_window.is_none() || max_output_tokens.is_none()) {
+    let existing_model = config.models.iter().find(|model| model.id == model_id);
+    let input_modalities = normalize_model_modalities(
+        requested_input_modalities,
+        existing_model.map(|model| model.input_modalities.as_slice()),
+        metadata_record
+            .as_ref()
+            .map(|record| record.input_modalities.as_slice()),
+        &["text"],
+    );
+    let output_modalities = normalize_model_modalities(
+        requested_output_modalities,
+        existing_model.map(|model| model.output_modalities.as_slice()),
+        metadata_record
+            .as_ref()
+            .map(|record| record.output_modalities.as_slice()),
+        &["text"],
+    );
+    let requires_text_limits = output_modalities.iter().any(|modality| modality == "text");
+
+    if request.enabled
+        && requires_text_limits
+        && (context_window.is_none() || max_output_tokens.is_none())
+    {
         return Err(ApiError::bad_request(
-            "enabled model requires context window and max output tokens",
+            "enabled text-output model requires context window and max output tokens",
         ));
     }
 
@@ -1160,7 +1441,6 @@ pub(crate) async fn save_manual_model(
         }
     };
 
-    let existing_model = config.models.iter().find(|model| model.id == model_id);
     let provider_ids = normalize_model_provider_ids(requested_provider_ids, existing_model)?;
     let active_provider_id = match requested_active_provider_id {
         Some(value) => optional_trimmed_string(Some(value)),
@@ -1211,6 +1491,8 @@ pub(crate) async fn save_manual_model(
             .as_ref()
             .map(|record| record.refreshed_at.clone()),
         limits,
+        input_modalities,
+        output_modalities,
     };
 
     if let Some(stored_model) = config.models.iter_mut().find(|model| model.id == model_id) {
@@ -1218,6 +1500,8 @@ pub(crate) async fn save_manual_model(
     } else {
         config.models.push(model);
     }
+
+    refresh_builtin_agent_definitions(&mut config)?;
 
     config
         .validate(Some(&state.config_file))
@@ -1245,10 +1529,11 @@ pub(crate) async fn delete_model(
         return Err(ApiError::bad_request("model id must not be empty"));
     }
 
+    let image_id = image_agent_definition_id()?;
     if let Some(definition) = config
         .agent_definitions
         .iter()
-        .find(|definition| definition.model_id == id)
+        .find(|definition| definition.id != image_id && definition.model_id == id)
     {
         return Err(ApiError::bad_request(format!(
             "model '{id}' is referenced by agent definition '{}'",
@@ -1263,6 +1548,10 @@ pub(crate) async fn delete_model(
         return Err(ApiError::bad_request(format!("model was not found: {id}")));
     }
 
+    refresh_builtin_agent_definitions(&mut config)?;
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     save_config(&state, config.clone())?;
 
     let cache = read_model_metadata_cache(&state.model_metadata_file)

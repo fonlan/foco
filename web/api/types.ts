@@ -712,6 +712,8 @@ export type ConfiguredModelSummary = {
   missingLimits: string[];
   providerIds: string[];
   activeProviderId: string | null;
+  inputModalities: string[];
+  outputModalities: string[];
   thinkingLevel: string | null;
   systemPromptName: string;
   supportsThinking: boolean;
@@ -734,6 +736,8 @@ export type ModelFormState = {
   contextWindow: string;
   providerIds: string[];
   activeProviderId: string;
+  inputModalities: string[];
+  outputModalities: string[];
   thinkingLevel: string;
   systemPromptName: string;
 };
@@ -1127,6 +1131,7 @@ export type SystemPromptSummary = {
 export type PromptSettingsSummary = {
   systemPrompt: string | null;
   defaultSystemPrompt: string;
+  defaultImageGenerationSystemPrompt?: string | null;
   systemPrompts?: SystemPromptSummary[];
   files: string[];
   extraText: string;

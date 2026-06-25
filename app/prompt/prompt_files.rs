@@ -3,12 +3,15 @@ use std::{fs, path::Path};
 use foco_agent::{ToolPromptInfo, build_default_system_prompt};
 use foco_mcp::McpToolDefinition;
 use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolDefinition};
-use foco_store::config::{DEFAULT_SYSTEM_PROMPT_NAME, PromptSettings};
+use foco_store::config::{
+    DEFAULT_SYSTEM_PROMPT_NAME, IMAGE_GENERATION_SYSTEM_PROMPT_NAME, PromptSettings,
+};
 use foco_tools::{SEARCH_TEXT_TOOL, WEB_SEARCH_TOOL, builtin_tool_definitions};
 
 use crate::{
     AGENTS_MESSAGE_PREFIX, ApiError, EXTRA_PROMPT_MESSAGE_PREFIX, PROMPT_FILE_MESSAGE_PREFIX,
-    SystemPromptSummary, neutral_text_message,
+    SystemPromptSummary, http::settings::default_image_generation_system_prompt,
+    neutral_text_message,
 };
 
 pub(crate) fn active_system_prompt(
@@ -28,6 +31,9 @@ pub(crate) fn active_system_prompt(
             .system_prompt
             .clone()
             .unwrap_or_else(build_default_system_prompt));
+    }
+    if name == IMAGE_GENERATION_SYSTEM_PROMPT_NAME {
+        return Ok(default_image_generation_system_prompt());
     }
 
     Err(ApiError::bad_request(format!(

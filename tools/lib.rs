@@ -34,6 +34,7 @@ pub const FIND_FILES_TOOL: &str = "find_files";
 pub const SEARCH_TEXT_TOOL: &str = "search_text";
 pub const WEB_SEARCH_TOOL: &str = "web_search";
 pub const WEB_FETCH_TOOL: &str = "web_fetch";
+pub const IMAGE_GEN_TOOL: &str = "image_gen";
 pub const WRITE_FILE_TOOL: &str = "write_file";
 pub const EDIT_FILE_TOOL: &str = "edit_file";
 pub const RUN_COMMAND_TOOL: &str = "run_command";
@@ -77,6 +78,7 @@ const DEFAULT_FILE_TOOL_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_GRAPH_TOOL_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SEARCH_TEXT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_WEB_TOOL_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_IMAGE_GEN_TOOL_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
@@ -238,9 +240,11 @@ fn execute_builtin_tool_inner(
         GRAPH_RELATED_FILES_TOOL => graph_tools::graph_related_files(workspace_path, arguments),
         GRAPH_EXPLORE_TOOL => graph_tools::graph_explore(workspace_path, arguments),
         SEARCH_TEXT_TOOL => file_tools::search_text(workspace_path, arguments, cancellation_token),
-        WEB_SEARCH_TOOL | WEB_FETCH_TOOL => Err(ToolRuntimeError::InvalidArguments(format!(
-            "{tool_name} requires app web runtime configuration"
-        ))),
+        WEB_SEARCH_TOOL | WEB_FETCH_TOOL | IMAGE_GEN_TOOL => {
+            Err(ToolRuntimeError::InvalidArguments(format!(
+                "{tool_name} requires app runtime configuration"
+            )))
+        }
         WRITE_FILE_TOOL => file_tools::write_file(workspace_path, arguments),
         EDIT_FILE_TOOL => file_tools::edit_file(workspace_path, arguments),
         CREATE_TODO_GRAPH_TOOL => todo_tools::create_todo_graph(workspace_path, chat_id, arguments),

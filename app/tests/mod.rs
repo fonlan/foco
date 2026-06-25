@@ -8,7 +8,8 @@ use axum::{
     response::IntoResponse,
 };
 use foco_agent::{
-    ToolResource, ToolResourceAccess, ToolResourceLock, context_compression_trigger_tokens,
+    ToolResource, ToolResourceAccess, ToolResourceLock, build_default_system_prompt,
+    context_compression_trigger_tokens,
 };
 use foco_providers::OPENAI_CHAT_KIND;
 use foco_store::{
@@ -36,8 +37,8 @@ use crate::http::{
         memory_dream_job, memory_dream_jobs, memory_extraction_job_summaries, run_memory_dream,
     },
     settings::{
-        associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
-        filter_provider_model_ids,
+        IMAGE_AGENT_SYSTEM_PROMPT_NAME, associate_provider_with_local_models,
+        can_save_new_provider_after_model_list_error, filter_provider_model_ids,
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
@@ -686,12 +687,14 @@ async fn execute_tool_reports_timeout_while_waiting_for_resource_lock() {
         )
         .await;
     let mcp_registry = Arc::new(McpRegistry::default());
+    let global_config = GlobalConfig::first_run(workspace.path().to_path_buf());
 
     let outcome = execute_tool(
         mcp_registry.clone(),
         HookRuntime::new(mcp_registry),
         &HookConfig::default(),
         true,
+        &global_config,
         &ProviderConnectionConfig {
             kind: test_provider_kind(),
             base_url: None,
@@ -1967,6 +1970,289 @@ async fn agent_definitions_api_creates_default_agent_when_empty() {
         .expect("list agent definitions again")
         .0;
     assert_eq!(listed_again.agent_definitions.len(), 1);
+}
+
+#[tokio::test]
+async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    let mut config = prompt_test_config(workspace_dir);
+    config.models.push(ModelSettings {
+        id: "gpt-image-2".to_string(),
+        display_name: "GPT Image 2".to_string(),
+        enabled: true,
+        provider_ids: vec!["provider".to_string()],
+        active_provider_id: Some("provider".to_string()),
+        thinking_level: None,
+        system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+        metadata_key: None,
+        metadata_source_url: None,
+        metadata_refreshed_at: None,
+        limits: None,
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["image".to_string()],
+    });
+    config.models.push(ModelSettings {
+        id: "gpt-alt".to_string(),
+        display_name: "GPT Alt".to_string(),
+        enabled: true,
+        provider_ids: vec!["provider".to_string()],
+        active_provider_id: Some("provider".to_string()),
+        thinking_level: Some("low".to_string()),
+        system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+        metadata_key: None,
+        metadata_source_url: None,
+        metadata_refreshed_at: None,
+        limits: Some(ModelLimits {
+            context_window: 20_000,
+            max_output_tokens: 1_000,
+        }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
+    });
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let prompt_settings = crate::http::settings::settings(State(state.clone()))
+        .await
+        .expect("settings response before listing agents")
+        .0;
+    let prompt_settings_image_prompt = prompt_settings
+        .prompts
+        .system_prompts
+        .iter()
+        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+        .expect("image agent prompt in settings before listing agents");
+    assert!(prompt_settings_image_prompt.content.contains("gpt-image-2"));
+    let default_prompt_index = prompt_settings
+        .prompts
+        .system_prompts
+        .iter()
+        .position(|prompt| prompt.name == DEFAULT_SYSTEM_PROMPT_NAME)
+        .expect("default prompt index");
+    let image_prompt_index = prompt_settings
+        .prompts
+        .system_prompts
+        .iter()
+        .position(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+        .expect("image prompt index");
+    assert_eq!(image_prompt_index, default_prompt_index + 1);
+
+    let saved_before_agents = crate::http::settings::save_prompt_settings(
+        State(state.clone()),
+        Json(ManualPromptSettingsRequest {
+            system_prompts: Some(vec![
+                ManualSystemPromptRequest {
+                    name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                    content: build_default_system_prompt(),
+                },
+                ManualSystemPromptRequest {
+                    name: IMAGE_AGENT_SYSTEM_PROMPT_NAME.to_string(),
+                    content: "Prompt edited before listing agents.".to_string(),
+                },
+            ]),
+            system_prompt: None,
+            files: Vec::new(),
+            extra_text: String::new(),
+        }),
+    )
+    .await
+    .expect("save synthesized image agent prompt")
+    .0;
+    let saved_before_agents_prompt = saved_before_agents
+        .prompts
+        .system_prompts
+        .iter()
+        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+        .expect("saved synthesized image agent prompt");
+    assert_eq!(
+        saved_before_agents_prompt.content,
+        "Prompt edited before listing agents."
+    );
+
+    let listed = crate::http::settings::agent_definitions(State(state.clone()))
+        .await
+        .expect("list agent definitions")
+        .0;
+    let image_definition_id =
+        AgentDefinitionId::new("agent-definition-image-gen").expect("image definition id");
+    let image_definition = listed
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == image_definition_id)
+        .expect("image agent definition");
+    assert_eq!(image_definition.model_id, "model");
+    assert_eq!(image_definition.provider_id, "provider");
+    assert!(
+        image_definition
+            .allowed_tools
+            .iter()
+            .any(|tool| tool == foco_tools::IMAGE_GEN_TOOL)
+    );
+    assert_eq!(
+        image_definition.system_prompt,
+        "Prompt edited before listing agents."
+    );
+
+    let mut custom_input = agent_definition_input_from_settings(image_definition);
+    custom_input.model_id = "gpt-alt".to_string();
+    custom_input.provider_id = "provider".to_string();
+    custom_input.model_options = AgentModelOptions {
+        thinking_level: Some("low".to_string()),
+        max_output_tokens: Some(800),
+    };
+    custom_input.system_prompt = "Custom image agent prompt.".to_string();
+    let updated = crate::http::settings::update_agent_definition(
+        State(state.clone()),
+        Json(UpdateAgentDefinitionRequest {
+            id: image_definition_id.clone(),
+            definition: custom_input,
+        }),
+    )
+    .await
+    .expect("update image agent prompt")
+    .0;
+    let updated_image_definition = updated
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == image_definition_id)
+        .expect("updated image agent");
+    assert_eq!(updated_image_definition.model_id, "gpt-alt");
+    assert_eq!(updated_image_definition.provider_id, "provider");
+    assert_eq!(
+        updated_image_definition.model_options.max_output_tokens,
+        Some(800)
+    );
+    assert_eq!(
+        updated_image_definition.system_prompt,
+        "Custom image agent prompt."
+    );
+
+    let settings = crate::http::settings::settings(State(state.clone()))
+        .await
+        .expect("settings response")
+        .0;
+    let listed_prompt = settings
+        .prompts
+        .system_prompts
+        .iter()
+        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+        .expect("image agent prompt in settings");
+    assert_eq!(listed_prompt.content, "Custom image agent prompt.");
+
+    let saved = crate::http::settings::save_prompt_settings(
+        State(state.clone()),
+        Json(ManualPromptSettingsRequest {
+            system_prompts: Some(vec![
+                ManualSystemPromptRequest {
+                    name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+                    content: build_default_system_prompt(),
+                },
+                ManualSystemPromptRequest {
+                    name: IMAGE_AGENT_SYSTEM_PROMPT_NAME.to_string(),
+                    content: "Prompt edited from prompt settings.".to_string(),
+                },
+            ]),
+            system_prompt: None,
+            files: Vec::new(),
+            extra_text: String::new(),
+        }),
+    )
+    .await
+    .expect("save prompt settings")
+    .0;
+    let saved_prompt = saved
+        .prompts
+        .system_prompts
+        .iter()
+        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+        .expect("saved image agent prompt in settings");
+    assert_eq!(saved_prompt.content, "Prompt edited from prompt settings.");
+
+    let config = state.config.lock().expect("config lock");
+    let stored_prompt = config
+        .prompts
+        .system_prompts
+        .iter()
+        .find(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+        .expect("stored image generation prompt");
+    assert_eq!(stored_prompt.content, "Prompt edited from prompt settings.");
+    let stored_image_definition = config
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == image_definition_id)
+        .expect("stored image agent");
+    assert_eq!(
+        stored_image_definition.system_prompt,
+        "Prompt edited from prompt settings."
+    );
+    assert_eq!(stored_image_definition.model_id, "gpt-alt");
+}
+
+#[tokio::test]
+async fn image_output_model_can_be_saved_without_text_limits() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+    let state = test_app_state(
+        prompt_test_config(workspace_dir),
+        profile.path().to_path_buf(),
+    );
+
+    let saved = crate::http::settings::save_manual_model(
+        State(state),
+        Json(ManualModelRequest {
+            model_id: "gpt-image-2".to_string(),
+            display_name: "GPT Image 2".to_string(),
+            enabled: true,
+            metadata_key: None,
+            context_window: Some(0),
+            max_output_tokens: Some(0),
+            provider_ids: Some(vec!["provider".to_string()]),
+            active_provider_id: Some("provider".to_string()),
+            input_modalities: Some(vec!["text".to_string()]),
+            output_modalities: Some(vec!["image".to_string()]),
+            thinking_level: None,
+            clear_thinking_level: Some(true),
+            system_prompt_name: Some(IMAGE_AGENT_SYSTEM_PROMPT_NAME.to_string()),
+        }),
+    )
+    .await
+    .expect("save image-only model")
+    .0;
+
+    let image_model = saved
+        .configured_models
+        .iter()
+        .find(|model| model.id == "gpt-image-2")
+        .expect("image model summary");
+    assert_eq!(image_model.context_window, None);
+    assert_eq!(image_model.max_output_tokens, None);
+    assert!(image_model.can_enable);
+    assert_eq!(image_model.output_modalities, vec!["image"]);
+    assert_eq!(
+        image_model.system_prompt_name,
+        IMAGE_AGENT_SYSTEM_PROMPT_NAME
+    );
+}
+
+fn agent_definition_input_from_settings(
+    definition: &AgentDefinitionSettings,
+) -> AgentDefinitionInput {
+    AgentDefinitionInput {
+        name: definition.name.clone(),
+        description: definition.description.clone(),
+        provider_id: definition.provider_id.clone(),
+        model_id: definition.model_id.clone(),
+        model_options: definition.model_options.clone(),
+        system_prompt: definition.system_prompt.clone(),
+        allowed_tools: definition.allowed_tools.clone(),
+        max_instances: definition.max_instances,
+        allowed_execution_workspace_modes: definition.allowed_execution_workspace_modes.clone(),
+        permissions: definition.permissions.clone(),
+    }
 }
 
 #[test]
@@ -4396,6 +4682,8 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let definition_id =
         AgentDefinitionId::new("agent-definition-api-coordinator").expect("definition id");
@@ -9242,6 +9530,8 @@ Search memory before repo work.
             context_window: 100_000,
             max_output_tokens: 1_024,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
 
@@ -9510,6 +9800,8 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
             context_window: 100_000,
             max_output_tokens: 1_024,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
 
@@ -9628,6 +9920,8 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
             context_window: 100_000,
             max_output_tokens: 1_024,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     let context = prepare_chat_context(
@@ -9722,6 +10016,8 @@ Use the existing product UI conventions.
             context_window: 100_000,
             max_output_tokens: 1_024,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     let expected_message = format!(
@@ -9809,6 +10105,8 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     let context = prepare_prompt_context(
@@ -9963,6 +10261,8 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     {
@@ -10162,6 +10462,8 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
 
@@ -10263,6 +10565,8 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     config.models.push(ModelSettings {
         id: "review-model".to_string(),
@@ -10279,6 +10583,8 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     let first_context = prepare_chat_context(
@@ -10718,6 +11024,8 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     {
@@ -10927,6 +11235,8 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     {
@@ -11194,6 +11504,8 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
@@ -11404,6 +11716,8 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     {
@@ -11689,6 +12003,8 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     {
@@ -11821,6 +12137,8 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     {
@@ -12018,6 +12336,8 @@ fn test_model_settings(id: &str) -> ModelSettings {
         metadata_source_url: None,
         metadata_refreshed_at: None,
         limits: None,
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     }
 }
 
@@ -12275,6 +12595,8 @@ fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
             context_window: 20_000,
             max_output_tokens: 1_000,
         }),
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
     });
     config
 }

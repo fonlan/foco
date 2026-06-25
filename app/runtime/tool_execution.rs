@@ -15,7 +15,7 @@ use foco_agent::{
 };
 use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
-use foco_store::config::{HookConfig, WebSearchSettings};
+use foco_store::config::{GlobalConfig, HookConfig, WebSearchSettings};
 use foco_store::workspace::{
     AgentInstanceRecord, AgentTaskRecord, NewAgentEvent, NewAgentInstance, NewAgentMessage,
     NewAgentTask, NewAgentTaskDependency, WorkspaceDatabase,
@@ -39,7 +39,8 @@ use super::{
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, AskQuestionInput, QuestionAnswer,
     QuestionItem, QuestionItemAnswer, QuestionOption, QuestionRegistry, QuestionRequest,
     ToolOutputDeltaSink, ToolResourceLease, ToolResourceLockOwner, ToolResourceLockRegistry,
-    execute_web_tool, is_web_tool_name, web_tool_timeout_ms,
+    execute_image_tool, execute_web_tool, image_tool_timeout_ms, is_image_tool_name,
+    is_web_tool_name, web_tool_timeout_ms,
 };
 use crate::*;
 
@@ -200,6 +201,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
     api_audit_save_details: bool,
+    global_config: GlobalConfig,
     provider_config: ProviderConnectionConfig,
     web_search_settings: WebSearchSettings,
     question_registry: QuestionRegistry,
@@ -237,6 +239,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                         hook_runtime.clone(),
                         global_hooks.clone(),
                         api_audit_save_details,
+                        global_config.clone(),
                         provider_config.clone(),
                         web_search_settings.clone(),
                         question_registry.clone(),
@@ -276,6 +279,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                     let hook_runtime = hook_runtime.clone();
                     let global_hooks = global_hooks.clone();
                     let api_audit_save_details = api_audit_save_details;
+                    let global_config = global_config.clone();
                     let provider_config = provider_config.clone();
                     let web_search_settings = web_search_settings.clone();
                     let question_registry = question_registry.clone();
@@ -300,6 +304,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                                 hook_runtime,
                                 global_hooks,
                                 api_audit_save_details,
+                                global_config,
                                 provider_config,
                                 web_search_settings,
                                 question_registry,
@@ -351,6 +356,7 @@ async fn execute_tool_call(
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
     api_audit_save_details: bool,
+    global_config: GlobalConfig,
     provider_config: ProviderConnectionConfig,
     web_search_settings: WebSearchSettings,
     question_registry: QuestionRegistry,
@@ -378,6 +384,7 @@ async fn execute_tool_call(
         hook_runtime.clone(),
         &global_hooks,
         api_audit_save_details,
+        &global_config,
         &provider_config,
         &web_search_settings,
         question_registry,
@@ -453,6 +460,7 @@ pub(crate) async fn execute_tool(
     hook_runtime: HookRuntime,
     global_hooks: &HookConfig,
     api_audit_save_details: bool,
+    global_config: &GlobalConfig,
     provider_config: &ProviderConnectionConfig,
     web_search_settings: &WebSearchSettings,
     question_registry: QuestionRegistry,
@@ -855,6 +863,42 @@ pub(crate) async fn execute_tool(
                 Err("tool execution cancelled".to_string())
             }
             execution = execute_web_tool(web_search_settings, tool_name, arguments, remaining_timeout) => execution,
+        };
+        let execution = match execution {
+            Ok(output) => ToolExecution {
+                output,
+                is_error: false,
+            },
+            Err(error) => ToolExecution {
+                output: json!({ "error": error }),
+                is_error: true,
+            },
+        };
+
+        return ToolExecutionWithHooks {
+            execution,
+            hook_summary,
+        };
+    }
+
+    if is_image_tool_name(tool_name) {
+        let remaining_timeout = tool_deadline
+            .and_then(remaining_duration_until)
+            .unwrap_or(Duration::ZERO);
+        set_tool_timeout_ms(&mut arguments, remaining_timeout);
+        let execution = tokio::select! {
+            _ = cancellation_token_cancelled(cancellation_token.clone()) => {
+                Err("tool execution cancelled".to_string())
+            }
+            execution = execute_image_tool(
+                global_config,
+                workspace_path,
+                chat_id,
+                run_id,
+                tool_name,
+                arguments,
+                remaining_timeout,
+            ) => execution,
         };
         let execution = match execution {
             Ok(output) => ToolExecution {
@@ -2196,6 +2240,8 @@ fn execution_tool_timeout_ms(tool_name: &str, arguments: &Value) -> Result<Optio
         memory_tool_timeout_ms(arguments).map(Some)
     } else if is_web_tool_name(tool_name) {
         web_tool_timeout_ms(arguments).map(Some)
+    } else if is_image_tool_name(tool_name) {
+        image_tool_timeout_ms(arguments).map(Some)
     } else if is_mcp_tool_name(tool_name) {
         Ok(None)
     } else {

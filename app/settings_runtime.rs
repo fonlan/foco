@@ -5,15 +5,18 @@ use foco_agent::build_default_system_prompt;
 use foco_providers::supported_provider_kinds;
 use foco_store::{
     config::{
-        GlobalConfig, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig, ModelSettings,
-        ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
-        SUPPORTED_TERMINAL_SHELLS, WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY,
-        WebSearchSettings, WorkspaceCommonCommand, WorkspaceConfig,
+        DEFAULT_SYSTEM_PROMPT_NAME, GlobalConfig, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig,
+        ModelSettings, ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
+        SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS, WEB_SEARCH_PROVIDER_BRAVE,
+        WEB_SEARCH_PROVIDER_TAVILY, WebSearchSettings, WorkspaceCommonCommand, WorkspaceConfig,
     },
     workspace::WorkspaceDatabase,
 };
 
-use crate::http::settings::known_agent_tool_names;
+use crate::http::settings::{
+    IMAGE_AGENT_SYSTEM_PROMPT_NAME, default_image_agent_system_prompt_for_config,
+    image_agent_system_prompt_for_config, known_agent_tool_names,
+};
 use crate::*;
 
 pub(crate) async fn settings_response(
@@ -139,7 +142,10 @@ pub(crate) async fn settings_response(
         prompts: PromptSettingsSummary {
             system_prompt: config.prompts.system_prompt.clone(),
             default_system_prompt: default_system_prompt.clone(),
-            system_prompts: system_prompt_summaries(&config.prompts, &default_system_prompt),
+            default_image_generation_system_prompt: default_image_agent_system_prompt_for_config(
+                config,
+            )?,
+            system_prompts: settings_system_prompt_summaries(config, &default_system_prompt)?,
             files: config
                 .prompts
                 .files
@@ -216,6 +222,33 @@ pub(crate) async fn settings_response(
             .collect(),
         skills: skills_settings_summary(config, &state.user_profile_dir),
     }))
+}
+
+fn settings_system_prompt_summaries(
+    config: &GlobalConfig,
+    default_system_prompt: &str,
+) -> Result<Vec<SystemPromptSummary>, ApiError> {
+    let mut summaries = system_prompt_summaries(&config.prompts, default_system_prompt);
+    let image_prompt = summaries
+        .iter()
+        .position(|prompt| prompt.name == IMAGE_AGENT_SYSTEM_PROMPT_NAME)
+        .map(|index| summaries.remove(index));
+    let image_prompt = match image_prompt {
+        Some(prompt) => Some(prompt),
+        None => image_agent_system_prompt_for_config(config)?.map(|content| SystemPromptSummary {
+            name: IMAGE_AGENT_SYSTEM_PROMPT_NAME.to_string(),
+            content,
+        }),
+    };
+    if let Some(prompt) = image_prompt {
+        let insert_index = summaries
+            .iter()
+            .position(|prompt| prompt.name == DEFAULT_SYSTEM_PROMPT_NAME)
+            .map(|index| index + 1)
+            .unwrap_or(summaries.len());
+        summaries.insert(insert_index, prompt);
+    }
+    Ok(summaries)
 }
 
 pub(crate) fn configured_workspace_summary(
@@ -603,13 +636,14 @@ pub(crate) fn workspace_response_from_config(
 pub(crate) fn configured_model_summary(model: &ModelSettings) -> ConfiguredModelSummary {
     let context_window = model.limits.as_ref().map(|limits| limits.context_window);
     let max_output_tokens = model.limits.as_ref().map(|limits| limits.max_output_tokens);
+    let requires_limits = model_outputs_text(model);
     let mut missing_limits = Vec::new();
 
-    if context_window.is_none() {
+    if requires_limits && context_window.is_none() {
         missing_limits.push("contextWindow");
     }
 
-    if max_output_tokens.is_none() {
+    if requires_limits && max_output_tokens.is_none() {
         missing_limits.push("maxOutputTokens");
     }
 
@@ -626,9 +660,19 @@ pub(crate) fn configured_model_summary(model: &ModelSettings) -> ConfiguredModel
         missing_limits,
         provider_ids: model.provider_ids.clone(),
         active_provider_id: model.active_provider_id.clone(),
+        input_modalities: model.input_modalities.clone(),
+        output_modalities: model.output_modalities.clone(),
         thinking_level: model.thinking_level.clone(),
         system_prompt_name: model.system_prompt_name.clone(),
         supports_thinking: false,
         warnings: Vec::new(),
     }
+}
+
+fn model_outputs_text(model: &ModelSettings) -> bool {
+    model.output_modalities.is_empty()
+        || model
+            .output_modalities
+            .iter()
+            .any(|modality| modality == "text")
 }

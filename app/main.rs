@@ -124,7 +124,7 @@ use crate::runtime::{
     QuestionAnswerResponse, QuestionRegistry, QuestionRequest, ReadOnlyToolProgressAction,
     ReadOnlyToolProgressDetector, RepeatedToolCallDetector, ToolOutputDeltaEvent,
     ToolResourceLockRegistry, chat_run_subscription_stream, execute_tool_calls_parallel,
-    insert_agent_event, is_agent_tool_name, pending_tool_calls,
+    image_model_available, insert_agent_event, is_agent_tool_name, pending_tool_calls,
     validate_agent_snapshot_for_workspace,
 };
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
@@ -2366,6 +2366,8 @@ struct ManualModelRequest {
     max_output_tokens: Option<u64>,
     provider_ids: Option<Vec<String>>,
     active_provider_id: Option<String>,
+    input_modalities: Option<Vec<String>>,
+    output_modalities: Option<Vec<String>>,
     thinking_level: Option<String>,
     clear_thinking_level: Option<bool>,
     system_prompt_name: Option<String>,
@@ -2821,6 +2823,7 @@ struct SpecSettingsSummary {
 struct PromptSettingsSummary {
     system_prompt: Option<String>,
     default_system_prompt: String,
+    default_image_generation_system_prompt: Option<String>,
     system_prompts: Vec<SystemPromptSummary>,
     files: Vec<String>,
     extra_text: String,
@@ -3115,6 +3118,8 @@ struct ConfiguredModelSummary {
     missing_limits: Vec<&'static str>,
     provider_ids: Vec<String>,
     active_provider_id: Option<String>,
+    input_modalities: Vec<String>,
+    output_modalities: Vec<String>,
     thinking_level: Option<String>,
     system_prompt_name: String,
     supports_thinking: bool,
@@ -5612,6 +5617,7 @@ impl PreparedChatContext {
                                     self.hook_runtime.clone(),
                                     self.global_hooks.clone(),
                                     api_audit_save_details(&self.global_config),
+                                    self.global_config.clone(),
                                     self.provider_config.clone(),
                                     self.global_config.web_search.clone(),
                                     self.question_registry.clone(),
@@ -8896,6 +8902,48 @@ fn normalize_model_provider_ids(
     }
 
     Ok(provider_ids)
+}
+
+fn normalize_model_modalities(
+    requested_modalities: Option<Vec<String>>,
+    existing_modalities: Option<&[String]>,
+    metadata_modalities: Option<&[String]>,
+    default_modalities: &[&str],
+) -> Vec<String> {
+    let selected = requested_modalities
+        .map(|modalities| normalize_modalities(modalities.into_iter()))
+        .or_else(|| {
+            existing_modalities.map(|modalities| normalize_modalities(modalities.iter().cloned()))
+        })
+        .or_else(|| {
+            metadata_modalities.map(|modalities| normalize_modalities(modalities.iter().cloned()))
+        });
+
+    selected
+        .filter(|modalities| !modalities.is_empty())
+        .unwrap_or_else(|| {
+            default_modalities
+                .iter()
+                .map(|value| value.to_string())
+                .collect()
+        })
+}
+
+fn normalize_modalities(modalities: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+
+    for modality in modalities {
+        let modality = modality.trim().to_ascii_lowercase();
+        if modality.is_empty() {
+            continue;
+        }
+        if seen.insert(modality.clone()) {
+            normalized.push(modality);
+        }
+    }
+
+    normalized
 }
 
 fn reorder_models(models: &mut Vec<ModelSettings>, model_ids: Vec<String>) -> Result<(), ApiError> {

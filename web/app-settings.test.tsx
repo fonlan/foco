@@ -866,6 +866,10 @@ describe("app-settings verification surfaces", () => {
                 name: "Default",
               },
               {
+                content: "Generate images with image_gen.",
+                name: "Image Generation",
+              },
+              {
                 name: "Review",
                 content: "Review as senior engineer.",
               },
@@ -875,6 +879,46 @@ describe("app-settings verification surfaces", () => {
         }),
       );
     });
+  });
+
+  it("shows the image agent system prompt as a fixed prompt", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+
+    const defaultPromptButton = screen.getByRole("button", { name: "Default" });
+    const imagePromptButton = screen.getByRole("button", { name: "Image Generation" });
+    expect(
+      defaultPromptButton.compareDocumentPosition(imagePromptButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    await userEvent.click(imagePromptButton);
+    expect(screen.getByLabelText("System prompt")).toHaveValue(
+      "Generate images with image_gen.",
+    );
+    const restoreButtons = screen.getAllByRole("button", {
+      name: "Restore default system prompt",
+    });
+    expect(restoreButtons).toHaveLength(2);
+    await userEvent.clear(screen.getByLabelText("System prompt"));
+    await userEvent.type(screen.getByLabelText("System prompt"), "Custom image prompt.");
+    await userEvent.click(restoreButtons[1]);
+    expect(screen.getByLabelText("System prompt")).toHaveValue(
+      "Generate images with image_gen.",
+    );
+    expect(
+      screen.queryByRole("button", {
+        name: "Rename system prompt Image Generation",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", {
+        name: "Remove system prompt Image Generation",
+      }),
+    ).not.toBeInTheDocument();
   });
 
   it("renames user system prompts before saving prompt settings", async () => {
@@ -918,6 +962,10 @@ describe("app-settings verification surfaces", () => {
                 name: "Default",
               },
               {
+                content: "Generate images with image_gen.",
+                name: "Image Generation",
+              },
+              {
                 name: "Reviewer",
                 content: "Review as senior engineer.",
               },
@@ -940,7 +988,9 @@ describe("app-settings verification surfaces", () => {
     const systemPromptInput = screen.getByLabelText("System prompt");
     await userEvent.clear(systemPromptInput);
     await userEvent.type(systemPromptInput, "Custom system prompt.");
-    await userEvent.click(screen.getByRole("button", { name: "Restore default system prompt" }));
+    await userEvent.click(
+      screen.getAllByRole("button", { name: "Restore default system prompt" })[0],
+    );
     expect(systemPromptInput).toHaveValue("You are Foco, a local coding agent.");
 
     await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
@@ -956,6 +1006,10 @@ describe("app-settings verification surfaces", () => {
               {
                 content: "You are Foco, a local coding agent.",
                 name: "Default",
+              },
+              {
+                content: "Generate images with image_gen.",
+                name: "Image Generation",
               },
             ],
           }),
@@ -1121,5 +1175,39 @@ describe("app-settings verification surfaces", () => {
       );
     });
   }, 10000);
+
+  it("saves image-output models without text token limits", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add model" }));
+    await userEvent.type(screen.getByLabelText("Model id"), "gpt-image-2");
+    await userEvent.type(screen.getByLabelText("Display name"), "GPT Image 2");
+    await userEvent.selectOptions(screen.getByLabelText("System prompt"), "Image Generation");
+    await userEvent.click(screen.getByRole("checkbox", { name: "Enable model" }));
+
+    const outputTypes = screen.getByRole("group", { name: "Output types" });
+    await userEvent.click(within(outputTypes).getByRole("checkbox", { name: "text" }));
+    await userEvent.click(within(outputTypes).getByRole("checkbox", { name: "image" }));
+    await userEvent.click(screen.getByRole("button", { name: "Save model" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          url === "/api/models/manual" &&
+          typeof init?.body === "string" &&
+          init.body.includes('"modelId":"gpt-image-2"'),
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(saveCall![1]?.body as string)).toMatchObject({
+        contextWindow: null,
+        maxOutputTokens: null,
+        outputModalities: ["image"],
+        systemPromptName: "Image Generation",
+      });
+    });
+  });
 
 });

@@ -3,9 +3,9 @@ use serde_json::{Value, json};
 use crate::{
     ASK_QUESTION_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
     GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
-    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL,
-    RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolDefinition, UPDATE_TODO_GRAPH_TOOL,
-    WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL,
+    READ_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolDefinition,
+    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
 };
 
 pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -21,6 +21,7 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         search_text_definition(),
         web_search_definition(),
         web_fetch_definition(),
+        image_gen_definition(),
         write_file_definition(),
         edit_file_definition(),
         create_todo_graph_definition(),
@@ -388,6 +389,100 @@ fn web_fetch_definition() -> ToolDefinition {
                 }
             },
             "required": ["url", "startLine", "endLine", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn image_gen_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: IMAGE_GEN_TOOL,
+        description: "Generate or edit images using the configured image generation model. The tool saves generated images under the workspace .foco directory and returns file paths plus metadata; it does not return image bytes inline.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Detailed prompt describing the image to generate or edit."
+                },
+                "mode": {
+                    "type": ["string", "null"],
+                    "enum": ["generate", "edit", null],
+                    "description": "Image operation mode. Defaults to generate. Edit mode requires at least one input image."
+                },
+                "model": {
+                    "type": ["string", "null"],
+                    "description": "Optional configured image-capable model id. Defaults to gpt-image-2 when configured, otherwise the first enabled image-output model."
+                },
+                "inputImages": {
+                    "type": ["array", "null"],
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Workspace-relative path to an input image for edit/reference use."
+                            },
+                            "description": {
+                                "type": ["string", "null"],
+                                "description": "Optional short description of the image's role."
+                            }
+                        },
+                        "required": ["path", "description"]
+                    },
+                    "description": "Optional input images for edit/reference use."
+                },
+                "maskPath": {
+                    "type": ["string", "null"],
+                    "description": "Optional workspace-relative mask image path for edit mode."
+                },
+                "size": {
+                    "type": ["string", "null"],
+                    "description": "Optional output size such as 1024x1024. Defaults to provider/model default."
+                },
+                "quality": {
+                    "type": ["string", "null"],
+                    "enum": ["auto", "low", "medium", "high", null],
+                    "description": "Optional generation quality. Defaults to auto."
+                },
+                "background": {
+                    "type": ["string", "null"],
+                    "enum": ["auto", "opaque", "transparent", null],
+                    "description": "Optional background handling. Defaults to auto."
+                },
+                "outputFormat": {
+                    "type": ["string", "null"],
+                    "enum": ["png", "jpeg", "webp", null],
+                    "description": "Optional saved image format. Defaults to png."
+                },
+                "compression": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "maximum": 100,
+                    "description": "Optional compression level from 0 to 100 for supported lossy formats."
+                },
+                "count": {
+                    "type": ["integer", "null"],
+                    "minimum": 1,
+                    "maximum": 4,
+                    "description": "Optional number of images from 1 to 4. Defaults to 1."
+                },
+                "outputDir": {
+                    "type": ["string", "null"],
+                    "description": "Optional workspace-relative output directory. Defaults to .foco/sessions/<chat_id>/image_gen/."
+                },
+                "outputName": {
+                    "type": ["string", "null"],
+                    "description": "Optional output file basename. A sequence suffix is added when generating multiple images."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 300000."
+                }
+            },
+            "required": ["prompt", "mode", "model", "inputImages", "maskPath", "size", "quality", "background", "outputFormat", "compression", "count", "outputDir", "outputName", "timeoutMs"]
         }),
         strict: true,
     }

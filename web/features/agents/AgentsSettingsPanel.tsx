@@ -24,6 +24,8 @@ const AGENT_EXECUTION_WORKSPACE_MODES: AgentExecutionWorkspaceMode[] = [
   "shared",
   "isolated_worktree",
 ];
+const IMAGE_AGENT_DEFINITION_ID = "agent-definition-image-gen";
+const IMAGE_GEN_MODEL_INSTRUCTION_PATTERN = /Use image_gen with model "([^"]+)"/;
 
 type AgentDefinitionDraft = {
   allowedTools: string[];
@@ -84,6 +86,19 @@ export function AgentsSettingsPanel({
         (model) =>
           model.enabled &&
           model.canEnable &&
+          modelOutputsText(model) &&
+          model.activeProviderId !== null &&
+          model.providerIds.length > 0,
+      ),
+    [models],
+  );
+  const imageModels = useMemo(
+    () =>
+      models.filter(
+        (model) =>
+          model.enabled &&
+          model.canEnable &&
+          modelOutputsImage(model) &&
           model.activeProviderId !== null &&
           model.providerIds.length > 0,
       ),
@@ -97,6 +112,7 @@ export function AgentsSettingsPanel({
     () => new Map(models.map((model) => [model.id, model.displayName])),
     [models],
   );
+  const modelById = useMemo(() => new Map(models.map((model) => [model.id, model])), [models]);
   const [dialogMode, setDialogMode] = useState<"create" | "edit" | null>(null);
   const [editingDefinitionId, setEditingDefinitionId] = useState<string | null>(null);
   const [draft, setDraft] = useState<AgentDefinitionDraft>(() =>
@@ -104,6 +120,17 @@ export function AgentsSettingsPanel({
   );
   const editingDefinition =
     definitions.find((definition) => definition.id === editingDefinitionId) ?? null;
+  const editingImageGenerationAgent =
+    editingDefinition?.id === IMAGE_AGENT_DEFINITION_ID;
+  const selectedImageModelId = imageModelIdFromSystemPrompt(draft.systemPrompt);
+  const selectedImageModel =
+    editingImageGenerationAgent && selectedImageModelId
+      ? imageModels.find((model) => model.id === selectedImageModelId) ?? null
+      : null;
+  const modelSelectModels = editingImageGenerationAgent ? imageModels : enabledModels;
+  const modelSelectValue = editingImageGenerationAgent
+    ? (selectedImageModel?.id ?? "")
+    : draft.modelId;
   const selectedModel = enabledModels.find((model) => model.id === draft.modelId) ?? null;
   const selectableProviders = selectedModel
     ? selectedModel.providerIds
@@ -161,6 +188,16 @@ export function AgentsSettingsPanel({
   }
 
   function selectModel(modelId: string) {
+    if (editingImageGenerationAgent) {
+      if (!modelId) {
+        return;
+      }
+      updateDraft({
+        systemPrompt: imageGenerationPromptWithModel(draft.systemPrompt, modelId),
+      });
+      return;
+    }
+
     const model = enabledModels.find((item) => item.id === modelId) ?? null;
     updateDraft({
       modelId,
@@ -260,50 +297,61 @@ export function AgentsSettingsPanel({
       ) : null}
 
       <div className="mt-4 grid gap-2">
-        {definitions.map((definition) => (
-          <article
-            className="group flex items-start gap-3 rounded-xl border border-stone-200 bg-stone-50/65 px-3 py-3 transition hover:border-teal-200 hover:bg-teal-50/45"
-            key={definition.id}
-          >
-            <div className="min-w-0 flex-1">
-              <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
-                <h4 className="truncate text-sm font-semibold text-stone-950">
-                  {definition.name}
-                </h4>
-                <span className="truncate text-xs font-medium text-stone-500">
-                  {modelNameById.get(definition.modelId) ?? definition.modelId}
-                  <span aria-hidden="true"> · </span>
-                  {providerNameById.get(definition.providerId) ?? definition.providerId}
-                </span>
+        {definitions.map((definition) => {
+          const imageModelId =
+            definition.id === IMAGE_AGENT_DEFINITION_ID
+              ? imageModelIdFromSystemPrompt(definition.systemPrompt)
+              : null;
+          const displayModelId = imageModelId ?? definition.modelId;
+          const imageModel = imageModelId ? modelById.get(imageModelId) : null;
+          const displayProviderId =
+            imageModel?.activeProviderId ?? imageModel?.providerIds[0] ?? definition.providerId;
+
+          return (
+            <article
+              className="group flex items-start gap-3 rounded-xl border border-stone-200 bg-stone-50/65 px-3 py-3 transition hover:border-teal-200 hover:bg-teal-50/45"
+              key={definition.id}
+            >
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
+                  <h4 className="truncate text-sm font-semibold text-stone-950">
+                    {definition.name}
+                  </h4>
+                  <span className="truncate text-xs font-medium text-stone-500">
+                    {modelNameById.get(displayModelId) ?? displayModelId}
+                    <span aria-hidden="true"> · </span>
+                    {providerNameById.get(displayProviderId) ?? displayProviderId}
+                  </span>
+                </div>
+                <p className="mt-1 text-sm leading-5 text-stone-600">
+                  {definition.description}
+                </p>
               </div>
-              <p className="mt-1 text-sm leading-5 text-stone-600">
-                {definition.description}
-              </p>
-            </div>
-            <div className="flex shrink-0 items-center gap-1">
-              <button
-                aria-label={t("Edit agent {name}", { name: definition.name })}
-                className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 transition hover:bg-white hover:text-teal-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 disabled:cursor-not-allowed disabled:text-stone-300"
-                disabled={operationKey !== null}
-                onClick={() => openEditDialog(definition)}
-                title={t("Edit")}
-                type="button"
-              >
-                <Pencil aria-hidden="true" className="size-4" />
-              </button>
-              <button
-                aria-label={t("Delete agent {name}", { name: definition.name })}
-                className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 transition hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:text-stone-300"
-                disabled={operationKey !== null}
-                onClick={() => void deleteDefinition(definition)}
-                title={t("Delete")}
-                type="button"
-              >
-                <Trash2 aria-hidden="true" className="size-4" />
-              </button>
-            </div>
-          </article>
-        ))}
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  aria-label={t("Edit agent {name}", { name: definition.name })}
+                  className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 transition hover:bg-white hover:text-teal-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 disabled:cursor-not-allowed disabled:text-stone-300"
+                  disabled={operationKey !== null}
+                  onClick={() => openEditDialog(definition)}
+                  title={t("Edit")}
+                  type="button"
+                >
+                  <Pencil aria-hidden="true" className="size-4" />
+                </button>
+                <button
+                  aria-label={t("Delete agent {name}", { name: definition.name })}
+                  className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 transition hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:text-stone-300"
+                  disabled={operationKey !== null}
+                  onClick={() => void deleteDefinition(definition)}
+                  title={t("Delete")}
+                  type="button"
+                >
+                  <Trash2 aria-hidden="true" className="size-4" />
+                </button>
+              </div>
+            </article>
+          );
+        })}
         {isLoading ? (
           <div className="flex items-center justify-center gap-2 py-8 text-sm text-stone-500">
             <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
@@ -387,9 +435,9 @@ export function AgentsSettingsPanel({
                   value={draft.description}
                 />
               </label>
-              <AgentSelect label={t("Model")} value={draft.modelId} onChange={selectModel}>
+              <AgentSelect label={t("Model")} value={modelSelectValue} onChange={selectModel}>
                 <option value="">{t("Select model")}</option>
-                {enabledModels.map((model) => (
+                {modelSelectModels.map((model) => (
                   <option key={model.id} value={model.id}>
                     {model.displayName}
                   </option>
@@ -455,6 +503,16 @@ export function AgentsSettingsPanel({
                     </option>
                   ))}
                 </select>
+              </label>
+              <label className="block md:col-span-2">
+                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  {t("System prompt content")}
+                </span>
+                <textarea
+                  className="min-h-40 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  onChange={(event) => updateDraft({ systemPrompt: event.target.value })}
+                  value={draft.systemPrompt}
+                />
               </label>
               <details className="group/tools relative md:col-span-2">
                 <summary className="flex h-10 cursor-pointer list-none items-center justify-between rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition marker:content-none focus-visible:border-teal-700 focus-visible:ring-2 focus-visible:ring-teal-100">
@@ -661,6 +719,30 @@ function emptyAgentDefinitionDraft(
     systemPrompt: systemPrompt?.content ?? "",
     thinkingLevel: "",
   };
+}
+
+function modelOutputsText(model: ConfiguredModelSummary) {
+  return model.outputModalities.length === 0 || model.outputModalities.includes("text");
+}
+
+function modelOutputsImage(model: ConfiguredModelSummary) {
+  return model.outputModalities.includes("image");
+}
+
+function imageModelIdFromSystemPrompt(prompt: string) {
+  return IMAGE_GEN_MODEL_INSTRUCTION_PATTERN.exec(prompt)?.[1] ?? null;
+}
+
+function imageGenerationPromptWithModel(prompt: string, modelId: string) {
+  const instruction = `Use image_gen with model "${modelId}" unless the user explicitly asks for another configured image model.`;
+  if (IMAGE_GEN_MODEL_INSTRUCTION_PATTERN.test(prompt)) {
+    return prompt.replace(
+      IMAGE_GEN_MODEL_INSTRUCTION_PATTERN,
+      `Use image_gen with model "${modelId}"`,
+    );
+  }
+  const trimmedPrompt = prompt.trimEnd();
+  return trimmedPrompt ? `${trimmedPrompt}\n\n${instruction}` : instruction;
 }
 
 function agentDefinitionToDraft(
