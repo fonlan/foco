@@ -38,10 +38,12 @@ export function useAiStatisticsData(initialPage = 1) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const selectedRequestRef = useRef<AiRequestAuditSummary | null>(null);
   const filtersRef = useRef(filters);
+  const statsRef = useRef<AiStatisticsResponse | null>(null);
   const isStatsRequestInFlightRef = useRef(false);
   const shouldReloadStatsAfterCurrentRequestRef = useRef(false);
 
   filtersRef.current = filters;
+  statsRef.current = stats;
 
   const loadRequestDetail = useCallback(
     async (request: AiRequestAuditSummary, showLoading: boolean) => {
@@ -117,7 +119,9 @@ export function useAiStatisticsData(initialPage = 1) {
         }
         if (shouldReloadStatsAfterCurrentRequestRef.current) {
           shouldReloadStatsAfterCurrentRequestRef.current = false;
-          void loadStats(false);
+          if (isAiStatsDocumentVisible()) {
+            void loadStats(false);
+          }
         }
       }
     },
@@ -125,19 +129,23 @@ export function useAiStatisticsData(initialPage = 1) {
   );
 
   useEffect(() => {
+    if (!isAiStatsDocumentVisible()) {
+      return;
+    }
+
     void loadStats(true, true);
   }, [filters, loadStats]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
-      if (document.hidden) {
+      if (!isAiStatsDocumentVisible()) {
         return;
       }
       void loadStats(false);
     }, AI_STATS_POLL_INTERVAL_MS);
     const handleVisibilityChange = () => {
-      if (!document.hidden) {
-        void loadStats(false);
+      if (isAiStatsDocumentVisible()) {
+        void loadStats(statsRef.current === null);
       }
     };
 
@@ -224,6 +232,10 @@ export function useAiStatisticsData(initialPage = 1) {
 
 function positivePage(value: number) {
   return Number.isSafeInteger(value) && value > 0 ? value : 1;
+}
+
+function isAiStatsDocumentVisible() {
+  return document.visibilityState !== "hidden";
 }
 
 function aiStatsQuery(filters: AiStatsFilterState) {

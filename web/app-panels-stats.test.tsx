@@ -52,6 +52,37 @@ describe("app-panels-stats verification surfaces", () => {
       .filter((url) => url.pathname === "/api/ai-statistics");
   }
 
+  function setDocumentVisibility(visibilityState: DocumentVisibilityState) {
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      value: visibilityState === "hidden",
+    });
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      value: visibilityState,
+    });
+  }
+
+  function latestStreamChatId() {
+    const streamCall = vi
+      .mocked(fetch)
+      .mock.calls.findLast(([input]) => {
+        const rawPath =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+        return new URL(rawPath, "http://localhost").pathname.endsWith(
+          "/chat/stream",
+        );
+      });
+    const body = JSON.parse(String(streamCall?.[1]?.body ?? "{}")) as {
+      chatId?: string | null;
+    };
+    return body.chatId ?? "chat-1";
+  }
+
   it("shows git file names before muted directories in the diff panel", async () => {
     appTestState.workspaceGitDiffResponse = generatedGitDiff;
 
@@ -392,15 +423,19 @@ describe("app-panels-stats verification surfaces", () => {
   });
 
   it("keeps todo graph and git diff in separate context tabs", async () => {
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
     await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "plan");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await act(async () => {
+      await Promise.resolve();
+    });
 
     await act(async () => {
       enqueueChatStreamEvent({
-        chatId: "chat-1",
+        chatId: latestStreamChatId(),
         type: "todoGraphRefresh",
         workspaceId: "workspace-1",
       });
@@ -410,9 +445,10 @@ describe("app-panels-stats verification surfaces", () => {
       name: /task-1[\s\S]*Inspect workspace changes/,
     });
     expect(todoTaskButton).toBeInTheDocument();
+    const contextPanel = todoTaskButton.closest(".context-panel") as HTMLElement;
     await userEvent.click(todoTaskButton);
     expect(await screen.findByText("README.md diff is visible")).toBeInTheDocument();
-    expect(screen.queryByText(/hello world/)).not.toBeInTheDocument();
+    expect(within(contextPanel).queryByText(/hello world/)).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
@@ -420,11 +456,11 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getAllByRole("button", { name: /README\.md M/ })).toHaveLength(2);
     expect(screen.getAllByRole("button", { name: /new-note\.txt U/ })).toHaveLength(2);
     expect(screen.getAllByRole("button", { name: /asset\.bin M/ }).length).toBeGreaterThan(0);
-    expect(screen.queryByText(/hello world/)).not.toBeInTheDocument();
+    expect(within(contextPanel).queryByText(/hello world/)).not.toBeInTheDocument();
 
     await userEvent.click(screen.getAllByRole("button", { name: /README\.md M/ })[0]);
 
-    const inlineDiffLine = (await screen.findAllByText(/hello world/))[0];
+    const inlineDiffLine = (await within(contextPanel).findAllByText(/hello world/))[0];
     expect(inlineDiffLine).toBeInTheDocument();
     const inlineDiffScrollRegion = inlineDiffLine.closest(
       ".panel-scroll",
@@ -437,7 +473,7 @@ describe("app-panels-stats verification surfaces", () => {
     expect(inlineDiffLine.closest(".overflow-y-auto")).toHaveClass(
       "panel-scroll",
     );
-    expect(screen.queryByText("Inspect workspace changes")).not.toBeInTheDocument();
+    expect(within(contextPanel).queryByText("Inspect workspace changes")).not.toBeInTheDocument();
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
@@ -577,15 +613,19 @@ describe("app-panels-stats verification surfaces", () => {
   });
 
   it("opens the todo graph sidebar when a todo graph refresh arrives", async () => {
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
     await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "plan");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await act(async () => {
+      await Promise.resolve();
+    });
 
     await act(async () => {
       enqueueChatStreamEvent({
-        chatId: "chat-1",
+        chatId: latestStreamChatId(),
         type: "todoGraphRefresh",
         workspaceId: "workspace-1",
       });
@@ -632,10 +672,13 @@ describe("app-panels-stats verification surfaces", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await act(async () => {
+      await Promise.resolve();
+    });
 
     await act(async () => {
       enqueueChatStreamEvent({
-        chatId: "chat-1",
+        chatId: latestStreamChatId(),
         type: "todoGraphRefresh",
         workspaceId: "workspace-1",
       });
@@ -693,7 +736,9 @@ describe("app-panels-stats verification surfaces", () => {
     expect(table.parentElement).toHaveClass("overflow-x-auto");
     expect(table.parentElement).not.toHaveClass("overflow-auto");
     expect(table.closest(".overflow-y-auto")).toHaveClass("panel-scroll");
-    expect(within(table).getByText("openai")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(within(table).getByText("openai")).toBeInTheDocument(),
+    );
     expect(within(table).getByText("gpt-test")).toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "Request audit pagination" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Go to page 2" })).toBeInTheDocument();
@@ -761,6 +806,33 @@ describe("app-panels-stats verification surfaces", () => {
       "aria-current",
       "page",
     );
+  });
+
+  it("waits to load API details while the page is hidden", async () => {
+    setDocumentVisibility("hidden");
+    window.history.replaceState(null, "", "/stats?page=2");
+
+    try {
+      renderApp();
+
+      expect(await screen.findByText("Request audit")).toBeInTheDocument();
+      expect(aiStatisticsCallUrls()).toHaveLength(0);
+
+      setDocumentVisibility("visible");
+      fireEvent(document, new Event("visibilitychange"));
+
+      await waitFor(() =>
+        expect(
+          aiStatisticsCallUrls().some(
+            (url) =>
+              url.searchParams.get("page") === "2" &&
+              url.searchParams.get("pageSize") === "20",
+          ),
+        ).toBe(true),
+      );
+    } finally {
+      setDocumentVisibility("visible");
+    }
   });
 
   it("updates the stats URL when request audit pagination changes", async () => {
