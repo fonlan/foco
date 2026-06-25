@@ -327,11 +327,11 @@ export function ApiStatsPanel({
               title={t("Refresh request audit")}
               type="button"
             >
-              {isLoading ? (
-                <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-              ) : (
-                <RefreshCw aria-hidden="true" className="size-4" />
-              )}
+              <RefreshCw
+                aria-hidden="true"
+                className="api-refresh-icon size-4"
+                data-loading={isLoading ? "true" : "false"}
+              />
             </button>
           </div>
         </section>
@@ -1480,4 +1480,3 @@ function isJsonValue(value: unknown): value is JsonValue {
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
-

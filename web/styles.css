@@ -3705,6 +3705,18 @@ summary:focus-visible {
   transform-origin: center;
 }
 
+.api-refresh-icon[data-loading="true"] {
+  animation: api-refresh-icon-spin 1s linear infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+@keyframes api-refresh-icon-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 @keyframes chat-tab-running-spinner-spin {
   to {
     transform: rotate(360deg);
@@ -4107,6 +4119,7 @@ summary:focus-visible {
     transition-duration: 0.01ms !important;
   }
 
+  .api-refresh-icon[data-loading="true"],
   .chat-tab-running-spinner,
   .message-waiting-spinner {
     animation-duration: 1s !important;

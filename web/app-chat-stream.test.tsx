@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   activeMemory,
+  aiStatistics,
   appTestState,
   changeInput,
   chatStreamResponse,
@@ -27,6 +28,7 @@ import {
   todoGraph,
   workspace,
   workspaceMemory,
+  type Deferred,
 } from "./test-utils/app-test-harness";
 
 describe("app-chat-stream verification surfaces", () => {
@@ -1624,6 +1626,55 @@ describe("app-chat-stream verification surfaces", () => {
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("spins the API overview refresh icon while reloading", async () => {
+    const fetchMock = vi.mocked(fetch);
+    let holdNextStatsRequest = false;
+    const heldStatsRequests: Deferred<Response>[] = [];
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/ai-statistics") {
+        if (holdNextStatsRequest) {
+          const request = deferred<Response>();
+          heldStatsRequests.push(request);
+          return request.promise;
+        }
+
+        return Promise.resolve(jsonResponse(aiStatistics));
+      }
+
+      return mockFetch(input, init);
+    });
+    renderApp();
+
+    expect(await screen.findByText("API overview")).toBeInTheDocument();
+    const refreshButton = screen.getByRole("button", {
+      name: "Refresh request audit",
+    });
+    await waitFor(() => expect(refreshButton).not.toBeDisabled());
+
+    holdNextStatsRequest = true;
+    await userEvent.click(refreshButton);
+
+    await waitFor(() => expect(heldStatsRequests).toHaveLength(1));
+    await waitFor(() => {
+      const icon = refreshButton.querySelector("svg");
+      if (!(icon instanceof SVGElement)) {
+        throw new Error("refresh icon was not rendered");
+      }
+      expect(icon).toHaveClass("lucide-refresh-cw");
+      expect(icon).toHaveClass("api-refresh-icon");
+      expect(icon).toHaveAttribute("data-loading", "true");
+    });
+
+    await act(async () => {
+      heldStatsRequests[0]?.resolve(jsonResponse(aiStatistics));
     });
   });
 

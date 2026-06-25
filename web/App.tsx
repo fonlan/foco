@@ -9379,11 +9379,11 @@ function ApiOverviewPanel({
             title={t("Refresh request audit")}
             type="button"
           >
-            {isLoading ? (
-              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-            ) : (
-              <RefreshCw aria-hidden="true" className="size-4" />
-            )}
+            <RefreshCw
+              aria-hidden="true"
+              className="api-refresh-icon size-4"
+              data-loading={isLoading ? "true" : "false"}
+            />
           </button>
         </div>
         <div className="mt-4 grid gap-3 md:grid-cols-3">
