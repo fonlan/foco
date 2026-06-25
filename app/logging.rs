@@ -24,13 +24,18 @@ pub fn init(log_dir: &Path) -> Result<(), LoggingError> {
         .with_ansi(false)
         .with_writer(writer);
 
-    tracing_subscriber::registry()
+    // try_init succeeds only for the first caller.  On Windows release
+    // builds the tray entrypoint initialises logging before spawning the
+    // server thread, so the server's second call will get an "already set"
+    // error — that is harmless and we silently ignore it.
+    match tracing_subscriber::registry()
         .with(LevelFilter::INFO)
         .with(file_layer)
         .try_init()
-        .map_err(LoggingError::Subscriber)?;
-
-    install_panic_hook();
+    {
+        Ok(()) => install_panic_hook(),
+        Err(_) => {}
+    }
 
     Ok(())
 }
@@ -56,7 +61,6 @@ fn install_panic_hook() {
 #[derive(Debug)]
 pub enum LoggingError {
     Io { path: PathBuf, source: io::Error },
-    Subscriber(tracing_subscriber::util::TryInitError),
 }
 
 impl fmt::Display for LoggingError {
@@ -70,7 +74,6 @@ impl fmt::Display for LoggingError {
                     source
                 )
             }
-            Self::Subscriber(source) => write!(formatter, "failed to initialize tracing: {source}"),
         }
     }
 }
@@ -79,7 +82,6 @@ impl std::error::Error for LoggingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Subscriber(source) => Some(source),
         }
     }
 }

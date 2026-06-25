@@ -475,6 +475,7 @@ impl NativeBrowserAuthorizations {
 #[tokio::main]
 async fn main() {
     if let Err(error) = run_entrypoint().await {
+        tracing::error!(%error, "Foco startup failed");
         eprintln!("Foco startup failed: {error}");
         std::process::exit(1);
     }
@@ -1509,6 +1510,11 @@ async fn log_http_request(request: axum::extract::Request, next: middleware::Nex
 #[cfg(all(windows, not(debug_assertions)))]
 fn run_windows_tray_entrypoint() -> AppResult<()> {
     let loaded_config = load_or_create_global_config()?;
+    // Initialise logging on the main thread BEFORE spawning the server so
+    // that any tray-loop error is captured in the daily log file.  The
+    // server thread will call logging::init again; the second call is a
+    // harmless no-op.
+    logging::init(&loaded_config.paths.logs_dir)?;
     let addr = local_addr(&loaded_config.config)?;
     let ui_url = foco_ui_url_for_listen_addr(addr);
     let labels = tray_menu_labels(&loaded_config.config.app.language)?;
@@ -1530,6 +1536,7 @@ fn run_windows_tray_entrypoint() -> AppResult<()> {
                 Some(shutdown_rx),
                 tray_menu_update_notifier,
             )) {
+                tracing::error!(%error, "Foco server failed");
                 eprintln!("Foco server failed: {error}");
                 std::process::exit(1);
             }
