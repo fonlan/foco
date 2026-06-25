@@ -9356,19 +9356,17 @@ function ApiOverviewPanel({
 
   return (
     <div className="api-overview-panel flex w-full flex-col gap-4">
-      <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+      <section className="foco-reticle rounded-2xl border border-stone-200 bg-white/85 px-5 py-5 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex min-w-0 items-center gap-3">
-            <span className="inline-flex size-10 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
+            <span className="inline-flex size-11 items-center justify-center rounded-xl bg-teal-50 text-teal-800 shadow-[inset_0_0_0_1px_rgba(200,101,27,0.18)]">
               <BarChart3 aria-hidden="true" className="size-5" />
             </span>
             <div className="min-w-0">
-              <h2 className="truncate text-lg font-semibold text-stone-950">
-                {t("API overview")}
-              </h2>
-              <p className="mt-1 truncate text-xs font-medium text-stone-500">
+              <span className="foco-eyebrow">{t("API overview")}</span>
+              <h2 className="foco-display mt-0.5 truncate text-2xl leading-tight text-stone-950">
                 {selectedWorkspace?.name ?? t("All workspaces")}
-              </p>
+              </h2>
             </div>
           </div>
           <button
@@ -9573,11 +9571,11 @@ function StatsCard({
 }) {
   return (
     <article className="rounded-2xl border border-stone-200/80 bg-white p-5 shadow-sm">
-      <div className="flex items-center gap-2 text-sm font-semibold text-stone-600">
-        <Icon aria-hidden="true" className="size-4" />
+      <div className="foco-eyebrow flex items-center gap-2">
+        <Icon aria-hidden="true" className="size-4 text-teal-700" />
         <span>{label}</span>
       </div>
-      <div className="mt-4 font-mono text-3xl font-semibold text-stone-950">
+      <div className="foco-display mt-3 text-4xl leading-none text-stone-950">
         {value}
       </div>
     </article>
@@ -10745,7 +10743,7 @@ function ContextSpecTab({
   }
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col bg-[#f8f8f8]">
+    <div className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--foco-canvas-raised)]">
       <div className="flex min-h-[var(--foco-header-height)] items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
@@ -11319,17 +11317,17 @@ function SourceControlPanel({
   const isCommitMessageInputDisabled = isCommitting || isGeneratingCommitMessage;
 
   return (
-    <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[#f8f8f8]">
+    <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[var(--foco-canvas-raised)]">
       <div className="flex min-h-[var(--foco-header-height)] items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-2">
         <div className="flex min-w-0 items-center gap-2">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
             <GitCompare aria-hidden="true" className="size-4" />
           </span>
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold">{t("Source Control")}</h2>
-            <p className="truncate text-xs font-medium text-stone-500">
+            <span className="foco-eyebrow">{t("Source Control")}</span>
+            <h2 className="truncate text-sm font-semibold text-stone-950">
               {selectedPath ?? t("Workspace changes")}
-            </p>
+            </h2>
           </div>
         </div>
         <button
@@ -21310,8 +21308,8 @@ function LoginView({
         <div className="flex items-center gap-3">
           <FocoLogoMark />
           <div className="min-w-0">
-            <h1 className="text-lg font-semibold text-stone-950">Foco</h1>
-            <p className="mt-1 text-xs font-medium text-stone-500">
+            <h1 className="foco-display text-2xl leading-none text-stone-950">Foco</h1>
+            <p className="foco-eyebrow mt-1.5">
               {t("Password required")}
             </p>
           </div>

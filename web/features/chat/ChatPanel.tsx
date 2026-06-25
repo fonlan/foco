@@ -723,7 +723,7 @@ function ChatPanelComponent({
 
           <div className="composer-shell shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
         <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
-          <div className="composer-surface relative rounded-xl border border-stone-300 bg-white">
+          <div className="composer-surface foco-reticle relative rounded-xl border border-stone-300 bg-white">
             {selectedSkills.length ? (
               <div className="flex flex-wrap gap-1.5 px-3 pt-2">
                 {selectedSkills.map((skill) => (
@@ -923,7 +923,7 @@ function ChatPanelComponent({
                   aria-label={runningButtonLabel}
                   className={
                     runningButtonSendsMessage
-                      ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                      ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(200,101,27,0.24)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
                       : "composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
                   }
                   disabled={
@@ -953,7 +953,7 @@ function ChatPanelComponent({
                       showSendButtonTooltip ? "composer-send-button-tooltip" : undefined
                     }
                     aria-label={t("Send message")}
-                    className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                    className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(200,101,27,0.24)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
                     disabled={
                       (!draftMessage.trim() && !draftAttachments.length) ||
                       !selectedModelId

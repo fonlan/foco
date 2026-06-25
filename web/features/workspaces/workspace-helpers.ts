@@ -12,9 +12,9 @@ export function workspaceNameFromPath(path: string) {
 }
 
 export function workspaceMenuClass(active: boolean) {
-  return `workspace-menu flex min-w-0 items-center gap-1 rounded-xl border px-1.5 py-1 transition-colors ${
+  return `workspace-menu foco-reticle flex min-w-0 items-center gap-1 rounded-xl border px-1.5 py-1 transition-colors ${
     active
-      ? "workspace-menu-active border-teal-200 bg-teal-50 text-teal-950 shadow-sm"
+      ? "foco-reticle-on workspace-menu-active border-teal-200 bg-teal-50 text-teal-950 shadow-sm"
       : "border-transparent bg-stone-100/60 text-stone-700 hover:border-stone-200 hover:bg-white/90 hover:text-stone-950"
   }`;
 }
