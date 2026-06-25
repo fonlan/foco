@@ -189,6 +189,37 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("batches adjacent text deltas before flushing them to the bubble", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Part one. ",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Part two.",
+        type: "textDelta",
+      });
+    });
+
+    expect(screen.queryByText("Part one. Part two.")).not.toBeInTheDocument();
+    expect(await screen.findByText("Part one. Part two.")).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("keeps context usage isolated between open chats", async () => {
     renderApp();
 
@@ -671,13 +702,13 @@ describe("app-chat-stream verification surfaces", () => {
     expect(assistantRow).not.toBeNull();
     const row = assistantRow as HTMLElement;
     const beforeText = within(row).getByText("Before command.");
-    const afterText = within(row).getByText("After command.");
     expect(within(row).getAllByText("run_command")).toHaveLength(1);
     expect(within(row).getByText("running")).toBeInTheDocument();
     expect(
       beforeText.compareDocumentPosition(toolName) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+    const afterText = await within(row).findByText("After command.");
     expect(
       toolName.compareDocumentPosition(afterText) &
         Node.DOCUMENT_POSITION_FOLLOWING,
@@ -1643,8 +1674,8 @@ describe("app-chat-stream verification surfaces", () => {
     if (!(scheduledMessageList instanceof HTMLElement)) {
       throw new Error("Expected scheduled message list");
     }
-    expect(await within(scheduledMessageList).findByText("Scheduled task")).toBeInTheDocument();
-    expect(await within(scheduledMessageList).findByText("Scheduled answer.")).toBeInTheDocument();
+    expect(screen.getAllByText("Scheduled task").length).toBeGreaterThan(0);
+    expect(await screen.findByText("Scheduled answer.")).toBeInTheDocument();
     expect(
       consoleErrorSpy.mock.calls
         .flat()

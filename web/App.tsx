@@ -2517,6 +2517,91 @@ export function App() {
     }
   }
 
+  const STREAM_TEXT_DELTA_FLUSH_MS = 32;
+
+  function appendBufferedTextDelta(
+    current: ShellMessage[],
+    assistantMessageId: string,
+    delta: string,
+  ) {
+    const messageIndex = current.findIndex(
+      (message) =>
+        message.role === "assistant" && message.id === assistantMessageId,
+    );
+    if (messageIndex < 0) {
+      return current;
+    }
+
+    const message = current[messageIndex];
+    const next = [...current];
+    next[messageIndex] = {
+      ...message,
+      content: message.content + delta,
+      parts: appendTextPart(message.parts, delta),
+    };
+    return next;
+  }
+
+  function createTextDeltaBuffer() {
+    const bufferedDeltasByChatKey = new Map<string, Map<string, string>>();
+    let flushTimer: number | null = null;
+
+    const cancelScheduledFlush = () => {
+      if (flushTimer === null) {
+        return;
+      }
+
+      window.clearTimeout(flushTimer);
+      flushTimer = null;
+    };
+
+    const flush = () => {
+      cancelScheduledFlush();
+      if (!bufferedDeltasByChatKey.size) {
+        return;
+      }
+
+      const bufferedDeltas = Array.from(bufferedDeltasByChatKey.entries());
+      bufferedDeltasByChatKey.clear();
+
+      for (const [chatKey, messageDeltas] of bufferedDeltas) {
+        for (const [assistantMessageId, delta] of messageDeltas) {
+          setMessagesForChatKey(chatKey, (current) =>
+            appendBufferedTextDelta(current, assistantMessageId, delta),
+          );
+        }
+      }
+    };
+
+    return {
+      flush,
+      push(
+        chatKey: string,
+        assistantMessageId: string,
+        delta: string,
+      ) {
+        const messageDeltas =
+          bufferedDeltasByChatKey.get(chatKey) ?? new Map<string, string>();
+        messageDeltas.set(
+          assistantMessageId,
+          `${messageDeltas.get(assistantMessageId) ?? ""}${delta}`,
+        );
+        bufferedDeltasByChatKey.set(chatKey, messageDeltas);
+
+        if (flushTimer !== null) {
+          return;
+        }
+
+        // ponytail: 32ms batching keeps the hot path simple; swap to RAF if we
+        // ever need tighter frame alignment.
+        flushTimer = window.setTimeout(() => {
+          flushTimer = null;
+          flush();
+        }, STREAM_TEXT_DELTA_FLUSH_MS);
+      },
+    };
+  }
+
   function moveMessagesForChatKey(
     fromChatKey: string,
     toChatKey: string,
@@ -5263,6 +5348,7 @@ export function App() {
     let liveStartedAtMs = Date.now();
     let hasGuidanceTurns = false;
     let streamHadError = false;
+    const textDeltaBuffer = createTextDeltaBuffer();
     const refreshRunContextUsage = () => {
       const modelId = selectedModelIdRef.current;
       const providerId = selectedProviderIdRef.current;
@@ -5447,6 +5533,10 @@ export function App() {
       }
 
       await readChatStream(response, (streamEvent) => {
+        if (streamEvent.type !== "textDelta") {
+          textDeltaBuffer.flush();
+        }
+
         if (streamEvent.type === "start") {
           const previousAssistantMessageId = currentAssistantMessageId;
           const startsNewAssistantBubble =
@@ -5502,16 +5592,10 @@ export function App() {
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? {
-                  ...message,
-                  content: message.content + streamEvent.delta,
-                  parts: appendTextPart(message.parts, streamEvent.delta),
-                }
-                : message,
-            ),
+          textDeltaBuffer.push(
+            chatKey,
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+            streamEvent.delta,
           );
           return;
         }
@@ -5874,6 +5958,7 @@ export function App() {
 
       await refreshWorkspaces();
     } catch (requestError) {
+      textDeltaBuffer.flush();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       const wasCancelled =
@@ -5883,6 +5968,7 @@ export function App() {
         setError(errorMessage(requestError));
       }
     } finally {
+      textDeltaBuffer.flush();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       if (activeRunAbortByChatKeyRef.current.get(chatKey) === abortController) {
@@ -5973,6 +6059,7 @@ export function App() {
     let hasGuidanceTurns = false;
     let activeRunId: string | null = null;
     const abortController = new AbortController();
+    const textDeltaBuffer = createTextDeltaBuffer();
     const refreshRunContextUsage = () => {
       if (!latestResponseUsage) {
         return;
@@ -6262,6 +6349,10 @@ export function App() {
       }
 
       await readChatStream(response, (streamEvent) => {
+        if (streamEvent.type !== "textDelta") {
+          textDeltaBuffer.flush();
+        }
+
         if (streamEvent.type === "start") {
           const previousAssistantMessageId = currentAssistantMessageId;
           const startsNewAssistantBubble =
@@ -6414,16 +6505,10 @@ export function App() {
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
-          setMessagesForChatKey(runMessagesKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? {
-                  ...message,
-                  content: message.content + streamEvent.delta,
-                  parts: appendTextPart(message.parts, streamEvent.delta),
-                }
-                : message,
-            ),
+          textDeltaBuffer.push(
+            runMessagesKey,
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+            streamEvent.delta,
           );
           return;
         }
@@ -6804,6 +6889,7 @@ export function App() {
       await refreshWorkspaces();
       runSucceeded = !streamHadError;
     } catch (requestError) {
+      textDeltaBuffer.flush();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       const wasCancelled =
@@ -6828,6 +6914,7 @@ export function App() {
         ),
       );
     } finally {
+      textDeltaBuffer.flush();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       if (
