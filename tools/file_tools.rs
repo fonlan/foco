@@ -15,8 +15,8 @@ use crate::{
     DEFAULT_WRITE_FILE_TIMEOUT_MS, LineRange, MAX_FIND_ENTRIES, MAX_FULL_READ_BYTES,
     MAX_RANGED_READ_OUTPUT_BYTES, MAX_RANGED_READ_SOURCE_BYTES, MAX_SEARCH_MATCHES,
     MAX_SEARCH_RESULT_FILES, MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES, MAX_SEARCH_TEXT_LINE_BYTES,
-    MAX_SEARCH_TEXT_OUTPUT_BYTES, RIPGREP_PATH, SEARCH_RESULT_TTL, SEARCH_RESULTS_DIR, TextEncoding,
-    ToolCancellationToken, count_text_lines, decode_text_file, encode_text_file,
+    MAX_SEARCH_TEXT_OUTPUT_BYTES, RIPGREP_PATH, SEARCH_RESULT_TTL, SEARCH_RESULTS_DIR,
+    TextEncoding, ToolCancellationToken, count_text_lines, decode_text_file, encode_text_file,
     errors::{ToolRuntimeError, tool_timeout_ms},
     normalize_read_line_range, normalize_workspace_path_text, numbered_content, parse_arguments,
     parse_optional_line_range, read_line_range, relative_workspace_path, replace_line_range,
@@ -556,7 +556,9 @@ fn write_search_results_file(
         source,
     })?;
 
-    Ok(format!("{WORKSPACE_FOCO_DIR}/{SEARCH_RESULTS_DIR}/{file_name}"))
+    Ok(format!(
+        "{WORKSPACE_FOCO_DIR}/{SEARCH_RESULTS_DIR}/{file_name}"
+    ))
 }
 
 fn next_search_results_file_name() -> String {

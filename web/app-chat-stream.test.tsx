@@ -220,6 +220,112 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("restores streaming parts when a provider attempt resets", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "retry",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Stable thinking.",
+        type: "reasoningDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Before.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-stable",
+          input: {},
+          isError: false,
+          name: "read_file",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    expect(await screen.findByText("Before.")).toBeInTheDocument();
+    expect(screen.getByText("read_file")).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        llmRequestId: "llm-retry",
+        type: "streamAttemptStart",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Dropped thinking.",
+        type: "reasoningDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Dropped answer.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-dropped",
+          input: {},
+          isError: false,
+          name: "dropped_tool",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        reason: "provider completed without assistant text or tool calls",
+        reasoning: "Flattened thinking.",
+        text: "Flattened answer.",
+        toolCalls: [
+          {
+            id: "call-stable",
+            input: {},
+            isError: false,
+            name: "read_file",
+            output: null,
+            status: "running",
+          },
+          {
+            id: "call-dropped",
+            input: {},
+            isError: false,
+            name: "dropped_tool",
+            output: null,
+            status: "running",
+          },
+        ],
+        type: "streamReset",
+      });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText("Dropped answer.")).not.toBeInTheDocument();
+      expect(screen.queryByText("Flattened answer.")).not.toBeInTheDocument();
+      expect(screen.queryByText("dropped_tool")).not.toBeInTheDocument();
+    });
+    expect(screen.getByText("Before.")).toBeInTheDocument();
+    expect(screen.getByText("read_file")).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("shows context compression badges from stream side events", async () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));

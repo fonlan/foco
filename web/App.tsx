@@ -5558,6 +5558,7 @@ export function App() {
 
     let activeReasoningStartedAtMs: number | null = null;
     let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null = null;
+    const streamAttemptSnapshots = new Map<string, StreamAttemptSnapshot>();
     const updateLiveReasoningDuration = (startedAtMs: number) => {
       setMessagesForChatKey(chatKey, (current) =>
         current.map((message) =>
@@ -5758,9 +5759,20 @@ export function App() {
           if (interruptedAssistantMessageId === null) {
             currentAssistantMessageId = streamEvent.assistantMessageId;
           }
+          const snapshotKey = resolvedAssistantMessageId(streamEvent.assistantMessageId);
+          streamAttemptSnapshots.set(snapshotKey, emptyStreamingAttemptSnapshot());
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
+          setMessagesForChatKey(chatKey, (current) => {
+            const message = current.find((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+            );
+            if (message) {
+              streamAttemptSnapshots.set(snapshotKey, streamingAttemptSnapshot(message));
+            }
+            return current;
+          });
           setActiveRunInfoForChatKey(chatKey, {
             acceptingGuidance: true,
             chatId: activeRun.chatId,
@@ -5784,7 +5796,13 @@ export function App() {
           setMessagesForChatKey(chatKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? resetStreamingAssistantMessage(message, streamEvent)
+                ? resetStreamingAssistantMessage(
+                  message,
+                  streamEvent,
+                  streamAttemptSnapshots.get(
+                    resolvedAssistantMessageId(streamEvent.assistantMessageId),
+                  ),
+                )
                 : message,
             ),
           );
@@ -6408,6 +6426,7 @@ export function App() {
     };
     let activeReasoningStartedAtMs: number | null = null;
     let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null = null;
+    const streamAttemptSnapshots = new Map<string, StreamAttemptSnapshot>();
     const updateLiveReasoningDuration = (startedAtMs: number) => {
       setMessagesForChatKey(runMessagesKey, (current) =>
         current.map((message) =>
@@ -6689,9 +6708,20 @@ export function App() {
           if (interruptedAssistantMessageId === null) {
             currentAssistantMessageId = streamEvent.assistantMessageId;
           }
+          const snapshotKey = resolvedAssistantMessageId(streamEvent.assistantMessageId);
+          streamAttemptSnapshots.set(snapshotKey, emptyStreamingAttemptSnapshot());
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
+          setMessagesForChatKey(runMessagesKey, (current) => {
+            const message = current.find((message) =>
+              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+            );
+            if (message) {
+              streamAttemptSnapshots.set(snapshotKey, streamingAttemptSnapshot(message));
+            }
+            return current;
+          });
           setActiveRunInfoForChatKey(runMessagesKey, {
             acceptingGuidance: activeRunId !== null,
             chatId: requestChatId,
@@ -6714,7 +6744,13 @@ export function App() {
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? resetStreamingAssistantMessage(message, streamEvent)
+                ? resetStreamingAssistantMessage(
+                  message,
+                  streamEvent,
+                  streamAttemptSnapshots.get(
+                    resolvedAssistantMessageId(streamEvent.assistantMessageId),
+                  ),
+                )
                 : message,
             ),
           );
@@ -22927,11 +22963,47 @@ function addChatRunBadge(
 function contextCompressionBadge(kind: "rule" | "llm"): ChatRunBadge {
   return kind === "llm" ? "contextCompressionLlm" : "contextCompressionRule";
 }
+
+type StreamAttemptSnapshot = {
+  content: string;
+  reasoning: string | null;
+  toolCalls: ChatToolCallSummary[];
+  parts: ChatMessagePart[];
+};
+
+function emptyStreamingAttemptSnapshot(): StreamAttemptSnapshot {
+  return {
+    content: "",
+    reasoning: null,
+    toolCalls: [],
+    parts: [],
+  };
+}
+
+function streamingAttemptSnapshot(message: ShellMessage): StreamAttemptSnapshot {
+  return {
+    content: message.content,
+    reasoning: message.reasoning,
+    toolCalls: message.toolCalls,
+    parts: message.parts,
+  };
+}
+
 function resetStreamingAssistantMessage(
   message: ShellMessage,
   streamEvent: Extract<ChatStreamEvent, { type: "streamReset" }>,
+  attemptSnapshot?: StreamAttemptSnapshot,
 ): ShellMessage {
   const toolCalls = streamEvent.toolCalls.map(normalizedToolCallSummary);
+  if (attemptSnapshot) {
+    return {
+      ...addChatRunBadge(message, "llmReconnect"),
+      content: attemptSnapshot.content,
+      reasoning: attemptSnapshot.reasoning,
+      toolCalls: attemptSnapshot.toolCalls,
+      parts: attemptSnapshot.parts,
+    };
+  }
   return {
     ...addChatRunBadge(message, "llmReconnect"),
     content: streamEvent.text,

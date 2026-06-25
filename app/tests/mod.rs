@@ -967,7 +967,7 @@ fn lazy_code_graph_initialization_indexes_workspace_once() {
     let state = test_app_state(config, profile_dir.clone());
 
     spawn_code_graph_workspace_initialization_if_needed(&state, &workspace);
-    for _ in 0..50 {
+    for _ in 0..250 {
         if state
             .code_graph_indexes
             .lock()
@@ -1012,6 +1012,7 @@ fn lazy_code_graph_initialization_indexes_workspace_once() {
         .expect("code graph index lock")
         .watchers
         .clear();
+    drop(state);
     remove_dir_if_exists(&workspace_dir);
     remove_dir_if_exists(&profile_dir);
 }
@@ -3075,7 +3076,7 @@ fn neutral_messages_from_record_replays_stored_assistant_parts_in_order() {
             content: "Before.After.",
             sequence: 0,
             metadata_json: Some(
-                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one."},{"type":"text","text":"Before."},{"type":"toolCall","tool_call_id":"call-1"},{"type":"reasoning","text":"Think two."},{"type":"text","text":"After."}],"partsVersion":2,"partsSource":"live_sse"}"#,
+                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one."},{"type":"text","text":"Before."},{"type":"toolCall","tool_call_id":"call-1"},{"type":"reasoning","text":"Think two."},{"type":"text","text":"After."}],"partsVersion":3,"partsSource":"live_sse"}"#,
             ),
         })
         .expect("assistant message insert");
@@ -4060,7 +4061,7 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
     )
     .expect("assistant metadata");
     assert!(!metadata_json.contains("large result"));
-    assert!(metadata_json.contains(r#""partsVersion":2"#));
+    assert!(metadata_json.contains(r#""partsVersion":3"#));
     assert!(metadata_json.contains(r#""partsSource":"live_sse""#));
 
     let parts = assistant_parts_from_metadata(&metadata_json, std::slice::from_ref(&tool_call))
@@ -4161,7 +4162,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
             content: "Before.After.",
             sequence: 0,
             metadata_json: Some(
-                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one.Think two."},{"type":"toolCall","tool_call_id":"tool-1"},{"type":"text","text":"Before.After."}],"partsVersion":2,"partsSource":"live_sse"}"#,
+                r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one.Think two."},{"type":"toolCall","tool_call_id":"tool-1"},{"type":"text","text":"Before.After."}],"partsVersion":3,"partsSource":"live_sse"}"#,
             ),
         })
         .expect("assistant insert");
@@ -4286,7 +4287,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
         .expect("saved message read")
         .expect("saved message");
     assert!(saved.metadata_json.contains(r#""tool_call_id":"tool-1""#));
-    assert!(saved.metadata_json.contains(r#""partsVersion":2"#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":3"#));
     assert!(
         saved
             .metadata_json
@@ -4403,7 +4404,157 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
             .metadata_json
             .contains(r#""partsSource":"run_events""#)
     );
-    assert!(saved.metadata_json.contains(r#""partsVersion":2"#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":3"#));
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn historical_chat_stream_reset_restores_attempt_start_parts() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-stream-reset-history-parts-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Streaming reset history order")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Before.Final.",
+            sequence: 0,
+            metadata_json: Some(
+                r#"{"reasoning":"Think one.Think final.","streamingState":"failed"}"#,
+            ),
+        })
+        .expect("assistant insert");
+    for (sequence, event_type, value) in [
+        (
+            0,
+            "reasoning_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Think one." }),
+        ),
+        (
+            1,
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Before." }),
+        ),
+        (
+            2,
+            "tool_call",
+            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-1" } }),
+        ),
+        (
+            3,
+            "stream_attempt_start",
+            json!({ "assistantMessageId": "assistant-1", "llmRequestId": "llm-failed" }),
+        ),
+        (
+            4,
+            "reasoning_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Dropped thinking." }),
+        ),
+        (
+            5,
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Dropped answer." }),
+        ),
+        (
+            6,
+            "tool_call",
+            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-2" } }),
+        ),
+        (
+            7,
+            "stream_reset",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "reason": "provider completed without assistant text or tool calls",
+                "reasoning": "Flattened thinking.",
+                "text": "Flattened answer.",
+                "toolCalls": [{ "id": "tool-1" }, { "id": "tool-2" }]
+            }),
+        ),
+        (
+            8,
+            "reasoning_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Think final." }),
+        ),
+        (
+            9,
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Final." }),
+        ),
+        (
+            10,
+            "tool_call",
+            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-3" } }),
+        ),
+    ] {
+        database
+            .insert_run_event(NewRunEvent {
+                id: &format!("run-event-{sequence}"),
+                chat_id: "chat-1",
+                run_id: "agent-task-1",
+                sequence,
+                event_type,
+                payload_json: &value.to_string(),
+            })
+            .expect("run event insert");
+    }
+    for tool_id in ["tool-1", "tool-2", "tool-3"] {
+        database
+            .insert_tool_call(NewToolCall {
+                id: tool_id,
+                chat_id: "chat-1",
+                run_id: "agent-task-1",
+                message_id: Some("assistant-1"),
+                tool_name: "read_file",
+                input_json: r#"{"path":"README.md"}"#,
+                status: "completed",
+                started_at: "2026-06-18T10:00:00Z",
+                completed_at: Some("2026-06-18T10:00:01Z"),
+            })
+            .expect("tool insert");
+    }
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
+        .into_iter()
+        .next()
+        .expect("assistant summary");
+    assert_eq!(summary.parts.len(), 6);
+    assert!(
+        matches!(&summary.parts[0], ChatMessagePart::Reasoning { text } if text == "Think one.")
+    );
+    assert!(matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Before."));
+    assert!(
+        matches!(&summary.parts[2], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-1")
+    );
+    assert!(
+        matches!(&summary.parts[3], ChatMessagePart::Reasoning { text } if text == "Think final.")
+    );
+    assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "Final."));
+    assert!(
+        matches!(&summary.parts[5], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-3")
+    );
+
+    let saved = database
+        .message("assistant-1")
+        .expect("saved message read")
+        .expect("saved message");
+    assert!(
+        saved
+            .metadata_json
+            .contains(r#""partsSource":"run_events""#)
+    );
+    assert!(!saved.metadata_json.contains("Flattened thinking."));
+    assert!(!saved.metadata_json.contains("Dropped thinking."));
+    assert!(!saved.metadata_json.contains(r#""tool_call_id":"tool-2""#));
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -5126,6 +5277,7 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
         json!(queued.assistant_message_id)
     );
     drop(database);
+    drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
 }
@@ -6299,6 +6451,7 @@ async fn chat_messages_return_memory_dream_transcript_steps_as_read_only_chat() 
     let Json(response) = crate::http::chat::chat_messages(
         State(state),
         AxumPath((workspace_id, chat_id.to_string())),
+        Query(crate::http::chat::ChatMessagesQuery::default()),
     )
     .await
     .expect("chat messages response");
@@ -10126,7 +10279,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
             attachments: Vec::new(),
         },
         None,
-        PromptAssemblyPurpose::ChatRun,
+        PromptAssemblyPurpose::ContextPreview,
     )
     .await
     .expect("prompt context");
@@ -10157,6 +10310,8 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
             .contains(MEMORY_WRITE_TOOL_NAME)
     );
 
+    drop(context);
+    drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
 }
@@ -10208,7 +10363,7 @@ async fn prepare_prompt_context_rejects_memory_dream_transcript_chat() {
             attachments: Vec::new(),
         },
         None,
-        PromptAssemblyPurpose::ChatRun,
+        PromptAssemblyPurpose::ContextPreview,
     )
     .await;
     let error = match result {
@@ -10288,7 +10443,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
             attachments: Vec::new(),
         },
         None,
-        PromptAssemblyPurpose::ChatRun,
+        PromptAssemblyPurpose::ContextPreview,
     )
     .await
     .expect("prompt context");
@@ -10309,6 +10464,8 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
     assert!(available_tools_message.content.contains("Available tools:"));
     assert!(!available_tools_message.content.contains(SEARCH_TEXT_TOOL));
 
+    drop(context);
+    drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
 }
@@ -10339,7 +10496,7 @@ async fn prepare_prompt_context_hides_web_search_without_enabled_search_api() {
             attachments: Vec::new(),
         },
         None,
-        PromptAssemblyPurpose::ChatRun,
+        PromptAssemblyPurpose::ContextPreview,
     )
     .await
     .expect("prompt context");
@@ -10360,6 +10517,8 @@ async fn prepare_prompt_context_hides_web_search_without_enabled_search_api() {
     assert!(!available_tools_message.content.contains(WEB_SEARCH_TOOL));
     assert!(available_tools_message.content.contains(WEB_FETCH_TOOL));
 
+    drop(context);
+    drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
 }
@@ -10392,7 +10551,7 @@ async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
             attachments: Vec::new(),
         },
         None,
-        PromptAssemblyPurpose::ChatRun,
+        PromptAssemblyPurpose::ContextPreview,
     )
     .await
     .expect("prompt context");
@@ -10413,6 +10572,8 @@ async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
     assert!(available_tools_message.content.contains(WEB_SEARCH_TOOL));
     assert!(available_tools_message.content.contains(WEB_FETCH_TOOL));
 
+    drop(context);
+    drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
 }
@@ -10484,7 +10645,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
             attachments: Vec::new(),
         },
         None,
-        PromptAssemblyPurpose::ChatRun,
+        PromptAssemblyPurpose::ContextPreview,
     )
     .await
     .expect("prompt context");
@@ -10516,6 +10677,8 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
     assert!(available_tools_message.content.contains("Available tools:"));
     assert!(available_tools_message.content.contains("read_file"));
 
+    drop(context);
+    drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
 }

@@ -3588,7 +3588,7 @@ enum StoredChatMessagePart {
     ToolCall { tool_call_id: String },
 }
 
-const STORED_CHAT_PARTS_VERSION: i64 = 2;
+const STORED_CHAT_PARTS_VERSION: i64 = 3;
 const MEMORY_DREAM_TRANSCRIPT_STEP_KIND: &str = "memory_dream_transcript_step";
 
 #[derive(Clone, Debug, Serialize)]
@@ -11153,6 +11153,8 @@ fn materialize_missing_assistant_parts(
         .collect::<HashMap<_, _>>();
     let mut parts_by_message = HashMap::<String, Vec<ChatMessagePart>>::new();
     let mut seen_tool_call_ids_by_message = HashMap::<String, HashSet<String>>::new();
+    let mut stream_attempt_snapshots_by_message =
+        HashMap::<String, (Vec<ChatMessagePart>, HashSet<String>)>::new();
     for event in &events {
         let value = parse_json_value(&event.payload_json, "chat run event")?;
         let Some(message_id) =
@@ -11199,7 +11201,30 @@ fn materialize_missing_assistant_parts(
                     tool_call_id,
                 );
             }
+            "stream_attempt_start" => {
+                stream_attempt_snapshots_by_message.insert(
+                    message_id.to_string(),
+                    (
+                        parts_by_message
+                            .get(message_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        seen_tool_call_ids_by_message
+                            .get(message_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
+                );
+            }
             "stream_reset" => {
+                if let Some((parts_snapshot, seen_tool_call_ids_snapshot)) =
+                    stream_attempt_snapshots_by_message.get(message_id).cloned()
+                {
+                    parts_by_message.insert(message_id.to_string(), parts_snapshot);
+                    seen_tool_call_ids_by_message
+                        .insert(message_id.to_string(), seen_tool_call_ids_snapshot);
+                    continue;
+                }
                 parts_by_message.remove(message_id);
                 seen_tool_call_ids_by_message.remove(message_id);
                 if let Some(reasoning) =
@@ -11917,12 +11942,17 @@ fn finalized_assistant_message_parts(
         .map(|tool_call| (tool_call.id.as_str(), tool_call))
         .collect::<HashMap<_, _>>();
     let mut seen_tool_call_ids = HashSet::new();
+    let mut stream_attempt_snapshot = None::<(Vec<ChatMessagePart>, HashSet<String>)>;
     let mut parts = Vec::new();
 
     for event in events {
         if !matches!(
             event.event_type.as_str(),
-            "text_delta" | "reasoning_delta" | "tool_call" | "stream_reset"
+            "text_delta"
+                | "reasoning_delta"
+                | "tool_call"
+                | "stream_attempt_start"
+                | "stream_reset"
         ) {
             continue;
         }
@@ -11955,7 +11985,17 @@ fn finalized_assistant_message_parts(
                     );
                 }
             }
+            "stream_attempt_start" => {
+                stream_attempt_snapshot = Some((parts.clone(), seen_tool_call_ids.clone()));
+            }
             "stream_reset" => {
+                if let Some((parts_snapshot, seen_tool_call_ids_snapshot)) =
+                    stream_attempt_snapshot.clone()
+                {
+                    parts = parts_snapshot;
+                    seen_tool_call_ids = seen_tool_call_ids_snapshot;
+                    continue;
+                }
                 parts.clear();
                 seen_tool_call_ids.clear();
                 if let Some(reasoning) =

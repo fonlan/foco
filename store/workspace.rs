@@ -1734,7 +1734,7 @@ impl WorkspaceDatabase {
                  FROM run_events
                  WHERE chat_id = ?1
                    AND event_type IN
-                       ('reasoning_delta', 'text_delta', 'tool_call', 'stream_reset')
+                       ('reasoning_delta', 'text_delta', 'tool_call', 'stream_attempt_start', 'stream_reset')
                  ORDER BY created_at ASC, run_id ASC, sequence ASC",
             )
             .map_err(|source| self.sqlite_error(source))?;
@@ -1772,7 +1772,7 @@ impl WorkspaceDatabase {
              FROM run_events
              WHERE chat_id = ?1
                AND event_type IN
-                   ('reasoning_delta', 'text_delta', 'tool_call', 'stream_reset')
+                   ('reasoning_delta', 'text_delta', 'tool_call', 'stream_attempt_start', 'stream_reset')
                AND CAST(
                    COALESCE(
                        json_extract(payload_json, '$.assistantMessageId'),
