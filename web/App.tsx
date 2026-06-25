@@ -9770,7 +9770,36 @@ function ApiStatsPanel({
               {error}
             </div>
           ) : null}
-          <div className="panel-scroll min-w-0 overflow-x-auto">
+          <div
+            className="panel-scroll min-w-0 overflow-x-auto"
+            onWheel={(event) => {
+              // overflow-x-auto forces overflow-y to compute to auto in Chromium,
+              // so this container traps vertical wheel events even though the table
+              // never overflows vertically. Forward them to the scrollable ancestor.
+              if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
+                return;
+              }
+              const deltaUnit =
+                event.deltaMode === 1
+                  ? 16
+                  : event.deltaMode === 2
+                    ? event.currentTarget.clientHeight
+                    : 1;
+              let node: HTMLElement | null = event.currentTarget.parentElement;
+              while (node) {
+                const overflowY = window.getComputedStyle(node).overflowY;
+                if (
+                  /(auto|scroll)/.test(overflowY) &&
+                  node.scrollHeight > node.clientHeight
+                ) {
+                  node.scrollTop += event.deltaY * deltaUnit;
+                  event.preventDefault();
+                  return;
+                }
+                node = node.parentElement;
+              }
+            }}
+          >
             <table className="w-full min-w-max text-left text-sm">
               <thead className="border-b border-stone-200 bg-white text-xs font-semibold text-stone-500">
                 <tr>
