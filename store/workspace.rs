@@ -38,17 +38,18 @@ pub use workspace_records::{
     ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
     LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
     LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
-    LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, NewAgentContextEntry,
-    NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
-    NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
-    NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot,
-    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection,
-    NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-    NewToolResult, NewWorkspaceSpecJob, PromptContextInjectionRecord, RunEventRecord,
-    ScheduledTaskDueRunClaim, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask,
-    TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord,
-    UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
+    LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, MessageRoleCountRecord,
+    NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
+    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
+    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
+    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
+    PromptContextInjectionRecord, RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskRecord,
+    ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TerminalSessionRecord,
+    TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
+    WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -65,6 +66,41 @@ pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
 const QUEUED_CHAT_METADATA_KEY: &str = "queuedRun";
 const QUEUED_MESSAGE_METADATA_KEY: &str = "queuedRun";
 const WORKSPACE_DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+const VISIBLE_MESSAGE_FILTER_SQL: &str = r#"
+  AND messages.id NOT IN (
+      SELECT private_message_id
+      FROM (
+          SELECT DISTINCT CAST(
+              COALESCE(
+                  json_extract(run_events.payload_json, '$.assistantMessageId'),
+                  json_extract(run_events.payload_json, '$.assistant_message_id')
+              ) AS TEXT
+          ) AS private_message_id
+          FROM run_events
+          INNER JOIN agent_tasks
+             ON agent_tasks.id = run_events.run_id
+          INNER JOIN agent_teams
+             ON agent_teams.id = agent_tasks.team_id
+            AND agent_teams.chat_id = run_events.chat_id
+          WHERE run_events.chat_id = ?1
+            AND run_events.event_type = 'start'
+            AND agent_tasks.owner_instance_id <> agent_teams.coordinator_instance_id
+          UNION
+          SELECT DISTINCT CAST(
+              COALESCE(
+                  json_extract(agent_tasks.input_json, '$.queuedUserMessageId'),
+                  json_extract(agent_tasks.input_json, '$.queued_user_message_id')
+              ) AS TEXT
+          ) AS private_message_id
+          FROM agent_tasks
+          INNER JOIN agent_teams
+             ON agent_teams.id = agent_tasks.team_id
+          WHERE agent_teams.chat_id = ?1
+            AND agent_tasks.owner_instance_id <> agent_teams.coordinator_instance_id
+      )
+      WHERE private_message_id IS NOT NULL
+        AND private_message_id <> ''
+  )"#;
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -1448,48 +1484,23 @@ impl WorkspaceDatabase {
         &self,
         chat_id: &str,
     ) -> Result<Vec<MessageRecord>, WorkspaceDatabaseError> {
+        let sql = format!(
+            "SELECT
+                messages.id,
+                messages.chat_id,
+                messages.role,
+                messages.content,
+                messages.sequence,
+                messages.created_at,
+                messages.metadata_json
+             FROM messages AS messages
+             WHERE messages.chat_id = ?1
+             {VISIBLE_MESSAGE_FILTER_SQL}
+             ORDER BY messages.sequence ASC"
+        );
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT id, chat_id, role, content, sequence, created_at, metadata_json
-                 FROM messages
-                 WHERE chat_id = ?1
-                   AND id NOT IN (
-                       SELECT private_message_id
-                       FROM (
-                           SELECT DISTINCT CAST(
-                               COALESCE(
-                                   json_extract(run_events.payload_json, '$.assistantMessageId'),
-                                   json_extract(run_events.payload_json, '$.assistant_message_id')
-                               ) AS TEXT
-                           ) AS private_message_id
-                           FROM run_events
-                           INNER JOIN agent_tasks
-                              ON agent_tasks.id = run_events.run_id
-                           INNER JOIN agent_teams
-                              ON agent_teams.id = agent_tasks.team_id
-                             AND agent_teams.chat_id = run_events.chat_id
-                           WHERE run_events.chat_id = ?1
-                             AND run_events.event_type = 'start'
-                             AND agent_tasks.owner_instance_id <> agent_teams.coordinator_instance_id
-                           UNION
-                           SELECT DISTINCT CAST(
-                               COALESCE(
-                                   json_extract(agent_tasks.input_json, '$.queuedUserMessageId'),
-                                   json_extract(agent_tasks.input_json, '$.queued_user_message_id')
-                               ) AS TEXT
-                           ) AS private_message_id
-                           FROM agent_tasks
-                           INNER JOIN agent_teams
-                              ON agent_teams.id = agent_tasks.team_id
-                           WHERE agent_teams.chat_id = ?1
-                             AND agent_tasks.owner_instance_id <> agent_teams.coordinator_instance_id
-                       )
-                       WHERE private_message_id IS NOT NULL
-                         AND private_message_id <> ''
-                   )
-                 ORDER BY sequence ASC",
-            )
+            .prepare(&sql)
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
             .query_map(params![chat_id], |row| {
@@ -1501,6 +1512,119 @@ impl WorkspaceDatabase {
                     sequence: row.get(4)?,
                     created_at: row.get(5)?,
                     metadata_json: row.get(6)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn messages_for_chat_page(
+        &self,
+        chat_id: &str,
+        before_sequence: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<MessageRecord>, WorkspaceDatabaseError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("message page limit overflowed: {source}"),
+            }
+        })?;
+        let sql = if before_sequence.is_some() {
+            format!(
+                "SELECT id, chat_id, role, content, sequence, created_at, metadata_json
+                 FROM (
+                     SELECT
+                        messages.id,
+                        messages.chat_id,
+                        messages.role,
+                        messages.content,
+                        messages.sequence,
+                        messages.created_at,
+                        messages.metadata_json
+                     FROM messages AS messages
+                     WHERE messages.chat_id = ?1
+                       AND messages.sequence < ?2
+                     {VISIBLE_MESSAGE_FILTER_SQL}
+                     ORDER BY messages.sequence DESC
+                     LIMIT ?3
+                 )
+                 ORDER BY sequence ASC"
+            )
+        } else {
+            format!(
+                "SELECT id, chat_id, role, content, sequence, created_at, metadata_json
+                 FROM (
+                     SELECT
+                        messages.id,
+                        messages.chat_id,
+                        messages.role,
+                        messages.content,
+                        messages.sequence,
+                        messages.created_at,
+                        messages.metadata_json
+                     FROM messages AS messages
+                     WHERE messages.chat_id = ?1
+                     {VISIBLE_MESSAGE_FILTER_SQL}
+                     ORDER BY messages.sequence DESC
+                     LIMIT ?2
+                 )
+                 ORDER BY sequence ASC"
+            )
+        };
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let map_row = |row: &Row<'_>| {
+            Ok(MessageRecord {
+                id: row.get(0)?,
+                chat_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                sequence: row.get(4)?,
+                created_at: row.get(5)?,
+                metadata_json: row.get(6)?,
+            })
+        };
+        let records = if let Some(before_sequence) = before_sequence {
+            let rows = statement
+                .query_map(params![chat_id, before_sequence, limit], map_row)
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(rows, &self.database_path)?
+        } else {
+            let rows = statement
+                .query_map(params![chat_id, limit], map_row)
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(rows, &self.database_path)?
+        };
+
+        Ok(records)
+    }
+
+    pub fn message_role_counts_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<MessageRoleCountRecord>, WorkspaceDatabaseError> {
+        let sql = format!(
+            "SELECT messages.role, COUNT(*)
+             FROM messages AS messages
+             WHERE messages.chat_id = ?1
+             {VISIBLE_MESSAGE_FILTER_SQL}
+             GROUP BY messages.role"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(MessageRoleCountRecord {
+                    role: row.get(0)?,
+                    count: row.get(1)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -1616,6 +1740,56 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
             .query_map(params![chat_id], |row| {
+                Ok(RunEventRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    sequence: row.get(3)?,
+                    event_type: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    pub fn history_run_events_for_chat_messages(
+        &self,
+        chat_id: &str,
+        message_ids: &[String],
+    ) -> Result<Vec<RunEventRecord>, WorkspaceDatabaseError> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (2..=message_ids.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, chat_id, run_id, sequence, event_type, payload_json, created_at
+             FROM run_events
+             WHERE chat_id = ?1
+               AND event_type IN
+                   ('reasoning_delta', 'text_delta', 'tool_call', 'stream_reset')
+               AND CAST(
+                   COALESCE(
+                       json_extract(payload_json, '$.assistantMessageId'),
+                       json_extract(payload_json, '$.assistant_message_id')
+                   ) AS TEXT
+               ) IN ({placeholders})
+             ORDER BY created_at ASC, run_id ASC, sequence ASC",
+        );
+        let mut parameters = Vec::with_capacity(message_ids.len() + 1);
+        parameters.push(SqlValue::Text(chat_id.to_string()));
+        parameters.extend(message_ids.iter().cloned().map(SqlValue::Text));
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(parameters), |row| {
                 Ok(RunEventRecord {
                     id: row.get(0)?,
                     chat_id: row.get(1)?,

@@ -1004,6 +1004,7 @@ export const chatMessages = {
     readOnly: false,
     title: "Tool run",
   },
+  pagination: { hasMoreBefore: false, nextBeforeSequence: null },
   messages: [
     {
       content: "Please inspect README.",
@@ -1090,6 +1091,7 @@ export const dreamTranscriptChatMessages = {
     readOnly: true,
     title: "Memory Dream: workspace manual",
   },
+  pagination: { hasMoreBefore: false, nextBeforeSequence: null },
   messages: [
     {
       content: "job started\n\nfinal status: completed",
@@ -1113,6 +1115,7 @@ export const secondChatMessages = {
     readOnly: false,
     title: "Second chat",
   },
+  pagination: { hasMoreBefore: false, nextBeforeSequence: null },
   messages: [
     {
       content: "Second question.",

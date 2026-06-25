@@ -1111,4 +1111,47 @@ describe("app-shell verification surfaces", () => {
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
   });
 
+  it("loads historical chat messages by recent page and prepends earlier messages", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const messageRequests: string[] = [];
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "Earlier note.",
+      createdAt: "2026-06-10T07:59:00.000Z",
+      id: "message-older",
+      parts: [{ text: "Earlier note.", type: "text" }],
+    };
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const requestUrl = new URL(url, "http://127.0.0.1");
+
+      if (requestUrl.pathname === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        messageRequests.push(requestUrl.toString());
+        if (requestUrl.searchParams.get("beforeSequence") === "200") {
+          return Promise.resolve(jsonResponse({
+            ...chatMessages,
+            messages: [olderMessage],
+            pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+          }));
+        }
+        return Promise.resolve(jsonResponse({
+          ...chatMessages,
+          pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+        }));
+      }
+
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    expect(new URL(messageRequests[0]).searchParams.get("limit")).toBe("100");
+
+    await userEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
+    expect(await screen.findByText("Earlier note.")).toBeInTheDocument();
+    expect(new URL(messageRequests[1]).searchParams.get("beforeSequence")).toBe("200");
+  });
+
 });

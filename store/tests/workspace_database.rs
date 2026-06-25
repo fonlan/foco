@@ -1735,6 +1735,71 @@ fn repository_helpers_delete_chat_cascades_chat_state_and_preserves_audit() {
 }
 
 #[test]
+fn messages_for_chat_page_and_role_counts_are_ordered() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Paged chat")
+        .expect("chat insert");
+
+    for (sequence, role) in [
+        (0, "user"),
+        (1, "assistant"),
+        (2, "user"),
+        (3, "assistant"),
+        (4, "tool"),
+    ] {
+        database
+            .insert_message(NewMessage {
+                id: &format!("message-{sequence}"),
+                chat_id: "chat-1",
+                role,
+                content: &format!("message {sequence}"),
+                sequence,
+                metadata_json: None,
+            })
+            .expect("message insert");
+    }
+
+    let recent = database
+        .messages_for_chat_page("chat-1", None, 2)
+        .expect("recent page");
+    assert_eq!(
+        recent
+            .iter()
+            .map(|message| message.sequence)
+            .collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    let previous = database
+        .messages_for_chat_page("chat-1", Some(3), 2)
+        .expect("previous page");
+    assert_eq!(
+        previous
+            .iter()
+            .map(|message| message.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+
+    let counts = database
+        .message_role_counts_for_chat("chat-1")
+        .expect("role counts");
+    let count_for = |role: &str| {
+        counts
+            .iter()
+            .find(|record| record.role == role)
+            .map(|record| record.count)
+            .unwrap_or_default()
+    };
+    assert_eq!(counts.iter().map(|record| record.count).sum::<i64>(), 5);
+    assert_eq!(count_for("user"), 2);
+    assert_eq!(count_for("assistant"), 2);
+    assert_eq!(count_for("tool"), 1);
+}
+
+#[test]
 fn repository_helpers_persist_terminal_working_directory() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

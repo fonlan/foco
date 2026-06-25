@@ -483,6 +483,12 @@ pub struct MessageRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageRoleCountRecord {
+    pub role: String,
+    pub count: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewRunEvent<'a> {
     pub id: &'a str,
     pub chat_id: &'a str,

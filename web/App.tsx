@@ -329,6 +329,10 @@ type WorkspaceChatContextMenuState = {
   top: number;
   workspace: WorkspaceSummary;
 };
+type ChatMessagesPaginationState = {
+  hasMoreBefore: boolean;
+  nextBeforeSequence: number | null;
+};
 
 const OPENAI_RESPONSES_PROVIDER_KIND = "openai-responses";
 
@@ -503,6 +507,7 @@ type WorkspaceFileContextMenuState = {
 
 const LIVE_REASONING_DURATION_REFRESH_MS = 250;
 const AGENT_TEAM_RUNNING_REFRESH_MS = 1000;
+const CHAT_MESSAGES_PAGE_LIMIT = 100;
 const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
 const MEMORY_DREAM_DEFAULT_PAGE_SIZE = 10;
 const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
@@ -583,6 +588,9 @@ export function App() {
   const openChatTabsRef = useRef<OpenChatTab[]>([]);
   const [openAgentTabs, setOpenAgentTabs] = useState<OpenAgentTab[]>([]);
   const [loadingChatKeys, setLoadingChatKeys] = useState<Set<string>>(() => new Set());
+  const [loadingOlderChatMessageKeys, setLoadingOlderChatMessageKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
   const openFileTabsRef = useRef<OpenFileTab[]>([]);
   const [workspaceFileEditors, setWorkspaceFileEditors] = useState<
@@ -611,6 +619,26 @@ export function App() {
         : updater;
     chatMessagesByKeyRef.current = next;
     setChatMessagesByKeyState(next);
+  }
+  const [, setChatMessagePaginationByKeyState] = useState<
+    Record<string, ChatMessagesPaginationState>
+  >({});
+  const chatMessagePaginationByKeyRef = useRef<
+    Record<string, ChatMessagesPaginationState>
+  >({});
+  function setChatMessagePaginationByKey(
+    updater:
+      | Record<string, ChatMessagesPaginationState>
+      | ((
+        current: Record<string, ChatMessagesPaginationState>,
+      ) => Record<string, ChatMessagesPaginationState>),
+  ) {
+    const next =
+      typeof updater === "function"
+        ? updater(chatMessagePaginationByKeyRef.current)
+        : updater;
+    chatMessagePaginationByKeyRef.current = next;
+    setChatMessagePaginationByKeyState(next);
   }
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionSettings[]>([]);
@@ -766,6 +794,7 @@ export function App() {
   const activeChatIdRef = useRef<string | null>(null);
   const loadingChatKeysRef = useRef<Set<string>>(new Set());
   const loadingChatControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const loadingOlderChatMessageKeysRef = useRef<Set<string>>(new Set());
   const runningChatKeysRef = useRef<Set<string>>(new Set());
   const activeRunInfoByChatKeyRef = useRef<Record<string, ActiveRunInfo>>({});
   const queuedRunRequestsByChatKeyRef = useRef<
@@ -793,6 +822,12 @@ export function App() {
       : chatRunKey(activeWorkspaceId, activeChatId);
   const isLoadingActiveChatMessages =
     activeChatKey !== null && loadingChatKeys.has(activeChatKey);
+  const activeChatPagination =
+    activeChatKey !== null
+      ? chatMessagePaginationByKeyRef.current[activeChatKey] ?? null
+      : null;
+  const isLoadingOlderActiveChatMessages =
+    activeChatKey !== null && loadingOlderChatMessageKeys.has(activeChatKey);
   const activeContextUsageKey =
     activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)
       ? chatRunKey(activeWorkspaceId, activeChatId)
@@ -1970,13 +2005,17 @@ export function App() {
       return;
     }
 
+    if (!isContextPanelOpen || contextPanelTab !== "todo") {
+      return;
+    }
+
     setTodoGraph(null);
     setTodoGraphError(null);
     void loadTodoGraph(
       todoGraphChatTarget.workspaceId,
       todoGraphChatTarget.chatId,
     );
-  }, [activeChatKey, activeWorkspace?.id, loadTodoGraph]);
+  }, [activeChatKey, activeWorkspace?.id, contextPanelTab, isContextPanelOpen, loadTodoGraph]);
 
   useEffect(() => {
     if (
@@ -1990,6 +2029,10 @@ export function App() {
       return;
     }
 
+    if (!isContextPanelOpen || contextPanelTab !== "stats") {
+      return;
+    }
+
     const requestedChatKey = chatRunKey(activeWorkspace.id, activeChatId);
     setChatStatistics(null);
     setChatStatisticsError(null);
@@ -1997,23 +2040,11 @@ export function App() {
       clearLiveChatStatistics(requestedChatKey);
     }
     void loadChatStatistics(activeWorkspace.id, activeChatId);
-  }, [activeChatId, activeWorkspace?.id, loadChatStatistics]);
-
-  useEffect(() => {
-    if (
-      contextPanelTab !== "stats" ||
-      !activeWorkspace?.id ||
-      !activeChatId ||
-      isPendingChatId(activeChatId)
-    ) {
-      return;
-    }
-
-    void loadChatStatistics(activeWorkspace.id, activeChatId);
   }, [
     activeChatId,
     activeWorkspace?.id,
     contextPanelTab,
+    isContextPanelOpen,
     loadChatStatistics,
   ]);
 
@@ -2625,11 +2656,34 @@ export function App() {
       setMessages((current) => updater(current));
     }
 
+    moveChatPaginationForChatKey(fromChatKey, toChatKey);
     moveContextUsageForChatKey(fromChatKey, toChatKey);
   }
 
   function removeMessagesForChatKey(chatKey: string) {
     setChatMessagesByKey((current) => {
+      if (!(chatKey in current)) {
+        return current;
+      }
+
+      const { [chatKey]: _removed, ...next } = current;
+      return next;
+    });
+  }
+
+  function moveChatPaginationForChatKey(fromChatKey: string, toChatKey: string) {
+    setChatMessagePaginationByKey((current) => {
+      const pagination = current[fromChatKey];
+      if (!pagination) {
+        return current;
+      }
+      const { [fromChatKey]: _removed, ...next } = current;
+      return { ...next, [toChatKey]: pagination };
+    });
+  }
+
+  function removeChatPaginationForChatKey(chatKey: string) {
+    setChatMessagePaginationByKey((current) => {
       if (!(chatKey in current)) {
         return current;
       }
@@ -3186,11 +3240,12 @@ export function App() {
 
     try {
       const data = await requestJson<ChatMessagesResponse>(
-        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages`,
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages?limit=${CHAT_MESSAGES_PAGE_LIMIT}`,
         { signal: controller.signal },
       );
       const nextMessages = data.messages.map(normalizeChatMessageSummary);
       const activeRun = normalizeActiveChatRunSummary(data.activeRun);
+      const pagination = normalizeChatMessagesPagination(data.pagination);
       updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);
       setReadOnlyChatKeys((current) => {
         const readOnly = data.chat?.readOnly === true;
@@ -3206,6 +3261,7 @@ export function App() {
         return next;
       });
       setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
+      setChatMessagePaginationByKey((current) => ({ ...current, [chatKey]: pagination }));
       restoreQueuedRunRequestsForChatKey(workspaceId, chatId, nextMessages);
       if (activeChatKeyRef.current === chatKey) {
         setMessages(nextMessages);
@@ -3231,6 +3287,63 @@ export function App() {
           return next;
         });
       }
+    }
+  }
+
+  async function loadOlderChatMessages(workspaceId: string, chatId: string) {
+    const chatKey = chatRunKey(workspaceId, chatId);
+    const pagination = chatMessagePaginationByKeyRef.current[chatKey];
+    if (
+      !pagination?.hasMoreBefore ||
+      pagination.nextBeforeSequence === null ||
+      loadingOlderChatMessageKeysRef.current.has(chatKey)
+    ) {
+      return;
+    }
+
+    loadingOlderChatMessageKeysRef.current.add(chatKey);
+    setLoadingOlderChatMessageKeys((current) => new Set(current).add(chatKey));
+    setError(null);
+
+    try {
+      const params = new URLSearchParams({
+        beforeSequence: String(pagination.nextBeforeSequence),
+        limit: String(CHAT_MESSAGES_PAGE_LIMIT),
+      });
+      const data = await requestJson<ChatMessagesResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages?${params}`,
+      );
+      const olderMessages = data.messages.map(normalizeChatMessageSummary);
+      const nextPagination = normalizeChatMessagesPagination(data.pagination);
+      let nextMessagesForChat = chatMessagesByKeyRef.current[chatKey] ?? [];
+
+      setChatMessagesByKey((current) => {
+        const existingMessages = current[chatKey] ?? [];
+        const existingIds = new Set(existingMessages.map((message) => message.id));
+        nextMessagesForChat = [
+          ...olderMessages.filter((message) => !existingIds.has(message.id)),
+          ...existingMessages,
+        ];
+        return { ...current, [chatKey]: nextMessagesForChat };
+      });
+      setChatMessagePaginationByKey((current) => ({
+        ...current,
+        [chatKey]: nextPagination,
+      }));
+      if (activeChatKeyRef.current === chatKey) {
+        setMessages(nextMessagesForChat);
+      }
+    } catch (requestError) {
+      if (activeChatKeyRef.current === chatKey) {
+        setError(errorMessage(requestError));
+      }
+    } finally {
+      loadingOlderChatMessageKeysRef.current.delete(chatKey);
+      setLoadingOlderChatMessageKeys((current) => {
+        const next = new Set(current);
+        next.delete(chatKey);
+        return next;
+      });
     }
   }
 
@@ -3928,6 +4041,7 @@ export function App() {
     setOpenChatTabs(nextOpenChatTabs);
     setChatRunFailed(chatKey, false);
     removeMessagesForChatKey(chatKey);
+    removeChatPaginationForChatKey(chatKey);
     removeContextUsageForChatKey(chatKey);
 
     if (
@@ -4073,8 +4187,10 @@ export function App() {
         });
       }
 
-      removeMessagesForChatKey(chatRunKey(workspaceId, chatId));
-      removeContextUsageForChatKey(chatRunKey(workspaceId, chatId));
+      const chatKey = chatRunKey(workspaceId, chatId);
+      removeMessagesForChatKey(chatKey);
+      removeChatPaginationForChatKey(chatKey);
+      removeContextUsageForChatKey(chatKey);
       setRetryRunRequest((current) =>
         current?.chatId === chatId ? null : current,
       );
@@ -7995,6 +8111,8 @@ export function App() {
                   isLoadingBranches={isLoadingBranches}
                   isLoadingContextUsage={isLoadingContextUsage}
                   isLoadingMessages={isLoadingActiveChatMessages}
+                  hasMoreMessagesBefore={activeChatPagination?.hasMoreBefore === true}
+                  isLoadingMoreMessages={isLoadingOlderActiveChatMessages}
                   isSendingMessage={isSendingMessage}
                   isSelectingAttachments={isSelectingAttachments}
                   isTeamModeEnabled={canUseTeamMode && isTeamModeEnabled}
@@ -8005,6 +8123,12 @@ export function App() {
                   onBranchChange={handleBranchChangeForChatPanel}
                   onDraftMessageChange={setDraftMessage}
                   onGuideQueuedMessage={handleGuideQueuedMessageForChatPanel}
+                  onLoadMoreMessages={() => {
+                    if (!activeWorkspaceId || !activeChatId || isPendingChatId(activeChatId)) {
+                      return Promise.resolve();
+                    }
+                    return loadOlderChatMessages(activeWorkspaceId, activeChatId);
+                  }}
                   onSelectAttachments={handleSelectDraftAttachmentsForChatPanel}
                   onCancelRun={handleCancelRunForChatPanel}
                   onGuideActiveRun={handleGuideActiveRunForChatPanel}
@@ -25011,6 +25135,25 @@ function normalizeChatMessageSummary(
   return {
     ...normalizedMessage,
     parts: parts.length ? parts : fallbackMessageParts(normalizedMessage),
+  };
+}
+
+function normalizeChatMessagesPagination(
+  value: ChatMessagesResponse["pagination"] | undefined,
+): ChatMessagesPaginationState {
+  if (!value || typeof value !== "object") {
+    return { hasMoreBefore: false, nextBeforeSequence: null };
+  }
+  const hasMoreBefore = fieldValue(value, "hasMoreBefore", "has_more_before") === true;
+  const nextBeforeSequence = fieldValue(
+    value,
+    "nextBeforeSequence",
+    "next_before_sequence",
+  );
+  return {
+    hasMoreBefore,
+    nextBeforeSequence:
+      typeof nextBeforeSequence === "number" ? nextBeforeSequence : null,
   };
 }
 

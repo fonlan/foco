@@ -18,6 +18,7 @@ use foco_store::{
         workspace_database_path,
     },
 };
+use serde::Deserialize;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::*;
@@ -29,6 +30,14 @@ type BoxedChatSse = Sse<KeepAliveStream<BoxedChatEventStream>>;
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.";
 const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_CHAT_MESSAGES_PAGE_LIMIT: usize = 500;
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatMessagesQuery {
+    limit: Option<usize>,
+    before_sequence: Option<i64>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum QueuedChatMessageOrigin {
@@ -1196,6 +1205,7 @@ pub(crate) async fn ai_statistics_detail(
 pub(crate) async fn chat_messages(
     State(state): State<AppState>,
     AxumPath((workspace_id, chat_id)): AxumPath<(String, String)>,
+    Query(query): Query<ChatMessagesQuery>,
 ) -> Result<Json<ChatMessagesResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace_id = workspace_id.trim();
@@ -1216,9 +1226,7 @@ pub(crate) async fn chat_messages(
     let include_memory_dream_transcript_steps =
         chat_summary.kind.as_deref() == Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND);
 
-    let message_records = database
-        .messages_for_chat(chat_id)
-        .map_err(ApiError::from_workspace_error)?;
+    let (message_records, pagination) = chat_message_records_for_query(&database, chat_id, &query)?;
     let messages = chat_message_summaries_for_chat(
         &mut database,
         &workspace.path,
@@ -1235,8 +1243,59 @@ pub(crate) async fn chat_messages(
     Ok(Json(ChatMessagesResponse {
         chat: Some(chat_summary),
         messages,
+        pagination,
         active_run,
     }))
+}
+
+fn chat_message_records_for_query(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    query: &ChatMessagesQuery,
+) -> Result<(Vec<MessageRecord>, ChatMessagesPaginationSummary), ApiError> {
+    if query.before_sequence.is_some_and(|sequence| sequence < 0) {
+        return Err(ApiError::bad_request(
+            "beforeSequence must be greater than or equal to 0",
+        ));
+    }
+    let Some(limit) = query.limit else {
+        let messages = database
+            .messages_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?;
+        return Ok((
+            messages,
+            ChatMessagesPaginationSummary {
+                has_more_before: false,
+                next_before_sequence: None,
+            },
+        ));
+    };
+    if limit == 0 || limit > MAX_CHAT_MESSAGES_PAGE_LIMIT {
+        return Err(ApiError::bad_request(format!(
+            "limit must be between 1 and {MAX_CHAT_MESSAGES_PAGE_LIMIT}"
+        )));
+    }
+    let fetch_limit = limit.checked_add(1).ok_or_else(|| {
+        ApiError::bad_request("limit is too large to calculate a chat message page")
+    })?;
+    let mut messages = database
+        .messages_for_chat_page(chat_id, query.before_sequence, fetch_limit)
+        .map_err(ApiError::from_workspace_error)?;
+    let has_more_before = messages.len() > limit;
+    if has_more_before {
+        messages.remove(0);
+    }
+    let next_before_sequence = has_more_before
+        .then(|| messages.first().map(|message| message.sequence))
+        .flatten();
+
+    Ok((
+        messages,
+        ChatMessagesPaginationSummary {
+            has_more_before,
+            next_before_sequence,
+        },
+    ))
 }
 
 pub(crate) async fn chat_todo_graph(
@@ -1298,8 +1357,8 @@ pub(crate) async fn chat_statistics(
         )));
     }
 
-    let messages = database
-        .messages_for_chat(chat_id)
+    let message_counts = database
+        .message_role_counts_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?;
     let llm_rows = database
         .llm_request_audit_count(LlmRequestAuditFilters {
@@ -1350,7 +1409,7 @@ pub(crate) async fn chat_statistics(
     Ok(Json(chat_statistics_response(
         workspace_id,
         chat_id,
-        messages,
+        chat_message_role_counts(message_counts),
         llm_rows,
         prompt_injections,
         compression_snapshots,

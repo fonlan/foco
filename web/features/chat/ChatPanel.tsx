@@ -65,6 +65,7 @@ import { MarkdownContent, type SelectedSkillPrefixResolver } from "./MarkdownCon
 const COMPOSER_EDITOR_MIN_HEIGHT_PX = 68;
 const COMPOSER_EDITOR_KEY_STEP_PX = 24;
 const COMPOSER_EDITOR_MAX_HEIGHT_RATIO = 0.55;
+const CHAT_TOP_LOAD_THRESHOLD_PX = 64;
 const MAX_GENERATED_IMAGE_PREVIEWS = 16;
 
 type ToolCallChangeStats = {
@@ -117,11 +118,13 @@ function ChatPanelComponent({
   draftAttachments,
   draftMessage,
   gitBranches,
+  hasMoreMessagesBefore,
   helpers,
   queuedRunCount,
   readOnly,
   isLoadingBranches,
   isLoadingContextUsage,
+  isLoadingMoreMessages,
   isLoadingMessages,
   isLoadingSettings,
   isSendingMessage,
@@ -135,6 +138,7 @@ function ChatPanelComponent({
   onDraftMessageChange,
   onGuideActiveRun,
   onGuideQueuedMessage,
+  onLoadMoreMessages,
   onModelChange,
   onProviderChange,
   onQueueActiveRun,
@@ -172,11 +176,13 @@ function ChatPanelComponent({
   draftAttachments: ComposerAttachment[];
   draftMessage: string;
   gitBranches: GitBranchesResponse | null;
+  hasMoreMessagesBefore: boolean;
   helpers: ChatPanelHelpers;
   queuedRunCount: number;
   readOnly: boolean;
   isLoadingBranches: boolean;
   isLoadingContextUsage: boolean;
+  isLoadingMoreMessages: boolean;
   isLoadingMessages: boolean;
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
@@ -190,6 +196,7 @@ function ChatPanelComponent({
   onDraftMessageChange: (value: string) => void;
   onGuideActiveRun: () => void;
   onGuideQueuedMessage: (messageId: string) => void;
+  onLoadMoreMessages: () => Promise<void>;
   onModelChange: (value: string) => void;
   onProviderChange: (value: string) => void;
   onQueueActiveRun: () => void;
@@ -232,6 +239,9 @@ function ChatPanelComponent({
   const messageTextareaRef = useRef<HTMLTextAreaElement>(null);
   const composerResizeDragRef = useRef<ComposerResizeDrag | null>(null);
   const copiedMessageTimerRef = useRef<number | null>(null);
+  const pendingPrependScrollHeightRef = useRef<number | null>(null);
+  const previousChatScrollKeyRef = useRef(chatScrollKey);
+  const previousMessageCountRef = useRef(messages.length);
   const shouldLockMessageScrollRef = useRef(true);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
@@ -329,17 +339,39 @@ function ChatPanelComponent({
   }
 
   useLayoutEffect(() => {
+    const previousScrollHeight = pendingPrependScrollHeightRef.current;
+    if (previousScrollHeight === null) {
+      return;
+    }
+
+    pendingPrependScrollHeightRef.current = null;
     const element = messageScrollRef.current;
-    shouldLockMessageScrollRef.current = messages.length > 0;
+    if (!element) {
+      return;
+    }
+    shouldLockMessageScrollRef.current = false;
+    element.scrollTop += Math.max(0, element.scrollHeight - previousScrollHeight);
+  }, [messages.length]);
+
+  useLayoutEffect(() => {
+    const element = messageScrollRef.current;
+    const chatChanged = previousChatScrollKeyRef.current !== chatScrollKey;
+    const wasEmpty = previousMessageCountRef.current === 0;
+    previousChatScrollKeyRef.current = chatScrollKey;
+    previousMessageCountRef.current = messages.length;
 
     if (messages.length === 0) {
+      shouldLockMessageScrollRef.current = false;
       if (element) {
         element.scrollTop = 0;
       }
       return;
     }
 
-    scrollMessageListToBottom();
+    if (chatChanged || wasEmpty) {
+      shouldLockMessageScrollRef.current = true;
+      scrollMessageListToBottom();
+    }
   }, [chatScrollKey, messages.length]);
 
   useLayoutEffect(() => {
@@ -478,6 +510,17 @@ function ChatPanelComponent({
     setIsResizingComposer(true);
   }
 
+  function requestMoreMessages() {
+    if (!hasMoreMessagesBefore || isLoadingMoreMessages) {
+      return;
+    }
+
+    const element = messageScrollRef.current;
+    pendingPrependScrollHeightRef.current = element?.scrollHeight ?? null;
+    shouldLockMessageScrollRef.current = false;
+    void onLoadMoreMessages();
+  }
+
   function handleMessageScroll() {
     const element = messageScrollRef.current;
     if (!element) {
@@ -492,6 +535,13 @@ function ChatPanelComponent({
     shouldLockMessageScrollRef.current =
       element.scrollHeight - element.scrollTop - element.clientHeight <=
       CHAT_BOTTOM_LOCK_THRESHOLD_PX;
+    if (
+      element.scrollTop <= CHAT_TOP_LOAD_THRESHOLD_PX &&
+      hasMoreMessagesBefore &&
+      !isLoadingMoreMessages
+    ) {
+      requestMoreMessages();
+    }
   }
 
   function handleSkillSelect(skill: ConfiguredSkillSummary) {
@@ -597,19 +647,38 @@ function ChatPanelComponent({
           ref={messageScrollContentRef}
         >
           {messages.length ? (
-            messages.map((message) => (
-              <MessageRow
-                helpers={helpers}
-                isCopied={copiedMessageId === message.id}
-                key={message.id}
-                message={message}
-                onCopyMessage={handleCopyMessage}
-                onGuideQueuedMessage={onGuideQueuedMessage}
-                onWithdrawQueuedMessage={onWithdrawQueuedMessage}
-                queuedMessageIds={queuedMessageIds}
-                workspaceId={workspaceId}
-              />
-            ))
+            <>
+              {hasMoreMessagesBefore || isLoadingMoreMessages ? (
+                <div className="flex justify-center">
+                  <button
+                    className="chat-toolbar-button inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-white/80 px-3 py-1.5 text-xs font-semibold text-stone-600"
+                    disabled={isLoadingMoreMessages}
+                    onClick={requestMoreMessages}
+                    type="button"
+                  >
+                    {isLoadingMoreMessages ? (
+                      <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                    ) : (
+                      <ArrowUp aria-hidden="true" className="size-3.5" />
+                    )}
+                    <span>{isLoadingMoreMessages ? t("Loading...") : t("Load earlier messages")}</span>
+                  </button>
+                </div>
+              ) : null}
+              {messages.map((message) => (
+                <MessageRow
+                  helpers={helpers}
+                  isCopied={copiedMessageId === message.id}
+                  key={message.id}
+                  message={message}
+                  onCopyMessage={handleCopyMessage}
+                  onGuideQueuedMessage={onGuideQueuedMessage}
+                  onWithdrawQueuedMessage={onWithdrawQueuedMessage}
+                  queuedMessageIds={queuedMessageIds}
+                  workspaceId={workspaceId}
+                />
+              ))}
+            </>
           ) : isLoadingMessages ? (
             <div className="flex min-h-48 items-center justify-center gap-2 text-sm font-medium text-stone-500">
               <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />

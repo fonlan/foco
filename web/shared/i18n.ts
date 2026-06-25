@@ -818,6 +818,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Saved bind": "已保存绑定",
     "restart required": "需要重启",
     "Loading...": "正在加载...",
+    "Load earlier messages": "加载更早消息",
     "Saved host and port are used the next time the backend starts.":
       "已保存的 host 和端口会在后端下次启动时生效。",
     "Language changes apply immediately after saving.":

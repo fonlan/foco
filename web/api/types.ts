@@ -348,6 +348,10 @@ export type QueueChatMessageResponse = {
 export type ChatMessagesResponse = {
   chat?: ChatMessagesChatSummary | null;
   messages: ChatMessageSummary[];
+  pagination: {
+    hasMoreBefore: boolean;
+    nextBeforeSequence: number | null;
+  };
   activeRun?: ActiveChatRunSummary | null;
 };
 

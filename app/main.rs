@@ -64,12 +64,13 @@ use foco_store::{
         ChatRecord, CodeChangeStats, ContextCompressionSnapshotRecord,
         LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown, LlmRequestAuditRow,
         LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
-        LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, NewContextCompressionSnapshot,
-        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPromptContextInjection, NewToolCall,
-        NewToolResult, PromptContextInjectionRecord, TodoGraphRecord, TodoGraphTask,
-        ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        WorkspaceDatabaseError, WorkspaceDatabaseSpaceStats, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, workspace_database_path,
+        LlmRequestMetricsRecord, LlmRequestRecord, MessageRecord, MessageRoleCountRecord,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+        NewPromptContextInjection, NewToolCall, NewToolResult, PromptContextInjectionRecord,
+        TodoGraphRecord, TodoGraphTask, ToolCallCountRecord, ToolCallWithResultRecord,
+        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceDatabaseSpaceStats, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
+        workspace_database_path,
     },
 };
 use foco_tools::{
@@ -3259,7 +3260,15 @@ struct ChatMessagesResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     chat: Option<ChatMessagesChatSummary>,
     messages: Vec<ChatMessageSummary>,
+    pagination: ChatMessagesPaginationSummary,
     active_run: Option<ActiveChatRunSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatMessagesPaginationSummary {
+    has_more_before: bool,
+    next_before_sequence: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -3306,6 +3315,14 @@ struct ChatStatisticsResponse {
     provider_breakdown: Vec<AiStatisticsProviderBreakdown>,
     tool_breakdown: Vec<ChatToolBreakdown>,
     compression: ChatCompressionStatistics,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ChatMessageRoleCounts {
+    message_count: i64,
+    user_message_count: i64,
+    assistant_message_count: i64,
+    tool_message_count: i64,
 }
 
 #[derive(Serialize)]
@@ -9700,7 +9717,7 @@ fn chat_summary(
 fn chat_statistics_response(
     workspace_id: &str,
     chat_id: &str,
-    messages: Vec<MessageRecord>,
+    message_counts: ChatMessageRoleCounts,
     llm_rows: Vec<LlmRequestAuditRow>,
     prompt_injections: Vec<PromptContextInjectionRecord>,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
@@ -9713,29 +9730,16 @@ fn chat_statistics_response(
         .iter()
         .filter_map(|row| row.total_latency_ms)
         .sum::<i64>();
-    let message_count = messages.len() as i64;
-    let user_message_count = messages
-        .iter()
-        .filter(|message| message.role == "user")
-        .count() as i64;
-    let assistant_message_count = messages
-        .iter()
-        .filter(|message| message.role == "assistant")
-        .count() as i64;
-    let tool_message_count = messages
-        .iter()
-        .filter(|message| message.role == "tool")
-        .count() as i64;
     let memory_references = unique_prompt_context_memory_keys(&prompt_injections)? as i64;
     let compression = chat_compression_statistics(&compression_snapshots);
 
     Ok(ChatStatisticsResponse {
         workspace_id: workspace_id.to_string(),
         chat_id: chat_id.to_string(),
-        message_count,
-        user_message_count,
-        assistant_message_count,
-        tool_message_count,
+        message_count: message_counts.message_count,
+        user_message_count: message_counts.user_message_count,
+        assistant_message_count: message_counts.assistant_message_count,
+        tool_message_count: message_counts.tool_message_count,
         total_requests: ai_summary.total_requests,
         failed_requests: ai_summary.failed_requests,
         total_input_tokens: ai_summary.total_input_tokens,
@@ -9753,6 +9757,20 @@ fn chat_statistics_response(
         tool_breakdown,
         compression,
     })
+}
+
+fn chat_message_role_counts(records: Vec<MessageRoleCountRecord>) -> ChatMessageRoleCounts {
+    let mut counts = ChatMessageRoleCounts::default();
+    for record in records {
+        counts.message_count += record.count;
+        match record.role.as_str() {
+            "user" => counts.user_message_count += record.count,
+            "assistant" => counts.assistant_message_count += record.count,
+            "tool" => counts.tool_message_count += record.count,
+            _ => {}
+        }
+    }
+    counts
 }
 
 fn unique_prompt_context_memory_keys(
@@ -11124,8 +11142,9 @@ fn materialize_missing_assistant_parts(
         return Ok(());
     }
 
+    let missing_message_id_list = missing_message_ids.iter().cloned().collect::<Vec<_>>();
     let events = database
-        .history_run_events_for_chat(chat_id)
+        .history_run_events_for_chat_messages(chat_id, &missing_message_id_list)
         .map_err(ApiError::from_workspace_error)?;
     let tool_calls_by_id = tool_calls_by_message
         .values()
