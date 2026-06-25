@@ -78,6 +78,7 @@ import {
   WheelEvent as ReactWheelEvent,
   Suspense,
   lazy,
+  memo,
   useCallback,
   useEffect,
   useId,
@@ -519,12 +520,27 @@ const AGENT_TEAM_RUNNING_REFRESH_MS = 1000;
 const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
 const MEMORY_DREAM_DEFAULT_PAGE_SIZE = 10;
 const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
+const EMPTY_CONFIGURED_PROVIDERS: ConfiguredProviderSummary[] = [];
+const EMPTY_GIT_STATUS_FILES: GitStatusFileSummary[] = [];
 
 type ComposerDefaultSelection = {
   modelId: string;
   providerId: string;
   thinkingLevel: string;
 };
+
+function useStableCallback<T extends (...args: any[]) => unknown>(callback: T): T {
+  const callbackRef = useRef(callback);
+
+  useLayoutEffect(() => {
+    callbackRef.current = callback;
+  });
+
+  return useCallback(
+    ((...args: Parameters<T>) => callbackRef.current(...args)) as T,
+    [],
+  );
+}
 
 export function App() {
   const [initialBrowserRoute] = useState(() => currentBrowserRoute());
@@ -780,15 +796,36 @@ export function App() {
   const liveChatStatistics = activeChatKey
     ? liveChatStatisticsByKey[activeChatKey] ?? null
     : null;
-  const displayedChatStatistics = liveChatStatistics
-    ? withLiveChatStatistics(
-      chatStatistics,
-      liveChatStatistics,
-      messages,
-      activeWorkspaceId,
+  // ponytail: stats only tracks message shape here; add text hashes if live stats need per-token updates.
+  const chatStatisticsMessageFingerprint = useMemo(
+    () =>
+      messages
+        .map(
+          (message) =>
+            `${message.id}:${message.role}:${message.status}:${message.toolCalls.length}:${message.parts.length}`,
+        )
+        .join("|"),
+    [messages],
+  );
+  const displayedChatStatistics = useMemo(
+    () =>
+      liveChatStatistics
+        ? withLiveChatStatistics(
+          chatStatistics,
+          liveChatStatistics,
+          messages,
+          activeWorkspaceId,
+          activeChatId,
+        )
+        : chatStatistics,
+    [
       activeChatId,
-    )
-    : chatStatistics;
+      activeWorkspaceId,
+      chatStatistics,
+      chatStatisticsMessageFingerprint,
+      liveChatStatistics,
+    ],
+  );
   const isLoadingContextUsage = activeContextUsageKey
     ? contextUsageLoadingByChatKey[activeContextUsageKey] ?? false
     : false;
@@ -6945,6 +6982,186 @@ export function App() {
     }
   }
 
+  const chatPanelHelpers = useMemo<ChatPanelHelpers>(
+    () => ({
+      activeSkillQuery,
+      compactInlineText,
+      compactToolJson,
+      fallbackMessageParts,
+      formatChatCreatedAt,
+      formatFileSize,
+      formatJsonValue,
+      formatNullableLatencySeconds: (value, nextLanguage) =>
+        formatNullableLatencySeconds(value, nextLanguage as AppLanguageId),
+      formatTokensPerSecond: (metrics, nextLanguage) =>
+        formatTokensPerSecond(metrics, nextLanguage as AppLanguageId),
+      messageCopyText,
+      normalizedToolInput,
+      removeActiveSkillToken,
+      selectedSkillPrefix,
+      skillScopeLabel,
+      toolCallChangeStats,
+      toolCallDetailText,
+      toolLiveOutputText,
+      toolStatusText,
+    }),
+    [],
+  );
+  const chatOverviewRenderer = useCallback(
+    () => (
+      <ApiOverviewPanel
+        activeWorkspaceId={activeWorkspaceId}
+        autoLoadEnabled={!isPreparingChatRun}
+        settings={settings}
+        workspaces={workspaces}
+      />
+    ),
+    [activeWorkspaceId, isPreparingChatRun, settings, workspaces],
+  );
+  const handleAddPastedImageAttachmentsForChatPanel = useStableCallback(
+    (files: File[]) => void handleAddPastedImageAttachments(files),
+  );
+  const handleBranchChangeForChatPanel = useStableCallback(
+    (branch: string) => void handleGitBranchChange(branch),
+  );
+  const handleGuideQueuedMessageForChatPanel = useStableCallback(
+    (messageId: string) => void handleGuideQueuedMessage(messageId),
+  );
+  const handleSelectDraftAttachmentsForChatPanel = useStableCallback(
+    (files: File[]) => void handleSelectDraftAttachments(files),
+  );
+  const handleCancelRunForChatPanel = useStableCallback(
+    () => void handleCancelRun(),
+  );
+  const handleGuideActiveRunForChatPanel = useStableCallback(
+    () => void handleGuideActiveRun(),
+  );
+  const handleQueueActiveRunForChatPanel = useStableCallback(
+    () => void handleQueueActiveRun(),
+  );
+  const handleRetryRunForChatPanel = useStableCallback(
+    () => void handleRetryRun(),
+  );
+  const handleSubmitForChatPanel = useStableCallback(
+    (
+      event: FormEvent<HTMLFormElement>,
+      options?: { schedule?: boolean },
+    ) => void handleSendMessage(event, options),
+  );
+  const handleModelChangeForChatPanel = useStableCallback(handleChatModelChange);
+  const handleProviderChangeForChatPanel = useStableCallback(handleChatProviderChange);
+  const handleRemoveAttachmentForChatPanel = useStableCallback(handleRemoveDraftAttachment);
+  const handleRemoveSkillForChatPanel = useStableCallback(removeSelectedSkill);
+  const handleThinkingLevelChangeForChatPanel = useStableCallback(
+    handleChatThinkingLevelChange,
+  );
+  const handleToggleSkillForChatPanel = useStableCallback(toggleSelectedSkill);
+  const handleWithdrawQueuedMessageForChatPanel = useStableCallback(
+    handleWithdrawQueuedMessage,
+  );
+  const providersForChatPanel = settings?.providers ?? EMPTY_CONFIGURED_PROVIDERS;
+  const refreshAgentPanelForContextPanel = useStableCallback(async () => {
+    if (activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)) {
+      await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
+    }
+  });
+  const openAgentInstanceTabForContextPanel = useStableCallback(openAgentInstanceTab);
+  const agentsPanelForContextPanel = useMemo(
+    () => (
+      <AgentsRuntimePanel
+        activeChatId={
+          activeChatId && !isPendingChatId(activeChatId)
+            ? activeChatId
+            : null
+        }
+        error={agentTeamError}
+        isLoading={isLoadingAgentTeam}
+        onRefresh={refreshAgentPanelForContextPanel}
+        onSelectInstance={openAgentInstanceTabForContextPanel}
+        selectedInstanceId={
+          activeMainTab.type === "agent"
+            ? activeMainTab.instanceId
+            : agentTeamSnapshot?.team.coordinatorInstanceId ?? null
+        }
+        snapshot={agentTeamSnapshot}
+      />
+    ),
+    [
+      activeChatId,
+      activeMainTab,
+      agentTeamError,
+      agentTeamSnapshot,
+      isLoadingAgentTeam,
+      openAgentInstanceTabForContextPanel,
+      refreshAgentPanelForContextPanel,
+    ],
+  );
+  const handleGenerateGitCommitMessageForContextPanel = useStableCallback(
+    () => void handleGenerateGitCommitMessage(),
+  );
+  const handleGitFileOperationForContextPanel = useStableCallback(
+    (action: "stage" | "unstage" | "discard", path: string) =>
+      void handleGitFileOperation(action, path),
+  );
+  const handleRefreshWorkspaceFilesForContextPanel = useStableCallback(() => {
+    if (activeWorkspace?.id) {
+      void loadWorkspaceFiles(activeWorkspace.id);
+    }
+  });
+  const handleOpenWorkspaceFileForContextPanel = useStableCallback(
+    (node: WorkspaceFileTreeNode) => void openWorkspaceFileTab(node),
+  );
+  const handleOpenWorkspaceFileMenuForContextPanel = useStableCallback(
+    (event: ReactMouseEvent, node: WorkspaceFileTreeNode) => {
+      if (!activeWorkspace) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      setWorkspaceFileContextMenu({
+        left: event.clientX,
+        node,
+        top: event.clientY,
+        workspacePath: activeWorkspace.path,
+      });
+    },
+  );
+  const handleRefreshDiffForContextPanel = useStableCallback(() => {
+    if (activeWorkspace?.id) {
+      void loadGitDiff(activeWorkspace.id, selectedDiffPath);
+    }
+  });
+  const handleForgetContextMemoryForContextPanel = useStableCallback(
+    (memory: MemoryFactRecord) => void forgetContextMemory(memory),
+  );
+  const handleReloadWorkspaceSpecForContextPanel = useStableCallback(() => {
+    if (activeWorkspace?.id) {
+      void loadWorkspaceSpec(activeWorkspace.id);
+    }
+  });
+  const handleSaveWorkspaceSpecForContextPanel = useStableCallback(
+    () => void saveWorkspaceSpecContent(),
+  );
+  const handleGenerateWorkspaceSpecForContextPanel = useStableCallback(
+    () => void generateWorkspaceSpec(),
+  );
+  const handleWorkspaceSpecSettingsChangeForContextPanel = useStableCallback(
+    (enabled: boolean, injectEnabled: boolean) => {
+      if (activeWorkspace?.id) {
+        void saveWorkspaceSpecSettings(
+          activeWorkspace.id,
+          enabled,
+          injectEnabled,
+        );
+      }
+    },
+  );
+  const handleContextPanelTabChange = useStableCallback((tab: ContextPanelTab) => {
+    setContextPanelTab(tab);
+    setIsContextPanelOpen(true);
+  });
+  const contextPanelFiles = gitDiff?.files ?? EMPTY_GIT_STATUS_FILES;
+
   if (isCheckingAuth) {
     return (
       <I18nContext.Provider value={{ language, t }}>
@@ -6968,29 +7185,6 @@ export function App() {
       </I18nContext.Provider>
     );
   }
-
-  const chatPanelHelpers: ChatPanelHelpers = {
-    activeSkillQuery,
-    compactInlineText,
-    compactToolJson,
-    fallbackMessageParts,
-    formatChatCreatedAt,
-    formatFileSize,
-    formatJsonValue,
-    formatNullableLatencySeconds: (value, nextLanguage) =>
-      formatNullableLatencySeconds(value, nextLanguage as AppLanguageId),
-    formatTokensPerSecond: (metrics, nextLanguage) =>
-      formatTokensPerSecond(metrics, nextLanguage as AppLanguageId),
-    messageCopyText,
-    normalizedToolInput,
-    removeActiveSkillToken,
-    selectedSkillPrefix,
-    skillScopeLabel,
-    toolCallChangeStats,
-    toolCallDetailText,
-    toolLiveOutputText,
-    toolStatusText,
-  };
 
   return (
     <I18nContext.Provider value={{ language, t }}>
@@ -7670,40 +7864,25 @@ export function App() {
                   isTeamModeEnabled={canUseTeamMode && isTeamModeEnabled}
                   messages={messages}
                   readOnly={activeChatReadOnly}
-                  overviewRenderer={() => (
-                    <ApiOverviewPanel
-                      activeWorkspaceId={activeWorkspaceId}
-                      autoLoadEnabled={!isPreparingChatRun}
-                      settings={settings}
-                      workspaces={workspaces}
-                    />
-                  )}
-                  onAddPastedImageAttachments={(files) =>
-                    void handleAddPastedImageAttachments(files)
-                  }
-                  onBranchChange={(branch) => void handleGitBranchChange(branch)}
+                  overviewRenderer={chatOverviewRenderer}
+                  onAddPastedImageAttachments={handleAddPastedImageAttachmentsForChatPanel}
+                  onBranchChange={handleBranchChangeForChatPanel}
                   onDraftMessageChange={setDraftMessage}
-                  onGuideQueuedMessage={(messageId) =>
-                    void handleGuideQueuedMessage(messageId)
-                  }
-                  onSelectAttachments={(files) =>
-                    void handleSelectDraftAttachments(files)
-                  }
-                  onCancelRun={() => void handleCancelRun()}
-                  onGuideActiveRun={() => void handleGuideActiveRun()}
-                  onQueueActiveRun={handleQueueActiveRun}
-                  onModelChange={handleChatModelChange}
-                  onProviderChange={handleChatProviderChange}
-                  onRemoveAttachment={handleRemoveDraftAttachment}
-                  onRemoveSkill={removeSelectedSkill}
-                  onRetryRun={() => void handleRetryRun()}
-                  onSubmit={(event, options) =>
-                    void handleSendMessage(event, options)
-                  }
+                  onGuideQueuedMessage={handleGuideQueuedMessageForChatPanel}
+                  onSelectAttachments={handleSelectDraftAttachmentsForChatPanel}
+                  onCancelRun={handleCancelRunForChatPanel}
+                  onGuideActiveRun={handleGuideActiveRunForChatPanel}
+                  onQueueActiveRun={handleQueueActiveRunForChatPanel}
+                  onModelChange={handleModelChangeForChatPanel}
+                  onProviderChange={handleProviderChangeForChatPanel}
+                  onRemoveAttachment={handleRemoveAttachmentForChatPanel}
+                  onRemoveSkill={handleRemoveSkillForChatPanel}
+                  onRetryRun={handleRetryRunForChatPanel}
+                  onSubmit={handleSubmitForChatPanel}
                   onTeamModeEnabledChange={setIsTeamModeEnabled}
-                  onThinkingLevelChange={handleChatThinkingLevelChange}
-                  onToggleSkill={toggleSelectedSkill}
-                  onWithdrawQueuedMessage={handleWithdrawQueuedMessage}
+                  onThinkingLevelChange={handleThinkingLevelChangeForChatPanel}
+                  onToggleSkill={handleToggleSkillForChatPanel}
+                  onWithdrawQueuedMessage={handleWithdrawQueuedMessageForChatPanel}
                   canRetryRun={retryRunRequest !== null && !isSendingMessage}
                   queuedRunCount={queuedRunRequests.length}
                   queuedMessageIds={queuedMessageIds}
@@ -7714,7 +7893,7 @@ export function App() {
                   selectedThinkingLevel={selectedThinkingLevel}
                   settings={settings}
                   showTeamModeToggle={canUseTeamMode}
-                  providers={settings?.providers ?? []}
+                  providers={providersForChatPanel}
                   skills={detectedSkills}
                   thinkingLevels={thinkingLevels}
                   workspaces={workspaces}
@@ -7809,29 +7988,7 @@ export function App() {
                   />
                   <ContextPanel
                     activeTab={contextPanelTab}
-                    agentsPanel={
-                      <AgentsRuntimePanel
-                        activeChatId={
-                          activeChatId && !isPendingChatId(activeChatId)
-                            ? activeChatId
-                            : null
-                        }
-                        error={agentTeamError}
-                        isLoading={isLoadingAgentTeam}
-                        onRefresh={async () => {
-                          if (activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)) {
-                            await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
-                          }
-                        }}
-                        onSelectInstance={openAgentInstanceTab}
-                        selectedInstanceId={
-                          activeMainTab.type === "agent"
-                            ? activeMainTab.instanceId
-                            : agentTeamSnapshot?.team.coordinatorInstanceId ?? null
-                        }
-                        snapshot={agentTeamSnapshot}
-                      />
-                    }
+                    agentsPanel={agentsPanelForContextPanel}
                     chatStatistics={displayedChatStatistics}
                     chatStatisticsError={chatStatisticsError}
                     contextMemories={contextMemories}
@@ -7840,7 +7997,7 @@ export function App() {
                     contextMemoryError={contextMemoryError}
                     diffError={diffError}
                     diffResponse={gitDiff}
-                    files={gitDiff?.files ?? []}
+                    files={contextPanelFiles}
                     gitCommitMessage={gitCommitMessage}
                     gitOperationKey={gitOperationKey}
                     expandedFileTreePaths={expandedFileTreePaths}
@@ -7851,60 +8008,25 @@ export function App() {
                     isLoadingWorkspaceSpec={isLoadingWorkspaceSpec}
                     isLoadingWorkspaceFiles={isLoadingWorkspaceFiles}
                     onGitCommit={handleGitCommit}
-                    onGenerateGitCommitMessage={() => void handleGenerateGitCommitMessage()}
+                    onGenerateGitCommitMessage={handleGenerateGitCommitMessageForContextPanel}
                     onGitCommitMessageChange={setGitCommitMessage}
-                    onGitFileOperation={(action, path) => void handleGitFileOperation(action, path)}
-                    onRefreshWorkspaceFiles={() => {
-                      if (activeWorkspace?.id) {
-                        void loadWorkspaceFiles(activeWorkspace.id);
-                      }
-                    }}
+                    onGitFileOperation={handleGitFileOperationForContextPanel}
+                    onRefreshWorkspaceFiles={handleRefreshWorkspaceFilesForContextPanel}
                     loadingWorkspaceDirectoryPaths={loadingWorkspaceDirectoryPaths}
                     onToggleFileTreePath={toggleWorkspaceFileTreePath}
-                    onOpenWorkspaceFile={(node) => void openWorkspaceFileTab(node)}
-                    onOpenWorkspaceFileMenu={(event, node) => {
-                      if (!activeWorkspace) {
-                        return;
-                      }
-                      event.preventDefault();
-                      event.stopPropagation();
-                      setWorkspaceFileContextMenu({
-                        left: event.clientX,
-                        node,
-                        top: event.clientY,
-                        workspacePath: activeWorkspace.path,
-                      });
-                    }}
-                    onRefreshDiff={() => {
-                      if (activeWorkspace?.id) {
-                        void loadGitDiff(activeWorkspace.id, selectedDiffPath);
-                      }
-                    }}
-                    onForgetContextMemory={(memory) => void forgetContextMemory(memory)}
+                    onOpenWorkspaceFile={handleOpenWorkspaceFileForContextPanel}
+                    onOpenWorkspaceFileMenu={handleOpenWorkspaceFileMenuForContextPanel}
+                    onRefreshDiff={handleRefreshDiffForContextPanel}
+                    onForgetContextMemory={handleForgetContextMemoryForContextPanel}
                     onMemoryPageChange={goToContextMemoryPage}
-                    onReloadWorkspaceSpec={() => {
-                      if (activeWorkspace?.id) {
-                        void loadWorkspaceSpec(activeWorkspace.id);
-                      }
-                    }}
-                    onSaveWorkspaceSpec={() => void saveWorkspaceSpecContent()}
-                    onGenerateWorkspaceSpec={() => void generateWorkspaceSpec()}
+                    onReloadWorkspaceSpec={handleReloadWorkspaceSpecForContextPanel}
+                    onSaveWorkspaceSpec={handleSaveWorkspaceSpecForContextPanel}
+                    onGenerateWorkspaceSpec={handleGenerateWorkspaceSpecForContextPanel}
                     onWorkspaceSpecContentChange={setWorkspaceSpecDraft}
                     onWorkspaceSpecPreviewChange={setWorkspaceSpecPreviewEnabled}
-                    onWorkspaceSpecSettingsChange={(enabled, injectEnabled) => {
-                      if (activeWorkspace?.id) {
-                        void saveWorkspaceSpecSettings(
-                          activeWorkspace.id,
-                          enabled,
-                          injectEnabled,
-                        );
-                      }
-                    }}
+                    onWorkspaceSpecSettingsChange={handleWorkspaceSpecSettingsChangeForContextPanel}
                     onSelectDiffFile={setSelectedDiffPath}
-                    onTabChange={(tab) => {
-                      setContextPanelTab(tab);
-                      setIsContextPanelOpen(true);
-                    }}
+                    onTabChange={handleContextPanelTabChange}
                     selectedPath={selectedDiffPath}
                     todoGraph={todoGraph}
                     workspaceSpec={workspaceSpec}
@@ -10009,7 +10131,7 @@ function StatsCard({
   );
 }
 
-function ContextPanel({
+const ContextPanel = memo(function ContextPanel({
   activeTab,
   agentsPanel,
   chatStatistics,
@@ -10236,7 +10358,7 @@ function ContextPanel({
       </div>
     </section>
   );
-}
+});
 
 function WorkspaceFileEditorPanel({
   editor,

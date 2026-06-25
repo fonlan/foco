@@ -26,8 +26,11 @@ import {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
+  memo,
+  useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -102,7 +105,7 @@ export type ChatPanelHelpers = {
   toolStatusText: (toolCall: ChatToolCallSummary, t: Translate) => string;
 };
 
-export function ChatPanel({
+function ChatPanelComponent({
   activeWorkspaceName,
   availableModels,
   branchError,
@@ -218,23 +221,8 @@ export function ChatPanel({
 }) {
   const {
     activeSkillQuery,
-    compactInlineText,
-    compactToolJson,
-    fallbackMessageParts,
-    formatChatCreatedAt,
-    formatFileSize,
-    formatJsonValue,
-    formatNullableLatencySeconds,
-    formatTokensPerSecond,
-    messageCopyText,
-    normalizedToolInput,
     removeActiveSkillToken,
-    selectedSkillPrefix,
     skillScopeLabel,
-    toolCallChangeStats,
-    toolCallDetailText,
-    toolLiveOutputText,
-    toolStatusText,
   } = helpers;
   const { t } = useI18n();
   const chatPanelRef = useRef<HTMLDivElement>(null);
@@ -253,46 +241,56 @@ export function ChatPanel({
     COMPOSER_EDITOR_MIN_HEIGHT_PX,
   );
   const skillQuery = activeSkillQuery(draftMessage);
-  const selectedSkillSet = new Set(selectedSkillIds);
-  const selectedSkills = selectedSkillIds
-    .map((skillId) => skills.find((skill) => skill.key === skillId))
-    .filter((skill): skill is ConfiguredSkillSummary => Boolean(skill));
+  const selectedSkillSet = useMemo(() => new Set(selectedSkillIds), [selectedSkillIds]);
+  const selectedSkills = useMemo(
+    () =>
+      selectedSkillIds
+        .map((skillId) => skills.find((skill) => skill.key === skillId))
+        .filter((skill): skill is ConfiguredSkillSummary => Boolean(skill)),
+    [selectedSkillIds, skills],
+  );
   const workspaceName = activeWorkspaceName?.trim();
   const composerPlaceholder = workspaceName
     ? t("Ask Foco anything about {name}...", { name: workspaceName })
     : t("Ask Foco anything...");
-  const providersById = new Map(providers.map((provider) => [provider.id, provider]));
-  const providerIdsForAvailableModels = Array.from(
-    new Set(availableModels.flatMap((model) => model.providerIds)),
-  );
-  const modelProviderGroups = [
-    ...providers
-      .map((provider) => provider.id)
-      .filter((providerId) => providerIdsForAvailableModels.includes(providerId)),
-    ...providerIdsForAvailableModels.filter(
-      (providerId) => !providersById.has(providerId),
-    ),
-  ].map((providerId) => ({
-    providerId,
-    providerLabel: providersById.get(providerId)?.name ?? providerId,
-    models: availableModels
-      .filter((model) => model.providerIds.includes(providerId))
-      .map((model) => ({
-        label: model.displayName,
-        value: model.id,
+  const modelProviderGroups = useMemo(() => {
+    const providersById = new Map(providers.map((provider) => [provider.id, provider]));
+    const providerIdsForAvailableModels = Array.from(
+      new Set(availableModels.flatMap((model) => model.providerIds)),
+    );
+    return [
+      ...providers
+        .map((provider) => provider.id)
+        .filter((providerId) => providerIdsForAvailableModels.includes(providerId)),
+      ...providerIdsForAvailableModels.filter(
+        (providerId) => !providersById.has(providerId),
+      ),
+    ].map((providerId) => ({
+      providerId,
+      providerLabel: providersById.get(providerId)?.name ?? providerId,
+      models: availableModels
+        .filter((model) => model.providerIds.includes(providerId))
+        .map((model) => ({
+          label: model.displayName,
+          value: model.id,
+        })),
+    }));
+  }, [availableModels, providers]);
+  const thinkingOptions = useMemo(
+    () => [
+      { label: t("Model default"), value: "" },
+      ...thinkingLevels.map((level) => ({
+        label: t(level.label),
+        value: level.value,
       })),
-  }));
-  const thinkingOptions = [
-    { label: t("Model default"), value: "" },
-    ...thinkingLevels.map((level) => ({
-      label: t(level.label),
-      value: level.value,
-    })),
-  ];
-  const visibleSkills =
-    skillQuery === null
-      ? []
-      : skills.filter((skill) => {
+    ],
+    [thinkingLevels, t],
+  );
+  const visibleSkills = useMemo(
+    () =>
+      skillQuery === null
+        ? []
+        : skills.filter((skill) => {
         const query = skillQuery.toLowerCase();
         return (
           skill.canEnable &&
@@ -302,7 +300,9 @@ export function ChatPanel({
             skill.key.toLowerCase().includes(query) ||
             skill.description.toLowerCase().includes(query))
         );
-      });
+      }),
+    [selectedSkillSet, skillQuery, skills],
+  );
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const hasComposerDraft = Boolean(draftMessage.trim() || draftAttachments.length);
   const runningButtonSendsMessage = isSendingMessage && hasComposerDraft;
@@ -556,7 +556,7 @@ export function ChatPanel({
     onAddPastedImageAttachments(imageFiles);
   }
 
-  async function handleCopyMessage(messageId: string, text: string) {
+  const handleCopyMessage = useCallback(async (messageId: string, text: string) => {
     if (!text) {
       return;
     }
@@ -574,7 +574,7 @@ export function ChatPanel({
       setCopiedMessageId((current) => (current === messageId ? null : current));
       copiedMessageTimerRef.current = null;
     }, 1600);
-  }
+  }, []);
 
   return (
     <div
@@ -597,221 +597,19 @@ export function ChatPanel({
           ref={messageScrollContentRef}
         >
           {messages.length ? (
-            messages.map((message) => {
-              const isUser = message.role === "user";
-              const parts = message.parts.length
-                ? message.parts
-                : fallbackMessageParts(message);
-              const reasoningPartCount = parts.filter(
-                (part) => part.type === "reasoning",
-              ).length;
-              const authorLabel = isUser ? "You" : "Foco Agent";
-              const createdAtLabel = formatChatCreatedAt(message.createdAt);
-              const copyText = messageCopyText(message, parts);
-              const copyLabel =
-                copiedMessageId === message.id
-                  ? t("Copied message")
-                  : t("Copy message");
-              const pendingLabel =
-                message.pendingMode === "guidance"
-                  ? t("Guidance pending")
-                  : message.pendingMode === "queued"
-                    ? t("Queued")
-                    : null;
-              const isPendingUserMessage = isUser && pendingLabel !== null;
-              const canManageQueuedMessage =
-                isUser &&
-                message.pendingMode === "queued" &&
-                queuedMessageIds.has(message.id);
-
-              return (
-                <div
-                  className={`message-row flex ${isUser ? "message-row-user" : "message-row-agent"}`}
-                  key={message.id}
-                >
-                  <div className="message-card-shell">
-                    <div
-                      className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${isUser
-                          ? "message-bubble-user flex-row rounded-tr-md"
-                          : "message-bubble-assistant flex-row rounded-tl-md"
-                        } ${isPendingUserMessage ? "message-bubble-pending" : ""}`}
-                      style={{
-                        backgroundColor: isPendingUserMessage
-                          ? "var(--foco-panel-soft)"
-                          : isUser
-                            ? "var(--foco-user-surface)"
-                            : "var(--foco-panel)",
-                        borderColor: isPendingUserMessage
-                          ? "var(--foco-border)"
-                          : isUser
-                            ? "var(--foco-user-border)"
-                            : "var(--foco-border)",
-                      }}
-                    >
-                      <div
-                        className={`message-avatar mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${isUser
-                            ? "bg-teal-950/45 text-white"
-                            : "bg-stone-100 text-stone-700"
-                          }`}
-                      >
-                        {isUser ? (
-                          <User aria-hidden="true" className="size-4" />
-                        ) : (
-                          <Bot aria-hidden="true" className="size-4" />
-                        )}
-                      </div>
-                      <div className="min-w-0 flex-1 space-y-3">
-                        <div className="message-author-row">
-                          <span className="message-author-meta">
-                            <span>{authorLabel}</span>
-                            {pendingLabel ? (
-                              <span className="message-pending-badge">
-                                {pendingLabel}
-                              </span>
-                            ) : null}
-                            <time
-                              className="message-created-at"
-                              dateTime={message.createdAt}
-                              title={message.createdAt}
-                            >
-                              {createdAtLabel}
-                            </time>
-                            {!isUser && message.metrics ? (
-                              <span
-                                className="message-model-id"
-                                title={`${t("Model")}: ${message.metrics.modelId}`}
-                              >
-                                {message.metrics.modelId}
-                              </span>
-                            ) : null}
-                            {!isUser && message.runBadges?.includes("llmReconnect") ? (
-                              <span
-                                className="message-run-badge"
-                                title={t("LLM request failed and reconnected")}
-                              >
-                                {t("Reconnected")}
-                              </span>
-                            ) : null}
-                            {!isUser && message.runBadges?.includes("contextCompressionRule") ? (
-                              <span
-                                className="message-run-badge"
-                                title={t("Rule-based context compression was triggered")}
-                              >
-                                {t("Rule compressed")}
-                              </span>
-                            ) : null}
-                            {!isUser && message.runBadges?.includes("contextCompressionLlm") ? (
-                              <span
-                                className="message-run-badge"
-                                title={t("LLM summary context compression was triggered")}
-                              >
-                                {t("LLM compressed")}
-                              </span>
-                            ) : null}
-                          </span>
-                          <span className="message-action-group">
-                            {canManageQueuedMessage ? (
-                              <>
-                                <button
-                                  aria-label={t(
-                                    "Convert queued message to guidance",
-                                  )}
-                                  className="message-action-menu"
-                                  onClick={() => onGuideQueuedMessage(message.id)}
-                                  title={t(
-                                    "Convert queued message to guidance",
-                                  )}
-                                  type="button"
-                                >
-                                  <ArrowUp
-                                    aria-hidden="true"
-                                    className="size-3.5"
-                                  />
-                                </button>
-                                <button
-                                  aria-label={t("Withdraw queued message")}
-                                  className="message-action-menu"
-                                  onClick={() => onWithdrawQueuedMessage(message.id)}
-                                  title={t("Withdraw queued message")}
-                                  type="button"
-                                >
-                                  <X
-                                    aria-hidden="true"
-                                    className="size-3.5"
-                                  />
-                                </button>
-                              </>
-                            ) : null}
-                            <button
-                              aria-label={copyLabel}
-                              className="message-action-menu"
-                              disabled={!copyText}
-                              onClick={() =>
-                                void handleCopyMessage(message.id, copyText)
-                              }
-                              title={copyLabel}
-                              type="button"
-                            >
-                              {copiedMessageId === message.id ? (
-                                <CheckCircle2
-                                  aria-hidden="true"
-                                  className="size-3.5"
-                                />
-                              ) : (
-                                <Copy
-                                  aria-hidden="true"
-                                  className="size-3.5"
-                                />
-                              )}
-                            </button>
-                          </span>
-                        </div>
-                        {!isUser ? (
-                          <MemoriesUsedBlock memories={message.memoriesUsed} />
-                        ) : null}
-                        {parts.length ? (
-                          parts.map((part, partIndex) => {
-                            return (
-                              <MessagePartBlock
-                                helpers={helpers}
-                                isError={message.status === "error"}
-                                isStreaming={message.status === "streaming"}
-                                isStreamingTail={partIndex === parts.length - 1}
-                                isUser={isUser}
-                                key={`${message.id}-part-${partIndex}`}
-                                part={part}
-                                reasoningDurationFallbackMs={
-                                  reasoningPartCount === 1
-                                    ? message.metrics?.totalLatencyMs ?? null
-                                    : null
-                                }
-                                workspaceId={workspaceId}
-                              />
-                            );
-                          })
-                        ) : message.status === "streaming" ? (
-                          <LoaderCircle
-                            aria-hidden="true"
-                            className="message-waiting-spinner size-4 animate-spin"
-                          />
-                        ) : null}
-                        {!isUser ? (
-                          <ExtractedMemoriesBlock
-                            memories={message.extractedMemories}
-                          />
-                        ) : null}
-                        {!isUser ? (
-                          <SpecUpdatesBlock updates={message.specUpdates} />
-                        ) : null}
-                        {!isUser && message.metrics ? (
-                          <ChatReplyMetricsLine helpers={helpers} metrics={message.metrics} />
-                        ) : null}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              );
-            })
+            messages.map((message) => (
+              <MessageRow
+                helpers={helpers}
+                isCopied={copiedMessageId === message.id}
+                key={message.id}
+                message={message}
+                onCopyMessage={handleCopyMessage}
+                onGuideQueuedMessage={onGuideQueuedMessage}
+                onWithdrawQueuedMessage={onWithdrawQueuedMessage}
+                queuedMessageIds={queuedMessageIds}
+                workspaceId={workspaceId}
+              />
+            ))
           ) : isLoadingMessages ? (
             <div className="flex min-h-48 items-center justify-center gap-2 text-sm font-medium text-stone-500">
               <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
@@ -1134,6 +932,217 @@ export function ChatPanel({
     </div>
   );
 }
+
+export const ChatPanel = memo(ChatPanelComponent);
+
+const MessageRow = memo(function MessageRow({
+  helpers,
+  isCopied,
+  message,
+  onCopyMessage,
+  onGuideQueuedMessage,
+  onWithdrawQueuedMessage,
+  queuedMessageIds,
+  workspaceId,
+}: {
+  helpers: ChatPanelHelpers;
+  isCopied: boolean;
+  message: ShellMessage;
+  onCopyMessage: (messageId: string, text: string) => void;
+  onGuideQueuedMessage: (messageId: string) => void;
+  onWithdrawQueuedMessage: (messageId: string) => void;
+  queuedMessageIds: ReadonlySet<string>;
+  workspaceId: string | null;
+}) {
+  const { fallbackMessageParts, formatChatCreatedAt, messageCopyText } = helpers;
+  const { t } = useI18n();
+  const isUser = message.role === "user";
+  const parts = useMemo(
+    () => (message.parts.length ? message.parts : fallbackMessageParts(message)),
+    [fallbackMessageParts, message],
+  );
+  const reasoningPartCount = useMemo(
+    () => parts.filter((part) => part.type === "reasoning").length,
+    [parts],
+  );
+  const copyText = useMemo(
+    () => messageCopyText(message, parts),
+    [message, messageCopyText, parts],
+  );
+  const authorLabel = isUser ? "You" : "Foco Agent";
+  const createdAtLabel = formatChatCreatedAt(message.createdAt);
+  const copyLabel = isCopied ? t("Copied message") : t("Copy message");
+  const pendingLabel =
+    message.pendingMode === "guidance"
+      ? t("Guidance pending")
+      : message.pendingMode === "queued"
+        ? t("Queued")
+        : null;
+  const isPendingUserMessage = isUser && pendingLabel !== null;
+  const canManageQueuedMessage =
+    isUser &&
+    message.pendingMode === "queued" &&
+    queuedMessageIds.has(message.id);
+
+  return (
+    <div
+      className={`message-row flex ${isUser ? "message-row-user" : "message-row-agent"}`}
+    >
+      <div className="message-card-shell">
+        <div
+          className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${isUser
+              ? "message-bubble-user flex-row rounded-tr-md"
+              : "message-bubble-assistant flex-row rounded-tl-md"
+            } ${isPendingUserMessage ? "message-bubble-pending" : ""}`}
+          style={{
+            backgroundColor: isPendingUserMessage
+              ? "var(--foco-panel-soft)"
+              : isUser
+                ? "var(--foco-user-surface)"
+                : "var(--foco-panel)",
+            borderColor: isPendingUserMessage
+              ? "var(--foco-border)"
+              : isUser
+                ? "var(--foco-user-border)"
+                : "var(--foco-border)",
+          }}
+        >
+          <div
+            className={`message-avatar mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${isUser
+                ? "bg-teal-950/45 text-white"
+                : "bg-stone-100 text-stone-700"
+              }`}
+          >
+            {isUser ? (
+              <User aria-hidden="true" className="size-4" />
+            ) : (
+              <Bot aria-hidden="true" className="size-4" />
+            )}
+          </div>
+          <div className="min-w-0 flex-1 space-y-3">
+            <div className="message-author-row">
+              <span className="message-author-meta">
+                <span>{authorLabel}</span>
+                {pendingLabel ? (
+                  <span className="message-pending-badge">{pendingLabel}</span>
+                ) : null}
+                <time
+                  className="message-created-at"
+                  dateTime={message.createdAt}
+                  title={message.createdAt}
+                >
+                  {createdAtLabel}
+                </time>
+                {!isUser && message.metrics ? (
+                  <span
+                    className="message-model-id"
+                    title={`${t("Model")}: ${message.metrics.modelId}`}
+                  >
+                    {message.metrics.modelId}
+                  </span>
+                ) : null}
+                {!isUser && message.runBadges?.includes("llmReconnect") ? (
+                  <span
+                    className="message-run-badge"
+                    title={t("LLM request failed and reconnected")}
+                  >
+                    {t("Reconnected")}
+                  </span>
+                ) : null}
+                {!isUser && message.runBadges?.includes("contextCompressionRule") ? (
+                  <span
+                    className="message-run-badge"
+                    title={t("Rule-based context compression was triggered")}
+                  >
+                    {t("Rule compressed")}
+                  </span>
+                ) : null}
+                {!isUser && message.runBadges?.includes("contextCompressionLlm") ? (
+                  <span
+                    className="message-run-badge"
+                    title={t("LLM summary context compression was triggered")}
+                  >
+                    {t("LLM compressed")}
+                  </span>
+                ) : null}
+              </span>
+              <span className="message-action-group">
+                {canManageQueuedMessage ? (
+                  <>
+                    <button
+                      aria-label={t("Convert queued message to guidance")}
+                      className="message-action-menu"
+                      onClick={() => onGuideQueuedMessage(message.id)}
+                      title={t("Convert queued message to guidance")}
+                      type="button"
+                    >
+                      <ArrowUp aria-hidden="true" className="size-3.5" />
+                    </button>
+                    <button
+                      aria-label={t("Withdraw queued message")}
+                      className="message-action-menu"
+                      onClick={() => onWithdrawQueuedMessage(message.id)}
+                      title={t("Withdraw queued message")}
+                      type="button"
+                    >
+                      <X aria-hidden="true" className="size-3.5" />
+                    </button>
+                  </>
+                ) : null}
+                <button
+                  aria-label={copyLabel}
+                  className="message-action-menu"
+                  disabled={!copyText}
+                  onClick={() => onCopyMessage(message.id, copyText)}
+                  title={copyLabel}
+                  type="button"
+                >
+                  {isCopied ? (
+                    <CheckCircle2 aria-hidden="true" className="size-3.5" />
+                  ) : (
+                    <Copy aria-hidden="true" className="size-3.5" />
+                  )}
+                </button>
+              </span>
+            </div>
+            {!isUser ? <MemoriesUsedBlock memories={message.memoriesUsed} /> : null}
+            {parts.length ? (
+              parts.map((part, partIndex) => (
+                <MessagePartBlock
+                  helpers={helpers}
+                  isError={message.status === "error"}
+                  isStreaming={message.status === "streaming"}
+                  isStreamingTail={partIndex === parts.length - 1}
+                  isUser={isUser}
+                  key={`${message.id}-part-${partIndex}`}
+                  part={part}
+                  reasoningDurationFallbackMs={
+                    reasoningPartCount === 1
+                      ? message.metrics?.totalLatencyMs ?? null
+                      : null
+                  }
+                  workspaceId={workspaceId}
+                />
+              ))
+            ) : message.status === "streaming" ? (
+              <LoaderCircle
+                aria-hidden="true"
+                className="message-waiting-spinner size-4 animate-spin"
+              />
+            ) : null}
+            {!isUser ? (
+              <ExtractedMemoriesBlock memories={message.extractedMemories} />
+            ) : null}
+            {!isUser ? <SpecUpdatesBlock updates={message.specUpdates} /> : null}
+            {!isUser && message.metrics ? (
+              <ChatReplyMetricsLine helpers={helpers} metrics={message.metrics} />
+            ) : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
 
 function ContextUsageCircle({
   className = "",
@@ -1564,7 +1573,7 @@ function ReasoningBlock({
   );
 }
 
-export function MessagePartBlock({
+function MessagePartBlockComponent({
   helpers,
   isError,
   isStreaming,
@@ -1625,6 +1634,8 @@ export function MessagePartBlock({
     />
   );
 }
+
+export const MessagePartBlock = memo(MessagePartBlockComponent);
 
 function ErrorMessagePart({ text }: { text: string }) {
   return (
