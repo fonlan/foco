@@ -571,6 +571,51 @@ summary:focus-visible {
   color: var(--foco-accent-strong);
 }
 
+.generated-image-file-list {
+  display: grid;
+  max-width: min(32rem, 100%);
+  gap: 0.5rem;
+}
+
+.generated-image-file {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--foco-border);
+  border-radius: 0.5rem;
+  background: var(--foco-panel-soft);
+  color: var(--foco-text-muted);
+}
+
+.generated-image-file img {
+  display: block;
+  width: 100%;
+  max-height: min(28rem, 58vh);
+  object-fit: contain;
+  background: var(--foco-panel);
+}
+
+.generated-image-file figcaption {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.generated-image-file-path {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+
+.generated-image-file-size {
+  flex: 0 0 auto;
+  color: var(--foco-text-subtle);
+}
+
 .composer-model-provider-select {
   width: 15rem;
 }

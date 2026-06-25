@@ -42,6 +42,7 @@ export function AgentTranscriptPanel({
   onOpenMainChat,
   onRefresh,
   snapshot,
+  workspaceId,
 }: {
   error: string | null;
   helpers: ChatPanelHelpers;
@@ -50,6 +51,7 @@ export function AgentTranscriptPanel({
   onOpenMainChat: () => void;
   onRefresh: () => Promise<void>;
   snapshot: AgentTeamSnapshotResponse | null;
+  workspaceId: string;
 }) {
   const { t } = useI18n();
   const instance =
@@ -144,7 +146,12 @@ export function AgentTranscriptPanel({
           ) : null}
 
           {items.map((item) => (
-            <AgentTranscriptBubble helpers={helpers} item={item} key={item.id} />
+            <AgentTranscriptBubble
+              helpers={helpers}
+              item={item}
+              key={item.id}
+              workspaceId={workspaceId}
+            />
           ))}
         </div>
       </div>
@@ -155,9 +162,11 @@ export function AgentTranscriptPanel({
 function AgentTranscriptBubble({
   helpers,
   item,
+  workspaceId,
 }: {
   helpers: ChatPanelHelpers;
   item: AgentTranscriptItem;
+  workspaceId: string;
 }) {
   const { t } = useI18n();
   const isUser = item.role === "user";
@@ -233,6 +242,7 @@ function AgentTranscriptBubble({
                       ? item.metrics?.totalLatencyMs ?? null
                       : null
                   }
+                  workspaceId={workspaceId}
                 />
               ))
             ) : isStreaming ? (

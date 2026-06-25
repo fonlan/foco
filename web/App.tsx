@@ -7645,6 +7645,7 @@ export function App() {
                     );
                   }}
                   snapshot={agentTeamSnapshot}
+                  workspaceId={activeAgentTab.workspaceId}
                 />
               ) : (
                 <ChatPanel
@@ -7720,6 +7721,7 @@ export function App() {
                   skills={detectedSkills}
                   thinkingLevels={thinkingLevels}
                   workspaces={workspaces}
+                  workspaceId={activeWorkspace?.id ?? (activeWorkspaceId || null)}
                 />
               )}
               {workspaces

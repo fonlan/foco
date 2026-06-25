@@ -131,6 +131,45 @@ pub(crate) async fn workspace_file_content(
     }))
 }
 
+pub(crate) async fn workspace_file_blob(
+    State(state): State<AppState>,
+    AxumPath(workspace_id): AxumPath<String>,
+    Query(query): Query<WorkspaceFileBlobQuery>,
+) -> Result<Response, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let path = workspace_file_path(&workspace.path, &query.path)?;
+    let metadata = fs::metadata(&path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "workspace file was not found: {}: {}",
+            query.path, source
+        ))
+    })?;
+
+    if !metadata.is_file() {
+        return Err(ApiError::bad_request(format!(
+            "workspace path is not a file: {}",
+            query.path
+        )));
+    }
+
+    let bytes = fs::read(&path).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read workspace file {}: {}",
+            query.path, source
+        ))
+    })?;
+    let content_type = workspace_image_content_type(&bytes)?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CACHE_CONTROL, "private, max-age=60")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(Body::from(bytes))
+        .expect("workspace file blob response is valid"))
+}
+
 pub(crate) async fn save_workspace_file(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,
@@ -609,6 +648,25 @@ fn workspace_file_path(workspace_root: &Path, input: &str) -> Result<std::path::
     }
 
     Ok(path)
+}
+
+fn workspace_image_content_type(bytes: &[u8]) -> Result<&'static str, ApiError> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1A\n") {
+        return Ok("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Ok("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Ok("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Ok("image/webp");
+    }
+
+    Err(ApiError::bad_request(
+        "workspace file preview only supports PNG, JPEG, WebP, or GIF images",
+    ))
 }
 
 fn validate_workspace_file_name(input: &str) -> Result<&str, ApiError> {

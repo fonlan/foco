@@ -1108,6 +1108,10 @@ fn app_router(state: AppState) -> Router {
             post(crate::http::workspaces::workspace_file_content),
         )
         .route(
+            "/api/workspaces/{workspace_id}/files/blob",
+            get(crate::http::workspaces::workspace_file_blob),
+        )
+        .route(
             "/api/workspaces/{workspace_id}/files/save",
             post(crate::http::workspaces::save_workspace_file),
         )
@@ -3148,6 +3152,12 @@ pub(crate) struct WorkspaceFileRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WorkspaceFileChildrenQuery {
+    pub(crate) path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileBlobQuery {
     pub(crate) path: String,
 }
 

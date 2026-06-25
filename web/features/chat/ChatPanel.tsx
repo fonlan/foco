@@ -62,10 +62,17 @@ import { MarkdownContent, type SelectedSkillPrefixResolver } from "./MarkdownCon
 const COMPOSER_EDITOR_MIN_HEIGHT_PX = 68;
 const COMPOSER_EDITOR_KEY_STEP_PX = 24;
 const COMPOSER_EDITOR_MAX_HEIGHT_RATIO = 0.55;
+const MAX_GENERATED_IMAGE_PREVIEWS = 16;
 
 type ToolCallChangeStats = {
   linesAdded: number;
   linesRemoved: number;
+};
+
+type GeneratedImageFile = {
+  bytes: number | null;
+  mimeType: string | null;
+  path: string;
 };
 
 type ComposerResizeDrag = {
@@ -149,6 +156,7 @@ export function ChatPanel({
   queuedMessageIds,
   thinkingLevels,
   workspaces,
+  workspaceId,
 }: {
   activeWorkspaceName: string | null;
   availableModels: ConfiguredModelSummary[];
@@ -206,6 +214,7 @@ export function ChatPanel({
   queuedMessageIds: ReadonlySet<string>;
   thinkingLevels: ThinkingLevelSummary[];
   workspaces: WorkspaceSummary[];
+  workspaceId: string | null;
 }) {
   const {
     activeSkillQuery,
@@ -776,6 +785,7 @@ export function ChatPanel({
                                     ? message.metrics?.totalLatencyMs ?? null
                                     : null
                                 }
+                                workspaceId={workspaceId}
                               />
                             );
                           })
@@ -1562,6 +1572,7 @@ export function MessagePartBlock({
   isUser,
   part,
   reasoningDurationFallbackMs,
+  workspaceId,
 }: {
   helpers: ChatPanelHelpers;
   isError: boolean;
@@ -1570,6 +1581,7 @@ export function MessagePartBlock({
   isUser: boolean;
   part: ChatMessagePart;
   reasoningDurationFallbackMs: number | null;
+  workspaceId: string | null;
 }) {
   if (part.type === "reasoning") {
     return (
@@ -1587,7 +1599,13 @@ export function MessagePartBlock({
   }
 
   if (part.type === "toolCall") {
-    return <ToolCallBlock helpers={helpers} toolCall={part.toolCall} />;
+    return (
+      <ToolCallBlock
+        helpers={helpers}
+        toolCall={part.toolCall}
+        workspaceId={workspaceId}
+      />
+    );
   }
 
   if (part.type === "attachment") {
@@ -1862,9 +1880,11 @@ function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
 function ToolCallBlock({
   helpers,
   toolCall,
+  workspaceId,
 }: {
   helpers: ChatPanelHelpers;
   toolCall: ChatToolCallSummary;
+  workspaceId: string | null;
 }) {
   const {
     formatJsonValue,
@@ -1879,70 +1899,223 @@ function ToolCallBlock({
   const detailText = toolCallDetailText(toolCall);
   const changeStats = toolCallChangeStats(toolCall);
   const liveOutputText = toolLiveOutputText(toolCall.liveOutput);
+  const generatedImages = toolCall.isError
+    ? []
+    : generatedImageFiles(toolCall.name, toolCall.output);
 
   return (
-    <details className="tool-call-block group min-w-0">
-      <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
-        <Wrench aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-        <span className="min-w-0 shrink-0 truncate">{toolCall.name}</span>
-        {changeStats ? (
-          <span className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-stone-600">
-            <span className="text-emerald-700">+{changeStats.linesAdded}</span>{" "}
-            <span className="text-rose-700">-{changeStats.linesRemoved}</span>
-          </span>
-        ) : null}
-        {detailText ? (
-          <span className="shrink-0 text-stone-300">·</span>
-        ) : null}
-        {detailText ? (
-          <span
-            className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-stone-500"
-            title={detailText}
-          >
-            {detailText}
-          </span>
-        ) : null}
-        <span
-          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${toolCall.isError
-              ? "bg-rose-50 text-rose-700"
-              : toolCall.status === "completed"
-                ? "bg-emerald-50 text-emerald-700"
-                : "bg-stone-100 text-stone-600"
-            }`}
-        >
-          {toolStatusText(toolCall, t)}
-        </span>
-      </summary>
-      <div className="mt-2 grid gap-2 text-xs text-stone-600">
-        <div className="min-w-0">
-          <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
-          <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
-            {formatJsonValue(input)}
-          </pre>
-        </div>
-        {toolCall.output !== null ? (
-          <div className="min-w-0">
-            <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
-            <pre
-              className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
-                  ? "border-rose-200 text-rose-700"
-                  : "border-stone-200"
-                }`}
+    <div className="grid min-w-0 gap-2">
+      <GeneratedImageFilesBlock
+        files={generatedImages}
+        formatFileSize={helpers.formatFileSize}
+        workspaceId={workspaceId}
+      />
+      <details className="tool-call-block group min-w-0">
+        <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
+          <Wrench aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+          <span className="min-w-0 shrink-0 truncate">{toolCall.name}</span>
+          {changeStats ? (
+            <span className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-stone-600">
+              <span className="text-emerald-700">+{changeStats.linesAdded}</span>{" "}
+              <span className="text-rose-700">-{changeStats.linesRemoved}</span>
+            </span>
+          ) : null}
+          {detailText ? (
+            <span className="shrink-0 text-stone-300">·</span>
+          ) : null}
+          {detailText ? (
+            <span
+              className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-stone-500"
+              title={detailText}
             >
-              {formatJsonValue(toolCall.output)}
-            </pre>
-          </div>
-        ) : liveOutputText ? (
+              {detailText}
+            </span>
+          ) : null}
+          <span
+            className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${toolCall.isError
+                ? "bg-rose-50 text-rose-700"
+                : toolCall.status === "completed"
+                  ? "bg-emerald-50 text-emerald-700"
+                  : "bg-stone-100 text-stone-600"
+              }`}
+          >
+            {toolStatusText(toolCall, t)}
+          </span>
+        </summary>
+        <div className="mt-2 grid gap-2 text-xs text-stone-600">
           <div className="min-w-0">
-            <div className="mb-1 font-semibold text-stone-500">
-              {t("Live output")}
-            </div>
-            <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">
-              {liveOutputText}
+            <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
+            <pre className="panel-scroll max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5">
+              {formatJsonValue(input)}
             </pre>
           </div>
-        ) : null}
-      </div>
-    </details>
+          {toolCall.output !== null ? (
+            <div className="min-w-0">
+              <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
+              <pre
+                className={`panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
+                    ? "border-rose-200 text-rose-700"
+                    : "border-stone-200"
+                  }`}
+              >
+                {formatJsonValue(toolCall.output)}
+              </pre>
+            </div>
+          ) : liveOutputText ? (
+            <div className="min-w-0">
+              <div className="mb-1 font-semibold text-stone-500">
+                {t("Live output")}
+              </div>
+              <pre className="panel-scroll max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700">
+                {liveOutputText}
+              </pre>
+            </div>
+          ) : null}
+        </div>
+      </details>
+    </div>
   );
+}
+
+function GeneratedImageFilesBlock({
+  files,
+  formatFileSize,
+  workspaceId,
+}: {
+  files: GeneratedImageFile[];
+  formatFileSize: (sizeBytes: number) => string;
+  workspaceId: string | null;
+}) {
+  if (!files.length) {
+    return null;
+  }
+
+  return (
+    <div className="generated-image-file-list">
+      {files.map((file) => (
+        <figure className="generated-image-file" key={file.path}>
+          {workspaceId ? (
+            <img
+              alt={file.path}
+              src={workspaceImageBlobUrl(workspaceId, file.path)}
+            />
+          ) : null}
+          <figcaption>
+            <span className="generated-image-file-path" title={file.path}>
+              {file.path}
+            </span>
+            {file.bytes === null ? null : (
+              <span className="generated-image-file-size">
+                {formatFileSize(file.bytes)}
+              </span>
+            )}
+          </figcaption>
+        </figure>
+      ))}
+    </div>
+  );
+}
+
+function workspaceImageBlobUrl(workspaceId: string, path: string) {
+  return `/api/workspaces/${encodeURIComponent(workspaceId)}/files/blob?path=${encodeURIComponent(path)}`;
+}
+
+function generatedImageFiles(
+  toolName: string,
+  output: JsonValue | null,
+): GeneratedImageFile[] {
+  const files = new Map<string, GeneratedImageFile>();
+  collectGeneratedImageFiles(
+    output,
+    files,
+    toolName === "agent_wait_tasks" || toolName === "agent_delegate_task",
+  );
+  return Array.from(files.values()).slice(0, MAX_GENERATED_IMAGE_PREVIEWS);
+}
+
+function collectGeneratedImageFiles(
+  value: JsonValue | null | undefined,
+  files: Map<string, GeneratedImageFile>,
+  includeTextPaths: boolean,
+) {
+  if (!value || files.size >= MAX_GENERATED_IMAGE_PREVIEWS) {
+    return;
+  }
+
+  if (typeof value === "string") {
+    if (includeTextPaths) {
+      for (const path of generatedImagePathsFromText(value)) {
+        files.set(path, { bytes: null, mimeType: null, path });
+        if (files.size >= MAX_GENERATED_IMAGE_PREVIEWS) {
+          return;
+        }
+      }
+    }
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectGeneratedImageFiles(item, files, includeTextPaths);
+      if (files.size >= MAX_GENERATED_IMAGE_PREVIEWS) {
+        return;
+      }
+    }
+    return;
+  }
+
+  if (typeof value !== "object") {
+    return;
+  }
+
+  const directFiles = value.files;
+  if (Array.isArray(directFiles)) {
+    for (const item of directFiles) {
+      const file = generatedImageFile(item);
+      if (file) {
+        files.set(file.path, file);
+      }
+      if (files.size >= MAX_GENERATED_IMAGE_PREVIEWS) {
+        return;
+      }
+    }
+  }
+
+  for (const item of Object.values(value)) {
+    collectGeneratedImageFiles(item, files, includeTextPaths);
+    if (files.size >= MAX_GENERATED_IMAGE_PREVIEWS) {
+      return;
+    }
+  }
+}
+
+function generatedImageFile(value: JsonValue): GeneratedImageFile | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const path = value.path;
+  const mimeType = value.mimeType;
+  const bytes = value.bytes;
+
+  if (typeof path !== "string" || !path.trim()) {
+    return null;
+  }
+  if (typeof mimeType !== "string" || !mimeType.startsWith("image/")) {
+    return null;
+  }
+
+  return {
+    bytes: typeof bytes === "number" && Number.isFinite(bytes) ? bytes : null,
+    mimeType: typeof mimeType === "string" ? mimeType : null,
+    path,
+  };
+}
+
+function generatedImagePathsFromText(text: string) {
+  // ponytail: text fallback handles unquoted no-space image paths; use files[] for arbitrary paths.
+  const matches = text.match(/[^\s`"'<>]+?\.(?:png|jpe?g|webp|gif)\b/gi) ?? [];
+  return matches
+    .map((path) => path.trim().replace(/^[([]+|[),.;:\]]+$/g, ""))
+    .filter((path) => path && !path.includes("://"));
 }

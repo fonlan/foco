@@ -777,6 +777,97 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("shows generated image files from direct and delegated tool results", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "generate an image",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    const directPath = ".foco/sessions/chat-1/image_gen/run-1/image.png";
+    const delegatedPath = ".foco/sessions/chat-1/image_gen/run-2/image.png";
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-image-gen",
+          input: { prompt: "a quiet workspace" },
+          isError: false,
+          name: "image_gen",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        isError: false,
+        output: {
+          files: [
+            {
+              bytes: 2048,
+              mimeType: "image/png",
+              path: directPath,
+            },
+          ],
+        },
+        toolCallId: "call-image-gen",
+        type: "toolResult",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-agent-wait",
+          input: { taskIds: ["agent-task-image"] },
+          isError: false,
+          name: "agent_wait_tasks",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        isError: false,
+        output: {
+          dependencies: [
+            {
+              result: {
+                text: `Generated image: ${delegatedPath}`,
+              },
+              status: "completed",
+              taskId: "agent-task-image",
+            },
+          ],
+          waiting: false,
+        },
+        toolCallId: "call-agent-wait",
+        type: "toolResult",
+      });
+    });
+
+    const directImage = await screen.findByAltText(directPath);
+    const delegatedImage = await screen.findByAltText(delegatedPath);
+    expect(directImage).toHaveAttribute(
+      "src",
+      `/api/workspaces/workspace-1/files/blob?path=${encodeURIComponent(directPath)}`,
+    );
+    expect(delegatedImage).toHaveAttribute(
+      "src",
+      `/api/workspaces/workspace-1/files/blob?path=${encodeURIComponent(delegatedPath)}`,
+    );
+    expect(screen.getByText(directPath)).toBeInTheDocument();
+    expect(screen.getByText(delegatedPath)).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("keeps a resumed agent-team reply in the original assistant bubble", async () => {
     renderApp();
 
