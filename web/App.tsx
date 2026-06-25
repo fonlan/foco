@@ -5770,12 +5770,16 @@ export function App() {
         }
 
         if (streamEvent.type === "todoGraphRefresh") {
-          setActiveWorkspaceChatRefs(streamEvent.workspaceId, streamEvent.chatId);
-          setContextPanelTab("todo");
-          setIsContextPanelOpen(true);
-          void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId, {
-            ignoreRequestInvalidation: true,
-          });
+          const isActiveTodoChat =
+            activeChatKeyRef.current ===
+            chatRunKey(streamEvent.workspaceId, streamEvent.chatId);
+          if (isActiveTodoChat) {
+            setContextPanelTab("todo");
+            setIsContextPanelOpen(true);
+            void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId, {
+              ignoreRequestInvalidation: true,
+            });
+          }
           return;
         }
 
@@ -6690,12 +6694,16 @@ export function App() {
         }
 
         if (streamEvent.type === "todoGraphRefresh") {
-          setActiveWorkspaceChatRefs(streamEvent.workspaceId, streamEvent.chatId);
-          setContextPanelTab("todo");
-          setIsContextPanelOpen(true);
-          void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId, {
-            ignoreRequestInvalidation: true,
-          });
+          const isActiveTodoChat =
+            activeChatKeyRef.current ===
+            chatRunKey(streamEvent.workspaceId, streamEvent.chatId);
+          if (isActiveTodoChat) {
+            setContextPanelTab("todo");
+            setIsContextPanelOpen(true);
+            void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId, {
+              ignoreRequestInvalidation: true,
+            });
+          }
           return;
         }
 
