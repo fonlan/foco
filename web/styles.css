@@ -1867,6 +1867,9 @@ body,
   display: block;
   border-bottom: 1px solid var(--foco-border);
   padding: 1rem 0;
+  /* ponytail: native offscreen rendering hint; virtualize only if long chats still profile poorly. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 12rem;
 }
 
 .message-card-shell {
