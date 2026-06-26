@@ -8124,7 +8124,11 @@ export function App() {
                   onClick={() => {
                     const { node } = workspaceFileContextMenu;
                     setWorkspaceFileContextMenu(null);
-                    if (!window.confirm(t("Delete file confirmation"))) {
+                    if (
+                      !window.confirm(
+                        t("Delete this file or folder?\n\nPath: {path}", { path: node.path }),
+                      )
+                    ) {
                       return;
                     }
                     void handleWorkspaceFileOperation("delete", node.path);

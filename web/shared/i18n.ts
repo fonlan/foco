@@ -56,7 +56,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Copy file name": "复制文件名",
     "Copy relative path": "复制相对路径",
     "Copy absolute path": "复制绝对路径",
-    "Delete file confirmation": "确定要删除此文件或文件夹吗？",
+    "Delete this file or folder?\n\nPath: {path}": "确定要删除此文件或文件夹吗？\n\n路径：{path}",
     "Select a workspace before using file actions.": "使用文件操作前请先选择工作区。",
     "Terminal shell": "终端 Shell",
     "Common commands": "常用命令",
