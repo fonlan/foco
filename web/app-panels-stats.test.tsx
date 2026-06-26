@@ -733,6 +733,35 @@ describe("app-panels-stats verification surfaces", () => {
   });
 
   it("opens the todo graph sidebar when a todo graph refresh arrives", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/todo-graph") {
+        return jsonResponse({
+          ...todoGraph,
+          tasks: [
+            ...todoGraph.tasks,
+            {
+              acceptance: [],
+              createdAt: "2026-06-05T10:06:00Z",
+              dependsOn: [],
+              id: "task-2",
+              status: "pending",
+              subtasks: [],
+              summary: "",
+              title: "Wait for next step",
+              updatedAt: "2026-06-05T10:06:00Z",
+            },
+          ],
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
@@ -751,9 +780,14 @@ describe("app-panels-stats verification surfaces", () => {
       });
     });
 
-    expect(await screen.findByText("ToDo graph")).toBeInTheDocument();
-    expect(screen.getByText("Inspect workspace changes")).toBeInTheDocument();
-    expect(screen.queryByText("Git diff")).not.toBeInTheDocument();
+    const todoGraphHeading = await screen.findByText("ToDo graph");
+    const todoPanel = todoGraphHeading.closest(".context-panel") as HTMLElement;
+    expect(todoGraphHeading).toBeInTheDocument();
+    expect(within(todoPanel).getByText("Inspect workspace changes")).toBeInTheDocument();
+    expect(within(todoPanel).getByText("running")).toHaveClass("bg-amber-100", "text-amber-800");
+    expect(within(todoPanel).getByText("completed")).toHaveClass("bg-emerald-100", "text-emerald-800");
+    expect(within(todoPanel).getByText("pending")).toHaveClass("bg-stone-100", "text-stone-600");
+    expect(within(todoPanel).queryByText("Git diff")).not.toBeInTheDocument();
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
