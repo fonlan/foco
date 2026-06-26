@@ -43,6 +43,7 @@ pub(crate) struct ParsedSkillFile {
     name: String,
     description: String,
     frontmatter: String,
+    markdown: String,
 }
 
 pub(crate) fn message_with_selected_skills(
@@ -82,7 +83,7 @@ pub(crate) fn message_with_selected_skills(
         .iter()
         .map(|skill| (skill.key.as_str(), *skill))
         .collect::<HashMap<_, _>>();
-    let mut links = Vec::with_capacity(requested_skill_keys.len());
+    let mut entries = Vec::with_capacity(requested_skill_keys.len());
     for skill_key in requested_skill_keys {
         let skill = match skills_by_key.get(skill_key.as_str()).copied() {
             Some(skill) => skill,
@@ -105,10 +106,23 @@ pub(crate) fn message_with_selected_skills(
             )));
         }
 
-        links.push(format!("[${}]({})", skill.name, skill.path.display()));
+        entries.push(selected_skill_entry(&skill.path, parsed));
     }
 
-    Ok(format!("{} {}", links.join(" "), message))
+    Ok(format!(
+        "<selected_skills>\n{}\n</selected_skills>\n\n{}",
+        entries.join("\n"),
+        message
+    ))
+}
+
+fn selected_skill_entry(path: &Path, skill: ParsedSkillFile) -> String {
+    format!(
+        "<skill name=\"{}\" path=\"{}\">\n{}\n</skill>",
+        xml_text_escape(&skill.name),
+        xml_text_escape(&path.display().to_string()),
+        xml_cdata_section("content_markdown", skill.markdown.trim())
+    )
 }
 
 fn normalize_skill_keys(values: Vec<String>) -> Result<Vec<String>, ApiError> {
@@ -558,6 +572,7 @@ pub(crate) fn parse_skill_markdown(path: &Path, content: &str) -> Result<ParsedS
         name: id,
         description,
         frontmatter: frontmatter.join("\n"),
+        markdown: content.to_string(),
     })
 }
 

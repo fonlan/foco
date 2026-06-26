@@ -34,6 +34,61 @@ import {
 describe("app-chat-stream verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
+  it("collapses selected skill content blocks in user messages", async () => {
+    const selectedSkillContent = [
+      "<selected_skills>",
+      '<skill name="web-design-guidelines" path="C:\\Users\\fonla\\.agents\\skills\\web-design-guidelines\\SKILL.md">',
+      "<content_markdown><![CDATA[",
+      "---",
+      "name: web-design-guidelines",
+      "description: UI design guidance.",
+      "---",
+      "",
+      "# Web Design Guidelines",
+      "",
+      "Use the existing product UI conventions.",
+      "]]></content_markdown>",
+      "</skill>",
+      "</selected_skills>",
+      "",
+      "Settings single-column layout.",
+    ].join("\n");
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return Promise.resolve(
+          jsonResponse({
+            ...chatMessages,
+            activeRun: null,
+            messages: [
+              {
+                ...chatMessages.messages[0],
+                content: selectedSkillContent,
+                parts: [{ text: selectedSkillContent, type: "text" }],
+              },
+            ],
+          }),
+        );
+      }
+
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    expect(await screen.findByText("web-design-guidelines")).toBeInTheDocument();
+    expect(screen.getByText("Settings single-column layout.")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Use the existing product UI conventions."),
+    ).not.toBeInTheDocument();
+  });
+
   it("updates context usage from latest response usage during a stream", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

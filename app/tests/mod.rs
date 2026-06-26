@@ -10312,9 +10312,7 @@ async fn prepare_chat_context_prefixes_selected_skills_in_user_message() {
 
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     fs::create_dir_all(&skill_dir).expect("skill directory");
-    fs::write(
-        &skill_file,
-        "---
+    let skill_markdown = "---
 name: web-design-guidelines
 description: UI design guidance.
 ---
@@ -10322,9 +10320,8 @@ description: UI design guidance.
 # Web Design Guidelines
 
 Use the existing product UI conventions.
-",
-    )
-    .expect("skill file write");
+";
+    fs::write(&skill_file, skill_markdown).expect("skill file write");
 
     let mut config = GlobalConfig::first_run(workspace_dir.clone());
     config.providers.push(ProviderSettings {
@@ -10359,8 +10356,9 @@ Use the existing product UI conventions.
     });
     let state = test_app_state(config.clone(), profile_dir.clone());
     let expected_message = format!(
-        "[$web-design-guidelines]({}) Settings single-column layout.",
-        skill_file.display()
+        "<selected_skills>\n<skill name=\"web-design-guidelines\" path=\"{}\">\n<content_markdown><![CDATA[\n{}\n]]></content_markdown>\n</skill>\n</selected_skills>\n\nSettings single-column layout.",
+        skill_file.display(),
+        skill_markdown.trim()
     );
 
     let context = prepare_chat_context(

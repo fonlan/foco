@@ -22710,6 +22710,11 @@ function selectedSkillPrefix(content: string, isUser: boolean) {
     return null;
   }
 
+  const blockPrefix = selectedSkillBlockPrefix(content);
+  if (blockPrefix) {
+    return blockPrefix;
+  }
+
   let remaining = content.trimStart();
   const skills: Array<{ name: string; path: string }> = [];
 
@@ -22739,6 +22744,49 @@ function selectedSkillPrefix(content: string, isUser: boolean) {
     remaining,
     skills,
   };
+}
+
+function selectedSkillBlockPrefix(content: string) {
+  const remaining = content.trimStart();
+  if (!remaining.startsWith("<selected_skills>")) {
+    return null;
+  }
+
+  const closingTag = "</selected_skills>";
+  const endIndex = remaining.indexOf(closingTag);
+  if (endIndex < 0) {
+    return null;
+  }
+
+  const block = remaining.slice(0, endIndex + closingTag.length);
+  const skills = [...block.matchAll(/<skill\b([^>]*)>/g)]
+    .map((match) => {
+      const name = /(?:^|\s)name="([^"]*)"/.exec(match[1])?.[1];
+      const path = /(?:^|\s)path="([^"]*)"/.exec(match[1])?.[1];
+
+      return name && path
+        ? { name: decodeXmlAttribute(name), path: decodeXmlAttribute(path) }
+        : null;
+    })
+    .filter((skill): skill is { name: string; path: string } => Boolean(skill));
+
+  if (!skills.length) {
+    return null;
+  }
+
+  return {
+    remaining: remaining.slice(endIndex + closingTag.length).trimStart(),
+    skills,
+  };
+}
+
+function decodeXmlAttribute(value: string) {
+  return value
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
 }
 
 function decodeMarkdownHref(value: string) {
