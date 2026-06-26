@@ -845,19 +845,25 @@ fn agent_definition_insert_index(chat_context: &PreparedChatContext) -> usize {
 }
 
 fn agent_team_protocol_insert_index(chat_context: &PreparedChatContext) -> usize {
-    chat_context
-        .message_context_sources
+    agent_team_protocol_insert_index_for_sources(
+        &chat_context.message_context_sources,
+        chat_context.active_tool_start_index,
+    )
+}
+
+fn agent_team_protocol_insert_index_for_sources(
+    message_context_sources: &[PromptContextSource],
+    fallback_index: usize,
+) -> usize {
+    message_context_sources
         .iter()
         .position(|source| {
             !matches!(
                 source,
-                PromptContextSource::ReservedPrompt
-                    | PromptContextSource::AgentDefinition
-                    | PromptContextSource::StableInjection
-                    | PromptContextSource::ProjectSpec
+                PromptContextSource::ReservedPrompt | PromptContextSource::AgentDefinition
             )
         })
-        .unwrap_or(chat_context.active_tool_start_index)
+        .unwrap_or(fallback_index)
 }
 
 fn insert_agent_prompt_message(
@@ -1893,6 +1899,19 @@ mod tests {
 
         let oversized = json!({ "text": "x".repeat(AGENT_MAX_TASK_OUTCOME_BYTES) });
         assert!(agent_task_outcome_json(&oversized, "result_json").is_err());
+    }
+
+    #[test]
+    fn agent_team_protocol_inserts_before_stable_context() {
+        let sources = vec![
+            PromptContextSource::ReservedPrompt,
+            PromptContextSource::AgentDefinition,
+            PromptContextSource::StableInjection,
+            PromptContextSource::ProjectSpec,
+            PromptContextSource::CurrentUser { sequence: 7 },
+        ];
+
+        assert_eq!(agent_team_protocol_insert_index_for_sources(&sources, 5), 2);
     }
 
     #[test]
