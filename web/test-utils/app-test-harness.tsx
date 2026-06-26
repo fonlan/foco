@@ -1374,6 +1374,15 @@ export const workspaceFilesResponse = {
         sizeBytes: 512,
       },
       {
+        children: [],
+        childrenLoaded: true,
+        hasChildren: false,
+        kind: "file",
+        name: "logo.png",
+        path: "assets/logo.png",
+        sizeBytes: 2048,
+      },
+      {
         children: [
           {
             children: [],

@@ -513,6 +513,7 @@ const MEMORY_DREAM_DEFAULT_PAGE_SIZE = 10;
 const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
 const EMPTY_CONFIGURED_PROVIDERS: ConfiguredProviderSummary[] = [];
 const EMPTY_GIT_STATUS_FILES: GitStatusFileSummary[] = [];
+const WORKSPACE_IMAGE_FILE_EXTENSIONS = new Set(["gif", "jpeg", "jpg", "png", "svg", "webp"]);
 
 function deferStreamSideUpdate(update: () => void) {
   // ponytail: transition is enough for sparse side events; add a real queue only
@@ -3663,8 +3664,6 @@ export function App() {
       return;
     }
 
-    preloadOptionalMonaco();
-
     const file: OpenFileTab = {
       name: node.name,
       path: node.path,
@@ -3673,8 +3672,14 @@ export function App() {
       workspaceName: activeWorkspace.name,
     };
 
+    if (!isWorkspaceImageFilePath(file.path)) {
+      preloadOptionalMonaco();
+    }
+
     selectWorkspaceFileTab(file);
-    await loadWorkspaceFileEditor(file);
+    if (!isWorkspaceImageFilePath(file.path)) {
+      await loadWorkspaceFileEditor(file);
+    }
   }
 
   function restoreWorkspaceFileTabs(
@@ -3704,8 +3709,10 @@ export function App() {
     }
 
     selectWorkspaceFileTab(selectedFile, { updateUrl: false });
-    preloadOptionalMonaco();
-    void loadWorkspaceFileEditor(selectedFile);
+    if (!isWorkspaceImageFilePath(selectedFile.path)) {
+      preloadOptionalMonaco();
+      void loadWorkspaceFileEditor(selectedFile);
+    }
     return true;
   }
 
@@ -3721,7 +3728,9 @@ export function App() {
     setActiveMainTab({ path: file.path, type: "file", workspaceId: file.workspaceId });
     setViewMode("chat");
     setIsMobileWorkspaceOpen(false);
-    initWorkspaceFileEditor(file.workspaceId, file.path);
+    if (!isWorkspaceImageFilePath(file.path)) {
+      initWorkspaceFileEditor(file.workspaceId, file.path);
+    }
     if (options.updateUrl !== false) {
       updateBrowserRoute(browserRouteForActiveFile(file));
     }
@@ -4010,6 +4019,10 @@ export function App() {
     }
 
     selectWorkspaceFileTab(tab);
+    if (isWorkspaceImageFilePath(tab.path)) {
+      return;
+    }
+
     const editorKey = workspaceFileEditorKey(tab.workspaceId, tab.path);
     if (!workspaceFileEditors[editorKey]) {
       void loadWorkspaceFileEditor(tab);
@@ -9982,6 +9995,8 @@ function WorkspaceFileEditorPanel({
   onSave: (file: OpenFileTab, content: string) => Promise<boolean> | boolean;
 }) {
   const { t } = useI18n();
+  const isImage = isWorkspaceImageFilePath(file.path);
+  const imageUrl = isImage ? workspaceFileBlobUrl(file.workspaceId, file.path) : null;
   const language = monacoLanguageForPath(file.path);
   const isMarkdown = isMarkdownFilePath(file.path);
   const editorPath = `${file.workspaceId}/${file.path}`;
@@ -10003,22 +10018,34 @@ function WorkspaceFileEditorPanel({
         </div>
       ) : null}
       <div className="workspace-file-editor-body">
-        <MonacoFileEditor
-          canSave={!editor?.isLoading && !editor?.isSaving}
-          isDirty={editor?.isDirty ?? false}
-          isMarkdown={isMarkdown}
-          isSaving={editor?.isSaving ?? false}
-          language={language}
-          onChange={handleChange}
-          onReload={handleReload}
-          onSave={handleSave}
-          path={editorPath}
-          value={editor?.content ?? ""}
-          workspaceFilePath={file.path}
-          workspaceId={file.workspaceId}
-        />
+        {imageUrl ? (
+          <WorkspaceImagePreview alt={file.name} src={imageUrl} />
+        ) : (
+          <MonacoFileEditor
+            canSave={!editor?.isLoading && !editor?.isSaving}
+            isDirty={editor?.isDirty ?? false}
+            isMarkdown={isMarkdown}
+            isSaving={editor?.isSaving ?? false}
+            language={language}
+            onChange={handleChange}
+            onReload={handleReload}
+            onSave={handleSave}
+            path={editorPath}
+            value={editor?.content ?? ""}
+            workspaceFilePath={file.path}
+            workspaceId={file.workspaceId}
+          />
+        )}
       </div>
     </section>
+  );
+}
+
+function WorkspaceImagePreview({ alt, src }: { alt: string; src: string }) {
+  return (
+    <div className="workspace-file-image-preview">
+      <img alt={alt} className="workspace-file-image-preview-image" src={src} />
+    </div>
   );
 }
 
@@ -21278,6 +21305,15 @@ function isMarkdownFilePath(path: string) {
   return extension === "md" || extension === "markdown";
 }
 
+function isWorkspaceImageFilePath(path: string) {
+  const extension = path.split(".").pop()?.toLowerCase();
+  return extension ? WORKSPACE_IMAGE_FILE_EXTENSIONS.has(extension) : false;
+}
+
+function workspaceFileBlobUrl(workspaceId: string, workspacePath: string) {
+  return `/api/workspaces/${encodeURIComponent(workspaceId)}/files/blob?path=${encodeURIComponent(workspacePath)}`;
+}
+
 function workspaceMarkdownImageUrlTransform(workspaceId: string, filePath: string) {
   const parentPath = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
   const basePath = `/__workspace__/${parentPath ? `${parentPath}/` : ""}`;
@@ -21298,7 +21334,7 @@ function workspaceMarkdownImageUrlTransform(workspaceId: string, filePath: strin
       return null;
     }
 
-    return `/api/workspaces/${encodeURIComponent(workspaceId)}/files/blob?path=${encodeURIComponent(workspacePath)}`;
+    return workspaceFileBlobUrl(workspaceId, workspacePath);
   };
 }
 

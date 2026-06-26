@@ -1270,6 +1270,31 @@ describe("app-panels-stats verification surfaces", () => {
     );
   });
 
+  it("opens image files from the workspace file tree without Monaco", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+    fetchMock.mockClear();
+
+    await userEvent.click(await screen.findByText("logo.png"));
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(within(tabList).getByRole("tab", { name: /logo\.png/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.queryByRole("toolbar", { name: "Editor toolbar" })).not.toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "logo.png" })).toHaveAttribute(
+      "src",
+      "/api/workspaces/workspace-1/files/blob?path=assets%2Flogo.png",
+    );
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/workspaces/workspace-1/files/content"),
+    ).toBe(false);
+  });
+
   it("copies file tree context menu values", async () => {
     renderApp();
 

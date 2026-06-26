@@ -1781,6 +1781,22 @@ body,
   font-size: 1.02rem;
 }
 
+.workspace-file-image-preview {
+  display: grid;
+  min-height: 100%;
+  overflow: auto;
+  place-items: center;
+  background: var(--foco-panel);
+  padding: 1rem;
+}
+
+.workspace-file-image-preview-image {
+  display: block;
+  max-width: 100%;
+  max-height: calc(100vh - var(--foco-header-height) - 2rem);
+  object-fit: contain;
+}
+
 .workspace-file-reload-dialog-backdrop {
   position: absolute;
   inset: 2.25rem 0 0;
