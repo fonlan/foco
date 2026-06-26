@@ -17261,6 +17261,7 @@ function SettingsPanel({
                                 <CapabilityPill
                                   label={memoryDreamStatusLabel(job.status, t)}
                                   ok={job.status === "completed"}
+                                  tone={memoryDreamStatusTone(job.status)}
                                 />
                               </td>
                               <td className="px-3 py-2 align-top text-xs text-stone-600">
@@ -17438,6 +17439,7 @@ function SettingsPanel({
                             <CapabilityPill
                               label={memoryDreamStatusLabel(memoryDreamDetailJob.status, t)}
                               ok={memoryDreamDetailJob.status === "completed"}
+                              tone={memoryDreamStatusTone(memoryDreamDetailJob.status)}
                             />
                             <CapabilityPill
                               label={memoryDreamScopeLabel(memoryDreamDetailJob.scope, t)}
@@ -21874,23 +21876,42 @@ function CapabilityPill({
   label,
   ok,
   title,
+  tone,
 }: {
   className?: string;
   label: string;
   ok: boolean;
   title?: string;
+  tone?: CapabilityPillTone;
 }) {
+  const toneClass = capabilityPillToneClass(tone ?? (ok ? "ok" : "muted"));
+
   return (
     <span
-      className={`inline-flex min-h-6 max-w-full items-center rounded-md border px-2 py-0.5 text-xs font-semibold ${ok
-          ? "border-teal-200 bg-teal-50 text-teal-800"
-          : "border-stone-200 bg-stone-50 text-stone-500"
-        } ${className ?? ""}`}
+      className={`inline-flex min-h-6 max-w-full items-center rounded-md border px-2 py-0.5 text-xs font-semibold ${toneClass} ${className ?? ""}`}
       title={title}
     >
       <span className="min-w-0 truncate">{label}</span>
     </span>
   );
+}
+
+type CapabilityPillTone = "ok" | "success" | "danger" | "active" | "muted";
+
+function capabilityPillToneClass(tone: CapabilityPillTone) {
+  switch (tone) {
+    case "success":
+      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+    case "danger":
+      return "border-rose-200 bg-rose-50 text-rose-700";
+    case "active":
+      return "border-amber-200 bg-amber-50 text-amber-800";
+    case "muted":
+      return "border-stone-200 bg-stone-50 text-stone-500";
+    case "ok":
+    default:
+      return "border-teal-200 bg-teal-50 text-teal-800";
+  }
 }
 
 function Warnings({ warnings }: { warnings: string[] }) {
@@ -23181,6 +23202,19 @@ function memoryDreamStatusLabel(status: string, t: Translate) {
     return t("Skipped");
   }
   return status;
+}
+
+function memoryDreamStatusTone(status: string): CapabilityPillTone {
+  if (status === "completed") {
+    return "success";
+  }
+  if (status === "failed") {
+    return "danger";
+  }
+  if (status === "queued" || status === "running") {
+    return "active";
+  }
+  return "muted";
 }
 
 function memoryDreamChangeOperationLabel(operation: string, t: Translate) {

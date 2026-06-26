@@ -406,6 +406,59 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("uses semantic colors for Dream history status pills", async () => {
+    const dreamJobs = [
+      { ...memoryDreamJob, id: "dream-job-completed", status: "completed" },
+      { ...memoryDreamJob, id: "dream-job-failed", status: "failed" },
+      { ...memoryDreamJob, id: "dream-job-running", status: "running" },
+      { ...memoryDreamJob, id: "dream-job-cancelled", status: "cancelled" },
+    ];
+
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/memory/dream/jobs") {
+        return Promise.resolve(jsonResponse({ jobs: dreamJobs }));
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    const dreamTable = await screen.findByRole("table");
+    const dreamStatusPill = (label: string) => {
+      const text = within(dreamTable).getByText(label);
+      return text.parentElement as HTMLElement;
+    };
+    expect(dreamStatusPill("Completed")).toHaveClass(
+      "bg-emerald-50",
+      "text-emerald-700",
+    );
+    expect(dreamStatusPill("Failed")).toHaveClass(
+      "bg-rose-50",
+      "text-rose-700",
+    );
+    expect(dreamStatusPill("Running")).toHaveClass(
+      "bg-amber-50",
+      "text-amber-800",
+    );
+    expect(dreamStatusPill("Cancelled")).toHaveClass(
+      "bg-stone-50",
+      "text-stone-500",
+    );
+  });
+
   it("shows Dream history actions and runs manual Dream jobs", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
