@@ -1690,10 +1690,12 @@ export function App() {
       }
       setWorkspaceSpec(data);
       setWorkspaceSpecDraft(data.contentMarkdown);
+      setWorkspaceSpecPreviewEnabled(data.contentMarkdown.trim().length > 0);
       return data;
     } catch (requestError) {
       setWorkspaceSpec(null);
       setWorkspaceSpecDraft("");
+      setWorkspaceSpecPreviewEnabled(false);
       setWorkspaceSpecError(errorMessage(requestError));
       return null;
     } finally {
@@ -2158,6 +2160,7 @@ export function App() {
   useEffect(() => {
     setWorkspaceSpec(null);
     setWorkspaceSpecDraft("");
+    setWorkspaceSpecPreviewEnabled(false);
     setWorkspaceSpecError(null);
     setWorkspaceSpecConflictMessage(null);
   }, [activeWorkspace?.id]);
