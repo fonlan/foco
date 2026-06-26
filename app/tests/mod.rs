@@ -3370,6 +3370,29 @@ fn active_chat_run_registry_accepts_matching_guidance() {
 }
 
 #[test]
+fn active_chat_run_count_tracks_registered_runs() {
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active run");
+
+    assert_eq!(registry.active_run_count().expect("active count"), 1);
+    registration.finish();
+    assert_eq!(registry.active_run_count().expect("active count"), 0);
+}
+
+#[test]
 fn active_chat_run_record_event_persists_streaming_assistant_message() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-streaming-assistant-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");

@@ -495,7 +495,7 @@ async fn run_entrypoint() -> AppResult<()> {
 
     #[cfg(any(not(windows), debug_assertions))]
     {
-        run_server_until_shutdown(None).await
+        run_server_until_shutdown(None, ActiveChatRunRegistry::default()).await
     }
 }
 
@@ -605,6 +605,7 @@ fn memory_dream_latest_usage() -> String {
 async fn run_server_until_shutdown(
     shutdown_rx: Option<watch::Receiver<bool>>,
     #[cfg(all(windows, not(debug_assertions)))] tray_menu_update_notifier: TrayMenuUpdateNotifier,
+    active_chat_runs: ActiveChatRunRegistry,
 ) -> AppResult<()> {
     let startup_started_at = Instant::now();
     let load_config_started_at = Instant::now();
@@ -727,7 +728,7 @@ async fn run_server_until_shutdown(
         mcp_registry: mcp_registry.clone(),
         hook_runtime,
         question_registry: QuestionRegistry::default(),
-        active_chat_runs: ActiveChatRunRegistry::default(),
+        active_chat_runs,
         memory_dream_runs: Arc::new(AsyncMutex::new(HashSet::new())),
         agent_scheduler: agent_scheduler.clone(),
         scheduled_task_scheduler: scheduled_task_scheduler.clone(),
@@ -1535,6 +1536,8 @@ fn run_windows_tray_entrypoint() -> AppResult<()> {
         thread_id: tray_menu_thread_id.clone(),
     };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let active_chat_runs = ActiveChatRunRegistry::default();
+    let runtime_active_chat_runs = active_chat_runs.clone();
     let runtime_thread = std::thread::Builder::new()
         .name("foco-http-runtime".to_string())
         .spawn(move || {
@@ -1545,6 +1548,7 @@ fn run_windows_tray_entrypoint() -> AppResult<()> {
             if let Err(error) = runtime.block_on(run_server_until_shutdown(
                 Some(shutdown_rx),
                 tray_menu_update_notifier,
+                runtime_active_chat_runs,
             )) {
                 tracing::error!(%error, "Foco server failed");
                 eprintln!("Foco server failed: {error}");
@@ -1555,6 +1559,7 @@ fn run_windows_tray_entrypoint() -> AppResult<()> {
     run_windows_tray_loop(
         ui_url,
         shutdown_tx,
+        active_chat_runs,
         labels,
         tray_menu_update_rx,
         tray_menu_thread_id,
@@ -1646,6 +1651,7 @@ async fn shutdown_signal(
 fn run_windows_tray_loop(
     ui_url: String,
     shutdown_tx: watch::Sender<bool>,
+    active_chat_runs: ActiveChatRunRegistry,
     labels: TrayMenuLabels,
     tray_menu_update_rx: std::sync::mpsc::Receiver<TrayMenuLabels>,
     tray_menu_thread_id: Arc<AtomicU32>,
@@ -1676,7 +1682,12 @@ fn run_windows_tray_loop(
         .build()?;
 
     loop {
-        drain_tray_events(&ui_url, &shutdown_tx);
+        drain_tray_events(
+            &ui_url,
+            &shutdown_tx,
+            &active_chat_runs,
+            &tray_menu_thread_id,
+        );
         drain_tray_menu_updates(&tray_menu_update_rx, &open_item, &quit_item);
 
         let message_result = unsafe { GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) };
@@ -1709,9 +1720,21 @@ fn drain_tray_menu_updates(
 }
 
 #[cfg(all(windows, not(debug_assertions)))]
-fn drain_tray_events(ui_url: &str, shutdown_tx: &watch::Sender<bool>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayShutdownChoice {
+    Force,
+    Wait,
+    Cancel,
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn drain_tray_events(
+    ui_url: &str,
+    shutdown_tx: &watch::Sender<bool>,
+    active_chat_runs: &ActiveChatRunRegistry,
+    tray_menu_thread_id: &Arc<AtomicU32>,
+) {
     use tray_icon::{TrayIconEvent, menu::MenuEvent};
-    use windows_sys::Win32::UI::WindowsAndMessaging::PostQuitMessage;
 
     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
         if matches!(event, TrayIconEvent::DoubleClick { .. }) {
@@ -1723,12 +1746,123 @@ fn drain_tray_events(ui_url: &str, shutdown_tx: &watch::Sender<bool>) {
         if event.id == TRAY_OPEN_ITEM_ID {
             open_foco_ui(ui_url);
         } else if event.id == TRAY_QUIT_ITEM_ID {
-            let _ = shutdown_tx.send(true);
-            unsafe {
-                PostQuitMessage(0);
-            }
+            request_tray_shutdown(shutdown_tx, active_chat_runs, tray_menu_thread_id);
         }
     }
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn request_tray_shutdown(
+    shutdown_tx: &watch::Sender<bool>,
+    active_chat_runs: &ActiveChatRunRegistry,
+    tray_menu_thread_id: &Arc<AtomicU32>,
+) {
+    let active_run_count = match active_chat_runs.active_run_count() {
+        Ok(count) => count,
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                "failed to inspect active chat runs before tray shutdown"
+            );
+            0
+        }
+    };
+    let choice = if active_run_count == 0 {
+        TrayShutdownChoice::Force
+    } else {
+        confirm_tray_shutdown_with_active_runs(active_run_count)
+    };
+
+    match choice {
+        TrayShutdownChoice::Force => finish_tray_shutdown(shutdown_tx, tray_menu_thread_id),
+        TrayShutdownChoice::Wait => wait_for_active_runs_then_shutdown(
+            shutdown_tx.clone(),
+            active_chat_runs.clone(),
+            tray_menu_thread_id.clone(),
+        ),
+        TrayShutdownChoice::Cancel => {}
+    }
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn wait_for_active_runs_then_shutdown(
+    shutdown_tx: watch::Sender<bool>,
+    active_chat_runs: ActiveChatRunRegistry,
+    tray_menu_thread_id: Arc<AtomicU32>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("foco-tray-shutdown-wait".to_string())
+        .spawn(move || {
+            loop {
+                match active_chat_runs.active_run_count() {
+                    Ok(0) => break,
+                    Ok(_) => std::thread::sleep(Duration::from_millis(250)),
+                    Err(error) => {
+                        tracing::warn!(
+                            ?error,
+                            "failed to inspect active chat runs while waiting for tray shutdown"
+                        );
+                        break;
+                    }
+                }
+            }
+            finish_tray_shutdown(&shutdown_tx, &tray_menu_thread_id);
+        });
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn finish_tray_shutdown(shutdown_tx: &watch::Sender<bool>, tray_menu_thread_id: &Arc<AtomicU32>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        PostQuitMessage, PostThreadMessageW, WM_QUIT,
+    };
+
+    let _ = shutdown_tx.send(true);
+    let thread_id = tray_menu_thread_id.load(Ordering::SeqCst);
+    if thread_id == 0 {
+        unsafe {
+            PostQuitMessage(0);
+        }
+        return;
+    }
+
+    let posted = unsafe { PostThreadMessageW(thread_id, WM_QUIT, 0, 0) };
+    if posted == 0 {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "failed to wake tray loop for shutdown");
+    }
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn confirm_tray_shutdown_with_active_runs(active_run_count: usize) -> TrayShutdownChoice {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDCANCEL, IDNO, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNOCANCEL, MessageBoxW,
+    };
+
+    let message = format!(
+        "Foco still has {active_run_count} running LLM request(s).\n\nYes / 是: force quit now and cancel running requests.\nNo / 否: wait for running requests to finish, then quit.\nCancel / 取消: keep Foco running."
+    );
+    let title = "Quit Foco? / 退出 Foco？";
+    let message = wide_null(&message);
+    let title = wide_null(title);
+    let response = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_YESNOCANCEL | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    };
+
+    match response {
+        IDYES => TrayShutdownChoice::Force,
+        IDNO => TrayShutdownChoice::Wait,
+        IDCANCEL => TrayShutdownChoice::Cancel,
+        _ => TrayShutdownChoice::Cancel,
+    }
+}
+
+#[cfg(all(windows, not(debug_assertions)))]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 #[cfg(all(windows, not(debug_assertions)))]

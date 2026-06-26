@@ -113,6 +113,18 @@ pub(crate) struct GuidanceMessage {
 }
 
 impl ActiveChatRunRegistry {
+    pub(crate) fn active_run_count(&self) -> Result<usize, ApiError> {
+        let runs = self
+            .runs
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
+
+        Ok(runs
+            .values()
+            .filter(|run| !*run.completed_rx.borrow())
+            .count())
+    }
+
     pub(crate) fn register(
         &self,
         run_id: String,
