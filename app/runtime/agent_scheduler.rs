@@ -45,7 +45,7 @@ const AGENT_CONTEXT_RECENT_MESSAGE_LIMIT: usize = 8;
 const AGENT_CONTEXT_SUMMARY_ENTRY_LIMIT: usize = 16;
 const AGENT_CONTEXT_SUMMARY_MAX_CHARS: usize = 320;
 const AGENT_MAX_TASK_OUTCOME_BYTES: usize = 64 * 1024;
-const AGENT_WAIT_RESUME_INSTRUCTION: &str = "Foco Agent wait resume: the following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.";
+const AGENT_WAIT_RESUME_INSTRUCTION: &str = "<agent_wait_resume>\n<source>Foco Agent wait resume</source>\n<instructions>the following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.</instructions>\n</agent_wait_resume>";
 
 #[derive(Clone)]
 pub(crate) struct AgentScheduler {
@@ -796,14 +796,12 @@ fn apply_agent_prompt_layers(
     let mut consumed_message_ids = Vec::with_capacity(unread_messages.len());
     for message in unread_messages {
         let payload = agent_message_payload(&message);
-        let prompt = format!(
-            "Foco Agent unread message:\n{}",
-            serde_json::to_string_pretty(&payload).map_err(|source| {
-                ApiError::internal(format!(
-                    "failed to serialize Agent message prompt: {source}"
-                ))
-            })?
-        );
+        let payload_json = serde_json::to_string_pretty(&payload).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to serialize Agent message prompt: {source}"
+            ))
+        })?;
+        let prompt = xml_json_section("agent_unread_message", &payload_json);
         let index = chat_context.active_tool_start_index;
         insert_agent_prompt_message(
             chat_context,
@@ -994,12 +992,10 @@ fn agent_team_protocol_prompt(
             "workerAutomaticMemoryExtraction": false,
         },
     });
-    Ok(format!(
-        "Foco Agent team protocol:\n{}",
-        serde_json::to_string_pretty(&protocol).map_err(|source| {
-            ApiError::internal(format!("failed to serialize Agent team protocol: {source}"))
-        })?
-    ))
+    let protocol_json = serde_json::to_string_pretty(&protocol).map_err(|source| {
+        ApiError::internal(format!("failed to serialize Agent team protocol: {source}"))
+    })?;
+    Ok(xml_json_section("agent_team_protocol", &protocol_json))
 }
 
 fn creatable_agent_definitions_prompt(
@@ -1130,13 +1126,14 @@ fn agent_private_context_prompt(
         "snapshot": snapshot_value,
         "recentEntries": recent_entries,
     });
-    Ok(Some(format!(
-        "Foco Agent private context:\n{}",
-        serde_json::to_string_pretty(&context).map_err(|source| {
-            ApiError::internal(format!(
-                "failed to serialize Agent private context: {source}"
-            ))
-        })?
+    let context_json = serde_json::to_string_pretty(&context).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize Agent private context: {source}"
+        ))
+    })?;
+    Ok(Some(xml_json_section(
+        "agent_private_context",
+        &context_json,
     )))
 }
 
@@ -1182,12 +1179,10 @@ fn agent_current_task_prompt(
         current_task["resume"] =
             agent_wait_resume_payload(wait_dependencies, wait_dependency_tasks)?;
     }
-    Ok(format!(
-        "Foco Agent current task:\n{}",
-        serde_json::to_string_pretty(&current_task).map_err(|source| {
-            ApiError::internal(format!("failed to serialize Agent current task: {source}"))
-        })?
-    ))
+    let current_task_json = serde_json::to_string_pretty(&current_task).map_err(|source| {
+        ApiError::internal(format!("failed to serialize Agent current task: {source}"))
+    })?;
+    Ok(xml_json_section("agent_current_task", &current_task_json))
 }
 
 fn agent_previous_attempt_payload(task: &AgentTaskRecord) -> Result<Value, ApiError> {
@@ -1901,6 +1896,17 @@ mod tests {
         assert!(agent_task_outcome_json(&oversized, "result_json").is_err());
     }
 
+    fn agent_team_protocol_json_from_prompt(prompt: &str) -> Value {
+        assert!(prompt.starts_with("<agent_team_protocol>\n<json><![CDATA[\n"));
+        assert!(prompt.ends_with("\n]]></json>\n</agent_team_protocol>"));
+        let json_text = prompt
+            .strip_prefix("<agent_team_protocol>\n<json><![CDATA[\n")
+            .expect("protocol prefix")
+            .strip_suffix("\n]]></json>\n</agent_team_protocol>")
+            .expect("protocol suffix");
+        serde_json::from_str(json_text).expect("protocol json")
+    }
+
     #[test]
     fn agent_team_protocol_inserts_before_stable_context() {
         let sources = vec![
@@ -1985,12 +1991,7 @@ mod tests {
             &[coordinator.clone(), worker],
         )
         .expect("protocol prompt");
-        let protocol: Value = serde_json::from_str(
-            prompt
-                .strip_prefix("Foco Agent team protocol:\n")
-                .expect("protocol prefix"),
-        )
-        .expect("protocol json");
+        let protocol = agent_team_protocol_json_from_prompt(&prompt);
         let creatable = protocol["creatableAgentDefinitions"]
             .as_array()
             .expect("creatable definitions");
@@ -2094,12 +2095,7 @@ mod tests {
             &[coordinator.clone(), worker],
         )
         .expect("protocol prompt");
-        let protocol: Value = serde_json::from_str(
-            prompt
-                .strip_prefix("Foco Agent team protocol:\n")
-                .expect("protocol prefix"),
-        )
-        .expect("protocol json");
+        let protocol = agent_team_protocol_json_from_prompt(&prompt);
         let creatable = protocol["creatableAgentDefinitions"]
             .as_array()
             .expect("creatable definitions");

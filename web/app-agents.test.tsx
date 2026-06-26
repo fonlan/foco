@@ -103,7 +103,7 @@ function stubImageAgentSettings() {
     providerId: textModel.activeProviderId!,
     revision: 1,
     systemPrompt:
-      "You are Foco's image generation agent. Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.\n\nUse image_gen with model \"gpt-image-2\" unless the user explicitly asks for another configured image model.",
+      "<agent_definition_prompt>\n<identity>You are Foco's image generation agent.</identity>\n<instructions>Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.</instructions>\n<tool_defaults>Use image_gen with model &quot;gpt-image-2&quot; unless the user explicitly asks for another configured image model.</tool_defaults>\n</agent_definition_prompt>",
   };
   const settingsWithImageModels = {
     ...settings,
@@ -255,8 +255,9 @@ describe("app agents verification surfaces", () => {
 
     const promptContent = within(dialog).getByLabelText("Agent role prompt");
     expect((promptContent as HTMLTextAreaElement).value).toContain(
-      'Use image_gen with model "gpt-image-2"',
+      "<tool_defaults>",
     );
+    expect((promptContent as HTMLTextAreaElement).value).toContain("gpt-image-2");
     await userEvent.clear(promptContent);
     await userEvent.type(promptContent, "Custom image role prompt.");
     await userEvent.click(
@@ -265,8 +266,9 @@ describe("app agents verification surfaces", () => {
       }),
     );
     expect((promptContent as HTMLTextAreaElement).value).toContain(
-      'Use image_gen with model "gpt-image-2"',
+      "<tool_defaults>",
     );
+    expect((promptContent as HTMLTextAreaElement).value).toContain("gpt-image-2");
 
     await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
 
@@ -283,9 +285,8 @@ describe("app agents verification surfaces", () => {
       expect(body.id).toBe("agent-definition-image-gen");
       expect(body.definition.modelId).toBe("gpt-test");
       expect(body.definition.providerId).toBe("openai");
-      expect(body.definition.systemPrompt).toContain(
-        'Use image_gen with model "gpt-image-2"',
-      );
+      expect(body.definition.systemPrompt).toContain("<tool_defaults>");
+      expect(body.definition.systemPrompt).toContain("gpt-image-2");
     });
     await waitFor(() => {
       const updatedImageAgentCard = screen.getByText("Image generation agent").closest("article");

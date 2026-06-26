@@ -28,7 +28,7 @@ type BoxedChatEventStream =
 type BoxedChatSse = Sse<KeepAliveStream<BoxedChatEventStream>>;
 
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
-const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.";
+const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "<agent_definition_prompt>\n<identity>You are Foco's default coding agent.</identity>\n<instructions>Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.</instructions>\n</agent_definition_prompt>";
 const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CHAT_MESSAGES_PAGE_LIMIT: usize = 500;
 

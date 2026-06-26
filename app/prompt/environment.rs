@@ -5,7 +5,7 @@ use foco_providers::{NeutralChatMessage, NeutralChatRole};
 
 use crate::{
     ApiError, ENVIRONMENT_CONTEXT_MESSAGE_PREFIX, git_backend::is_git_workspace,
-    neutral_text_message, non_empty_string,
+    neutral_text_message, non_empty_string, xml_text_escape,
 };
 
 pub(crate) fn environment_context_message(
@@ -19,19 +19,21 @@ pub(crate) fn environment_context_message(
     Ok(neutral_text_message(
         NeutralChatRole::User,
         format!(
-            "{ENVIRONMENT_CONTEXT_MESSAGE_PREFIX}:\n\
-             - workspace directory: {}\n\
-             - git repository: {}\n\
-             - shell type: {}\n\
-             - shell executable: {}\n\
-             - current date: {}\n\
-             - local timestamp: {}\n\
-             - time zone: {}\n\
-             - wsl: {}",
-            workspace_path.display(),
+            "<environment_context>\n\
+             <source>{}</source>\n\
+             <workspace_directory>{}</workspace_directory>\n\
+             <git_repository>{}</git_repository>\n\
+             <shell type=\"{}\">{}</shell>\n\
+             <current_date>{}</current_date>\n\
+             <local_timestamp>{}</local_timestamp>\n\
+             <time_zone>{}</time_zone>\n\
+             <wsl>{}</wsl>\n\
+             </environment_context>",
+            xml_text_escape(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX),
+            xml_text_escape(&workspace_path.display().to_string()),
             git_repository,
-            shell.kind,
-            shell.executable,
+            xml_text_escape(&shell.kind),
+            xml_text_escape(&shell.executable),
             now.format("%Y-%m-%d"),
             now.to_rfc3339_opts(SecondsFormat::Secs, false),
             now.offset(),

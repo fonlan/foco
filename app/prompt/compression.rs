@@ -1081,17 +1081,21 @@ pub(crate) fn compression_snapshot_message(
     neutral_text_message(
         NeutralChatRole::System,
         format!(
-            "{CONTEXT_COMPRESSION_PROMPT_PREFIX}\n\
-             - snapshot id: {}\n\
-             - source message sequence range: {}..={}\n\
-             - original tokens: {}\n\
-             - summary tokens: {}\n\n{}",
-            snapshot.id,
+            "<context_compression_snapshot>\n\
+             <source>{}</source>\n\
+             <snapshot_id>{}</snapshot_id>\n\
+             <source_message_sequence_range start=\"{}\" end=\"{}\" />\n\
+             <original_tokens>{}</original_tokens>\n\
+             <summary_tokens>{}</summary_tokens>\n\
+             {}\n\
+             </context_compression_snapshot>",
+            xml_text_escape(CONTEXT_COMPRESSION_PROMPT_PREFIX),
+            xml_text_escape(&snapshot.id),
             snapshot.source_message_start_sequence,
             snapshot.source_message_end_sequence,
             snapshot.original_token_count,
             snapshot.summary_token_count,
-            snapshot.summary
+            xml_cdata_section("summary", &snapshot.summary)
         ),
     )
 }

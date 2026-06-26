@@ -25,8 +25,8 @@ use crate::*;
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 pub(crate) const IMAGE_AGENT_DEFINITION_ID: &str = "agent-definition-image-gen";
 pub(crate) const IMAGE_AGENT_SYSTEM_PROMPT_NAME: &str = IMAGE_GENERATION_SYSTEM_PROMPT_NAME;
-const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "You are Foco's default coding agent. Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.";
-const IMAGE_AGENT_SYSTEM_PROMPT: &str = "You are Foco's image generation agent. Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.\n\nUse image_gen with model \"gpt-image-2\" unless the user explicitly asks for another configured image model.";
+const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "<agent_definition_prompt>\n<identity>You are Foco's default coding agent.</identity>\n<instructions>Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.</instructions>\n</agent_definition_prompt>";
+const IMAGE_AGENT_SYSTEM_PROMPT: &str = "<agent_definition_prompt>\n<identity>You are Foco's image generation agent.</identity>\n<instructions>Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.</instructions>\n<tool_defaults>Use image_gen with model &quot;gpt-image-2&quot; unless the user explicitly asks for another configured image model.</tool_defaults>\n</agent_definition_prompt>";
 
 pub(crate) fn default_image_generation_system_prompt() -> String {
     IMAGE_AGENT_SYSTEM_PROMPT.to_string()

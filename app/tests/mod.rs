@@ -1393,14 +1393,21 @@ Search memory before repo work.
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].role, NeutralChatRole::Developer);
+    assert!(messages[0].content.contains("<skills_instructions>"));
     assert!(messages[0].content.contains(ENABLED_SKILLS_MESSAGE_PREFIX));
     assert!(
         messages[0]
             .content
-            .contains(&skill_file.display().to_string())
+            .contains(&format!("<skill path=\"{}\">", skill_file.display()))
     );
-    assert!(messages[0].content.contains("name: gitmemo"));
+    assert!(
+        messages[0]
+            .content
+            .contains("<frontmatter><![CDATA[\nname: gitmemo")
+    );
     assert!(messages[0].content.contains("description: Project memory."));
+    assert!(messages[0].content.contains("\n]]></frontmatter>"));
+    assert!(messages[0].content.contains("</skills_instructions>"));
     assert!(!messages[0].content.contains("Search memory"));
 
     fs::remove_dir_all(profile_dir).expect("remove skill test profile");
@@ -2090,7 +2097,11 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         listed
             .default_role_prompts
             .get(&image_definition_id)
-            .is_some_and(|prompt| prompt.contains("Use image_gen with model \"gpt-image-2\""))
+            .is_some_and(|prompt| {
+                prompt.contains("<agent_definition_prompt>")
+                    && prompt.contains("<tool_defaults>")
+                    && prompt.contains("gpt-image-2")
+            })
     );
     let image_definition = listed
         .agent_definitions
@@ -2108,13 +2119,15 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
     assert!(
         image_definition
             .system_prompt
-            .contains("image generation agent")
+            .contains("<agent_definition_prompt>")
     );
     assert!(
         image_definition
             .system_prompt
-            .contains("Use image_gen with model \"gpt-image-2\"")
+            .contains("image generation agent")
     );
+    assert!(image_definition.system_prompt.contains("<tool_defaults>"));
+    assert!(image_definition.system_prompt.contains("gpt-image-2"));
 
     let delete_image_error = match crate::http::settings::delete_agent_definition(
         State(state.clone()),
@@ -2505,14 +2518,16 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
 
     assert_eq!(agents_messages.len(), 1);
     assert_eq!(agents_messages[0].role, NeutralChatRole::User);
+    assert!(agents_messages[0].content.contains("<prompt_file_context>"));
     assert!(agents_messages[0].content.contains(AGENTS_MESSAGE_PREFIX));
     assert!(
         agents_messages[0]
             .content
-            .contains("Workspace instructions.")
+            .contains("<content><![CDATA[\nWorkspace instructions.")
     );
     assert_eq!(prompt_messages.len(), 1);
     assert_eq!(prompt_messages[0].role, NeutralChatRole::User);
+    assert!(prompt_messages[0].content.contains("<prompt_file_context>"));
     assert!(
         prompt_messages[0]
             .content
@@ -2521,9 +2536,14 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
     assert!(
         prompt_messages[0]
             .content
-            .contains("Configured prompt instructions.")
+            .contains("<content><![CDATA[\nConfigured prompt instructions.")
     );
     assert_eq!(extra_prompt_message.role, NeutralChatRole::User);
+    assert!(
+        extra_prompt_message
+            .content
+            .contains("<extra_prompt_context>")
+    );
     assert!(
         extra_prompt_message
             .content
@@ -2532,7 +2552,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
     assert!(
         extra_prompt_message
             .content
-            .contains("Extra prompt instructions.")
+            .contains("<content><![CDATA[\nExtra prompt instructions.")
     );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -9791,7 +9811,7 @@ Search memory before repo work.
         .provider_request
         .messages
         .iter()
-        .filter(|message| message.content.contains(ENABLED_SKILLS_MESSAGE_PREFIX))
+        .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
 
     assert_eq!(skill_messages.len(), 1);
@@ -9807,29 +9827,20 @@ Search memory before repo work.
         .provider_request
         .messages
         .iter()
-        .filter(|message| message.content.contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX))
+        .filter(|message| message.content.contains("<environment_context>"))
         .collect::<Vec<_>>();
 
     assert_eq!(environment_messages.len(), 1);
     assert_eq!(environment_messages[0].role, NeutralChatRole::User);
     assert!(environment_messages[0].content.contains(&format!(
-        "- workspace directory: {}",
+        "<workspace_directory>{}</workspace_directory>",
         workspace_dir.display()
     )));
-    assert!(
-        environment_messages[0]
-            .content
-            .contains("- git repository: ")
-    );
-    assert!(environment_messages[0].content.contains("- shell type: "));
-    assert!(
-        environment_messages[0]
-            .content
-            .contains("- shell executable: ")
-    );
-    assert!(environment_messages[0].content.contains("- current date: "));
-    assert!(environment_messages[0].content.contains("- time zone: "));
-    assert!(environment_messages[0].content.contains("- wsl: "));
+    assert!(environment_messages[0].content.contains("<git_repository>"));
+    assert!(environment_messages[0].content.contains("<shell type="));
+    assert!(environment_messages[0].content.contains("<current_date>"));
+    assert!(environment_messages[0].content.contains("<time_zone>"));
+    assert!(environment_messages[0].content.contains("<wsl>"));
 
     {
         let database =
@@ -9847,12 +9858,12 @@ Search memory before repo work.
         assert!(
             context_injections[0]
                 .messages_json
-                .contains(AGENTS_MESSAGE_PREFIX)
+                .contains("<prompt_file_context>")
         );
         assert!(
             context_injections[0]
                 .messages_json
-                .contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX)
+                .contains("<environment_context>")
         );
         assert!(
             context_injections[0]
@@ -9933,7 +9944,7 @@ Search memory before repo work.
         .provider_request
         .messages
         .iter()
-        .filter(|message| message.content.contains(ENABLED_SKILLS_MESSAGE_PREFIX))
+        .filter(|message| message.content.contains("<skills_instructions>"))
         .collect::<Vec<_>>();
     assert_eq!(existing_skill_messages.len(), 1);
     assert_eq!(existing_skill_messages[0].role, NeutralChatRole::Developer);
@@ -9945,7 +9956,7 @@ Search memory before repo work.
         .provider_request
         .messages
         .iter()
-        .filter(|message| message.content.contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX))
+        .filter(|message| message.content.contains("<environment_context>"))
         .collect::<Vec<_>>();
     assert_eq!(existing_environment_messages.len(), 1);
     assert_eq!(
@@ -10079,7 +10090,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         assert!(
             injections[0]
                 .messages_json
-                .contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX)
+                .contains("<environment_context>")
         );
     }
 
@@ -10350,7 +10361,11 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         .get(1)
         .expect("available tools message");
     assert_eq!(available_tools_message.role, NeutralChatRole::System);
-    assert!(available_tools_message.content.contains("Available tools:"));
+    assert!(
+        available_tools_message
+            .content
+            .contains("<available_tools>")
+    );
     assert!(
         !available_tools_message
             .content
@@ -10513,7 +10528,11 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         .get(1)
         .expect("available tools message");
     assert_eq!(available_tools_message.role, NeutralChatRole::System);
-    assert!(available_tools_message.content.contains("Available tools:"));
+    assert!(
+        available_tools_message
+            .content
+            .contains("<available_tools>")
+    );
     assert!(!available_tools_message.content.contains(SEARCH_TEXT_TOOL));
 
     drop(context);
@@ -10718,7 +10737,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
     assert!(
         !context.provider_request.messages[0]
             .content
-            .contains("Available tools:")
+            .contains("<available_tools>")
     );
     let available_tools_message = context
         .provider_request
@@ -10726,7 +10745,11 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
         .get(1)
         .expect("available tools message");
     assert_eq!(available_tools_message.role, NeutralChatRole::System);
-    assert!(available_tools_message.content.contains("Available tools:"));
+    assert!(
+        available_tools_message
+            .content
+            .contains("<available_tools>")
+    );
     assert!(available_tools_message.content.contains("read_file"));
 
     drop(context);
@@ -10913,11 +10936,7 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
         .provider_request
         .messages
         .iter()
-        .position(|message| {
-            message
-                .content
-                .contains(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX)
-        })
+        .position(|message| message.content.contains("<project_spec_context>"))
         .expect("project spec message");
     assert_eq!(
         first_context.message_context_sources[first_spec_index],
@@ -10966,11 +10985,7 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
         .provider_request
         .messages
         .iter()
-        .find(|message| {
-            message
-                .content
-                .contains(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX)
-        })
+        .find(|message| message.content.contains("<project_spec_context>"))
         .expect("project spec message");
     assert!(second_spec.content.contains("Version one"));
     assert!(!second_spec.content.contains("Version two"));
@@ -11020,11 +11035,13 @@ async fn prepare_chat_context_skips_project_spec_when_injection_disabled() {
     .await
     .expect("chat context");
 
-    assert!(context.provider_request.messages.iter().all(|message| {
-        !message
-            .content
-            .contains(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX)
-    }));
+    assert!(
+        context
+            .provider_request
+            .messages
+            .iter()
+            .all(|message| { !message.content.contains("<project_spec_context>") })
+    );
     {
         let database =
             WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
@@ -11091,11 +11108,7 @@ async fn prepare_prompt_context_preview_uses_saved_project_spec_snapshot() {
         .provider_request
         .messages
         .iter()
-        .find(|message| {
-            message
-                .content
-                .contains(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX)
-        })
+        .find(|message| message.content.contains("<project_spec_context>"))
         .expect("project spec message");
 
     assert!(spec_message.content.contains("Saved spec"));
@@ -11372,8 +11385,9 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
             .content
             .contains("Graph-linked memory is pulled through adjacent edges.")
     );
-    assert!(memory_message.content.contains("source: direct"));
-    assert!(memory_message.content.contains("source: related"));
+    assert!(memory_message.content.contains("<memory_context>"));
+    assert!(memory_message.content.contains("source=\"direct\""));
+    assert!(memory_message.content.contains("source=\"related\""));
     assert!(
         memory_message
             .content
@@ -11513,7 +11527,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
     let messages = &context.provider_request.messages;
     let todo_graph_index = messages
         .iter()
-        .position(|message| message.content.contains(TODO_GRAPH_CONTEXT_MESSAGE_PREFIX))
+        .position(|message| message.content.contains("<todo_graph_context>"))
         .expect("todo graph context message");
     assert_eq!(messages[todo_graph_index].role, NeutralChatRole::System);
     assert!(

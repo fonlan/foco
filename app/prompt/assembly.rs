@@ -621,7 +621,13 @@ fn project_spec_context_message(
     Some(neutral_text_message(
         NeutralChatRole::System,
         format!(
-            "{PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX}\nrevision: {revision}\n\n{content_markdown}"
+            "<project_spec_context>\n\
+             <source>{}</source>\n\
+             <revision>{revision}</revision>\n\
+             {}\n\
+             </project_spec_context>",
+            xml_text_escape(PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX),
+            xml_cdata_section("content_markdown", content_markdown)
         ),
     ))
 }

@@ -11,7 +11,7 @@ use foco_tools::{SEARCH_TEXT_TOOL, WEB_SEARCH_TOOL, builtin_tool_definitions};
 use crate::{
     AGENTS_MESSAGE_PREFIX, ApiError, EXTRA_PROMPT_MESSAGE_PREFIX, PROMPT_FILE_MESSAGE_PREFIX,
     SystemPromptSummary, http::settings::default_image_generation_system_prompt,
-    neutral_text_message,
+    neutral_text_message, xml_cdata_section, xml_text_escape,
 };
 
 pub(crate) fn active_system_prompt(
@@ -178,7 +178,12 @@ fn prompt_file_message(
 
     Ok(Some(neutral_text_message(
         NeutralChatRole::User,
-        format!("{prefix} {}:\n\n{}", path.display(), content.trim()),
+        format!(
+            "<prompt_file_context>\n<source>{}</source>\n<path>{}</path>\n{}\n</prompt_file_context>",
+            xml_text_escape(prefix),
+            xml_text_escape(&path.display().to_string()),
+            xml_cdata_section("content", content.trim())
+        ),
     )))
 }
 
@@ -190,6 +195,10 @@ fn extra_prompt_message(content: &str) -> Option<NeutralChatMessage> {
 
     Some(neutral_text_message(
         NeutralChatRole::User,
-        format!("{EXTRA_PROMPT_MESSAGE_PREFIX}\n\n{content}"),
+        format!(
+            "<extra_prompt_context>\n<source>{}</source>\n{}\n</extra_prompt_context>",
+            xml_text_escape(EXTRA_PROMPT_MESSAGE_PREFIX),
+            xml_cdata_section("content", content)
+        ),
     ))
 }

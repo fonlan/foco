@@ -719,7 +719,11 @@ fn retrieved_memory_context_message(
         };
     }
 
-    let prefix_tokens = estimate_text_tokens(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX);
+    let prefix = format!(
+        "<memory_context>\n<source>{}</source>",
+        xml_text_escape(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX)
+    );
+    let prefix_tokens = estimate_text_tokens(&prefix);
     if prefix_tokens > *remaining_tokens {
         return RetrievedMemoryContext {
             message: None,
@@ -728,21 +732,21 @@ fn retrieved_memory_context_message(
         };
     }
     *remaining_tokens = remaining_tokens.saturating_sub(prefix_tokens);
-    let mut content = String::from(MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX);
+    let mut content = prefix;
     let mut memories_used = Vec::new();
     let mut memory_keys = Vec::new();
     for retrieved_fact in facts {
         let fact = &retrieved_fact.fact;
         let entry = format!(
-            "\n\n- id: {}\n  scope: {}\n  chatId: {}\n  kind: {}\n  pinned: {}\n  source: {}\n  updatedAt: {}\n  fact: {}",
-            fact.id,
-            fact.scope,
-            fact.chat_id.as_deref().unwrap_or("n/a"),
-            fact.kind,
+            "\n<memory_fact id=\"{}\" scope=\"{}\" chat_id=\"{}\" kind=\"{}\" pinned=\"{}\" source=\"{}\" updated_at=\"{}\">\n{}\n</memory_fact>",
+            xml_text_escape(&fact.id),
+            xml_text_escape(&fact.scope.to_string()),
+            xml_text_escape(fact.chat_id.as_deref().unwrap_or("n/a")),
+            xml_text_escape(&fact.kind.to_string()),
             fact.pinned,
-            retrieved_fact.source.as_str(),
-            fact.updated_at,
-            markdown_safe_single_line(&fact.fact)
+            xml_text_escape(retrieved_fact.source.as_str()),
+            xml_text_escape(&fact.updated_at),
+            xml_cdata_section("fact", &fact.fact)
         );
         let entry_tokens = estimate_text_tokens(&entry);
         if entry_tokens > *remaining_tokens {
@@ -754,13 +758,14 @@ fn retrieved_memory_context_message(
         *remaining_tokens = remaining_tokens.saturating_sub(entry_tokens);
     }
 
-    if content == MEMORY_RETRIEVED_CONTEXT_MESSAGE_PREFIX {
+    if memories_used.is_empty() {
         return RetrievedMemoryContext {
             message: None,
             memories_used: Vec::new(),
             memory_keys: Vec::new(),
         };
     }
+    content.push_str("\n</memory_context>");
 
     RetrievedMemoryContext {
         message: Some(neutral_text_message(role, content)),

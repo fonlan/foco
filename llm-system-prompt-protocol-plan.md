@@ -11,13 +11,13 @@
 
 ## Phase 2: XML-structured prompt content
 
-- [ ] Define the XML-like section schema for system prompt content, including `system_prompt`, `skills_instructions`, `memory_context`, `environment_context`, and related runtime sections.
-- [ ] Update base system prompt assembly to emit structured plain text inside the provider-native system field.
-- [ ] Audit current context roles for skills, prompt files, AGENTS.md, environment context, memories, hook feedback, and task state.
-- [ ] Decide which currently user-role context messages should remain user context and which should move to system/developer-level instructions.
-- [ ] Escape or fence untrusted user-provided content to avoid accidental XML tag boundary confusion.
-- [ ] Add prompt assembly tests or snapshot-style assertions for the structured sections.
-- [ ] Run app/provider tests and document any intentional prompt behavior changes.
+- [x] Define the XML-like section schema for system prompt content, including `system_prompt`, `skills_instructions`, `memory_context`, `environment_context`, and related runtime sections.
+- [x] Update base system prompt assembly to emit structured plain text inside the provider-native system field.
+- [x] Audit current context roles for skills, prompt files, AGENTS.md, environment context, memories, hook feedback, and task state.
+- [x] Decide which currently user-role context messages should remain user context and which should move to system/developer-level instructions.
+- [x] Escape or fence untrusted user-provided content to avoid accidental XML tag boundary confusion.
+- [x] Add prompt assembly tests or snapshot-style assertions for the structured sections.
+- [x] Run app/provider tests and document any intentional prompt behavior changes.
 
 ## Notes
 

@@ -10,7 +10,7 @@ use foco_store::config::{
 };
 use serde::Serialize;
 
-use crate::{ApiError, neutral_text_message};
+use crate::{ApiError, neutral_text_message, xml_cdata_section, xml_text_escape};
 
 // Prefix used to identify injected enabled skill front matter messages.
 pub(crate) const ENABLED_SKILLS_MESSAGE_PREFIX: &str =
@@ -709,16 +709,17 @@ pub(crate) fn enabled_skill_frontmatter_messages(
     Ok(vec![neutral_text_message(
         NeutralChatRole::Developer,
         format!(
-            "{ENABLED_SKILLS_MESSAGE_PREFIX}:\n\n{}",
-            entries.join("\n\n")
+            "<skills_instructions>\n<source>{}</source>\n{}\n</skills_instructions>",
+            xml_text_escape(ENABLED_SKILLS_MESSAGE_PREFIX),
+            entries.join("\n")
         ),
     )])
 }
 
 fn skill_frontmatter_entry(path: &Path, skill: ParsedSkillFile) -> String {
     format!(
-        "path: {}\n---\n{}\n---",
-        path.display(),
-        skill.frontmatter.trim()
+        "<skill path=\"{}\">\n{}\n</skill>",
+        xml_text_escape(&path.display().to_string()),
+        xml_cdata_section("frontmatter", skill.frontmatter.trim())
     )
 }
