@@ -309,6 +309,63 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("keeps bottom lock through non-user scroll events while streaming", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    const messageList = document.querySelector(".message-list");
+    if (!(messageList instanceof HTMLElement)) {
+      throw new Error("Expected message list");
+    }
+
+    let scrollHeight = 1000;
+    const clientHeight = 500;
+    let scrollTop = 0;
+    Object.defineProperties(messageList, {
+      clientHeight: { configurable: true, get: () => clientHeight },
+      scrollHeight: { configurable: true, get: () => scrollHeight },
+      scrollTop: {
+        configurable: true,
+        get: () => scrollTop,
+        set: (value) => {
+          scrollTop = Math.min(value, Math.max(0, scrollHeight - clientHeight));
+        },
+      },
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "First lock chunk. ",
+        type: "textDelta",
+      });
+    });
+    expect(await screen.findByText("First lock chunk.")).toBeInTheDocument();
+    await waitFor(() => expect(messageList.scrollTop).toBe(500));
+
+    scrollHeight = 1080;
+    fireEvent.scroll(messageList);
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Second lock chunk.",
+        type: "textDelta",
+      });
+    });
+
+    await waitFor(() => expect(messageList.scrollTop).toBe(580));
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
   it("batches adjacent text deltas before flushing them to the bubble", async () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));

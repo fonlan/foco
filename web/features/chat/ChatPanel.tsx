@@ -237,7 +237,6 @@ function ChatPanelComponent({
   const chatPanelRef = useRef<HTMLDivElement>(null);
   const messageScrollRef = useRef<HTMLDivElement>(null);
   const messageScrollContentRef = useRef<HTMLDivElement>(null);
-  const messageScrollEndRef = useRef<HTMLDivElement>(null);
   const messageTextareaRef = useRef<HTMLTextAreaElement>(null);
   const composerResizeDragRef = useRef<ComposerResizeDrag | null>(null);
   const copiedMessageTimerRef = useRef<number | null>(null);
@@ -245,6 +244,7 @@ function ChatPanelComponent({
   const previousChatScrollKeyRef = useRef(chatScrollKey);
   const previousMessageCountRef = useRef(messages.length);
   const shouldLockMessageScrollRef = useRef(true);
+  const userMessageScrollIntentRef = useRef(false);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
   const [isResizingComposer, setIsResizingComposer] = useState(false);
@@ -338,9 +338,16 @@ function ChatPanelComponent({
   const showSendButtonTooltip = isSendButtonTooltipOpen && !isSendingMessage;
 
   function scrollMessageListToBottom() {
-    messageScrollEndRef.current?.scrollIntoView({
-      block: "end",
-      inline: "nearest",
+    const element = messageScrollRef.current;
+    if (!element) {
+      return;
+    }
+
+    element.scrollTop = element.scrollHeight;
+    window.requestAnimationFrame(() => {
+      if (shouldLockMessageScrollRef.current) {
+        element.scrollTop = element.scrollHeight;
+      }
     });
   }
 
@@ -527,6 +534,10 @@ function ChatPanelComponent({
     void onLoadMoreMessages();
   }
 
+  function markUserMessageScrollIntent() {
+    userMessageScrollIntentRef.current = true;
+  }
+
   function handleMessageScroll() {
     const element = messageScrollRef.current;
     if (!element) {
@@ -535,12 +546,18 @@ function ChatPanelComponent({
 
     if (messages.length === 0) {
       shouldLockMessageScrollRef.current = false;
+      userMessageScrollIntentRef.current = false;
       return;
     }
 
-    shouldLockMessageScrollRef.current =
+    const isAtBottom =
       element.scrollHeight - element.scrollTop - element.clientHeight <=
       CHAT_BOTTOM_LOCK_THRESHOLD_PX;
+    if (isAtBottom || userMessageScrollIntentRef.current) {
+      shouldLockMessageScrollRef.current = isAtBottom;
+    }
+    userMessageScrollIntentRef.current = false;
+
     if (
       element.scrollTop <= CHAT_TOP_LOAD_THRESHOLD_PX &&
       hasMoreMessagesBefore &&
@@ -644,7 +661,10 @@ function ChatPanelComponent({
     >
       <div
         className="message-list panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4"
+        onKeyDown={markUserMessageScrollIntent}
         onScroll={handleMessageScroll}
+        onTouchMove={markUserMessageScrollIntent}
+        onWheel={markUserMessageScrollIntent}
         ref={messageScrollRef}
       >
         <div
@@ -698,7 +718,7 @@ function ChatPanelComponent({
             overviewRenderer()
           )}
         </div>
-        <div aria-hidden="true" className="h-px" ref={messageScrollEndRef} />
+        <div aria-hidden="true" className="h-px" />
       </div>
 
       {!readOnly ? (
