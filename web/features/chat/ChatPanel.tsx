@@ -729,7 +729,7 @@ function ChatPanelComponent({
 
           <div className="composer-shell shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
         <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
-          <div className="composer-surface foco-reticle relative rounded-xl border border-stone-300 bg-white">
+          <div className="composer-surface relative rounded-xl border border-stone-300 bg-white">
             {selectedSkills.length ? (
               <div className="flex flex-wrap gap-1.5 px-3 pt-2">
                 {selectedSkills.map((skill) => (
