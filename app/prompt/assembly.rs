@@ -256,9 +256,21 @@ pub(crate) async fn prepare_prompt_context(
         &mcp_tools,
     );
     let system_prompt = active_system_prompt(&config.prompts, &model.system_prompt_name)?;
+    let project_spec_prompt_section = project_spec_context
+        .message
+        .as_ref()
+        .map(|_| build_project_spec_prompt_section());
+    let memory_prompt_section = config.memory.enabled.then(build_memory_prompt_section);
     let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos);
-    let extra_prompt_message = configured_extra_prompt_message(&config.prompts);
     let system_prompt_tokens = estimate_text_tokens(&system_prompt)
+        + project_spec_prompt_section
+            .as_ref()
+            .map(|prompt| estimate_text_tokens(prompt))
+            .unwrap_or(0)
+        + memory_prompt_section
+            .as_ref()
+            .map(|prompt| estimate_text_tokens(prompt))
+            .unwrap_or(0)
         + available_tools_prompt
             .as_ref()
             .map(|prompt| estimate_text_tokens(prompt))
@@ -336,6 +348,7 @@ pub(crate) async fn prepare_prompt_context(
             .await?,
         )
     };
+    let extra_prompt_message = configured_extra_prompt_message(&config.prompts);
     let mut stable_context_messages = if is_new_chat {
         let mut messages = Vec::new();
         if let Some(message) = memory_context
@@ -387,6 +400,8 @@ pub(crate) async fn prepare_prompt_context(
             + usize::from(project_spec_context.message.is_some())
             + usize::from(extra_prompt_message.is_some())
             + usize::from(todo_graph_context_message.is_some())
+            + usize::from(project_spec_prompt_section.is_some())
+            + usize::from(memory_prompt_section.is_some())
             + existing_turn_memory_messages.len()
             + current_turn_memory_messages.len()
             + usize::from(assistant_draft.is_some() || assistant_draft_reasoning.is_some())
@@ -397,6 +412,22 @@ pub(crate) async fn prepare_prompt_context(
     neutral_messages.push(neutral_text_message(NeutralChatRole::System, system_prompt));
     message_source_sequences.push(None);
     message_context_sources.push(PromptContextSource::ReservedPrompt);
+    if let Some(project_spec_prompt_section) = project_spec_prompt_section {
+        neutral_messages.push(neutral_text_message(
+            NeutralChatRole::System,
+            project_spec_prompt_section,
+        ));
+        message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::ReservedPrompt);
+    }
+    if let Some(memory_prompt_section) = memory_prompt_section {
+        neutral_messages.push(neutral_text_message(
+            NeutralChatRole::System,
+            memory_prompt_section,
+        ));
+        message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::ReservedPrompt);
+    }
     if let Some(available_tools_prompt) = available_tools_prompt {
         neutral_messages.push(neutral_text_message(
             NeutralChatRole::System,

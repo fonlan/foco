@@ -10376,6 +10376,13 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
             .content
             .contains(MEMORY_WRITE_TOOL_NAME)
     );
+    assert!(
+        context
+            .provider_request
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("<memory>"))
+    );
 
     drop(context);
     drop(state);
@@ -10938,6 +10945,13 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
         .iter()
         .position(|message| message.content.contains("<project_spec_context>"))
         .expect("project spec message");
+    assert!(
+        first_context
+            .provider_request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("<project_spec>"))
+    );
     assert_eq!(
         first_context.message_context_sources[first_spec_index],
         PromptContextSource::ProjectSpec
@@ -11042,6 +11056,13 @@ async fn prepare_chat_context_skips_project_spec_when_injection_disabled() {
             .iter()
             .all(|message| { !message.content.contains("<project_spec_context>") })
     );
+    assert!(
+        context
+            .provider_request
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("<project_spec>"))
+    );
     {
         let database =
             WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
@@ -11112,6 +11133,13 @@ async fn prepare_prompt_context_preview_uses_saved_project_spec_snapshot() {
         .expect("project spec message");
 
     assert!(spec_message.content.contains("Saved spec"));
+    assert!(
+        context
+            .provider_request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("<project_spec>"))
+    );
     assert!(!spec_message.content.contains("Latest spec"));
     assert!(context.pending_spec_snapshot.is_none());
 
@@ -11353,6 +11381,11 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
     let messages = &context.provider_request.messages;
 
     assert!(messages[0].content.contains("You are Foco"));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content.contains("<memory>"))
+    );
     let current_user_index = messages
         .iter()
         .position(|message| message.content == "renderer prompt assembly")

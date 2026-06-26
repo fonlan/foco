@@ -30,8 +30,9 @@ use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermissions, AgentRunAssociations,
     AgentRunContext, AgentRunEvent, AgentRunEventEmitter, AgentRunEventKind, AgentRunExecutor,
     AgentRunFuture, AgentRunInput, AgentRunOutcome, AgentRunTask, build_available_tools_prompt,
-    calculate_context_budget, estimate_json_tokens, estimate_text_tokens, pack_context,
-    plan_context_compression, plan_tool_execution,
+    build_memory_prompt_section, build_project_spec_prompt_section, calculate_context_budget,
+    estimate_json_tokens, estimate_text_tokens, pack_context, plan_context_compression,
+    plan_tool_execution,
 };
 use foco_graph::{CodeGraphWatcher, index_workspace, start_code_graph_watcher};
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};

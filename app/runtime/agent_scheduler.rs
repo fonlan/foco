@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use foco_agent::{
     AgentAttemptId, AgentCollaborationTool, AgentExecutionWorkspaceMode, AgentInstanceStatus,
     AgentPermissions, AgentRole, AgentRunAssociations, AgentRunOutcome, AgentTaskId,
-    AgentTaskStatus, AgentTaskTransition, estimate_text_tokens,
+    AgentTaskStatus, AgentTaskTransition, build_subagents_prompt_section, estimate_text_tokens,
 };
 use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
 use foco_store::{
@@ -995,7 +995,11 @@ fn agent_team_protocol_prompt(
     let protocol_json = serde_json::to_string_pretty(&protocol).map_err(|source| {
         ApiError::internal(format!("failed to serialize Agent team protocol: {source}"))
     })?;
-    Ok(xml_json_section("agent_team_protocol", &protocol_json))
+    Ok(format!(
+        "{}\n{}",
+        build_subagents_prompt_section(),
+        xml_json_section("agent_team_protocol", &protocol_json)
+    ))
 }
 
 fn creatable_agent_definitions_prompt(
@@ -1897,9 +1901,14 @@ mod tests {
     }
 
     fn agent_team_protocol_json_from_prompt(prompt: &str) -> Value {
-        assert!(prompt.starts_with("<agent_team_protocol>\n<json><![CDATA[\n"));
-        assert!(prompt.ends_with("\n]]></json>\n</agent_team_protocol>"));
-        let json_text = prompt
+        assert!(prompt.contains("<subagents>"));
+        let protocol_prompt = prompt
+            .split_once("<agent_team_protocol>")
+            .map(|(_, rest)| format!("<agent_team_protocol>{rest}"))
+            .expect("protocol section");
+        assert!(protocol_prompt.starts_with("<agent_team_protocol>\n<json><![CDATA[\n"));
+        assert!(protocol_prompt.ends_with("\n]]></json>\n</agent_team_protocol>"));
+        let json_text = protocol_prompt
             .strip_prefix("<agent_team_protocol>\n<json><![CDATA[\n")
             .expect("protocol prefix")
             .strip_suffix("\n]]></json>\n</agent_team_protocol>")
