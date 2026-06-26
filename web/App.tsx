@@ -9318,15 +9318,11 @@ function ApiOverviewPanel({
   );
   const selectedWorkspace =
     workspaces.find((workspace) => workspace.id === filters.workspaceId) ?? null;
-  const requestTrendData = summary.trend.map((point) => ({
+  const trendData = summary.trend.map((point) => ({
     id: point.bucket,
     label: formatTrendBucket(point.bucket, language),
-    value: point.requestCount,
-  }));
-  const tokenTrendData = summary.trend.map((point) => ({
-    id: point.bucket,
-    label: formatTrendBucket(point.bucket, language),
-    value: point.totalTokens,
+    primaryValue: point.requestCount,
+    secondaryValue: point.totalTokens,
   }));
   const modelTokenData = summary.modelBreakdown.map((item) => ({
     id: item.modelId,
@@ -9348,18 +9344,22 @@ function ApiOverviewPanel({
     label: providerLabels.get(item.providerId) ?? item.providerId,
     value: item.requestCount,
   }));
-  const providerSuccessData = summary.providerBreakdown.map((item) => ({
-    displayValue: formatPercent(item.successRate, language),
-    id: item.providerId,
-    label: providerLabels.get(item.providerId) ?? item.providerId,
-    value: item.successRate ?? 0,
-  }));
-  const providerLatencyData = summary.providerBreakdown.map((item) => ({
-    displayValue: formatNullableLatencySeconds(item.averageLatencyMs, language),
-    id: item.providerId,
-    label: providerLabels.get(item.providerId) ?? item.providerId,
-    value: item.averageLatencyMs ?? 0,
-  }));
+  const providerQualityData = summary.providerBreakdown.flatMap((item) => {
+    if (item.averageLatencyMs === null || item.successRate === null) {
+      return [];
+    }
+
+    return [
+      {
+        displayXValue: formatNullableLatencySeconds(item.averageLatencyMs, language),
+        displayYValue: formatPercent(item.successRate, language),
+        id: item.providerId,
+        label: providerLabels.get(item.providerId) ?? item.providerId,
+        x: item.averageLatencyMs,
+        y: item.successRate,
+      },
+    ];
+  });
 
   const loadOverview = useCallback(async () => {
     if (
@@ -9551,46 +9551,39 @@ function ApiOverviewPanel({
       ) : (
         <Suspense fallback={<PanelLoadingFallback />}>
         <section className="grid gap-4 xl:grid-cols-2">
-          <LineChartCard
-            data={requestTrendData}
-            title={t("Request trend")}
-            valueFormatter={(value) => formatNumber(value, language)}
+          <DualLineChartCard
+            data={trendData}
+            primaryFormatter={(value) => formatNumber(value, language)}
+            primaryLabel={t("Requests")}
+            secondaryFormatter={(value) => formatCompactNumber(value, language)}
+            secondaryLabel={t("Tokens")}
+            title={t("Requests and tokens trend")}
           />
-          <LineChartCard
-            data={tokenTrendData}
-            title={t("Token trend")}
-            valueFormatter={(value) => formatCompactNumber(value, language)}
+          <DoubleDonutChartCard
+            innerData={modelTokenData}
+            innerFormatter={(value) => formatCompactNumber(value, language)}
+            innerLabel={t("Tokens")}
+            outerData={modelRequestData}
+            outerFormatter={(value) => formatNumber(value, language)}
+            outerLabel={t("Requests")}
+            title={t("Model distribution")}
           />
-          <DonutChartCard
-            data={modelTokenData}
-            title={t("Tokens by model")}
-            valueFormatter={(value) => formatCompactNumber(value, language)}
+          <DoubleDonutChartCard
+            innerData={providerTokenData}
+            innerFormatter={(value) => formatCompactNumber(value, language)}
+            innerLabel={t("Tokens")}
+            outerData={providerRequestData}
+            outerFormatter={(value) => formatNumber(value, language)}
+            outerLabel={t("Requests")}
+            title={t("Channel distribution")}
           />
-          <DonutChartCard
-            data={modelRequestData}
-            title={t("Requests by model")}
-            valueFormatter={(value) => formatNumber(value, language)}
-          />
-          <BarChartCard
-            data={providerTokenData}
-            title={t("Tokens by channel")}
-            valueFormatter={(value) => formatCompactNumber(value, language)}
-          />
-          <DonutChartCard
-            data={providerRequestData}
-            title={t("Requests by channel")}
-            valueFormatter={(value) => formatNumber(value, language)}
-          />
-          <BarChartCard
-            data={providerSuccessData}
-            maxValue={1}
-            title={t("Channel success rate")}
-            valueFormatter={(value) => formatPercent(value, language)}
-          />
-          <BarChartCard
-            data={providerLatencyData}
-            title={t("Channel response time")}
-            valueFormatter={(value) => formatNullableLatencySeconds(value, language)}
+          <ScatterChartCard
+            data={providerQualityData}
+            title={t("Channel quality")}
+            xFormatter={(value) => formatNullableLatencySeconds(value, language)}
+            xLabel={t("Response time")}
+            yFormatter={(value) => formatPercent(value, language)}
+            yLabel={t("Success rate")}
           />
         </section>
         </Suspense>
@@ -9599,14 +9592,14 @@ function ApiOverviewPanel({
   );
 }
 
-const LineChartCard = lazy(() =>
-  import("./features/stats/StatCharts").then((m) => ({ default: m.LineChartCard })),
+const DualLineChartCard = lazy(() =>
+  import("./features/stats/StatCharts").then((m) => ({ default: m.DualLineChartCard })),
 );
-const DonutChartCard = lazy(() =>
-  import("./features/stats/StatCharts").then((m) => ({ default: m.DonutChartCard })),
+const DoubleDonutChartCard = lazy(() =>
+  import("./features/stats/StatCharts").then((m) => ({ default: m.DoubleDonutChartCard })),
 );
-const BarChartCard = lazy(() =>
-  import("./features/stats/StatCharts").then((m) => ({ default: m.BarChartCard })),
+const ScatterChartCard = lazy(() =>
+  import("./features/stats/StatCharts").then((m) => ({ default: m.ScatterChartCard })),
 );
 
 function PanelLoadingFallback() {
