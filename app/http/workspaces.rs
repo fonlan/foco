@@ -165,6 +165,7 @@ pub(crate) async fn workspace_file_blob(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "private, max-age=60")
+        .header(header::CONTENT_SECURITY_POLICY, "default-src 'none'; img-src data:; style-src 'unsafe-inline'")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(Body::from(bytes))
         .expect("workspace file blob response is valid"))
@@ -663,10 +664,30 @@ fn workspace_image_content_type(bytes: &[u8]) -> Result<&'static str, ApiError> 
     if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return Ok("image/webp");
     }
+    if let Ok(text) = std::str::from_utf8(&bytes[..bytes.len().min(256)]) {
+        let trimmed = text.trim_start();
+        if trimmed.starts_with("<?xml") || trimmed.starts_with("<svg") || trimmed.starts_with("<!DOCTYPE") {
+            return Ok("image/svg+xml");
+        }
+    }
 
     Err(ApiError::bad_request(
-        "workspace file preview only supports PNG, JPEG, WebP, or GIF images",
+        "workspace file preview only supports PNG, JPEG, WebP, GIF, or SVG images",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_image_content_type;
+
+    #[test]
+    fn workspace_image_content_type_accepts_svg_only_as_image_text() {
+        assert_eq!(
+            workspace_image_content_type(br#"  <svg xmlns="http://www.w3.org/2000/svg"></svg>"#).unwrap(),
+            "image/svg+xml"
+        );
+        assert!(workspace_image_content_type(b"plain text").is_err());
+    }
 }
 
 fn validate_workspace_file_name(input: &str) -> Result<&str, ApiError> {

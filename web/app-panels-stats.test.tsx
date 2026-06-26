@@ -1255,6 +1255,17 @@ describe("app-panels-stats verification surfaces", () => {
     expect(editButton).toHaveAttribute("aria-pressed", "true");
     expect(editButton.querySelector(".lucide-eye-off")).toBeInTheDocument();
     expect(editButton.querySelector(".lucide-eye")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/<\/?div/i),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "Foco" })).toHaveAttribute(
+      "src",
+      "/api/workspaces/workspace-1/files/blob?path=foco.svg",
+    );
+    expect(screen.getByRole("img", { name: "Foco" })).toHaveAttribute(
+      "width",
+      "96",
+    );
     expect(screen.getByRole("img", { name: "Remote asset" })).toHaveAttribute(
       "src",
       "https://example.com/asset.png",

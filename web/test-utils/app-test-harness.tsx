@@ -1421,6 +1421,10 @@ export const workspaceFilesResponse = {
 };
 
 export const markdownFileContent = [
+  '<div align="center">',
+  "",
+  '<img src="foco.svg" alt="Foco" width="96" />',
+  "",
   "# Preview title",
   "",
   "![Remote asset](https://example.com/asset.png)",
@@ -1435,6 +1439,8 @@ export const markdownFileContent = [
   "flowchart TD",
   "  A --> B",
   "```",
+  "",
+  "</div>",
 ].join("\n");
 
 export const importedHooks = {

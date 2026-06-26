@@ -9941,6 +9941,8 @@ function WorkspaceFileEditorPanel({
           onSave={handleSave}
           path={editorPath}
           value={editor?.content ?? ""}
+          workspaceFilePath={file.path}
+          workspaceId={file.workspaceId}
         />
       </div>
     </section>
@@ -9968,6 +9970,8 @@ function MonacoFileEditor({
   onSave,
   path,
   value,
+  workspaceFilePath,
+  workspaceId,
 }: {
   canSave: boolean;
   isDirty: boolean;
@@ -9979,6 +9983,8 @@ function MonacoFileEditor({
   onSave: (value: string) => Promise<boolean> | boolean;
   path: string;
   value: string;
+  workspaceFilePath: string;
+  workspaceId: string;
 }) {
   const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -10171,6 +10177,11 @@ function MonacoFileEditor({
     ignoreModelChangeRef.current = false;
   }, [value]);
 
+  const markdownImageUrlTransform = useMemo(
+    () => workspaceMarkdownImageUrlTransform(workspaceId, workspaceFilePath),
+    [workspaceFilePath, workspaceId],
+  );
+
   return (
     <div className="workspace-file-editor-shell">
       <div aria-label={t("Editor toolbar")} className="workspace-file-editor-toolbar" role="toolbar">
@@ -10260,7 +10271,9 @@ function MonacoFileEditor({
       {isMarkdown && previewEnabled ? (
         <div className="workspace-file-markdown-preview">
           <MarkdownContent
+            allowHtml
             content={value}
+            imageUrlTransform={markdownImageUrlTransform}
             isUser={false}
             selectedSkillPrefix={selectedSkillPrefix}
           />
@@ -21188,6 +21201,30 @@ function workspaceFileEditorKey(workspaceId: string, path: string) {
 function isMarkdownFilePath(path: string) {
   const extension = path.split(".").pop()?.toLowerCase();
   return extension === "md" || extension === "markdown";
+}
+
+function workspaceMarkdownImageUrlTransform(workspaceId: string, filePath: string) {
+  const parentPath = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
+  const basePath = `/__workspace__/${parentPath ? `${parentPath}/` : ""}`;
+
+  return (url: string) => {
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl || trimmedUrl.startsWith("#") || trimmedUrl.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(trimmedUrl)) {
+      return null;
+    }
+
+    const normalizedPath = new URL(trimmedUrl, `https://foco.local${basePath}`).pathname;
+    if (!normalizedPath.startsWith("/__workspace__/")) {
+      return null;
+    }
+
+    const workspacePath = normalizedPath.slice("/__workspace__/".length);
+    if (!workspacePath) {
+      return null;
+    }
+
+    return `/api/workspaces/${encodeURIComponent(workspaceId)}/files/blob?path=${encodeURIComponent(workspacePath)}`;
+  };
 }
 
 function workspaceRenamedFilePath(path: string, newName: string) {

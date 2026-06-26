@@ -11,8 +11,12 @@ import {
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components, UrlTransform } from "react-markdown";
 import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+
+import type { PluggableList } from "unified";
 
 import { useI18n } from "../../shared/i18n";
 
@@ -30,6 +34,19 @@ export type SelectedSkillPrefixResolver = (
 ) => SelectedSkillPrefix | null;
 
 type MarkdownRenderMode = "full" | "streaming";
+
+type MarkdownImageUrlTransform = (url: string) => string | null;
+
+type MarkdownContentProps = {
+  allowHtml?: boolean;
+  content: string;
+  imageUrlTransform?: MarkdownImageUrlTransform;
+  isError?: boolean;
+  isUser: boolean;
+  renderMode?: MarkdownRenderMode;
+  selectedSkillPrefix: SelectedSkillPrefixResolver;
+  variant?: "message" | "reasoning";
+};
 
 type MermaidRuntime = {
   initialize: (config: Record<string, unknown>) => void;
@@ -78,21 +95,30 @@ const MARKDOWN_COMPONENTS: Components = {
   },
 };
 
+const MARKDOWN_REHYPE_PLUGINS: PluggableList = [rehypeKatex];
+const MARKDOWN_SANITIZE_SCHEMA = {
+  ...defaultSchema,
+  protocols: {
+    ...defaultSchema.protocols,
+    src: [...(defaultSchema.protocols?.src ?? []), "data"],
+  },
+};
+const MARKDOWN_HTML_REHYPE_PLUGINS: PluggableList = [
+  rehypeRaw,
+  [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
+  rehypeKatex,
+];
+
 export const MarkdownContent = memo(function MarkdownContent({
+  allowHtml = false,
   content,
+  imageUrlTransform,
   isError = false,
   isUser,
   renderMode = "full",
   selectedSkillPrefix,
   variant = "message",
-}: {
-  content: string;
-  isError?: boolean;
-  isUser: boolean;
-  renderMode?: MarkdownRenderMode;
-  selectedSkillPrefix: SelectedSkillPrefixResolver;
-  variant?: "message" | "reasoning";
-}) {
+}: MarkdownContentProps) {
   const skillPrefix = selectedSkillPrefix(content, isUser);
   const displayContent = skillPrefix?.remaining ?? content;
   const markdownContent =
@@ -128,9 +154,9 @@ export const MarkdownContent = memo(function MarkdownContent({
       ) : (
         <ReactMarkdown
           components={MARKDOWN_COMPONENTS}
-          rehypePlugins={[rehypeKatex]}
+          rehypePlugins={allowHtml ? MARKDOWN_HTML_REHYPE_PLUGINS : MARKDOWN_REHYPE_PLUGINS}
           remarkPlugins={[remarkGfm, remarkMath]}
-          urlTransform={markdownUrlTransform}
+          urlTransform={markdownUrlTransform(imageUrlTransform)}
         >
           {markdownContent}
         </ReactMarkdown>
@@ -220,13 +246,19 @@ async function loadMermaidRuntime() {
   return mermaidRuntimePromise;
 }
 
-const markdownUrlTransform: UrlTransform = (url, key, node) => {
-  if (key === "src" && node.tagName === "img" && safeBase64ImageUrl(url)) {
-    return url;
-  }
+function markdownUrlTransform(imageUrlTransform?: MarkdownImageUrlTransform): UrlTransform {
+  return (url, key, node) => {
+    if (key === "src" && node.tagName === "img" && safeBase64ImageUrl(url)) {
+      return url;
+    }
 
-  return defaultUrlTransform(url);
-};
+    if (key === "src" && node.tagName === "img") {
+      return imageUrlTransform?.(url) ?? defaultUrlTransform(url);
+    }
+
+    return defaultUrlTransform(url);
+  };
+}
 
 function safeBase64ImageUrl(url: string) {
   return /^data:image\/(?:avif|bmp|gif|jpe?g|png|webp);base64,[a-z0-9+/=\s]+$/i.test(
