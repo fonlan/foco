@@ -539,6 +539,62 @@ function useStableCallback<T extends (...args: any[]) => unknown>(callback: T): 
   );
 }
 
+type NetworkInformationLike = {
+  saveData?: boolean;
+};
+
+type WindowWithIdleCallback = Window & {
+  cancelIdleCallback?: (handle: number) => void;
+  requestIdleCallback?: (
+    callback: (deadline: { didTimeout: boolean; timeRemaining: () => number }) => void,
+    options?: { timeout?: number },
+  ) => number;
+};
+
+let monacoPreloadPromise: Promise<typeof import("monaco-editor")> | null = null;
+
+function preloadMonaco() {
+  monacoPreloadPromise ??= import("monaco-editor").catch((error: unknown) => {
+    monacoPreloadPromise = null;
+    throw error;
+  });
+  return monacoPreloadPromise;
+}
+
+function preloadMonacoQuietly() {
+  void preloadMonaco().catch(() => undefined);
+}
+
+function canPreloadOptionalMonaco() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  const connection = (navigator as Navigator & { connection?: NetworkInformationLike }).connection;
+  return connection?.saveData !== true;
+}
+
+function scheduleOptionalMonacoPreload() {
+  if (typeof window === "undefined" || !canPreloadOptionalMonaco()) {
+    return undefined;
+  }
+
+  const idleWindow = window as WindowWithIdleCallback;
+  if (idleWindow.requestIdleCallback) {
+    const handle = idleWindow.requestIdleCallback(preloadMonacoQuietly, { timeout: 5000 });
+    return () => idleWindow.cancelIdleCallback?.(handle);
+  }
+
+  const handle = window.setTimeout(preloadMonacoQuietly, 3000);
+  return () => window.clearTimeout(handle);
+}
+
+function preloadOptionalMonaco() {
+  if (canPreloadOptionalMonaco()) {
+    preloadMonacoQuietly();
+  }
+}
+
 export function App() {
   const [initialBrowserRoute] = useState(() => currentBrowserRoute());
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
@@ -1021,6 +1077,15 @@ export function App() {
     (key, values) => translate(key, values, language),
     [language],
   );
+
+  useEffect(() => {
+    if (!canUseApp) {
+      return undefined;
+    }
+
+    return scheduleOptionalMonacoPreload();
+  }, [canUseApp]);
+
   const updateSidebarWidthFromClientX = useCallback((clientX: number) => {
     const sidebarLeft =
       workspaceSidebarRef.current?.getBoundingClientRect().left ?? 0;
@@ -3577,6 +3642,8 @@ export function App() {
       return;
     }
 
+    preloadOptionalMonaco();
+
     const file: OpenFileTab = {
       name: node.name,
       path: node.path,
@@ -3616,6 +3683,7 @@ export function App() {
     }
 
     selectWorkspaceFileTab(selectedFile, { updateUrl: false });
+    preloadOptionalMonaco();
     void loadWorkspaceFileEditor(selectedFile);
     return true;
   }
@@ -7463,6 +7531,10 @@ export function App() {
     },
   );
   const handleContextPanelTabChange = useStableCallback((tab: ContextPanelTab) => {
+    if (tab === "files") {
+      preloadOptionalMonaco();
+    }
+
     setContextPanelTab(tab);
     setIsContextPanelOpen(true);
   });
@@ -9923,6 +9995,7 @@ function MonacoFileEditor({
   const valueRef = useRef(value);
   const [previewEnabled, setPreviewEnabled] = useState(false);
   const [wordWrapEnabled, setWordWrapEnabled] = useState(false);
+  const [monacoError, setMonacoError] = useState<string | null>(null);
   const [isReloadConfirmOpen, setIsReloadConfirmOpen] = useState(false);
   const [isReloading, setIsReloading] = useState(false);
   const reloadConfirmTitleId = useId();
@@ -10037,48 +10110,55 @@ function MonacoFileEditor({
     let disposed = false;
     let cleanupEditor: (() => void) | null = null;
 
-    void import("monaco-editor").then((monaco) => {
-      if (disposed) {
-        return;
-      }
+    void preloadMonaco()
+      .then((monaco) => {
+        if (disposed) {
+          return;
+        }
 
-      registerTomlMonacoLanguage(monaco);
+        setMonacoError(null);
+        registerTomlMonacoLanguage(monaco);
 
-      const model = monaco.editor.createModel(
-        valueRef.current,
-        language,
-        monaco.Uri.parse(`file:///${path}`),
-      );
-      const editor = monaco.editor.create(container, {
-        automaticLayout: true,
-        fontSize: 13,
-        language,
-        minimap: { enabled: true },
-        model,
-        readOnly: false,
-        scrollBeyondLastLine: false,
-        theme: "vs",
-        wordWrap: wordWrapEnabled ? "on" : "off",
-      });
-      const changeDisposable = model.onDidChangeContent(() => {
-        if (!ignoreModelChangeRef.current) {
-          onChange(model.getValue());
+        const model = monaco.editor.createModel(
+          valueRef.current,
+          language,
+          monaco.Uri.parse(`file:///${path}`),
+        );
+        const editor = monaco.editor.create(container, {
+          automaticLayout: true,
+          fontSize: 13,
+          language,
+          minimap: { enabled: true },
+          model,
+          readOnly: false,
+          scrollBeyondLastLine: false,
+          theme: "vs",
+          wordWrap: wordWrapEnabled ? "on" : "off",
+        });
+        const changeDisposable = model.onDidChangeContent(() => {
+          if (!ignoreModelChangeRef.current) {
+            onChange(model.getValue());
+          }
+        });
+        editor.addCommand(
+          monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
+          () => {
+            onSave(editor.getValue());
+          },
+        );
+        editorRef.current = editor;
+        modelRef.current = model;
+        cleanupEditor = () => {
+          changeDisposable.dispose();
+          editor.dispose();
+          model.dispose();
+        };
+      })
+      .catch((loadError: unknown) => {
+        if (!disposed) {
+          setMonacoError(errorMessage(loadError));
         }
       });
-      editor.addCommand(
-        monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
-        () => {
-          onSave(editor.getValue());
-        },
-      );
-      editorRef.current = editor;
-      modelRef.current = model;
-      cleanupEditor = () => {
-        changeDisposable.dispose();
-        editor.dispose();
-        model.dispose();
-      };
-    });
 
     return () => {
       disposed = true;
@@ -10173,6 +10253,11 @@ function MonacoFileEditor({
           </>
         ) : null}
       </div>
+      {monacoError ? (
+        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {monacoError}
+        </div>
+      ) : null}
       <div
         aria-hidden={previewEnabled || undefined}
         className={`workspace-file-monaco ${previewEnabled ? "workspace-file-monaco-hidden" : ""}`}
@@ -10320,7 +10405,13 @@ function WorkspaceFilesTab({
 
       <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3">
         {response ? (
-          <div className="workspace-file-tree" role="tree">
+          <div
+            className="workspace-file-tree"
+            onFocusCapture={preloadOptionalMonaco}
+            onMouseEnter={preloadOptionalMonaco}
+            onPointerDown={preloadOptionalMonaco}
+            role="tree"
+          >
             <WorkspaceFileTreeNodeRow
               depth={0}
               expandedPaths={expandedPaths}
