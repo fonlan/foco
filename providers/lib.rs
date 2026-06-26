@@ -812,20 +812,13 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
         .count();
     let leading_system = leading_system_prompt(&request.messages[..leading_system_count])?;
 
-    let mut developer_parts = Vec::new();
     let mut messages = Vec::with_capacity(request.messages.len() - leading_system_count);
     for message in &request.messages[leading_system_count..] {
-        if message.role == NeutralChatRole::Developer {
-            validate_instruction_message(message, "developer")?;
-            developer_parts.push(message.content.clone());
-            continue;
-        }
-
         messages.push(genai_message(message)?);
     }
 
     let mut chat_request = ChatRequest::from_messages(messages);
-    if let Some(system) = combined_instruction_prompt(leading_system, developer_parts) {
+    if let Some(system) = leading_system {
         chat_request = chat_request.with_system(system);
     }
     if !request.tools.is_empty() {
@@ -849,23 +842,6 @@ fn leading_system_prompt(
     }
 
     Ok(Some(parts.join("\n\n")))
-}
-
-fn combined_instruction_prompt(
-    leading_system: Option<String>,
-    developer_parts: Vec<String>,
-) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(system) = leading_system {
-        parts.push(system);
-    }
-    parts.extend(developer_parts);
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n\n"))
-    }
 }
 
 fn validate_instruction_message(
@@ -1750,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn folds_developer_messages_into_genai_system() {
+    fn keeps_developer_messages_inline() {
         let request = neutral_request(vec![
             neutral_text_message(NeutralChatRole::System, "Base system."),
             neutral_text_message(NeutralChatRole::User, "User turn."),
@@ -1760,13 +1736,15 @@ mod tests {
 
         let chat_request = genai_chat_request(&request).expect("chat request");
 
-        assert_eq!(
-            chat_request.system.as_deref(),
-            Some("Base system.\n\nSkill instructions.")
-        );
-        assert_eq!(chat_request.messages.len(), 2);
+        assert_eq!(chat_request.system.as_deref(), Some("Base system."));
+        assert_eq!(chat_request.messages.len(), 3);
         assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::User);
-        assert_eq!(chat_request.messages[1].role, genai::chat::ChatRole::User);
+        assert_eq!(chat_request.messages[1].role, genai::chat::ChatRole::System);
+        assert_eq!(
+            chat_request.messages[1].content.first_text(),
+            Some("Skill instructions.")
+        );
+        assert_eq!(chat_request.messages[2].role, genai::chat::ChatRole::User);
     }
 
     #[test]
