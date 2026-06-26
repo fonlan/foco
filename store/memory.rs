@@ -24,12 +24,13 @@ pub use memory_records::{
 };
 use memory_schema::MemoryMigration;
 pub use memory_schema::{
-    GLOBAL_MEMORY_DREAM_SCHEMA_SQL, GLOBAL_MEMORY_SCHEMA_SQL, MEMORY_REFERENCES_SCHEMA_SQL,
-    WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
+    GLOBAL_MEMORY_DREAM_SCHEMA_SQL, GLOBAL_MEMORY_EXTRACTION_SKIPPED_STATUS_MIGRATION_SQL,
+    GLOBAL_MEMORY_SCHEMA_SQL, MEMORY_REFERENCES_SCHEMA_SQL, WORKSPACE_MEMORY_DREAM_SCHEMA_SQL,
+    WORKSPACE_MEMORY_SCHEMA_SQL,
 };
 
 pub const GLOBAL_MEMORY_DATABASE_FILE: &str = "memory.sqlite";
-pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 3;
+pub const GLOBAL_MEMORY_SCHEMA_VERSION: u32 = 4;
 
 const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[
     MemoryMigration {
@@ -43,6 +44,10 @@ const GLOBAL_MEMORY_MIGRATIONS: &[MemoryMigration] = &[
     MemoryMigration {
         version: 3,
         sql: MEMORY_REFERENCES_SCHEMA_SQL,
+    },
+    MemoryMigration {
+        version: 4,
+        sql: GLOBAL_MEMORY_EXTRACTION_SKIPPED_STATUS_MIGRATION_SQL,
     },
 ];
 
@@ -486,6 +491,7 @@ pub enum MemoryExtractionJobStatus {
     Running,
     Completed,
     Failed,
+    Skipped,
 }
 
 impl MemoryExtractionJobStatus {
@@ -495,6 +501,7 @@ impl MemoryExtractionJobStatus {
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Failed => "failed",
+            Self::Skipped => "skipped",
         }
     }
 
@@ -504,6 +511,7 @@ impl MemoryExtractionJobStatus {
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
+            "skipped" => Ok(Self::Skipped),
             _ => Err(MemoryDatabaseError::InvalidMemoryInput {
                 message: format!("unknown memory extraction job status: {value}"),
             }),
@@ -1161,6 +1169,7 @@ impl MemoryDatabase {
             .execute(
                 "UPDATE memory_extraction_jobs
                  SET status = 'running',
+                     output_json = NULL,
                      started_at = COALESCE(started_at, ?2),
                      completed_at = NULL,
                      error_message = NULL
@@ -1223,6 +1232,67 @@ impl MemoryDatabase {
             .map_err(|source| sqlite_error(&self.database_path, source))?;
 
         Ok(changed > 0)
+    }
+
+    pub fn retry_failed_extraction_job(
+        &mut self,
+        id: &str,
+        model_id: &str,
+    ) -> Result<bool, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        require_non_empty("model_id", model_id)?;
+        let now = now_timestamp();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE memory_extraction_jobs
+                 SET status = 'running',
+                     model_id = ?3,
+                     output_json = NULL,
+                     error_message = NULL,
+                     started_at = ?2,
+                     completed_at = NULL
+                 WHERE id = ?1 AND status = 'failed'",
+                params![id, now, model_id],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(changed > 0)
+    }
+
+    pub fn skip_failed_extraction_job(&mut self, id: &str) -> Result<bool, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        let now = now_timestamp();
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE memory_extraction_jobs
+                 SET status = 'skipped',
+                     completed_at = ?2
+                 WHERE id = ?1 AND status = 'failed'",
+                params![id, now],
+            )
+            .map_err(|source| sqlite_error(&self.database_path, source))?;
+
+        Ok(changed > 0)
+    }
+
+    pub fn extraction_job(
+        &self,
+        id: &str,
+    ) -> Result<Option<MemoryExtractionJobRecord>, MemoryDatabaseError> {
+        require_non_empty("id", id)?;
+        self.connection
+            .query_row(
+                "SELECT id, scope, chat_id, status, model_id, input_json, output_json,
+                        error_message, created_at, started_at, completed_at
+                 FROM memory_extraction_jobs
+                 WHERE id = ?1",
+                params![id],
+                memory_extraction_job_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.database_path, source))
     }
 
     pub fn extraction_jobs_for_scope(
@@ -4800,6 +4870,52 @@ mod tests {
             .expect("all failed jobs");
         assert_eq!(all_failed.len(), 1);
         assert_eq!(all_failed[0].id, "job-1");
+
+        assert!(
+            memory
+                .skip_failed_extraction_job("job-1")
+                .expect("mark skipped")
+        );
+        let skipped = memory
+            .extraction_job("job-1")
+            .expect("skipped job")
+            .expect("job exists");
+        assert_eq!(skipped.status, "skipped");
+        let failed_after_skip = memory
+            .extraction_jobs(Some(MemoryExtractionJobStatus::Failed), 10)
+            .expect("failed jobs after skip");
+        assert!(failed_after_skip.is_empty());
+
+        assert!(
+            memory
+                .retry_failed_extraction_job("job-1", "model-2")
+                .expect("retry skipped job ignored")
+                == false
+        );
+
+        memory
+            .insert_extraction_job(NewMemoryExtractionJob {
+                id: "job-2",
+                scope: MemoryScope::Chat,
+                chat_id: Some("chat-1"),
+                status: MemoryExtractionJobStatus::Failed,
+                model_id: Some("model-1"),
+                input_json: r#"{"safe":"ok"}"#,
+                output_json: None,
+                error_message: Some("provider failed"),
+            })
+            .expect("second failed job insert");
+        assert!(
+            memory
+                .retry_failed_extraction_job("job-2", "model-2")
+                .expect("retry failed job")
+        );
+        let retried = memory
+            .extraction_job("job-2")
+            .expect("retried job")
+            .expect("job exists");
+        assert_eq!(retried.status, "running");
+        assert_eq!(retried.model_id.as_deref(), Some("model-2"));
 
         assert!(
             memory

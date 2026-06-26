@@ -8,14 +8,15 @@ mod tools;
 pub(crate) use expiration::{apply_memory_expiration_to_fact, expire_due_memories};
 #[cfg(test)]
 pub(crate) use extraction::{
-    MemoryExtractionEvidenceCandidate, MemoryExtractionTask,
-    memory_extraction_existing_memory_candidates, memory_extraction_provider_request,
-    memory_extraction_target_status, parse_memory_extraction_output,
-    should_queue_memory_extraction, store_extracted_memory_facts, validate_extracted_memory_facts,
+    MemoryExtractionEvidenceCandidate, memory_extraction_existing_memory_candidates,
+    memory_extraction_provider_request, memory_extraction_target_status,
+    parse_memory_extraction_output, should_queue_memory_extraction, store_extracted_memory_facts,
+    validate_extracted_memory_facts,
 };
 pub(crate) use extraction::{
-    call_memory_retrieval_provider, memory_extraction_error_should_be_ignored,
-    memory_target_status_for_prompt, parse_memory_retrieval_output, queue_memory_extraction_job,
+    MemoryExtractionTask, call_memory_retrieval_provider,
+    memory_extraction_error_should_be_ignored, memory_target_status_for_prompt,
+    parse_memory_retrieval_output, queue_memory_extraction_job, run_memory_extraction_job,
 };
 pub(crate) use retrieval::{
     RetrievedMemoryFact, active_prompt_context_memory_keys, chat_extracted_memory_summary,

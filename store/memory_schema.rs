@@ -126,7 +126,7 @@ CREATE TABLE memory_extraction_jobs (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
     scope TEXT NOT NULL CHECK (scope IN ('workspace', 'chat')),
     chat_id TEXT REFERENCES chats(id) ON DELETE CASCADE,
-    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'skipped')),
     model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
     input_json TEXT NOT NULL,
     output_json TEXT,
@@ -326,7 +326,7 @@ CREATE TABLE memory_extraction_jobs (
     id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
     scope TEXT NOT NULL CHECK (scope = 'global'),
     chat_id TEXT CHECK (chat_id IS NULL),
-    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'skipped')),
     model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
     input_json TEXT NOT NULL,
     output_json TEXT,
@@ -335,6 +335,40 @@ CREATE TABLE memory_extraction_jobs (
     started_at TEXT,
     completed_at TEXT
 );
+
+CREATE INDEX memory_extraction_jobs_scope_status_idx ON memory_extraction_jobs (scope, status);
+CREATE INDEX memory_extraction_jobs_created_idx ON memory_extraction_jobs (created_at);
+"#;
+
+pub const GLOBAL_MEMORY_EXTRACTION_SKIPPED_STATUS_MIGRATION_SQL: &str = r#"
+PRAGMA legacy_alter_table = ON;
+
+ALTER TABLE memory_extraction_jobs RENAME TO memory_extraction_jobs_old;
+
+CREATE TABLE memory_extraction_jobs (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    scope TEXT NOT NULL CHECK (scope = 'global'),
+    chat_id TEXT CHECK (chat_id IS NULL),
+    status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'skipped')),
+    model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
+    input_json TEXT NOT NULL,
+    output_json TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT
+);
+
+INSERT INTO memory_extraction_jobs (
+    id, scope, chat_id, status, model_id, input_json, output_json,
+    error_message, created_at, started_at, completed_at
+)
+SELECT
+    id, scope, chat_id, status, model_id, input_json, output_json,
+    error_message, created_at, started_at, completed_at
+FROM memory_extraction_jobs_old;
+
+DROP TABLE memory_extraction_jobs_old;
 
 CREATE INDEX memory_extraction_jobs_scope_status_idx ON memory_extraction_jobs (scope, status);
 CREATE INDEX memory_extraction_jobs_created_idx ON memory_extraction_jobs (created_at);

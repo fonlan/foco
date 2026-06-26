@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use axum::{
     Json,
@@ -7,14 +10,17 @@ use axum::{
 use foco_store::memory::{
     MemoryDatabase, MemoryDreamChangeRecord, MemoryDreamChangeStatus, MemoryDreamJobRecord,
     MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
-    MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, MemoryScope, MemorySourceRecord,
-    MemoryStatus, NewMemoryFact, NewMemorySource, UpdateMemoryFact, UpdateMemorySource,
+    MemoryExtractionJobRecord, MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind,
+    MemoryScope, MemorySourceRecord, MemoryStatus, NewMemoryFact, NewMemorySource,
+    UpdateMemoryFact, UpdateMemorySource,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::memory_runtime::memory_extraction_error_should_be_ignored;
-use crate::memory_runtime::run_memory_dream_for_state;
+use crate::memory_runtime::{
+    MemoryExtractionTask, memory_extraction_error_should_be_ignored, run_memory_dream_for_state,
+    run_memory_extraction_job,
+};
 use crate::memory_runtime::{apply_memory_expiration_to_fact, expire_due_memories};
 use crate::*;
 
@@ -150,6 +156,33 @@ pub(crate) struct MemoryDreamJobsQuery {
 pub(crate) struct MemoryDreamChangesQuery {
     status: Option<String>,
     limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryExtractionJobActionRequest {
+    workspace_id: String,
+    job_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryExtractionJobInput {
+    workspace_id: String,
+    chat_id: String,
+    run_id: String,
+    user_message_id: String,
+    assistant_message_id: String,
+    extraction_model_id: String,
+    #[serde(default)]
+    chat_model_id: Option<String>,
+    target_status: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryExtractionJobActionResponse {
+    job: MemoryExtractionJobSummary,
 }
 
 #[derive(Debug, Serialize)]
@@ -434,6 +467,130 @@ pub(crate) async fn create_manual_memory(
     Ok(Json(MemoryMutationResponse { memory }))
 }
 
+pub(crate) async fn retry_memory_extraction_job(
+    State(state): State<AppState>,
+    Json(request): Json<MemoryExtractionJobActionRequest>,
+) -> Result<Json<MemoryExtractionJobActionResponse>, ApiError> {
+    let workspace_id = request.workspace_id.trim();
+    let job_id = request.job_id.trim();
+    if job_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "memory extraction job id must not be empty",
+        ));
+    }
+
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    WorkspaceDatabase::open_or_create(&workspace.path).map_err(ApiError::from_workspace_error)?;
+    let mut database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
+        .map_err(ApiError::from_memory_error)?;
+    let job = database
+        .extraction_job(job_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("memory extraction job was not found: {job_id}"))
+        })?;
+    if job.status != MemoryExtractionJobStatus::Failed.as_str() {
+        return Err(ApiError::conflict(
+            "only failed memory extraction jobs can be retried",
+        ));
+    }
+
+    let task = memory_extraction_task_from_job(
+        &job,
+        workspace_id,
+        workspace.path.clone(),
+        state.memory_database_file.clone(),
+        config,
+    )?;
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|_| ApiError::internal("memory extraction retry requires an async runtime"))?;
+    if !database
+        .retry_failed_extraction_job(job_id, &task.model_id)
+        .map_err(ApiError::from_memory_error)?
+    {
+        return Err(ApiError::conflict(
+            "memory extraction job is no longer failed",
+        ));
+    }
+    let job = database
+        .extraction_job(job_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("memory extraction job was not found: {job_id}"))
+        })?;
+    spawn_memory_extraction_retry(handle, task);
+
+    Ok(Json(MemoryExtractionJobActionResponse {
+        job: memory_extraction_job_summary(job),
+    }))
+}
+
+pub(crate) async fn skip_memory_extraction_job(
+    State(state): State<AppState>,
+    Json(request): Json<MemoryExtractionJobActionRequest>,
+) -> Result<Json<MemoryExtractionJobActionResponse>, ApiError> {
+    let workspace_id = request.workspace_id.trim();
+    let job_id = request.job_id.trim();
+    if job_id.is_empty() {
+        return Err(ApiError::bad_request(
+            "memory extraction job id must not be empty",
+        ));
+    }
+
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, workspace_id)?;
+    WorkspaceDatabase::open_or_create(&workspace.path).map_err(ApiError::from_workspace_error)?;
+    let mut database = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace.path))
+        .map_err(ApiError::from_memory_error)?;
+    let job = database
+        .extraction_job(job_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("memory extraction job was not found: {job_id}"))
+        })?;
+    if job.status != MemoryExtractionJobStatus::Failed.as_str() {
+        return Err(ApiError::conflict(
+            "only failed memory extraction jobs can be skipped",
+        ));
+    }
+    if !database
+        .skip_failed_extraction_job(job_id)
+        .map_err(ApiError::from_memory_error)?
+    {
+        return Err(ApiError::conflict(
+            "memory extraction job is no longer failed",
+        ));
+    }
+    let job = database
+        .extraction_job(job_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("memory extraction job was not found: {job_id}"))
+        })?;
+
+    Ok(Json(MemoryExtractionJobActionResponse {
+        job: memory_extraction_job_summary(job),
+    }))
+}
+
+fn spawn_memory_extraction_retry(handle: tokio::runtime::Handle, task: MemoryExtractionTask) {
+    handle.spawn(async move {
+        let job_id = task.job_id.clone();
+        let workspace_id = task.workspace_id.clone();
+        let chat_id = task.chat_id.clone();
+        if let Err(error) = run_memory_extraction_job(task).await {
+            tracing::warn!(
+                job_id = %job_id,
+                workspace_id = %workspace_id,
+                chat_id = %chat_id,
+                error = %error.message,
+                "memory extraction retry failed"
+            );
+        }
+    });
+}
+
 pub(crate) fn memory_extraction_job_summaries(
     scope: MemoryScope,
     database: &MemoryDatabase,
@@ -456,18 +613,72 @@ pub(crate) fn memory_extraction_job_summaries(
         .into_iter()
         .filter(|job| !memory_extraction_error_should_be_ignored(job.error_message.as_deref()))
         .take(limit as usize)
-        .map(|job| MemoryExtractionJobSummary {
-            id: job.id,
-            scope: job.scope,
-            chat_id: job.chat_id,
-            status: job.status,
-            model_id: job.model_id,
-            error_message: job.error_message,
-            created_at: job.created_at,
-            started_at: job.started_at,
-            completed_at: job.completed_at,
-        })
+        .map(memory_extraction_job_summary)
         .collect())
+}
+
+fn memory_extraction_job_summary(job: MemoryExtractionJobRecord) -> MemoryExtractionJobSummary {
+    MemoryExtractionJobSummary {
+        id: job.id,
+        scope: job.scope,
+        chat_id: job.chat_id,
+        status: job.status,
+        model_id: job.model_id,
+        error_message: job.error_message,
+        created_at: job.created_at,
+        started_at: job.started_at,
+        completed_at: job.completed_at,
+    }
+}
+
+pub(crate) fn memory_extraction_task_from_job(
+    job: &MemoryExtractionJobRecord,
+    workspace_id: &str,
+    workspace_path: PathBuf,
+    global_memory_database_file: PathBuf,
+    config: GlobalConfig,
+) -> Result<MemoryExtractionTask, ApiError> {
+    let input: MemoryExtractionJobInput =
+        serde_json::from_str(&job.input_json).map_err(|source| {
+            ApiError::bad_request(format!("memory extraction job input is invalid: {source}"))
+        })?;
+    let target_status =
+        MemoryStatus::parse(input.target_status.trim()).map_err(ApiError::from_memory_error)?;
+
+    if input.workspace_id != workspace_id {
+        return Err(ApiError::conflict(
+            "memory extraction job belongs to another workspace",
+        ));
+    }
+    if job.scope != MemoryScope::Chat.as_str()
+        || job.chat_id.as_deref() != Some(input.chat_id.as_str())
+    {
+        return Err(ApiError::conflict(
+            "memory extraction job target does not match its input",
+        ));
+    }
+
+    let model_id = config
+        .memory
+        .extraction_model_id
+        .as_deref()
+        .or(input.chat_model_id.as_deref())
+        .unwrap_or(&input.extraction_model_id)
+        .to_string();
+
+    Ok(MemoryExtractionTask {
+        job_id: job.id.clone(),
+        workspace_id: input.workspace_id,
+        workspace_path,
+        global_memory_database_file,
+        chat_id: input.chat_id,
+        run_id: input.run_id,
+        user_message_id: input.user_message_id,
+        assistant_message_id: input.assistant_message_id,
+        model_id,
+        target_status,
+        config,
+    })
 }
 
 pub(crate) fn refresh_memory_profile(

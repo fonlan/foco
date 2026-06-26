@@ -13820,6 +13820,35 @@ function SettingsPanel({
     }
   }
 
+  async function updateMemoryExtractionJob(jobId: string, action: "retry" | "skip") {
+    if (!memoryFilter.workspaceId) {
+      setError(t("Workspace is required"));
+      return;
+    }
+
+    setIsSavingMemory(true);
+    setError(null);
+
+    try {
+      await requestJson<{ job: MemoryExtractionJobSummary }>(
+        `/api/memory/extraction/${action}`,
+        {
+          body: JSON.stringify({
+            jobId,
+            workspaceId: memoryFilter.workspaceId,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      await loadMemories();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingMemory(false);
+    }
+  }
+
   async function saveModel(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setIsSaving(true);
@@ -17817,8 +17846,36 @@ function SettingsPanel({
                               </span>
                             ) : null}
                           </div>
-                          <div className="mt-2 text-sm font-semibold text-rose-700">
-                            {job.errorMessage ?? t("Memory extraction failed")}
+                          <div className="mt-2 flex flex-wrap items-start justify-between gap-2">
+                            <div className="min-w-0 flex-1 text-sm font-semibold text-rose-700">
+                              {job.errorMessage ?? t("Memory extraction failed")}
+                            </div>
+                            <div className="flex shrink-0 items-center gap-2">
+                              <button
+                                aria-label={t("Retry extraction")}
+                                className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                disabled={isSavingMemory}
+                                onClick={() =>
+                                  void updateMemoryExtractionJob(job.id, "retry")
+                                }
+                                title={t("Retry extraction")}
+                                type="button"
+                              >
+                                <Redo2 aria-hidden="true" className="size-3.5" />
+                              </button>
+                              <button
+                                aria-label={t("Skip extraction failure")}
+                                className="inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                disabled={isSavingMemory}
+                                onClick={() =>
+                                  void updateMemoryExtractionJob(job.id, "skip")
+                                }
+                                title={t("Skip extraction failure")}
+                                type="button"
+                              >
+                                <X aria-hidden="true" className="size-3.5" />
+                              </button>
+                            </div>
                           </div>
                           <div className="mt-1 text-xs text-stone-500">
                             {job.completedAt ?? job.startedAt ?? job.createdAt}

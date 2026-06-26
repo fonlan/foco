@@ -16,7 +16,7 @@ use foco_store::{
     config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PromptSettings, WebSearchSettings},
     memory::{
         MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
-        MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, NewMemoryDreamJob,
+        MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, MemoryStatus, NewMemoryDreamJob,
         NewMemoryExtractionJob, NewMemoryFact, NewMemorySource, UpdateMemoryFact,
     },
     workspace::{
@@ -34,7 +34,8 @@ use serde_json::json;
 use crate::http::{
     memory::{
         MemoryDreamChangesQuery, MemoryDreamJobsQuery, MemoryDreamRunRequest, memory_dream_changes,
-        memory_dream_job, memory_dream_jobs, memory_extraction_job_summaries, run_memory_dream,
+        memory_dream_job, memory_dream_jobs, memory_extraction_job_summaries,
+        memory_extraction_task_from_job, run_memory_dream,
     },
     settings::{
         IMAGE_AGENT_SYSTEM_PROMPT_NAME, associate_provider_with_local_models,
@@ -7533,6 +7534,74 @@ fn memory_list_summarizes_failed_extraction_jobs() {
         summaries[0].error_message.as_deref(),
         Some("memory extraction provider failed")
     );
+
+    drop(memory_database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn memory_extraction_retry_task_uses_current_extraction_model() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-memory-job-retry-task-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut config = GlobalConfig::first_run(workspace_dir.clone());
+    config.memory.extraction_model_id = Some("model-current".to_string());
+    let workspace_id = config.workspaces[0].id.clone();
+    {
+        let mut workspace_database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        workspace_database
+            .insert_chat("chat-1", "Retry extraction")
+            .expect("chat insert");
+    }
+    let mut memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+    let input_json = json!({
+        "trigger": "chat_completed",
+        "targetStatus": "pending",
+        "workspaceId": workspace_id,
+        "chatId": "chat-1",
+        "runId": "run-1",
+        "userMessageId": "user-1",
+        "assistantMessageId": "assistant-1",
+        "chatModelId": "model-chat",
+        "extractionModelId": "model-old"
+    })
+    .to_string();
+    memory_database
+        .insert_extraction_job(NewMemoryExtractionJob {
+            id: "job-1",
+            scope: MemoryScope::Chat,
+            chat_id: Some("chat-1"),
+            status: MemoryExtractionJobStatus::Failed,
+            model_id: Some("model-old"),
+            input_json: &input_json,
+            output_json: None,
+            error_message: Some("provider failed"),
+        })
+        .expect("failed job insert");
+
+    let job = memory_database
+        .extraction_job("job-1")
+        .expect("job lookup")
+        .expect("job exists");
+    let task = memory_extraction_task_from_job(
+        &job,
+        &workspace_id,
+        workspace_dir.clone(),
+        workspace_dir.join("memory.sqlite"),
+        config,
+    )
+    .expect("retry task");
+
+    assert_eq!(task.job_id, "job-1");
+    assert_eq!(task.workspace_id, workspace_id);
+    assert_eq!(task.chat_id, "chat-1");
+    assert_eq!(task.run_id, "run-1");
+    assert_eq!(task.user_message_id, "user-1");
+    assert_eq!(task.assistant_message_id, "assistant-1");
+    assert_eq!(task.model_id, "model-current");
+    assert_eq!(task.target_status, MemoryStatus::Pending);
 
     drop(memory_database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");

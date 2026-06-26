@@ -3140,6 +3140,104 @@ fn migrates_v16_memory_references_table() {
 }
 
 #[test]
+fn migrates_v18_memory_extraction_jobs_allow_skipped_status() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let database_path = workspace_database_path(workspace.path());
+    fs::create_dir_all(database_path.parent().expect("database parent")).expect("database parent");
+    let connection = Connection::open(&database_path).expect("v18 database");
+    connection
+        .execute_batch(&format!(
+            r#"CREATE TABLE chats (
+                id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+                title TEXT NOT NULL CHECK (length(title) > 0),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                archived_at TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{{}}'
+             );
+             {WORKSPACE_MEMORY_SCHEMA_SQL}
+             {WORKSPACE_MEMORY_DREAM_SCHEMA_SQL}
+             CREATE TABLE memory_references (
+                id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+                fact_id TEXT NOT NULL REFERENCES memory_facts(id) ON DELETE CASCADE,
+                reference_type TEXT NOT NULL CHECK (reference_type IN ('file_path', 'url', 'symbol', 'command', 'ticket', 'external_id')),
+                value TEXT NOT NULL CHECK (length(value) > 0),
+                normalized_value TEXT NOT NULL CHECK (length(normalized_value) > 0),
+                status TEXT NOT NULL CHECK (status IN ('valid', 'invalid', 'ambiguous', 'skipped')),
+                metadata_json TEXT NOT NULL DEFAULT '{{}}',
+                checked_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (fact_id, reference_type, normalized_value)
+             );
+             CREATE TABLE workspace_specs (
+                id TEXT PRIMARY KEY NOT NULL CHECK (id = 'default'),
+                enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                inject_enabled INTEGER NOT NULL CHECK (inject_enabled IN (0, 1)),
+                content_markdown TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision >= 0),
+                generated_at TEXT,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE workspace_spec_jobs (
+                id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+                trigger_type TEXT NOT NULL CHECK (trigger_type IN ('manual_initial', 'manual_refresh', 'chat_completed')),
+                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'skipped', 'failed')),
+                chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+                run_id TEXT CHECK (run_id IS NULL OR length(run_id) > 0),
+                model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
+                base_revision INTEGER CHECK (base_revision IS NULL OR base_revision >= 0),
+                input_summary_json TEXT NOT NULL DEFAULT '{{}}',
+                output_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT
+             );
+             CREATE TABLE chat_spec_snapshots (
+                chat_id TEXT PRIMARY KEY NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                spec_revision INTEGER NOT NULL CHECK (spec_revision >= 0),
+                content_markdown TEXT NOT NULL,
+                created_at TEXT NOT NULL
+             );
+             INSERT INTO chats (id, title, created_at, updated_at, metadata_json)
+             VALUES ('chat-1', 'Chat', '2026-06-26T00:00:00.000Z', '2026-06-26T00:00:00.000Z', '{{}}');
+             INSERT INTO memory_extraction_jobs (
+                id, scope, chat_id, status, model_id, input_json, output_json,
+                error_message, created_at, started_at, completed_at
+             ) VALUES (
+                'job-1', 'chat', 'chat-1', 'failed', 'model-1', '{{"safe":"ok"}}', NULL,
+                'provider failed', '2026-06-26T00:00:00.000Z', NULL, '2026-06-26T00:00:01.000Z'
+             );
+             PRAGMA user_version = 18;"#
+        ))
+        .expect("v18 schema");
+    drop(connection);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("migrated database");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+    drop(database);
+
+    let mut memory_database = MemoryDatabase::open_workspace_at(&database_path).expect("memory db");
+    assert!(
+        memory_database
+            .skip_failed_extraction_job("job-1")
+            .expect("skip failed extraction")
+    );
+    assert_eq!(
+        memory_database
+            .extraction_job("job-1")
+            .expect("job lookup")
+            .expect("job exists")
+            .status,
+        "skipped"
+    );
+}
+
+#[test]
 fn failed_agent_schema_migration_rolls_back_and_preserves_backup() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let database_path = workspace_database_path(workspace.path());

@@ -1204,6 +1204,14 @@ fn app_router(state: AppState) -> Router {
             get(crate::http::memory::memory_sources),
         )
         .route(
+            "/api/memory/extraction/retry",
+            post(crate::http::memory::retry_memory_extraction_job),
+        )
+        .route(
+            "/api/memory/extraction/skip",
+            post(crate::http::memory::skip_memory_extraction_job),
+        )
+        .route(
             "/api/memory/dream/run",
             post(crate::http::memory::run_memory_dream),
         )

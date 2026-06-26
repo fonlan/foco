@@ -54,12 +54,12 @@ pub use workspace_records::{
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
-    MIGRATION_014, MIGRATION_015, MIGRATION_018, Migration,
+    MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 18;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 19;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -174,6 +174,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 18,
         sql: MIGRATION_018,
+    },
+    Migration {
+        version: 19,
+        sql: MIGRATION_019,
     },
 ];
 
