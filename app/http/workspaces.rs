@@ -165,7 +165,10 @@ pub(crate) async fn workspace_file_blob(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CACHE_CONTROL, "private, max-age=60")
-        .header(header::CONTENT_SECURITY_POLICY, "default-src 'none'; img-src data:; style-src 'unsafe-inline'")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; img-src data:; style-src 'unsafe-inline'",
+        )
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .body(Body::from(bytes))
         .expect("workspace file blob response is valid"))
@@ -666,7 +669,10 @@ fn workspace_image_content_type(bytes: &[u8]) -> Result<&'static str, ApiError> 
     }
     if let Ok(text) = std::str::from_utf8(&bytes[..bytes.len().min(256)]) {
         let trimmed = text.trim_start();
-        if trimmed.starts_with("<?xml") || trimmed.starts_with("<svg") || trimmed.starts_with("<!DOCTYPE") {
+        if trimmed.starts_with("<?xml")
+            || trimmed.starts_with("<svg")
+            || trimmed.starts_with("<!DOCTYPE")
+        {
             return Ok("image/svg+xml");
         }
     }
@@ -683,7 +689,8 @@ mod tests {
     #[test]
     fn workspace_image_content_type_accepts_svg_only_as_image_text() {
         assert_eq!(
-            workspace_image_content_type(br#"  <svg xmlns="http://www.w3.org/2000/svg"></svg>"#).unwrap(),
+            workspace_image_content_type(br#"  <svg xmlns="http://www.w3.org/2000/svg"></svg>"#)
+                .unwrap(),
             "image/svg+xml"
         );
         assert!(workspace_image_content_type(b"plain text").is_err());
