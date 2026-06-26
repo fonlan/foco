@@ -1381,8 +1381,8 @@ body,
 
 .workspace-sidebar-splitter::before {
   position: absolute;
-  top: 0.5rem;
-  bottom: 0.5rem;
+  top: 0;
+  bottom: 0;
   right: 0;
   width: 1px;
   content: "";
