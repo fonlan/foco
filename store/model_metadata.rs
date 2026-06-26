@@ -31,6 +31,8 @@ pub struct ModelMetadataRecord {
     pub output_modalities: Vec<String>,
     pub supports_tools: bool,
     pub supports_cache: bool,
+    #[serde(default)]
+    pub reasoning: bool,
     pub source_url: String,
     pub refreshed_at: String,
 }
@@ -147,6 +149,7 @@ pub fn parse_models_dev_metadata(
                 output_modalities,
                 supports_tools: model.tool_call.unwrap_or(false),
                 supports_cache,
+                reasoning: model.reasoning.unwrap_or(false),
                 source_url: source_url.to_string(),
                 refreshed_at: fetched_at.to_string(),
             });
@@ -265,6 +268,7 @@ struct RawProvider {
 struct RawModel {
     id: Option<String>,
     name: Option<String>,
+    reasoning: Option<bool>,
     tool_call: Option<bool>,
     limit: Option<RawLimit>,
     cost: Option<RawCost>,
@@ -309,6 +313,7 @@ mod tests {
       "gpt-test": {
         "id": "gpt-test",
         "name": "GPT Test",
+        "reasoning": true,
         "tool_call": true,
         "limit": { "context": 128000, "output": 16384 },
         "cost": { "input": 1.25, "output": 10.0, "cache_read": 0.125 },
@@ -332,6 +337,7 @@ mod tests {
         assert_eq!(model.pricing.output, Some(10.0));
         assert!(model.supports_tools);
         assert!(model.supports_cache);
+        assert!(model.reasoning);
         assert_eq!(model.input_modalities, ["text", "image"]);
         assert_eq!(model.output_modalities, ["text"]);
         assert_eq!(model.source_url, MODELS_DEV_API_URL);

@@ -335,6 +335,24 @@ type ChatMessagesPaginationState = {
 };
 
 const OPENAI_RESPONSES_PROVIDER_KIND = "openai-responses";
+const MODEL_DEVELOPERS = [
+  "deepseek",
+  "alibaba",
+  "zai",
+  "openai",
+  "moonshot",
+  "anthropic",
+  "google",
+  "minimax",
+  "xiaomi",
+  "longcat",
+  "mistral",
+  "nvidia",
+  "xai",
+  "bytedance",
+  "stepfun",
+  "meta",
+];
 
 function saveWorkspaceSpecSettingsRequest(
   workspaceId: string,
@@ -11919,6 +11937,7 @@ function SettingsPanel({
   const [metadata, setMetadata] = useState<ModelMetadataResponse | null>(null);
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedMetadataKey, setSelectedMetadataKey] = useState("");
+  const [selectedModelDeveloper, setSelectedModelDeveloper] = useState("");
   const [modelSearch, setModelSearch] = useState("");
   const [form, setForm] = useState<ModelFormState>(() => emptyModelForm());
   const [providerForm, setProviderForm] = useState<ProviderFormState>(() =>
@@ -12076,6 +12095,7 @@ function SettingsPanel({
       null,
     [metadata, selectedMetadataKey],
   );
+  const modelDeveloperOptions = MODEL_DEVELOPERS;
   const inputModalityOptions = useMemo(
     () =>
       modelModalityOptions(
@@ -12117,6 +12137,18 @@ function SettingsPanel({
       )
       .slice(0, 80);
   }, [metadata, modelSearch]);
+  const developerModels = useMemo(
+    () => modelsForDeveloper(metadata?.models ?? [], selectedModelDeveloper).slice(0, 200),
+    [metadata, selectedModelDeveloper],
+  );
+  const developerModelOptions = useMemo(
+    () =>
+      developerModels.map((model) => ({
+        key: model.key,
+        value: modelIdForDeveloper(model, selectedModelDeveloper),
+      })),
+    [developerModels, selectedModelDeveloper],
+  );
   const modelOutputsText = form.outputModalities.includes("text");
   const enabledNeedsLimits =
     form.enabled &&
@@ -12295,6 +12327,9 @@ function SettingsPanel({
   }, [workspaceOrderPreview, workspaces]);
   const editingModel =
     configuredModels.find((model) => model.id === form.modelId) ?? null;
+  const modelThinkingEnabled = selectedMetadata
+    ? selectedMetadata.reasoning
+    : Boolean(editingModel?.supportsThinking);
   const editingWorkspace =
     workspaces.find((workspace) => workspace.id === workspaceForm.id) ?? null;
   const selectedProviderKind = providerKinds.find(
@@ -12722,6 +12757,67 @@ function SettingsPanel({
     }
   }, [loadSettings, workspaceDialogRevision]);
 
+  function matchedProviderIdsForModel(modelId: string) {
+    const normalizedModelId = modelId.trim();
+
+    if (!normalizedModelId) {
+      return [];
+    }
+
+    return providers
+      .filter((provider) => {
+        const modelList = providerModelLists[provider.id];
+        return (
+          modelList?.status === "ok" &&
+          modelList.models.some((providerModelId) => providerModelId === normalizedModelId)
+        );
+      })
+      .map((provider) => provider.id);
+  }
+
+  function formForMetadataModel(
+    model: ModelMetadataRecord,
+    current: ModelFormState,
+  ): ModelFormState {
+    const inputModalities = defaultModalities(model.inputModalities);
+    const outputModalities = defaultModalities(model.outputModalities);
+    const modelId = modelIdForDeveloper(
+      model,
+      selectedModelDeveloper || model.providerId,
+    );
+    const providerIds = matchedProviderIdsForModel(modelId);
+    const nextProviderIds = providerIds.length ? providerIds : current.providerIds;
+    const activeProviderId = nextProviderIds.includes(current.activeProviderId)
+      ? current.activeProviderId
+      : nextProviderIds[0] ?? "";
+
+    return {
+      ...current,
+      displayName: model.name,
+      enabled: outputModalitiesRequireLimits(outputModalities)
+        ? model.contextWindow !== null && model.maxOutputTokens !== null
+        : true,
+      modelId,
+      contextWindow: numberInputValue(model.contextWindow),
+      maxOutputTokens: numberInputValue(model.maxOutputTokens),
+      providerIds: nextProviderIds,
+      activeProviderId,
+      inputModalities,
+      outputModalities,
+      thinkingLevel: model.reasoning ? current.thinkingLevel || thinkingLevels[0]?.value || "" : "",
+      systemPromptName: current.systemPromptName || DEFAULT_SYSTEM_PROMPT_NAME,
+    };
+  }
+
+  function selectModelDeveloper(developer: string) {
+    setSelectedModelDeveloper(developer);
+    setSelectedMetadataKey("");
+    setForm((current) => ({
+      ...emptyModelForm(),
+      systemPromptName: current.systemPromptName || DEFAULT_SYSTEM_PROMPT_NAME,
+    }));
+  }
+
   function selectMetadataModel(key: string) {
     setSelectedMetadataKey(key);
     const model = metadata?.models.find((item) => item.key === key);
@@ -12730,22 +12826,8 @@ function SettingsPanel({
       return;
     }
 
-    setForm({
-      displayName: model.name,
-      enabled:
-        outputModalitiesRequireLimits(defaultModalities(model.outputModalities)) ?
-          model.contextWindow !== null && model.maxOutputTokens !== null
-        : true,
-      modelId: model.modelId,
-      contextWindow: numberInputValue(model.contextWindow),
-      maxOutputTokens: numberInputValue(model.maxOutputTokens),
-      providerIds: [],
-      activeProviderId: "",
-      inputModalities: defaultModalities(model.inputModalities),
-      outputModalities: defaultModalities(model.outputModalities),
-      thinkingLevel: "",
-      systemPromptName: DEFAULT_SYSTEM_PROMPT_NAME,
-    });
+    setSelectedModelDeveloper(model.providerId);
+    setForm((current) => formForMetadataModel(model, current));
     setIsModelDialogOpen(true);
   }
 
@@ -12756,11 +12838,15 @@ function SettingsPanel({
       return null;
     }
 
-    const models = metadata?.models ?? [];
+    const models = selectedModelDeveloper ? developerModels : metadata?.models ?? [];
 
     return (
       models.find((model) => model.key === normalizedModelId) ??
-      models.find((model) => model.modelId === normalizedModelId) ??
+      models.find(
+        (model) =>
+          modelIdForDeveloper(model, selectedModelDeveloper || model.providerId) ===
+          normalizedModelId,
+      ) ??
       null
     );
   }
@@ -12768,33 +12854,26 @@ function SettingsPanel({
   function updateModelId(modelId: string) {
     const model = modelMetadataForInput(modelId);
     setSelectedMetadataKey(model?.key ?? "");
+    if (model) {
+      setSelectedModelDeveloper(model.providerId);
+    }
 
     setForm((current) => {
       if (!model) {
         return {
           ...current,
           modelId,
+          thinkingLevel: "",
         };
       }
 
-      return {
-        ...current,
-        displayName: model.name,
-        enabled:
-          outputModalitiesRequireLimits(defaultModalities(model.outputModalities)) ?
-            model.contextWindow !== null && model.maxOutputTokens !== null
-          : true,
-        modelId: model.modelId,
-        contextWindow: numberInputValue(model.contextWindow),
-        maxOutputTokens: numberInputValue(model.maxOutputTokens),
-        inputModalities: defaultModalities(model.inputModalities),
-        outputModalities: defaultModalities(model.outputModalities),
-      };
+      return formForMetadataModel(model, current);
     });
   }
-
   function editConfiguredModel(model: ConfiguredModelSummary) {
     setSelectedMetadataKey(model.metadataKey ?? "");
+    const metadataModel = metadata?.models.find((item) => item.key === model.metadataKey);
+    setSelectedModelDeveloper(metadataModel?.providerId ?? "");
     setForm({
       displayName: model.displayName,
       enabled: model.enabled,
@@ -12805,7 +12884,9 @@ function SettingsPanel({
       activeProviderId: model.activeProviderId ?? "",
       inputModalities: defaultModalities(model.inputModalities),
       outputModalities: defaultModalities(model.outputModalities),
-      thinkingLevel: model.thinkingLevel ?? "",
+      thinkingLevel: model.supportsThinking
+        ? model.thinkingLevel ?? thinkingLevels[0]?.value ?? ""
+        : "",
       systemPromptName: model.systemPromptName || DEFAULT_SYSTEM_PROMPT_NAME,
     });
     setIsModelDialogOpen(true);
@@ -12813,6 +12894,7 @@ function SettingsPanel({
 
   function startAddingModel() {
     setSelectedMetadataKey("");
+    setSelectedModelDeveloper("");
     setForm(emptyModelForm());
     setIsModelDialogOpen(true);
   }
@@ -14001,6 +14083,42 @@ function SettingsPanel({
       setMetadata(data);
       await loadSettings();
       setIsModelDialogOpen(false);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function toggleConfiguredModelEnabled(
+    model: ConfiguredModelSummary,
+    enabled: boolean,
+  ) {
+    setIsSaving(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<ModelMetadataResponse>("/api/models/manual", {
+        body: JSON.stringify({
+          displayName: model.displayName,
+          enabled,
+          metadataKey: model.metadataKey,
+          modelId: model.id,
+          contextWindow: model.contextWindow,
+          maxOutputTokens: model.maxOutputTokens,
+          providerIds: model.providerIds,
+          activeProviderId: model.activeProviderId ?? "",
+          inputModalities: model.inputModalities,
+          outputModalities: model.outputModalities,
+          thinkingLevel: model.thinkingLevel,
+          clearThinkingLevel: !model.thinkingLevel,
+          systemPromptName: model.systemPromptName,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setMetadata(data);
+      await loadSettings();
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -20627,11 +20745,6 @@ function SettingsPanel({
                             ok
                             title={model.systemPromptName}
                           />
-                          <CapabilityPill
-                            className="shrink-0"
-                            label={model.enabled ? t("enabled") : t("disabled")}
-                            ok={model.enabled}
-                          />
                           {!model.canEnable ? (
                             <CapabilityPill
                               className="shrink-0"
@@ -20657,17 +20770,67 @@ function SettingsPanel({
                             title={model.activeProviderId ?? undefined}
                           />
                         </div>
-                        <button
-                          aria-label={t("Edit model {name}", {
-                            name: model.displayName,
-                          })}
-                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                          onClick={() => editConfiguredModel(model)}
-                          title={t("Edit model")}
-                          type="button"
-                        >
-                          <SlidersHorizontal aria-hidden="true" className="size-4" />
-                        </button>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <label
+                            className="relative inline-flex h-6 w-11 cursor-pointer items-center disabled:cursor-not-allowed"
+                            title={
+                              model.enabled
+                                ? t("Disable model {name}", {
+                                    name: model.displayName,
+                                  })
+                                : t("Enable model {name}", {
+                                    name: model.displayName,
+                                  })
+                            }
+                          >
+                            <input
+                              aria-label={
+                                model.enabled
+                                  ? t("Disable model {name}", {
+                                      name: model.displayName,
+                                    })
+                                  : t("Enable model {name}", {
+                                      name: model.displayName,
+                                    })
+                              }
+                              checked={model.enabled}
+                              className="peer sr-only"
+                              disabled={isSaving || (!model.canEnable && !model.enabled)}
+                              onChange={(event) =>
+                                void toggleConfiguredModelEnabled(
+                                  model,
+                                  event.target.checked,
+                                )
+                              }
+                              type="checkbox"
+                            />
+                            <span className="absolute inset-0 rounded-full bg-stone-200 transition peer-checked:bg-teal-700 peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
+                            <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
+                          </label>
+                          <button
+                            aria-label={t("Edit model {name}", {
+                              name: model.displayName,
+                            })}
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            onClick={() => editConfiguredModel(model)}
+                            title={t("Edit model")}
+                            type="button"
+                          >
+                            <SlidersHorizontal aria-hidden="true" className="size-4" />
+                          </button>
+                          <button
+                            aria-label={t("Delete model {name}", {
+                              name: model.displayName,
+                            })}
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                            disabled={isSaving}
+                            onClick={() => void deleteModel(model.id)}
+                            title={t("Delete model")}
+                            type="button"
+                          >
+                            <Trash2 aria-hidden="true" className="size-4" />
+                          </button>
+                        </div>
                       </div>
                     ))
                   ) : (
@@ -20688,7 +20851,7 @@ function SettingsPanel({
                   />
                   <form
                     aria-label={t("Model configuration")}
-                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,38rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(96vw,70rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
                     onSubmit={(event) => void saveModel(event)}
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
@@ -20708,315 +20871,352 @@ function SettingsPanel({
                           </div>
                         ) : null}
                       </div>
-                      <div className="flex shrink-0 gap-2">
-                        {editingModel ? (
-                          <button
-                            aria-label={t("Delete model")}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
-                            disabled={isSaving}
-                            onClick={() => void deleteModel(editingModel.id)}
-                            title={t("Delete model")}
-                            type="button"
-                          >
-                            <Trash2 aria-hidden="true" className="size-4" />
-                          </button>
-                        ) : null}
-                        <button
-                          aria-label={t("Close model configuration")}
-                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-                          onClick={() => setIsModelDialogOpen(false)}
-                          title={t("Close")}
-                          type="button"
-                        >
-                          <X aria-hidden="true" className="size-4" />
-                        </button>
-                      </div>
-                    </div>
-                    <div className="space-y-3">
-                      <TextField
-                        label={t("Model id")}
-                        onChange={updateModelId}
-                        placeholder="gpt-5.5"
-                        value={form.modelId}
-                      />
-                      <TextField
-                        label={t("Display name")}
-                        onChange={(value) =>
-                          setForm((current) => ({
-                            ...current,
-                            displayName: value,
-                          }))
-                        }
-                        placeholder="GPT 5.5"
-                        value={form.displayName}
-                      />
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <TextField
-                          inputMode="numeric"
-                          label={t("Context window")}
-                          onChange={(value) =>
-                            setForm((current) => ({
-                              ...current,
-                              contextWindow: value,
-                            }))
-                          }
-                          placeholder="128000"
-                          value={form.contextWindow}
-                        />
-                        <TextField
-                          inputMode="numeric"
-                          label={t("Max output tokens")}
-                          onChange={(value) =>
-                            setForm((current) => ({
-                              ...current,
-                              maxOutputTokens: value,
-                            }))
-                          }
-                          placeholder="16384"
-                          value={form.maxOutputTokens}
-                        />
-                      </div>
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                          <legend className="px-1 text-xs font-semibold text-stone-600">
-                            {t("Input types")}
-                          </legend>
-                          <div className="grid gap-2">
-                            {inputModalityOptions.map((modality) => (
-                              <label
-                                className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 text-sm font-medium text-stone-700"
-                                key={modality}
-                              >
-                                <span>{t(modality)}</span>
-                                <input
-                                  checked={form.inputModalities.includes(modality)}
-                                  className="size-4 accent-teal-700"
-                                  onChange={(event) =>
-                                    toggleModelModality(
-                                      "inputModalities",
-                                      modality,
-                                      event.target.checked,
-                                    )
-                                  }
-                                  type="checkbox"
-                                />
-                              </label>
-                            ))}
-                          </div>
-                        </fieldset>
-                        <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                          <legend className="px-1 text-xs font-semibold text-stone-600">
-                            {t("Output types")}
-                          </legend>
-                          <div className="grid gap-2">
-                            {outputModalityOptions.map((modality) => (
-                              <label
-                                className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 text-sm font-medium text-stone-700"
-                                key={modality}
-                              >
-                                <span>{t(modality)}</span>
-                                <input
-                                  checked={form.outputModalities.includes(modality)}
-                                  className="size-4 accent-teal-700"
-                                  onChange={(event) =>
-                                    toggleModelModality(
-                                      "outputModalities",
-                                      modality,
-                                      event.target.checked,
-                                    )
-                                  }
-                                  type="checkbox"
-                                />
-                              </label>
-                            ))}
-                          </div>
-                        </fieldset>
-                      </div>
-                      <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                        <span className="text-sm font-semibold text-stone-700">
-                          {t("Enable model")}
-                        </span>
-                        <input
-                          checked={form.enabled}
-                          className="size-4 accent-teal-700"
-                          onChange={(event) =>
-                            setForm((current) => ({
-                              ...current,
-                              enabled: event.target.checked,
-                            }))
-                          }
-                          type="checkbox"
-                        />
-                      </label>
-                      <div className="rounded-xl border border-stone-200 px-3 py-3">
-                        <div className="mb-2 flex items-center justify-between gap-2">
-                          <div className="text-xs font-semibold text-stone-600">
-                            {t("Providers")}
-                          </div>
-                          <button
-                            aria-label={t("Add provider")}
-                            className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                            onClick={startAddingProviderFromModel}
-                            title={t("Add provider")}
-                            type="button"
-                          >
-                            <Plus aria-hidden="true" className="size-4" />
-                          </button>
-                        </div>
-                        <div className="space-y-2">
-                          {providers.length ? (
-                            providers.map((provider) => (
-                              <label
-                                className="flex items-center justify-between gap-3 rounded-lg bg-stone-50/80 px-3 py-2"
-                                key={provider.id}
-                              >
-                                <span className="min-w-0">
-                                  <span className="block truncate text-sm font-semibold text-stone-700">
-                                    {provider.name}
-                                  </span>
-                                  <span className="block truncate text-xs text-stone-500">
-                                    {provider.kindLabel}
-                                  </span>
-                                </span>
-                                <input
-                                  checked={selectedProviderIds.has(provider.id)}
-                                  className="size-4 accent-teal-700"
-                                  onChange={(event) =>
-                                    toggleModelProvider(
-                                      provider.id,
-                                      event.target.checked,
-                                    )
-                                  }
-                                  type="checkbox"
-                                />
-                              </label>
-                            ))
-                          ) : (
-                            <button
-                              className="flex w-full items-center justify-between rounded-lg border border-dashed border-stone-300 bg-stone-50 px-3 py-3 text-left text-sm text-stone-500 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                              onClick={startAddingProviderFromModel}
-                              type="button"
-                            >
-                              <span>{t("No providers")}</span>
-                              <Plus aria-hidden="true" className="size-4" />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                      <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                          {t("Active provider")}
-                        </span>
-                        <select
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                          disabled={!form.providerIds.length}
-                          onChange={(event) =>
-                            setForm((current) => ({
-                              ...current,
-                              activeProviderId: event.target.value,
-                            }))
-                          }
-                          value={form.activeProviderId}
-                        >
-                          <option value="">{t("None")}</option>
-                          {form.providerIds.map((providerId) => {
-                            const provider = providers.find(
-                              (item) => item.id === providerId,
-                            );
-
-                            return (
-                              <option key={providerId} value={providerId}>
-                                {provider?.name ?? providerId}
-                              </option>
-                            );
-                          })}
-                        </select>
-                      </label>
-                      <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                          {t("Thinking level")}
-                        </span>
-                        <select
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                          onChange={(event) =>
-                            setForm((current) => ({
-                              ...current,
-                              thinkingLevel: event.target.value,
-                            }))
-                          }
-                          value={form.thinkingLevel}
-                        >
-                          <option value="">{t("None")}</option>
-                          {thinkingLevels.map((level) => (
-                            <option key={level.value} value={level.value}>
-                              {t(level.label)}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                          {t("System prompt")}
-                        </span>
-                        <select
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                          onChange={(event) =>
-                            setForm((current) => ({
-                              ...current,
-                              systemPromptName: event.target.value,
-                            }))
-                          }
-                          value={form.systemPromptName}
-                        >
-                          {savedSystemPrompts.map((prompt) => (
-                            <option key={prompt.name} value={prompt.name}>
-                              {prompt.name}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      {enabledNeedsLimits ? (
-                        <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                          <CircleAlert
-                            aria-hidden="true"
-                            className="size-4 shrink-0"
-                          />
-                          {t("Fill both limits before enabling.")}
-                        </div>
-                      ) : null}
                       <button
-                        aria-label={t("Save model")}
-                        className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
-                        disabled={
-                          isSaving ||
-                          enabledNeedsLimits ||
-                          !form.modelId.trim() ||
-                          !form.displayName.trim()
-                        }
-                        title={t("Save model")}
-                        type="submit"
+                        aria-label={t("Close model configuration")}
+                        className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        onClick={() => setIsModelDialogOpen(false)}
+                        title={t("Close")}
+                        type="button"
                       >
-                        {isSaving ? (
-                          <LoaderCircle
-                            aria-hidden="true"
-                            className="size-4 animate-spin"
-                          />
-                        ) : (
-                          <CheckCircle2 aria-hidden="true" className="size-4" />
-                        )}
+                        <X aria-hidden="true" className="size-4" />
                       </button>
                     </div>
 
-                    {selectedMetadata ? (
-                      <div className="mt-4 border-t border-stone-200 pt-4 text-xs text-stone-500">
-                        <div className="truncate">{selectedMetadata.key}</div>
-                        <div className="mt-1">
-                          {t("pricing in/out:")}{" "}
-                          {priceText(selectedMetadata.pricing.input)} /{" "}
-                          {priceText(selectedMetadata.pricing.output)}
+                    <div className="grid gap-4 lg:grid-cols-[minmax(0,1.05fr)_minmax(20rem,0.95fr)]">
+                      <div className="space-y-3">
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <label className="block">
+                            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                              {t("Model developer")}
+                            </span>
+                            <select
+                              className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                              onChange={(event) => selectModelDeveloper(event.target.value)}
+                              value={selectedModelDeveloper}
+                            >
+                              <option value="">{t("Select model developer")}</option>
+                              {modelDeveloperOptions.map((developer) => (
+                                <option key={developer} value={developer}>
+                                  {developer}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="block">
+                            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                              {t("Model id")}
+                            </span>
+                            <select
+                              className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                              disabled={!selectedModelDeveloper && !editingModel}
+                              onChange={(event) => updateModelId(event.target.value)}
+                              value={form.modelId}
+                            >
+                              <option value="">{t("Select model id")}</option>
+                              {developerModelOptions.map((model) => (
+                                <option key={model.key} value={model.value}>
+                                  {model.value}
+                                </option>
+                              ))}
+                              {editingModel &&
+                                form.modelId &&
+                                !developerModelOptions.some(
+                                  (model) => model.value === form.modelId,
+                                ) ? (
+                                <option value={form.modelId}>{form.modelId}</option>
+                              ) : null}
+                            </select>
+                          </label>
                         </div>
+
+                        {selectedModelDeveloper && !developerModels.length ? (
+                          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                            {t("No cached models for developer")}
+                          </div>
+                        ) : null}
+
+                        <TextField
+                          label={t("Display name")}
+                          onChange={(value) =>
+                            setForm((current) => ({
+                              ...current,
+                              displayName: value,
+                            }))
+                          }
+                          placeholder="GPT 5.5"
+                          value={form.displayName}
+                        />
+
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <TextField
+                            inputMode="numeric"
+                            label={t("Context window")}
+                            onChange={(value) =>
+                              setForm((current) => ({
+                                ...current,
+                                contextWindow: value,
+                              }))
+                            }
+                            placeholder="128000"
+                            value={form.contextWindow}
+                          />
+                          <TextField
+                            inputMode="numeric"
+                            label={t("Max output tokens")}
+                            onChange={(value) =>
+                              setForm((current) => ({
+                                ...current,
+                                maxOutputTokens: value,
+                              }))
+                            }
+                            placeholder="16384"
+                            value={form.maxOutputTokens}
+                          />
+                        </div>
+
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                            <legend className="px-1 text-xs font-semibold text-stone-600">
+                              {t("Input types")}
+                            </legend>
+                            <div className="grid gap-2">
+                              {inputModalityOptions.map((modality) => (
+                                <label
+                                  className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 text-sm font-medium text-stone-700"
+                                  key={modality}
+                                >
+                                  <span>{t(modality)}</span>
+                                  <input
+                                    checked={form.inputModalities.includes(modality)}
+                                    className="size-4 accent-teal-700"
+                                    onChange={(event) =>
+                                      toggleModelModality(
+                                        "inputModalities",
+                                        modality,
+                                        event.target.checked,
+                                      )
+                                    }
+                                    type="checkbox"
+                                  />
+                                </label>
+                              ))}
+                            </div>
+                          </fieldset>
+                          <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                            <legend className="px-1 text-xs font-semibold text-stone-600">
+                              {t("Output types")}
+                            </legend>
+                            <div className="grid gap-2">
+                              {outputModalityOptions.map((modality) => (
+                                <label
+                                  className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 text-sm font-medium text-stone-700"
+                                  key={modality}
+                                >
+                                  <span>{t(modality)}</span>
+                                  <input
+                                    checked={form.outputModalities.includes(modality)}
+                                    className="size-4 accent-teal-700"
+                                    onChange={(event) =>
+                                      toggleModelModality(
+                                        "outputModalities",
+                                        modality,
+                                        event.target.checked,
+                                      )
+                                    }
+                                    type="checkbox"
+                                  />
+                                </label>
+                              ))}
+                            </div>
+                          </fieldset>
+                        </div>
+
+                        {selectedMetadata ? (
+                          <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3 text-xs text-stone-600">
+                            <div className="truncate font-semibold text-stone-800">
+                              {t("Model metadata")}: {selectedMetadata.key}
+                            </div>
+                            <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                              <KeyValue label={t("Input")} value={priceText(selectedMetadata.pricing.input)} />
+                              <KeyValue label={t("Output")} value={priceText(selectedMetadata.pricing.output)} />
+                              <KeyValue label={t("Cache read")} value={priceText(selectedMetadata.pricing.cacheRead)} />
+                              <KeyValue label={t("Cache write")} value={priceText(selectedMetadata.pricing.cacheWrite)} />
+                              <KeyValue label={t("Reasoning")} value={priceText(selectedMetadata.pricing.reasoning)} />
+                            </div>
+                          </div>
+                        ) : null}
                       </div>
-                    ) : null}
+
+                      <div className="space-y-3">
+                        <div className="rounded-xl border border-stone-200 px-3 py-3">
+                          <div className="mb-2 flex items-center justify-between gap-2">
+                            <div className="text-xs font-semibold text-stone-600">
+                              {t("Providers")}
+                            </div>
+                            <button
+                              aria-label={t("Add provider")}
+                              className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                              onClick={startAddingProviderFromModel}
+                              title={t("Add provider")}
+                              type="button"
+                            >
+                              <Plus aria-hidden="true" className="size-4" />
+                            </button>
+                          </div>
+                          <div className="panel-scroll max-h-56 space-y-2 overflow-y-auto pr-1">
+                            {providers.length ? (
+                              providers.map((provider) => (
+                                <label
+                                  className="flex items-center justify-between gap-3 rounded-lg bg-stone-50/80 px-3 py-2"
+                                  key={provider.id}
+                                >
+                                  <span className="min-w-0">
+                                    <span className="block truncate text-sm font-semibold text-stone-700">
+                                      {provider.name}
+                                    </span>
+                                    <span className="block truncate text-xs text-stone-500">
+                                      {provider.kindLabel}
+                                    </span>
+                                  </span>
+                                  <input
+                                    aria-label={provider.name}
+                                    checked={selectedProviderIds.has(provider.id)}
+                                    className="size-4 accent-teal-700"
+                                    onChange={(event) =>
+                                      toggleModelProvider(
+                                        provider.id,
+                                        event.target.checked,
+                                      )
+                                    }
+                                    type="checkbox"
+                                  />
+                                </label>
+                              ))
+                            ) : (
+                              <button
+                                className="flex w-full items-center justify-between rounded-lg border border-dashed border-stone-300 bg-stone-50 px-3 py-3 text-left text-sm text-stone-500 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                onClick={startAddingProviderFromModel}
+                                type="button"
+                              >
+                                <span>{t("No providers")}</span>
+                                <Plus aria-hidden="true" className="size-4" />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        <label className="block">
+                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                            {t("Active provider")}
+                          </span>
+                          <select
+                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                            disabled={!form.providerIds.length}
+                            onChange={(event) =>
+                              setForm((current) => ({
+                                ...current,
+                                activeProviderId: event.target.value,
+                              }))
+                            }
+                            value={form.activeProviderId}
+                          >
+                            <option value="">{t("None")}</option>
+                            {form.providerIds.map((providerId) => {
+                              const provider = providers.find(
+                                (item) => item.id === providerId,
+                              );
+
+                              return (
+                                <option key={providerId} value={providerId}>
+                                  {provider?.name ?? providerId}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </label>
+
+                        <label className="block">
+                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                            {t("Thinking level")}
+                          </span>
+                          <select
+                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                            disabled={!modelThinkingEnabled}
+                            onChange={(event) =>
+                              setForm((current) => ({
+                                ...current,
+                                thinkingLevel: event.target.value,
+                              }))
+                            }
+                            value={modelThinkingEnabled ? form.thinkingLevel : ""}
+                          >
+                            {modelThinkingEnabled ? null : (
+                              <option value="">{t("None")}</option>
+                            )}
+                            {thinkingLevels.map((level) => (
+                              <option key={level.value} value={level.value}>
+                                {t(level.label)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+
+                        <label className="block">
+                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                            {t("System prompt")}
+                          </span>
+                          <select
+                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            onChange={(event) =>
+                              setForm((current) => ({
+                                ...current,
+                                systemPromptName: event.target.value,
+                              }))
+                            }
+                            value={form.systemPromptName}
+                          >
+                            {savedSystemPrompts.map((prompt) => (
+                              <option key={prompt.name} value={prompt.name}>
+                                {prompt.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+
+                        {enabledNeedsLimits ? (
+                          <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                            <CircleAlert
+                              aria-hidden="true"
+                              className="size-4 shrink-0"
+                            />
+                            {t("Fill both limits before enabling.")}
+                          </div>
+                        ) : null}
+
+                        <button
+                          aria-label={t("Save model")}
+                          className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                          disabled={
+                            isSaving ||
+                            enabledNeedsLimits ||
+                            (!editingModel && !selectedModelDeveloper) ||
+                            !form.modelId.trim() ||
+                            !form.displayName.trim()
+                          }
+                          title={t("Save model")}
+                          type="submit"
+                        >
+                          {isSaving ? (
+                            <LoaderCircle
+                              aria-hidden="true"
+                              className="size-4 animate-spin"
+                            />
+                          ) : (
+                            <CheckCircle2 aria-hidden="true" className="size-4" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
                   </form>
                 </>
               ) : null}
@@ -21802,6 +22002,19 @@ function SourceValueEditor({
           <code>{jsonSyntaxNodes(compactToolText(parsed.pretty))}</code>
         </div>
       )}
+    </div>
+  );
+}
+
+function KeyValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0 rounded-lg bg-white px-3 py-2">
+      <div className="truncate text-[11px] font-semibold uppercase text-stone-400">
+        {label}
+      </div>
+      <div className="mt-0.5 truncate text-sm font-semibold text-stone-800">
+        {value}
+      </div>
     </div>
   );
 }
@@ -23075,6 +23288,42 @@ function modelModalityOptions(
   ]);
 
   return values;
+}
+
+function modelsForDeveloper(models: ModelMetadataRecord[], developer: string) {
+  const normalizedDeveloper = normalizeDeveloperToken(developer);
+
+  if (!normalizedDeveloper) {
+    return [];
+  }
+
+  return models.filter((model) =>
+    normalizeDeveloperToken(model.key).startsWith(`${normalizedDeveloper}/`),
+  );
+}
+
+function modelIdForDeveloper(model: ModelMetadataRecord, developer: string) {
+  return stripDeveloperPrefix(
+    normalizeDeveloperToken(model.key).startsWith(`${normalizeDeveloperToken(developer)}/`)
+      ? model.key.slice(developer.length + 1)
+      : model.modelId,
+    developer,
+  );
+}
+
+function stripDeveloperPrefix(modelId: string, developer: string) {
+  const prefix = `${normalizeDeveloperToken(developer)}/`;
+  let value = modelId.trim();
+
+  while (normalizeDeveloperToken(value).startsWith(prefix)) {
+    value = value.slice(prefix.length);
+  }
+
+  return value;
+}
+
+function normalizeDeveloperToken(value: string) {
+  return value.trim().toLowerCase();
 }
 
 function normalizeModalities(modalities: string[]) {

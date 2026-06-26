@@ -1090,14 +1090,155 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByText("system prompt Default")).toBeInTheDocument();
     expect(screen.queryByText("limits ok")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Edit model GPT Test" }));
-    await userEvent.click(screen.getByRole("button", { name: "Delete model" }));
+    await userEvent.click(screen.getByRole("button", { name: "Delete model GPT Test" }));
 
     expect(confirmSpy).toHaveBeenCalledWith("Delete model confirmation");
     expect(fetchMock.mock.calls.some(([url]) => url === "/api/models/delete")).toBe(
       false,
     );
     confirmSpy.mockRestore();
+  });
+  it("prefills model details from the selected developer metadata", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+
+      if (path === "/api/model-metadata") {
+        return jsonResponse({
+          cachePath: "C:\\Users\\fonla\\.foco\\models.dev.json",
+          configuredModels: settings.configuredModels,
+          fetchedAt: "2026-06-05T10:00:00Z",
+          models: [
+            {
+              contextWindow: 200000,
+              inputModalities: ["text", "image", "pdf"],
+              key: "openai/o3",
+              maxOutputTokens: 100000,
+              modelId: "openai/o3",
+              name: "o3",
+              outputModalities: ["text"],
+              pricing: {
+                cacheRead: 0.5,
+                cacheWrite: null,
+                input: 2,
+                output: 8,
+                reasoning: null,
+              },
+              providerId: "openai",
+              providerName: "OpenAI",
+              reasoning: true,
+              refreshedAt: "2026-06-05T10:00:00Z",
+              sourceUrl: "https://models.dev/api.json",
+              supportsCache: true,
+              supportsTools: true,
+            },
+            {
+              contextWindow: 200000,
+              inputModalities: ["text"],
+              key: "anthropic/claude-test",
+              maxOutputTokens: 64000,
+              modelId: "claude-test",
+              name: "Claude Test",
+              outputModalities: ["text"],
+              pricing: {
+                cacheRead: null,
+                cacheWrite: null,
+                input: 5,
+                output: 25,
+                reasoning: null,
+              },
+              providerId: "anthropic",
+              providerName: "Anthropic",
+              reasoning: false,
+              refreshedAt: "2026-06-05T10:00:00Z",
+              sourceUrl: "https://models.dev/api.json",
+              supportsCache: false,
+              supportsTools: true,
+            },
+          ],
+          sourceUrl: "https://models.dev/api.json",
+        });
+      }
+
+      if (path === "/api/providers/models") {
+        return jsonResponse({ providerId: "openai", models: ["o3"] });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Providers" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Load provider models for OpenAI" }),
+    );
+    await screen.findByText("o3");
+
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add model" }));
+    await userEvent.selectOptions(screen.getByLabelText("Model developer"), "openai");
+    const modelIdSelect = screen.getByLabelText("Model id");
+    expect(within(modelIdSelect).getByRole("option", { name: "o3" })).toBeInTheDocument();
+    expect(
+      within(modelIdSelect).queryByRole("option", { name: "claude-test" }),
+    ).toBeNull();
+
+    await userEvent.selectOptions(modelIdSelect, "o3");
+
+    expect(screen.getByLabelText("Display name")).toHaveValue("o3");
+    expect(screen.getByLabelText("Context window")).toHaveValue("200000");
+    const inputTypes = screen.getByRole("group", { name: "Input types" });
+    expect(within(inputTypes).getByRole("checkbox", { name: "image" })).toBeChecked();
+    expect(screen.getByLabelText("Thinking level")).toHaveValue("low");
+    expect(screen.getByText("openai/o3")).toBeInTheDocument();
+    expect(screen.getByText("$2")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "OpenAI" })).toBeChecked();
+
+    await userEvent.click(screen.getByRole("button", { name: "Save model" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/models/manual",
+      );
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(saveCall![1]?.body as string)).toMatchObject({
+        contextWindow: 200000,
+        maxOutputTokens: 100000,
+        metadataKey: "openai/o3",
+        modelId: "o3",
+        providerIds: ["openai"],
+        activeProviderId: "openai",
+        thinkingLevel: "low",
+      });
+    });
+  });
+
+  it("toggles configured models from the model list", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "Disable model GPT Test" }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/models/manual",
+        expect.objectContaining({
+          body: expect.stringContaining('"enabled":false'),
+          method: "POST",
+        }),
+      );
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/models/manual",
+      expect.objectContaining({
+        body: expect.stringContaining('"modelId":"gpt-test"'),
+        method: "POST",
+      }),
+    );
   });
 
   it("saves provider, model, MCP server, and skill settings", async () => {
@@ -1174,10 +1315,8 @@ describe("app-settings verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Models" }));
     await userEvent.click(screen.getByRole("button", { name: "Add model" }));
-    await userEvent.type(screen.getByLabelText("Model id"), "created-model");
-    await userEvent.type(screen.getByLabelText("Display name"), "Created Model");
-    await userEvent.type(screen.getByLabelText("Context window"), "32000");
-    await userEvent.type(screen.getByLabelText("Max output tokens"), "2048");
+    await userEvent.selectOptions(screen.getByLabelText("Model developer"), "openai");
+    await userEvent.selectOptions(screen.getByLabelText("Model id"), "created-model");
     await userEvent.click(screen.getByRole("button", { name: "Save model" }));
 
     await waitFor(() => {
@@ -1278,13 +1417,8 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
     await userEvent.click(screen.getByRole("button", { name: "Models" }));
     await userEvent.click(screen.getByRole("button", { name: "Add model" }));
-    await userEvent.type(screen.getByLabelText("Model id"), "gpt-image-2");
-    await userEvent.type(screen.getByLabelText("Display name"), "GPT Image 2");
-    await userEvent.click(screen.getByRole("checkbox", { name: "Enable model" }));
-
-    const outputTypes = screen.getByRole("group", { name: "Output types" });
-    await userEvent.click(within(outputTypes).getByRole("checkbox", { name: "text" }));
-    await userEvent.click(within(outputTypes).getByRole("checkbox", { name: "image" }));
+    await userEvent.selectOptions(screen.getByLabelText("Model developer"), "openai");
+    await userEvent.selectOptions(screen.getByLabelText("Model id"), "gpt-image-2");
     await userEvent.click(screen.getByRole("button", { name: "Save model" }));
 
     await waitFor(() => {

@@ -699,10 +699,10 @@ export type ModelMetadataRecord = {
   outputModalities: string[];
   supportsTools: boolean;
   supportsCache: boolean;
+  reasoning: boolean;
   sourceUrl: string;
   refreshedAt: string;
 };
-
 export type ConfiguredModelSummary = {
   id: string;
   displayName: string;
