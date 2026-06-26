@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   activeMemory,
+  agentTeamSnapshot,
   aiStatistics,
   aiStatisticsDetail,
   appTestState,
@@ -28,6 +29,7 @@ import {
   settings,
   todoGraph,
   workspace,
+  workspaceFilesResponse,
   workspaceMemory,
   workspaceSpec,
   workspaceSpecQueuedJob,
@@ -173,6 +175,124 @@ describe("app-panels-stats verification surfaces", () => {
     return screen.findByRole("heading", { name: "Project Spec" });
   }
 
+  it("marks right panel refresh icons as loading after refresh clicks", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const heldRequests = {
+      agent: [] as Deferred<Response>[],
+      diff: [] as Deferred<Response>[],
+      files: [] as Deferred<Response>[],
+      spec: [] as Deferred<Response>[],
+    };
+    const holdNextRequest = {
+      agent: false,
+      diff: false,
+      files: false,
+      spec: false,
+    };
+
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/files" && holdNextRequest.files) {
+        const request = deferred<Response>();
+        heldRequests.files.push(request);
+        return request.promise;
+      }
+
+      if (path === "/api/workspaces/workspace-1/git/diff" && holdNextRequest.diff) {
+        const request = deferred<Response>();
+        heldRequests.diff.push(request);
+        return request.promise;
+      }
+
+      if (path === "/api/workspaces/workspace-1/spec" && holdNextRequest.spec) {
+        const request = deferred<Response>();
+        heldRequests.spec.push(request);
+        return request.promise;
+      }
+
+      if (
+        path === "/api/workspaces/workspace-1/chats/chat-1/agent-team" &&
+        holdNextRequest.agent
+      ) {
+        const request = deferred<Response>();
+        heldRequests.agent.push(request);
+        return request.promise;
+      }
+
+      return mockFetch(input, init);
+    });
+
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    const expectRefreshIconLoading = async (buttonName: string) => {
+      const button = screen.getByRole("button", { name: buttonName });
+      await waitFor(() => expect(button).toBeDisabled());
+      const icon = button.querySelector("svg");
+      if (!(icon instanceof SVGElement)) {
+        throw new Error(`${buttonName} refresh icon was not rendered`);
+      }
+      expect(icon).toHaveClass("lucide-refresh-cw");
+      expect(icon).toHaveClass("context-refresh-icon");
+      expect(icon).toHaveAttribute("data-loading", "true");
+    };
+
+    await screen.findAllByText("Default");
+
+    await userEvent.click(screen.getByRole("tab", { name: "Files" }));
+    await screen.findByText("Workspace file tree");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Refresh files" })).not.toBeDisabled(),
+    );
+    holdNextRequest.files = true;
+    await userEvent.click(screen.getByRole("button", { name: "Refresh files" }));
+    await waitFor(() => expect(heldRequests.files).toHaveLength(1));
+    await expectRefreshIconLoading("Refresh files");
+    await act(async () => {
+      heldRequests.files[0]?.resolve(jsonResponse(workspaceFilesResponse));
+    });
+
+    await userEvent.click(screen.getByRole("tab", { name: "Git" }));
+    await screen.findByText("Source Control");
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Refresh diff" })).not.toBeDisabled(),
+    );
+    holdNextRequest.diff = true;
+    await userEvent.click(screen.getByRole("button", { name: "Refresh diff" }));
+    await waitFor(() => expect(heldRequests.diff).toHaveLength(1));
+    await expectRefreshIconLoading("Refresh diff");
+    await act(async () => {
+      heldRequests.diff[0]?.resolve(jsonResponse(appTestState.workspaceGitDiffResponse));
+    });
+
+    await userEvent.click(screen.getByRole("tab", { name: "Spec" }));
+    await screen.findByRole("heading", { name: "Project Spec" });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Reload spec" })).not.toBeDisabled(),
+    );
+    holdNextRequest.spec = true;
+    await userEvent.click(screen.getByRole("button", { name: "Reload spec" }));
+    await waitFor(() => expect(heldRequests.spec).toHaveLength(1));
+    await expectRefreshIconLoading("Reload spec");
+    await act(async () => {
+      heldRequests.spec[0]?.resolve(jsonResponse(appTestState.workspaceSpecResponse));
+    });
+
+    await userEvent.click(screen.getByRole("tab", { name: "Agents" }));
+    const agentRefreshButton = await screen.findByRole("button", { name: "Refresh" });
+    await waitFor(() => expect(agentRefreshButton).not.toBeDisabled());
+    holdNextRequest.agent = true;
+    await userEvent.click(agentRefreshButton);
+    await waitFor(() => expect(heldRequests.agent).toHaveLength(1));
+    await expectRefreshIconLoading("Refresh");
+    await act(async () => {
+      heldRequests.agent[0]?.resolve(jsonResponse(agentTeamSnapshot));
+    });
+  });
   it("loads the Project Spec tab in the right panel", async () => {
     await openSpecPanel();
 

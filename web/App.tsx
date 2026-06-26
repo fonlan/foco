@@ -10304,7 +10304,11 @@ function WorkspaceFilesTab({
           title={t("Refresh files")}
           type="button"
         >
-          <RefreshCw aria-hidden="true" className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
+          <RefreshCw
+            aria-hidden="true"
+            className="context-refresh-icon size-4"
+            data-loading={isLoading ? "true" : undefined}
+          />
         </button>
       </div>
 
@@ -10785,7 +10789,11 @@ function ContextSpecTab({
           title={t("Reload spec")}
           type="button"
         >
-          <RefreshCw aria-hidden="true" className={`size-4 ${isLoading ? "animate-spin" : ""}`} />
+          <RefreshCw
+            aria-hidden="true"
+            className="context-refresh-icon size-4"
+            data-loading={isLoading ? "true" : undefined}
+          />
         </button>
       </div>
 
@@ -10870,7 +10878,11 @@ function ContextSpecTab({
               onClick={onReload}
               type="button"
             >
-              <RefreshCw aria-hidden="true" className="size-3.5" />
+              <RefreshCw
+                aria-hidden="true"
+                className="context-refresh-icon size-3.5"
+                data-loading={isLoading ? "true" : undefined}
+              />
               {t("Reload spec")}
             </button>
           </div>
@@ -11357,11 +11369,11 @@ function SourceControlPanel({
           title={t("Refresh diff")}
           type="button"
         >
-          {isLoading ? (
-            <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-          ) : (
-            <RefreshCw aria-hidden="true" className="size-4" />
-          )}
+          <RefreshCw
+            aria-hidden="true"
+            className="context-refresh-icon size-4"
+            data-loading={isLoading ? "true" : undefined}
+          />
         </button>
       </div>
 

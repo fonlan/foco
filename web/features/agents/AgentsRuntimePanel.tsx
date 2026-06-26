@@ -64,7 +64,8 @@ export function AgentsRuntimePanel({
         >
           <RefreshCw
             aria-hidden="true"
-            className={`size-4 ${isLoading ? "animate-spin" : ""}`}
+            className="context-refresh-icon size-4"
+            data-loading={isLoading ? "true" : undefined}
           />
         </button>
       </div>
