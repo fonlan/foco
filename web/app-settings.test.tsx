@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   activeMemory,
+  agentDefinitions,
   appTestState,
   changeInput,
   chatMemory,
@@ -1141,7 +1142,47 @@ describe("app-settings verification surfaces", () => {
   }, 10000);
 
   it("saves image-output models without text token limits", async () => {
-    const fetchMock = vi.mocked(fetch);
+    const imageAgentDefinition = {
+      ...agentDefinitions.agentDefinitions[0],
+      allowedExecutionWorkspaceModes: ["shared"],
+      allowedTools: ["image_gen", "ask_question", "read_file", "find_files"],
+      description: "Built-in agent dedicated to generating images with an image-output model.",
+      id: "agent-definition-image-gen",
+      maxInstances: 1,
+      modelId: "gpt-test",
+      name: "Image generation agent",
+      permissions: {
+        allowedAgentDefinitionIds: [],
+        canCreateInstances: false,
+        canDelegate: false,
+      },
+      providerId: "openai",
+      systemPrompt: "Use image_gen with model \"gpt-image-2\".",
+    };
+    let imageModelSaved = false;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.split("?")[0];
+
+      if (path === "/api/models/manual") {
+        imageModelSaved = true;
+        return mockFetch(input, init);
+      }
+
+      if (path === "/api/agent-definitions") {
+        return jsonResponse({
+          agentDefinitions: imageModelSaved
+            ? [...agentDefinitions.agentDefinitions, imageAgentDefinition]
+            : agentDefinitions.agentDefinitions,
+          defaultRolePrompts: imageModelSaved
+            ? { [imageAgentDefinition.id]: imageAgentDefinition.systemPrompt }
+            : {},
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
@@ -1171,6 +1212,9 @@ describe("app-settings verification surfaces", () => {
         systemPromptName: "Default",
       });
     });
+
+    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    expect(await screen.findByText("Image generation agent")).toBeInTheDocument();
   });
 
 });

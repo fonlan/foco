@@ -7248,7 +7248,8 @@ export function App() {
   const handleSettingsPanelSettingsChange = useCallback((data: SettingsResponse) => {
     setSettings(data);
     setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
-  }, []);
+    void loadAgentDefinitions();
+  }, [loadAgentDefinitions]);
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
