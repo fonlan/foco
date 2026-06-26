@@ -713,11 +713,11 @@ function terminalStatusClass(status: "closed" | "connected" | "connecting" | "er
   const base = "rounded-md px-1.5 py-0.5 text-[11px] font-semibold";
 
   if (status === "connected") {
-    return `${base} bg-teal-100 text-teal-800`;
+    return `${base} bg-emerald-100 text-emerald-800`;
   }
 
   if (status === "connecting") {
-    return `${base} bg-stone-200 text-stone-700`;
+    return `${base} bg-amber-100 text-amber-800`;
   }
 
   if (status === "error") {

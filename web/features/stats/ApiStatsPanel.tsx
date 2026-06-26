@@ -1069,15 +1069,19 @@ function auditStatusClass(status: string) {
   const base = "inline-flex rounded-md px-2 py-1 text-xs font-semibold";
 
   if (status === "succeeded" || status === "completed") {
-    return `${base} bg-teal-100 text-teal-800`;
+    return `${base} bg-emerald-100 text-emerald-800`;
   }
 
   if (status === "failed") {
     return `${base} bg-rose-100 text-rose-700`;
   }
 
-  if (status === "cancelled") {
+  if (status === "running") {
     return `${base} bg-amber-100 text-amber-800`;
+  }
+
+  if (status === "cancelled") {
+    return `${base} bg-stone-100 text-stone-600`;
   }
 
   return `${base} bg-stone-100 text-stone-600`;

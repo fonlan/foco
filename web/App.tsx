@@ -24429,7 +24429,7 @@ function taskStatusClass(status: TaskStatus) {
     return `${base} bg-amber-100 text-amber-800`;
   }
 
-  if (status === "failed" || status === "cancelled") {
+  if (status === "failed") {
     return `${base} bg-rose-100 text-rose-700`;
   }
 

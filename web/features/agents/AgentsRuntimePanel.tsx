@@ -231,30 +231,30 @@ function agentStatusPresentation(status: string): {
     case "running":
       return {
         animate: true,
-        className: "border-sky-200 bg-sky-100 text-sky-700",
+        className: "border-amber-200 bg-amber-100 text-amber-700",
         icon: LoaderCircle,
-        textClassName: "text-sky-700",
+        textClassName: "text-amber-700",
       };
     case "waiting":
       return {
         animate: false,
-        className: "border-violet-200 bg-violet-100 text-violet-700",
+        className: "border-amber-200 bg-amber-100 text-amber-700",
         icon: Hourglass,
-        textClassName: "text-violet-700",
+        textClassName: "text-amber-700",
       };
     case "paused":
       return {
         animate: false,
-        className: "border-amber-200 bg-amber-100 text-amber-700",
+        className: "border-stone-200 bg-stone-100 text-stone-600",
         icon: CirclePause,
-        textClassName: "text-amber-700",
+        textClassName: "text-stone-600",
       };
     case "draining":
       return {
         animate: false,
-        className: "border-orange-200 bg-orange-100 text-orange-700",
+        className: "border-amber-200 bg-amber-100 text-amber-700",
         icon: Activity,
-        textClassName: "text-orange-700",
+        textClassName: "text-amber-700",
       };
     case "stopped":
       return {

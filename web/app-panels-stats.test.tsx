@@ -945,6 +945,59 @@ describe("app-panels-stats verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("uses semantic colors for API request status pills", async () => {
+    const requests = ["succeeded", "failed", "running", "cancelled"].map(
+      (finalState, index) => ({
+        ...aiStatistics.requests[0],
+        finalState,
+        id: `request-status-${index}`,
+      }),
+    );
+
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/ai-statistics") {
+        return Promise.resolve(jsonResponse({
+          ...aiStatistics,
+          page: 1,
+          requests,
+          totalCount: requests.length,
+          totalPages: 1,
+        }));
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    const table = await screen.findByRole("table");
+
+    expect(within(table).getByText("succeeded")).toHaveClass(
+      "bg-emerald-100",
+      "text-emerald-800",
+    );
+    expect(within(table).getByText("failed")).toHaveClass(
+      "bg-rose-100",
+      "text-rose-700",
+    );
+    expect(within(table).getByText("running")).toHaveClass(
+      "bg-amber-100",
+      "text-amber-800",
+    );
+    expect(within(table).getByText("cancelled")).toHaveClass(
+      "bg-stone-100",
+      "text-stone-600",
+    );
+  });
+
   it("loads API details from the stats URL page", async () => {
     window.history.replaceState(null, "", "/stats?page=2");
 
