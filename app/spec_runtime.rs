@@ -19,12 +19,14 @@ use serde_json::{Value, json};
 use crate::{
     ApiError, AppState, PreparedChatContext, api_audit_save_details, audited_provider_tool_request,
     config_snapshot, neutral_text_message, provider_connection_config, unique_id, workspace_by_id,
+    xml_cdata_section,
 };
 
 const WORKSPACE_SPEC_TOOL_NAME: &str = "submit_workspace_spec";
 const WORKSPACE_SPEC_UPDATE_TOOL_NAME: &str = "submit_workspace_spec_update";
 const WORKSPACE_SPEC_TIMEOUT_MS: u64 = 120_000;
 const WORKSPACE_SPEC_MAX_OUTPUT_TOKENS: u32 = 4_000;
+const WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES: usize = 56 * 1024;
 const WORKSPACE_SPEC_FILE_SUMMARY_LIMIT: i64 = 24;
 const WORKSPACE_SPEC_SYMBOL_LIMIT: i64 = 48;
 const WORKSPACE_SPEC_MEMORY_PROFILE_LIMIT: u32 = 4;
@@ -333,6 +335,17 @@ async fn run_workspace_spec_job_inner(
     )
     .await?;
     let content_markdown = parse_workspace_spec_output(tool_arguments)?;
+    let content_markdown = ensure_workspace_spec_markdown_fits_limit(
+        config,
+        &prepared.workspace_path,
+        &prepared.workspace_id,
+        &prepared.provider_id,
+        &prepared.provider_config,
+        &prepared.request.model_id,
+        prepared.request.max_output_tokens,
+        &content_markdown,
+    )
+    .await?;
     let result = apply_workspace_spec_job_output(
         &prepared.workspace_path,
         &prepared.job_id,
@@ -411,11 +424,23 @@ async fn run_workspace_spec_update_job_inner(
     )
     .await?;
 
-    let result = apply_workspace_spec_update_job_output(
+    let update_output = parse_workspace_spec_update_output(tool_arguments)?;
+    let update_output = ensure_workspace_spec_update_fits_limit(
+        config,
+        workspace_path,
+        workspace_id,
+        &model.provider_id,
+        &model.provider_config,
+        &model.model_id,
+        model.max_output_tokens,
+        update_output,
+    )
+    .await?;
+    let result = apply_workspace_spec_update_job_parsed_output(
         workspace_path,
         &job.id,
         base_revision,
-        tool_arguments,
+        update_output,
     );
     if result.is_ok() {
         log_workspace_spec_job_status_at_path(workspace_path, workspace_id, &job.id);
@@ -429,7 +454,21 @@ pub(crate) fn apply_workspace_spec_update_job_output(
     base_revision: u64,
     value: Value,
 ) -> Result<(), ApiError> {
-    match parse_workspace_spec_update_output(value)? {
+    apply_workspace_spec_update_job_parsed_output(
+        workspace_path,
+        job_id,
+        base_revision,
+        parse_workspace_spec_update_output(value)?,
+    )
+}
+
+fn apply_workspace_spec_update_job_parsed_output(
+    workspace_path: &std::path::Path,
+    job_id: &str,
+    base_revision: u64,
+    output: WorkspaceSpecUpdateOutput,
+) -> Result<(), ApiError> {
+    match output {
         WorkspaceSpecUpdateOutput::NoUpdateNeeded => {
             let mut database = WorkspaceDatabase::open_or_create(workspace_path)
                 .map_err(ApiError::from_workspace_error)?;
@@ -604,6 +643,134 @@ pub(crate) fn apply_workspace_spec_job_output(
     }
 
     Ok(())
+}
+
+async fn ensure_workspace_spec_update_fits_limit(
+    config: &GlobalConfig,
+    workspace_path: &std::path::Path,
+    workspace_id: &str,
+    provider_id: &str,
+    provider_config: &ProviderConnectionConfig,
+    model_id: &str,
+    max_output_tokens: u32,
+    output: WorkspaceSpecUpdateOutput,
+) -> Result<WorkspaceSpecUpdateOutput, ApiError> {
+    match output {
+        WorkspaceSpecUpdateOutput::NoUpdateNeeded => Ok(WorkspaceSpecUpdateOutput::NoUpdateNeeded),
+        WorkspaceSpecUpdateOutput::FullReplacementMarkdown(content_markdown) => {
+            ensure_workspace_spec_markdown_fits_limit(
+                config,
+                workspace_path,
+                workspace_id,
+                provider_id,
+                provider_config,
+                model_id,
+                Some(max_output_tokens),
+                &content_markdown,
+            )
+            .await
+            .map(WorkspaceSpecUpdateOutput::FullReplacementMarkdown)
+        }
+    }
+}
+
+async fn ensure_workspace_spec_markdown_fits_limit(
+    config: &GlobalConfig,
+    workspace_path: &std::path::Path,
+    workspace_id: &str,
+    provider_id: &str,
+    provider_config: &ProviderConnectionConfig,
+    model_id: &str,
+    max_output_tokens: Option<u32>,
+    content_markdown: &str,
+) -> Result<String, ApiError> {
+    if content_markdown.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
+        return Ok(content_markdown.to_string());
+    }
+
+    let original_bytes = content_markdown.len();
+    tracing::warn!(
+        workspace_id = %workspace_id,
+        content_bytes = original_bytes,
+        max_bytes = WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        target_bytes = WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES,
+        "workspace spec exceeded size limit; requesting compaction"
+    );
+
+    let request =
+        workspace_spec_compaction_provider_request(model_id, max_output_tokens, content_markdown);
+    let tool_arguments = audited_provider_tool_request(
+        workspace_path,
+        workspace_id,
+        None,
+        provider_id,
+        provider_config,
+        request,
+        "workspace spec compaction",
+        WORKSPACE_SPEC_TOOL_NAME,
+        "submit compacted workspace spec tool",
+        WORKSPACE_SPEC_TIMEOUT_MS,
+        config.app.llm_request_retry_count,
+        api_audit_save_details(config),
+    )
+    .await?;
+    let compacted = parse_workspace_spec_output(tool_arguments)?;
+    if compacted.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
+        return Ok(compacted);
+    }
+
+    Err(ApiError::bad_request(workspace_spec_markdown_limit_error(
+        original_bytes,
+        Some(compacted.len()),
+    )))
+}
+
+fn workspace_spec_compaction_provider_request(
+    model_id: &str,
+    max_output_tokens: Option<u32>,
+    content_markdown: &str,
+) -> NeutralChatRequest {
+    let system_prompt = format!(
+        "Compress the provided Project Spec Markdown into a complete replacement document. \
+Preserve the existing language and section shape. Preserve durable product behavior, architecture, runtime flows, data contracts, commands, settings, UI contracts, agent/tool contracts, operational constraints, and open questions. \
+Omit low-value details such as long file lists, exhaustive symbol lists, repeated facts, transient task history, implementation blow-by-blow notes, and UI copy minutiae unless they define a contract. \
+Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec tool exactly once."
+    );
+    NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages: vec![
+            neutral_text_message(NeutralChatRole::System, system_prompt),
+            neutral_text_message(
+                NeutralChatRole::User,
+                format!(
+                    "Current Project Spec Markdown is {} bytes. Compact it below the target.\n{}",
+                    content_markdown.len(),
+                    xml_cdata_section("content_markdown", content_markdown)
+                ),
+            ),
+        ],
+        tools: vec![workspace_spec_tool_definition()],
+        thinking_level: None,
+        max_output_tokens,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    }
+}
+
+fn workspace_spec_markdown_limit_error(
+    original_bytes: usize,
+    compacted_bytes: Option<usize>,
+) -> String {
+    match compacted_bytes {
+        Some(compacted_bytes) => format!(
+            "workspace spec generation exceeded {} bytes after compression retry (initial {} bytes, compressed {} bytes). Regenerate, or manually shorten long file lists, repeated facts, transient task history, and low-value implementation details.",
+            WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, original_bytes, compacted_bytes
+        ),
+        None => format!(
+            "workspace spec generation exceeded {} bytes ({} bytes). Regenerate, or manually shorten long file lists, repeated facts, transient task history, and low-value implementation details.",
+            WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, original_bytes
+        ),
+    }
 }
 
 fn workspace_spec_update_assistant_message_id(
@@ -838,6 +1005,7 @@ fn workspace_spec_tool_definition() -> NeutralToolDefinition {
             "properties": {
                 "contentMarkdown": {
                     "type": "string",
+                    "maxLength": WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
                     "description": "Full replacement Markdown for the Project Spec."
                 }
             },
@@ -861,6 +1029,7 @@ fn workspace_spec_update_tool_definition() -> NeutralToolDefinition {
                 },
                 "contentMarkdown": {
                     "type": ["string", "null"],
+                    "maxLength": WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
                     "description": "Full replacement Markdown when updateNeeded is true; null when updateNeeded is false."
                 }
             },
@@ -873,7 +1042,7 @@ pub(crate) fn default_workspace_spec_generation_system_prompt() -> String {
     format!(
         "Generate a concise Project Spec Markdown document from provided evidence. \
 Use exactly these sections: # Project Spec, ## Purpose, ## Product Surface, ## Architecture, ## Data And Persistence, ## Runtime Flows, ## UI Contracts, ## Agent And Tool Contracts, ## Operational Constraints, ## Open Questions. \
-Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Put unknowns under Open Questions. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec tool exactly once."
+Prefer facts evidenced by code graph summaries, workspace memory profiles, or root source reads. Put unknowns under Open Questions. Do not invent product claims. Keep durable product, architecture, data, command, settings, and operational facts; omit low-value details such as long file lists, exhaustive symbol lists, repeated notes, transient task history, and implementation minutiae that do not guide future work. Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec tool exactly once."
     )
 }
 
@@ -881,7 +1050,7 @@ pub(crate) fn default_workspace_spec_update_system_prompt() -> String {
     format!(
         "Decide whether the Project Spec needs an update after the latest completed chat turn. \
 If the turn did not change durable product behavior, architecture, runtime flows, data contracts, commands, settings, or operational constraints, submit updateNeeded=false and contentMarkdown=null. \
-If an update is needed, submit a full replacement Project Spec Markdown document using the existing section shape. Preserve accurate existing facts unless the turn supersedes them. Do not invent product claims. Keep the Markdown under {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec_update tool exactly once."
+If an update is needed, submit a full replacement Project Spec Markdown document using the existing section shape. Preserve accurate existing facts unless the turn supersedes them. Do not invent product claims. Keep durable facts that guide future work, but omit low-value details such as transient task history, implementation blow-by-blow notes, repeated facts, long file lists, exhaustive symbol lists, and UI copy minutiae unless they define a contract. Target under {WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES} bytes; hard limit is {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES} bytes. Use the submit_workspace_spec_update tool exactly once."
     )
 }
 
@@ -1192,6 +1361,42 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_spec_tool_schemas_cap_markdown_length() {
+        let generate_tool = workspace_spec_tool_definition();
+        assert_eq!(
+            generate_tool.input_schema["properties"]["contentMarkdown"]["maxLength"].as_u64(),
+            Some(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES as u64)
+        );
+
+        let update_tool = workspace_spec_update_tool_definition();
+        assert_eq!(
+            update_tool.input_schema["properties"]["contentMarkdown"]["maxLength"].as_u64(),
+            Some(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES as u64)
+        );
+    }
+
+    #[test]
+    fn workspace_spec_update_prompt_omits_low_value_details() {
+        let prompt = default_workspace_spec_update_system_prompt();
+
+        assert!(prompt.contains("omit low-value details"));
+        assert!(prompt.contains("transient task history"));
+        assert!(prompt.contains("implementation blow-by-blow notes"));
+        assert!(prompt.contains(&WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES.to_string()));
+        assert!(prompt.contains(&WORKSPACE_SPEC_MAX_MARKDOWN_BYTES.to_string()));
+    }
+
+    #[test]
+    fn workspace_spec_limit_error_reports_retry_sizes() {
+        let message = workspace_spec_markdown_limit_error(67_826, Some(66_000));
+
+        assert!(message.contains("65536 bytes"));
+        assert!(message.contains("initial 67826 bytes"));
+        assert!(message.contains("compressed 66000 bytes"));
+        assert!(message.contains("low-value implementation details"));
+    }
 
     #[test]
     fn workspace_spec_update_prompt_appends_current_language_to_custom_prompt() {
