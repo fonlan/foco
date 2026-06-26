@@ -417,6 +417,21 @@ describe("app-settings verification surfaces", () => {
     expect(await screen.findByText("Dream history")).toBeInTheDocument();
     const dreamTable = screen.getByRole("table");
     expect(within(dreamTable).getByRole("columnheader", { name: "Actions" })).toBeInTheDocument();
+    const dreamTableScroller = dreamTable.parentElement;
+    const settingsScroller = dreamTable.closest(".settings-shell") as HTMLElement | null;
+    expect(dreamTableScroller).toHaveClass("overflow-x-auto");
+    expect(settingsScroller).not.toBeNull();
+    if (!dreamTableScroller || !settingsScroller) {
+      throw new Error("Expected Dream history to live inside settings scroller");
+    }
+    settingsScroller.style.overflowY = "auto";
+    Object.defineProperties(settingsScroller, {
+      clientHeight: { configurable: true, value: 360 },
+      scrollHeight: { configurable: true, value: 960 },
+    });
+    settingsScroller.scrollTop = 0;
+    fireEvent.wheel(dreamTableScroller, { deltaX: 0, deltaY: 120 });
+    expect(settingsScroller.scrollTop).toBe(120);
     expect(within(dreamTable).getAllByText(workspace.name)).toHaveLength(2);
     expect(within(dreamTable).getAllByRole("button", { name: "View details" })).toHaveLength(2);
     expect(screen.queryByText(memoryDreamJob.summary!)).not.toBeInTheDocument();

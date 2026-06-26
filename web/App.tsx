@@ -13440,6 +13440,29 @@ function SettingsPanel({
     );
   }
 
+  function handleMemoryDreamHistoryWheel(event: ReactWheelEvent<HTMLDivElement>) {
+    if (Math.abs(event.deltaY) <= Math.abs(event.deltaX)) {
+      return;
+    }
+
+    const deltaUnit =
+      event.deltaMode === 1
+        ? 16
+        : event.deltaMode === 2
+          ? event.currentTarget.clientHeight
+          : 1;
+    let node: HTMLElement | null = event.currentTarget.parentElement;
+    while (node) {
+      const overflowY = window.getComputedStyle(node).overflowY;
+      if (/(auto|scroll)/.test(overflowY) && node.scrollHeight > node.clientHeight) {
+        node.scrollTop += event.deltaY * deltaUnit;
+        event.preventDefault();
+        return;
+      }
+      node = node.parentElement;
+    }
+  }
+
   function goToMemoryPage(page: number) {
     if (!isMemoryFilterReady) {
       return;
@@ -16973,7 +16996,10 @@ function SettingsPanel({
                   </div>
                 ) : null}
 
-                <div className="panel-scroll mt-4 overflow-x-auto rounded-xl border border-stone-200 bg-white">
+                <div
+                  className="panel-scroll mt-4 overflow-x-auto rounded-xl border border-stone-200 bg-white"
+                  onWheel={handleMemoryDreamHistoryWheel}
+                >
                   <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
                     <thead className="bg-stone-50 text-xs font-semibold uppercase tracking-wide text-stone-500">
                       <tr>
