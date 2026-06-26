@@ -910,12 +910,31 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
                     continue;
                 }
 
-                if attachment.path.is_none() {
-                    return Err(ProviderConfigError::InvalidRequest(format!(
-                        "attachment '{}' must have contentBase64 or path",
-                        attachment.name
-                    )));
+                if let Some(path) = &attachment.path {
+                    // ponytail: only media/PDF path attachments become model-visible binary input;
+                    // text/code paths stay in the prompt for workspace tools. Add provider-aware
+                    // filtering here if a provider needs stricter media support than the model config.
+                    if is_model_visible_binary_attachment(&attachment.content_type) {
+                        let mut part =
+                            ContentPart::from_binary_file(path.as_str()).map_err(|source| {
+                                ProviderConfigError::InvalidRequest(format!(
+                                    "attachment '{}' could not be read: {source}",
+                                    attachment.name
+                                ))
+                            })?;
+                        if let ContentPart::Binary(binary) = &mut part {
+                            binary.content_type = attachment.content_type.clone();
+                            binary.name = Some(attachment.name.clone());
+                        }
+                        parts.push(part);
+                    }
+                    continue;
                 }
+
+                return Err(ProviderConfigError::InvalidRequest(format!(
+                    "attachment '{}' must have contentBase64 or path",
+                    attachment.name
+                )));
             }
 
             if parts.is_empty() {
@@ -1020,6 +1039,20 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
             Ok(ChatMessage::from(response))
         }
     }
+}
+
+fn is_model_visible_binary_attachment(content_type: &str) -> bool {
+    let content_type = content_type
+        .trim()
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    content_type.starts_with("image/")
+        || content_type.starts_with("audio/")
+        || content_type.starts_with("video/")
+        || content_type == "application/pdf"
 }
 
 fn genai_chat_options(
@@ -1859,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_path_attachments_as_text_only_messages() {
+    fn keeps_text_path_attachments_as_text_only_messages() {
         let request = NeutralChatRequest {
             model_id: "gpt-4o-mini".to_string(),
             messages: vec![NeutralChatMessage {
@@ -1893,6 +1926,101 @@ mod tests {
 
         assert_eq!(parts.len(), 1);
         assert!(parts[0].is_text());
+    }
+
+    #[test]
+    fn converts_user_image_path_attachments_to_binary_parts() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "foco-provider-image-attachment-{}.png",
+            std::process::id()
+        ));
+        std::fs::write(&temp_path, b"not a real png, but enough bytes")
+            .expect("write image fixture");
+
+        let request = NeutralChatRequest {
+            model_id: "gpt-4o-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "Inspect this image.".to_string(),
+                attachments: vec![NeutralChatAttachment {
+                    id: "att-1".to_string(),
+                    name: "image.png".to_string(),
+                    content_type: "image/png".to_string(),
+                    size_bytes: 29,
+                    content_base64: None,
+                    path: Some(temp_path.display().to_string()),
+                }],
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let result = genai_chat_request(&request);
+        let _ = std::fs::remove_file(&temp_path);
+        let chat_request = result.expect("chat request");
+        let parts = (&chat_request.messages[0].content)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].is_text());
+        let binary = parts[1].as_binary().expect("binary part");
+        assert_eq!(binary.content_type, "image/png");
+        assert_eq!(binary.name.as_deref(), Some("image.png"));
+    }
+
+    #[test]
+    fn converts_user_pdf_path_attachments_to_binary_parts() {
+        let temp_path = std::env::temp_dir().join(format!(
+            "foco-provider-pdf-attachment-{}.pdf",
+            std::process::id()
+        ));
+        std::fs::write(&temp_path, b"%PDF-1.4\n").expect("write pdf fixture");
+
+        let request = NeutralChatRequest {
+            model_id: "gpt-4o-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "Read this PDF.".to_string(),
+                attachments: vec![NeutralChatAttachment {
+                    id: "att-1".to_string(),
+                    name: "paper.pdf".to_string(),
+                    content_type: "application/pdf".to_string(),
+                    size_bytes: 9,
+                    content_base64: None,
+                    path: Some(temp_path.display().to_string()),
+                }],
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let result = genai_chat_request(&request);
+        let _ = std::fs::remove_file(&temp_path);
+        let chat_request = result.expect("chat request");
+        let parts = (&chat_request.messages[0].content)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0].is_text());
+        let binary = parts[1].as_binary().expect("binary part");
+        assert_eq!(binary.content_type, "application/pdf");
+        assert_eq!(binary.name.as_deref(), Some("paper.pdf"));
     }
 
     #[test]

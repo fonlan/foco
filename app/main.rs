@@ -4848,7 +4848,11 @@ impl PreparedChatContext {
                     Err(error) => {
                         let status_code = provider_status_code(&error);
                         let message = error.to_string();
-                        if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                        if should_retry_provider_stream_error(
+                            &error,
+                            turn_retry_count,
+                            self.global_config.app.llm_request_retry_count,
+                        ) {
                             self.capture_failed_llm_request(
                                 turn_llm_request_id,
                                 turn_request_started_at,
@@ -4987,7 +4991,11 @@ impl PreparedChatContext {
                         Err(error) => {
                             let status_code = provider_status_code(&error);
                             let message = error.to_string();
-                            if turn_retry_count < self.global_config.app.llm_request_retry_count {
+                            if should_retry_provider_stream_error(
+                                &error,
+                                turn_retry_count,
+                                self.global_config.app.llm_request_retry_count,
+                            ) {
                                 self.capture_failed_llm_request(
                                     turn_llm_request_id,
                                     turn_request_started_at,
@@ -7653,6 +7661,35 @@ async fn failed_chat_audit_outcome(
 
 fn provider_status_code(error: &ProviderConfigError) -> Option<i64> {
     error.status_code().map(i64::from)
+}
+
+fn should_retry_provider_stream_error(
+    error: &ProviderConfigError,
+    attempt_count: u32,
+    max_attempts: u32,
+) -> bool {
+    if attempt_count >= max_attempts {
+        return false;
+    }
+
+    match error {
+        ProviderConfigError::Connection { status_code, .. } => {
+            status_code.is_none_or(is_retryable_provider_status)
+        }
+        ProviderConfigError::EmptyBaseUrl
+        | ProviderConfigError::EmptyProxyUrl
+        | ProviderConfigError::InvalidBaseUrl { .. }
+        | ProviderConfigError::InvalidProxyUrl { .. }
+        | ProviderConfigError::InvalidRequest(_)
+        | ProviderConfigError::MissingRequiredField(_)
+        | ProviderConfigError::MissingApiKey
+        | ProviderConfigError::UnsupportedKind(_)
+        | ProviderConfigError::UnsupportedProxyKind(_) => false,
+    }
+}
+
+fn is_retryable_provider_status(status_code: u16) -> bool {
+    matches!(status_code, 408 | 409 | 429 | 500..=599)
 }
 
 fn cancelled_audit_outcome(started_at: Instant, message: &str) -> ChatAuditOutcome {

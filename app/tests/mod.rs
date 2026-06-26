@@ -3249,6 +3249,37 @@ fn model_input_modalities_reject_unsupported_media_attachments() {
 }
 
 #[test]
+fn provider_stream_retry_skips_non_retryable_errors() {
+    let bad_request = ProviderConfigError::Connection {
+        message: "bad request".to_string(),
+        status_code: Some(400),
+    };
+    let rate_limited = ProviderConfigError::Connection {
+        message: "rate limited".to_string(),
+        status_code: Some(429),
+    };
+    let unavailable = ProviderConfigError::Connection {
+        message: "unavailable".to_string(),
+        status_code: Some(503),
+    };
+    let network = ProviderConfigError::Connection {
+        message: "connection reset".to_string(),
+        status_code: None,
+    };
+
+    assert!(!should_retry_provider_stream_error(&bad_request, 0, 3));
+    assert!(should_retry_provider_stream_error(&rate_limited, 0, 3));
+    assert!(should_retry_provider_stream_error(&unavailable, 0, 3));
+    assert!(should_retry_provider_stream_error(&network, 0, 3));
+    assert!(!should_retry_provider_stream_error(&network, 3, 3));
+    assert!(!should_retry_provider_stream_error(
+        &ProviderConfigError::InvalidRequest("missing attachment".to_string()),
+        0,
+        3,
+    ));
+}
+
+#[test]
 fn text_attachments_use_original_path_in_user_prompt() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-text-attachment-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
