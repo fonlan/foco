@@ -21246,7 +21246,7 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
   }
 
   if (section === "prompts") {
-    return t("System prompt, prompt files, and extra instructions");
+    return t("System prompt and user prompt context");
   }
 
   if (section === "spec") {

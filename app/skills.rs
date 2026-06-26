@@ -707,7 +707,7 @@ pub(crate) fn enabled_skill_frontmatter_messages(
     }
 
     Ok(vec![neutral_text_message(
-        NeutralChatRole::User,
+        NeutralChatRole::Developer,
         format!(
             "{ENABLED_SKILLS_MESSAGE_PREFIX}:\n\n{}",
             entries.join("\n\n")

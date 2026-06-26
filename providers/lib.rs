@@ -547,6 +547,7 @@ pub struct NeutralChatAttachment {
 #[serde(rename_all = "lowercase")]
 pub enum NeutralChatRole {
     System,
+    Developer,
     User,
     Assistant,
     Tool,
@@ -804,12 +805,29 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
         ));
     }
 
-    let mut messages = Vec::with_capacity(request.messages.len());
-    for message in &request.messages {
+    let leading_system_count = request
+        .messages
+        .iter()
+        .take_while(|message| message.role == NeutralChatRole::System)
+        .count();
+    let leading_system = leading_system_prompt(&request.messages[..leading_system_count])?;
+
+    let mut developer_parts = Vec::new();
+    let mut messages = Vec::with_capacity(request.messages.len() - leading_system_count);
+    for message in &request.messages[leading_system_count..] {
+        if message.role == NeutralChatRole::Developer {
+            validate_instruction_message(message, "developer")?;
+            developer_parts.push(message.content.clone());
+            continue;
+        }
+
         messages.push(genai_message(message)?);
     }
 
     let mut chat_request = ChatRequest::from_messages(messages);
+    if let Some(system) = combined_instruction_prompt(leading_system, developer_parts) {
+        chat_request = chat_request.with_system(system);
+    }
     if !request.tools.is_empty() {
         chat_request = chat_request.with_tools(request.tools.iter().map(genai_tool));
     }
@@ -817,24 +835,71 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
     Ok(chat_request)
 }
 
+fn leading_system_prompt(
+    messages: &[NeutralChatMessage],
+) -> Result<Option<String>, ProviderConfigError> {
+    if messages.is_empty() {
+        return Ok(None);
+    }
+
+    let mut parts = Vec::with_capacity(messages.len());
+    for message in messages {
+        validate_instruction_message(message, "system")?;
+        parts.push(message.content.clone());
+    }
+
+    Ok(Some(parts.join("\n\n")))
+}
+
+fn combined_instruction_prompt(
+    leading_system: Option<String>,
+    developer_parts: Vec<String>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(system) = leading_system {
+        parts.push(system);
+    }
+    parts.extend(developer_parts);
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+fn validate_instruction_message(
+    message: &NeutralChatMessage,
+    role_label: &str,
+) -> Result<(), ProviderConfigError> {
+    if !message.attachments.is_empty() {
+        return Err(ProviderConfigError::InvalidRequest(format!(
+            "{role_label} messages cannot contain attachments"
+        )));
+    }
+    if message.content.trim().is_empty() {
+        return Err(ProviderConfigError::InvalidRequest(
+            "chat message content must not be empty".to_string(),
+        ));
+    }
+    if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
+        return Err(ProviderConfigError::InvalidRequest(format!(
+            "{role_label} messages cannot contain tool state"
+        )));
+    }
+
+    Ok(())
+}
+
 fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderConfigError> {
     match message.role {
         NeutralChatRole::System => {
-            if !message.attachments.is_empty() {
-                return Err(ProviderConfigError::InvalidRequest(
-                    "system messages cannot contain attachments".to_string(),
-                ));
-            }
-            if message.content.trim().is_empty() {
-                return Err(ProviderConfigError::InvalidRequest(
-                    "chat message content must not be empty".to_string(),
-                ));
-            }
-            if !message.tool_calls.is_empty() || message.tool_call_id.is_some() {
-                return Err(ProviderConfigError::InvalidRequest(
-                    "system and user messages cannot contain tool state".to_string(),
-                ));
-            }
+            validate_instruction_message(message, "system")?;
+
+            Ok(ChatMessage::system(message.content.clone()))
+        }
+        NeutralChatRole::Developer => {
+            validate_instruction_message(message, "developer")?;
 
             Ok(ChatMessage::system(message.content.clone()))
         }
@@ -1389,6 +1454,30 @@ mod tests {
         parse_provider_kind(OPENAI_RESPONSES_KIND).expect("responses kind")
     }
 
+    fn neutral_request(messages: Vec<NeutralChatMessage>) -> NeutralChatRequest {
+        NeutralChatRequest {
+            model_id: "gpt-4o-mini".to_string(),
+            messages,
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        }
+    }
+
+    fn neutral_text_message(role: NeutralChatRole, content: &str) -> NeutralChatMessage {
+        NeutralChatMessage {
+            role,
+            content: content.to_string(),
+            attachments: Vec::new(),
+            reasoning: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
     #[test]
     fn parses_supported_provider_kinds() {
         assert_eq!(
@@ -1609,6 +1698,75 @@ mod tests {
             normalized_tool_arguments(&serde_json::Value::String("plain text".to_string())),
             serde_json::Value::String("plain text".to_string())
         );
+    }
+
+    #[test]
+    fn moves_leading_system_messages_to_genai_system() {
+        let mut request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "Core prompt."),
+            neutral_text_message(NeutralChatRole::System, "Tool guidance."),
+            neutral_text_message(NeutralChatRole::User, "Do it."),
+        ]);
+        request.tools.push(NeutralToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a file.".to_string(),
+            input_schema: serde_json::json!({ "type": "object" }),
+            strict: true,
+        });
+
+        let chat_request = genai_chat_request(&request).expect("chat request");
+
+        assert_eq!(
+            chat_request.system.as_deref(),
+            Some("Core prompt.\n\nTool guidance.")
+        );
+        assert_eq!(chat_request.messages.len(), 1);
+        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::User);
+        assert_eq!(
+            chat_request.messages[0].content.first_text(),
+            Some("Do it.")
+        );
+        assert_eq!(chat_request.tools.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn keeps_non_leading_system_messages_inline() {
+        let request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "Initial system."),
+            neutral_text_message(NeutralChatRole::User, "User turn."),
+            neutral_text_message(NeutralChatRole::System, "Runtime guard."),
+        ]);
+
+        let chat_request = genai_chat_request(&request).expect("chat request");
+
+        assert_eq!(chat_request.system.as_deref(), Some("Initial system."));
+        assert_eq!(chat_request.messages.len(), 2);
+        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::User);
+        assert_eq!(chat_request.messages[1].role, genai::chat::ChatRole::System);
+        assert_eq!(
+            chat_request.messages[1].content.first_text(),
+            Some("Runtime guard.")
+        );
+    }
+
+    #[test]
+    fn folds_developer_messages_into_genai_system() {
+        let request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "Base system."),
+            neutral_text_message(NeutralChatRole::User, "User turn."),
+            neutral_text_message(NeutralChatRole::Developer, "Skill instructions."),
+            neutral_text_message(NeutralChatRole::User, "Continue."),
+        ]);
+
+        let chat_request = genai_chat_request(&request).expect("chat request");
+
+        assert_eq!(
+            chat_request.system.as_deref(),
+            Some("Base system.\n\nSkill instructions.")
+        );
+        assert_eq!(chat_request.messages.len(), 2);
+        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::User);
+        assert_eq!(chat_request.messages[1].role, genai::chat::ChatRole::User);
     }
 
     #[test]

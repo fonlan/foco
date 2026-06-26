@@ -1392,7 +1392,7 @@ Search memory before repo work.
         .expect("enabled skill frontmatter messages");
 
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].role, NeutralChatRole::User);
+    assert_eq!(messages[0].role, NeutralChatRole::Developer);
     assert!(messages[0].content.contains(ENABLED_SKILLS_MESSAGE_PREFIX));
     assert!(
         messages[0]
@@ -2523,7 +2523,7 @@ fn prompt_messages_read_workspace_and_configured_prompt_files() {
             .content
             .contains("Configured prompt instructions.")
     );
-    assert_eq!(extra_prompt_message.role, NeutralChatRole::System);
+    assert_eq!(extra_prompt_message.role, NeutralChatRole::User);
     assert!(
         extra_prompt_message
             .content
@@ -9773,6 +9773,11 @@ Search memory before repo work.
 
     assert_eq!(prompt_messages.len(), 2);
     assert!(
+        prompt_messages
+            .iter()
+            .all(|message| message.role == NeutralChatRole::User)
+    );
+    assert!(
         prompt_messages[0]
             .content
             .contains("Extra configured prompt.")
@@ -9790,6 +9795,7 @@ Search memory before repo work.
         .collect::<Vec<_>>();
 
     assert_eq!(skill_messages.len(), 1);
+    assert_eq!(skill_messages[0].role, NeutralChatRole::Developer);
     assert!(skill_messages[0].content.contains("name: gitmemo"));
     assert!(
         skill_messages[0]
@@ -9849,6 +9855,11 @@ Search memory before repo work.
                 .contains(ENVIRONMENT_CONTEXT_MESSAGE_PREFIX)
         );
         assert!(
+            context_injections[0]
+                .messages_json
+                .contains("\"role\":\"developer\"")
+        );
+        assert!(
             !context_injections[0]
                 .messages_json
                 .contains(EXTRA_PROMPT_MESSAGE_PREFIX)
@@ -9900,6 +9911,11 @@ Search memory before repo work.
         .collect::<Vec<_>>();
     assert_eq!(existing_prompt_messages.len(), 2);
     assert!(
+        existing_prompt_messages
+            .iter()
+            .all(|message| message.role == NeutralChatRole::User)
+    );
+    assert!(
         existing_prompt_messages[0]
             .content
             .contains("Updated extra configured prompt.")
@@ -9920,6 +9936,7 @@ Search memory before repo work.
         .filter(|message| message.content.contains(ENABLED_SKILLS_MESSAGE_PREFIX))
         .collect::<Vec<_>>();
     assert_eq!(existing_skill_messages.len(), 1);
+    assert_eq!(existing_skill_messages[0].role, NeutralChatRole::Developer);
     assert_eq!(
         existing_skill_messages[0].content,
         skill_messages[0].content

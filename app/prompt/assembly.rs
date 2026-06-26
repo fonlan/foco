@@ -1,6 +1,4 @@
-use super::{
-    compression_snapshot_message, neutral_message_estimated_tokens, snapshot_covered_sequences,
-};
+use super::{compression_snapshot_message, snapshot_covered_sequences};
 use crate::memory_runtime::{
     memory_retrieval_query_text, neutral_messages_from_record,
     stored_turn_memory_messages_by_sequence,
@@ -264,10 +262,6 @@ pub(crate) async fn prepare_prompt_context(
         + available_tools_prompt
             .as_ref()
             .map(|prompt| estimate_text_tokens(prompt))
-            .unwrap_or(0)
-        + extra_prompt_message
-            .as_ref()
-            .map(neutral_message_estimated_tokens)
             .unwrap_or(0);
     let context_budget = calculate_context_budget(
         limits.context_window,
@@ -414,7 +408,7 @@ pub(crate) async fn prepare_prompt_context(
     if let Some(extra_prompt_message) = extra_prompt_message {
         neutral_messages.push(extra_prompt_message);
         message_source_sequences.push(None);
-        message_context_sources.push(PromptContextSource::ReservedPrompt);
+        message_context_sources.push(PromptContextSource::StableInjection);
     }
     let stable_insert_index = neutral_messages.len();
     for stable_context_message in stable_context_messages.drain(..) {

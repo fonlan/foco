@@ -189,7 +189,7 @@ fn extra_prompt_message(content: &str) -> Option<NeutralChatMessage> {
     }
 
     Some(neutral_text_message(
-        NeutralChatRole::System,
+        NeutralChatRole::User,
         format!("{EXTRA_PROMPT_MESSAGE_PREFIX}\n\n{content}"),
     ))
 }

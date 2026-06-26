@@ -740,8 +740,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No extraction failures": "暂无抽取失败",
     "Memory extraction failed": "记忆抽取失败",
     "Web service listen address": "Web 服务监听地址",
-    "System prompt, prompt files, and extra instructions":
-      "系统提示词、提示词文件与额外指令",
+    "System prompt and user prompt context": "系统提示词与用户提示词上下文",
     "Search API credentials and runtime web tools":
       "搜索 API 凭据与运行时 Web 工具",
     "Provider credentials and connection checks": "供应商凭据与连接检查",

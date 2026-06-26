@@ -1412,6 +1412,7 @@ pub(crate) fn serialize_provider_request(request: &NeutralChatRequest) -> Result
 fn neutral_role_label(role: &NeutralChatRole) -> &'static str {
     match role {
         NeutralChatRole::System => "system",
+        NeutralChatRole::Developer => "developer",
         NeutralChatRole::User => "user",
         NeutralChatRole::Assistant => "assistant",
         NeutralChatRole::Tool => "tool",
@@ -1774,8 +1775,10 @@ pub(crate) fn context_message_groups(
             }
         });
         let must_keep = message_indices.iter().any(|message_index| {
-            messages[*message_index].role == NeutralChatRole::System
-                || prompt_context_source_is_required(&message_context_sources[*message_index])
+            matches!(
+                messages[*message_index].role,
+                NeutralChatRole::System | NeutralChatRole::Developer
+            ) || prompt_context_source_is_required(&message_context_sources[*message_index])
                 || Some(*message_index) == latest_user_index
                 || *message_index >= active_tool_start_index
         });

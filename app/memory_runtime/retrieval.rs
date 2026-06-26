@@ -1277,6 +1277,7 @@ pub(crate) fn neutral_messages_from_record(
 ) -> Result<Vec<NeutralChatMessage>, ApiError> {
     let role = match message.role.as_str() {
         "system" => NeutralChatRole::System,
+        "developer" => NeutralChatRole::Developer,
         "user" => NeutralChatRole::User,
         "assistant" => NeutralChatRole::Assistant,
         "tool" => NeutralChatRole::Tool,
