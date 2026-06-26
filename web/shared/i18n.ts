@@ -194,6 +194,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "At most {count} attachments are allowed.": "最多允许 {count} 个附件。",
     "Attachment {name} exceeds the {size} limit.":
       "附件 {name} 超过 {size} 限制。",
+    "Selected model does not support {type} attachments: {name}":
+      "所选模型不支持 {type} 附件：{name}",
+    "Selected model does not support this attachment.":
+      "所选模型不支持此附件。",
     "Attachments exceed the {size} total limit.":
       "附件总大小超过 {size} 限制。",
     "Run cancelled.": "运行已取消。",

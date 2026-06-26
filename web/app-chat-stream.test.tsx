@@ -2149,6 +2149,82 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("blocks unsupported media attachments for the selected model", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await screen.findByText("Tool run");
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"][multiple]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput as HTMLInputElement,
+      new File(["png"], "screen.png", { type: "image/png" }),
+    );
+
+    expect(
+      await screen.findByText(
+        "Selected model does not support image attachments: screen.png",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("screen.png")).toBeNull();
+
+    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "Review it");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url === "/api/workspaces/workspace-1/chat/stream",
+        ),
+      ).toBe(true);
+    });
+    const chatStreamCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    const body = JSON.parse(String(chatStreamCall?.[1]?.body));
+    expect(body.attachments).toEqual([]);
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("allows media attachments when the selected model supports their modality", async () => {
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        {
+          ...settings.configuredModels[0]!,
+          inputModalities: ["text", "image"],
+        },
+      ],
+    };
+    renderApp();
+
+    await screen.findByText("Tool run");
+    const fileInput = document.querySelector<HTMLInputElement>(
+      'input[type="file"][multiple]',
+    );
+    expect(fileInput).not.toBeNull();
+    await userEvent.upload(
+      fileInput as HTMLInputElement,
+      new File(["png"], "screen.png", { type: "image/png" }),
+    );
+
+    expect(await screen.findByText("screen.png")).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Selected model does not support image attachments: screen.png",
+      ),
+    ).toBeNull();
+  });
+
   it("defers streaming Mermaid rendering until the message completes", async () => {
     renderApp();
 

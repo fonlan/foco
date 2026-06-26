@@ -3227,6 +3227,28 @@ fn normalized_chat_attachments_rejects_invalid_payloads() {
 }
 
 #[test]
+fn model_input_modalities_reject_unsupported_media_attachments() {
+    let model = test_model_settings("text-only");
+    let attachments = vec![NeutralChatAttachment {
+        id: "att-1".to_string(),
+        name: "screen.png".to_string(),
+        content_type: "image/png".to_string(),
+        content_base64: Some("cG5n".to_string()),
+        path: None,
+        size_bytes: 3,
+    }];
+
+    let error = validate_model_input_modalities_for_attachments(&model, &attachments)
+        .expect_err("image attachment should require image input modality");
+    assert!(error.message.contains("does not support image attachments"));
+
+    let mut image_model = model;
+    image_model.input_modalities.push("image".to_string());
+    validate_model_input_modalities_for_attachments(&image_model, &attachments)
+        .expect("image modality should allow image attachment");
+}
+
+#[test]
 fn text_attachments_use_original_path_in_user_prompt() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-text-attachment-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");

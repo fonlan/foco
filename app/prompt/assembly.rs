@@ -139,6 +139,7 @@ pub(crate) async fn prepare_prompt_context(
         chat_id.as_deref(),
         attachment_inputs,
     )?;
+    validate_model_input_modalities_for_attachments(model, &attachments)?;
     let has_user_turn = raw_message.is_some() || !attachments.is_empty();
     let message = if has_user_turn {
         Some(message_with_selected_skills(

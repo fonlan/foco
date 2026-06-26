@@ -1583,6 +1583,7 @@ export const appTestState: {
   chatQueueCounter: number;
   scheduledTaskRunsByTaskId: Record<string, ScheduledTaskRunFixture[]>;
   scheduledTasksResponse: typeof scheduledTasks;
+  settingsResponse: typeof settings;
   workspaceSpecResponse: typeof workspaceSpec;
   workspaceSpecSaveConflict: boolean;
   workspaceSpecGenerateCompletes: boolean;
@@ -1596,6 +1597,7 @@ export const appTestState: {
   chatQueueCounter: 0,
   scheduledTaskRunsByTaskId,
   scheduledTasksResponse: scheduledTasks,
+  settingsResponse: settings,
   workspaceSpecResponse: clonedWorkspaceSpec(),
   workspaceSpecSaveConflict: false,
   workspaceSpecGenerateCompletes: false,
@@ -1668,6 +1670,7 @@ export function resetAppTestEnvironment() {
     "scheduled-task-1": [...scheduledTaskRunsByTaskId["scheduled-task-1"]],
   };
   appTestState.scheduledTasksResponse = scheduledTasks;
+  appTestState.settingsResponse = settings;
   appTestState.workspaceSpecResponse = clonedWorkspaceSpec();
   appTestState.workspaceSpecSaveConflict = false;
   appTestState.workspaceSpecGenerateCompletes = false;
@@ -2066,7 +2069,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/settings") {
-    return jsonResponse(settings);
+    return jsonResponse(appTestState.settingsResponse);
   }
 
   if (path === "/api/agent-definitions") {
@@ -2332,7 +2335,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   if (path === "/api/model-metadata") {
     return jsonResponse({
       cachePath: "C:\\Users\\fonla\\.foco\\models.dev.json",
-      configuredModels: settings.configuredModels,
+      configuredModels: appTestState.settingsResponse.configuredModels,
       fetchedAt: "2026-06-05T10:00:00Z",
       models: [],
       sourceUrl: "https://models.dev/api.json",

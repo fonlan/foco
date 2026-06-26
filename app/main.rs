@@ -8682,7 +8682,13 @@ fn attachment_content_type_for_path(path: &Path) -> String {
         "js" => "text/javascript",
         "json" => "application/json",
         "jsx" => "text/javascript",
+        "m4a" => "audio/mp4",
         "md" => "text/markdown",
+        "mkv" => "video/x-matroska",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "ogg" => "audio/ogg",
         "pdf" => "application/pdf",
         "png" => "image/png",
         "ps1" => "text/plain",
@@ -8693,6 +8699,8 @@ fn attachment_content_type_for_path(path: &Path) -> String {
         "ts" => "text/typescript",
         "tsx" => "text/typescript",
         "txt" => "text/plain",
+        "wav" => "audio/wav",
+        "webm" => "video/webm",
         "webp" => "image/webp",
         "xml" => "application/xml",
         "yaml" | "yml" => "application/yaml",
@@ -11038,6 +11046,48 @@ fn validate_stored_chat_attachments(attachments: &[NeutralChatAttachment]) -> Re
 
 fn is_inline_binary_attachment(content_type: &str) -> bool {
     content_type.starts_with("image/")
+}
+
+fn validate_model_input_modalities_for_attachments(
+    model: &ModelSettings,
+    attachments: &[NeutralChatAttachment],
+) -> Result<(), ApiError> {
+    for attachment in attachments {
+        let Some(modality) = attachment_input_modality(&attachment.content_type) else {
+            continue;
+        };
+        if !model
+            .input_modalities
+            .iter()
+            .any(|input| input.trim().eq_ignore_ascii_case(modality))
+        {
+            return Err(ApiError::bad_request(format!(
+                "model '{}' does not support {} attachments: {}",
+                model.id, modality, attachment.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn attachment_input_modality(content_type: &str) -> Option<&'static str> {
+    let content_type = content_type
+        .trim()
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if content_type.starts_with("image/") {
+        return Some("image");
+    }
+    if content_type.starts_with("audio/") {
+        return Some("audio");
+    }
+    if content_type.starts_with("video/") {
+        return Some("video");
+    }
+    (content_type == "application/pdf").then_some("pdf")
 }
 
 fn validate_attachment_base64(

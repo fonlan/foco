@@ -117,6 +117,7 @@ function ChatPanelComponent({
   contextUsage,
   draftAttachments,
   draftMessage,
+  draftUnsupportedAttachmentMessage,
   gitBranches,
   hasMoreMessagesBefore,
   helpers,
@@ -175,6 +176,7 @@ function ChatPanelComponent({
   contextUsage: ContextUsageResponse | null;
   draftAttachments: ComposerAttachment[];
   draftMessage: string;
+  draftUnsupportedAttachmentMessage: string | null;
   gitBranches: GitBranchesResponse | null;
   hasMoreMessagesBefore: boolean;
   helpers: ChatPanelHelpers;
@@ -328,7 +330,11 @@ function ChatPanelComponent({
         })
         : t("Send guidance. Ctrl+click queues.")
     : t("Cancel run");
-  const sendButtonTitle = isCtrlKeyPressed ? t("Send to queue") : t("Send");
+  const sendButtonTitle = draftUnsupportedAttachmentMessage
+    ? draftUnsupportedAttachmentMessage
+    : isCtrlKeyPressed
+      ? t("Send to queue")
+      : t("Send");
   const showSendButtonTooltip = isSendButtonTooltipOpen && !isSendingMessage;
 
   function scrollMessageListToBottom() {
@@ -928,7 +934,9 @@ function ChatPanelComponent({
                   }
                   disabled={
                     runningButtonSendsMessage &&
-                    (!canGuideActiveRun || !selectedModelId)
+                    (!canGuideActiveRun ||
+                      !selectedModelId ||
+                      Boolean(draftUnsupportedAttachmentMessage))
                   }
                   onClick={handleRunningRunButtonClick}
                   title={runningButtonTitle}
@@ -956,7 +964,8 @@ function ChatPanelComponent({
                     className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(200,101,27,0.24)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
                     disabled={
                       (!draftMessage.trim() && !draftAttachments.length) ||
-                      !selectedModelId
+                      !selectedModelId ||
+                      Boolean(draftUnsupportedAttachmentMessage)
                     }
                     onClick={(event) => {
                       if (isQueueModifierActive(event)) {

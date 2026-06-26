@@ -1015,6 +1015,17 @@ export function App() {
       ),
     [configuredModelsByName],
   );
+  const selectedModel = useMemo(
+    () => availableModels.find((model) => model.id === selectedModelId) ?? null,
+    [availableModels, selectedModelId],
+  );
+  const unsupportedDraftAttachment = useMemo(
+    () =>
+      draftAttachments.find((attachment) =>
+        unsupportedAttachmentInputModality(selectedModel, attachment.contentType),
+      ) ?? null,
+    [draftAttachments, selectedModel],
+  );
   const defaultAgentDefinition = useMemo(
     () =>
       agentDefinitions.find(
@@ -1077,6 +1088,9 @@ export function App() {
     (key, values) => translate(key, values, language),
     [language],
   );
+  const unsupportedDraftAttachmentMessage = unsupportedDraftAttachment
+    ? unsupportedAttachmentMessage(selectedModel, unsupportedDraftAttachment, t)
+    : null;
 
   useEffect(() => {
     if (!canUseApp) {
@@ -4684,6 +4698,18 @@ export function App() {
       return;
     }
 
+    for (const attachment of attachments) {
+      const unsupportedMessage = unsupportedAttachmentMessage(
+        selectedModel,
+        attachment,
+        t,
+      );
+      if (unsupportedMessage) {
+        setError(unsupportedMessage);
+        return;
+      }
+    }
+
     const totalCount = draftAttachments.length + attachments.length;
     if (totalCount > MAX_CHAT_ATTACHMENTS) {
       setError(
@@ -4728,6 +4754,17 @@ export function App() {
     }
 
     try {
+      for (const file of files) {
+        const unsupportedMessage = unsupportedFileAttachmentMessage(
+          selectedModel,
+          file,
+          t,
+        );
+        if (unsupportedMessage) {
+          setError(unsupportedMessage);
+          return;
+        }
+      }
       const nextAttachments = await Promise.all(
         files.map(fileToComposerAttachment),
       );
@@ -4746,6 +4783,17 @@ export function App() {
     setError(null);
 
     try {
+      for (const file of files) {
+        const unsupportedMessage = unsupportedFileAttachmentMessage(
+          selectedModel,
+          file,
+          t,
+        );
+        if (unsupportedMessage) {
+          setError(unsupportedMessage);
+          return;
+        }
+      }
       const attachments = await Promise.all(files.map(fileToComposerAttachment));
       await handleAddDraftAttachments(attachments);
     } catch (requestError) {
@@ -4786,6 +4834,19 @@ export function App() {
 
     if (!selectedProviderId) {
       setError(t("Select a provider before sending."));
+      return null;
+    }
+
+    const unsupportedAttachment = attachments.find((attachment) =>
+      unsupportedAttachmentInputModality(selectedModel, attachment.contentType),
+    );
+    if (unsupportedAttachment) {
+      const message = unsupportedAttachmentMessage(
+        selectedModel,
+        unsupportedAttachment,
+        t,
+      );
+      setError(message ?? t("Selected model does not support this attachment."));
       return null;
     }
 
@@ -8236,6 +8297,7 @@ export function App() {
                   canUseNativePicker={canUseNativePicker}
                   draftAttachments={draftAttachments}
                   draftMessage={draftMessage}
+                  draftUnsupportedAttachmentMessage={unsupportedDraftAttachmentMessage}
                   gitBranches={gitBranches}
                   contextUsage={contextUsage}
                   isLoadingSettings={isLoadingSettings}
@@ -22753,7 +22815,13 @@ function fileContentType(file: File) {
     js: "text/javascript",
     json: "application/json",
     jsx: "text/javascript",
+    m4a: "audio/mp4",
     md: "text/markdown",
+    mkv: "video/x-matroska",
+    mov: "video/quicktime",
+    mp3: "audio/mpeg",
+    mp4: "video/mp4",
+    ogg: "audio/ogg",
     pdf: "application/pdf",
     ps1: "text/plain",
     py: "text/x-python",
@@ -22763,6 +22831,8 @@ function fileContentType(file: File) {
     ts: "text/typescript",
     tsx: "text/typescript",
     txt: "text/plain",
+    wav: "audio/wav",
+    webm: "video/webm",
     xml: "application/xml",
     yaml: "application/yaml",
     yml: "application/yaml",
@@ -22864,8 +22934,15 @@ function skillScopeLabel(skill: ConfiguredSkillSummary, t: Translate) {
     : t("Workspace skill");
 }
 
-const MODEL_MODALITY_OPTIONS = ["text", "image", "audio", "video"];
+const MODEL_INPUT_MODALITY_OPTIONS = ["text", "image", "audio", "video", "pdf"];
+const MODEL_OUTPUT_MODALITY_OPTIONS = ["text", "image", "audio", "video"];
 
+const ATTACHMENT_INPUT_MODALITY_LABELS: Record<string, string> = {
+  audio: "audio",
+  image: "image",
+  pdf: "PDF",
+  video: "video",
+};
 type ModelModalityField = "inputModalities" | "outputModalities";
 
 function modelModalityOptions(
@@ -22874,7 +22951,9 @@ function modelModalityOptions(
   selected: string[],
 ) {
   const values = normalizeModalities([
-    ...MODEL_MODALITY_OPTIONS,
+    ...(field === "inputModalities"
+      ? MODEL_INPUT_MODALITY_OPTIONS
+      : MODEL_OUTPUT_MODALITY_OPTIONS),
     ...models.flatMap((model) => model[field]),
     ...selected,
   ]);
@@ -22896,6 +22975,65 @@ function defaultModalities(modalities: string[], fallback = ["text"]) {
 
 function uniqueString(value: string, index: number, values: string[]) {
   return values.indexOf(value) === index;
+}
+
+function attachmentInputModality(contentType: string) {
+  const normalized = contentType.trim().toLowerCase().split(";")[0]?.trim() ?? "";
+  if (normalized.startsWith("image/")) {
+    return "image";
+  }
+  if (normalized.startsWith("audio/")) {
+    return "audio";
+  }
+  if (normalized.startsWith("video/")) {
+    return "video";
+  }
+  if (normalized === "application/pdf") {
+    return "pdf";
+  }
+  return null;
+}
+
+function unsupportedAttachmentInputModality(
+  model: ConfiguredModelSummary | null,
+  contentType: string,
+) {
+  const modality = attachmentInputModality(contentType);
+  if (!modality) {
+    return null;
+  }
+  return model?.inputModalities.includes(modality) ? null : modality;
+}
+
+function unsupportedAttachmentMessage(
+  model: ConfiguredModelSummary | null,
+  attachment: Pick<ComposerAttachment, "contentType" | "name">,
+  t: Translate,
+) {
+  const modality = unsupportedAttachmentInputModality(model, attachment.contentType);
+  if (!modality) {
+    return null;
+  }
+  return t("Selected model does not support {type} attachments: {name}", {
+    name: attachment.name,
+    type: ATTACHMENT_INPUT_MODALITY_LABELS[modality] ?? modality,
+  });
+}
+
+function unsupportedFileAttachmentMessage(
+  model: ConfiguredModelSummary | null,
+  file: File,
+  t: Translate,
+) {
+  const contentType = fileContentType(file);
+  if (!contentType) {
+    return null;
+  }
+  return unsupportedAttachmentMessage(
+    model,
+    { contentType, name: file.name.trim() || file.name },
+    t,
+  );
 }
 
 function numberInputValue(value: number | null) {
