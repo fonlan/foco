@@ -2,6 +2,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { ConfiguredSkillSummary } from "./api/types";
 import {
   activeMemory,
   aiStatistics,
@@ -87,6 +88,68 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       screen.queryByText("Use the existing product UI conventions."),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows only enabled skills available to the active workspace in the composer picker", async () => {
+    const detectedSkills: ConfiguredSkillSummary[] = [
+      ...settings.skills.detected,
+      {
+        canEnable: true,
+        description: "Current workspace helper.",
+        enabled: true,
+        id: "current-skill",
+        key: "workspace:workspace-1:current-skill",
+        name: "Current skill",
+        path: "C:\\Users\\fonla\\.foco\\workspace\\.agents\\skills\\current-skill\\SKILL.md",
+        scope: "workspace",
+        workspaceId: workspace.id,
+        workspaceName: workspace.name,
+        warnings: [],
+      },
+      {
+        canEnable: true,
+        description: "Disabled helper.",
+        enabled: false,
+        id: "disabled-skill",
+        key: "global:disabled-skill",
+        name: "Disabled skill",
+        path: "C:\\Users\\fonla\\.agents\\skills\\disabled-skill\\SKILL.md",
+        scope: "global",
+        workspaceId: null,
+        workspaceName: null,
+        warnings: [],
+      },
+      {
+        canEnable: true,
+        description: "Other workspace helper.",
+        enabled: true,
+        id: "other-skill",
+        key: "workspace:workspace-2:other-skill",
+        name: "Other skill",
+        path: "C:\\Users\\fonla\\Documents\\Repos\\SideProject\\.agents\\skills\\other-skill\\SKILL.md",
+        scope: "workspace",
+        workspaceId: secondaryWorkspace.id,
+        workspaceName: secondaryWorkspace.name,
+        warnings: [],
+      },
+    ];
+
+    appTestState.settingsResponse = {
+      ...settings,
+      skills: {
+        ...settings.skills,
+        detected: detectedSkills,
+      },
+    } as unknown as typeof settings;
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "/");
+
+    expect(await screen.findByRole("button", { name: "Select skill gitmemo" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Select skill Current skill" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Select skill Disabled skill" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Select skill Other skill" })).not.toBeInTheDocument();
   });
 
   it("updates context usage from latest response usage during a stream", async () => {

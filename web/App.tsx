@@ -1070,6 +1070,10 @@ export function App() {
     () => settings?.skills.detected ?? [],
     [settings],
   );
+  const availableSkills = useMemo(
+    () => detectedSkills.filter((skill) => isSkillAvailableForWorkspace(skill, activeWorkspace?.id ?? null)),
+    [activeWorkspace?.id, detectedSkills],
+  );
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const isTerminalOpen = activeWorkspace
     ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
@@ -2506,14 +2510,14 @@ export function App() {
 
   useEffect(() => {
     const enabledSkillIds = new Set(
-      detectedSkills.filter((skill) => skill.enabled).map((skill) => skill.key),
+      availableSkills.map((skill) => skill.key),
     );
 
     setSelectedSkillIds((current) => {
       const next = current.filter((skillId) => enabledSkillIds.has(skillId));
       return next.length === current.length ? current : next;
     });
-  }, [detectedSkills]);
+  }, [availableSkills]);
 
   async function handleWorkspaceSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -8350,7 +8354,7 @@ export function App() {
                   settings={settings}
                   showTeamModeToggle={canUseTeamMode}
                   providers={providersForChatPanel}
-                  skills={detectedSkills}
+                  skills={availableSkills}
                   thinkingLevels={thinkingLevels}
                   workspaces={workspaces}
                   workspaceId={activeWorkspace?.id ?? (activeWorkspaceId || null)}
@@ -22694,6 +22698,10 @@ function slugId(value: string) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+function isSkillAvailableForWorkspace(skill: ConfiguredSkillSummary, workspaceId: string | null) {
+  return skill.enabled && (skill.scope !== "workspace" || skill.workspaceId === workspaceId);
 }
 
 function activeSkillQuery(value: string) {

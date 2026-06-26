@@ -305,7 +305,7 @@ function ChatPanelComponent({
         : skills.filter((skill) => {
         const query = skillQuery.toLowerCase();
         return (
-          skill.canEnable &&
+          skill.enabled &&
           !selectedSkillSet.has(skill.key) &&
           (skill.name.toLowerCase().includes(query) ||
             skill.id.toLowerCase().includes(query) ||
