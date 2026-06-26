@@ -350,6 +350,26 @@ describe("app agents verification surfaces", () => {
   });
 
   it("opens the Agents panel and shows current chat Agent instances", async () => {
+    const runningSnapshot = {
+      ...agentTeamSnapshot,
+      instances: agentTeamSnapshot.instances.map((instance) =>
+        instance.id === "agent-instance-worker"
+          ? { ...instance, status: "running" }
+          : instance,
+      ),
+    };
+    vi.mocked(fetch).mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          return jsonResponse(runningSnapshot);
+        }
+        return mockFetch(input, init);
+      },
+    );
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
@@ -367,6 +387,9 @@ describe("app agents verification surfaces", () => {
     expect(screen.getByText("agent-instance-coordinator")).toBeInTheDocument();
     expect(screen.getByText("agent-instance-worker")).toBeInTheDocument();
     expect(screen.getByText("foco/agent-instance-worker")).toBeInTheDocument();
+    expect(screen.getByLabelText("Agent status running").firstElementChild).toHaveClass(
+      "agent-running-status-spinner",
+    );
     expect(screen.queryByRole("button", { name: "Enable" })).not.toBeInTheDocument();
     expect(screen.queryByText("Observability")).not.toBeInTheDocument();
 

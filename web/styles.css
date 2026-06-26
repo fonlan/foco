@@ -3728,6 +3728,7 @@ summary:focus-visible {
   background: var(--foco-accent);
 }
 
+.agent-running-status-spinner,
 .chat-tab-running-spinner {
   animation: chat-tab-running-spinner-spin 1s linear infinite;
   transform-origin: center;
@@ -4277,6 +4278,7 @@ summary:focus-visible {
 
   .api-refresh-icon[data-loading="true"],
   .context-refresh-icon[data-loading="true"],
+  .agent-running-status-spinner,
   .chat-tab-running-spinner,
   .message-waiting-spinner {
     animation-duration: 1s !important;

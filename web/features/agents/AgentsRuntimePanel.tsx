@@ -163,7 +163,7 @@ function AgentInstanceCard({
         >
           <StatusIcon
             aria-hidden="true"
-            className={`size-5 ${status.animate ? "animate-spin" : ""}`}
+            className={`size-5 ${status.animate ? "agent-running-status-spinner animate-spin" : ""}`}
           />
         </span>
         <div className="min-w-0 flex-1">
