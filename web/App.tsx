@@ -14434,6 +14434,10 @@ function SettingsPanel({
   }
 
   async function deleteModel(modelId: string) {
+    if (!window.confirm(t("Delete model confirmation"))) {
+      return;
+    }
+
     setIsSaving(true);
     setError(null);
 
@@ -20431,54 +20435,62 @@ function SettingsPanel({
                             )}
                           </span>
                         </div>
-                        <div className="min-w-0">
-                          <div className="flex min-w-0 items-center gap-2 overflow-hidden">
-                            <span
-                              className="min-w-0 truncate text-sm font-semibold"
-                              title={model.displayName}
-                            >
-                              {model.displayName}
-                            </span>
+                        <div className="flex min-w-0 items-center gap-2 overflow-hidden">
+                          <span
+                            className="min-w-0 truncate text-sm font-semibold"
+                            title={model.displayName}
+                          >
+                            {model.displayName}
+                          </span>
+                          <span
+                            aria-hidden="true"
+                            className="shrink-0 text-xs text-stone-300"
+                          >
+                            /
+                          </span>
+                          <span
+                            className="min-w-0 truncate text-xs font-medium text-stone-500"
+                            title={model.id}
+                          >
+                            {model.id}
+                          </span>
+                          <CapabilityPill
+                            className="min-w-0 shrink"
+                            label={t("system prompt {name}", {
+                              name: model.systemPromptName,
+                            })}
+                            ok
+                            title={model.systemPromptName}
+                          />
+                          <CapabilityPill
+                            className="shrink-0"
+                            label={model.enabled ? t("enabled") : t("disabled")}
+                            ok={model.enabled}
+                          />
+                          {!model.canEnable ? (
                             <CapabilityPill
                               className="shrink-0"
-                              label={model.enabled ? t("enabled") : t("disabled")}
-                              ok={model.enabled}
+                              label={t("limits missing")}
+                              ok={false}
                             />
-                            <CapabilityPill
-                              className="shrink-0"
-                              label={
-                                model.canEnable
-                                  ? t("limits ok")
-                                  : t("limits missing")
-                              }
-                              ok={model.canEnable}
-                            />
-                          </div>
-                          <div className="mt-1 flex min-w-0 items-center gap-2 overflow-hidden">
-                            <span
-                              className="min-w-0 truncate text-xs font-medium text-stone-500"
-                              title={model.id}
-                            >
-                              {model.id}
-                            </span>
-                            <CapabilityPill
-                              className="shrink-0"
-                              label={t("providers {count}", {
-                                count: model.providerIds.length,
-                              })}
-                              ok={model.providerIds.length > 0}
-                            />
-                            <CapabilityPill
-                              className="min-w-0"
-                              label={
-                                model.activeProviderId
-                                  ? t("active {id}", { id: model.activeProviderId })
-                                  : t("active missing")
-                              }
-                              ok={model.activeProviderId !== null}
-                              title={model.activeProviderId ?? undefined}
-                            />
-                          </div>
+                          ) : null}
+                          <CapabilityPill
+                            className="shrink-0"
+                            label={t("providers {count}", {
+                              count: model.providerIds.length,
+                            })}
+                            ok={model.providerIds.length > 0}
+                          />
+                          <CapabilityPill
+                            className="min-w-0 shrink"
+                            label={
+                              model.activeProviderId
+                                ? t("active {id}", { id: model.activeProviderId })
+                                : t("active missing")
+                            }
+                            ok={model.activeProviderId !== null}
+                            title={model.activeProviderId ?? undefined}
+                          />
                         </div>
                         <button
                           aria-label={t("Edit model {name}", {

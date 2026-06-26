@@ -1011,6 +1011,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Add model": "添加模型",
     "Edit model": "编辑模型",
     "Delete model": "删除模型",
+    "Delete model confirmation": "确定删除这个模型吗？",
+    "system prompt {name}": "系统提示词 {name}",
     "Close model configuration": "关闭模型配置",
     "Close model configuration backdrop": "关闭模型配置背景",
     "Model configuration": "模型配置",

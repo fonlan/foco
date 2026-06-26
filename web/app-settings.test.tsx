@@ -1025,6 +1025,28 @@ describe("app-settings verification surfaces", () => {
     );
   });
 
+  it("shows compact model rows with system prompt names and confirms deletion", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+
+    expect(await screen.findByText("GPT Test")).toBeInTheDocument();
+    expect(screen.getByText("system prompt Default")).toBeInTheDocument();
+    expect(screen.queryByText("limits ok")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit model GPT Test" }));
+    await userEvent.click(screen.getByRole("button", { name: "Delete model" }));
+
+    expect(confirmSpy).toHaveBeenCalledWith("Delete model confirmation");
+    expect(fetchMock.mock.calls.some(([url]) => url === "/api/models/delete")).toBe(
+      false,
+    );
+    confirmSpy.mockRestore();
+  });
+
   it("saves provider, model, MCP server, and skill settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
