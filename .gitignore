@@ -1,6 +1,7 @@
 AGENTS.md
 Spec.md
-foco-performance-lightness-plan.md
+CODE_SPLIT_IMPLEMENTATION_PLAN.md
+CODE_SPLIT_PHASE_0_BASELINE.md
 
 .mem/
 .codegraph/
