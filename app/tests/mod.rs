@@ -8968,6 +8968,41 @@ fn memory_extraction_request_includes_existing_candidates_and_strict_prompt_rule
 }
 
 #[test]
+fn memory_extraction_request_truncates_large_evidence_content() {
+    let large_content = format!(
+        "{}TAIL_SHOULD_BE_TRUNCATED",
+        "x".repeat(MEMORY_EXTRACTION_MAX_EVIDENCE_CONTENT_CHARS + 64)
+    );
+    let evidence = vec![MemoryExtractionEvidenceCandidate {
+        evidence_id: "tool_result_1".to_string(),
+        source_type: MemorySourceType::ToolResult,
+        source_id: "result-1".to_string(),
+        title: "Tool result read_file".to_string(),
+        content: large_content,
+        metadata: json!({"toolName":"read_file"}),
+    }];
+
+    let request = memory_extraction_provider_request(
+        "model-1",
+        "workspace-1",
+        "chat-1",
+        "run-1",
+        "provider-1",
+        "en-US",
+        512,
+        &evidence,
+        &[],
+    )
+    .expect("memory extraction request");
+    let user_message = &request.messages[1].content;
+
+    assert!(user_message.contains(r#""contentTruncated": true"#));
+    assert!(user_message.contains("memory extraction evidence truncated"));
+    assert!(user_message.contains(r#""contentChars": "#));
+    assert!(!user_message.contains("TAIL_SHOULD_BE_TRUNCATED"));
+}
+
+#[test]
 fn memory_extraction_existing_candidates_include_active_and_pending_memories() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-memory-extract-candidates-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");

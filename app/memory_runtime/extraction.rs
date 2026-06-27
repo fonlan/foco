@@ -594,24 +594,10 @@ pub(crate) fn memory_extraction_provider_request(
             "failed to serialize extraction memory candidates: {source}"
         ))
     })?;
-    let evidence_json = serde_json::to_string_pretty(
-        &evidence
-            .iter()
-            .map(|item| {
-                json!({
-                    "evidenceId": &item.evidence_id,
-                    "sourceType": item.source_type.as_str(),
-                    "sourceId": &item.source_id,
-                    "title": &item.title,
-                    "content": &item.content,
-                    "metadata": &item.metadata,
-                })
-            })
-            .collect::<Vec<_>>(),
-    )
-    .map_err(|source| {
-        ApiError::internal(format!("failed to serialize extraction evidence: {source}"))
-    })?;
+    let evidence_json = serde_json::to_string_pretty(&memory_extraction_request_evidence(evidence))
+        .map_err(|source| {
+            ApiError::internal(format!("failed to serialize extraction evidence: {source}"))
+        })?;
     let system_prompt = format!(
         "{MEMORY_EXTRACTION_SYSTEM_PROMPT} {}",
         memory_extraction_language_instruction(app_language)
@@ -646,6 +632,66 @@ fn memory_extraction_language_instruction(app_language: &str) -> &'static str {
             "Language preference: Summarize and extract memory facts in English whenever possible. Preserve source quotes, code identifiers, file paths, commands, API names, and proper nouns when translation would reduce accuracy."
         }
     }
+}
+
+fn memory_extraction_request_evidence(
+    evidence: &[MemoryExtractionEvidenceCandidate],
+) -> Vec<Value> {
+    let mut remaining_content_chars = MEMORY_EXTRACTION_MAX_TOTAL_EVIDENCE_CHARS;
+
+    evidence
+        .iter()
+        .map(|item| {
+            let (content, content_chars, content_truncated) =
+                compact_memory_extraction_evidence_content(
+                    &item.content,
+                    &mut remaining_content_chars,
+                );
+            json!({
+                "evidenceId": &item.evidence_id,
+                "sourceType": item.source_type.as_str(),
+                "sourceId": &item.source_id,
+                "title": &item.title,
+                "content": content,
+                "contentChars": content_chars,
+                "contentTruncated": content_truncated,
+                "metadata": &item.metadata,
+            })
+        })
+        .collect()
+}
+
+fn compact_memory_extraction_evidence_content(
+    content: &str,
+    remaining_content_chars: &mut usize,
+) -> (String, usize, bool) {
+    let content_chars = content.chars().count();
+    let keep_chars = (*remaining_content_chars).min(MEMORY_EXTRACTION_MAX_EVIDENCE_CONTENT_CHARS);
+    if content_chars <= keep_chars {
+        *remaining_content_chars = (*remaining_content_chars).saturating_sub(content_chars);
+        return (content.to_string(), content_chars, false);
+    }
+
+    *remaining_content_chars = (*remaining_content_chars).saturating_sub(keep_chars);
+    if keep_chars == 0 {
+        return (
+            format!(
+                "[memory extraction evidence omitted: {content_chars} chars exceeded request budget]"
+            ),
+            content_chars,
+            true,
+        );
+    }
+
+    let preview = content.chars().take(keep_chars).collect::<String>();
+    let omitted_chars = content_chars.saturating_sub(keep_chars);
+    (
+        format!(
+            "{preview}\n\n[... memory extraction evidence truncated: {omitted_chars} chars omitted ...]"
+        ),
+        content_chars,
+        true,
+    )
 }
 
 pub(crate) async fn call_memory_extraction_provider(
