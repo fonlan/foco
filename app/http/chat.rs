@@ -739,7 +739,24 @@ fn team_chat_task_event_stream(
                     )));
                 }
             }
-            if !agent_task_keeps_team_stream_open(task.status) {
+            let has_pending_wait_recovery = if task.status
+                == foco_agent::AgentTaskStatus::Interrupted
+            {
+                match database
+                    .agent_task_dependencies(&task.id)
+                    .map_err(ApiError::from_workspace_error)
+                {
+                    Ok(dependencies) => !dependencies.is_empty(),
+                    Err(error) => {
+                        yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
+                        yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                        return;
+                    }
+                }
+            } else {
+                false
+            };
+            if !agent_task_keeps_team_stream_open(task.status) && !has_pending_wait_recovery {
                 yield Ok(sse_event(&agent_team_refresh_event_for_task(
                     &workspace.id,
                     &team.chat_id,

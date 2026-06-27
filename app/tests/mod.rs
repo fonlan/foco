@@ -891,8 +891,7 @@ fn background_code_graph_initialization_indexes_workspace_and_keeps_watcher() {
     indexes
         .lock()
         .expect("code graph index lock")
-        .watchers
-        .clear();
+        .clear_watchers();
     remove_dir_if_exists(&workspace_dir);
 }
 
@@ -1011,8 +1010,7 @@ fn lazy_code_graph_initialization_indexes_workspace_once() {
         .code_graph_indexes
         .lock()
         .expect("code graph index lock")
-        .watchers
-        .clear();
+        .clear_watchers();
     drop(state);
     remove_dir_if_exists(&workspace_dir);
     remove_dir_if_exists(&profile_dir);
@@ -6741,6 +6739,124 @@ async fn team_chat_task_sse_stays_open_while_coordinator_task_is_waiting() {
     assert!(
         completed.is_err(),
         "waiting Coordinator stream should stay open instead of sending StreamEnd"
+    );
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn team_chat_task_sse_stays_open_during_interrupted_wait_recovery() {
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-interrupted-wait-team-stream-test"));
+    let profile_dir =
+        env::temp_dir().join(unique_id("foco-interrupted-wait-team-stream-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let chat_id = "chat-interrupted-wait-team-stream";
+    let task_id = {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat(chat_id, "Interrupted waiting team stream")
+            .expect("chat insert");
+        let task_id = insert_waiting_coordinator_task(
+            &mut database,
+            chat_id,
+            "user-interrupted-wait-team-stream",
+            "interrupted-wait-team-stream",
+        );
+        let task = database
+            .agent_task(&task_id)
+            .expect("task read")
+            .expect("task");
+        let worker_id = foco_agent::AgentInstanceId::new(
+            "agent-instance-interrupted-wait-team-stream-worker",
+        )
+        .expect("worker id");
+        let worker_definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-interrupted-wait-team-stream-worker")
+                .expect("definition id"),
+            revision: 1,
+            name: "Interrupted wait worker".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Review.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_instances_with_limits(
+                &[foco_store::workspace::NewAgentInstance {
+                    id: &worker_id,
+                    team_id: &task.team_id,
+                    definition: &worker_definition,
+                    role: foco_agent::AgentRole::Worker,
+                    execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                    execution_root_path: None,
+                    worktree_base_revision: None,
+                    worktree_branch: None,
+                    worktree_status: None,
+                }],
+                2,
+                1,
+            )
+            .expect("worker create");
+        let child_task_id =
+            foco_agent::AgentTaskId::new("agent-task-interrupted-wait-team-stream-child")
+                .expect("child task id");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &child_task_id,
+                team_id: &task.team_id,
+                owner_instance_id: &worker_id,
+                origin_instance_id: Some(&task.owner_instance_id),
+                parent_task_id: Some(&task_id),
+                input_json: r#"{"goal":"review"}"#,
+            })
+            .expect("child task enqueue");
+        database
+            .insert_agent_task_dependency(foco_store::workspace::NewAgentTaskDependency {
+                team_id: &task.team_id,
+                waiting_task_id: &task_id,
+                dependency_task_id: &child_task_id,
+                wait_mode: foco_agent::AgentTaskWaitMode::All,
+                pending_tool_call_id: Some("call-interrupted-wait-team-stream"),
+                deadline_at: None,
+            })
+            .expect("wait dependency insert");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &task.team_id,
+                task_id: &task_id,
+                expected_status: foco_agent::AgentTaskStatus::Waiting,
+                transition: foco_agent::AgentTaskTransition::Interrupt,
+                result_json: None,
+                error_json: Some(
+                    r#"{"message":"backend restarted while Agent attempt was active"}"#,
+                ),
+                interruption_reason: Some("backend restarted while Agent attempt was active"),
+            })
+            .expect("interrupt waiting task");
+        task_id
+    };
+
+    let state = test_app_state(config, profile_dir.clone());
+    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id)
+        .await
+        .expect("interrupted waiting Coordinator stream response");
+    let body = response.into_response().into_body();
+    let completed = timeout(Duration::from_millis(200), to_bytes(body, usize::MAX)).await;
+
+    assert!(
+        completed.is_err(),
+        "interrupted Coordinator with wait dependencies should stay open for recovery"
     );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
