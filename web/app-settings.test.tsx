@@ -1195,6 +1195,8 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByText("openai/o3")).toBeInTheDocument();
     expect(screen.getByText("$2")).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: "OpenAI" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Anthropic" })).toBeDisabled();
+    expect(screen.getByText("Model not supported")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Save model" }));
 
@@ -1214,6 +1216,70 @@ describe("app-settings verification surfaces", () => {
       });
     });
   });
+  it("disables unsupported providers when editing a metadata-backed model", async () => {
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        {
+          ...settings.configuredModels[0],
+          activeProviderId: "openai",
+          displayName: "Created Model",
+          id: "created-model",
+          metadataKey: "openai/created-model",
+          providerIds: ["openai"],
+          supportsThinking: false,
+          thinkingLevel: null,
+        },
+      ],
+    };
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit model Created Model" }));
+
+    expect(screen.getByRole("checkbox", { name: "OpenAI" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Anthropic" })).toBeDisabled();
+    expect(screen.getByLabelText("Active provider")).toHaveValue("openai");
+  });
+
+  it("keeps configured provider associations when local provider id differs from metadata", async () => {
+    const geminiProvider = {
+      ...settings.providers[1],
+      id: "gemini-openrouter",
+      kindLabel: "Gemini",
+      name: "Gemini Router",
+    };
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        {
+          ...settings.configuredModels[0],
+          activeProviderId: geminiProvider.id,
+          displayName: "Gemini 3.5 Flash",
+          id: "gemini-3.5-flash",
+          metadataKey: "google/gemini-3.5-flash",
+          providerIds: [geminiProvider.id],
+          supportsThinking: false,
+          thinkingLevel: null,
+        },
+      ],
+      providers: [settings.providers[0], geminiProvider],
+    };
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit model Gemini 3.5 Flash" }));
+
+    expect(screen.getByRole("checkbox", { name: "OpenAI" })).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: "Gemini Router" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Gemini Router" })).not.toBeDisabled();
+    expect(screen.getByLabelText("Active provider")).toHaveValue(geminiProvider.id);
+  });
+
   it("keeps thinking level editable when configured model supports it despite stale metadata", async () => {
     const gpt55Model = {
       ...settings.configuredModels[0],

@@ -1053,6 +1053,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "active missing": "缺少当前供应商",
     "No configured models": "暂无已配置模型",
     "No providers": "暂无供应商",
+    "Model not supported": "不支持该模型",
     "Active provider": "当前供应商",
     "Thinking level": "思考级别",
     None: "无",

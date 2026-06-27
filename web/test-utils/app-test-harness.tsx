@@ -1,7 +1,11 @@
 import { fireEvent, render, type RenderOptions } from "@testing-library/react";
 import { vi } from "vitest";
 
-import type { WorkspaceSpecJobSummary, WorkspaceSpecResponse } from "../api/types";
+import type {
+  ConfiguredModelSummary,
+  WorkspaceSpecJobSummary,
+  WorkspaceSpecResponse,
+} from "../api/types";
 
 export const mermaidMock = {
   initialize: vi.fn(),
@@ -119,13 +123,12 @@ export const settings = {
       missingLimits: [],
       providerIds: ["openai", "anthropic"],
       outputModalities: ["text"],
-      reasoning: true,
       supportsThinking: true,
       systemPromptName: "Default",
       thinkingLevel: null,
       warnings: [],
     },
-  ],
+  ] as ConfiguredModelSummary[],
   general: {
     apiAudit: {
       requestDetailRetentionDays: 3,

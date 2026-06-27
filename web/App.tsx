@@ -12369,7 +12369,21 @@ function SettingsPanel({
     ];
   const hasSavedProviderKey = editingProvider?.hasApiKey ?? false;
   const hasProviderKeyClearButton = hasSavedProviderKey || providerForm.clearApiKey;
-  const selectedProviderIds = new Set(form.providerIds);
+  const modelSupportMetadata = selectedMetadata ?? modelMetadataForInput(form.modelId);
+  const supportedModelProviderIds = providers
+    .filter((provider) =>
+      providerSupportsModel(provider, form.modelId, modelSupportMetadata, editingModel),
+    )
+    .map((provider) => provider.id);
+  const supportedModelProviderIdSet = new Set(supportedModelProviderIds);
+  const modelProviderIds = form.providerIds.filter((providerId) =>
+    supportedModelProviderIdSet.has(providerId),
+  );
+  const selectedProviderIds = new Set(modelProviderIds);
+  const activeModelProviderId =
+    !form.activeProviderId || modelProviderIds.includes(form.activeProviderId)
+      ? form.activeProviderId
+      : modelProviderIds[0] ?? "";
   const systemPrompts = promptSettingsForm.systemPrompts.length
     ? promptSettingsForm.systemPrompts
     : settings
@@ -12764,21 +12778,64 @@ function SettingsPanel({
     }
   }, [loadSettings, workspaceDialogRevision]);
 
-  function matchedProviderIdsForModel(modelId: string) {
+  function providerModelListMatches(providerId: string, modelId: string) {
+    const normalizedModelId = modelId.trim();
+    const modelList = providerModelLists[providerId];
+
+    return (
+      Boolean(normalizedModelId) &&
+      modelList?.status === "ok" &&
+      modelList.models.some((providerModelId) => providerModelId === normalizedModelId)
+    );
+  }
+
+  function supportedProviderIdsForModel(
+    modelId: string,
+    metadataModel: ModelMetadataRecord | null = null,
+    configuredModel: ConfiguredModelSummary | null = null,
+  ) {
     const normalizedModelId = modelId.trim();
 
     if (!normalizedModelId) {
-      return [];
+      return providers.map((provider) => provider.id);
     }
 
+    const providerIdsFromLoadedLists = providers
+      .filter((provider) => providerModelListMatches(provider.id, normalizedModelId))
+      .map((provider) => provider.id);
+    if (providerIdsFromLoadedLists.length) {
+      return providerIdsFromLoadedLists;
+    }
+
+    if (configuredModel?.providerIds.length) {
+      return configuredModel.providerIds;
+    }
+
+    if (metadataModel) {
+      return [metadataModel.providerId];
+    }
+
+    return providers.map((provider) => provider.id);
+  }
+
+  function providerSupportsModel(
+    provider: ConfiguredProviderSummary,
+    modelId: string,
+    metadataModel: ModelMetadataRecord | null,
+    configuredModel: ConfiguredModelSummary | null,
+  ) {
+    return supportedProviderIdsForModel(modelId, metadataModel, configuredModel).includes(provider.id);
+  }
+
+  function matchedProviderIdsForModel(
+    modelId: string,
+    metadataModel: ModelMetadataRecord | null = null,
+    configuredModel: ConfiguredModelSummary | null = null,
+  ) {
     return providers
-      .filter((provider) => {
-        const modelList = providerModelLists[provider.id];
-        return (
-          modelList?.status === "ok" &&
-          modelList.models.some((providerModelId) => providerModelId === normalizedModelId)
-        );
-      })
+      .filter((provider) =>
+        providerSupportsModel(provider, modelId, metadataModel, configuredModel),
+      )
       .map((provider) => provider.id);
   }
 
@@ -12792,7 +12849,7 @@ function SettingsPanel({
       model,
       selectedModelDeveloper || model.providerId,
     );
-    const providerIds = matchedProviderIdsForModel(modelId);
+    const providerIds = matchedProviderIdsForModel(modelId, model);
     const nextProviderIds = providerIds.length ? providerIds : current.providerIds;
     const activeProviderId = nextProviderIds.includes(current.activeProviderId)
       ? current.activeProviderId
@@ -14075,8 +14132,8 @@ function SettingsPanel({
               "Max output tokens",
               modelOutputsText,
             ),
-            providerIds: form.providerIds,
-            activeProviderId: form.activeProviderId,
+            providerIds: modelProviderIds,
+            activeProviderId: activeModelProviderId,
             inputModalities: normalizeModalities(form.inputModalities),
             outputModalities: normalizeModalities(form.outputModalities),
             thinkingLevel: form.thinkingLevel || null,
@@ -15168,9 +15225,22 @@ function SettingsPanel({
 
   function toggleModelProvider(providerId: string, checked: boolean) {
     setForm((current) => {
+      const metadataModel = modelMetadataForInput(current.modelId);
+      const configuredModel = configuredModels.find((model) => model.id === current.modelId) ?? null;
+      const matchedProviderIds = matchedProviderIdsForModel(
+        current.modelId,
+        metadataModel,
+        configuredModel,
+      );
+      if (checked && matchedProviderIds.length && !matchedProviderIds.includes(providerId)) {
+        return current;
+      }
+      const baseProviderIds = matchedProviderIds.length
+        ? current.providerIds.filter((id) => matchedProviderIds.includes(id))
+        : current.providerIds;
       const providerIds = checked
-        ? [...current.providerIds, providerId].filter(uniqueString)
-        : current.providerIds.filter((id) => id !== providerId);
+        ? [...baseProviderIds, providerId].filter(uniqueString)
+        : baseProviderIds.filter((id) => id !== providerId);
       const activeProviderId = providerIds.includes(current.activeProviderId)
         ? current.activeProviderId
         : providerIds[0] ?? "";
@@ -21072,33 +21142,41 @@ function SettingsPanel({
                           </div>
                           <div className="panel-scroll max-h-56 space-y-2 overflow-y-auto pr-1">
                             {providers.length ? (
-                              providers.map((provider) => (
-                                <label
-                                  className="flex items-center justify-between gap-3 rounded-lg bg-stone-50/80 px-3 py-2"
-                                  key={provider.id}
-                                >
-                                  <span className="min-w-0">
-                                    <span className="block truncate text-sm font-semibold text-stone-700">
-                                      {provider.name}
+                              providers.map((provider) => {
+                                const providerSupportsCurrentModel =
+                                  supportedModelProviderIdSet.has(provider.id);
+
+                                return (
+                                  <label
+                                    className={`flex items-center justify-between gap-3 rounded-lg bg-stone-50/80 px-3 py-2 ${providerSupportsCurrentModel ? "" : "opacity-60"}`}
+                                    key={provider.id}
+                                  >
+                                    <span className="min-w-0">
+                                      <span className="block truncate text-sm font-semibold text-stone-700">
+                                        {provider.name}
+                                      </span>
+                                      <span className="block truncate text-xs text-stone-500">
+                                        {providerSupportsCurrentModel
+                                          ? provider.kindLabel
+                                          : t("Model not supported")}
+                                      </span>
                                     </span>
-                                    <span className="block truncate text-xs text-stone-500">
-                                      {provider.kindLabel}
-                                    </span>
-                                  </span>
-                                  <input
-                                    aria-label={provider.name}
-                                    checked={selectedProviderIds.has(provider.id)}
-                                    className="size-4 accent-teal-700"
-                                    onChange={(event) =>
-                                      toggleModelProvider(
-                                        provider.id,
-                                        event.target.checked,
-                                      )
-                                    }
-                                    type="checkbox"
-                                  />
-                                </label>
-                              ))
+                                    <input
+                                      aria-label={provider.name}
+                                      checked={selectedProviderIds.has(provider.id)}
+                                      className="size-4 accent-teal-700 disabled:cursor-not-allowed"
+                                      disabled={!providerSupportsCurrentModel}
+                                      onChange={(event) =>
+                                        toggleModelProvider(
+                                          provider.id,
+                                          event.target.checked,
+                                        )
+                                      }
+                                      type="checkbox"
+                                    />
+                                  </label>
+                                );
+                              })
                             ) : (
                               <button
                                 className="flex w-full items-center justify-between rounded-lg border border-dashed border-stone-300 bg-stone-50 px-3 py-3 text-left text-sm text-stone-500 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
@@ -21118,17 +21196,17 @@ function SettingsPanel({
                           </span>
                           <select
                             className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                            disabled={!form.providerIds.length}
+                            disabled={!modelProviderIds.length}
                             onChange={(event) =>
                               setForm((current) => ({
                                 ...current,
                                 activeProviderId: event.target.value,
                               }))
                             }
-                            value={form.activeProviderId}
+                            value={activeModelProviderId}
                           >
                             <option value="">{t("None")}</option>
-                            {form.providerIds.map((providerId) => {
+                            {modelProviderIds.map((providerId) => {
                               const provider = providers.find(
                                 (item) => item.id === providerId,
                               );
