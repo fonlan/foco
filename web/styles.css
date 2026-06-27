@@ -3102,6 +3102,12 @@ body,
 .message-composer-control-row > .composer-branch-select {
   width: 100%;
 }
+
+.message-composer-control-row .composer-team-toggle,
+.message-composer-control-row .composer-select-summary,
+.message-composer-control-row > .composer-branch-select {
+  border-radius: 0.4375rem;
+}
 .message-composer-control-row .composer-select-summary,
 .message-composer-control-row .composer-branch-select {
   font-size: var(--foco-font-micro);
