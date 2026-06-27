@@ -335,7 +335,6 @@ export function SettingsPanel({
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [selectedMetadataKey, setSelectedMetadataKey] = useState("");
   const [selectedModelDeveloper, setSelectedModelDeveloper] = useState("");
-  const [modelSearch, setModelSearch] = useState("");
   const [form, setForm] = useState<ModelFormState>(() => emptyModelForm());
   const [providerForm, setProviderForm] = useState<ProviderFormState>(() =>
     emptyProviderForm(),
@@ -511,29 +510,6 @@ export function SettingsPanel({
       ),
     [form.outputModalities, metadata],
   );
-  const filteredModels = useMemo(() => {
-    const query = modelSearch.trim().toLowerCase();
-    const models = metadata?.models ?? [];
-
-    if (!query) {
-      return models.slice(0, 80);
-    }
-
-    return models
-      .filter((model) =>
-        [
-          model.providerName,
-          model.providerId,
-          model.name,
-          model.modelId,
-          model.key,
-        ]
-          .join(" ")
-          .toLowerCase()
-          .includes(query),
-      )
-      .slice(0, 80);
-  }, [metadata, modelSearch]);
   const developerModels = useMemo(
     () => modelsForDeveloper(metadata?.models ?? [], selectedModelDeveloper).slice(0, 200),
     [metadata, selectedModelDeveloper],
@@ -1270,19 +1246,6 @@ export function SettingsPanel({
       ...emptyModelForm(),
       systemPromptName: current.systemPromptName || DEFAULT_SYSTEM_PROMPT_NAME,
     }));
-  }
-
-  function selectMetadataModel(key: string) {
-    setSelectedMetadataKey(key);
-    const model = metadata?.models.find((item) => item.key === key);
-
-    if (!model) {
-      return;
-    }
-
-    setSelectedModelDeveloper(model.providerId);
-    setForm((current) => formForMetadataModel(model, current));
-    setIsModelDialogOpen(true);
   }
 
   function modelMetadataForInput(modelId: string) {
@@ -9696,64 +9659,6 @@ export function SettingsPanel({
                 </>
               ) : null}
 
-              <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
-                <div className="border-b border-stone-200 px-4 py-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <input
-                      className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                      onChange={(event) => setModelSearch(event.target.value)}
-                      placeholder={t("Search model metadata")}
-                      value={modelSearch}
-                    />
-                    <button
-                      aria-label={t("Reload model metadata cache")}
-                      className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                      disabled={isLoading}
-                      onClick={() => void loadMetadata()}
-                      title={t("Reload cache")}
-                      type="button"
-                    >
-                      {isLoading ? (
-                        <LoaderCircle
-                          aria-hidden="true"
-                          className="size-4 animate-spin"
-                        />
-                      ) : (
-                        <RefreshCw aria-hidden="true" className="size-4" />
-                      )}
-                    </button>
-                  </div>
-                </div>
-                <div className="panel-scroll max-h-80 overflow-y-auto">
-                  {filteredModels.length > 0 ? (
-                    filteredModels.map((model) => (
-                      <button
-                        className={`grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 border-b border-stone-100 px-4 py-3 text-left hover:bg-stone-50 ${selectedMetadataKey === model.key ? "bg-teal-50" : "bg-white/70"
-                          }`}
-                        key={model.key}
-                        onClick={() => selectMetadataModel(model.key)}
-                        type="button"
-                      >
-                        <span className="min-w-0">
-                          <span className="block truncate text-sm font-semibold text-stone-950">
-                            {model.name}
-                          </span>
-                          <span className="mt-1 block truncate text-xs font-medium text-stone-500">
-                            {model.providerName} / {model.modelId}
-                          </span>
-                        </span>
-                        <span className="text-right text-xs font-medium text-stone-500">
-                          {model.inputModalities.join(", ") || t("input n/a")}
-                        </span>
-                      </button>
-                    ))
-                  ) : (
-                    <div className="px-4 py-8 text-sm text-stone-500">
-                      {isLoading ? t("Loading models...") : t("No cached models")}
-                    </div>
-                  )}
-                </div>
-              </section>
             </section>
           ) : null}
         </div>
