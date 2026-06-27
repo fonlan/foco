@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
+use crate::runtime::agent_run_event_kind;
 use axum::{
     Json,
     body::to_bytes,
@@ -8,8 +9,9 @@ use axum::{
     response::IntoResponse,
 };
 use foco_agent::{
-    ToolResource, ToolResourceAccess, ToolResourceLock, build_default_system_prompt,
-    context_compression_trigger_tokens,
+    AgentRunContext, AgentRunEvent, AgentRunEventEmitter, AgentRunExecutor, AgentRunFuture,
+    AgentRunInput, AgentRunOutcome, AgentRunTask, ToolResource, ToolResourceAccess,
+    ToolResourceLock, build_default_system_prompt, context_compression_trigger_tokens,
 };
 use foco_providers::OPENAI_CHAT_KIND;
 use foco_store::{
@@ -29,6 +31,7 @@ use foco_tools::{
     GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL, READ_FILE_TOOL, SEARCH_TEXT_TOOL,
     ToolCancellationToken, WEB_FETCH_TOOL, WEB_SEARCH_TOOL,
 };
+use futures_util::StreamExt;
 use serde_json::json;
 
 use crate::http::{
