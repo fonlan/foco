@@ -16,6 +16,125 @@ use foco_tools::set_ripgrep_path;
 
 use crate::runtime::download_and_install_ripgrep;
 use crate::*;
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspacePathRequest {
+    pub(crate) name: String,
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) content_base64: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualWorkspaceRequest {
+    id: String,
+    name: String,
+    path: String,
+    pinned: bool,
+    terminal_shell: String,
+    #[serde(default)]
+    common_commands: Vec<WorkspaceCommonCommandRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceCommonCommandRequest {
+    pub(crate) name: String,
+    pub(crate) command: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceLogoRequest {
+    pub(crate) content_base64: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceOrderRequest {
+    workspace_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileChildrenQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileBlobQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SaveWorkspaceFileRequest {
+    path: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RenameWorkspaceFileRequest {
+    path: String,
+    new_name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileSaveResponse {
+    content: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileContentResponse {
+    content: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFilesResponse {
+    root: WorkspaceFileTreeNode,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileChildrenResponse {
+    path: String,
+    children: Vec<WorkspaceFileTreeNode>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceFileTreeNode {
+    name: String,
+    path: String,
+    kind: WorkspaceFileTreeNodeKind,
+    size_bytes: u64,
+    has_children: bool,
+    children_loaded: bool,
+    children: Vec<WorkspaceFileTreeNode>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+enum WorkspaceFileTreeNodeKind {
+    Directory,
+    File,
+}
 pub(crate) async fn workspace_files(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,

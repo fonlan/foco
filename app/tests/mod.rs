@@ -47,7 +47,7 @@ use crate::http::{
         workspace_spec_jobs,
     },
     terminal::create_terminal_session,
-    workspaces::add_workspace,
+    workspaces::{WorkspacePathRequest, add_workspace},
 };
 use crate::memory_runtime::scheduler::{
     dispatch_auto_memory_dreams_at, memory_dream_interval_due, reconcile_memory_dream_runs,
@@ -6747,10 +6747,8 @@ async fn team_chat_task_sse_stays_open_while_coordinator_task_is_waiting() {
 
 #[tokio::test]
 async fn team_chat_task_sse_stays_open_during_interrupted_wait_recovery() {
-    let workspace_dir =
-        env::temp_dir().join(unique_id("foco-interrupted-wait-team-stream-test"));
-    let profile_dir =
-        env::temp_dir().join(unique_id("foco-interrupted-wait-team-stream-profile"));
+    let workspace_dir = env::temp_dir().join(unique_id("foco-interrupted-wait-team-stream-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-interrupted-wait-team-stream-profile"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     fs::create_dir_all(&profile_dir).expect("profile directory");
 
@@ -6772,10 +6770,9 @@ async fn team_chat_task_sse_stays_open_during_interrupted_wait_recovery() {
             .agent_task(&task_id)
             .expect("task read")
             .expect("task");
-        let worker_id = foco_agent::AgentInstanceId::new(
-            "agent-instance-interrupted-wait-team-stream-worker",
-        )
-        .expect("worker id");
+        let worker_id =
+            foco_agent::AgentInstanceId::new("agent-instance-interrupted-wait-team-stream-worker")
+                .expect("worker id");
         let worker_definition = AgentDefinitionSettings {
             id: AgentDefinitionId::new("agent-definition-interrupted-wait-team-stream-worker")
                 .expect("definition id"),
