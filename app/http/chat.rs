@@ -18,7 +18,7 @@ use foco_store::{
         workspace_database_path,
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
 use crate::*;
@@ -31,6 +31,259 @@ const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "<agent_definition_prompt>\n<identity>You are Foco's default coding agent.</identity>\n<instructions>Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.</instructions>\n</agent_definition_prompt>";
 const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CHAT_MESSAGES_PAGE_LIMIT: usize = 500;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatStreamRequest {
+    pub(crate) chat_id: Option<String>,
+    pub(crate) queued_user_message_id: Option<String>,
+    #[serde(skip)]
+    pub(crate) run_id_override: Option<String>,
+    #[serde(skip)]
+    pub(crate) visible_assistant_message_id: Option<String>,
+    #[serde(skip)]
+    pub(crate) visible_assistant_sequence: Option<i64>,
+    pub(crate) model_id: String,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) thinking_level: Option<String>,
+    pub(crate) skill_ids: Option<Vec<String>>,
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) attachments: Vec<ChatAttachmentInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QueueChatMessageRequest {
+    pub(crate) chat_id: Option<String>,
+    pub(crate) model_id: String,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) thinking_level: Option<String>,
+    pub(crate) skill_ids: Option<Vec<String>>,
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) team_mode_enabled: bool,
+    #[serde(default)]
+    pub(crate) defer_start: bool,
+    #[serde(default)]
+    pub(crate) attachments: Vec<ChatAttachmentInput>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QueueChatMessageResponse {
+    pub(crate) chat_id: String,
+    pub(crate) chat_title: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) user_message_id: String,
+    pub(crate) assistant_message_id: String,
+    pub(crate) content: String,
+    pub(crate) parts: Vec<ChatMessagePart>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_team_id: Option<foco_agent::AgentTeamId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_task_id: Option<foco_agent::AgentTaskId>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatRunStreamQuery {
+    after_sequence: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CancelChatRunResponse {
+    ok: bool,
+    run_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatGuidanceRequest {
+    pub(crate) chat_id: String,
+    pub(crate) run_id: String,
+    pub(crate) message: String,
+    #[serde(default)]
+    pub(crate) attachments: Vec<ChatAttachmentInput>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatGuidanceResponse {
+    id: String,
+    content: String,
+    parts: Vec<ChatMessagePart>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContextUsageRequest {
+    pub(crate) chat_id: Option<String>,
+    pub(crate) model_id: String,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) thinking_level: Option<String>,
+    pub(crate) skill_ids: Option<Vec<String>>,
+    pub(crate) latest_response_usage: NeutralUsage,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatAttachmentInput {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) content_type: String,
+    pub(crate) content_base64: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) size_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatAttachmentPart {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) content_type: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) path: Option<String>,
+    pub(crate) preview_data_url: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContextUsageResponse {
+    pub(crate) used_message_tokens: u64,
+    pub(crate) available_message_tokens: u64,
+    pub(crate) memory_context_tokens: u64,
+    pub(crate) memory_budget_tokens: u64,
+    pub(crate) usage_percent: u64,
+    pub(crate) compression_trigger_tokens: u64,
+    pub(crate) compression_trigger_percent: u64,
+    pub(crate) will_compress_on_next_send: bool,
+    pub(crate) token_breakdown: ContextTokenBreakdown,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AiStatisticsQuery {
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) chat_id: Option<String>,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) model_id: Option<String>,
+    pub(crate) status: Option<String>,
+    pub(crate) started_after: Option<String>,
+    pub(crate) started_before: Option<String>,
+    pub(crate) page: Option<i64>,
+    pub(crate) page_size: Option<i64>,
+    pub(crate) limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TodoGraphQuery {
+    status: Option<String>,
+    task_id: Option<String>,
+    include_subtasks: Option<bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatSummary {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) code_change_stats: CodeChangeStats,
+    pub(crate) active_run: Option<ActiveChatRunSummary>,
+    pub(crate) queued_run: Option<QueuedRunSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QueuedRunSummary {
+    pub(crate) status: String,
+    pub(crate) user_message_id: String,
+    pub(crate) assistant_message_id: Option<String>,
+    pub(crate) assistant_sequence: Option<i64>,
+    pub(crate) model_id: Option<String>,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) thinking_level: Option<String>,
+    pub(crate) skill_ids: Vec<String>,
+    pub(crate) content: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatMessagesResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) chat: Option<ChatMessagesChatSummary>,
+    pub(crate) messages: Vec<ChatMessageSummary>,
+    pub(crate) pagination: ChatMessagesPaginationSummary,
+    pub(crate) active_run: Option<ActiveChatRunSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatMessagesPaginationSummary {
+    pub(crate) has_more_before: bool,
+    pub(crate) next_before_sequence: Option<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatMessagesChatSummary {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) kind: Option<String>,
+    pub(crate) read_only: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatStatisticsResponse {
+    pub(crate) workspace_id: String,
+    pub(crate) chat_id: String,
+    pub(crate) message_count: i64,
+    pub(crate) user_message_count: i64,
+    pub(crate) assistant_message_count: i64,
+    pub(crate) tool_message_count: i64,
+    pub(crate) total_requests: i64,
+    pub(crate) failed_requests: i64,
+    pub(crate) total_input_tokens: i64,
+    pub(crate) total_output_tokens: i64,
+    pub(crate) total_cache_read_tokens: i64,
+    pub(crate) total_cache_write_tokens: i64,
+    pub(crate) total_tokens: i64,
+    pub(crate) total_latency_ms: i64,
+    pub(crate) average_latency_ms: Option<i64>,
+    pub(crate) memory_references: i64,
+    pub(crate) created_memories: i64,
+    pub(crate) code_change_stats: CodeChangeStats,
+    pub(crate) model_breakdown: Vec<AiStatisticsModelBreakdown>,
+    pub(crate) provider_breakdown: Vec<AiStatisticsProviderBreakdown>,
+    pub(crate) tool_breakdown: Vec<ChatToolBreakdown>,
+    pub(crate) compression: ChatCompressionStatistics,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatToolBreakdown {
+    pub(crate) tool_name: String,
+    pub(crate) call_count: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatCompressionStatistics {
+    pub(crate) snapshot_count: i64,
+    pub(crate) rule_snapshot_count: i64,
+    pub(crate) llm_snapshot_count: i64,
+    pub(crate) runtime_tool_state_snapshot_count: i64,
+    pub(crate) original_token_count: i64,
+    pub(crate) summary_token_count: i64,
+    pub(crate) saved_token_count: i64,
+}
 
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]

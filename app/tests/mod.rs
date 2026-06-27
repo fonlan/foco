@@ -35,14 +35,18 @@ use futures_util::StreamExt;
 use serde_json::json;
 
 use crate::http::{
+    chat::{ChatGuidanceRequest, QueueChatMessageRequest},
     memory::{
         MemoryDreamChangesQuery, MemoryDreamJobsQuery, MemoryDreamRunRequest, memory_dream_changes,
         memory_dream_job, memory_dream_jobs, memory_extraction_job_summaries,
         memory_extraction_task_from_job, run_memory_dream,
     },
     settings::{
-        IMAGE_AGENT_SYSTEM_PROMPT_NAME, associate_provider_with_local_models,
-        can_save_new_provider_after_model_list_error, filter_provider_model_ids,
+        AgentDefinitionInput, CreateAgentDefinitionRequest, DeleteAgentDefinitionRequest,
+        DeleteSettingsItemRequest, IMAGE_AGENT_SYSTEM_PROMPT_NAME, ManualModelRequest,
+        ManualPromptSettingsRequest, UpdateAgentDefinitionRequest,
+        associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
+        filter_provider_model_ids,
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,

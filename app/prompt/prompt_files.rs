@@ -10,7 +10,7 @@ use foco_tools::{SEARCH_TEXT_TOOL, WEB_SEARCH_TOOL, builtin_tool_definitions};
 
 use crate::{
     AGENTS_MESSAGE_PREFIX, ApiError, EXTRA_PROMPT_MESSAGE_PREFIX, PROMPT_FILE_MESSAGE_PREFIX,
-    SystemPromptSummary, http::settings::default_image_generation_system_prompt,
+    http::settings::{SystemPromptSummary, default_image_generation_system_prompt},
     neutral_text_message, xml_cdata_section, xml_text_escape,
 };
 

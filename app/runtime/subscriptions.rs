@@ -15,6 +15,7 @@ use foco_tools::ToolCancellationToken;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::http::chat::ChatGuidanceRequest;
 use crate::*;
 
 #[derive(Clone, Default)]

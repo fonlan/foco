@@ -14,6 +14,7 @@ use axum::{
 use foco_store::workspace::WorkspaceDatabase;
 use foco_tools::set_ripgrep_path;
 
+use crate::http::settings::SettingsResponse;
 use crate::runtime::download_and_install_ripgrep;
 use crate::*;
 use serde::{Deserialize, Serialize};

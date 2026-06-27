@@ -5,6 +5,7 @@ use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
 use foco_store::workspace::{ContextCompressionSnapshotRecord, ToolCallWithResultRecord};
 use serde_json::{Value, json};
 
+use crate::http::chat::ContextUsageResponse;
 use crate::*;
 
 pub(crate) fn neutral_tool_call_from_record(

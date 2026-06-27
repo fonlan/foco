@@ -30,6 +30,552 @@ pub(crate) const IMAGE_AGENT_SYSTEM_PROMPT_NAME: &str = IMAGE_GENERATION_SYSTEM_
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "<agent_definition_prompt>\n<identity>You are Foco's default coding agent.</identity>\n<instructions>Complete simple tasks directly. For complex tasks, consider creating and coordinating multiple worker agents when they can help with parallel investigation, implementation, review, or verification.</instructions>\n</agent_definition_prompt>";
 const IMAGE_AGENT_SYSTEM_PROMPT: &str = "<agent_definition_prompt>\n<identity>You are Foco's image generation agent.</identity>\n<instructions>Turn the user's request into a precise image prompt, call image_gen, and return the generated file paths with concise notes. Do not modify source files unless explicitly asked.</instructions>\n<tool_defaults>Use image_gen with model &quot;gpt-image-2&quot; unless the user explicitly asks for another configured image model.</tool_defaults>\n</agent_definition_prompt>";
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualGeneralSettingsRequest {
+    pub(crate) auto_start_enabled: Option<bool>,
+    pub(crate) default_team_mode_enabled: Option<bool>,
+    pub(crate) api_audit: Option<ManualApiAuditSettingsRequest>,
+    pub(crate) listen_host: String,
+    pub(crate) listen_port: u32,
+    pub(crate) llm_request_retry_count: Option<u32>,
+    pub(crate) language: String,
+    pub(crate) theme: String,
+    pub(crate) hook_audit_enabled: Option<bool>,
+    pub(crate) password: Option<String>,
+    pub(crate) clear_password: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualApiAuditSettingsRequest {
+    pub(crate) request_detail_retention_days: u32,
+    pub(crate) save_request_response_details: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualWebSearchSettingsRequest {
+    pub(crate) enabled: bool,
+    pub(crate) active_provider: String,
+    pub(crate) api_proxy: Option<ManualApiProxySettingsRequest>,
+    pub(crate) tavily_api_key: Option<String>,
+    pub(crate) brave_api_key: Option<String>,
+    pub(crate) clear_tavily_api_key: Option<bool>,
+    pub(crate) clear_brave_api_key: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualMemorySettingsRequest {
+    pub(crate) enabled: bool,
+    pub(crate) extraction_mode: String,
+    pub(crate) retrieval_mode: String,
+    pub(crate) retention_days: Option<u32>,
+    pub(crate) extraction_model_id: Option<String>,
+    pub(crate) retrieval_model_id: Option<String>,
+    pub(crate) dream: Option<ManualMemoryDreamSettingsRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualMemoryDreamSettingsRequest {
+    pub(crate) enabled: bool,
+    pub(crate) auto_enabled: bool,
+    pub(crate) mode: String,
+    pub(crate) model_id: Option<String>,
+    pub(crate) workspace_interval_days: u32,
+    pub(crate) global_interval_days: u32,
+    pub(crate) create_transcript_chat: bool,
+    pub(crate) max_facts_per_run: u32,
+    pub(crate) max_changes_per_run: u32,
+    pub(crate) scheduler_scan_minutes: u32,
+    pub(crate) workspace_threshold_facts: Option<u32>,
+    pub(crate) global_threshold_facts: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualSpecSettingsRequest {
+    pub(crate) auto_enabled: bool,
+    pub(crate) generation_model_id: Option<String>,
+    pub(crate) generation_system_prompt: Option<String>,
+    pub(crate) update_system_prompt: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualPromptSettingsRequest {
+    pub(crate) system_prompts: Option<Vec<ManualSystemPromptRequest>>,
+    pub(crate) system_prompt: Option<String>,
+    pub(crate) files: Vec<String>,
+    pub(crate) extra_text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualSystemPromptRequest {
+    pub(crate) name: String,
+    pub(crate) content: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualApiProxySettingsRequest {
+    pub(crate) enabled: bool,
+    pub(crate) proxy_type: String,
+    pub(crate) url: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AgentDefinitionInput {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) provider_id: String,
+    pub(crate) model_id: String,
+    pub(crate) model_options: AgentModelOptions,
+    pub(crate) system_prompt: String,
+    pub(crate) allowed_tools: Vec<String>,
+    pub(crate) max_instances: u32,
+    #[serde(default = "default_agent_execution_workspace_modes")]
+    pub(crate) allowed_execution_workspace_modes: Vec<AgentExecutionWorkspaceMode>,
+    pub(crate) permissions: AgentPermissions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CreateAgentDefinitionRequest {
+    pub(crate) definition: AgentDefinitionInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UpdateAgentDefinitionRequest {
+    pub(crate) id: AgentDefinitionId,
+    pub(crate) definition: AgentDefinitionInput,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DeleteAgentDefinitionRequest {
+    pub(crate) id: AgentDefinitionId,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualModelRequest {
+    pub(crate) model_id: String,
+    pub(crate) display_name: String,
+    pub(crate) enabled: bool,
+    pub(crate) metadata_key: Option<String>,
+    pub(crate) context_window: Option<u64>,
+    pub(crate) max_output_tokens: Option<u64>,
+    pub(crate) provider_ids: Option<Vec<String>>,
+    pub(crate) active_provider_id: Option<String>,
+    pub(crate) input_modalities: Option<Vec<String>>,
+    pub(crate) output_modalities: Option<Vec<String>>,
+    pub(crate) thinking_level: Option<String>,
+    pub(crate) clear_thinking_level: Option<bool>,
+    pub(crate) system_prompt_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelOrderRequest {
+    pub(crate) model_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualProviderRequest {
+    pub(crate) api_proxy: Option<ManualApiProxySettingsRequest>,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) enabled: bool,
+    pub(crate) base_url: Option<String>,
+    pub(crate) api_key: Option<String>,
+    pub(crate) clear_api_key: Option<bool>,
+    #[serde(default)]
+    pub(crate) auto_sync_models: bool,
+    pub(crate) model_sync_filter_regex: Option<String>,
+    pub(crate) request_overrides: Vec<ProviderRequestOverride>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualMcpServerRequest {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) enabled: bool,
+    pub(crate) transport: String,
+    pub(crate) command: Option<String>,
+    pub(crate) args: Option<Vec<String>>,
+    pub(crate) url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualSkillsRequest {
+    pub(crate) disabled: Option<Vec<String>>,
+    pub(crate) enabled: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TestProviderRequest {
+    pub(crate) provider_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeleteSettingsItemRequest {
+    pub(crate) id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SettingsResponse {
+    pub(crate) general: GeneralSettingsSummary,
+    pub(crate) agent_tools: Vec<String>,
+    pub(crate) native_tools: NativeToolsSummary,
+    pub(crate) web_search: WebSearchSettingsSummary,
+    pub(crate) memory: MemorySettingsSummary,
+    pub(crate) spec: SpecSettingsSummary,
+    pub(crate) prompts: PromptSettingsSummary,
+    pub(crate) workspaces: Vec<ConfiguredWorkspaceSummary>,
+    pub(crate) terminal_shells: Vec<TerminalShellSummary>,
+    pub(crate) provider_kinds: Vec<ProviderKindSummary>,
+    pub(crate) thinking_levels: Vec<ThinkingLevelSummary>,
+    pub(crate) providers: Vec<ConfiguredProviderSummary>,
+    pub(crate) configured_models: Vec<ConfiguredModelSummary>,
+    pub(crate) mcp_transports: Vec<McpTransportSummary>,
+    pub(crate) mcp_servers: Vec<ConfiguredMcpServerSummary>,
+    pub(crate) skills: SkillsSettingsSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentDefinitionsResponse {
+    pub(crate) agent_definitions: Vec<AgentDefinitionSettings>,
+    pub(crate) default_role_prompts: BTreeMap<AgentDefinitionId, String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeToolsSummary {
+    pub(crate) browser_probe_port: u16,
+    pub(crate) ripgrep: RipgrepToolSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GeneralSettingsSummary {
+    pub(crate) auto_start_enabled: bool,
+    pub(crate) default_team_mode_enabled: bool,
+    pub(crate) api_audit: ApiAuditSettingsSummary,
+    pub(crate) web_server: WebServerSettingsSummary,
+    pub(crate) llm_request_retry_count: u32,
+    pub(crate) max_llm_request_retry_count: u32,
+    pub(crate) language: String,
+    pub(crate) theme: String,
+    pub(crate) hook_audit_enabled: bool,
+    pub(crate) supported_languages: Vec<AppLanguageSummary>,
+    pub(crate) supported_themes: Vec<AppThemeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApiAuditSettingsSummary {
+    pub(crate) request_detail_retention_days: u32,
+    pub(crate) save_request_response_details: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WebSearchSettingsSummary {
+    pub(crate) enabled: bool,
+    pub(crate) active_provider: String,
+    pub(crate) providers: Vec<WebSearchProviderSummary>,
+    pub(crate) api_proxy: ApiProxySettingsSummary,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WebSearchProviderSummary {
+    pub(crate) provider: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) has_api_key: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemorySettingsSummary {
+    pub(crate) enabled: bool,
+    pub(crate) extraction_mode: String,
+    pub(crate) retrieval_mode: String,
+    pub(crate) retention_days: Option<u32>,
+    pub(crate) extraction_model_id: Option<String>,
+    pub(crate) retrieval_model_id: Option<String>,
+    pub(crate) dream: MemoryDreamSettingsSummary,
+    pub(crate) extraction_modes: Vec<MemoryExtractionModeSummary>,
+    pub(crate) retrieval_modes: Vec<MemoryExtractionModeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryDreamSettingsSummary {
+    pub(crate) enabled: bool,
+    pub(crate) auto_enabled: bool,
+    pub(crate) mode: String,
+    pub(crate) model_id: Option<String>,
+    pub(crate) workspace_interval_days: u32,
+    pub(crate) global_interval_days: u32,
+    pub(crate) create_transcript_chat: bool,
+    pub(crate) max_facts_per_run: u32,
+    pub(crate) max_changes_per_run: u32,
+    pub(crate) scheduler_scan_minutes: u32,
+    pub(crate) workspace_threshold_facts: u32,
+    pub(crate) global_threshold_facts: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryExtractionModeSummary {
+    pub(crate) value: &'static str,
+    pub(crate) label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SpecSettingsSummary {
+    pub(crate) auto_enabled: bool,
+    pub(crate) generation_model_id: Option<String>,
+    pub(crate) generation_system_prompt: Option<String>,
+    pub(crate) update_system_prompt: Option<String>,
+    pub(crate) default_generation_system_prompt: String,
+    pub(crate) default_update_system_prompt: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PromptSettingsSummary {
+    pub(crate) system_prompt: Option<String>,
+    pub(crate) default_system_prompt: String,
+    pub(crate) default_image_generation_system_prompt: Option<String>,
+    pub(crate) system_prompts: Vec<SystemPromptSummary>,
+    pub(crate) files: Vec<String>,
+    pub(crate) extra_text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SystemPromptSummary {
+    pub(crate) name: String,
+    pub(crate) content: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApiProxySettingsSummary {
+    pub(crate) enabled: bool,
+    pub(crate) proxy_type: String,
+    pub(crate) url: String,
+    pub(crate) supported_types: Vec<ApiProxyTypeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ApiProxyTypeSummary {
+    pub(crate) proxy_type: &'static str,
+    pub(crate) label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WebServerSettingsSummary {
+    pub(crate) listen_host: String,
+    pub(crate) listen_port: u16,
+    pub(crate) password_enabled: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AppLanguageSummary {
+    pub(crate) id: &'static str,
+    pub(crate) name: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AppThemeSummary {
+    pub(crate) id: &'static str,
+    pub(crate) name: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfiguredWorkspaceSummary {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) logo_url: Option<String>,
+    pub(crate) pinned: bool,
+    pub(crate) terminal_shell: String,
+    pub(crate) common_commands: Vec<WorkspaceCommonCommandSummary>,
+    pub(crate) is_default: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceCommonCommandSummary {
+    pub(crate) name: String,
+    pub(crate) command: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TerminalShellSummary {
+    pub(crate) shell: &'static str,
+    pub(crate) label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderKindSummary {
+    pub(crate) kind: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) default_base_url: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ThinkingLevelSummary {
+    pub(crate) value: &'static str,
+    pub(crate) label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct McpTransportSummary {
+    pub(crate) transport: &'static str,
+    pub(crate) label: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfiguredProviderSummary {
+    pub(crate) api_proxy: ApiProxySettingsSummary,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) kind_label: &'static str,
+    pub(crate) enabled: bool,
+    pub(crate) base_url: Option<String>,
+    pub(crate) has_api_key: bool,
+    pub(crate) auto_sync_models: bool,
+    pub(crate) model_sync_filter_regex: Option<String>,
+    pub(crate) request_overrides: Vec<ProviderRequestOverride>,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfiguredMcpServerSummary {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) enabled: bool,
+    pub(crate) transport: String,
+    pub(crate) transport_label: &'static str,
+    pub(crate) command: Option<String>,
+    pub(crate) args: Vec<String>,
+    pub(crate) url: Option<String>,
+    pub(crate) state: String,
+    pub(crate) error: Option<String>,
+    pub(crate) tool_count: usize,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SkillsSettingsSummary {
+    pub(crate) directories: Vec<String>,
+    pub(crate) detected: Vec<ConfiguredSkillSummary>,
+    pub(crate) errors: Vec<SkillDiscoveryErrorSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfiguredSkillSummary {
+    pub(crate) key: String,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) path: String,
+    pub(crate) scope: String,
+    pub(crate) workspace_id: Option<String>,
+    pub(crate) workspace_name: Option<String>,
+    pub(crate) enabled: bool,
+    pub(crate) can_enable: bool,
+    pub(crate) warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderTestResponse {
+    pub(crate) ok: bool,
+    pub(crate) message: String,
+    pub(crate) model_count: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderModelsResponse {
+    pub(crate) provider_id: String,
+    pub(crate) models: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderModelsRefreshResponse {
+    pub(crate) settings: SettingsResponse,
+    pub(crate) providers: Vec<ProviderModelsResponse>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ModelMetadataResponse {
+    pub(crate) source_url: Option<String>,
+    pub(crate) fetched_at: Option<String>,
+    pub(crate) cache_path: String,
+    pub(crate) models: Vec<ModelMetadataRecord>,
+    pub(crate) configured_models: Vec<ConfiguredModelSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfiguredModelSummary {
+    pub(crate) id: String,
+    pub(crate) display_name: String,
+    pub(crate) enabled: bool,
+    pub(crate) metadata_key: Option<String>,
+    pub(crate) metadata_source_url: Option<String>,
+    pub(crate) metadata_refreshed_at: Option<String>,
+    pub(crate) context_window: Option<u64>,
+    pub(crate) max_output_tokens: Option<u64>,
+    pub(crate) can_enable: bool,
+    pub(crate) missing_limits: Vec<&'static str>,
+    pub(crate) provider_ids: Vec<String>,
+    pub(crate) active_provider_id: Option<String>,
+    pub(crate) input_modalities: Vec<String>,
+    pub(crate) output_modalities: Vec<String>,
+    pub(crate) thinking_level: Option<String>,
+    pub(crate) system_prompt_name: String,
+    pub(crate) supports_thinking: bool,
+    pub(crate) warnings: Vec<String>,
+}
+
 pub(crate) fn default_image_generation_system_prompt() -> String {
     IMAGE_AGENT_SYSTEM_PROMPT.to_string()
 }
