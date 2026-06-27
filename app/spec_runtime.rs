@@ -448,6 +448,7 @@ async fn run_workspace_spec_update_job_inner(
     result
 }
 
+#[cfg(test)]
 pub(crate) fn apply_workspace_spec_update_job_output(
     workspace_path: &std::path::Path,
     job_id: &str,
