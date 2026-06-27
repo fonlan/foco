@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+#[cfg(all(windows, not(debug_assertions)))]
+use crate::platform::tray_windows::tray_menu_labels;
 use axum::{
     Json,
     extract::State,

@@ -1,4 +1,5 @@
 mod agent_scheduler;
+mod code_graph;
 mod image_tools;
 mod questions;
 mod subscriptions;
@@ -14,6 +15,10 @@ pub(crate) use agent_scheduler::{
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, CoordinatorTaskInput, insert_agent_event,
     validate_agent_snapshot_for_workspace,
+};
+pub(crate) use code_graph::{
+    CodeGraphIndexState, recently_active_code_graph_workspaces,
+    spawn_code_graph_index_initialization, spawn_code_graph_workspace_initialization_if_needed,
 };
 pub(crate) use image_tools::{
     execute_image_tool, image_model_available, image_tool_timeout_ms, is_image_tool_name,

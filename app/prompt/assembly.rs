@@ -3,7 +3,7 @@ use crate::memory_runtime::{
     memory_retrieval_query_text, neutral_messages_from_record,
     stored_turn_memory_messages_by_sequence,
 };
-use crate::runtime::web_search_enabled;
+use crate::runtime::{spawn_code_graph_workspace_initialization_if_needed, web_search_enabled};
 use crate::*;
 use foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND;
 
