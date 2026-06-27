@@ -57,6 +57,8 @@ graph LR
 | `foco-mcp` | MCP 客户端运行时、stdio/streamable HTTP 传输、服务器状态和工具定义 |
 | `foco-store` | 全局配置、工作区 SQLite 数据库、迁移、审计记录、记忆和模型元数据 |
 
+前端和后端主入口文件保持为装配层。`web/App.tsx` 负责 shell 级路由、当前工作区/聊天协调和跨 feature 状态，具体功能 UI 放在 `web/features/`。`app/main.rs` 负责进程启动、全局状态接线和运行时启动顺序，HTTP 路由、平台代码、原生工具、code graph 启动、聊天运行适配、记忆、提示词、定时任务和存储逻辑放在各自领域模块。
+
 ## 快速开始
 
 ### 前提条件

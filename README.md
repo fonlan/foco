@@ -57,6 +57,8 @@ graph LR
 | `foco-mcp` | MCP client runtime, stdio/streamable HTTP transport, server state, and tool definitions |
 | `foco-store` | Global config, workspace SQLite databases, migrations, audit records, memory, and model metadata |
 
+The main frontend and backend entry files are kept as assembly layers. `web/App.tsx` owns shell-level routing, active workspace/chat coordination, and cross-feature state, while feature UI lives under `web/features/`. `app/main.rs` owns process startup, global state wiring, and runtime boot order, while HTTP routes, platform code, native tools, code graph startup, chat run adaptation, memory, prompt, scheduled task, and store concerns live in their domain modules.
+
 ## Quick Start
 
 ### Prerequisites

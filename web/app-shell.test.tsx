@@ -51,8 +51,7 @@ describe("app-shell verification surfaces", () => {
     const userBubble = screen
       .getByText("Please inspect README.")
       .closest(".message-bubble") as HTMLElement | null;
-    const assistantBubble = screen
-      .getByText("Done.")
+    const assistantBubble = (await screen.findByText("Done."))
       .closest(".message-bubble") as HTMLElement | null;
     expect(userBubble).toHaveClass("message-bubble-user");
     expect(userBubble).not.toHaveClass("bg-teal-800", "text-white");
