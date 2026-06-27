@@ -6753,6 +6753,85 @@ async fn team_chat_task_sse_stays_open_while_coordinator_task_is_waiting() {
 }
 
 #[tokio::test]
+async fn team_chat_task_sse_replays_persisted_run_events_while_task_is_waiting() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-waiting-team-run-events-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-waiting-team-run-events-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let chat_id = "chat-waiting-team-run-events";
+    let user_message_id = "user-waiting-team-run-events";
+    let assistant_message_id = "assistant-waiting-team-run-events";
+    let task_id = {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat(chat_id, "Waiting team run events")
+            .expect("chat insert");
+        let task_id = insert_waiting_coordinator_task(
+            &mut database,
+            chat_id,
+            user_message_id,
+            "waiting-team-run-events",
+        );
+        let run_id = task_id.to_string();
+        for (sequence, event) in [
+            ChatSseEvent::Start {
+                chat_id: chat_id.to_string(),
+                user_message_id: user_message_id.to_string(),
+                assistant_message_id: assistant_message_id.to_string(),
+                llm_request_id: run_id.clone(),
+                memories_used: Vec::new(),
+            },
+            ChatSseEvent::TextDelta {
+                assistant_message_id: assistant_message_id.to_string(),
+                delta: "Already running.".to_string(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let captured = captured_event(&event);
+            database
+                .insert_run_event(NewRunEvent {
+                    id: &format!("{run_id}-event-{sequence}"),
+                    chat_id,
+                    run_id: &run_id,
+                    sequence: sequence as i64,
+                    event_type: &captured.event_type,
+                    payload_json: &captured.normalized_event_json,
+                })
+                .expect("run event insert");
+        }
+        task_id
+    };
+
+    let state = test_app_state(config, profile_dir.clone());
+    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id)
+        .await
+        .expect("waiting Coordinator stream response");
+    let mut stream = response.into_response().into_body().into_data_stream();
+    let mut body = String::new();
+    for _ in 0..2 {
+        let chunk = timeout(Duration::from_millis(200), stream.next())
+            .await
+            .expect("persisted run event should be replayed")
+            .expect("persisted run event chunk")
+            .expect("persisted run event body");
+        body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+
+    assert!(body.contains(r#""type":"start""#), "{body}");
+    assert!(body.contains(r#""type":"textDelta""#), "{body}");
+    assert!(body.contains("Already running."), "{body}");
+    drop(stream);
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn team_chat_task_sse_stays_open_during_interrupted_wait_recovery() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-interrupted-wait-team-stream-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-interrupted-wait-team-stream-profile"));

@@ -870,21 +870,22 @@ fn team_chat_task_event_stream(
     let stream = async_stream::stream! {
         // ponytail: polling avoids a new task-status broadcast; switch to notifications if queued streams become numerous.
         let mut last_agent_event_sequence: Option<i64> = None;
+        let mut last_run_event_sequence: i64 = -1;
         loop {
             let mut streamed_active_run = false;
             if let Ok(subscription) =
                 state
                     .active_chat_runs
-                    .subscribe(&workspace.id, task_id.as_str(), Some(-1))
+                    .subscribe(&workspace.id, task_id.as_str(), Some(last_run_event_sequence))
             {
                 streamed_active_run = true;
                 let mut subscription = subscription;
-                let mut last_sequence = subscription.after_sequence;
+                let mut last_sequence = last_run_event_sequence.max(subscription.after_sequence);
                 for event in subscription.replay {
                     if event.sequence > last_sequence {
                         last_sequence = event.sequence;
+                        yield Ok(sse_event_payload(&event.payload_json));
                     }
-                    yield Ok(sse_event_payload(&event.payload_json));
                 }
 
                 if !*subscription.completed_rx.borrow() {
@@ -921,6 +922,7 @@ fn team_chat_task_event_stream(
                         }
                     }
                 }
+                last_run_event_sequence = last_run_event_sequence.max(last_sequence);
             }
 
             let database = match WorkspaceDatabase::open_or_create(&workspace.path)
@@ -969,6 +971,23 @@ fn team_chat_task_event_stream(
                     return;
                 }
             };
+            let new_run_events = match database
+                .run_events_for_run(task_id.as_str())
+                .map_err(ApiError::from_workspace_error)
+            {
+                Ok(events) => events,
+                Err(error) => {
+                    yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
+                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                    return;
+                }
+            };
+            for event in new_run_events {
+                if event.sequence > last_run_event_sequence {
+                    last_run_event_sequence = event.sequence;
+                    yield Ok(sse_event_payload(&event.payload_json));
+                }
+            }
             let new_agent_events = match database
                 .agent_events_after(&task.team_id, last_agent_event_sequence.unwrap_or(-1))
                 .map_err(ApiError::from_workspace_error)
@@ -1033,7 +1052,10 @@ fn team_chat_task_event_stream(
                     }
                 };
                 for event in events {
-                    yield Ok(Event::default().data(event.payload_json));
+                    if event.sequence > last_run_event_sequence {
+                        last_run_event_sequence = event.sequence;
+                        yield Ok(sse_event_payload(&event.payload_json));
+                    }
                 }
                 yield Ok(sse_event(&ChatSseEvent::StreamEnd));
                 return;
