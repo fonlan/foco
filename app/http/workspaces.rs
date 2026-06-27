@@ -14,8 +14,8 @@ use axum::{
 use foco_store::workspace::WorkspaceDatabase;
 use foco_tools::set_ripgrep_path;
 
+use crate::runtime::download_and_install_ripgrep;
 use crate::*;
-
 pub(crate) async fn workspace_files(
     State(state): State<AppState>,
     AxumPath(workspace_id): AxumPath<String>,

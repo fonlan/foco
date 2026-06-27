@@ -1,13 +1,13 @@
 mod agent_scheduler;
 mod code_graph;
 mod image_tools;
+mod native_tools;
 mod questions;
 mod subscriptions;
 mod tool_events;
 mod tool_execution;
 mod tool_locks;
 mod web_tools;
-
 #[cfg(test)]
 pub(crate) use agent_scheduler::reconcile_agent_runtime;
 pub(crate) use agent_scheduler::{
@@ -22,6 +22,15 @@ pub(crate) use code_graph::{
 };
 pub(crate) use image_tools::{
     execute_image_tool, image_model_available, image_tool_timeout_ms, is_image_tool_name,
+};
+#[cfg(test)]
+pub(crate) use native_tools::{
+    GithubReleaseAsset, find_system_ripgrep, ripgrep_asset_target, ripgrep_executable_name,
+    ripgrep_install_dir, select_ripgrep_asset,
+};
+pub(crate) use native_tools::{
+    RipgrepStatus, RipgrepToolSummary, detect_ripgrep, download_and_install_ripgrep,
+    ripgrep_tool_summary,
 };
 pub(crate) use questions::{
     AskQuestionInput, QuestionAnswer, QuestionAnswerResponse, QuestionItem, QuestionItemAnswer,
