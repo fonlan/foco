@@ -33,6 +33,10 @@ function currentChatTabs() {
   return new URLSearchParams(window.location.search).getAll("tab");
 }
 
+function currentFileTabs() {
+  return new URLSearchParams(window.location.search).getAll("file");
+}
+
 describe("app-shell verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
@@ -1097,6 +1101,54 @@ describe("app-shell verification surfaces", () => {
       "workspace-1/chat-1",
       "workspace-1/chat-2",
     ]);
+  });
+
+  it("closes chat tabs to the right from the tab context menu", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      "/?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2&file=workspace-1%2FREADME.md&activeFile=workspace-1%2FREADME.md",
+    );
+
+    renderApp();
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    await waitFor(() =>
+      expect(within(tabList).getByRole("tab", { name: /README\.md/ })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      ),
+    );
+
+    const secondChatTab = within(tabList).getByRole("tab", { name: /Second chat/ });
+    const secondChatItem = secondChatTab.closest(".chat-tab-item");
+    expect(secondChatItem).not.toBeNull();
+
+    fireEvent.contextMenu(secondChatItem as HTMLElement);
+    const menu = await screen.findByRole("menu", { name: "Second chat" });
+    for (const item of [
+      "Close current tab",
+      "Close other tabs",
+      "Close all tabs",
+      "Close tabs to the right",
+      "Close tabs to the left",
+    ]) {
+      expect(within(menu).getByRole("menuitem", { name: item })).toBeInTheDocument();
+    }
+
+    await userEvent.click(within(menu).getByRole("menuitem", { name: "Close tabs to the right" }));
+
+    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toBeInTheDocument();
+    expect(within(tabList).getByRole("tab", { name: /Second chat/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(within(tabList).queryByRole("tab", { name: /README\.md/ })).not.toBeInTheDocument();
+    expect(currentChatTabs()).toEqual([
+      "workspace-1/chat-1",
+      "workspace-1/chat-2",
+    ]);
+    expect(currentFileTabs()).toEqual([]);
   });
 
   it("opens and selects a historical chat tab before its messages finish loading", async () => {

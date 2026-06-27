@@ -1547,6 +1547,10 @@ body,
   padding: 0.25rem;
 }
 
+.main-tab-context-menu {
+  z-index: 120;
+}
+
 .workspace-chat-context-menu-item {
   display: flex;
   width: 100%;
@@ -1562,8 +1566,13 @@ body,
 
 .workspace-chat-context-menu-item:hover,
 .workspace-chat-context-menu-item:focus-visible {
-  background: var(--foco-row-hover);
+  background-color: rgba(245, 245, 244, 1);
   outline: none;
+}
+
+.workspace-chat-context-menu-item:disabled:hover,
+.workspace-chat-context-menu-item:disabled:focus-visible {
+  background-color: transparent;
 }
 
 .workspace-chat-context-menu-item-danger {
@@ -3046,7 +3055,7 @@ body,
 
 .composer-team-toggle {
   display: inline-flex;
-  height: 2rem;
+  height: 1.875rem;
   flex: 0 0 auto;
   align-items: center;
   gap: 0.375rem;

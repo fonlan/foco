@@ -48,6 +48,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import type {
   ActiveChatRunSummary,
   ActiveRunInfo,
@@ -283,6 +284,15 @@ type MainTabSummary =
       workspaceName: string;
       workspaceLogoUrl: string | null;
     });
+
+type MainTabCloseScope = "current" | "others" | "all" | "right" | "left";
+
+type MainTabContextMenuState = {
+  left: number;
+  positioned: boolean;
+  tab: MainTabSummary;
+  top: number;
+};
 
 type WorkspaceFileContextMenuState = {
   left: number;
@@ -3812,6 +3822,111 @@ export function App() {
       chatId: activeChatId,
       viewMode: "chat",
       workspaceId: activeWorkspaceId || tab.workspaceId,
+    }, "replace");
+  }
+
+  function closeMainTabs(scope: MainTabCloseScope, anchorTab: MainTabSummary) {
+    const anchorIndex = mainTabs.findIndex(
+      (tab) => mainTabKey(tab) === mainTabKey(anchorTab),
+    );
+    if (anchorIndex < 0) {
+      return;
+    }
+
+    const candidates = mainTabs.filter((tab, index) => {
+      if (scope === "current") {
+        return index === anchorIndex;
+      }
+      if (scope === "others") {
+        return index !== anchorIndex;
+      }
+      if (scope === "right") {
+        return index > anchorIndex;
+      }
+      if (scope === "left") {
+        return index < anchorIndex;
+      }
+      return true;
+    });
+    const tabsToClose = candidates.filter(
+      (tab) =>
+        tab.type !== "chat" ||
+        !runningChatKeys.has(chatRunKey(tab.workspaceId, tab.chatId)),
+    );
+    if (!tabsToClose.length) {
+      return;
+    }
+
+    const closedKeys = new Set(tabsToClose.map(mainTabKey));
+    const nextTabs = mainTabs.filter((tab) => !closedKeys.has(mainTabKey(tab)));
+    const nextOpenChatTabs = openChatTabsRef.current.filter(
+      (tab) => !closedKeys.has(`chat:${chatRunKey(tab.workspaceId, tab.chatId)}`),
+    );
+    const nextOpenFileTabs = openFileTabsRef.current.filter(
+      (tab) => !closedKeys.has(workspaceFileEditorKey(tab.workspaceId, tab.path)),
+    );
+
+    openChatTabsRef.current = nextOpenChatTabs;
+    openFileTabsRef.current = nextOpenFileTabs;
+    setOpenChatTabs(nextOpenChatTabs);
+    setOpenFileTabs(nextOpenFileTabs);
+    setOpenAgentTabs((current) =>
+      current.filter(
+        (tab) =>
+          !closedKeys.has(`agent:${tab.workspaceId}:${tab.chatId}:${tab.instanceId}`),
+      ),
+    );
+
+    for (const tab of tabsToClose) {
+      if (tab.type !== "chat") {
+        continue;
+      }
+      const chatKey = chatRunKey(tab.workspaceId, tab.chatId);
+      setChatRunFailed(chatKey, false);
+      removeMessagesForChatKey(chatKey);
+      removeChatPaginationForChatKey(chatKey);
+      removeContextUsageForChatKey(chatKey);
+    }
+
+    setWorkspaceFileEditors((current) => {
+      const next = { ...current };
+      for (const tab of tabsToClose) {
+        if (tab.type === "file") {
+          delete next[workspaceFileEditorKey(tab.workspaceId, tab.path)];
+        }
+      }
+      return next;
+    });
+
+    const activeWasClosed = tabsToClose.some((tab) => mainTabMatches(activeMainTab, tab));
+    if (!activeWasClosed) {
+      if (activeMainTab.type === "file" && activeFileTab) {
+        updateBrowserRoute(browserRouteForActiveFile(activeFileTab), "replace");
+      } else {
+        updateBrowserRoute({
+          chatId: activeChatId,
+          viewMode: "chat",
+          workspaceId: activeWorkspaceId || anchorTab.workspaceId,
+        }, "replace");
+      }
+      return;
+    }
+
+    const nextTab = nextTabs[Math.min(anchorIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    if (nextTab) {
+      selectMainTab(nextTab);
+      return;
+    }
+
+    const workspaceId = activeWorkspaceId || anchorTab.workspaceId;
+    setActiveWorkspaceChatRefs(workspaceId, null);
+    setActiveChatId(null);
+    setMessages([]);
+    setActiveMainTab({ chatId: null, type: "chat", workspaceId });
+    updateBrowserRoute({
+      chatId: null,
+      viewMode: "chat",
+      workspaceId,
     }, "replace");
   }
 
@@ -7997,6 +8112,7 @@ export function App() {
                   <MainTabBar
                     activeTab={activeMainTab}
                     onCloseTab={closeMainTab}
+                    onCloseTabs={closeMainTabs}
                     onSelectTab={selectMainTab}
                     runningChatKeys={runningChatKeys}
                     tabs={mainTabs}
@@ -8604,12 +8720,14 @@ function QuestionDialog({
 function MainTabBar({
   activeTab,
   onCloseTab,
+  onCloseTabs,
   onSelectTab,
   runningChatKeys,
   tabs,
 }: {
   activeTab: ActiveMainTab;
   onCloseTab: (tab: MainTabSummary) => void;
+  onCloseTabs: (scope: MainTabCloseScope, anchorTab: MainTabSummary) => void;
   onSelectTab: (tab: MainTabSummary) => void;
   runningChatKeys: Set<string>;
   tabs: MainTabSummary[];
@@ -8618,8 +8736,10 @@ function MainTabBar({
   const tabsContainerRef = useRef<HTMLDivElement>(null);
   const tabListRef = useRef<HTMLDivElement>(null);
   const tabItemRefs = useRef(new Map<string, HTMLDivElement>());
+  const contextMenuRef = useRef<HTMLDivElement>(null);
   const hasTrackedTabKeysRef = useRef(false);
   const previousTabKeysRef = useRef<string[]>([]);
+  const [contextMenu, setContextMenu] = useState<MainTabContextMenuState | null>(null);
   const [scrollState, setScrollState] = useState({
     canScrollLeft: false,
     canScrollRight: false,
@@ -8709,6 +8829,84 @@ function MainTabBar({
     };
   }, [updateScrollState]);
 
+  useEffect(() => {
+    if (!contextMenu) {
+      return;
+    }
+
+    function closeContextMenuForPointer(event: PointerEvent) {
+      const target = event.target;
+      if (
+        target instanceof Element &&
+        target.closest(".main-tab-context-menu")
+      ) {
+        return;
+      }
+      setContextMenu(null);
+    }
+
+    function closeContextMenuForKey(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setContextMenu(null);
+      }
+    }
+
+    function closeContextMenu() {
+      setContextMenu(null);
+    }
+
+    window.addEventListener("pointerdown", closeContextMenuForPointer);
+    window.addEventListener("keydown", closeContextMenuForKey);
+    window.addEventListener("resize", closeContextMenu);
+    window.addEventListener("scroll", closeContextMenu, true);
+
+    return () => {
+      window.removeEventListener("pointerdown", closeContextMenuForPointer);
+      window.removeEventListener("keydown", closeContextMenuForKey);
+      window.removeEventListener("resize", closeContextMenu);
+      window.removeEventListener("scroll", closeContextMenu, true);
+    };
+  }, [contextMenu]);
+
+  useEffect(() => {
+    if (!contextMenu) {
+      return;
+    }
+
+    const contextMenuTabKey = mainTabKey(contextMenu.tab);
+    if (!tabs.some((tab) => mainTabKey(tab) === contextMenuTabKey)) {
+      setContextMenu(null);
+    }
+  }, [contextMenu, tabs]);
+
+  useLayoutEffect(() => {
+    if (!contextMenu || contextMenu.positioned) {
+      return;
+    }
+
+    const element = contextMenuRef.current;
+    if (!element || typeof window === "undefined") {
+      return;
+    }
+
+    const margin = 8;
+    const rect = element.getBoundingClientRect();
+    const nextLeft = Math.max(
+      margin,
+      Math.min(contextMenu.left, window.innerWidth - rect.width - margin),
+    );
+    const nextTop = Math.max(
+      margin,
+      Math.min(contextMenu.top, window.innerHeight - rect.height - margin),
+    );
+    setContextMenu({
+      ...contextMenu,
+      left: nextLeft,
+      positioned: true,
+      top: nextTop,
+    });
+  }, [contextMenu]);
+
   function scrollTabs(direction: -1 | 1) {
     const element = tabListRef.current;
     if (!element) {
@@ -8754,11 +8952,99 @@ function MainTabBar({
     updateScrollState();
   }
 
-  return (
+  function handleContextMenu(event: ReactMouseEvent<HTMLDivElement>, tab: MainTabSummary) {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({
+      left: event.clientX,
+      positioned: false,
+      tab,
+      top: event.clientY,
+    });
+  }
+
+  function closeTabsFromMenu(scope: MainTabCloseScope) {
+    if (!contextMenu) {
+      return;
+    }
+
+    const { tab } = contextMenu;
+    setContextMenu(null);
+    onCloseTabs(scope, tab);
+  }
+
+  function canCloseTab(tab: MainTabSummary) {
+    return tab.type !== "chat" || !runningChatKeys.has(chatRunKey(tab.workspaceId, tab.chatId));
+  }
+
+  function hasClosableTabs(scope: MainTabCloseScope, anchorTab: MainTabSummary) {
+    const anchorIndex = tabs.findIndex((tab) => mainTabKey(tab) === mainTabKey(anchorTab));
+    if (anchorIndex < 0) {
+      return false;
+    }
+
+    return tabs.some((tab, index) => {
+      if (!canCloseTab(tab)) {
+        return false;
+      }
+      if (scope === "current") {
+        return index === anchorIndex;
+      }
+      if (scope === "others") {
+        return index !== anchorIndex;
+      }
+      if (scope === "right") {
+        return index > anchorIndex;
+      }
+      if (scope === "left") {
+        return index < anchorIndex;
+      }
+      return true;
+    });
+  }
+
+  const contextMenuItems: Array<{ label: string; scope: MainTabCloseScope }> = [
+    { label: "Close current tab", scope: "current" },
+    { label: "Close other tabs", scope: "others" },
+    { label: "Close all tabs", scope: "all" },
+    { label: "Close tabs to the right", scope: "right" },
+    { label: "Close tabs to the left", scope: "left" },
+  ];
+
+  const contextMenuElement = contextMenu ? (
     <div
-      className="chat-tabs flex min-w-0 flex-1 flex-nowrap overflow-hidden"
-      ref={tabsContainerRef}
+      aria-label={contextMenu.tab.title}
+      className="workspace-chat-context-menu main-tab-context-menu"
+      ref={contextMenuRef}
+      role="menu"
+      style={{
+        left: contextMenu.left,
+        top: contextMenu.top,
+        visibility: contextMenu.positioned ? "visible" : "hidden",
+      }}
     >
+      {contextMenuItems.map((item) => (
+        <button
+          className="workspace-chat-context-menu-item"
+          disabled={!hasClosableTabs(item.scope, contextMenu.tab)}
+          key={item.scope}
+          onClick={() => closeTabsFromMenu(item.scope)}
+          role="menuitem"
+          type="button"
+        >
+          <X aria-hidden="true" className="size-3.5" />
+          <span>{t(item.label)}</span>
+        </button>
+      ))}
+    </div>
+  ) : null;
+
+  return (
+    <>
+      <div
+        className="chat-tabs flex min-w-0 flex-1 flex-nowrap overflow-hidden"
+        ref={tabsContainerRef}
+      >
       {scrollState.hasOverflow ? (
         <button
           aria-label={t("Scroll chat tabs left")}
@@ -8795,6 +9081,7 @@ function MainTabBar({
                     : "border-stone-200 bg-stone-50/80 text-stone-600 hover:border-stone-300 hover:bg-white"
                   }`}
                 key={key}
+                onContextMenu={(event) => handleContextMenu(event, tab)}
                 ref={(element) => {
                   if (element) {
                     tabItemRefs.current.set(key, element);
@@ -8870,7 +9157,11 @@ function MainTabBar({
           <ChevronRight aria-hidden="true" className="size-4" />
         </button>
       ) : null}
-    </div>
+      </div>
+      {contextMenuElement && typeof document !== "undefined"
+        ? createPortal(contextMenuElement, document.body)
+        : null}
+    </>
   );
 }
 
