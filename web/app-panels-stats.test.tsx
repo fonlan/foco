@@ -700,6 +700,11 @@ describe("app-panels-stats verification surfaces", () => {
       within(screen.getByText("Tools and compression").parentElement!)
         .getByText("read_file"),
     ).toBeInTheDocument();
+    expect(screen.getByText("Runtime tool-state snapshots")).toBeInTheDocument();
+    expect(
+      within(screen.getByText("Runtime tool-state snapshots").parentElement!)
+        .getByText("2"),
+    ).toBeInTheDocument();
     expect(screen.getByText("Context usage unavailable.")).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(([url]) => url === "/api/workspaces/workspace-1/context-usage"),

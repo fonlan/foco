@@ -1380,6 +1380,9 @@ pub(crate) async fn chat_statistics(
     let compression_snapshots = database
         .context_compression_snapshots_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?;
+    let runtime_tool_state_snapshot_count = database
+        .runtime_tool_state_compression_count_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?;
     let code_change_stats = database
         .code_change_stats_for_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?;
@@ -1413,6 +1416,7 @@ pub(crate) async fn chat_statistics(
         llm_rows,
         prompt_injections,
         compression_snapshots,
+        runtime_tool_state_snapshot_count,
         code_change_stats,
         tool_breakdown,
         created_workspace_memories + created_global_memories,

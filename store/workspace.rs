@@ -1727,6 +1727,54 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    pub fn runtime_tool_state_compression_count_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        let event_count = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM run_events
+                 WHERE chat_id = ?1
+                   AND event_type = 'context_compression'
+                   AND CAST(json_extract(payload_json, '$.kind') AS TEXT)
+                       IN ('runtimeToolState', 'runtime_tool_state')",
+                params![chat_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if event_count > 0 {
+            return Ok(event_count);
+        }
+
+        const RUNTIME_TOOL_STATE_MARKER: &str = "Runtime tool-state compression snapshot";
+        self.connection
+            .query_row(
+                "SELECT COALESCE(SUM(snapshot_count), 0)
+                 FROM (
+                     SELECT MAX(
+                         (
+                             LENGTH(request_body_json)
+                             - LENGTH(REPLACE(request_body_json, ?2, ''))
+                         ) / ?3
+                     ) AS snapshot_count
+                     FROM llm_requests
+                     WHERE chat_id = ?1
+                       AND agent_task_id IS NOT NULL
+                       AND request_body_json LIKE '%' || ?2 || '%'
+                     GROUP BY agent_task_id
+                 )",
+                params![
+                    chat_id,
+                    RUNTIME_TOOL_STATE_MARKER,
+                    RUNTIME_TOOL_STATE_MARKER.len() as i64
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn history_run_events_for_chat(
         &self,
         chat_id: &str,

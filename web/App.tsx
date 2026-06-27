@@ -11320,6 +11320,13 @@ function ContextStatsTab({
               value: formatNumber(statistics.compression.llmSnapshotCount, language),
             },
             {
+              label: t("Runtime tool-state snapshots"),
+              value: formatNumber(
+                statistics.compression.runtimeToolStateSnapshotCount,
+                language,
+              ),
+            },
+            {
               label: t("Compression snapshots"),
               value: formatNumber(statistics.compression.snapshotCount, language),
             },
@@ -12328,7 +12335,7 @@ function SettingsPanel({
   const editingModel =
     configuredModels.find((model) => model.id === form.modelId) ?? null;
   const modelThinkingEnabled = selectedMetadata
-    ? selectedMetadata.reasoning
+    ? selectedMetadata.reasoning || Boolean(editingModel?.supportsThinking)
     : Boolean(editingModel?.supportsThinking);
   const editingWorkspace =
     workspaces.find((workspace) => workspace.id === workspaceForm.id) ?? null;
@@ -23725,8 +23732,16 @@ function addChatRunBadge(
   return { ...message, runBadges: [...runBadges, badge] };
 }
 
-function contextCompressionBadge(kind: "rule" | "llm"): ChatRunBadge {
-  return kind === "llm" ? "contextCompressionLlm" : "contextCompressionRule";
+function contextCompressionBadge(
+  kind: "rule" | "llm" | "runtimeToolState",
+): ChatRunBadge {
+  if (kind === "llm") {
+    return "contextCompressionLlm";
+  }
+  if (kind === "runtimeToolState") {
+    return "contextCompressionRuntime";
+  }
+  return "contextCompressionRule";
 }
 
 type StreamAttemptSnapshot = {
@@ -24495,6 +24510,7 @@ function emptyChatStatistics(
       snapshotCount: 0,
       ruleSnapshotCount: 0,
       llmSnapshotCount: 0,
+      runtimeToolStateSnapshotCount: 0,
       originalTokenCount: 0,
       summaryTokenCount: 0,
       savedTokenCount: 0,
@@ -25221,13 +25237,23 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     );
     const snapshotId = stringField(value, "snapshotId", "snapshot_id");
     const kindValue = stringField(value, "kind") ?? "rule";
-    const kind = kindValue === "llm" ? "llm" : "rule";
+    const kind =
+      kindValue === "llm"
+        ? "llm"
+        : kindValue === "runtimeToolState" || kindValue === "runtime_tool_state"
+          ? "runtimeToolState"
+          : "rule";
 
-    if (!assistantMessageId || !snapshotId) {
+    if (!assistantMessageId || (kind !== "runtimeToolState" && !snapshotId)) {
       return null;
     }
 
-    return { type: "contextCompression", assistantMessageId, snapshotId, kind };
+    return {
+      type: "contextCompression",
+      assistantMessageId,
+      ...(snapshotId ? { snapshotId } : {}),
+      kind,
+    };
   }
   if (value.type === "toolOutputDelta" || value.type === "tool_output_delta") {
     const assistantMessageId = stringField(

@@ -97,14 +97,14 @@ fn validate_prompt_context_lengths(
 
 pub(crate) async fn ensure_context_compression(
     context: &mut PreparedChatContext,
-) -> Result<usize, ApiError> {
+) -> Result<ContextCompressionResult, ApiError> {
     validate_prompt_context_lengths(
         &context.provider_request.messages,
         &context.message_source_sequences,
         &context.message_context_sources,
     )?;
 
-    let compressed_runtime_tool_state = compress_runtime_tool_state_if_needed(context, false)?;
+    let mut runtime_tool_state_compressed = compress_runtime_tool_state_if_needed(context, false)?;
 
     let message_groups = context_message_groups(
         &context.provider_request.messages,
@@ -120,7 +120,10 @@ pub(crate) async fn ensure_context_compression(
         > llm_context_compression_trigger_tokens(context.context_budget.available_message_tokens)
         && ensure_llm_context_compression(context, &message_groups).await?
     {
-        return Ok(context.active_tool_start_index);
+        return Ok(ContextCompressionResult {
+            active_tool_start_index: context.active_tool_start_index,
+            runtime_tool_state_compressed,
+        });
     }
     let pack_items = pack_items_from_message_groups(&message_groups);
 
@@ -130,13 +133,17 @@ pub(crate) async fn ensure_context_compression(
         active_tool_start_group_index(&message_groups, context.active_tool_start_index),
         CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES,
     ) else {
-        if !compressed_runtime_tool_state {
+        if !runtime_tool_state_compressed {
             let breakdown = context_token_breakdown(&message_groups);
             if breakdown.required_tokens > context.context_budget.available_message_tokens {
-                compress_runtime_tool_state_if_needed(context, true)?;
+                runtime_tool_state_compressed |=
+                    compress_runtime_tool_state_if_needed(context, true)?;
             }
         }
-        return Ok(context.active_tool_start_index);
+        return Ok(ContextCompressionResult {
+            active_tool_start_index: context.active_tool_start_index,
+            runtime_tool_state_compressed,
+        });
     };
     let covered_indices = message_group_indices(&message_groups, &plan.covered_indices)?;
 
@@ -148,7 +155,10 @@ pub(crate) async fn ensure_context_compression(
     let summary_token_count = estimate_text_tokens(&summary);
 
     if summary_token_count >= plan.original_tokens {
-        return Ok(context.active_tool_start_index);
+        return Ok(ContextCompressionResult {
+            active_tool_start_index: context.active_tool_start_index,
+            runtime_tool_state_compressed,
+        });
     }
 
     let covered_sequences =
@@ -189,7 +199,10 @@ pub(crate) async fn ensure_context_compression(
         &pre_summary.additional_context,
     );
     if pre_summary.first_block_reason().is_some() {
-        return Ok(context.active_tool_start_index);
+        return Ok(ContextCompressionResult {
+            active_tool_start_index: context.active_tool_start_index,
+            runtime_tool_state_compressed,
+        });
     }
     let snapshot_id = unique_id("ctx");
     let snapshot_sequence = next_context_snapshot_sequence(&context.compression_snapshots)?;
@@ -304,10 +317,13 @@ pub(crate) async fn ensure_context_compression(
     )?;
     let breakdown = context_token_breakdown(&message_groups);
     if breakdown.required_tokens > context.context_budget.available_message_tokens {
-        compress_runtime_tool_state_if_needed(context, true)?;
+        runtime_tool_state_compressed |= compress_runtime_tool_state_if_needed(context, true)?;
     }
 
-    Ok(context.active_tool_start_index)
+    Ok(ContextCompressionResult {
+        active_tool_start_index: context.active_tool_start_index,
+        runtime_tool_state_compressed,
+    })
 }
 
 fn llm_context_compression_trigger_tokens(available_tokens: u64) -> u64 {

@@ -307,6 +307,7 @@ export type QueuedMessageRunSummary = {
 export type ChatRunBadge =
   | "contextCompressionRule"
   | "contextCompressionLlm"
+  | "contextCompressionRuntime"
   | "llmReconnect";
 
 export type ChatMessageSummary = {
@@ -417,8 +418,8 @@ export type ChatStreamEvent =
   | {
     type: "contextCompression";
     assistantMessageId: string;
-    snapshotId: string;
-    kind: "rule" | "llm";
+    snapshotId?: string;
+    kind: "rule" | "llm" | "runtimeToolState";
   }
   | { type: "usage"; usage?: ChatUsage }
   | {
@@ -512,6 +513,7 @@ export type ChatCompressionStatistics = {
   snapshotCount: number;
   ruleSnapshotCount: number;
   llmSnapshotCount: number;
+  runtimeToolStateSnapshotCount: number;
   originalTokenCount: number;
   summaryTokenCount: number;
   savedTokenCount: number;

@@ -398,6 +398,121 @@ fn workspace_connections_wait_for_concurrent_writer_lock() {
 }
 
 #[test]
+fn counts_runtime_tool_state_compression_events_for_chat() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Compression events")
+        .expect("chat insert");
+    database
+        .insert_chat("chat-2", "Other chat")
+        .expect("other chat insert");
+
+    for (sequence, (id, chat_id, kind)) in [
+        ("event-1", "chat-1", "runtimeToolState"),
+        ("event-2", "chat-1", "rule"),
+        ("event-3", "chat-2", "runtimeToolState"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        database
+            .insert_run_event(NewRunEvent {
+                id,
+                chat_id,
+                run_id: "run-1",
+                sequence: sequence as i64,
+                event_type: "context_compression",
+                payload_json: &format!(r#"{{"type":"contextCompression","kind":"{kind}"}}"#),
+            })
+            .expect("run event insert");
+    }
+
+    assert_eq!(
+        database
+            .runtime_tool_state_compression_count_for_chat("chat-1")
+            .expect("runtime compression count"),
+        1
+    );
+}
+
+#[test]
+fn infers_runtime_tool_state_compression_from_saved_request_bodies() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-1", "legacy-compression");
+    let task_1 = AgentTaskId::new("agent-task-1").expect("task id");
+    let task_2 = AgentTaskId::new("agent-task-2").expect("task id");
+    for task_id in [&task_1, &task_2] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("agent task enqueue");
+    }
+
+    for (id, task_id, body) in [
+        (
+            "request-1",
+            &task_1,
+            r#"{"messages":[{"content":"Runtime tool-state compression snapshot Runtime tool-state compression snapshot"}]}"#,
+        ),
+        (
+            "request-2",
+            &task_1,
+            r#"{"messages":[{"content":"Runtime tool-state compression snapshot"}]}"#,
+        ),
+        (
+            "request-3",
+            &task_2,
+            r#"{"messages":[{"content":"Runtime tool-state compression snapshot"}]}"#,
+        ),
+    ] {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id,
+                workspace_id: "workspace-1",
+                chat_id: Some("chat-1"),
+                agent_team_id: Some(&team_id),
+                agent_instance_id: None,
+                agent_task_id: Some(task_id),
+                agent_attempt_id: None,
+                provider_id: "openai",
+                model_id: "gpt-test",
+                request_started_at: "2026-06-27T00:00:00Z",
+                first_token_at: None,
+                completed_at: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: None,
+                status_code: None,
+                final_state: "succeeded",
+                request_body_json: Some(body),
+                response_body_json: None,
+            })
+            .expect("llm request insert");
+    }
+
+    assert_eq!(
+        database
+            .runtime_tool_state_compression_count_for_chat("chat-1")
+            .expect("runtime compression count"),
+        3
+    );
+}
+
+#[test]
 fn initializes_every_registered_workspace() {
     let first = tempfile::tempdir().expect("first workspace");
     let second = tempfile::tempdir().expect("second workspace");

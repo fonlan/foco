@@ -1268,6 +1268,7 @@ export const chatStatistics = {
     llmSnapshotCount: 0,
     originalTokenCount: 9000,
     ruleSnapshotCount: 1,
+    runtimeToolStateSnapshotCount: 2,
     savedTokenCount: 6800,
     snapshotCount: 1,
     summaryTokenCount: 2200,

@@ -1214,6 +1214,31 @@ describe("app-settings verification surfaces", () => {
       });
     });
   });
+  it("keeps thinking level editable when configured model supports it despite stale metadata", async () => {
+    const gpt55Model = {
+      ...settings.configuredModels[0],
+      displayName: "GPT 5.5",
+      id: "gpt-5.5",
+      metadataKey: "openai/gpt-5.5",
+      supportsThinking: true,
+      thinkingLevel: "high",
+    };
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [gpt55Model],
+    };
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit model GPT 5.5" }));
+
+    const thinkingLevel = screen.getByLabelText("Thinking level");
+    // ponytail: UI-level regression check; save behavior is already covered by model form tests.
+    expect(thinkingLevel).not.toBeDisabled();
+    expect(thinkingLevel).toHaveValue("high");
+  });
 
   it("toggles configured models from the model list", async () => {
     const fetchMock = vi.mocked(fetch);

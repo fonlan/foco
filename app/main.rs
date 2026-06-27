@@ -194,6 +194,8 @@ const CONTEXT_COMPRESSION_PROMPT_PREFIX: &str = "Context compression snapshot:";
 const CONTEXT_COMPRESSION_KIND_RULE: &str = "rule";
 // Metadata kind for model-generated fallback context compression snapshots.
 const CONTEXT_COMPRESSION_KIND_LLM: &str = "llm";
+// Event kind for lossy in-progress tool-state compression.
+const CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE: &str = "runtimeToolState";
 // Numerator for the 95% model-generated fallback compression threshold.
 const LLM_CONTEXT_COMPRESSION_TRIGGER_NUMERATOR: u64 = 19;
 // Denominator for the 95% model-generated fallback compression threshold.
@@ -268,6 +270,10 @@ const MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 2048;
 const MEMORY_RETRIEVAL_MAX_OUTPUT_TOKENS: u32 = 1024;
 // Maximum active or pending facts included for extraction-time duplicate checks.
 const MEMORY_EXTRACTION_EXISTING_FACT_LIMIT: u32 = 80;
+// Per-evidence content budget for background memory extraction requests.
+const MEMORY_EXTRACTION_MAX_EVIDENCE_CONTENT_CHARS: usize = 4_096;
+// Total content budget for background memory extraction requests.
+const MEMORY_EXTRACTION_MAX_TOTAL_EVIDENCE_CHARS: usize = 65_536;
 // Maximum active memory facts sent to the model-based memory retrieval request.
 const MEMORY_RETRIEVAL_LLM_FACT_LIMIT: u32 = 200;
 // System prompt for the memory extraction request that forces evidence-backed tool output only.
@@ -3482,6 +3488,7 @@ struct ChatCompressionStatistics {
     snapshot_count: i64,
     rule_snapshot_count: i64,
     llm_snapshot_count: i64,
+    runtime_tool_state_snapshot_count: i64,
     original_token_count: i64,
     summary_token_count: i64,
     saved_token_count: i64,
@@ -3825,7 +3832,8 @@ enum ChatSseEvent {
     },
     ContextCompression {
         assistant_message_id: String,
-        snapshot_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        snapshot_id: Option<String>,
         kind: String,
     },
     ToolCall {
@@ -4140,6 +4148,12 @@ struct ContextMessageGroup {
     must_keep: bool,
     source_bucket: PromptContextSourceBucket,
     runtime_tool_batch_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ContextCompressionResult {
+    active_tool_start_index: usize,
+    runtime_tool_state_compressed: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -4757,8 +4771,8 @@ impl PreparedChatContext {
                 }
 
                 let previous_compression_snapshot_count = self.compression_snapshots.len();
-                let turn_active_tool_start_index = match ensure_context_compression(&mut self).await {
-                    Ok(index) => index,
+                let compression_result = match ensure_context_compression(&mut self).await {
+                    Ok(result) => result,
                     Err(error) => {
                         let message = error.message;
                         let event = ChatSseEvent::Error {
@@ -4786,6 +4800,7 @@ impl PreparedChatContext {
                         return;
                     }
                 };
+                let turn_active_tool_start_index = compression_result.active_tool_start_index;
                 for notification in std::mem::take(&mut self.hook_notifications) {
                     let event = ChatSseEvent::HookNotification {
                         assistant_message_id: self.assistant_message_id.clone(),
@@ -4798,12 +4813,21 @@ impl PreparedChatContext {
                     if let Some(snapshot) = self.compression_snapshots.last() {
                         let event = ChatSseEvent::ContextCompression {
                             assistant_message_id: self.assistant_message_id.clone(),
-                            snapshot_id: snapshot.id.clone(),
+                            snapshot_id: Some(snapshot.id.clone()),
                             kind: compression_snapshot_kind(snapshot).to_string(),
                         };
                         events.push(captured_event(&event));
                         yield event;
                     }
+                }
+                if compression_result.runtime_tool_state_compressed {
+                    let event = ChatSseEvent::ContextCompression {
+                        assistant_message_id: self.assistant_message_id.clone(),
+                        snapshot_id: None,
+                        kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
+                    };
+                    events.push(captured_event(&event));
+                    yield event;
                 }
                 let packed_messages = match pack_neutral_messages(
                     self.provider_request.messages.clone(),
@@ -9949,6 +9973,7 @@ fn chat_statistics_response(
     llm_rows: Vec<LlmRequestAuditRow>,
     prompt_injections: Vec<PromptContextInjectionRecord>,
     compression_snapshots: Vec<ContextCompressionSnapshotRecord>,
+    runtime_tool_state_snapshot_count: i64,
     code_change_stats: CodeChangeStats,
     tool_breakdown: Vec<ChatToolBreakdown>,
     created_memories: i64,
@@ -9959,7 +9984,8 @@ fn chat_statistics_response(
         .filter_map(|row| row.total_latency_ms)
         .sum::<i64>();
     let memory_references = unique_prompt_context_memory_keys(&prompt_injections)? as i64;
-    let compression = chat_compression_statistics(&compression_snapshots);
+    let compression =
+        chat_compression_statistics(&compression_snapshots, runtime_tool_state_snapshot_count);
 
     Ok(ChatStatisticsResponse {
         workspace_id: workspace_id.to_string(),
@@ -10018,6 +10044,7 @@ fn unique_prompt_context_memory_keys(
 
 fn chat_compression_statistics(
     snapshots: &[ContextCompressionSnapshotRecord],
+    runtime_tool_state_snapshot_count: i64,
 ) -> ChatCompressionStatistics {
     let original_token_count = snapshots
         .iter()
@@ -10040,6 +10067,7 @@ fn chat_compression_statistics(
         snapshot_count: snapshots.len() as i64,
         rule_snapshot_count,
         llm_snapshot_count,
+        runtime_tool_state_snapshot_count,
         original_token_count,
         summary_token_count,
         saved_token_count: (original_token_count - summary_token_count).max(0),

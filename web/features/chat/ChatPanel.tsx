@@ -1163,6 +1163,14 @@ const MessageRow = memo(function MessageRow({
                     {t("LLM compressed")}
                   </span>
                 ) : null}
+                {!isUser && message.runBadges?.includes("contextCompressionRuntime") ? (
+                  <span
+                    className="message-run-badge"
+                    title={t("Runtime tool-state compression was triggered")}
+                  >
+                    {t("Tool state compressed")}
+                  </span>
+                ) : null}
               </span>
               <span className="message-action-group">
                 {canManageQueuedMessage ? (
