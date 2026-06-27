@@ -1,4 +1,5 @@
 mod agent_scheduler;
+mod api_audit;
 mod chat_run;
 mod code_graph;
 mod image_tools;
@@ -17,6 +18,9 @@ pub(crate) use agent_scheduler::{
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, CoordinatorTaskInput, insert_agent_event,
     validate_agent_snapshot_for_workspace,
 };
+#[cfg(test)]
+pub(crate) use api_audit::should_vacuum_workspace_database;
+pub(crate) use api_audit::{spawn_api_audit_cleanup_once, spawn_api_audit_cleanup_scheduler};
 #[cfg(test)]
 pub(crate) use chat_run::agent_run_event_kind;
 pub(crate) use chat_run::run_chat_context_in_background;
