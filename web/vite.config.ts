@@ -18,7 +18,7 @@ export default defineConfig({
           groups: [
             {
               name: "vendor-react",
-              test: /vite[\\/]preload-helper/,
+              test: /(?:vite[\\/]preload-helper|node_modules[\\/](?:react|react-dom)[\\/])/,
             },
             {
               name: "vendor-markdown",
