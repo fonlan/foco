@@ -118,7 +118,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Misfire: "错过运行",
     "Team mode": "团队模式",
     "Enable Team mode": "启用团队模式",
-    Plan: "计划",
+    Plan: "规划",
     "Plan mode": "规划模式",
     "Plan settings": "规划模式",
     "Plan automation and history": "合并策略与规划历史",

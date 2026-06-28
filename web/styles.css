@@ -2248,7 +2248,7 @@ body,
   border-bottom-color: var(--foco-accent);
 }
 
-@container (max-width: 26rem) {
+@container (max-width: 32rem) {
   .context-panel-tab {
     width: 2rem;
     justify-content: center;
