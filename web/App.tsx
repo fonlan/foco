@@ -1616,15 +1616,20 @@ export function App() {
       setActivePlansError(null);
 
       try {
-        await requestJson<unknown>(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/agent-tasks/${encodeURIComponent(agentTaskId)}/action`,
+        const response = await requestJson<PlanResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/action`,
           {
-            body: JSON.stringify({ action: "retry" }),
+            body: JSON.stringify({ action: "start" }),
             headers: { "Content-Type": "application/json" },
             method: "POST",
           },
         );
         const plansResponse = await loadActivePlans(workspaceId);
+        const plan =
+          plansResponse?.plans.find((candidate) => candidate.id === planId) ??
+          response.plan;
+        const retriedPhase =
+          plan.phases.find((phase) => phase.id === phaseId) ?? null;
         setPendingPlanPhaseRetryRefresh(
           plansResponse &&
             !planPhaseRetryRefreshStillRunning(plansResponse.plans, refreshTarget)
@@ -1632,8 +1637,9 @@ export function App() {
             : refreshTarget,
         );
         await refreshWorkspaces();
-        if (implementationChatId) {
-          selectWorkspaceChat(workspaceId, implementationChatId);
+        const chatId = retriedPhase?.implementationChatId ?? implementationChatId;
+        if (chatId) {
+          selectWorkspaceChat(workspaceId, chatId);
         }
       } catch (requestError) {
         setActivePlansError(errorMessage(requestError));

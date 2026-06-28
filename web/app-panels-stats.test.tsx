@@ -355,7 +355,7 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
-  it("retries a failed plan phase through the bound agent task", async () => {
+  it("restarts a failed plan phase through the plan action", async () => {
     const user = userEvent.setup();
     const timestamp = "2026-06-28T05:00:00Z";
     const failedStep = {
@@ -414,6 +414,8 @@ describe("app-panels-stats verification surfaces", () => {
       phases: [
         {
           ...failedPhase,
+          agentTaskId: "agent-task-retried",
+          implementationChatId: "chat-retried",
           completedAt: null,
           errorMessage: null,
           status: "running",
@@ -466,9 +468,9 @@ describe("app-panels-stats verification surfaces", () => {
         });
       }
 
-      if (path === "/api/workspaces/workspace-1/agent-tasks/agent-task-failed/action") {
+      if (path === "/api/workspaces/workspace-1/plans/plan-failed/action") {
         didRetry = true;
-        return jsonResponse(agentTeamSnapshot);
+        return jsonResponse({ plan: retriedPlan });
       }
 
       return mockFetch(input, init);
@@ -485,9 +487,9 @@ describe("app-panels-stats verification surfaces", () => {
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/workspaces/workspace-1/agent-tasks/agent-task-failed/action",
+        "/api/workspaces/workspace-1/plans/plan-failed/action",
         expect.objectContaining({
-          body: JSON.stringify({ action: "retry" }),
+          body: JSON.stringify({ action: "start" }),
           method: "POST",
         }),
       );

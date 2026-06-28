@@ -616,6 +616,101 @@ fn plan_phase_run_completion_advances_until_pause() {
 }
 
 #[test]
+fn starting_failed_plan_phase_clears_previous_agent_run() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-restart-failed-phase",
+            title: "Restart failed phase",
+            overview: "Retry should create a fresh phase run.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-restart-failed-phase-1",
+                title: "Phase one",
+                summary: "Fails after an Agent run.",
+                steps: vec![NewPlanStep {
+                    id: "plan-restart-failed-step-1",
+                    title: "Do work",
+                    detail: "Complete the change.",
+                    acceptance: vec!["fresh run".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    database
+        .transition_plan("plan-restart-failed-phase", "start")
+        .expect("start phase");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-plan-restart", "plan-restart");
+    let task_id = AgentTaskId::new("agent-task-plan-restart").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_run(
+            "plan-restart-failed-phase",
+            "plan-restart-failed-phase-1",
+            "chat-plan-restart",
+            &team_id,
+            &task_id,
+        )
+        .expect("attach phase");
+
+    let failed = database
+        .fail_plan_phase_run(&task_id, "provider failed")
+        .expect("fail phase")
+        .expect("failed plan");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.phases[0].status, "failed");
+    assert_eq!(
+        failed.phases[0].agent_task_id.as_deref(),
+        Some("agent-task-plan-restart")
+    );
+    assert_eq!(failed.phases[0].steps[0].status, "failed");
+    assert!(
+        database
+            .try_begin_plan_phase_merge_attempt(
+                "plan-restart-failed-phase",
+                "plan-restart-failed-phase-1",
+                "merge failed",
+            )
+            .expect("record merge attempt")
+    );
+
+    let restarted = database
+        .transition_plan("plan-restart-failed-phase", "start")
+        .expect("restart failed phase");
+    let phase = &restarted.phases[0];
+    assert_eq!(restarted.status, "running");
+    assert_eq!(
+        restarted.active_phase_id.as_deref(),
+        Some("plan-restart-failed-phase-1")
+    );
+    assert_eq!(phase.status, "running");
+    assert!(phase.implementation_chat_id.is_none());
+    assert!(phase.agent_team_id.is_none());
+    assert!(phase.agent_task_id.is_none());
+    assert!(phase.commit_id.is_none());
+    assert_eq!(phase.merge_attempt_count, 0);
+    assert!(phase.error_message.is_none());
+    assert!(phase.completed_at.is_none());
+    assert_eq!(phase.steps[0].status, "pending");
+    assert!(phase.steps[0].checked_at.is_none());
+}
+
+#[test]
 fn plan_phase_merge_attempt_can_begin_once() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

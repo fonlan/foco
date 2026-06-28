@@ -1722,9 +1722,30 @@ impl WorkspaceDatabase {
         };
         self.connection
             .execute(
+                "UPDATE plan_steps
+                 SET status = 'pending',
+                     checked_at = NULL,
+                     updated_at = ?3
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND EXISTS (
+                       SELECT 1 FROM plan_phases
+                       WHERE plan_id = ?1 AND id = ?2 AND status = 'failed'
+                   )",
+                params![plan.id.as_str(), next_phase_id.as_str(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
                 "UPDATE plan_phases
                  SET status = 'running',
-                     started_at = COALESCE(started_at, ?3),
+                     implementation_chat_id = CASE WHEN status = 'failed' THEN NULL ELSE implementation_chat_id END,
+                     agent_team_id = CASE WHEN status = 'failed' THEN NULL ELSE agent_team_id END,
+                     agent_task_id = CASE WHEN status = 'failed' THEN NULL ELSE agent_task_id END,
+                     commit_id = CASE WHEN status = 'failed' THEN NULL ELSE commit_id END,
+                     merge_attempt_count = CASE WHEN status = 'failed' THEN 0 ELSE merge_attempt_count END,
+                     error_message = NULL,
+                     started_at = CASE WHEN status = 'failed' THEN ?3 ELSE COALESCE(started_at, ?3) END,
                      completed_at = NULL,
                      updated_at = ?3
                  WHERE plan_id = ?1 AND id = ?2",
