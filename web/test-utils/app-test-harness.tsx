@@ -1815,6 +1815,7 @@ export function resetAppTestEnvironment() {
   Object.defineProperty(navigator, "clipboard", {
     configurable: true,
     value: {
+      write: vi.fn().mockResolvedValue(undefined),
       writeText: vi.fn().mockResolvedValue(undefined),
     },
   });

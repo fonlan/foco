@@ -77,6 +77,24 @@ class MockWebSocket extends EventTarget implements WebSocket {
   send() {}
 }
 
+class MockClipboardItem implements ClipboardItem {
+  readonly presentationStyle = "unspecified";
+  readonly types: string[];
+
+  constructor(items: Record<string, unknown>) {
+    this.types = Object.keys(items);
+    for (const item of Object.values(items)) {
+      if (item && typeof (item as Promise<unknown>).then === "function") {
+        void (item as Promise<unknown>).catch(() => undefined);
+      }
+    }
+  }
+
+  async getType(_type: string) {
+    return new Blob();
+  }
+}
+
 Object.defineProperty(window.HTMLElement.prototype, "scrollIntoView", {
   configurable: true,
   value: vi.fn(),
@@ -107,6 +125,16 @@ Object.defineProperty(window, "WebSocket", {
   value: MockWebSocket,
 });
 
+Object.defineProperty(window, "ClipboardItem", {
+  configurable: true,
+  value: MockClipboardItem,
+});
+
+Object.defineProperty(globalThis, "ClipboardItem", {
+  configurable: true,
+  value: MockClipboardItem,
+});
+
 Object.defineProperty(window, "requestAnimationFrame", {
   configurable: true,
   value: (callback: FrameRequestCallback) => window.setTimeout(callback, 0),
@@ -129,6 +157,7 @@ Object.defineProperty(window, "matchMedia", {
 Object.defineProperty(navigator, "clipboard", {
   configurable: true,
   value: {
+    write: vi.fn().mockResolvedValue(undefined),
     writeText: vi.fn().mockResolvedValue(undefined),
   },
 });
