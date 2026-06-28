@@ -680,6 +680,7 @@ function ContextPlanTab({
           );
           const action = primaryPlanAction(plan.status);
           const actionKey = action ? `${action}:${plan.id}` : null;
+          const isMergedIntoSharedWorkspace = planMergedIntoSharedWorkspace(plan);
 
           return (
             <article className="context-memory-item" key={plan.id}>
@@ -691,6 +692,15 @@ function ContextPlanTab({
                   <span className="context-memory-kind">
                     {completedSteps}/{totalSteps}
                   </span>
+                  {isMergedIntoSharedWorkspace ? (
+                    <span
+                      className="context-memory-pin inline-flex items-center gap-1"
+                      title={t("Merged into shared workspace")}
+                    >
+                      <CheckCircle2 aria-hidden="true" className="size-3" />
+                      {t("Merged")}
+                    </span>
+                  ) : null}
                 </div>
                 {action ? (
                   <button
@@ -2153,6 +2163,16 @@ function planActionLabel(action: string) {
     default:
       return action;
   }
+}
+
+function planMergedIntoSharedWorkspace(plan: Plan) {
+  return (
+    plan.status === "implemented" &&
+    plan.phases.length > 0 &&
+    plan.phases.every(
+      (phase) => phase.status === "completed" && phase.implementationChatId,
+    )
+  );
 }
 
 function planStatusLabel(status: string) {

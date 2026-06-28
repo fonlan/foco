@@ -140,6 +140,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No plans": "暂无计划",
     "No active plans for this workspace.": "当前工作区暂无活跃计划。",
     "Mark complete": "标记完成",
+    Merged: "已合并",
+    "Merged into shared workspace": "已合并到共享工作区",
     Draft: "草稿",
     Ready: "就绪",
     Implemented: "已实现",

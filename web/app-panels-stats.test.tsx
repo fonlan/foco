@@ -355,6 +355,115 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("marks implemented plans as merged in the plan panel", async () => {
+    const timestamp = "2026-06-28T04:45:00Z";
+    const completedStep = {
+      acceptance: ["The shared workspace contains the phase result."],
+      checkedAt: timestamp,
+      createdAt: timestamp,
+      detail: "The runner completed the phase merge path.",
+      id: "plan-step-merged-1",
+      phaseId: "plan-phase-merged-1",
+      planId: "plan-merged",
+      sequence: 0,
+      status: "completed",
+      title: "Merge phase changes",
+      updatedAt: timestamp,
+    };
+    const implementedPlan = {
+      activePhaseId: null,
+      completedAt: timestamp,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: null,
+      id: "plan-merged",
+      overview: "Every phase has completed its implementation chat.",
+      pauseRequestedAt: null,
+      phases: [
+        {
+          agentTaskId: "agent-task-merged-1",
+          agentTeamId: "agent-team-merged-1",
+          commitId: "abc1234",
+          completedAt: timestamp,
+          createdAt: timestamp,
+          errorMessage: null,
+          id: "plan-phase-merged-1",
+          implementationChatId: "plan-chat-merged-1",
+          mergeAttemptCount: 0,
+          planId: "plan-merged",
+          sequence: 0,
+          startedAt: timestamp,
+          status: "completed",
+          steps: [completedStep],
+          summary: "Changed files were committed.",
+          title: "Committed phase",
+          updatedAt: timestamp,
+        },
+        {
+          agentTaskId: "agent-task-merged-2",
+          agentTeamId: "agent-team-merged-2",
+          commitId: null,
+          completedAt: timestamp,
+          createdAt: timestamp,
+          errorMessage: null,
+          id: "plan-phase-merged-2",
+          implementationChatId: "plan-chat-merged-2",
+          mergeAttemptCount: 0,
+          planId: "plan-merged",
+          sequence: 1,
+          startedAt: timestamp,
+          status: "completed",
+          steps: [
+            {
+              ...completedStep,
+              id: "plan-step-merged-2",
+              phaseId: "plan-phase-merged-2",
+              title: "Run verification",
+            },
+          ],
+          summary: "No file changes were left to commit.",
+          title: "No-op phase",
+          updatedAt: timestamp,
+        },
+      ],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "implemented",
+      title: "Merged implementation plan",
+      updatedAt: timestamp,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [implementedPlan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await userEvent.click(screen.getByRole("tab", { name: "Plan" }));
+
+    expect(await screen.findByText("Merged implementation plan")).toBeInTheDocument();
+    expect(screen.getByText("Merged")).toHaveAttribute(
+      "title",
+      "Merged into shared workspace",
+    );
+  });
+
   async function openSpecPanel() {
     renderApp();
 
