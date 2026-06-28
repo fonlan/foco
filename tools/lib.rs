@@ -5,6 +5,7 @@ mod errors;
 mod file_tools;
 mod graph_tools;
 mod plan_tools;
+mod spec_tools;
 mod todo_tools;
 
 use std::{
@@ -53,6 +54,8 @@ pub const CREATE_PLAN_TOOL: &str = "create_plan";
 pub const GET_PLANS_TOOL: &str = "get_plans";
 pub const UPDATE_PLAN_TOOL: &str = "update_plan";
 pub const UPDATE_PLAN_STEP_TOOL: &str = "update_plan_step";
+pub const READ_SPEC_TOOL: &str = "read_spec";
+pub const UPDATE_SPEC_TOOL: &str = "update_spec";
 pub const ASK_QUESTION_TOOL: &str = "ask_question";
 pub const AGENT_LIST_TOOL: &str = "agent_list";
 pub const AGENT_GET_TASK_TOOL: &str = "agent_get_task";
@@ -93,6 +96,7 @@ const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_TODO_GRAPH_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_PLAN_TOOL_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_SPEC_TOOL_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_AGENT_TOOL_TIMEOUT_MS: u64 = 10_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 600_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
@@ -264,6 +268,8 @@ fn execute_builtin_tool_inner(
         GET_PLANS_TOOL => plan_tools::get_plans(workspace_path, arguments),
         UPDATE_PLAN_TOOL => plan_tools::update_plan(workspace_path, arguments),
         UPDATE_PLAN_STEP_TOOL => plan_tools::update_plan_step(workspace_path, arguments),
+        READ_SPEC_TOOL => spec_tools::read_spec(workspace_path, arguments),
+        UPDATE_SPEC_TOOL => spec_tools::update_spec(workspace_path, arguments),
         ASK_QUESTION_TOOL => Err(ToolRuntimeError::InvalidArguments(
             "ask_question must be executed through the chat UI question bridge".to_string(),
         )),
@@ -1918,6 +1924,92 @@ mod tests {
                 .expect("stderr")
                 .contains("not a git repository")
         );
+    }
+
+    #[test]
+    fn spec_tools_round_trip_with_revision_conflict() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let initial = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "timeoutMs": null }),
+        );
+        assert!(!initial.is_error);
+        assert_eq!(initial.output["enabled"], false);
+        assert_eq!(initial.output["injectEnabled"], false);
+        assert_eq!(initial.output["revision"], 0);
+        assert_eq!(initial.output["contentMarkdown"], "");
+        assert_eq!(initial.output["generatedAt"], Value::Null);
+        assert_eq!(initial.output["updatedAt"], Value::Null);
+
+        let first_update = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": "# Project Spec\n\nVersion one",
+                "timeoutMs": null
+            }),
+        );
+        assert!(!first_update.is_error);
+        assert_eq!(first_update.output["revision"], 1);
+        assert_eq!(
+            first_update.output["contentMarkdown"],
+            "# Project Spec\n\nVersion one"
+        );
+
+        let stale_update = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": "# Project Spec\n\nStale write",
+                "timeoutMs": null
+            }),
+        );
+        assert!(stale_update.is_error);
+        assert!(
+            stale_update.output["error"]
+                .as_str()
+                .expect("stale error")
+                .contains("call read_spec again")
+        );
+
+        let second_update = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": "# Project Spec\n\nVersion two",
+                "timeoutMs": null
+            }),
+        );
+        assert!(!second_update.is_error);
+        assert_eq!(second_update.output["revision"], 2);
+        assert_eq!(
+            second_update.output["contentMarkdown"],
+            "# Project Spec\n\nVersion two"
+        );
+
+        let read_back = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "timeoutMs": null }),
+        );
+        assert!(!read_back.is_error);
+        assert_eq!(read_back.output, second_update.output);
+    }
+
+    #[test]
+    fn builtin_tools_include_spec_tools() {
+        let tool_names = builtin_tool_definitions()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(tool_names.contains(&READ_SPEC_TOOL));
+        assert!(tool_names.contains(&UPDATE_SPEC_TOOL));
     }
 
     #[test]

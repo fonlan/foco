@@ -4,9 +4,9 @@ use crate::{
     ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
     GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL,
     GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
-    GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL, READ_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
-    SLEEP_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_TODO_GRAPH_TOOL,
-    WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, RUN_COMMAND_TOOL,
+    SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL,
+    UPDATE_SPEC_TOOL, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
 };
 
 pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -32,6 +32,8 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         get_plans_definition(),
         update_plan_definition(),
         update_plan_step_definition(),
+        read_spec_definition(),
+        update_spec_definition(),
         ask_question_definition(),
         run_command_definition(),
         sleep_definition(),
@@ -843,6 +845,52 @@ fn update_plan_step_definition() -> ToolDefinition {
                 }
             },
             "required": ["planId", "stepId", "title", "detail", "acceptance", "status", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn read_spec_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: READ_SPEC_TOOL,
+        description: "Read the Project Spec for the active workspace. The spec is durable workspace context for product, architecture, runtime, data, UI, tool, and operational facts; it is not for temporary todos, logs, secrets, or personal preferences.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn update_spec_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: UPDATE_SPEC_TOOL,
+        description: "Update the Project Spec for the active workspace using expectedRevision optimistic locking. The spec is durable workspace context; do not use it for temporary todos, logs, secrets, personal preferences, or chat-only notes. Call read_spec first and retry from the latest revision if the update conflicts.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "expectedRevision": {
+                    "type": "integer",
+                    "description": "Revision returned by the latest read_spec call. The update fails if the stored revision changed."
+                },
+                "contentMarkdown": {
+                    "type": "string",
+                    "description": "Complete replacement Project Spec markdown content. Existing workspace spec size validation applies."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["expectedRevision", "contentMarkdown", "timeoutMs"]
         }),
         strict: true,
     }
