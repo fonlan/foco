@@ -106,6 +106,9 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingChatStatistics,
   isLoadingContextMemories,
   isLoadingPlans,
+  isPlanAutoRunBusy,
+  isPlanAutoRunEnabled,
+  isPlanAutoRunToggleDisabled,
   loadingWorkspaceDirectoryPaths,
   isLoadingDiff,
   isLoadingTodoGraph,
@@ -119,6 +122,7 @@ const ContextPanel = memo(function ContextPanel({
   onGitFileOperation,
   onMemoryPageChange,
   onPlanAction,
+  onPlanAutoRunToggle,
   onPlanPhaseRetry,
   onReloadWorkspaceSpec,
   onRefreshDiff,
@@ -166,6 +170,9 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingChatStatistics: boolean;
   isLoadingContextMemories: boolean;
   isLoadingPlans: boolean;
+  isPlanAutoRunBusy: boolean;
+  isPlanAutoRunEnabled: boolean;
+  isPlanAutoRunToggleDisabled: boolean;
   loadingWorkspaceDirectoryPaths: Set<string>;
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
@@ -179,6 +186,7 @@ const ContextPanel = memo(function ContextPanel({
   onGitFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
   onPlanAction: (planId: string, action: string) => void;
+  onPlanAutoRunToggle: (enabled: boolean) => void;
   onPlanPhaseRetry: (
     planId: string,
     phaseId: string,
@@ -260,9 +268,13 @@ const ContextPanel = memo(function ContextPanel({
 
         {activeTab === "plan" ? (
           <ContextPlanTab
+            autoRunBusy={isPlanAutoRunBusy}
+            autoRunEnabled={isPlanAutoRunEnabled}
+            autoRunToggleDisabled={isPlanAutoRunToggleDisabled}
             error={planError}
             isLoading={isLoadingPlans}
             onAction={onPlanAction}
+            onAutoRunToggle={onPlanAutoRunToggle}
             onPhaseRetry={onPlanPhaseRetry}
             operationKey={planOperationKey}
             plans={plans}
@@ -622,16 +634,24 @@ function ContextTodoGraphTab({
 }
 
 function ContextPlanTab({
+  autoRunBusy,
+  autoRunEnabled,
+  autoRunToggleDisabled,
   error,
   isLoading,
   onAction,
+  onAutoRunToggle,
   onPhaseRetry,
   operationKey,
   plans,
 }: {
+  autoRunBusy: boolean;
+  autoRunEnabled: boolean;
+  autoRunToggleDisabled: boolean;
   error: string | null;
   isLoading: boolean;
   onAction: (planId: string, action: string) => void;
+  onAutoRunToggle: (enabled: boolean) => void;
   onPhaseRetry: (
     planId: string,
     phaseId: string,
@@ -645,216 +665,242 @@ function ContextPlanTab({
   const [expandedPhaseKeys, setExpandedPhaseKeys] = useState<Set<string>>(
     () => new Set(),
   );
-
-  if (isLoading && plans.length === 0) {
-    return (
-      <div className="context-empty-state">
-        <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
-        <h2>{t("Plan")}</h2>
-        <p>{t("Loading plans...")}</p>
-      </div>
-    );
-  }
-
-  if (error && plans.length === 0) {
-    return (
-      <div className="context-empty-state">
-        <ScrollText aria-hidden="true" className="size-5" />
-        <h2>{t("Plan")}</h2>
-        <p>{error}</p>
-      </div>
-    );
-  }
-
-  if (!plans.length) {
-    return (
-      <div className="context-empty-state">
-        <ScrollText aria-hidden="true" className="size-5" />
-        <h2>{t("Plan")}</h2>
-        <p>{t("No active plans for this workspace.")}</p>
-      </div>
-    );
-  }
+  const showAutoRunBusy = autoRunEnabled && autoRunBusy;
 
   return (
-    <div className="context-list-panel panel-scroll">
-      {error ? (
-        <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
-          {error}
-        </div>
-      ) : null}
-      <div className="space-y-3">
-        {plans.map((plan) => {
-          const totalSteps = plan.phases.reduce(
-            (count, phase) => count + phase.steps.length,
-            0,
-          );
-          const completedSteps = plan.phases.reduce(
-            (count, phase) =>
-              count + phase.steps.filter((step) => step.status === "completed").length,
-            0,
-          );
-          const action = primaryPlanAction(plan.status);
-          const actionKey = action ? `${action}:${plan.id}` : null;
-          const isMergedIntoSharedWorkspace = planMergedIntoSharedWorkspace(plan);
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-200/80 px-3 py-2">
+        <label className="flex min-w-0 items-start gap-2 text-xs text-stone-700">
+          <input
+            checked={autoRunEnabled}
+            className="mt-0.5 size-3.5 shrink-0 rounded border-stone-300 text-teal-700 focus:ring-teal-600 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={autoRunToggleDisabled}
+            onChange={(event) => onAutoRunToggle(event.currentTarget.checked)}
+            type="checkbox"
+          />
+          <span className="min-w-0">
+            <span className="block truncate font-semibold text-stone-800">
+              {t("Auto run plans")}
+            </span>
+            <span className="block truncate text-stone-500">
+              {t("Run every active plan in order")}
+            </span>
+          </span>
+        </label>
+        {showAutoRunBusy ? (
+          <span className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2 text-xs font-medium text-amber-700">
+            <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
+            {t("Auto running")}
+          </span>
+        ) : null}
+      </div>
 
-          return (
-            <article className="context-memory-item" key={plan.id}>
-              <div className="context-memory-item-header">
-                <div className="context-memory-badges">
-                  <span className={planStatusClass(plan.status)}>
-                    {t(planStatusLabel(plan.status))}
-                  </span>
-                  <span className="context-memory-kind">
-                    {completedSteps}/{totalSteps}
-                  </span>
-                  {isMergedIntoSharedWorkspace ? (
-                    <span
-                      className="context-memory-pin inline-flex items-center gap-1"
-                      title={t("Merged into shared workspace")}
-                    >
-                      <CheckCircle2 aria-hidden="true" className="size-3" />
-                      {t("Merged")}
-                    </span>
-                  ) : null}
-                </div>
-                {action ? (
-                  <button
-                    aria-label={t(planActionLabel(action))}
-                    className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                    disabled={operationKey !== null}
-                    onClick={() => onAction(plan.id, action)}
-                    title={t(planActionLabel(action))}
-                    type="button"
-                  >
-                    {operationKey === actionKey ? (
-                      <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-                    ) : (
-                      <CheckCircle2 aria-hidden="true" className="size-3.5" />
-                    )}
-                    {t(planActionLabel(action))}
-                  </button>
-                ) : null}
-              </div>
-              <h3 className="break-words text-sm font-semibold text-stone-950">
-                {plan.title}
-              </h3>
-              <p>{plan.overview}</p>
-              <small>
-                {t("Updated {time}", {
-                  time: formatTodoGraphDate(plan.updatedAt, language),
-                })}
-              </small>
-              <div className="mt-3 space-y-2">
-                {plan.phases.map((phase) => {
-                  const phaseKey = `${plan.id}:${phase.id}`;
-                  const isExpanded = expandedPhaseKeys.has(phaseKey);
-                  const canRetryPhase = isRetryablePlanPhase(phase);
-                  const retryOperationKey = phase.agentTaskId
-                    ? planPhaseRetryOperationKey(phase.agentTaskId)
-                    : null;
+      <div className="context-list-panel panel-scroll">
+        {isLoading && plans.length === 0 ? (
+          <div className="context-empty-state">
+            <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+            <h2>{t("Plan")}</h2>
+            <p>{t("Loading plans...")}</p>
+          </div>
+        ) : null}
 
-                  return (
-                    <section
-                      className="rounded-lg border border-stone-200 bg-stone-50/80 px-2.5 py-2"
-                      key={phase.id}
-                    >
-                      <div className="flex min-w-0 items-start justify-between gap-2">
-                        <button
-                          aria-expanded={isExpanded}
-                          className="flex min-w-0 flex-1 items-start gap-2 text-left"
-                          onClick={() => {
-                            setExpandedPhaseKeys((current) => {
-                              const next = new Set(current);
-                              if (next.has(phaseKey)) {
-                                next.delete(phaseKey);
-                              } else {
-                                next.add(phaseKey);
-                              }
-                              return next;
-                            });
-                          }}
-                          type="button"
+        {error && plans.length === 0 ? (
+          <div className="context-empty-state">
+            <ScrollText aria-hidden="true" className="size-5" />
+            <h2>{t("Plan")}</h2>
+            <p>{error}</p>
+          </div>
+        ) : null}
+
+        {!isLoading && !error && plans.length === 0 ? (
+          <div className="context-empty-state">
+            <ScrollText aria-hidden="true" className="size-5" />
+            <h2>{t("Plan")}</h2>
+            <p>{t("No active plans for this workspace.")}</p>
+          </div>
+        ) : null}
+
+        {error && plans.length > 0 ? (
+          <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+            {error}
+          </div>
+        ) : null}
+
+        {plans.length > 0 ? (
+          <div className="space-y-3">
+            {plans.map((plan) => {
+              const totalSteps = plan.phases.reduce(
+                (count, phase) => count + phase.steps.length,
+                0,
+              );
+              const completedSteps = plan.phases.reduce(
+                (count, phase) =>
+                  count + phase.steps.filter((step) => step.status === "completed").length,
+                0,
+              );
+              const action = primaryPlanAction(plan.status);
+              const actionKey = action ? `${action}:${plan.id}` : null;
+              const isMergedIntoSharedWorkspace = planMergedIntoSharedWorkspace(plan);
+
+              return (
+                <article className="context-memory-item" key={plan.id}>
+                  <div className="context-memory-item-header">
+                    <div className="context-memory-badges">
+                      <span className={planStatusClass(plan.status)}>
+                        {t(planStatusLabel(plan.status))}
+                      </span>
+                      <span className="context-memory-kind">
+                        {completedSteps}/{totalSteps}
+                      </span>
+                      {isMergedIntoSharedWorkspace ? (
+                        <span
+                          className="context-memory-pin inline-flex items-center gap-1"
+                          title={t("Merged into shared workspace")}
                         >
-                          <ChevronRight
-                            aria-hidden="true"
-                            className={`mt-0.5 size-3.5 shrink-0 text-stone-500 transition-transform ${
-                              isExpanded ? "rotate-90" : ""
-                            }`}
-                          />
-                          <div className="min-w-0">
-                            <div className="truncate text-xs font-semibold text-stone-900">
-                              {phase.title}
-                            </div>
-                            {phase.summary ? (
-                              <div className="mt-0.5 line-clamp-2 text-xs text-stone-500">
-                                {phase.summary}
-                              </div>
-                            ) : null}
-                          </div>
-                        </button>
-                        <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-                          <span className={planPhaseStatusClass(phase.status)}>
-                            {t(planPhaseStatusLabel(phase.status))}
-                          </span>
-                          {canRetryPhase ? (
+                          <CheckCircle2 aria-hidden="true" className="size-3" />
+                          {t("Merged")}
+                        </span>
+                      ) : null}
+                    </div>
+                    {action ? (
+                      <button
+                        aria-label={t(planActionLabel(action))}
+                        className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        disabled={operationKey !== null}
+                        onClick={() => onAction(plan.id, action)}
+                        title={t(planActionLabel(action))}
+                        type="button"
+                      >
+                        {operationKey === actionKey ? (
+                          <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                        ) : (
+                          <CheckCircle2 aria-hidden="true" className="size-3.5" />
+                        )}
+                        {t(planActionLabel(action))}
+                      </button>
+                    ) : null}
+                  </div>
+                  <h3 className="break-words text-sm font-semibold text-stone-950">
+                    {plan.title}
+                  </h3>
+                  <p>{plan.overview}</p>
+                  <small>
+                    {t("Updated {time}", {
+                      time: formatTodoGraphDate(plan.updatedAt, language),
+                    })}
+                  </small>
+                  <div className="mt-3 space-y-2">
+                    {plan.phases.map((phase) => {
+                      const phaseKey = `${plan.id}:${phase.id}`;
+                      const isExpanded = expandedPhaseKeys.has(phaseKey);
+                      const canRetryPhase = isRetryablePlanPhase(phase);
+                      const retryOperationKey = phase.agentTaskId
+                        ? planPhaseRetryOperationKey(phase.agentTaskId)
+                        : null;
+
+                      return (
+                        <section
+                          className="rounded-lg border border-stone-200 bg-stone-50/80 px-2.5 py-2"
+                          key={phase.id}
+                        >
+                          <div className="flex min-w-0 items-start justify-between gap-2">
                             <button
-                              aria-label={t("Retry plan phase")}
-                              className="inline-flex h-7 items-center justify-center gap-1 rounded-md border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                              disabled={operationKey !== null}
+                              aria-expanded={isExpanded}
+                              className="flex min-w-0 flex-1 items-start gap-2 text-left"
                               onClick={() => {
-                                if (!phase.agentTaskId) {
-                                  return;
-                                }
-                                onPhaseRetry(
-                                  plan.id,
-                                  phase.id,
-                                  phase.agentTaskId,
-                                  phase.implementationChatId,
-                                );
+                                setExpandedPhaseKeys((current) => {
+                                  const next = new Set(current);
+                                  if (next.has(phaseKey)) {
+                                    next.delete(phaseKey);
+                                  } else {
+                                    next.add(phaseKey);
+                                  }
+                                  return next;
+                                });
                               }}
-                              title={t("Retry plan phase")}
                               type="button"
                             >
-                              {operationKey === retryOperationKey ? (
-                                <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-                              ) : (
-                                <RefreshCw aria-hidden="true" className="size-3.5" />
-                              )}
-                              {t("Retry phase")}
+                              <ChevronRight
+                                aria-hidden="true"
+                                className={`mt-0.5 size-3.5 shrink-0 text-stone-500 transition-transform ${
+                                  isExpanded ? "rotate-90" : ""
+                                }`}
+                              />
+                              <div className="min-w-0">
+                                <div className="truncate text-xs font-semibold text-stone-900">
+                                  {phase.title}
+                                </div>
+                                {phase.summary ? (
+                                  <div className="mt-0.5 line-clamp-2 text-xs text-stone-500">
+                                    {phase.summary}
+                                  </div>
+                                ) : null}
+                              </div>
                             </button>
-                          ) : null}
-                        </div>
-                      </div>
-                      {isExpanded ? (
-                        <div className="mt-2 space-y-2 pl-5">
-                          {phase.errorMessage ? (
-                            <div className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700">
-                              {phase.errorMessage}
-                            </div>
-                          ) : null}
-                          {phase.implementationChatId ? (
-                            <div className="flex min-w-0 items-center gap-1.5 text-xs text-stone-500">
-                              <MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />
-                              <span className="truncate">
-                                {t("Implementation chat")}: {phase.implementationChatId}
+                            <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
+                              <span className={planPhaseStatusClass(phase.status)}>
+                                {t(planPhaseStatusLabel(phase.status))}
                               </span>
+                              {canRetryPhase ? (
+                                <button
+                                  aria-label={t("Retry plan phase")}
+                                  className="inline-flex h-7 items-center justify-center gap-1 rounded-md border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                  disabled={operationKey !== null}
+                                  onClick={() => {
+                                    if (!phase.agentTaskId) {
+                                      return;
+                                    }
+                                    onPhaseRetry(
+                                      plan.id,
+                                      phase.id,
+                                      phase.agentTaskId,
+                                      phase.implementationChatId,
+                                    );
+                                  }}
+                                  title={t("Retry plan phase")}
+                                  type="button"
+                                >
+                                  {operationKey === retryOperationKey ? (
+                                    <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                                  ) : (
+                                    <RefreshCw aria-hidden="true" className="size-3.5" />
+                                  )}
+                                  {t("Retry phase")}
+                                </button>
+                              ) : null}
+                            </div>
+                          </div>
+                          {isExpanded ? (
+                            <div className="mt-2 space-y-2 pl-5">
+                              {phase.errorMessage ? (
+                                <div className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700">
+                                  {phase.errorMessage}
+                                </div>
+                              ) : null}
+                              {phase.implementationChatId ? (
+                                <div className="flex min-w-0 items-center gap-1.5 text-xs text-stone-500">
+                                  <MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />
+                                  <span className="truncate">
+                                    {t("Implementation chat")}: {phase.implementationChatId}
+                                  </span>
+                                </div>
+                              ) : null}
+                              <div className="space-y-1.5">
+                                {phase.steps.map((step) => (
+                                  <PlanStepRow key={step.id} step={step} />
+                                ))}
+                              </div>
                             </div>
                           ) : null}
-                          <div className="space-y-1.5">
-                            {phase.steps.map((step) => (
-                              <PlanStepRow key={step.id} step={step} />
-                            ))}
-                          </div>
-                        </div>
-                      ) : null}
-                    </section>
-                  );
-                })}
-              </div>
-            </article>
-          );
-        })}
+                        </section>
+                      );
+                    })}
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        ) : null}
       </div>
     </div>
   );

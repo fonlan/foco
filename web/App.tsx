@@ -240,7 +240,49 @@ const ScheduledTasksPage = lazy(() =>
   })),
 );
 
+const PLAN_PHASE_RETRY_REFRESH_INTERVAL_MS = 3000;
+const PLAN_AUTO_RUN_REFRESH_MS = 3000;
+
 type ViewMode = BrowserRoute["viewMode"];
+type PlanAutoRunnableAction = "start" | "resume";
+
+type PendingPlanPhaseRetryRefresh = {
+  workspaceId: string;
+  planId: string;
+  phaseId: string;
+  agentTaskId: string;
+};
+
+function isAutoRunPlanInFlight(plan: Plan) {
+  return (
+    plan.status === "running" ||
+    plan.phases.some(
+      (phase) => phase.status === "queued" || phase.status === "running",
+    )
+  );
+}
+
+export function nextAutoRunnablePlan(
+  plans: Plan[],
+): { planId: string; action: PlanAutoRunnableAction } | null {
+  for (const plan of plans) {
+    if (
+      plan.status === "ready" ||
+      plan.status === "draft" ||
+      plan.status === "failed"
+    ) {
+      return { planId: plan.id, action: "start" };
+    }
+
+    if (plan.status === "paused") {
+      return { planId: plan.id, action: "resume" };
+    }
+  }
+
+  return null;
+}
+
+
 type WorkspaceChatContextMenuState = {
   chat: WorkspaceChatListItem;
   left: number;
@@ -555,6 +597,11 @@ export function App() {
   const [isLoadingActivePlans, setIsLoadingActivePlans] = useState(false);
   const [activePlansError, setActivePlansError] = useState<string | null>(null);
   const [planOperationKey, setPlanOperationKey] = useState<string | null>(null);
+  const [isPlanAutoRunEnabled, setIsPlanAutoRunEnabled] = useState(false);
+  const [isPlanAutoRunDispatching, setIsPlanAutoRunDispatching] =
+    useState(false);
+  const [pendingPlanPhaseRetryRefresh, setPendingPlanPhaseRetryRefresh] =
+    useState<PendingPlanPhaseRetryRefresh | null>(null);
   const [runningChatKeys, setRunningChatKeys] = useState<Set<string>>(
     () => new Set(),
   );
@@ -1542,8 +1589,10 @@ export function App() {
         if (implementationChatId) {
           selectWorkspaceChat(workspaceId, implementationChatId);
         }
+        return true;
       } catch (requestError) {
         setActivePlansError(errorMessage(requestError));
+        return false;
       } finally {
         setPlanOperationKey((current) =>
           current === operationKey ? null : current,
@@ -1556,10 +1605,13 @@ export function App() {
   const runPlanPhaseRetry = useCallback(
     async (
       workspaceId: string,
+      planId: string,
+      phaseId: string,
       agentTaskId: string,
       implementationChatId: string | null,
     ) => {
       const operationKey = `retry-phase:${agentTaskId}`;
+      const refreshTarget = { agentTaskId, phaseId, planId, workspaceId };
       setPlanOperationKey(operationKey);
       setActivePlansError(null);
 
@@ -1572,7 +1624,13 @@ export function App() {
             method: "POST",
           },
         );
-        await loadActivePlans(workspaceId);
+        const plansResponse = await loadActivePlans(workspaceId);
+        setPendingPlanPhaseRetryRefresh(
+          plansResponse &&
+            !planPhaseRetryRefreshStillRunning(plansResponse.plans, refreshTarget)
+            ? null
+            : refreshTarget,
+        );
         await refreshWorkspaces();
         if (implementationChatId) {
           selectWorkspaceChat(workspaceId, implementationChatId);
@@ -2074,7 +2132,104 @@ export function App() {
     setActivePlans([]);
     setActivePlansError(null);
     setPlanOperationKey(null);
+    setIsPlanAutoRunEnabled(false);
+    setIsPlanAutoRunDispatching(false);
+    setPendingPlanPhaseRetryRefresh(null);
   }, [activeWorkspace?.id]);
+
+  useEffect(() => {
+    if (!isPlanAutoRunEnabled || !activeWorkspace?.id) {
+      return;
+    }
+    if (isPlanAutoRunDispatching || planOperationKey) {
+      return;
+    }
+    if (activePlans.some(isAutoRunPlanInFlight)) {
+      return;
+    }
+
+    const nextPlanAction = nextAutoRunnablePlan(activePlans);
+    if (!nextPlanAction) {
+      return;
+    }
+
+    // ponytail: this is a frontend queue pump over the current active view.
+    // Ceiling: active view limit=50; upgrade path is a backend persisted runner.
+    setIsPlanAutoRunDispatching(true);
+    void runPlanAction(
+      activeWorkspace.id,
+      nextPlanAction.planId,
+      nextPlanAction.action,
+    ).then((ok) => {
+      setIsPlanAutoRunDispatching(false);
+      if (!ok) {
+        setIsPlanAutoRunEnabled(false);
+      }
+    });
+  }, [
+    activePlans,
+    activeWorkspace?.id,
+    isPlanAutoRunDispatching,
+    isPlanAutoRunEnabled,
+    planOperationKey,
+    runPlanAction,
+  ]);
+
+  useEffect(() => {
+    if (!isPlanAutoRunEnabled || !activeWorkspace?.id) {
+      return;
+    }
+    if (!activePlans.some(isAutoRunPlanInFlight)) {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      void loadActivePlans(activeWorkspace.id);
+    }, PLAN_AUTO_RUN_REFRESH_MS);
+
+    return () => window.clearInterval(intervalId);
+  }, [
+    activePlans,
+    activeWorkspace?.id,
+    isPlanAutoRunEnabled,
+    loadActivePlans,
+  ]);
+
+  useEffect(() => {
+    const refreshTarget = pendingPlanPhaseRetryRefresh;
+    if (!refreshTarget) {
+      return;
+    }
+    if (activeWorkspace?.id !== refreshTarget.workspaceId) {
+      setPendingPlanPhaseRetryRefresh(null);
+      return;
+    }
+    const target = refreshTarget;
+
+    let cancelled = false;
+    async function refreshRetryPhase() {
+      const plansResponse = await loadActivePlans(target.workspaceId);
+      if (cancelled || !plansResponse) {
+        return;
+      }
+      if (!planPhaseRetryRefreshStillRunning(plansResponse.plans, target)) {
+        setPendingPlanPhaseRetryRefresh((current) =>
+          current && samePlanPhaseRetryRefreshTarget(current, target)
+            ? null
+            : current,
+        );
+      }
+    }
+
+    const intervalId = window.setInterval(() => {
+      void refreshRetryPhase();
+    }, PLAN_PHASE_RETRY_REFRESH_INTERVAL_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [activeWorkspace?.id, loadActivePlans, pendingPlanPhaseRetryRefresh]);
 
   useEffect(() => {
     if (!activeWorkspace?.id) {
@@ -8659,6 +8814,9 @@ export function App() {
                 isLoadingDiff={isLoadingDiff}
                 isLoadingContextMemories={isLoadingContextMemories}
                 isLoadingPlans={isLoadingActivePlans}
+                isPlanAutoRunBusy={isPlanAutoRunDispatching || planOperationKey !== null}
+                isPlanAutoRunEnabled={isPlanAutoRunEnabled}
+                isPlanAutoRunToggleDisabled={!activeWorkspace?.id}
                 isLoadingTodoGraph={isLoadingTodoGraph}
                 isLoadingWorkspaceSpec={isLoadingWorkspaceSpec}
                 isLoadingWorkspaceFiles={isLoadingWorkspaceFiles}
@@ -8681,11 +8839,13 @@ export function App() {
                     void runPlanAction(workspaceId, planId, action);
                   }
                 }}
-                onPlanPhaseRetry={(_planId, _phaseId, agentTaskId, implementationChatId) => {
+                onPlanPhaseRetry={(planId, phaseId, agentTaskId, implementationChatId) => {
                   const workspaceId = activeWorkspace?.id;
                   if (workspaceId) {
                     void runPlanPhaseRetry(
                       workspaceId,
+                      planId,
+                      phaseId,
                       agentTaskId,
                       implementationChatId,
                     );
@@ -8699,6 +8859,7 @@ export function App() {
                 onWorkspaceSpecSettingsChange={handleWorkspaceSpecSettingsChangeForContextPanel}
                 onSelectDiffFile={setSelectedDiffPath}
                 onTabChange={handleContextPanelTabChange}
+                onPlanAutoRunToggle={setIsPlanAutoRunEnabled}
                 selectedPath={selectedDiffPath}
                 selectedSkillPrefix={selectedSkillPrefix}
                 setMobileHeight={setContextPanelMobileHeight}
@@ -11657,6 +11818,34 @@ function isPendingChatId(chatId: string) {
 function chatKeyWorkspaceId(chatKey: string) {
   const separatorIndex = chatKey.indexOf(":");
   return separatorIndex > 0 ? chatKey.slice(0, separatorIndex) : null;
+}
+
+function planPhaseRetryRefreshStillRunning(
+  plans: Plan[],
+  target: PendingPlanPhaseRetryRefresh,
+) {
+  const plan = plans.find((candidate) => candidate.id === target.planId);
+  if (!plan) {
+    return false;
+  }
+  const phase = plan.phases.find(
+    (candidate) =>
+      candidate.id === target.phaseId ||
+      candidate.agentTaskId === target.agentTaskId,
+  );
+  return phase?.status === "running";
+}
+
+function samePlanPhaseRetryRefreshTarget(
+  left: PendingPlanPhaseRetryRefresh,
+  right: PendingPlanPhaseRetryRefresh,
+) {
+  return (
+    left.workspaceId === right.workspaceId &&
+    left.planId === right.planId &&
+    left.phaseId === right.phaseId &&
+    left.agentTaskId === right.agentTaskId
+  );
 }
 
 function chatTitleForDraft(

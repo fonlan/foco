@@ -421,7 +421,28 @@ describe("app-panels-stats verification surfaces", () => {
       ],
       status: "running",
     };
+    const implementedPlan = {
+      ...retriedPlan,
+      activePhaseId: null,
+      completedAt: timestamp,
+      phases: [
+        {
+          ...retriedPlan.phases[0],
+          completedAt: timestamp,
+          status: "completed",
+          steps: [
+            {
+              ...failedStep,
+              checkedAt: timestamp,
+              status: "completed",
+            },
+          ],
+        },
+      ],
+      status: "implemented",
+    };
     let didRetry = false;
+    let planRequestCount = 0;
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const path = url.startsWith("http://127.0.0.1")
@@ -429,10 +450,17 @@ describe("app-panels-stats verification surfaces", () => {
         : url.split("?")[0];
 
       if (path === "/api/workspaces/workspace-1/plans") {
+        planRequestCount += 1;
         return jsonResponse({
           page: 1,
           pageSize: 50,
-          plans: [didRetry ? retriedPlan : failedPlan],
+          plans: [
+            !didRetry
+              ? failedPlan
+              : planRequestCount >= 3
+                ? implementedPlan
+                : retriedPlan,
+          ],
           totalCount: 1,
           totalPages: 1,
         });
@@ -465,7 +493,252 @@ describe("app-panels-stats verification surfaces", () => {
       );
     });
     expect((await screen.findAllByText("Running")).length).toBeGreaterThan(0);
+    await waitFor(
+      () => {
+        expect(screen.getByText("Implemented")).toBeInTheDocument();
+      },
+      { timeout: 5000 },
+    );
   });
+
+
+  it("shows the auto-run checkbox when the plan list is empty", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [],
+          totalCount: 0,
+          totalPages: 1,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("tab", { name: "Plan" }));
+
+    expect(
+      await screen.findByRole("checkbox", { name: /Auto run plans/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Run every active plan in order")).toBeInTheDocument();
+    expect(screen.getByText("No active plans for this workspace.")).toBeInTheDocument();
+  });
+
+  it("auto-runs active plans in order while waiting for running plans", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-06-28T05:00:00Z";
+    const makePlan = (
+      id: string,
+      title: string,
+      status: "ready" | "running" | "implemented",
+      sortOrder: number,
+    ) => {
+      const phaseId = `${id}-phase-1`;
+      const stepId = `${id}-step-1`;
+      const isRunning = status === "running";
+      const isImplemented = status === "implemented";
+
+      return {
+        activePhaseId: isRunning ? phaseId : null,
+        completedAt: isImplemented ? timestamp : null,
+        completedByUserAt: null,
+        createdAt: timestamp,
+        errorMessage: null,
+        id,
+        overview: `${title} overview`,
+        pauseRequestedAt: null,
+        phases: [
+          {
+            agentTaskId: isRunning ? `${id}-task-1` : null,
+            agentTeamId: isRunning ? `${id}-team-1` : null,
+            commitId: isImplemented ? `${id}-commit-1` : null,
+            completedAt: isImplemented ? timestamp : null,
+            createdAt: timestamp,
+            errorMessage: null,
+            id: phaseId,
+            implementationChatId: null,
+            mergeAttemptCount: 0,
+            planId: id,
+            sequence: 0,
+            startedAt: isRunning || isImplemented ? timestamp : null,
+            status: isRunning
+              ? "running"
+              : isImplemented
+                ? "completed"
+                : "pending",
+            steps: [
+              {
+                acceptance: [`${title} acceptance`],
+                checkedAt: isImplemented ? timestamp : null,
+                createdAt: timestamp,
+                detail: `${title} detail`,
+                id: stepId,
+                phaseId,
+                planId: id,
+                sequence: 0,
+                status: isImplemented ? "completed" : "pending",
+                title: `${title} step`,
+                updatedAt: timestamp,
+              },
+            ],
+            summary: `${title} phase`,
+            title: `${title} phase`,
+            updatedAt: timestamp,
+          },
+        ],
+        sortOrder,
+        sourceChatId: "chat-1",
+        status,
+        title,
+        updatedAt: timestamp,
+      };
+    };
+    const planSnapshots = [
+      [
+        makePlan("plan-1", "First ready plan", "ready", 0),
+        makePlan("plan-2", "Second ready plan", "ready", 1),
+      ],
+      [
+        makePlan("plan-1", "First ready plan", "running", 0),
+        makePlan("plan-2", "Second ready plan", "ready", 1),
+      ],
+      [
+        makePlan("plan-1", "First ready plan", "implemented", 0),
+        makePlan("plan-2", "Second ready plan", "ready", 1),
+        makePlan("plan-3", "Third added plan", "ready", 2),
+      ],
+      [
+        makePlan("plan-1", "First ready plan", "implemented", 0),
+        makePlan("plan-2", "Second ready plan", "running", 1),
+        makePlan("plan-3", "Third added plan", "ready", 2),
+      ],
+      [
+        makePlan("plan-1", "First ready plan", "implemented", 0),
+        makePlan("plan-2", "Second ready plan", "implemented", 1),
+        makePlan("plan-3", "Third added plan", "ready", 2),
+      ],
+      [
+        makePlan("plan-1", "First ready plan", "implemented", 0),
+        makePlan("plan-2", "Second ready plan", "implemented", 1),
+        makePlan("plan-3", "Third added plan", "running", 2),
+      ],
+    ];
+    let planStage = 0;
+    const waitForAutoRunRefresh = () =>
+      act(async () => {
+        await new Promise((resolve) => window.setTimeout(resolve, 3100));
+      });
+    const actionCallSummary = () =>
+      fetchMock.mock.calls
+        .map(([input, init]) => {
+          const url = typeof input === "string" ? input : input.toString();
+          const path = new URL(url, "http://127.0.0.1").pathname;
+          const match = path.match(
+            /^\/api\/workspaces\/workspace-1\/plans\/([^/]+)\/action$/,
+          );
+
+          if (!match) {
+            return null;
+          }
+
+          return {
+            action: JSON.parse(String(init?.body ?? "{}")) as { action?: string },
+            planId: decodeURIComponent(match[1] ?? ""),
+          };
+        })
+        .filter((call): call is { action: { action?: string }; planId: string } =>
+          call !== null,
+        );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const path = new URL(rawUrl, "http://127.0.0.1").pathname;
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        const plans = planSnapshots[planStage] ?? planSnapshots.at(-1) ?? [];
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans,
+          totalCount: plans.length,
+          totalPages: 1,
+        });
+      }
+
+      const actionMatch = path.match(
+        /^\/api\/workspaces\/workspace-1\/plans\/([^/]+)\/action$/,
+      );
+      if (actionMatch) {
+        const planId = decodeURIComponent(actionMatch[1] ?? "");
+        planStage = planId === "plan-1" ? 1 : planId === "plan-2" ? 3 : 5;
+        const plan = (planSnapshots[planStage] ?? []).find(
+          (candidate) => candidate.id === planId,
+        );
+        return jsonResponse({ plan });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    await screen.findByText("First ready plan", {}, { timeout: 3000 });
+    const autoRunCheckbox = await screen.findByRole("checkbox", {
+      name: /Auto run plans/,
+    });
+    await user.click(autoRunCheckbox);
+    expect(autoRunCheckbox).toBeChecked();
+
+    await waitFor(() => {
+      expect(actionCallSummary()).toEqual([
+        { action: { action: "start" }, planId: "plan-1" },
+      ]);
+    });
+
+    await waitForAutoRunRefresh();
+    expect(actionCallSummary()).toEqual([
+      { action: { action: "start" }, planId: "plan-1" },
+    ]);
+
+    planStage = 2;
+    await waitForAutoRunRefresh();
+    await waitFor(() => {
+      expect(actionCallSummary()).toEqual([
+        { action: { action: "start" }, planId: "plan-1" },
+        { action: { action: "start" }, planId: "plan-2" },
+      ]);
+    });
+
+    await waitForAutoRunRefresh();
+    expect(actionCallSummary()).toEqual([
+      { action: { action: "start" }, planId: "plan-1" },
+      { action: { action: "start" }, planId: "plan-2" },
+    ]);
+
+    planStage = 4;
+    await waitForAutoRunRefresh();
+    await waitFor(() => {
+      expect(actionCallSummary()).toEqual([
+        { action: { action: "start" }, planId: "plan-1" },
+        { action: { action: "start" }, planId: "plan-2" },
+        { action: { action: "start" }, planId: "plan-3" },
+      ]);
+    });
+  }, 30000);
 
   it("marks implemented plans as merged in the plan panel", async () => {
     const timestamp = "2026-06-28T04:45:00Z";
