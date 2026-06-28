@@ -24,6 +24,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
         .route("/api/auth/logout", post(crate::http::auth::auth_logout))
         .route("/api/workspaces", get(crate::http::workspaces::workspaces))
         .route(
+            "/api/workspaces/search-chats",
+            get(crate::http::workspaces::search_workspace_chats),
+        )
+        .route(
             "/api/workspaces/add",
             post(crate::http::workspaces::add_workspace),
         )

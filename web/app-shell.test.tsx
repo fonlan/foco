@@ -50,16 +50,35 @@ describe("app-shell verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
   it("filters workspace chats across workspaces", async () => {
+    appTestState.workspaceResponseWorkspaces = [
+      workspace,
+      { ...secondaryWorkspace, chats: [] },
+    ];
+    appTestState.workspaceChatSearchResponseWorkspaces = [
+      workspace,
+      secondaryWorkspace,
+    ];
     renderApp();
 
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
 
+    expect(within(workspaceList).queryByText("Side note")).not.toBeInTheDocument();
+
     await userEvent.click(screen.getByRole("button", { name: "Search chats" }));
     changeInput(screen.getByRole("searchbox", { name: "Search chats" }), "Side");
 
-    expect(within(workspaceList).getByText("Side note")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.some(([input]) =>
+            String(input).includes("/api/workspaces/search-chats?query=Side"),
+          ),
+      ).toBe(true),
+    );
+    expect(await within(workspaceList).findByText("Side note")).toBeInTheDocument();
     expect(within(workspaceList).queryByText("Tool run")).not.toBeInTheDocument();
     expect(within(workspaceList).queryByText("Second chat")).not.toBeInTheDocument();
   });

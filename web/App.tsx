@@ -136,6 +136,7 @@ import type {
   WorkspaceSpecJobsResponse,
   WorkspaceSpecResponse,
   WorkspaceSummary,
+  WorkspaceChatSearchResponse,
   WorkspacesResponse,
 } from "./api/types";
 import {
@@ -388,6 +389,15 @@ function useStableCallback<T extends (...args: any[]) => unknown>(callback: T): 
   );
 }
 
+function isAbortError(value: unknown) {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "name" in value &&
+    value.name === "AbortError"
+  );
+}
+
 export function App() {
   const [initialBrowserRoute] = useState(() => currentBrowserRoute());
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
@@ -410,6 +420,14 @@ export function App() {
   >({});
   const [workspaceChatSearchOpen, setWorkspaceChatSearchOpen] = useState(false);
   const [workspaceChatSearchQuery, setWorkspaceChatSearchQuery] = useState("");
+  const [workspaceChatSearchResults, setWorkspaceChatSearchResults] = useState<
+    WorkspaceSummary[]
+  >([]);
+  const [isSearchingWorkspaceChats, setIsSearchingWorkspaceChats] =
+    useState(false);
+  const [workspaceChatSearchError, setWorkspaceChatSearchError] = useState<
+    string | null
+  >(null);
   const [viewMode, setViewMode] = useState<ViewMode>(
     initialBrowserRoute.viewMode,
   );
@@ -7971,16 +7989,49 @@ export function App() {
     setIsContextPanelOpen(true);
   });
   const contextPanelFiles = gitDiff?.files ?? EMPTY_GIT_STATUS_FILES;
-  const normalizedWorkspaceChatSearchQuery = workspaceChatSearchQuery
-    .trim()
-    .toLocaleLowerCase();
-  const isWorkspaceSearchActive = normalizedWorkspaceChatSearchQuery.length > 0;
-  const sidebarWorkspaces = isWorkspaceSearchActive
-    ? displayedWorkspaces.filter((workspace) =>
-      workspaceChatListItemsFor(workspace).some((chat) =>
-        chat.title.toLocaleLowerCase().includes(normalizedWorkspaceChatSearchQuery),
-      ),
+  const normalizedWorkspaceChatSearchQuery = workspaceChatSearchQuery.trim();
+  const isWorkspaceSearchActive =
+    workspaceChatSearchOpen && normalizedWorkspaceChatSearchQuery.length > 0;
+
+  useEffect(() => {
+    if (!isWorkspaceSearchActive) {
+      setWorkspaceChatSearchResults([]);
+      setWorkspaceChatSearchError(null);
+      setIsSearchingWorkspaceChats(false);
+      return;
+    }
+
+    const abortController = new AbortController();
+
+    setIsSearchingWorkspaceChats(true);
+    setWorkspaceChatSearchError(null);
+
+    void requestJson<WorkspaceChatSearchResponse>(
+      `/api/workspaces/search-chats?query=${encodeURIComponent(normalizedWorkspaceChatSearchQuery)}`,
+      { signal: abortController.signal },
     )
+      .then((data) => {
+        setWorkspaceChatSearchResults(data.workspaces);
+      })
+      .catch((requestError) => {
+        if (isAbortError(requestError)) {
+          return;
+        }
+
+        setWorkspaceChatSearchResults([]);
+        setWorkspaceChatSearchError(errorMessage(requestError));
+      })
+      .finally(() => {
+        if (!abortController.signal.aborted) {
+          setIsSearchingWorkspaceChats(false);
+        }
+      });
+
+    return () => abortController.abort();
+  }, [isWorkspaceSearchActive, normalizedWorkspaceChatSearchQuery]);
+
+  const sidebarWorkspaces = isWorkspaceSearchActive
+    ? workspaceChatSearchResults
     : displayedWorkspaces;
 
   if (isCheckingAuth) {
@@ -8257,14 +8308,15 @@ export function App() {
                       const isExpanded =
                         isWorkspaceSearchActive || expandedWorkspaceId === workspace.id;
                       const isActive = workspace.id === activeWorkspace?.id;
-                      const workspaceChats = workspaceChatListItemsFor(workspace);
-                      const searchedWorkspaceChats = isWorkspaceSearchActive
-                        ? workspaceChats.filter((chat) =>
-                          chat.title
-                            .toLocaleLowerCase()
-                            .includes(normalizedWorkspaceChatSearchQuery),
+                      const workspaceChats = isWorkspaceSearchActive
+                        ? workspace.chats.map(
+                          (chat): WorkspaceChatListItem => ({
+                            ...chat,
+                            scheduledStatus:
+                              chat.queuedRun?.status === "queued" ? "queued" : undefined,
+                          }),
                         )
-                        : workspaceChats;
+                        : workspaceChatListItemsFor(workspace);
                       const selectedChatIndex =
                         isActive && activeChatId
                           ? workspaceChats.findIndex((chat) => chat.id === activeChatId)
@@ -8273,11 +8325,11 @@ export function App() {
                         workspaceChatVisibleCounts[workspace.id] ??
                         WORKSPACE_CHAT_HISTORY_PAGE_SIZE;
                       const visibleChatCount = isWorkspaceSearchActive
-                        ? searchedWorkspaceChats.length
+                        ? workspaceChats.length
                         : selectedChatIndex >= configuredVisibleChatCount
                           ? selectedChatIndex + 1
                           : configuredVisibleChatCount;
-                      const visibleChats = searchedWorkspaceChats.slice(0, visibleChatCount);
+                      const visibleChats = workspaceChats.slice(0, visibleChatCount);
                       const hiddenChatCount = isWorkspaceSearchActive
                         ? 0
                         : Math.max(
@@ -8519,7 +8571,9 @@ export function App() {
                   ) : (
                     <div className="mx-2 rounded-lg border border-dashed border-stone-300 bg-white/60 px-3 py-4 text-sm text-stone-500">
                       {isWorkspaceSearchActive
-                        ? t("No matching chats")
+                        ? isSearchingWorkspaceChats
+                          ? t("Searching chats...")
+                          : workspaceChatSearchError ?? t("No matching chats")
                         : isLoading
                           ? t("Loading workspaces...")
                           : t("No workspaces")}

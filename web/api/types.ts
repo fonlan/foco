@@ -741,6 +741,8 @@ export type WorkspacesResponse = {
   workspaces: WorkspaceSummary[];
 };
 
+export type WorkspaceChatSearchResponse = WorkspacesResponse;
+
 export type ConfiguredWorkspaceSummary = {
   id: string;
   name: string;

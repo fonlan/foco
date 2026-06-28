@@ -12,6 +12,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Search chats placeholder": "搜索会话标题",
     "Clear search": "清空搜索",
     "No matching chats": "没有匹配的会话",
+    "Searching chats...": "正在搜索会话...",
     "Add workspace": "添加工作区",
     "Collapse chat history": "收起聊天历史",
     "Expand chat history": "展开聊天历史",
