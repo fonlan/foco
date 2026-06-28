@@ -8266,7 +8266,6 @@ export function App() {
                   isSendingMessage={isSendingMessage}
                   isSelectingAttachments={isSelectingAttachments}
                   isPlanModeEnabled={isPlanModeEnabled}
-                  isTeamModeEnabled={canUseTeamMode && isTeamModeEnabled}
                   messages={messages}
                   readOnly={activeChatReadOnly}
                   overviewRenderer={chatOverviewRenderer}
@@ -8291,12 +8290,6 @@ export function App() {
                   onRetryRun={handleRetryRunForChatPanel}
                   onSubmit={handleSubmitForChatPanel}
                   onPlanModeEnabledChange={handlePlanModeEnabledChange}
-                  onTeamModeEnabledChange={(value) => {
-                    setIsTeamModeEnabled(value);
-                    if (value) {
-                      setIsPlanModeEnabled(false);
-                    }
-                  }}
                   onThinkingLevelChange={handleThinkingLevelChangeForChatPanel}
                   onToggleSkill={handleToggleSkillForChatPanel}
                   onWithdrawQueuedMessage={handleWithdrawQueuedMessageForChatPanel}
@@ -8309,7 +8302,6 @@ export function App() {
                   selectedSkillIds={selectedSkillIds}
                   selectedThinkingLevel={selectedThinkingLevel}
                   settings={settings}
-                  showTeamModeToggle={canUseTeamMode}
                   providers={providersForChatPanel}
                   skills={availableSkills}
                   thinkingLevels={thinkingLevels}

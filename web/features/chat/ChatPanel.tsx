@@ -132,7 +132,6 @@ function ChatPanelComponent({
   isSendingMessage,
   isSelectingAttachments,
   isPlanModeEnabled,
-  isTeamModeEnabled,
   messages,
   onAddPastedImageAttachments,
   overviewRenderer,
@@ -151,7 +150,6 @@ function ChatPanelComponent({
   onSelectAttachments,
   onSubmit,
   onPlanModeEnabledChange,
-  onTeamModeEnabledChange,
   onThinkingLevelChange,
   onToggleSkill,
   onWithdrawQueuedMessage,
@@ -161,7 +159,6 @@ function ChatPanelComponent({
   selectedSkillIds,
   selectedThinkingLevel,
   settings,
-  showTeamModeToggle,
   providers,
   skills,
   queuedMessageIds,
@@ -193,7 +190,6 @@ function ChatPanelComponent({
   isSendingMessage: boolean;
   isSelectingAttachments: boolean;
   isPlanModeEnabled: boolean;
-  isTeamModeEnabled: boolean;
   messages: ShellMessage[];
   onAddPastedImageAttachments: (files: File[]) => void;
   overviewRenderer: () => ReactNode;
@@ -215,7 +211,6 @@ function ChatPanelComponent({
     options?: { schedule?: boolean },
   ) => void;
   onPlanModeEnabledChange: (value: boolean) => void;
-  onTeamModeEnabledChange: (value: boolean) => void;
   onThinkingLevelChange: (value: string) => void;
   onToggleSkill: (skillId: string) => void;
   onWithdrawQueuedMessage: (messageId: string) => void;
@@ -225,7 +220,6 @@ function ChatPanelComponent({
   selectedSkillIds: string[];
   selectedThinkingLevel: string;
   settings: SettingsResponse | null;
-  showTeamModeToggle: boolean;
   providers: ConfiguredProviderSummary[];
   skills: ConfiguredSkillSummary[];
   queuedMessageIds: ReadonlySet<string>;
@@ -889,22 +883,6 @@ function ChatPanelComponent({
                   <Plus aria-hidden="true" className="size-4" />
                 )}
               </button>
-              {showTeamModeToggle ? (
-                <button
-                  aria-label={t("Team mode")}
-                  aria-pressed={isTeamModeEnabled}
-                  className={`composer-team-toggle ${isTeamModeEnabled
-                    ? "composer-team-toggle-enabled"
-                    : ""
-                    }`}
-                  onClick={() => onTeamModeEnabledChange(!isTeamModeEnabled)}
-                  title={t("Team mode")}
-                  type="button"
-                >
-                  <Bot aria-hidden="true" className="size-3.5 shrink-0" />
-                  <span className="composer-team-toggle-label">{t("Team")}</span>
-                </button>
-              ) : null}
               <button
                 aria-label={t("Plan mode")}
                 aria-pressed={isPlanModeEnabled}
