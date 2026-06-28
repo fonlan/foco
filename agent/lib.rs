@@ -2071,12 +2071,17 @@ mod tests {
         assert_eq!(tool_effect(READ_FILE_TOOL_NAME), ToolEffect::ReadOnly);
         assert_eq!(tool_effect(GRAPH_EXPLORE_TOOL_NAME), ToolEffect::ReadOnly);
         assert_eq!(tool_effect(WEB_FETCH_TOOL_NAME), ToolEffect::ReadOnly);
+        assert_eq!(tool_effect(READ_SPEC_TOOL_NAME), ToolEffect::ReadOnly);
         assert_eq!(
             tool_effect(WRITE_FILE_TOOL_NAME),
             ToolEffect::WorkspaceMutation
         );
         assert_eq!(
             tool_effect(EDIT_FILE_TOOL_NAME),
+            ToolEffect::WorkspaceMutation
+        );
+        assert_eq!(
+            tool_effect(UPDATE_SPEC_TOOL_NAME),
             ToolEffect::WorkspaceMutation
         );
         assert_eq!(
@@ -2145,6 +2150,11 @@ mod tests {
                 access: ToolResourceAccess::Read,
             }]
         );
+        assert!(
+            !read_spec_locks
+                .iter()
+                .any(|lock| lock.resource == ToolResource::WorkspaceMutationLease)
+        );
 
         let update_spec_locks =
             tool_resource_locks(&test_tool_call(UPDATE_SPEC_TOOL_NAME, json!({})))
@@ -2156,7 +2166,17 @@ mod tests {
                 access: ToolResourceAccess::Write,
             }]
         );
+        assert!(
+            !update_spec_locks
+                .iter()
+                .any(|lock| lock.resource == ToolResource::WorkspaceMutationLease)
+        );
 
+        let second_update_spec_locks =
+            tool_resource_locks(&test_tool_call(UPDATE_SPEC_TOOL_NAME, json!({})))
+                .expect("second update spec locks");
+        let command_locks = tool_resource_locks(&test_tool_call(RUN_COMMAND_TOOL_NAME, json!({})))
+            .expect("command locks");
         let plan_locks = tool_resource_locks(&test_tool_call(CREATE_PLAN_TOOL_NAME, json!({})))
             .expect("plan locks");
         let file_locks = tool_resource_locks(&test_tool_call(
@@ -2169,6 +2189,16 @@ mod tests {
             read_spec_locks
                 .iter()
                 .any(|read_lock| tool_resource_locks_conflict(update_lock, read_lock))
+        }));
+        assert!(update_spec_locks.iter().any(|update_lock| {
+            second_update_spec_locks.iter().any(|second_update_lock| {
+                tool_resource_locks_conflict(update_lock, second_update_lock)
+            })
+        }));
+        assert!(!update_spec_locks.iter().any(|update_lock| {
+            command_locks
+                .iter()
+                .any(|command_lock| tool_resource_locks_conflict(update_lock, command_lock))
         }));
         assert!(!update_spec_locks.iter().any(|update_lock| {
             plan_locks
@@ -2892,6 +2922,64 @@ mod tests {
                     mode: ToolExecutionMode::Parallel,
                     call_indices: vec![0, 1],
                 }]
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_same_turn_project_spec_read_write_conflicts() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-read".to_string(),
+                name: READ_SPEC_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+            PendingToolCall {
+                id: "call-update".to_string(),
+                name: UPDATE_SPEC_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+        ];
+
+        let error = plan_tool_execution(&calls).expect_err("conflict");
+
+        assert_eq!(
+            error,
+            ToolConflictError::ResourceConflict {
+                resource: ToolResource::ProjectSpec,
+                first_call_id: "call-read".to_string(),
+                first_access: ToolResourceAccess::Read,
+                second_call_id: "call-update".to_string(),
+                second_access: ToolResourceAccess::Write,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_same_turn_project_spec_write_write_conflicts() {
+        let calls = vec![
+            PendingToolCall {
+                id: "call-update-a".to_string(),
+                name: UPDATE_SPEC_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+            PendingToolCall {
+                id: "call-update-b".to_string(),
+                name: UPDATE_SPEC_TOOL_NAME.to_string(),
+                arguments: json!({}),
+            },
+        ];
+
+        let error = plan_tool_execution(&calls).expect_err("conflict");
+
+        assert_eq!(
+            error,
+            ToolConflictError::ResourceConflict {
+                resource: ToolResource::ProjectSpec,
+                first_call_id: "call-update-a".to_string(),
+                first_access: ToolResourceAccess::Write,
+                second_call_id: "call-update-b".to_string(),
+                second_access: ToolResourceAccess::Write,
             }
         );
     }

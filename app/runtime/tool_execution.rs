@@ -48,7 +48,7 @@ use foco_providers::NeutralToolCall;
 use foco_tools::{
     FIND_FILES_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL,
     GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
-    GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL, SEARCH_TEXT_TOOL,
+    GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, SEARCH_TEXT_TOOL,
 };
 use serde_json::Value;
 
@@ -171,6 +171,7 @@ fn is_read_only_tool(tool_name: &str) -> bool {
             | GRAPH_RELATED_FILES_TOOL
             | GRAPH_EXPLORE_TOOL
             | GET_TODO_GRAPH_TOOL
+            | READ_SPEC_TOOL
             | MEMORY_SEARCH_TOOL_NAME
     )
 }
