@@ -1076,6 +1076,7 @@ const MessageRow = memo(function MessageRow({
         ? t("Queued")
         : null;
   const isPendingUserMessage = isUser && pendingLabel !== null;
+  const isPlanModeMessage = isUser && message.sessionMode === "plan";
   const canManageQueuedMessage =
     isUser &&
     message.pendingMode === "queued" &&
@@ -1122,6 +1123,9 @@ const MessageRow = memo(function MessageRow({
                 <span>{authorLabel}</span>
                 {pendingLabel ? (
                   <span className="message-pending-badge">{pendingLabel}</span>
+                ) : null}
+                {isPlanModeMessage ? (
+                  <span className="message-run-badge">{t("Plan mode")}</span>
                 ) : null}
                 <time
                   className="message-created-at"

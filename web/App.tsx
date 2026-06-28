@@ -12579,8 +12579,8 @@ function normalizeChatMessageSummary(
       ? message.pendingMode
       : undefined;
   const rawSessionMode = fieldValue(message, "sessionMode", "session_mode");
-  const sessionMode: "plan" | undefined =
-    rawSessionMode === "plan" ? "plan" : undefined;
+  const sessionMode: "plan" | null =
+    rawSessionMode === "plan" ? "plan" : null;
   const queuedRun = normalizeQueuedMessageRunSummary(message.queuedRun);
   const normalizedMessage = {
     ...message,
@@ -12645,6 +12645,9 @@ function normalizeQueuedMessageRunSummary(
     "assistant_sequence",
   );
   const status = fieldValue(queuedRun, "status");
+  const rawSessionMode = fieldValue(queuedRun, "sessionMode", "session_mode");
+  const sessionMode: "plan" | null =
+    rawSessionMode === "plan" ? "plan" : null;
 
   return {
     status: typeof status === "string" ? status : "queued",
@@ -12658,6 +12661,7 @@ function normalizeQueuedMessageRunSummary(
       typeof assistantMessageId === "string" ? assistantMessageId : null,
     assistantSequence:
       typeof assistantSequence === "number" ? assistantSequence : null,
+    sessionMode,
   };
 }
 
