@@ -40,6 +40,7 @@ pub const SUPPORTED_WEB_SEARCH_PROVIDERS: &[&str] =
     &[WEB_SEARCH_PROVIDER_TAVILY, WEB_SEARCH_PROVIDER_BRAVE];
 pub const DEFAULT_SYSTEM_PROMPT_NAME: &str = "Default";
 pub const IMAGE_GENERATION_SYSTEM_PROMPT_NAME: &str = "Image Generation";
+pub const PLAN_MODE_SYSTEM_PROMPT_NAME: &str = "Plan Mode";
 pub const AGENT_DEFINITION_INITIAL_REVISION: u64 = 1;
 pub const AGENT_DEFINITION_NAME_MAX_CHARS: usize = 80;
 pub const AGENT_DEFINITION_DESCRIPTION_MAX_CHARS: usize = 500;
@@ -2197,6 +2198,7 @@ fn validate_prompt_settings(
 fn prompt_settings_contains_system_prompt(settings: &PromptSettings, name: &str) -> bool {
     name == DEFAULT_SYSTEM_PROMPT_NAME
         || name == IMAGE_GENERATION_SYSTEM_PROMPT_NAME
+        || name == PLAN_MODE_SYSTEM_PROMPT_NAME
         || settings
             .system_prompts
             .iter()

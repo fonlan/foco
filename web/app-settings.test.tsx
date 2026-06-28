@@ -21,6 +21,7 @@ import {
   mermaidMock,
   mockFetch,
   pendingMemory,
+  defaultPlanModeSystemPrompt,
   renderApp,
   resetAppTestEnvironment,
   secondaryWorkspace,
@@ -935,6 +936,10 @@ describe("app-settings verification surfaces", () => {
                 name: "Default",
               },
               {
+                content: defaultPlanModeSystemPrompt,
+                name: "Plan Mode",
+              },
+              {
                 name: "Review",
                 content: "Review as senior engineer.",
               },
@@ -955,11 +960,12 @@ describe("app-settings verification surfaces", () => {
 
     const defaultPromptButton = screen.getByRole("button", { name: "Default" });
     expect(defaultPromptButton).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Plan Mode" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Image Generation" })).not.toBeInTheDocument();
     const restoreButtons = screen.getAllByRole("button", {
       name: "Restore default system prompt",
     });
-    expect(restoreButtons).toHaveLength(1);
+    expect(restoreButtons).toHaveLength(2);
   });
 
   it("renames user system prompts before saving prompt settings", async () => {
@@ -974,6 +980,9 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Add system prompt" }));
     expect(
       screen.queryByRole("button", { name: "Rename system prompt Default" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Rename system prompt Plan Mode" }),
     ).not.toBeInTheDocument();
     const renameButton = screen.getByRole("button", {
       name: "Rename system prompt Review",
@@ -1001,6 +1010,10 @@ describe("app-settings verification surfaces", () => {
               {
                 content: "You are Foco, a local coding agent.",
                 name: "Default",
+              },
+              {
+                content: defaultPlanModeSystemPrompt,
+                name: "Plan Mode",
               },
               {
                 name: "Reviewer",
@@ -1043,6 +1056,10 @@ describe("app-settings verification surfaces", () => {
               {
                 content: "You are Foco, a local coding agent.",
                 name: "Default",
+              },
+              {
+                content: defaultPlanModeSystemPrompt,
+                name: "Plan Mode",
               },
             ],
           }),

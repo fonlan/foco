@@ -23,6 +23,8 @@ vi.mock("mermaid", () => ({
 
 export const defaultComposerPlaceholder = "Ask Foco anything about Default...";
 export const sideProjectComposerPlaceholder = "Ask Foco anything about Side project...";
+export const defaultPlanModeSystemPrompt =
+  "You are Foco Plan Mode, a planning partner for software work.";
 
 export function chatSummary(
   id: string,
@@ -207,6 +209,7 @@ export const settings = {
   },
   prompts: {
     defaultSystemPrompt: "You are Foco, a local coding agent.",
+    defaultPlanModeSystemPrompt,
     extraText: "",
     files: [],
     systemPrompt: null,
@@ -214,6 +217,10 @@ export const settings = {
       {
         content: "You are Foco, a local coding agent.",
         name: "Default",
+      },
+      {
+        content: defaultPlanModeSystemPrompt,
+        name: "Plan Mode",
       },
     ],
   },
@@ -2286,6 +2293,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       ...settings,
       prompts: {
         defaultSystemPrompt: settings.prompts.defaultSystemPrompt,
+        defaultPlanModeSystemPrompt: settings.prompts.defaultPlanModeSystemPrompt,
         extraText: body.extraText ?? "Keep replies concise.",
         files: body.files ?? ["C:/Users/fonla/.codex/AGENTS.md"],
         systemPrompt: null,

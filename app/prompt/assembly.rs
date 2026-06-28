@@ -5,6 +5,7 @@ use crate::memory_runtime::{
 };
 use crate::runtime::{spawn_code_graph_workspace_initialization_if_needed, web_search_enabled};
 use crate::*;
+use foco_store::config::PLAN_MODE_SYSTEM_PROMPT_NAME;
 use foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND;
 
 pub(crate) async fn prepare_prompt_context(
@@ -276,7 +277,12 @@ pub(crate) async fn prepare_prompt_context(
         &memory_tool_definitions,
         &mcp_tools,
     );
-    let system_prompt = active_system_prompt(&config.prompts, &model.system_prompt_name)?;
+    let system_prompt_name = if plan_mode {
+        PLAN_MODE_SYSTEM_PROMPT_NAME
+    } else {
+        &model.system_prompt_name
+    };
+    let system_prompt = active_system_prompt(&config.prompts, system_prompt_name)?;
     let project_spec_prompt_section = project_spec_context
         .message
         .as_ref()

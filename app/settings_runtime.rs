@@ -5,11 +5,12 @@ use foco_agent::build_default_system_prompt;
 use foco_providers::supported_provider_kinds;
 use foco_store::{
     config::{
-        GlobalConfig, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig, ModelSettings,
-        PLAN_MERGE_AUTOMATION_DIRECT_AUTO, PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
-        ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
-        SUPPORTED_TERMINAL_SHELLS, WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY,
-        WebSearchSettings, WorkspaceCommonCommand, WorkspaceConfig,
+        DEFAULT_SYSTEM_PROMPT_NAME, GlobalConfig, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig,
+        ModelSettings, PLAN_MERGE_AUTOMATION_DIRECT_AUTO, PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
+        PLAN_MODE_SYSTEM_PROMPT_NAME, ProviderSettings, SUPPORTED_API_PROXY_TYPES,
+        SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS,
+        WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY, WebSearchSettings,
+        WorkspaceCommonCommand, WorkspaceConfig,
     },
     workspace::WorkspaceDatabase,
 };
@@ -24,7 +25,8 @@ use crate::http::settings::{
     ProviderKindSummary, SettingsResponse, SkillsSettingsSummary, SpecSettingsSummary,
     SystemPromptSummary, TerminalShellSummary, ThinkingLevelSummary, WebSearchProviderSummary,
     WebSearchSettingsSummary, WebServerSettingsSummary, WorkspaceCommonCommandSummary,
-    default_image_agent_system_prompt_for_config, known_agent_tool_names,
+    default_image_agent_system_prompt_for_config, default_plan_mode_system_prompt,
+    known_agent_tool_names,
 };
 use crate::*;
 
@@ -167,6 +169,7 @@ pub(crate) async fn settings_response(
             default_image_generation_system_prompt: default_image_agent_system_prompt_for_config(
                 config,
             )?,
+            default_plan_mode_system_prompt: default_plan_mode_system_prompt(),
             system_prompts: settings_system_prompt_summaries(config, &default_system_prompt)?,
             files: config
                 .prompts
@@ -252,6 +255,23 @@ fn settings_system_prompt_summaries(
 ) -> Result<Vec<SystemPromptSummary>, ApiError> {
     let mut summaries = system_prompt_summaries(&config.prompts, default_system_prompt);
     summaries.retain(|prompt| prompt.name != IMAGE_AGENT_SYSTEM_PROMPT_NAME);
+    if !summaries
+        .iter()
+        .any(|prompt| prompt.name == PLAN_MODE_SYSTEM_PROMPT_NAME)
+    {
+        let insert_at = summaries
+            .iter()
+            .position(|prompt| prompt.name == DEFAULT_SYSTEM_PROMPT_NAME)
+            .map(|index| index + 1)
+            .unwrap_or(summaries.len());
+        summaries.insert(
+            insert_at,
+            SystemPromptSummary {
+                name: PLAN_MODE_SYSTEM_PROMPT_NAME.to_string(),
+                content: default_plan_mode_system_prompt(),
+            },
+        );
+    }
     Ok(summaries)
 }
 

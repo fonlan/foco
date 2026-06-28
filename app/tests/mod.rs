@@ -15,7 +15,10 @@ use foco_agent::{
 };
 use foco_providers::OPENAI_CHAT_KIND;
 use foco_store::{
-    config::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PromptSettings, WebSearchSettings},
+    config::{
+        DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PLAN_MODE_SYSTEM_PROMPT_NAME, PromptSettings,
+        WebSearchSettings,
+    },
     memory::{
         MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
         MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind, MemoryStatus, NewMemoryDreamJob,
@@ -46,7 +49,7 @@ use crate::http::{
         DeleteSettingsItemRequest, IMAGE_AGENT_SYSTEM_PROMPT_NAME, ManualModelRequest,
         ManualPromptSettingsRequest, UpdateAgentDefinitionRequest,
         associate_provider_with_local_models, can_save_new_provider_after_model_list_error,
-        filter_provider_model_ids,
+        default_plan_mode_system_prompt, filter_provider_model_ids,
     },
     spec::{
         GenerateWorkspaceSpecRequest, SaveWorkspaceSpecRequest, WorkspaceSpecSettingsRequest,
@@ -10820,6 +10823,17 @@ async fn prepare_prompt_context_plan_mode_exposes_only_read_and_plan_tools() {
 
     let mut config = prompt_test_config(workspace_dir.clone());
     config.memory.enabled = true;
+    config.prompts.system_prompts = vec![
+        SystemPromptSettings {
+            name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            content: "Default Foco system prompt.".to_string(),
+        },
+        SystemPromptSettings {
+            name: "Review".to_string(),
+            content: "Review Foco system prompt.".to_string(),
+        },
+    ];
+    config.models[0].system_prompt_name = "Review".to_string();
     let state = test_app_state(config.clone(), profile_dir.clone());
     let context = prepare_prompt_context(
         &state,
@@ -10862,6 +10876,16 @@ async fn prepare_prompt_context_plan_mode_exposes_only_read_and_plan_tools() {
     assert!(!tool_names.contains(CREATE_TODO_GRAPH_TOOL));
     assert!(!tool_names.contains(UPDATE_TODO_GRAPH_TOOL));
     assert!(!tool_names.contains(MEMORY_WRITE_TOOL_NAME));
+    assert_eq!(
+        context.provider_request.messages[0].content,
+        default_plan_mode_system_prompt()
+    );
+    assert_eq!(PLAN_MODE_SYSTEM_PROMPT_NAME, "Plan Mode");
+    assert!(
+        !context.provider_request.messages[0]
+            .content
+            .contains("Review Foco system prompt.")
+    );
 
     let available_tools_message = context
         .provider_request

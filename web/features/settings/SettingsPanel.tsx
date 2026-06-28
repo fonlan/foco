@@ -130,6 +130,7 @@ import type {
 import {
   DEFAULT_SYSTEM_PROMPT_NAME,
   IMAGE_AGENT_SYSTEM_PROMPT_NAME,
+  PLAN_MODE_SYSTEM_PROMPT_NAME,
   MEMORY_KIND_OPTIONS,
   SAVED_PASSWORD_MASK,
 } from "../../app/constants";
@@ -1987,6 +1988,9 @@ export function SettingsPanel({
     }
     if (name === DEFAULT_SYSTEM_PROMPT_NAME) {
       return settings.prompts.defaultSystemPrompt;
+    }
+    if (name === PLAN_MODE_SYSTEM_PROMPT_NAME) {
+      return settings.prompts.defaultPlanModeSystemPrompt ?? null;
     }
     return null;
   }
@@ -10670,21 +10674,36 @@ function normalizedSystemPromptSummaries(
     (prompt) => prompt.name !== IMAGE_AGENT_SYSTEM_PROMPT_NAME,
   );
 
-  if (filteredPrompts.some((prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME)) {
-    return filteredPrompts;
+  const normalizedPrompts = filteredPrompts.some(
+    (prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME,
+  )
+    ? filteredPrompts
+    : [
+      {
+        name: DEFAULT_SYSTEM_PROMPT_NAME,
+        content: prompts.defaultSystemPrompt,
+      },
+      ...filteredPrompts,
+    ];
+
+  if (
+    prompts.defaultPlanModeSystemPrompt &&
+    !normalizedPrompts.some((prompt) => prompt.name === PLAN_MODE_SYSTEM_PROMPT_NAME)
+  ) {
+    const defaultIndex = normalizedPrompts.findIndex(
+      (prompt) => prompt.name === DEFAULT_SYSTEM_PROMPT_NAME,
+    );
+    normalizedPrompts.splice(Math.max(defaultIndex + 1, 0), 0, {
+      name: PLAN_MODE_SYSTEM_PROMPT_NAME,
+      content: prompts.defaultPlanModeSystemPrompt,
+    });
   }
 
-  return [
-    {
-      name: DEFAULT_SYSTEM_PROMPT_NAME,
-      content: prompts.defaultSystemPrompt,
-    },
-    ...filteredPrompts,
-  ];
+  return normalizedPrompts;
 }
 
 function isSystemPromptFixed(name: string): boolean {
-  return name === DEFAULT_SYSTEM_PROMPT_NAME;
+  return name === DEFAULT_SYSTEM_PROMPT_NAME || name === PLAN_MODE_SYSTEM_PROMPT_NAME;
 }
 
 function emptyMemorySettingsForm(): MemorySettingsFormState {
