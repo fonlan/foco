@@ -1,4 +1,4 @@
-﻿import focoLogoSvg from "../foco.svg?raw";
+import focoLogoSvg from "../foco.svg?raw";
 import {
   Activity,
   BarChart3,
@@ -627,6 +627,8 @@ export function App() {
   const workspaceSidebarRef = useRef<HTMLElement | null>(null);
   const workspaceChatLongPressTimeoutRef = useRef<number | null>(null);
   const suppressNextWorkspaceChatClickRef = useRef(false);
+  const workspaceOrderPreviewRef = useRef<string[] | null>(null);
+  const workspaceOrderDropHandledRef = useRef(false);
   const displayedWorkspaces = useMemo(
     () =>
       workspaceOrderPreview
@@ -7337,8 +7339,11 @@ export function App() {
     event: ReactDragEvent<HTMLDivElement>,
     workspaceId: string,
   ) {
+    const workspaceIds = workspaces.map((workspace) => workspace.id);
     setDraggedWorkspaceId(workspaceId);
-    setWorkspaceOrderPreview(workspaces.map((workspace) => workspace.id));
+    workspaceOrderDropHandledRef.current = false;
+    workspaceOrderPreviewRef.current = workspaceIds;
+    setWorkspaceOrderPreview(workspaceIds);
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("text/plain", workspaceId);
   }
@@ -7364,19 +7369,18 @@ export function App() {
 
     event.preventDefault();
     const workspaceIds = moveItemId(
-      workspaceOrderPreview ?? workspaces.map((workspace) => workspace.id),
+      workspaceOrderPreviewRef.current ?? workspaces.map((workspace) => workspace.id),
       sourceWorkspaceId,
       targetWorkspaceId,
     );
+    workspaceOrderPreviewRef.current = workspaceIds;
     setWorkspaceOrderPreview(workspaceIds);
   }
 
-  async function handleWorkspaceDrop(event: ReactDragEvent<HTMLDivElement>) {
-    event.preventDefault();
-
-    const workspaceIds = workspaceOrderPreview;
+  async function commitWorkspaceOrderPreview(workspaceIds: string[] | null) {
     const previousWorkspaces = workspaces;
     setDraggedWorkspaceId(null);
+    workspaceOrderPreviewRef.current = null;
     setWorkspaceOrderPreview(null);
 
     if (!workspaceIds || sameStringList(workspaceIds, previousWorkspaces.map((workspace) => workspace.id))) {
@@ -7386,9 +7390,22 @@ export function App() {
     await saveWorkspaceOrder(workspaceIds, previousWorkspaces);
   }
 
+  async function handleWorkspaceDrop(event: ReactDragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    workspaceOrderDropHandledRef.current = true;
+    await commitWorkspaceOrderPreview(workspaceOrderPreviewRef.current);
+  }
+
   function handleWorkspaceDragEnd() {
-    setDraggedWorkspaceId(null);
-    setWorkspaceOrderPreview(null);
+    if (workspaceOrderDropHandledRef.current) {
+      workspaceOrderDropHandledRef.current = false;
+      setDraggedWorkspaceId(null);
+      workspaceOrderPreviewRef.current = null;
+      setWorkspaceOrderPreview(null);
+      return;
+    }
+
+    void commitWorkspaceOrderPreview(workspaceOrderPreviewRef.current);
   }
 
   function openWorkspaceDialog() {

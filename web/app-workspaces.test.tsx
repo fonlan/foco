@@ -165,6 +165,91 @@ describe("app-workspaces verification surfaces", () => {
     ).toBe(true);
   });
 
+  it("saves the latest main workspace drag preview when drop happens before React re-renders", async () => {
+    const anotherWorkspace = {
+      ...secondaryWorkspace,
+      chats: [],
+      id: "workspace-3",
+      name: "Another project",
+      path: "C:\\Users\\fonla\\Documents\\Repos\\AnotherProject",
+      pinned: false,
+    };
+    appTestState.workspaceResponseWorkspaces = [
+      { ...workspace },
+      { ...secondaryWorkspace },
+      { ...anotherWorkspace },
+    ];
+    appTestState.settingsResponse = {
+      ...settings,
+      workspaces: [
+        configuredWorkspace(workspace, true),
+        configuredWorkspace(secondaryWorkspace),
+        configuredWorkspace(anotherWorkspace),
+      ],
+    };
+
+    renderApp();
+
+    await screen.findByRole("button", { name: "Side project" });
+    fireEvent.dragStart(workspaceDragContainer("Side project"), {
+      dataTransfer: dragDataTransfer(),
+    });
+    await act(async () => {
+      fireEvent.dragOver(workspaceDragContainer("Another project"));
+      fireEvent.drop(workspaceDragContainer("Another project"));
+    });
+
+    await waitFor(() => {
+      expect(appTestState.lastWorkspaceOrderRequest).toEqual([
+        "workspace-1",
+        "workspace-3",
+        "workspace-2",
+      ]);
+    });
+    expectWorkspaceOrder(["Default", "Another project", "Side project"]);
+  });
+  it("commits the main workspace preview on drag end when drop is missed", async () => {
+    const anotherWorkspace = {
+      ...secondaryWorkspace,
+      chats: [],
+      id: "workspace-3",
+      name: "Another project",
+      path: "C:\\Users\\fonla\\Documents\\Repos\\AnotherProject",
+      pinned: false,
+    };
+    appTestState.workspaceResponseWorkspaces = [
+      { ...workspace },
+      { ...secondaryWorkspace },
+      { ...anotherWorkspace },
+    ];
+    appTestState.settingsResponse = {
+      ...settings,
+      workspaces: [
+        configuredWorkspace(workspace, true),
+        configuredWorkspace(secondaryWorkspace),
+        configuredWorkspace(anotherWorkspace),
+      ],
+    };
+
+    renderApp();
+
+    await screen.findByRole("button", { name: "Side project" });
+    fireEvent.dragStart(workspaceDragContainer("Side project"), {
+      dataTransfer: dragDataTransfer(),
+    });
+    fireEvent.dragOver(workspaceDragContainer("Another project"));
+    fireEvent.dragEnd(workspaceDragContainer("Side project"));
+
+    await waitFor(() => {
+      expect(appTestState.lastWorkspaceOrderRequest).toEqual([
+        "workspace-1",
+        "workspace-3",
+        "workspace-2",
+      ]);
+    });
+    expectWorkspaceOrder(["Default", "Another project", "Side project"]);
+  });
+
   it("ignores main workspace drops across pinned groups", async () => {
     const pinnedWorkspace = {
       ...secondaryWorkspace,
