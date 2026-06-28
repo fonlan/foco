@@ -7966,11 +7966,11 @@ export function App() {
                       />
                     </button>
                     <button
-                      aria-label={t("Search workspace chats")}
+                      aria-label={t("Search chats")}
                       aria-pressed={workspaceChatSearchOpen}
                       className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
                       onClick={() => setWorkspaceChatSearchOpen((current) => !current)}
-                      title={t("Search workspace chats")}
+                      title={t("Search chats")}
                       type="button"
                     >
                       <Search aria-hidden="true" className="size-4" />
@@ -7991,10 +7991,10 @@ export function App() {
                   <div className="border-b border-stone-200/80 px-3 py-2">
                     <div className="flex items-center gap-2">
                       <input
-                        aria-label={t("Search workspace chats")}
+                        aria-label={t("Search chats")}
                         className="h-9 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                         onChange={(event) => setWorkspaceChatSearchQuery(event.target.value)}
-                        placeholder={t("Search chats")}
+                        placeholder={t("Search chats placeholder")}
                         type="search"
                         value={workspaceChatSearchQuery}
                       />

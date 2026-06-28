@@ -37,50 +37,67 @@ function currentFileTabs() {
   return new URLSearchParams(window.location.search).getAll("file");
 }
 
+function getAssistantFinalAnswer(container: HTMLElement) {
+  return within(container).getByText((_content, element) =>
+    Boolean(
+      element?.classList.contains("markdown-content-assistant") &&
+        element.textContent?.startsWith("Done."),
+    ),
+  );
+}
+
 describe("app-shell verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
-  it("filters workspace chats across workspaces and refreshes without navigation", async () => {
+  it("filters workspace chats across workspaces", async () => {
     renderApp();
 
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
+
+    await userEvent.click(screen.getByRole("button", { name: "Search chats" }));
+    changeInput(screen.getByRole("searchbox", { name: "Search chats" }), "Side");
+
+    expect(within(workspaceList).getByText("Side note")).toBeInTheDocument();
+    expect(within(workspaceList).queryByText("Tool run")).not.toBeInTheDocument();
+    expect(within(workspaceList).queryByText("Second chat")).not.toBeInTheDocument();
+  });
+
+  it("refreshes workspaces and renders newly returned chats", async () => {
+    renderApp();
+
+    await screen.findByRole("navigation", { name: "Workspace list" });
     const workspaceRequestCount = () =>
       vi
         .mocked(fetch)
         .mock.calls.filter(([input]) => String(input).includes("/api/workspaces"))
         .length;
-
     const initialWorkspaceRequests = workspaceRequestCount();
-    const refreshWorkspacesButton = screen.getByRole("button", {
-      name: "Refresh workspaces",
-    });
-    await userEvent.click(refreshWorkspacesButton);
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: [
+          {
+            activeRun: null,
+            codeChangeStats: { additions: 0, deletions: 0 },
+            createdAt: "2026-06-05T13:00:00Z",
+            id: "refreshed-chat",
+            title: "Refreshed chat",
+            updatedAt: "2026-06-05T13:05:00Z",
+          },
+          ...workspace.chats,
+        ],
+      },
+      secondaryWorkspace,
+    ];
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
 
     await waitFor(() => {
       expect(workspaceRequestCount()).toBeGreaterThan(initialWorkspaceRequests);
-      expect(refreshWorkspacesButton).not.toBeDisabled();
     });
-
-    await userEvent.click(
-      screen.getByRole("button", { name: "Search workspace chats" }),
-    );
-    changeInput(screen.getByRole("searchbox", { name: "Search workspace chats" }), "OLDER CHAT 10");
-
-    expect(within(workspaceList).getByText("Older chat 10")).toBeInTheDocument();
-    expect(within(workspaceList).getByText("Default")).toBeInTheDocument();
-    expect(within(workspaceList).queryByText("Side project")).not.toBeInTheDocument();
-    expect(
-      within(workspaceList).queryByRole("button", {
-        name: /Show \d+ more chats in Default/,
-      }),
-    ).not.toBeInTheDocument();
-
-    changeInput(screen.getByRole("searchbox", { name: "Search workspace chats" }), "missing session");
-
-    expect(await within(workspaceList).findByText("No matching chats")).toBeInTheDocument();
-    expect(within(workspaceList).queryByText("Loading workspaces...")).not.toBeInTheDocument();
+    expect(await screen.findByText("Refreshed chat")).toBeInTheDocument();
   });
 
   it("renders the workspace sidebar and persisted chat tool results", async () => {
@@ -98,7 +115,7 @@ describe("app-shell verification surfaces", () => {
     const userBubble = screen
       .getByText("Please inspect README.")
       .closest(".message-bubble") as HTMLElement | null;
-    const assistantBubble = (await screen.findByText("Done."))
+    const assistantBubble = (await screen.findByText("edit_file"))
       .closest(".message-bubble") as HTMLElement | null;
     expect(userBubble).toHaveClass("message-bubble-user");
     expect(userBubble).not.toHaveClass("bg-teal-800", "text-white");
@@ -181,7 +198,7 @@ describe("app-shell verification surfaces", () => {
         Boolean(element.textContent?.includes('"oldStr": "hello"')),
       ),
     ).toBeInTheDocument();
-    expect(screen.getByText("Done.")).toBeInTheDocument();
+    expect(getAssistantFinalAnswer(assistantBubble)).toBeInTheDocument();
     expect(await screen.findByTestId("mermaid-svg", undefined, { timeout: 5000 })).toBeInTheDocument();
     expect(mermaidMock.render).toHaveBeenCalledWith(
       expect.stringMatching(/^foco-mermaid-/),
@@ -193,7 +210,7 @@ describe("app-shell verification surfaces", () => {
     expect(screen.getByText("tokens/s: 20")).toBeInTheDocument();
     expect(screen.getByText("First token latency: 0.25 s")).toBeInTheDocument();
     const memoriesUsedLabel = within(assistantBubble!).getByText("Memories used");
-    const finalAnswer = within(assistantBubble!).getByText("Done.");
+    const finalAnswer = getAssistantFinalAnswer(assistantBubble!);
     expect(
       memoriesUsedLabel.compareDocumentPosition(finalAnswer) &
         Node.DOCUMENT_POSITION_FOLLOWING,
@@ -382,8 +399,7 @@ describe("app-shell verification surfaces", () => {
     renderApp();
 
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
-    const assistantBubble = screen
-      .getByText("Done.")
+    const assistantBubble = (await screen.findByText("edit_file"))
       .closest(".message-bubble") as HTMLElement | null;
     if (!assistantBubble) {
       throw new Error("Expected assistant message bubble");

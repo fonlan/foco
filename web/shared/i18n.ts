@@ -9,6 +9,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Refresh workspaces": "刷新工作区",
     "Search workspace chats": "搜索工作区会话",
     "Search chats": "搜索会话",
+    "Search chats placeholder": "搜索会话标题",
     "Clear search": "清空搜索",
     "No matching chats": "没有匹配的会话",
     "Add workspace": "添加工作区",
