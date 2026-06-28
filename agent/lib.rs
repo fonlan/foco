@@ -1578,7 +1578,16 @@ pub fn tool_resource_locks(
 
     match effect {
         ToolEffect::ReadOnly => {}
-        ToolEffect::WorkspaceMutation | ToolEffect::ExternalOrUnknown => {
+        ToolEffect::WorkspaceMutation
+            if tool_requires_workspace_mutation_lease(&tool_call.name) =>
+        {
+            locks.push(ToolResourceLock {
+                resource: ToolResource::WorkspaceMutationLease,
+                access: ToolResourceAccess::Exclusive,
+            });
+        }
+        ToolEffect::WorkspaceMutation => {}
+        ToolEffect::ExternalOrUnknown => {
             locks.push(ToolResourceLock {
                 resource: ToolResource::WorkspaceMutationLease,
                 access: ToolResourceAccess::Exclusive,
@@ -1587,6 +1596,10 @@ pub fn tool_resource_locks(
     }
 
     Ok(locks)
+}
+
+fn tool_requires_workspace_mutation_lease(tool_name: &str) -> bool {
+    matches!(tool_name, WRITE_FILE_TOOL_NAME | EDIT_FILE_TOOL_NAME)
 }
 
 pub fn tool_effect(tool_name: &str) -> ToolEffect {
@@ -2063,7 +2076,7 @@ mod tests {
     }
 
     #[test]
-    fn mutation_and_unknown_tools_take_workspace_mutation_lease() {
+    fn mutation_and_unknown_tools_take_workspace_mutation_lease_when_they_touch_workspace_files() {
         let write_locks = tool_resource_locks(&test_tool_call(
             WRITE_FILE_TOOL_NAME,
             json!({ "path": "src/lib.rs" }),
@@ -2088,11 +2101,35 @@ mod tests {
             }]
         );
 
+        let plan_locks = tool_resource_locks(&test_tool_call(CREATE_PLAN_TOOL_NAME, json!({})))
+            .expect("plan locks");
+        assert_eq!(
+            plan_locks,
+            vec![ToolResourceLock {
+                resource: ToolResource::Plan,
+                access: ToolResourceAccess::Write,
+            }]
+        );
+
         let mcp_locks = tool_resource_locks(&test_tool_call("mcp__server__tool", json!({})))
             .expect("mcp locks");
         assert!(mcp_locks.iter().any(|lock| {
             lock.resource == ToolResource::WorkspaceMutationLease
                 && lock.access == ToolResourceAccess::Exclusive
+        }));
+    }
+
+    #[test]
+    fn plan_tool_locks_do_not_conflict_with_running_command_lock() {
+        let command_locks = tool_resource_locks(&test_tool_call(RUN_COMMAND_TOOL_NAME, json!({})))
+            .expect("command locks");
+        let plan_locks = tool_resource_locks(&test_tool_call(CREATE_PLAN_TOOL_NAME, json!({})))
+            .expect("plan locks");
+
+        assert!(!command_locks.iter().any(|command_lock| {
+            plan_locks
+                .iter()
+                .any(|plan_lock| tool_resource_locks_conflict(command_lock, plan_lock))
         }));
     }
 

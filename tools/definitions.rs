@@ -680,14 +680,14 @@ fn get_todo_graph_definition() -> ToolDefinition {
 fn create_plan_definition() -> ToolDefinition {
     ToolDefinition {
         name: CREATE_PLAN_TOOL,
-        description: "Create a durable workspace plan for the Plan panel. Use stable ids such as plan-*, plan-phase-*, and plan-step-*; phases are ordered as provided and steps are checkable.",
+        description: "Create a durable workspace plan for the Plan panel. Use workspace-wide unique ids such as plan-<topic>-<timestamp>, plan-phase-<topic>-<timestamp>-*, and plan-step-<topic>-<timestamp>-*; phases are ordered as provided and steps are checkable.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "id": {
                     "type": "string",
-                    "description": "Stable unique plan id. Use a plan-* prefix."
+                    "description": "Stable workspace-wide unique plan id. Use a plan-* prefix with a task-specific suffix."
                 },
                 "title": {
                     "type": "string",
@@ -972,7 +972,7 @@ fn plan_phase_schema() -> Value {
         "properties": {
             "id": {
                 "type": "string",
-                "description": "Stable unique phase id. Use a plan-phase-* prefix."
+                "description": "Stable workspace-wide unique phase id. Use a plan-phase-* prefix with the plan topic and a unique suffix."
             },
             "title": {
                 "type": "string",
@@ -999,7 +999,7 @@ fn plan_step_schema() -> Value {
         "properties": {
             "id": {
                 "type": "string",
-                "description": "Stable unique step id. Use a plan-step-* prefix."
+                "description": "Stable workspace-wide unique step id. Use a plan-step-* prefix with the plan topic and a unique suffix; do not reuse generic ids like plan-step-tests across plans."
             },
             "title": {
                 "type": "string",

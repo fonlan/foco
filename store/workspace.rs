@@ -1014,6 +1014,13 @@ impl WorkspaceDatabase {
                 });
             }
         }
+        let plan_id = ensure_plan_entity_id_available(
+            &transaction,
+            &database_path,
+            "SELECT EXISTS(SELECT 1 FROM plans WHERE id = ?1)",
+            "plan",
+            plan.id,
+        )?;
         let sort_order = transaction
             .query_row(
                 "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM plans",
@@ -1029,7 +1036,7 @@ impl WorkspaceDatabase {
                      created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
                 params![
-                    plan.id.trim(),
+                    plan_id,
                     title,
                     overview,
                     plan.status,
@@ -1041,6 +1048,13 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
 
         for (phase_index, phase) in plan.phases.iter().enumerate() {
+            let phase_id = ensure_plan_entity_id_available(
+                &transaction,
+                &database_path,
+                "SELECT EXISTS(SELECT 1 FROM plan_phases WHERE id = ?1)",
+                "plan phase",
+                phase.id,
+            )?;
             let sequence = i64::try_from(phase_index).map_err(|source| {
                 WorkspaceDatabaseError::InvalidPlan {
                     message: format!("plan phase index overflowed: {source}"),
@@ -1052,8 +1066,8 @@ impl WorkspaceDatabase {
                         (id, plan_id, sequence, title, summary, status, created_at, updated_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
                     params![
-                        phase.id.trim(),
-                        plan.id.trim(),
+                        phase_id,
+                        plan_id,
                         sequence,
                         required_plan_text("phase.title", phase.title)?,
                         phase.summary.trim(),
@@ -1062,6 +1076,13 @@ impl WorkspaceDatabase {
                 )
                 .map_err(|source| sqlite_error(&database_path, source))?;
             for (step_index, step) in phase.steps.iter().enumerate() {
+                let step_id = ensure_plan_entity_id_available(
+                    &transaction,
+                    &database_path,
+                    "SELECT EXISTS(SELECT 1 FROM plan_steps WHERE id = ?1)",
+                    "plan step",
+                    step.id,
+                )?;
                 let step_sequence = i64::try_from(step_index).map_err(|source| {
                     WorkspaceDatabaseError::InvalidPlan {
                         message: format!("plan step index overflowed: {source}"),
@@ -1075,9 +1096,9 @@ impl WorkspaceDatabase {
                              status, created_at, updated_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)",
                         params![
-                            step.id.trim(),
-                            plan.id.trim(),
-                            phase.id.trim(),
+                            step_id,
+                            plan_id,
+                            phase_id,
                             step_sequence,
                             required_plan_text("step.title", step.title)?,
                             step.detail.trim(),
@@ -1092,10 +1113,10 @@ impl WorkspaceDatabase {
         transaction
             .commit()
             .map_err(|source| sqlite_error(&database_path, source))?;
-        self.refresh_plan_status_from_steps(plan.id.trim())?;
-        self.plan(plan.id.trim())?
+        self.refresh_plan_status_from_steps(plan_id.as_str())?;
+        self.plan(plan_id.as_str())?
             .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan '{}' was not found after insert", plan.id.trim()),
+                message: format!("plan '{}' was not found after insert", plan_id),
             })
     }
 
@@ -9122,6 +9143,26 @@ fn required_plan_text(field: &str, value: &str) -> Result<String, WorkspaceDatab
     }
 
     Ok(value.to_string())
+}
+
+fn ensure_plan_entity_id_available(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    exists_sql: &str,
+    entity: &str,
+    id: &str,
+) -> Result<String, WorkspaceDatabaseError> {
+    let id = required_plan_text(&format!("{entity}.id"), id)?;
+    let exists: bool = transaction
+        .query_row(exists_sql, params![id.as_str()], |row| row.get(0))
+        .map_err(|source| sqlite_error(database_path, source))?;
+    if exists {
+        return Err(WorkspaceDatabaseError::InvalidPlan {
+            message: format!("{entity} id already exists: {id}"),
+        });
+    }
+
+    Ok(id)
 }
 
 fn plan_acceptance_json(values: &[String]) -> Result<String, WorkspaceDatabaseError> {

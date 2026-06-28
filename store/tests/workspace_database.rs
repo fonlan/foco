@@ -363,6 +363,115 @@ fn plan_completed_steps_remain_active_until_user_marks_complete() {
 }
 
 #[test]
+fn create_plan_reports_duplicate_step_id_before_sqlite_constraint() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-duplicate-step-source",
+            title: "Source plan",
+            overview: "Existing plan with a step id.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-duplicate-step-source-phase",
+                title: "Phase one",
+                summary: "Existing phase.",
+                steps: vec![NewPlanStep {
+                    id: "plan-step-duplicate",
+                    title: "Existing step",
+                    detail: "Create the existing step.",
+                    acceptance: vec!["existing step is stored".to_string()],
+                }],
+            }],
+        })
+        .expect("create source plan");
+
+    let error = database
+        .create_plan(NewPlan {
+            id: "plan-duplicate-step-new",
+            title: "New plan",
+            overview: "Attempts to reuse the step id.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-duplicate-step-new-phase",
+                title: "Phase one",
+                summary: "New phase.",
+                steps: vec![NewPlanStep {
+                    id: "plan-step-duplicate",
+                    title: "New step",
+                    detail: "Reuse the existing step id.",
+                    acceptance: vec!["new step is rejected".to_string()],
+                }],
+            }],
+        })
+        .expect_err("duplicate step id rejected");
+
+    assert!(matches!(
+        error,
+        WorkspaceDatabaseError::InvalidPlan { ref message }
+            if message == "plan step id already exists: plan-step-duplicate"
+    ));
+    assert!(
+        database
+            .plan("plan-duplicate-step-new")
+            .expect("plan lookup")
+            .is_none()
+    );
+}
+
+#[test]
+fn create_plan_reports_duplicate_step_id_within_same_request() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    let error = database
+        .create_plan(NewPlan {
+            id: "plan-duplicate-step-same-request",
+            title: "Duplicate step request",
+            overview: "Attempts to reuse a step id in one plan.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-duplicate-step-same-request-phase",
+                title: "Phase one",
+                summary: "Duplicate step phase.",
+                steps: vec![
+                    NewPlanStep {
+                        id: "plan-step-duplicate-in-request",
+                        title: "First step",
+                        detail: "Create the first step.",
+                        acceptance: vec!["first step is seen".to_string()],
+                    },
+                    NewPlanStep {
+                        id: "plan-step-duplicate-in-request",
+                        title: "Second step",
+                        detail: "Reuse the first step id.",
+                        acceptance: vec!["second step is rejected".to_string()],
+                    },
+                ],
+            }],
+        })
+        .expect_err("duplicate step id rejected");
+
+    assert!(matches!(
+        error,
+        WorkspaceDatabaseError::InvalidPlan { ref message }
+            if message == "plan step id already exists: plan-step-duplicate-in-request"
+    ));
+    assert!(
+        database
+            .plan("plan-duplicate-step-same-request")
+            .expect("plan lookup")
+            .is_none()
+    );
+}
+
+#[test]
 fn plan_phase_run_completion_advances_until_pause() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
