@@ -152,6 +152,7 @@ mod hooks_support;
 mod http;
 mod logging;
 mod memory_runtime;
+mod plan_runtime;
 mod platform;
 mod prompt;
 mod runtime;

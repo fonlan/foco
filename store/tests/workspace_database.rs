@@ -363,6 +363,150 @@ fn plan_completed_steps_remain_active_until_user_marks_complete() {
 }
 
 #[test]
+fn plan_phase_run_completion_advances_until_pause() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-runner",
+            title: "Plan runner",
+            overview: "Run phases through Agent tasks.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![
+                NewPlanPhase {
+                    id: "plan-runner-phase-1",
+                    title: "Phase one",
+                    summary: "First implementation phase.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-runner-step-1",
+                        title: "Do first",
+                        detail: "Complete first work.",
+                        acceptance: vec!["first done".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-runner-phase-2",
+                    title: "Phase two",
+                    summary: "Second implementation phase.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-runner-step-2",
+                        title: "Do second",
+                        detail: "Complete second work.",
+                        acceptance: vec!["second done".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-runner-phase-3",
+                    title: "Phase three",
+                    summary: "Third implementation phase.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-runner-step-3",
+                        title: "Do third",
+                        detail: "Complete third work.",
+                        acceptance: vec!["third done".to_string()],
+                    }],
+                },
+            ],
+        })
+        .expect("create plan");
+
+    let first_running = database
+        .transition_plan("plan-runner", "start")
+        .expect("start first phase");
+    assert_eq!(first_running.status, "running");
+    assert_eq!(
+        first_running.active_phase_id.as_deref(),
+        Some("plan-runner-phase-1")
+    );
+
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-plan-runner-1", "plan-runner-1");
+    let first_task_id = AgentTaskId::new("agent-task-plan-runner-1").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &first_task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue first task");
+    let attached = database
+        .attach_plan_phase_run(
+            "plan-runner",
+            "plan-runner-phase-1",
+            "chat-plan-runner-1",
+            &team_id,
+            &first_task_id,
+        )
+        .expect("attach first phase");
+    assert_eq!(
+        attached.phases[0].agent_task_id.as_deref(),
+        Some("agent-task-plan-runner-1")
+    );
+
+    let after_first = database
+        .complete_plan_phase_run(&first_task_id, Some("commit-one"))
+        .expect("complete first phase")
+        .expect("plan after first phase");
+    assert_eq!(after_first.status, "ready");
+    assert_eq!(after_first.phases[0].status, "completed");
+    assert_eq!(
+        after_first.phases[0].commit_id.as_deref(),
+        Some("commit-one")
+    );
+    assert_eq!(after_first.phases[0].steps[0].status, "completed");
+    assert_eq!(after_first.phases[1].status, "pending");
+
+    let second_running = database
+        .transition_plan("plan-runner", "resume")
+        .expect("start second phase");
+    assert_eq!(
+        second_running.active_phase_id.as_deref(),
+        Some("plan-runner-phase-2")
+    );
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-plan-runner-2", "plan-runner-2");
+    let second_task_id = AgentTaskId::new("agent-task-plan-runner-2").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &second_task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue second task");
+    database
+        .attach_plan_phase_run(
+            "plan-runner",
+            "plan-runner-phase-2",
+            "chat-plan-runner-2",
+            &team_id,
+            &second_task_id,
+        )
+        .expect("attach second phase");
+    let paused = database
+        .transition_plan("plan-runner", "pause")
+        .expect("pause plan");
+    assert_eq!(paused.status, "paused");
+
+    let after_second = database
+        .complete_plan_phase_run(&second_task_id, Some("commit-two"))
+        .expect("complete second phase")
+        .expect("plan after second phase");
+    assert_eq!(after_second.status, "paused");
+    assert!(after_second.active_phase_id.is_none());
+    assert_eq!(after_second.phases[1].status, "completed");
+    assert_eq!(after_second.phases[2].status, "pending");
+}
+
+#[test]
 fn workspace_spec_jobs_redact_audit_json_fields() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
@@ -5898,6 +6042,11 @@ fn create_test_agent_team(
             chat_id,
             coordinator_instance_id: &instance_id,
             coordinator_definition: &definition,
+            coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+            coordinator_execution_root_path: None,
+            coordinator_worktree_base_revision: None,
+            coordinator_worktree_branch: None,
+            coordinator_worktree_status: None,
             max_concurrent_runs: 1,
         })
         .expect("agent team create");

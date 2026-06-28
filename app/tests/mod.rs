@@ -128,6 +128,11 @@ fn insert_waiting_coordinator_task(
             chat_id,
             coordinator_instance_id: &instance_id,
             coordinator_definition: &definition,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_execution_root_path: None,
+            coordinator_worktree_base_revision: None,
+            coordinator_worktree_branch: None,
+            coordinator_worktree_status: None,
             max_concurrent_runs: 1,
         })
         .expect("team create");
@@ -4875,6 +4880,12 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
                 chat_id: "chat-reconcile",
                 coordinator_instance_id: &instance_id,
                 coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
                 max_concurrent_runs: 1,
             })
             .expect("team create");
@@ -5145,6 +5156,12 @@ async fn team_chat_task_sse_returns_while_coordinator_task_is_still_queued() {
                 chat_id,
                 coordinator_instance_id: &instance_id,
                 coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
                 max_concurrent_runs: 1,
             })
             .expect("team create");
@@ -5366,6 +5383,7 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
             defer_start: false,
             attachments: Vec::new(),
             agent_definition_id: None,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
             origin: crate::http::chat::QueuedChatMessageOrigin::ScheduledTask {
                 task_id: "scheduled-task-test".to_string(),
                 run_id: "scheduled-run-test".to_string(),
@@ -6011,6 +6029,12 @@ async fn queue_chat_message_resumes_paused_coordinator_without_active_work() {
                 chat_id,
                 coordinator_instance_id: &instance_id,
                 coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
                 max_concurrent_runs: 1,
             })
             .expect("team create");
@@ -6189,6 +6213,12 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
                 chat_id: "chat-1",
                 coordinator_instance_id: &instance_id,
                 coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
                 max_concurrent_runs: 1,
             })
             .expect("agent team create");
@@ -12123,6 +12153,12 @@ async fn prepare_prompt_context_allocates_after_hidden_worker_messages() {
                 chat_id: "chat-hidden-worker-sequence",
                 coordinator_instance_id: &coordinator_id,
                 coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
                 max_concurrent_runs: 1,
             })
             .expect("team create");

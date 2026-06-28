@@ -8,9 +8,9 @@ use std::{
 
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    AgentAttemptId, AgentAttemptStatus, AgentDomainError, AgentEntityKind, AgentInstanceId,
-    AgentInstanceStatus, AgentMessageId, AgentTaskId, AgentTaskStatus, AgentTaskTransition,
-    AgentTeamId, AgentTeamStatus, TeamWorkload,
+    AgentAttemptId, AgentAttemptStatus, AgentDomainError, AgentEntityKind,
+    AgentExecutionWorkspaceMode, AgentInstanceId, AgentInstanceStatus, AgentMessageId, AgentTaskId,
+    AgentTaskStatus, AgentTaskTransition, AgentTeamId, AgentTeamStatus, TeamWorkload,
 };
 use rusqlite::{
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter,
@@ -1345,6 +1345,285 @@ impl WorkspaceDatabase {
         self.refresh_plan_status_from_steps(plan_id)
     }
 
+    pub fn attach_plan_phase_run(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        implementation_chat_id: &str,
+        agent_team_id: &AgentTeamId,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        let phase = plan
+            .phases
+            .iter()
+            .find(|phase| phase.id == phase_id.trim())
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase '{}' does not belong to plan '{}'",
+                    phase_id.trim(),
+                    plan.id
+                ),
+            })?;
+        if phase.status != "running" {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase '{}' is not running", phase.id),
+            });
+        }
+        if phase.agent_task_id.is_some() {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase '{}' already has an Agent task", phase.id),
+            });
+        }
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET implementation_chat_id = ?3,
+                     agent_team_id = ?4,
+                     agent_task_id = ?5,
+                     error_message = NULL,
+                     updated_at = ?6
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![
+                    plan.id.as_str(),
+                    phase.id.as_str(),
+                    implementation_chat_id.trim(),
+                    agent_team_id.as_str(),
+                    agent_task_id.as_str(),
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after phase attach: {}", plan_id.trim()),
+            })
+    }
+
+    pub fn plan_phase_for_agent_task(
+        &self,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<Option<PlanPhaseRecord>, WorkspaceDatabaseError> {
+        let Some(mut phase) = self
+            .connection
+            .query_row(
+                "SELECT id, plan_id, sequence, title, summary, status,
+                        implementation_chat_id, agent_team_id, agent_task_id,
+                        commit_id, merge_attempt_count, error_message,
+                        started_at, completed_at, created_at, updated_at
+                 FROM plan_phases
+                 WHERE agent_task_id = ?1",
+                params![agent_task_id.as_str()],
+                plan_phase_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))?
+        else {
+            return Ok(None);
+        };
+        phase.steps = self.plan_steps_for_phase(&phase.id)?;
+        Ok(Some(phase))
+    }
+
+    pub fn complete_plan_phase_run(
+        &mut self,
+        agent_task_id: &AgentTaskId,
+        commit_id: Option<&str>,
+    ) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
+        let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
+            return Ok(None);
+        };
+        let plan =
+            self.plan(&phase.plan_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan was not found: {}", phase.plan_id),
+                })?;
+        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+            return Ok(Some(plan));
+        }
+        let commit_id = commit_id.map(str::trim).filter(|value| !value.is_empty());
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_steps
+                 SET status = 'completed',
+                     checked_at = COALESCE(checked_at, ?3),
+                     updated_at = ?3
+                 WHERE plan_id = ?1 AND phase_id = ?2",
+                params![phase.plan_id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'completed',
+                     commit_id = ?3,
+                     error_message = NULL,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![phase.plan_id.as_str(), phase.id.as_str(), commit_id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let refreshed = self.refresh_plan_status_from_steps(&phase.plan_id)?;
+        if refreshed.status == "ready" && refreshed.pause_requested_at.is_some() {
+            self.connection
+                .execute(
+                    "UPDATE plans
+                     SET status = 'paused',
+                         active_phase_id = NULL,
+                         updated_at = ?2
+                     WHERE id = ?1",
+                    params![phase.plan_id.as_str(), now],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            return self
+                .plan(&phase.plan_id)
+                .and_then(|plan| {
+                    plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                        message: format!("plan was not found after pause: {}", phase.plan_id),
+                    })
+                })
+                .map(Some);
+        }
+        Ok(Some(refreshed))
+    }
+
+    pub fn fail_plan_phase_run(
+        &mut self,
+        agent_task_id: &AgentTaskId,
+        error_message: &str,
+    ) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
+        let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
+            return Ok(None);
+        };
+        let plan =
+            self.plan(&phase.plan_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan was not found: {}", phase.plan_id),
+                })?;
+        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+            return Ok(Some(plan));
+        }
+        let now = now_timestamp();
+        let error_message = error_message.trim();
+        self.connection
+            .execute(
+                "UPDATE plan_steps
+                 SET status = 'failed',
+                     checked_at = NULL,
+                     updated_at = ?3
+                 WHERE plan_id = ?1 AND phase_id = ?2 AND status IN ('pending', 'running')",
+                params![phase.plan_id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'failed',
+                     error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![
+                    phase.plan_id.as_str(),
+                    phase.id.as_str(),
+                    error_message,
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'failed',
+                     active_phase_id = NULL,
+                     error_message = ?2,
+                     completed_at = ?3,
+                     completed_by_user_at = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                params![phase.plan_id.as_str(), error_message, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(&phase.plan_id)
+            .and_then(|plan| {
+                plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan was not found after phase failure: {}", phase.plan_id),
+                })
+            })
+            .map(Some)
+    }
+
+    pub fn fail_plan_phase_start(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        error_message: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        let phase = plan
+            .phases
+            .iter()
+            .find(|phase| phase.id == phase_id.trim())
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase '{}' does not belong to plan '{}'",
+                    phase_id.trim(),
+                    plan.id
+                ),
+            })?;
+        let now = now_timestamp();
+        let error_message = error_message.trim();
+        self.connection
+            .execute(
+                "UPDATE plan_steps
+                 SET status = 'failed',
+                     checked_at = NULL,
+                     updated_at = ?3
+                 WHERE plan_id = ?1 AND phase_id = ?2 AND status IN ('pending', 'running')",
+                params![plan.id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'failed',
+                     error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![plan.id.as_str(), phase.id.as_str(), error_message, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'failed',
+                     active_phase_id = NULL,
+                     error_message = ?2,
+                     completed_at = ?3,
+                     completed_by_user_at = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                params![plan.id.as_str(), error_message, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(&plan.id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after phase start failure: {}", plan.id),
+            })
+    }
+
     fn start_next_plan_phase(
         &mut self,
         plan_id: &str,
@@ -1626,6 +1905,26 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    fn plan_steps_for_phase(
+        &self,
+        phase_id: &str,
+    ) -> Result<Vec<PlanStepRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, plan_id, phase_id, sequence, title, detail, acceptance_json,
+                        status, checked_at, created_at, updated_at
+                 FROM plan_steps
+                 WHERE phase_id = ?1
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![phase_id.trim()], plan_step_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
     fn plan_phases_for_plan(
         &self,
         plan_id: &str,
@@ -1647,20 +1946,7 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
         let mut phases = collect_rows(rows, &self.database_path)?;
         for phase in &mut phases {
-            let mut step_statement = self
-                .connection
-                .prepare(
-                    "SELECT id, plan_id, phase_id, sequence, title, detail, acceptance_json,
-                            status, checked_at, created_at, updated_at
-                     FROM plan_steps
-                     WHERE phase_id = ?1
-                     ORDER BY sequence ASC",
-                )
-                .map_err(|source| self.sqlite_error(source))?;
-            let rows = step_statement
-                .query_map(params![phase.id], plan_step_from_row)
-                .map_err(|source| self.sqlite_error(source))?;
-            phase.steps = collect_rows(rows, &self.database_path)?;
+            phase.steps = self.plan_steps_for_phase(&phase.id)?;
         }
 
         Ok(phases)
@@ -4213,6 +4499,32 @@ impl WorkspaceDatabase {
                 }
             })?;
         validate_agent_definition_snapshot(&snapshot_json)?;
+        match team.coordinator_execution_workspace_mode {
+            AgentExecutionWorkspaceMode::Shared => {
+                if team.coordinator_execution_root_path.is_some()
+                    || team.coordinator_worktree_base_revision.is_some()
+                    || team.coordinator_worktree_branch.is_some()
+                    || team.coordinator_worktree_status.is_some()
+                {
+                    return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                        message: "shared Coordinator must not include Agent worktree metadata"
+                            .to_string(),
+                    });
+                }
+            }
+            AgentExecutionWorkspaceMode::IsolatedWorktree => {
+                if team.coordinator_execution_root_path.is_none()
+                    || team.coordinator_worktree_base_revision.is_none()
+                    || team.coordinator_worktree_branch.is_none()
+                    || team.coordinator_worktree_status.is_none()
+                {
+                    return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                        message: "isolated Coordinator requires Agent worktree metadata"
+                            .to_string(),
+                    });
+                }
+            }
+        }
 
         let now = now_timestamp();
         let database_path = self.database_path.clone();
@@ -4241,8 +4553,9 @@ impl WorkspaceDatabase {
                     (id, team_id, definition_id, definition_revision,
                      definition_snapshot_json, role, status, next_task_sequence,
                      next_message_sequence, context_generation, execution_workspace_mode,
-                     created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'coordinator', 'idle', 0, 0, 0, 'shared', ?6, ?6)",
+                     execution_root_path, worktree_base_revision, worktree_branch,
+                     worktree_status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'coordinator', 'idle', 0, 0, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
                 params![
                     team.coordinator_instance_id.as_str(),
                     team.id.as_str(),
@@ -4254,6 +4567,11 @@ impl WorkspaceDatabase {
                         }
                     })?,
                     snapshot_json,
+                    team.coordinator_execution_workspace_mode.as_str(),
+                    team.coordinator_execution_root_path,
+                    team.coordinator_worktree_base_revision,
+                    team.coordinator_worktree_branch,
+                    team.coordinator_worktree_status,
                     now
                 ],
             )

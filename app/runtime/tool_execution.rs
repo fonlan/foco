@@ -3000,6 +3000,11 @@ mod tests {
                 chat_id: "chat-agent-tool-test",
                 coordinator_instance_id: &instance_id,
                 coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
                 max_concurrent_runs: 1,
             })
             .expect("team create");

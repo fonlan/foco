@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     convert::Infallible,
+    path::Path,
     pin::Pin,
     time::{Duration, Instant},
 };
@@ -21,6 +22,7 @@ use foco_store::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::git_backend::{create_agent_worktree, delete_agent_worktree};
 use crate::*;
 
 type BoxedChatEventStream =
@@ -304,6 +306,10 @@ pub(crate) enum QueuedChatMessageOrigin {
         run_id: String,
         trigger_reason: String,
     },
+    PlanPhase {
+        plan_id: String,
+        phase_id: String,
+    },
 }
 
 impl QueuedChatMessageOrigin {
@@ -319,6 +325,11 @@ impl QueuedChatMessageOrigin {
                 "scheduledTaskId": task_id,
                 "scheduledTaskRunId": run_id,
                 "triggerReason": trigger_reason,
+            })),
+            Self::PlanPhase { plan_id, phase_id } => Some(serde_json::json!({
+                "source": "plan_phase",
+                "planId": plan_id,
+                "phaseId": phase_id,
             })),
         }
     }
@@ -336,6 +347,7 @@ pub(crate) struct QueueChatMessageInput {
     pub(crate) defer_start: bool,
     pub(crate) attachments: Vec<ChatAttachmentInput>,
     pub(crate) agent_definition_id: Option<String>,
+    pub(crate) coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode,
     pub(crate) origin: QueuedChatMessageOrigin,
 }
 
@@ -372,6 +384,7 @@ pub(crate) async fn queue_chat_message(
             defer_start: request.defer_start,
             attachments: request.attachments,
             agent_definition_id: None,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
             origin: QueuedChatMessageOrigin::User,
         },
     )
@@ -410,6 +423,7 @@ pub(crate) async fn queue_chat_message_internal(
         defer_start,
         attachments,
         agent_definition_id,
+        coordinator_execution_workspace_mode,
         origin,
     } = input;
     let mut team = if let Some(chat_id) = chat_id.as_deref() {
@@ -548,15 +562,42 @@ pub(crate) async fn queue_chat_message_internal(
             .map_err(|error| ApiError::internal(error.to_string()))?;
         let instance_id = foco_agent::AgentInstanceId::new(unique_id("agent-instance"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
+        let coordinator_worktree = match coordinator_execution_workspace_mode {
+            foco_agent::AgentExecutionWorkspaceMode::Shared => None,
+            foco_agent::AgentExecutionWorkspaceMode::IsolatedWorktree => Some(
+                create_agent_worktree(&workspace.path, instance_id.as_str())?,
+            ),
+        };
+        let coordinator_worktree_root = coordinator_worktree
+            .as_ref()
+            .map(|worktree| display_path(&worktree.root_path));
         let (created_team, created_coordinator) = database
             .create_agent_team(foco_store::workspace::NewAgentTeam {
                 id: &team_id,
                 chat_id: &chat_id,
                 coordinator_instance_id: &instance_id,
                 coordinator_definition: &definition,
+                coordinator_execution_workspace_mode,
+                coordinator_execution_root_path: coordinator_worktree_root.as_deref(),
+                coordinator_worktree_base_revision: coordinator_worktree
+                    .as_ref()
+                    .map(|worktree| worktree.base_revision.as_str()),
+                coordinator_worktree_branch: coordinator_worktree
+                    .as_ref()
+                    .map(|worktree| worktree.branch.as_str()),
+                coordinator_worktree_status: coordinator_worktree.as_ref().map(|_| "active"),
                 max_concurrent_runs: DEFAULT_AGENT_TEAM_MAX_CONCURRENT_RUNS,
             })
-            .map_err(ApiError::from_workspace_error)?;
+            .map_err(|error| {
+                if let Some(worktree) = &coordinator_worktree {
+                    let _ = delete_agent_worktree(
+                        &workspace.path,
+                        Path::new(&worktree.root_path),
+                        true,
+                    );
+                }
+                ApiError::from_workspace_error(error)
+            })?;
         insert_agent_event(
             &mut database,
             &team_id,

@@ -293,7 +293,7 @@ pub(super) fn discard_git_file(
 pub(super) fn commit_staged_changes(
     workspace_path: &Path,
     message: String,
-) -> Result<(), ApiError> {
+) -> Result<String, ApiError> {
     let message = validate_commit_message(message)?;
     let repo = open_repo(workspace_path)?;
     let entries = status_entries_for_repo(workspace_path, &repo)?;
@@ -313,12 +313,13 @@ pub(super) fn commit_staged_changes(
         .map(|id| vec![id.detach()])
         .unwrap_or_else(|_| Vec::new());
 
-    repo.commit("HEAD", message, tree_id, parents)
-        .map_err(|source| {
-            ApiError::bad_request(format!("failed to create git commit: {source}"))
-        })?;
+    let commit_id = repo
+        .commit("HEAD", message, tree_id, parents)
+        .map_err(|source| ApiError::bad_request(format!("failed to create git commit: {source}")))?
+        .detach()
+        .to_string();
 
-    Ok(())
+    Ok(commit_id)
 }
 
 pub(super) fn create_agent_worktree(

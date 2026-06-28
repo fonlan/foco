@@ -652,6 +652,8 @@ fn scheduled_queue_input(
                 defer_start: false,
                 attachments: Vec::new(),
                 agent_definition_id,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
                 origin: QueuedChatMessageOrigin::ScheduledTask {
                     task_id: task.id.clone(),
                     run_id: run.id.clone(),

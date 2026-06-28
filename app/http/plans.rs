@@ -295,13 +295,13 @@ pub(crate) async fn plan_action(
     AxumPath((workspace_id, plan_id)): AxumPath<(String, String)>,
     Json(request): Json<PlanActionRequest>,
 ) -> Result<Json<PlanResponse>, ApiError> {
-    let config = config_snapshot(&state)?;
-    let workspace = workspace_by_id(&config, &workspace_id)?;
-    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
-    let plan = database
-        .transition_plan(&plan_id, request.action.trim())
-        .map_err(ApiError::from_workspace_error)?;
+    let plan = crate::plan_runtime::transition_plan_action(
+        &state,
+        &workspace_id,
+        &plan_id,
+        &request.action,
+    )
+    .await?;
 
     Ok(Json(PlanResponse {
         plan: plan_summary(plan),

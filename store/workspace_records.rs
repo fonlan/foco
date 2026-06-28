@@ -15,6 +15,11 @@ pub struct NewAgentTeam<'a> {
     pub chat_id: &'a str,
     pub coordinator_instance_id: &'a AgentInstanceId,
     pub coordinator_definition: &'a AgentDefinitionSettings,
+    pub coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode,
+    pub coordinator_execution_root_path: Option<&'a str>,
+    pub coordinator_worktree_base_revision: Option<&'a str>,
+    pub coordinator_worktree_branch: Option<&'a str>,
+    pub coordinator_worktree_status: Option<&'a str>,
     pub max_concurrent_runs: i64,
 }
 

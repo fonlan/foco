@@ -619,7 +619,8 @@ async fn run_coordinator_task_inner(
     )?;
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;
     persist_agent_task_context(&workspace.path, &task, &instance, attempt_id, &outcome)?;
-    finish_claimed_task(&workspace.path, &task, attempt_id, outcome)
+    finish_claimed_task(&workspace.path, &task, attempt_id, outcome)?;
+    crate::plan_runtime::sync_plan_phase_for_agent_task(state, workspace, &task.id).await
 }
 
 fn agent_task_model_selection(
