@@ -2938,6 +2938,77 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("reattaches from refreshed workspace active run when reopening cached chat", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    await userEvent.click(await screen.findByText("Second chat"));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: workspace.chats.map((chat) =>
+          chat.id === "chat-1"
+            ? {
+                ...chat,
+                activeRun: {
+                  chatId: "chat-1",
+                  lastSequence: 0,
+                  runId: "request-stream",
+                  workspaceId: "workspace-1",
+                },
+              }
+            : chat,
+        ),
+      },
+      secondaryWorkspace,
+    ];
+
+    const initialWorkspaceRequests = fetchMock.mock.calls.filter(([url]) =>
+      String(url).includes("/api/workspaces"),
+    ).length;
+    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
+    await waitFor(() => {
+      const workspaceRequests = fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/api/workspaces"),
+      ).length;
+      expect(workspaceRequests).toBeGreaterThan(initialWorkspaceRequests);
+    });
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    await userEvent.click(within(workspaceList).getByText("Tool run"));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url ===
+              "/api/workspaces/workspace-1/chat/runs/request-stream/stream?afterSequence=-1",
+        ),
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        delta: "Reattached from workspace list.",
+        type: "textDelta",
+      });
+    });
+
+    expect(await screen.findByText("Reattached from workspace list.")).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream")?.close();
+    });
+  });
+
   it("reattaches to an active run when loading chat messages", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();

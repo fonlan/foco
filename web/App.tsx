@@ -3408,6 +3408,11 @@ export function App() {
     }
 
     const chatKey = chatRunKey(workspaceId, chatId);
+    const workspaceChatActiveRun = normalizeActiveChatRunSummary(
+      workspaces
+        .find((workspace) => workspace.id === workspaceId)
+        ?.chats.find((chat) => chat.id === chatId)?.activeRun,
+    );
     for (const [loadingChatKey, controller] of loadingChatControllersRef.current) {
       if (loadingChatKey !== chatKey) {
         controller.abort();
@@ -3444,6 +3449,9 @@ export function App() {
     setIsMobileWorkspaceOpen(false);
     if (options.updateUrl !== false) {
       updateBrowserRoute({ chatId, viewMode: "chat", workspaceId });
+    }
+    if (workspaceChatActiveRun) {
+      void subscribeActiveChatRun(workspaceChatActiveRun);
     }
   }
 
@@ -5679,8 +5687,13 @@ export function App() {
 
   async function subscribeActiveChatRun(activeRun: ActiveChatRunSummary) {
     const chatKey = chatRunKey(activeRun.workspaceId, activeRun.chatId);
-    if (activeRunAbortByChatKeyRef.current.has(chatKey)) {
-      return;
+    const existingAbortController = activeRunAbortByChatKeyRef.current.get(chatKey);
+    if (existingAbortController) {
+      const existingRunId = activeRunInfoByChatKeyRef.current[chatKey]?.runId;
+      if (existingRunId === activeRun.runId) {
+        return;
+      }
+      existingAbortController.abort();
     }
 
     const abortController = new AbortController();
