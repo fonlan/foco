@@ -2000,11 +2000,23 @@ async fn agent_definitions_api_creates_default_agent_when_empty() {
             .system_prompt
             .contains("code review agent")
     );
+    assert!(default_definition.system_prompt.contains("review-focused"));
+    assert!(
+        default_definition
+            .system_prompt
+            .contains("independently inspect")
+    );
+    assert!(default_definition.system_prompt.contains("validation"));
     assert!(
         listed
             .default_role_prompts
             .get(&default_definition_id)
-            .is_some_and(|prompt| prompt.contains("Foco's default coding agent"))
+            .is_some_and(|prompt| {
+                prompt.contains("Foco's default coding agent")
+                    && prompt.contains("review-focused")
+                    && prompt.contains("independently inspect")
+                    && prompt.contains("validation")
+            })
     );
 
     let delete_default_error = match crate::http::settings::delete_agent_definition(
