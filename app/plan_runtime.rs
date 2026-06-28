@@ -259,6 +259,7 @@ async fn dispatch_plan_merge(
         &workspace.id,
         QueueChatMessageInput {
             chat_id: None,
+            chat_title_override: None,
             model_id: selection.model_id,
             provider_id: Some(selection.provider_id),
             thinking_level: selection.thinking_level,
@@ -368,6 +369,7 @@ async fn dispatch_plan_phase(
         workspace_id,
         QueueChatMessageInput {
             chat_id: None,
+            chat_title_override: Some(plan_phase_chat_title(&plan.title, &phase.title)),
             model_id: selection.model_id,
             provider_id: Some(selection.provider_id),
             thinking_level: selection.thinking_level,
@@ -735,6 +737,10 @@ fn model_outputs_text(model: &ModelSettings) -> bool {
             .any(|modality| modality == "text")
 }
 
+fn plan_phase_chat_title(plan_title: &str, phase_title: &str) -> String {
+    format!("{plan_title} - {phase_title}")
+}
+
 fn plan_phase_prompt(plan: &PlanRecord, phase: &PlanPhaseRecord) -> String {
     let mut message = format!(
         "Implement this plan phase in the plan's isolated worktree. Do not create a git commit; Foco will commit this phase in the worktree after the phase completes, and later phases will continue from that commit. Foco merges the worktree back to the shared workspace only after all phases complete.\n\nPlan: {}\n\nOverview:\n{}\n\nPhase {}: {}\n\n{}",
@@ -936,6 +942,14 @@ fn agent_task_error_message(task: &AgentTaskRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_phase_chat_title_uses_plan_and_phase_titles() {
+        assert_eq!(
+            plan_phase_chat_title("Build plan runner UI", "Wire start action"),
+            "Build plan runner UI - Wire start action"
+        );
+    }
 
     fn task_with_input(input_json: &str) -> AgentTaskRecord {
         AgentTaskRecord {

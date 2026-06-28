@@ -346,6 +346,7 @@ impl QueuedChatMessageOrigin {
 
 pub(crate) struct QueueChatMessageInput {
     pub(crate) chat_id: Option<String>,
+    pub(crate) chat_title_override: Option<String>,
     pub(crate) model_id: String,
     pub(crate) provider_id: Option<String>,
     pub(crate) thinking_level: Option<String>,
@@ -385,6 +386,7 @@ pub(crate) async fn queue_chat_message(
         &workspace_id,
         QueueChatMessageInput {
             chat_id: request.chat_id,
+            chat_title_override: None,
             model_id: request.model_id,
             provider_id: request.provider_id,
             thinking_level: request.thinking_level,
@@ -426,6 +428,7 @@ pub(crate) async fn queue_chat_message_internal(
     let workspace = workspace_by_id(&config, workspace_id)?;
     let QueueChatMessageInput {
         chat_id,
+        chat_title_override,
         model_id,
         provider_id,
         thinking_level,
@@ -533,7 +536,12 @@ pub(crate) async fn queue_chat_message_internal(
             .chat_id
             .clone()
             .ok_or_else(|| ApiError::internal("new chat is missing preallocated id"))?;
-        let title = chat_title_for_prompt(raw_message, &prompt_context.attachments);
+        let title = chat_title_override
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| chat_title_for_prompt(raw_message, &prompt_context.attachments));
         let chat_metadata_json = queued_chat_metadata_json(
             &user_message_id,
             &assistant_message_id,

@@ -642,6 +642,7 @@ fn scheduled_queue_input(
 
             Ok(QueueChatMessageInput {
                 chat_id,
+                chat_title_override: None,
                 model_id,
                 provider_id,
                 thinking_level,

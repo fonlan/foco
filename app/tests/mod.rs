@@ -5376,6 +5376,7 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
         &workspace_id,
         crate::http::chat::QueueChatMessageInput {
             chat_id: None,
+            chat_title_override: None,
             model_id: "model".to_string(),
             provider_id: Some("provider".to_string()),
             thinking_level: None,
