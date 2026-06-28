@@ -235,6 +235,55 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("renders a plan mode badge only on plan user messages", async () => {
+    const planModeMessages = {
+      ...chatMessages,
+      messages: [
+        {
+          ...chatMessages.messages[0],
+          content: "Use plan mode for this request.",
+          id: "message-user-plan",
+          parts: [{ text: "Use plan mode for this request.", type: "text" }],
+          sessionMode: "plan",
+        },
+        {
+          ...chatMessages.messages[0],
+          content: "Use normal mode for this request.",
+          createdAt: "2026-06-10T08:00:01.000Z",
+          id: "message-user-normal",
+          parts: [{ text: "Use normal mode for this request.", type: "text" }],
+        },
+      ],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...planModeMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    const planBubble = (await screen.findByText("Use plan mode for this request."))
+      .closest(".message-bubble") as HTMLElement | null;
+    const normalBubble = screen
+      .getByText("Use normal mode for this request.")
+      .closest(".message-bubble") as HTMLElement | null;
+
+    if (!planBubble || !normalBubble) {
+      throw new Error("Expected user message bubbles");
+    }
+    expect(within(planBubble).getByText("Plan mode")).toHaveClass("message-run-badge");
+    expect(within(normalBubble).queryByText("Plan mode")).not.toBeInTheDocument();
+  });
+
   it("keeps the thinking duration visible when reply latency is unavailable", async () => {
     const messagesWithUnknownThinkingDuration = {
       ...chatMessages,
