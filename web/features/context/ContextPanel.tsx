@@ -6,6 +6,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ClipboardList,
   Eye,
   EyeOff,
   Files,
@@ -208,7 +209,7 @@ const ContextPanel = memo(function ContextPanel({
   const { t } = useI18n();
   const tabs: { id: ContextPanelTab; label: string; icon: LucideIcon }[] = [
     { id: "todo", label: "ToDo", icon: ListChecks },
-    { id: "plan", label: "Plan", icon: ScrollText },
+    { id: "plan", label: "Plan", icon: ClipboardList },
     { id: "files", label: "Files", icon: Files },
     { id: "git", label: "Git", icon: GitCompare },
     { id: "agents", label: "Agents", icon: Bot },
