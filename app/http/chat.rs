@@ -84,6 +84,7 @@ pub(crate) struct QueueChatMessageResponse {
     pub(crate) assistant_message_id: String,
     pub(crate) content: String,
     pub(crate) parts: Vec<ChatMessagePart>,
+    pub(crate) session_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) agent_team_id: Option<foco_agent::AgentTeamId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -372,6 +373,7 @@ pub(crate) struct QueuedChatMessageArtifacts {
     pub(crate) assistant_message_id: String,
     pub(crate) content: String,
     pub(crate) parts: Vec<ChatMessagePart>,
+    pub(crate) session_mode: Option<String>,
     pub(crate) agent_team_id: Option<foco_agent::AgentTeamId>,
     pub(crate) agent_task_id: Option<foco_agent::AgentTaskId>,
 }
@@ -414,6 +416,7 @@ pub(crate) async fn queue_chat_message(
         assistant_message_id: queued.assistant_message_id,
         content: queued.content,
         parts: queued.parts,
+        session_mode: queued.session_mode,
         agent_team_id: queued.agent_team_id,
         agent_task_id: queued.agent_task_id,
     }))
@@ -727,6 +730,7 @@ pub(crate) async fn queue_chat_message_internal(
         assistant_message_id,
         content: message.to_string(),
         parts: user_message_response_parts(message, &prompt_context.attachments),
+        session_mode: requested_session_mode,
         agent_team_id,
         agent_task_id,
     })

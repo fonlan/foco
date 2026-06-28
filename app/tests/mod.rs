@@ -6418,6 +6418,26 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
 }
 
 #[test]
+fn queued_user_message_metadata_writes_top_level_session_mode() {
+    let metadata_json = queued_user_message_metadata_json(
+        &[],
+        "assistant-1",
+        1,
+        "gpt-5.4",
+        Some("openai-responses"),
+        None,
+        &[],
+        Some("plan"),
+        None,
+    )
+    .expect("queued user metadata json");
+    let metadata = parse_json_value(&metadata_json, "message metadata").expect("metadata json");
+
+    assert_eq!(metadata["sessionMode"], "plan");
+    assert_eq!(metadata["queuedRun"]["sessionMode"], "plan");
+}
+
+#[test]
 fn persist_chat_result_clears_completed_queued_run_metadata() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-queued-run-clear-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -6428,7 +6448,7 @@ fn persist_chat_result_clears_completed_queued_run_metadata() {
             .insert_chat_with_metadata(
                 "chat-1",
                 "Queued chat",
-                r#"{"queuedRun":{"status":"running","userMessageId":"user-1","assistantMessageId":"assistant-1","modelId":"gpt-5.4","providerId":"openai-responses","content":"Hello"}}"#,
+                r#"{"queuedRun":{"status":"running","userMessageId":"user-1","assistantMessageId":"assistant-1","modelId":"gpt-5.4","providerId":"openai-responses","sessionMode":"plan","content":"Hello"}}"#,
             )
             .expect("chat insert");
         database
@@ -6439,7 +6459,7 @@ fn persist_chat_result_clears_completed_queued_run_metadata() {
                 content: "Hello",
                 sequence: 0,
                 metadata_json: Some(
-                    r#"{"queuedRun":{"status":"running","assistantMessageId":"assistant-1","modelId":"gpt-5.4","providerId":"openai-responses"}}"#,
+                    r#"{"sessionMode":"plan","queuedRun":{"status":"running","assistantMessageId":"assistant-1","modelId":"gpt-5.4","providerId":"openai-responses","sessionMode":"plan"}}"#,
                 ),
             })
             .expect("message insert");
@@ -6480,7 +6500,8 @@ fn persist_chat_result_clears_completed_queued_run_metadata() {
     )
     .expect("persist chat result");
 
-    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let chat_metadata = parse_json_value(
         &database
             .chat("chat-1")
@@ -6502,6 +6523,19 @@ fn persist_chat_result_clears_completed_queued_run_metadata() {
 
     assert!(chat_metadata.get("queuedRun").is_none());
     assert!(message_metadata.get("queuedRun").is_none());
+    assert_eq!(message_metadata["sessionMode"], "plan");
+
+    let messages = database
+        .messages_for_chat("chat-1")
+        .expect("messages for chat");
+    let summaries = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries");
+    let user_summary = summaries
+        .iter()
+        .find(|message| message.id == "user-1")
+        .expect("user message summary");
+    assert_eq!(user_summary.session_mode.as_deref(), Some("plan"));
+    assert!(user_summary.queued_run.is_none());
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");

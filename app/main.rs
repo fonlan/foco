@@ -1584,6 +1584,7 @@ struct ChatMessageSummary {
     content: String,
     created_at: String,
     reasoning: Option<String>,
+    session_mode: Option<String>,
     pending_mode: Option<String>,
     queued_run: Option<QueuedMessageRunSummary>,
     tool_calls: Vec<ChatToolCallSummary>,
@@ -7890,6 +7891,9 @@ fn queued_user_message_metadata_json(
             "user message metadata must be an object",
         ));
     };
+    if let Some(session_mode) = session_mode {
+        metadata_object.insert("sessionMode".to_string(), json!(session_mode));
+    }
     metadata_object.insert(
         "queuedRun".to_string(),
         json!({
@@ -9165,6 +9169,11 @@ fn chat_message_summaries_for_chat(
         let pending_mode = queued_run
             .as_ref()
             .and_then(|queued_run| (queued_run.status == "queued").then(|| "queued".to_string()));
+        let session_mode = if is_user_message {
+            user_message_session_mode(&message.metadata_json, queued_run.as_ref())?
+        } else {
+            None
+        };
         let metrics = metrics_by_message.remove(&message.id);
         let extracted_memories = extracted_memories_by_message
             .remove(&message.id)
@@ -9181,6 +9190,7 @@ fn chat_message_summaries_for_chat(
             content: message.content,
             created_at: message.created_at,
             reasoning,
+            session_mode,
             pending_mode,
             queued_run,
             tool_calls,
@@ -9537,6 +9547,16 @@ fn queued_run_summary_from_message_metadata(
         assistant_message_id,
         assistant_sequence,
     }))
+}
+
+fn user_message_session_mode(
+    metadata_json: &str,
+    queued_run: Option<&QueuedMessageRunSummary>,
+) -> Result<Option<String>, ApiError> {
+    let metadata = parse_json_value(metadata_json, "user message metadata")?;
+    Ok(string_json_field(&metadata, "sessionMode", "session_mode")
+        .map(str::to_string)
+        .or_else(|| queued_run.and_then(|queued_run| queued_run.session_mode.clone())))
 }
 
 #[cfg(test)]

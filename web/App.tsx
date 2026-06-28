@@ -5044,6 +5044,7 @@ export function App() {
           reasoning: null,
           pendingMode: "queued",
           queuedRun: null,
+          sessionMode: queued.sessionMode ?? request.sessionMode,
           toolCalls: [],
           parts: queued.parts,
           metrics: null,
@@ -5132,6 +5133,7 @@ export function App() {
           createdAt: queued.createdAt,
           reasoning: null,
           pendingMode: "queued",
+          sessionMode: queued.sessionMode ?? request.sessionMode,
           toolCalls: [],
           parts: queued.parts,
           metrics: null,
@@ -6490,6 +6492,7 @@ export function App() {
                 ...message,
                 content: visibleUserContent,
                 pendingMode: undefined,
+                sessionMode: request.sessionMode,
                 parts: localUserParts,
               }
               : message,
@@ -6507,6 +6510,7 @@ export function App() {
           content: visibleUserContent,
           createdAt: localCreatedAt,
           reasoning: null,
+          sessionMode: request.sessionMode,
           toolCalls: [],
           parts: localUserParts,
           metrics: null,
@@ -12574,6 +12578,9 @@ function normalizeChatMessageSummary(
     message.pendingMode === "queued" || message.pendingMode === "guidance"
       ? message.pendingMode
       : undefined;
+  const rawSessionMode = fieldValue(message, "sessionMode", "session_mode");
+  const sessionMode: "plan" | undefined =
+    rawSessionMode === "plan" ? "plan" : undefined;
   const queuedRun = normalizeQueuedMessageRunSummary(message.queuedRun);
   const normalizedMessage = {
     ...message,
@@ -12583,6 +12590,7 @@ function normalizeChatMessageSummary(
     pendingMode,
     queuedRun,
     runBadges: [],
+    sessionMode,
     specUpdates,
     toolCalls,
     parts,

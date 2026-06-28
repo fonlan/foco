@@ -401,6 +401,7 @@ export type ChatMessageSummary = {
   content: string;
   createdAt: string;
   reasoning: string | null;
+  sessionMode?: "plan" | null;
   pendingMode?: "guidance" | "queued";
   queuedRun?: QueuedMessageRunSummary | null;
   toolCalls: ChatToolCallSummary[];
@@ -427,6 +428,7 @@ export type QueueChatMessageResponse = {
   assistantMessageId: string;
   content: string;
   parts: ChatMessagePart[];
+  sessionMode?: "plan" | null;
   agentTeamId?: string;
   agentTaskId?: string;
 };
@@ -1855,6 +1857,7 @@ export type ShellMessage = {
   createdAt: string;
   reasoning: string | null;
   status?: "error" | "streaming";
+  sessionMode?: "plan" | null;
   pendingMode?: "guidance" | "queued";
   queuedRun?: QueuedMessageRunSummary | null;
   toolCalls: ChatToolCallSummary[];
