@@ -32,6 +32,46 @@ import {
   type Deferred,
 } from "./test-utils/app-test-harness";
 
+function activePlan(id: string, title: string) {
+  const timestamp = "2026-06-28T09:00:00Z";
+  const phase = {
+    agentTaskId: null,
+    agentTeamId: null,
+    commitId: null,
+    completedAt: null,
+    createdAt: timestamp,
+    errorMessage: null,
+    id: `${id}-phase-1`,
+    implementationChatId: null,
+    mergeAttemptCount: 0,
+    planId: id,
+    sequence: 0,
+    startedAt: null,
+    status: "pending",
+    steps: [],
+    summary: "Refresh active plans.",
+    title: "Phase 1",
+    updatedAt: timestamp,
+  };
+
+  return {
+    activePhaseId: null,
+    completedAt: null,
+    completedByUserAt: null,
+    createdAt: timestamp,
+    errorMessage: null,
+    id,
+    overview: "Refresh the plan panel.",
+    pauseRequestedAt: null,
+    phases: [phase],
+    sortOrder: 0,
+    sourceChatId: "chat-1",
+    status: "ready",
+    title,
+    updatedAt: timestamp,
+  };
+}
+
 describe("app-chat-stream verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
@@ -526,6 +566,119 @@ describe("app-chat-stream verification surfaces", () => {
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("opens and reloads active plans after a plan refresh side event", async () => {
+    let activePlanRequests = 0;
+    const refreshedPlan = activePlan("plan-refresh-1", "Refresh-visible plan");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        activePlanRequests += 1;
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [refreshedPlan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        type: "plan_refresh",
+        workspace_id: "workspace-1",
+      });
+    });
+
+    expect(await screen.findByRole("tab", { name: "Plan" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(await screen.findByText("Refresh-visible plan")).toBeInTheDocument();
+    expect(activePlanRequests).toBeGreaterThanOrEqual(1);
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("opens and reloads active plans after a running chat plan refresh event", async () => {
+    let activePlanRequests = 0;
+    const refreshedPlan = activePlan("plan-refresh-running", "Running-refresh plan");
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({
+          ...chatMessages,
+          activeRun: {
+            chatId: "chat-1",
+            lastSequence: 0,
+            runId: "request-stream",
+            workspaceId: "workspace-1",
+          },
+        });
+      }
+
+      if (path === "/api/workspaces/workspace-1/plans") {
+        activePlanRequests += 1;
+        return jsonResponse({
+          page: 1,
+          pageSize: 50,
+          plans: [refreshedPlan],
+          totalCount: 1,
+          totalPages: 1,
+        });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await waitFor(() =>
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+    );
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        type: "planRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
+
+    expect(await screen.findByRole("tab", { name: "Plan" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(await screen.findByText("Running-refresh plan")).toBeInTheDocument();
+    expect(activePlanRequests).toBeGreaterThanOrEqual(1);
+
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream")?.close();
     });
   });
 

@@ -1501,6 +1501,19 @@ export function App() {
     }
   }, []);
 
+  const handlePlanRefresh = useCallback(
+    (event: Extract<ChatStreamEvent, { type: "planRefresh" }>) => {
+      if (activeWorkspaceIdRef.current !== event.workspaceId) {
+        return;
+      }
+
+      setContextPanelTab("plan");
+      setIsContextPanelOpen(true);
+      void loadActivePlans(event.workspaceId);
+    },
+    [loadActivePlans],
+  );
+
   const runPlanAction = useCallback(
     async (workspaceId: string, planId: string, action: string) => {
       const operationKey = `${action}:${planId}`;
@@ -6222,6 +6235,11 @@ export function App() {
           return;
         }
 
+        if (streamEvent.type === "planRefresh") {
+          handlePlanRefresh(streamEvent);
+          return;
+        }
+
         if (streamEvent.type === "agentTeamRefresh") {
           handleAgentTeamRefresh(streamEvent);
           return;
@@ -7181,6 +7199,11 @@ export function App() {
               ignoreRequestInvalidation: true,
             });
           }
+          return;
+        }
+
+        if (streamEvent.type === "planRefresh") {
+          handlePlanRefresh(streamEvent);
           return;
         }
 
@@ -12048,6 +12071,16 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     }
 
     return { type: "todoGraphRefresh", workspaceId, chatId };
+  }
+
+  if (value.type === "planRefresh" || value.type === "plan_refresh") {
+    const workspaceId = stringField(value, "workspaceId", "workspace_id");
+
+    if (!workspaceId) {
+      return null;
+    }
+
+    return { type: "planRefresh", workspaceId };
   }
 
   if (

@@ -566,6 +566,10 @@ export type ChatStreamEvent =
     chatId: string;
   }
   | {
+    type: "planRefresh";
+    workspaceId: string;
+  }
+  | {
     type: "agentTeamRefresh";
     workspaceId: string;
     chatId: string;
