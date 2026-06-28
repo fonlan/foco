@@ -310,6 +310,10 @@ pub(crate) enum QueuedChatMessageOrigin {
         plan_id: String,
         phase_id: String,
     },
+    PlanMerge {
+        plan_id: String,
+        phase_id: String,
+    },
 }
 
 impl QueuedChatMessageOrigin {
@@ -331,6 +335,11 @@ impl QueuedChatMessageOrigin {
                 "planId": plan_id,
                 "phaseId": phase_id,
             })),
+            Self::PlanMerge { plan_id, phase_id } => Some(serde_json::json!({
+                "source": "plan_merge",
+                "planId": plan_id,
+                "phaseId": phase_id,
+            })),
         }
     }
 }
@@ -348,6 +357,7 @@ pub(crate) struct QueueChatMessageInput {
     pub(crate) attachments: Vec<ChatAttachmentInput>,
     pub(crate) agent_definition_id: Option<String>,
     pub(crate) coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode,
+    pub(crate) correlation_id: Option<String>,
     pub(crate) origin: QueuedChatMessageOrigin,
 }
 
@@ -385,6 +395,7 @@ pub(crate) async fn queue_chat_message(
             attachments: request.attachments,
             agent_definition_id: None,
             coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            correlation_id: None,
             origin: QueuedChatMessageOrigin::User,
         },
     )
@@ -424,6 +435,7 @@ pub(crate) async fn queue_chat_message_internal(
         attachments,
         agent_definition_id,
         coordinator_execution_workspace_mode,
+        correlation_id,
         origin,
     } = input;
     let mut team = if let Some(chat_id) = chat_id.as_deref() {
@@ -629,7 +641,7 @@ pub(crate) async fn queue_chat_message_internal(
             collaboration_tools_enabled: team_mode_enabled,
             defer_until_workspace_idle: defer_start,
             delegated_input: None,
-            correlation_id: None,
+            correlation_id,
         })
         .map_err(|source| {
             ApiError::internal(format!("failed to serialize Coordinator task: {source}"))

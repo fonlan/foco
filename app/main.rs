@@ -1531,11 +1531,11 @@ pub(crate) struct GitStatusFileSummary {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GitDiffResponse {
-    path: Option<String>,
-    status: String,
-    diff: String,
+    pub(crate) path: Option<String>,
+    pub(crate) status: String,
+    pub(crate) diff: String,
     pub(crate) staged_diff: String,
-    files: Vec<GitStatusFileSummary>,
+    pub(crate) files: Vec<GitStatusFileSummary>,
     pub(crate) staged_files: Vec<GitStatusFileSummary>,
 }
 

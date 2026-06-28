@@ -507,6 +507,63 @@ fn plan_phase_run_completion_advances_until_pause() {
 }
 
 #[test]
+fn plan_phase_merge_attempt_can_begin_once() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-merge-once",
+            title: "Plan merge once",
+            overview: "Only one automated merge retry is allowed.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-merge-once-phase",
+                title: "Phase one",
+                summary: "Needs merge automation.",
+                steps: vec![NewPlanStep {
+                    id: "plan-merge-once-step",
+                    title: "Do work",
+                    detail: "Complete the change.",
+                    acceptance: vec!["merge retry recorded".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    assert!(
+        database
+            .try_begin_plan_phase_merge_attempt(
+                "plan-merge-once",
+                "plan-merge-once-phase",
+                "first merge failure",
+            )
+            .expect("first merge attempt")
+    );
+    assert!(
+        !database
+            .try_begin_plan_phase_merge_attempt(
+                "plan-merge-once",
+                "plan-merge-once-phase",
+                "second merge failure",
+            )
+            .expect("second merge attempt")
+    );
+
+    let plan = database
+        .plan("plan-merge-once")
+        .expect("plan lookup")
+        .expect("plan");
+    assert_eq!(plan.phases[0].merge_attempt_count, 1);
+    assert_eq!(
+        plan.phases[0].error_message.as_deref(),
+        Some("first merge failure")
+    );
+}
+
+#[test]
 fn workspace_spec_jobs_redact_audit_json_fields() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

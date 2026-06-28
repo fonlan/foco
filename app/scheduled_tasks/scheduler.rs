@@ -654,6 +654,7 @@ fn scheduled_queue_input(
                 agent_definition_id,
                 coordinator_execution_workspace_mode:
                     foco_agent::AgentExecutionWorkspaceMode::Shared,
+                correlation_id: None,
                 origin: QueuedChatMessageOrigin::ScheduledTask {
                     task_id: task.id.clone(),
                     run_id: run.id.clone(),

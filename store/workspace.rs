@@ -1430,6 +1430,28 @@ impl WorkspaceDatabase {
         Ok(Some(phase))
     }
 
+    fn plan_phase_for_plan(
+        &self,
+        plan_id: &str,
+        phase_id: &str,
+    ) -> Result<PlanPhaseRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        plan.phases
+            .into_iter()
+            .find(|phase| phase.id == phase_id.trim())
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase '{}' does not belong to plan '{}'",
+                    phase_id.trim(),
+                    plan.id
+                ),
+            })
+    }
+
     pub fn complete_plan_phase_run(
         &mut self,
         agent_task_id: &AgentTaskId,
@@ -1438,13 +1460,31 @@ impl WorkspaceDatabase {
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
+        self.complete_plan_phase_record(phase, commit_id).map(Some)
+    }
+
+    pub fn complete_plan_phase_by_id(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        commit_id: Option<&str>,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
+        self.complete_plan_phase_record(phase, commit_id)
+    }
+
+    fn complete_plan_phase_record(
+        &mut self,
+        phase: PlanPhaseRecord,
+        commit_id: Option<&str>,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
         let plan =
             self.plan(&phase.plan_id)?
                 .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                     message: format!("plan was not found: {}", phase.plan_id),
                 })?;
         if matches!(plan.status.as_str(), "completed" | "cancelled") {
-            return Ok(Some(plan));
+            return Ok(plan);
         }
         let commit_id = commit_id.map(str::trim).filter(|value| !value.is_empty());
         let now = now_timestamp();
@@ -1489,9 +1529,9 @@ impl WorkspaceDatabase {
                         message: format!("plan was not found after pause: {}", phase.plan_id),
                     })
                 })
-                .map(Some);
+                .map(|plan| plan);
         }
-        Ok(Some(refreshed))
+        Ok(refreshed)
     }
 
     pub fn fail_plan_phase_run(
@@ -1502,13 +1542,31 @@ impl WorkspaceDatabase {
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
+        self.fail_plan_phase_record(phase, error_message).map(Some)
+    }
+
+    pub fn fail_plan_phase_by_id(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        error_message: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
+        self.fail_plan_phase_record(phase, error_message)
+    }
+
+    fn fail_plan_phase_record(
+        &mut self,
+        phase: PlanPhaseRecord,
+        error_message: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
         let plan =
             self.plan(&phase.plan_id)?
                 .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                     message: format!("plan was not found: {}", phase.plan_id),
                 })?;
         if matches!(plan.status.as_str(), "completed" | "cancelled") {
-            return Ok(Some(plan));
+            return Ok(plan);
         }
         let now = now_timestamp();
         let error_message = error_message.trim();
@@ -1551,13 +1609,38 @@ impl WorkspaceDatabase {
                 params![phase.plan_id.as_str(), error_message, now],
             )
             .map_err(|source| self.sqlite_error(source))?;
-        self.plan(&phase.plan_id)
-            .and_then(|plan| {
-                plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
-                    message: format!("plan was not found after phase failure: {}", phase.plan_id),
-                })
+        self.plan(&phase.plan_id).and_then(|plan| {
+            plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after phase failure: {}", phase.plan_id),
             })
-            .map(Some)
+        })
+    }
+
+    pub fn try_begin_plan_phase_merge_attempt(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        error_message: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
+        let now = now_timestamp();
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE plan_phases
+                 SET merge_attempt_count = merge_attempt_count + 1,
+                     error_message = ?3,
+                     updated_at = ?4
+                 WHERE plan_id = ?1 AND id = ?2 AND merge_attempt_count = 0",
+                params![
+                    phase.plan_id.as_str(),
+                    phase.id.as_str(),
+                    error_message.trim(),
+                    now
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(updated == 1)
     }
 
     pub fn fail_plan_phase_start(
@@ -1566,62 +1649,7 @@ impl WorkspaceDatabase {
         phase_id: &str,
         error_message: &str,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
-        let plan = self
-            .plan(plan_id)?
-            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan was not found: {}", plan_id.trim()),
-            })?;
-        let phase = plan
-            .phases
-            .iter()
-            .find(|phase| phase.id == phase_id.trim())
-            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
-                message: format!(
-                    "plan phase '{}' does not belong to plan '{}'",
-                    phase_id.trim(),
-                    plan.id
-                ),
-            })?;
-        let now = now_timestamp();
-        let error_message = error_message.trim();
-        self.connection
-            .execute(
-                "UPDATE plan_steps
-                 SET status = 'failed',
-                     checked_at = NULL,
-                     updated_at = ?3
-                 WHERE plan_id = ?1 AND phase_id = ?2 AND status IN ('pending', 'running')",
-                params![plan.id.as_str(), phase.id.as_str(), now],
-            )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
-            .execute(
-                "UPDATE plan_phases
-                 SET status = 'failed',
-                     error_message = ?3,
-                     completed_at = COALESCE(completed_at, ?4),
-                     updated_at = ?4
-                 WHERE plan_id = ?1 AND id = ?2",
-                params![plan.id.as_str(), phase.id.as_str(), error_message, now],
-            )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
-            .execute(
-                "UPDATE plans
-                 SET status = 'failed',
-                     active_phase_id = NULL,
-                     error_message = ?2,
-                     completed_at = ?3,
-                     completed_by_user_at = NULL,
-                     updated_at = ?3
-                 WHERE id = ?1",
-                params![plan.id.as_str(), error_message, now],
-            )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.plan(&plan.id)?
-            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan was not found after phase start failure: {}", plan.id),
-            })
+        self.fail_plan_phase_by_id(plan_id, phase_id, error_message)
     }
 
     fn start_next_plan_phase(
