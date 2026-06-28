@@ -115,14 +115,10 @@ pub(crate) async fn prepare_prompt_context(
     }
 
     let provider_config = provider_connection_config(provider)?;
-    let mcp_tools = if plan_mode {
-        Vec::new()
-    } else {
-        sync_mcp_workspace(&state.mcp_registry, workspace, config)
-            .await
-            .map_err(ApiError::from_mcp_error)?;
-        state.mcp_registry.tool_definitions(&workspace.id).await
-    };
+    sync_mcp_workspace(&state.mcp_registry, workspace, config)
+        .await
+        .map_err(ApiError::from_mcp_error)?;
+    let mcp_tools = state.mcp_registry.tool_definitions(&workspace.id).await;
     let database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
     let requested_chat_id = optional_trimmed_string(request.chat_id);

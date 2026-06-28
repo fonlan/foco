@@ -49,4 +49,5 @@ resvg.workspace = true
 winresource.workspace = true
 
 [dev-dependencies]
+foco-mcp = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
