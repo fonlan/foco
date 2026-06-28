@@ -432,6 +432,79 @@ describe("app-panels-stats verification surfaces", () => {
       title: "Merged implementation plan",
       updatedAt: timestamp,
     };
+    const statusColorPlans = [
+      {
+        ...implementedPlan,
+        completedByUserAt: timestamp,
+        id: "plan-color-completed",
+        phases: [
+          {
+            ...implementedPlan.phases[0],
+            id: "plan-phase-color-completed",
+            planId: "plan-color-completed",
+            status: "completed",
+            steps: [],
+            title: "Completed color phase",
+          },
+        ],
+        status: "completed",
+        title: "Completed status colors",
+      },
+      {
+        ...implementedPlan,
+        completedAt: null,
+        id: "plan-color-failed",
+        phases: [
+          {
+            ...implementedPlan.phases[0],
+            completedAt: null,
+            id: "plan-phase-color-failed",
+            planId: "plan-color-failed",
+            status: "failed",
+            steps: [],
+            title: "Failed color phase",
+          },
+        ],
+        status: "failed",
+        title: "Failed status colors",
+      },
+      {
+        ...implementedPlan,
+        completedAt: null,
+        id: "plan-color-cancelled",
+        phases: [
+          {
+            ...implementedPlan.phases[0],
+            completedAt: null,
+            id: "plan-phase-color-cancelled",
+            planId: "plan-color-cancelled",
+            status: "cancelled",
+            steps: [],
+            title: "Cancelled color phase",
+          },
+        ],
+        status: "cancelled",
+        title: "Cancelled status colors",
+      },
+      {
+        ...implementedPlan,
+        completedAt: null,
+        id: "plan-color-ready",
+        phases: [
+          {
+            ...implementedPlan.phases[0],
+            completedAt: null,
+            id: "plan-phase-color-ready",
+            planId: "plan-color-ready",
+            status: "ready",
+            steps: [],
+            title: "Ready color phase",
+          },
+        ],
+        status: "ready",
+        title: "Ready status colors",
+      },
+    ];
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       const path = url.startsWith("http://127.0.0.1")
@@ -442,8 +515,8 @@ describe("app-panels-stats verification surfaces", () => {
         return jsonResponse({
           page: 1,
           pageSize: 50,
-          plans: [implementedPlan],
-          totalCount: 1,
+          plans: [implementedPlan, ...statusColorPlans],
+          totalCount: 5,
           totalPages: 1,
         });
       }
@@ -462,6 +535,42 @@ describe("app-panels-stats verification surfaces", () => {
       "title",
       "Merged into shared workspace",
     );
+
+    function expectPlanStatusTone(
+      planTitle: string,
+      status: string,
+      classes: string[],
+    ) {
+      const planCard = screen.getByText(planTitle).closest("article");
+      if (!planCard) {
+        throw new Error(`Expected plan card for ${planTitle}`);
+      }
+
+      for (const statusPill of within(planCard).getAllByText(status)) {
+        expect(statusPill).toHaveClass(...classes);
+      }
+    }
+
+    expectPlanStatusTone("Merged implementation plan", "Implemented", [
+      "bg-emerald-100",
+      "text-emerald-800",
+    ]);
+    expectPlanStatusTone("Completed status colors", "Completed", [
+      "bg-emerald-100",
+      "text-emerald-800",
+    ]);
+    expectPlanStatusTone("Failed status colors", "Failed", [
+      "bg-rose-100",
+      "text-rose-700",
+    ]);
+    expectPlanStatusTone("Cancelled status colors", "Cancelled", [
+      "bg-stone-100",
+      "text-stone-600",
+    ]);
+    expectPlanStatusTone("Ready status colors", "Ready", [
+      "bg-amber-100",
+      "text-amber-800",
+    ]);
   });
 
   async function openSpecPanel() {

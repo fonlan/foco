@@ -2205,15 +2205,12 @@ function planPhaseStatusLabel(status: string) {
 function planStatusClass(status: PlanStatus) {
   const base = "inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold";
   if (status === "implemented" || status === "completed") {
-    return `${base} bg-teal-100 text-teal-800`;
+    return `${base} bg-emerald-100 text-emerald-800`;
   }
-  if (status === "running") {
+  if (status === "ready" || status === "running") {
     return `${base} bg-amber-100 text-amber-800`;
   }
-  if (status === "paused" || status === "draft" || status === "ready") {
-    return `${base} bg-sky-100 text-sky-700`;
-  }
-  if (status === "failed" || status === "cancelled") {
+  if (status === "failed") {
     return `${base} bg-rose-100 text-rose-700`;
   }
   return `${base} bg-stone-100 text-stone-600`;
@@ -2222,12 +2219,12 @@ function planStatusClass(status: PlanStatus) {
 function planPhaseStatusClass(status: string) {
   const base = "inline-flex shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-semibold";
   if (status === "completed" || status === "implemented") {
-    return `${base} bg-teal-100 text-teal-800`;
+    return `${base} bg-emerald-100 text-emerald-800`;
   }
-  if (status === "running") {
+  if (status === "ready" || status === "running") {
     return `${base} bg-amber-100 text-amber-800`;
   }
-  if (status === "failed" || status === "cancelled") {
+  if (status === "failed") {
     return `${base} bg-rose-100 text-rose-700`;
   }
   return `${base} bg-stone-100 text-stone-600`;
