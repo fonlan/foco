@@ -48,6 +48,12 @@ pub const AGENT_DEFINITION_MAX_INSTANCES: u32 = 32;
 pub const AGENT_DEFINITION_MAX_ALLOWED_TOOLS: usize = 128;
 pub const AGENT_DEFINITION_MAX_ALLOWED_DEFINITIONS: usize = 64;
 pub const SPEC_SYSTEM_PROMPT_MAX_CHARS: usize = 32_000;
+pub const PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE: &str = "isolated_auto_once";
+pub const PLAN_MERGE_AUTOMATION_DIRECT_AUTO: &str = "direct_auto";
+pub const SUPPORTED_PLAN_MERGE_AUTOMATION_MODES: &[&str] = &[
+    PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
+    PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
+];
 pub const SUPPORTED_AGENT_THINKING_LEVELS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 pub const FOCO_CONFIG_DIR_ENV: &str = "FOCO_CONFIG_DIR";
 pub const WORKSPACE_HOOK_CONFIG_FILE: &str = "hooks.json";
@@ -307,6 +313,8 @@ pub struct GlobalConfig {
     pub web_search: WebSearchSettings,
     #[serde(default)]
     pub spec: SpecSettings,
+    #[serde(default)]
+    pub plan: PlanSettings,
     pub providers: Vec<ProviderSettings>,
     pub models: Vec<ModelSettings>,
     #[serde(default, rename = "agentDefinitions")]
@@ -335,6 +343,7 @@ impl GlobalConfig {
             prompts: PromptSettings::default(),
             web_search: WebSearchSettings::default(),
             spec: SpecSettings::default(),
+            plan: PlanSettings::default(),
             providers: Vec::new(),
             models: Vec::new(),
             agent_definitions: Vec::new(),
@@ -384,6 +393,7 @@ impl GlobalConfig {
         validate_prompt_settings(config_path, &self.prompts)?;
         validate_web_search_settings(config_path, &self.web_search)?;
         validate_spec_settings(config_path, &self.spec, &self.models, &self.providers)?;
+        validate_plan_settings(config_path, &self.plan)?;
         require_non_empty_list(config_path, "workspaces", self.workspaces.len())?;
 
         let mut workspace_ids = HashSet::new();
@@ -936,6 +946,21 @@ impl Default for SpecSettings {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanSettings {
+    #[serde(default = "default_plan_merge_automation_mode")]
+    pub merge_automation_mode: String,
+}
+
+impl Default for PlanSettings {
+    fn default() -> Self {
+        Self {
+            merge_automation_mode: default_plan_merge_automation_mode(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PromptSettings {
@@ -1065,6 +1090,10 @@ fn default_memory_dream_workspace_threshold_facts() -> u32 {
 
 fn default_memory_dream_global_threshold_facts() -> u32 {
     50
+}
+
+fn default_plan_merge_automation_mode() -> String {
+    PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE.to_string()
 }
 
 fn default_system_prompt_name() -> String {
@@ -2083,6 +2112,23 @@ fn validate_spec_system_prompt(
             format!("{field} must be no longer than {SPEC_SYSTEM_PROMPT_MAX_CHARS} characters"),
         );
     }
+    Ok(())
+}
+
+fn validate_plan_settings(
+    config_path: Option<&Path>,
+    settings: &PlanSettings,
+) -> Result<(), ConfigError> {
+    if !SUPPORTED_PLAN_MERGE_AUTOMATION_MODES.contains(&settings.merge_automation_mode.as_str()) {
+        return invalid_config(
+            config_path,
+            format!(
+                "plan.merge_automation_mode must be one of: {}",
+                SUPPORTED_PLAN_MERGE_AUTOMATION_MODES.join(", ")
+            ),
+        );
+    }
+
     Ok(())
 }
 
@@ -3348,6 +3394,40 @@ mod tests {
         let loaded = load_global_config(&paths.config_file).expect("old config should load");
 
         assert_eq!(loaded.spec, SpecSettings::default());
+    }
+
+    #[test]
+    fn plan_defaults_are_loaded_for_old_configs() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+
+        let config = GlobalConfig::first_run(paths.workspace_dir.clone());
+        let mut json = serde_json::to_value(&config).expect("config json");
+        json.as_object_mut().expect("config object").remove("plan");
+        fs::write(
+            &paths.config_file,
+            serde_json::to_string_pretty(&json).expect("serialize config"),
+        )
+        .expect("config write");
+
+        let loaded = load_global_config(&paths.config_file).expect("old config should load");
+
+        assert_eq!(loaded.plan, PlanSettings::default());
+    }
+
+    #[test]
+    fn plan_settings_are_validated() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let mut loaded =
+            load_or_create_global_config_at(profile.path()).expect("first-run config should load");
+
+        loaded.config.plan.merge_automation_mode = "surprise".to_string();
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("bad plan merge mode should fail");
+
+        assert!(error.to_string().contains("plan.merge_automation_mode"));
     }
 
     #[test]

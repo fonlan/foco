@@ -45,6 +45,9 @@ import type {
   GitDiffResponse,
   GitStatusFileSummary,
   MemoryFactRecord,
+  Plan,
+  PlanStatus,
+  PlanStep,
   TaskStatus,
   TodoGraphResponse,
   TodoGraphTask,
@@ -66,7 +69,7 @@ import { diffLineClass, parseGitDiffSections, type GitDiffSection } from "../git
 import { preloadOptionalMonaco } from "../files/WorkspaceFileEditorPanel";
 import { useI18n } from "../../shared/i18n";
 
-export type ContextPanelTab = "todo" | "files" | "git" | "memory" | "stats" | "agents" | "spec";
+export type ContextPanelTab = "todo" | "plan" | "files" | "git" | "memory" | "stats" | "agents" | "spec";
 
 type PanelNumberSetter = (value: SetStateAction<number>) => void;
 
@@ -100,6 +103,7 @@ const ContextPanel = memo(function ContextPanel({
   expandedFileTreePaths,
   isLoadingChatStatistics,
   isLoadingContextMemories,
+  isLoadingPlans,
   loadingWorkspaceDirectoryPaths,
   isLoadingDiff,
   isLoadingTodoGraph,
@@ -112,6 +116,7 @@ const ContextPanel = memo(function ContextPanel({
   onGitCommitMessageChange,
   onGitFileOperation,
   onMemoryPageChange,
+  onPlanAction,
   onReloadWorkspaceSpec,
   onRefreshDiff,
   onRefreshWorkspaceFiles,
@@ -126,6 +131,9 @@ const ContextPanel = memo(function ContextPanel({
   onWorkspaceSpecSettingsChange,
   selectedPath,
   selectedSkillPrefix,
+  plans,
+  planError,
+  planOperationKey,
   todoGraph,
   todoGraphError,
   workspaceSpec,
@@ -154,6 +162,7 @@ const ContextPanel = memo(function ContextPanel({
   expandedFileTreePaths: Set<string>;
   isLoadingChatStatistics: boolean;
   isLoadingContextMemories: boolean;
+  isLoadingPlans: boolean;
   loadingWorkspaceDirectoryPaths: Set<string>;
   isLoadingDiff: boolean;
   isLoadingTodoGraph: boolean;
@@ -166,6 +175,7 @@ const ContextPanel = memo(function ContextPanel({
   onGitCommitMessageChange: (message: string) => void;
   onGitFileOperation: (action: "stage" | "unstage" | "discard", path: string) => void;
   onMemoryPageChange: (scope: "global" | "workspace", page: number) => void;
+  onPlanAction: (planId: string, action: string) => void;
   onReloadWorkspaceSpec: () => void;
   onRefreshDiff: () => void;
   onRefreshWorkspaceFiles: () => void;
@@ -180,6 +190,9 @@ const ContextPanel = memo(function ContextPanel({
   onWorkspaceSpecSettingsChange: (enabled: boolean, injectEnabled: boolean) => void;
   selectedPath: string | null;
   selectedSkillPrefix: SelectedSkillPrefixResolver;
+  plans: Plan[];
+  planError: string | null;
+  planOperationKey: string | null;
   todoGraph: TodoGraphResponse | null;
   todoGraphError: string | null;
   workspaceSpec: WorkspaceSpecResponse | null;
@@ -195,6 +208,7 @@ const ContextPanel = memo(function ContextPanel({
   const { t } = useI18n();
   const tabs: { id: ContextPanelTab; label: string; icon: LucideIcon }[] = [
     { id: "todo", label: "ToDo", icon: ListChecks },
+    { id: "plan", label: "Plan", icon: ScrollText },
     { id: "files", label: "Files", icon: Files },
     { id: "git", label: "Git", icon: GitCompare },
     { id: "agents", label: "Agents", icon: Bot },
@@ -232,6 +246,16 @@ const ContextPanel = memo(function ContextPanel({
             error={todoGraphError}
             isLoading={isLoadingTodoGraph}
             todoGraph={todoGraph}
+          />
+        ) : null}
+
+        {activeTab === "plan" ? (
+          <ContextPlanTab
+            error={planError}
+            isLoading={isLoadingPlans}
+            onAction={onPlanAction}
+            operationKey={planOperationKey}
+            plans={plans}
           />
         ) : null}
 
@@ -583,6 +607,186 @@ function ContextTodoGraphTab({
       <ListChecks aria-hidden="true" className="size-5" />
       <h2>{t("ToDo graph")}</h2>
       <p>{t("No todo graph for the active session yet.")}</p>
+    </div>
+  );
+}
+
+function ContextPlanTab({
+  error,
+  isLoading,
+  onAction,
+  operationKey,
+  plans,
+}: {
+  error: string | null;
+  isLoading: boolean;
+  onAction: (planId: string, action: string) => void;
+  operationKey: string | null;
+  plans: Plan[];
+}) {
+  const { language, t } = useI18n();
+
+  if (isLoading && plans.length === 0) {
+    return (
+      <div className="context-empty-state">
+        <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+        <h2>{t("Plan")}</h2>
+        <p>{t("Loading plans...")}</p>
+      </div>
+    );
+  }
+
+  if (error && plans.length === 0) {
+    return (
+      <div className="context-empty-state">
+        <ScrollText aria-hidden="true" className="size-5" />
+        <h2>{t("Plan")}</h2>
+        <p>{error}</p>
+      </div>
+    );
+  }
+
+  if (!plans.length) {
+    return (
+      <div className="context-empty-state">
+        <ScrollText aria-hidden="true" className="size-5" />
+        <h2>{t("Plan")}</h2>
+        <p>{t("No active plans for this workspace.")}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="context-list-panel panel-scroll">
+      {error ? (
+        <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+          {error}
+        </div>
+      ) : null}
+      <div className="space-y-3">
+        {plans.map((plan) => {
+          const totalSteps = plan.phases.reduce(
+            (count, phase) => count + phase.steps.length,
+            0,
+          );
+          const completedSteps = plan.phases.reduce(
+            (count, phase) =>
+              count + phase.steps.filter((step) => step.status === "completed").length,
+            0,
+          );
+          const action = primaryPlanAction(plan.status);
+          const actionKey = action ? `${action}:${plan.id}` : null;
+
+          return (
+            <article className="context-memory-item" key={plan.id}>
+              <div className="context-memory-item-header">
+                <div className="context-memory-badges">
+                  <span className={planStatusClass(plan.status)}>
+                    {t(planStatusLabel(plan.status))}
+                  </span>
+                  <span className="context-memory-kind">
+                    {completedSteps}/{totalSteps}
+                  </span>
+                </div>
+                {action ? (
+                  <button
+                    aria-label={t(planActionLabel(action))}
+                    className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                    disabled={operationKey !== null}
+                    onClick={() => onAction(plan.id, action)}
+                    title={t(planActionLabel(action))}
+                    type="button"
+                  >
+                    {operationKey === actionKey ? (
+                      <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                    ) : (
+                      <CheckCircle2 aria-hidden="true" className="size-3.5" />
+                    )}
+                    {t(planActionLabel(action))}
+                  </button>
+                ) : null}
+              </div>
+              <h3 className="break-words text-sm font-semibold text-stone-950">
+                {plan.title}
+              </h3>
+              <p>{plan.overview}</p>
+              <small>
+                {t("Updated {time}", {
+                  time: formatTodoGraphDate(plan.updatedAt, language),
+                })}
+              </small>
+              <div className="mt-3 space-y-2">
+                {plan.phases.map((phase) => (
+                  <section
+                    className="rounded-lg border border-stone-200 bg-stone-50/80 px-2.5 py-2"
+                    key={phase.id}
+                  >
+                    <div className="flex min-w-0 items-start justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="truncate text-xs font-semibold text-stone-900">
+                          {phase.title}
+                        </div>
+                        {phase.summary ? (
+                          <div className="mt-0.5 line-clamp-2 text-xs text-stone-500">
+                            {phase.summary}
+                          </div>
+                        ) : null}
+                      </div>
+                      <span className={planPhaseStatusClass(phase.status)}>
+                        {t(planPhaseStatusLabel(phase.status))}
+                      </span>
+                    </div>
+                    <div className="mt-2 space-y-1.5">
+                      {phase.steps.map((step) => (
+                        <PlanStepRow key={step.id} step={step} />
+                      ))}
+                    </div>
+                  </section>
+                ))}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function PlanStepRow({ step }: { step: PlanStep }) {
+  const { t } = useI18n();
+  const isComplete = step.status === "completed";
+
+  return (
+    <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-2 text-xs">
+      <span
+        aria-hidden="true"
+        className={`mt-0.5 inline-flex size-4 items-center justify-center rounded border ${
+          isComplete
+            ? "border-teal-700 bg-teal-700 text-white"
+            : "border-stone-300 bg-white text-transparent"
+        }`}
+      >
+        <CheckCircle2 className="size-3" />
+      </span>
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          <span
+            className={`min-w-0 break-words font-medium ${
+              isComplete ? "text-stone-500 line-through" : "text-stone-800"
+            }`}
+          >
+            {step.title}
+          </span>
+          {step.status !== "pending" && step.status !== "completed" ? (
+            <span className={planPhaseStatusClass(step.status)}>
+              {t(planPhaseStatusLabel(step.status))}
+            </span>
+          ) : null}
+        </div>
+        {step.detail ? (
+          <div className="mt-0.5 line-clamp-2 text-stone-500">{step.detail}</div>
+        ) : null}
+      </div>
     </div>
   );
 }
@@ -1861,6 +2065,95 @@ function taskStatusClass(status: TaskStatus) {
     return `${base} bg-rose-100 text-rose-700`;
   }
 
+  return `${base} bg-stone-100 text-stone-600`;
+}
+
+function primaryPlanAction(status: PlanStatus) {
+  if (status === "implemented" || status === "failed" || status === "cancelled") {
+    return "mark_complete";
+  }
+  if (status === "paused") {
+    return "resume";
+  }
+  if (status === "ready" || status === "draft") {
+    return "start";
+  }
+  if (status === "running") {
+    return "pause";
+  }
+  return null;
+}
+
+function planActionLabel(action: string) {
+  switch (action) {
+    case "mark_complete":
+      return "Mark complete";
+    case "resume":
+      return "Resume";
+    case "start":
+      return "Start";
+    case "pause":
+      return "Pause";
+    default:
+      return action;
+  }
+}
+
+function planStatusLabel(status: string) {
+  switch (status) {
+    case "draft":
+      return "Draft";
+    case "ready":
+      return "Ready";
+    case "running":
+      return "Running";
+    case "paused":
+      return "Paused";
+    case "implemented":
+      return "Implemented";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
+    default:
+      return status;
+  }
+}
+
+function planPhaseStatusLabel(status: string) {
+  return planStatusLabel(status);
+}
+
+function planStatusClass(status: PlanStatus) {
+  const base = "inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold";
+  if (status === "implemented" || status === "completed") {
+    return `${base} bg-teal-100 text-teal-800`;
+  }
+  if (status === "running") {
+    return `${base} bg-amber-100 text-amber-800`;
+  }
+  if (status === "paused" || status === "draft" || status === "ready") {
+    return `${base} bg-sky-100 text-sky-700`;
+  }
+  if (status === "failed" || status === "cancelled") {
+    return `${base} bg-rose-100 text-rose-700`;
+  }
+  return `${base} bg-stone-100 text-stone-600`;
+}
+
+function planPhaseStatusClass(status: string) {
+  const base = "inline-flex shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-semibold";
+  if (status === "completed" || status === "implemented") {
+    return `${base} bg-teal-100 text-teal-800`;
+  }
+  if (status === "running") {
+    return `${base} bg-amber-100 text-amber-800`;
+  }
+  if (status === "failed" || status === "cancelled") {
+    return `${base} bg-rose-100 text-rose-700`;
+  }
   return `${base} bg-stone-100 text-stone-600`;
 }
 

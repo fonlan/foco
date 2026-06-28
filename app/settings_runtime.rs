@@ -6,6 +6,7 @@ use foco_providers::supported_provider_kinds;
 use foco_store::{
     config::{
         GlobalConfig, MAX_LLM_REQUEST_RETRY_COUNT, McpServerConfig, ModelSettings,
+        PLAN_MERGE_AUTOMATION_DIRECT_AUTO, PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
         ProviderSettings, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
         SUPPORTED_TERMINAL_SHELLS, WEB_SEARCH_PROVIDER_BRAVE, WEB_SEARCH_PROVIDER_TAVILY,
         WebSearchSettings, WorkspaceCommonCommand, WorkspaceConfig,
@@ -18,7 +19,8 @@ use crate::http::settings::{
     AppThemeSummary, ConfiguredMcpServerSummary, ConfiguredModelSummary, ConfiguredProviderSummary,
     ConfiguredSkillSummary, ConfiguredWorkspaceSummary, GeneralSettingsSummary,
     IMAGE_AGENT_SYSTEM_PROMPT_NAME, McpTransportSummary, MemoryDreamSettingsSummary,
-    MemoryExtractionModeSummary, MemorySettingsSummary, NativeToolsSummary, PromptSettingsSummary,
+    MemoryExtractionModeSummary, MemorySettingsSummary, NativeToolsSummary,
+    PlanMergeAutomationModeSummary, PlanSettingsSummary, PromptSettingsSummary,
     ProviderKindSummary, SettingsResponse, SkillsSettingsSummary, SpecSettingsSummary,
     SystemPromptSummary, TerminalShellSummary, ThinkingLevelSummary, WebSearchProviderSummary,
     WebSearchSettingsSummary, WebServerSettingsSummary, WorkspaceCommonCommandSummary,
@@ -145,6 +147,19 @@ pub(crate) async fn settings_response(
                 crate::spec_runtime::default_workspace_spec_generation_system_prompt(),
             default_update_system_prompt:
                 crate::spec_runtime::default_workspace_spec_update_system_prompt(),
+        },
+        plan: PlanSettingsSummary {
+            merge_automation_mode: config.plan.merge_automation_mode.clone(),
+            merge_automation_modes: vec![
+                PlanMergeAutomationModeSummary {
+                    value: PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
+                    label: "Isolated auto once",
+                },
+                PlanMergeAutomationModeSummary {
+                    value: PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
+                    label: "Direct auto",
+                },
+            ],
         },
         prompts: PromptSettingsSummary {
             system_prompt: config.prompts.system_prompt.clone(),

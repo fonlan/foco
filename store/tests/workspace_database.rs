@@ -18,16 +18,17 @@ use foco_store::{
         NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
         NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-        NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-        ScheduledTaskDueRunClaim, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
-        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
-        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
-        WorkspaceSpecWriteDecision, initialize_workspace_databases, workspace_database_path,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
+        NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask,
+        NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
+        PlanListFilter, PlanStepPatch, ScheduledTaskDueRunClaim, ScheduledTaskRunUpdate,
+        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
+        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
+        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
+        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
+        initialize_workspace_databases, workspace_database_path,
     },
 };
 use rusqlite::{Connection, params};
@@ -95,6 +96,9 @@ fn creates_workspace_foco_database_and_runs_migrations() {
         "workspace_specs",
         "workspace_spec_jobs",
         "chat_spec_snapshots",
+        "plans",
+        "plan_phases",
+        "plan_steps",
     ] {
         assert!(
             table_exists(&connection, table),
@@ -262,6 +266,100 @@ fn workspace_spec_content_update_rejects_stale_revision() {
         .expect("updated spec");
     assert_eq!(updated.revision, 2);
     assert_eq!(updated.content_markdown, "# Project Spec\n\nSecond");
+}
+
+#[test]
+fn plan_completed_steps_remain_active_until_user_marks_complete() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+
+    let created = database
+        .create_plan(NewPlan {
+            id: "plan-history-active",
+            title: "Plan history active",
+            overview: "Keep implemented plans visible until the user archives them.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-phase-history-active",
+                title: "Phase one",
+                summary: "Implement the phase.",
+                steps: vec![NewPlanStep {
+                    id: "plan-step-history-active",
+                    title: "Finish step",
+                    detail: "Complete the implementation step.",
+                    acceptance: vec!["step is checked".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    assert_eq!(created.status, "ready");
+
+    let active = database
+        .plans(PlanListFilter {
+            view: "active",
+            status: None,
+            limit: 20,
+            offset: 0,
+        })
+        .expect("active plans");
+    assert_eq!(active.total_count, 1);
+
+    let implemented = database
+        .update_plan_step(
+            "plan-history-active",
+            "plan-step-history-active",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete plan step");
+    assert_eq!(implemented.status, "implemented");
+    assert!(implemented.completed_at.is_some());
+    assert!(implemented.completed_by_user_at.is_none());
+
+    let active = database
+        .plans(PlanListFilter {
+            view: "active",
+            status: None,
+            limit: 20,
+            offset: 0,
+        })
+        .expect("implemented active plans");
+    assert_eq!(active.total_count, 1);
+    assert_eq!(active.plans[0].status, "implemented");
+
+    let completed = database
+        .transition_plan("plan-history-active", "mark_complete")
+        .expect("mark complete");
+    assert_eq!(completed.status, "completed");
+    assert!(completed.completed_by_user_at.is_some());
+
+    let active = database
+        .plans(PlanListFilter {
+            view: "active",
+            status: None,
+            limit: 20,
+            offset: 0,
+        })
+        .expect("active plans after archive");
+    assert_eq!(active.total_count, 0);
+    assert!(active.plans.is_empty());
+
+    let all_completed = database
+        .plans(PlanListFilter {
+            view: "all",
+            status: Some("completed"),
+            limit: 20,
+            offset: 0,
+        })
+        .expect("completed history plans");
+    assert_eq!(all_completed.total_count, 1);
+    assert_eq!(all_completed.plans[0].status, "completed");
 }
 
 #[test]

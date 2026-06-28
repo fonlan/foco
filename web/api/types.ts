@@ -7,6 +7,7 @@ export type SettingsSection =
   | "agents"
   | "prompts"
   | "spec"
+  | "plan"
   | "web-search"
   | "hooks"
   | "memory"
@@ -145,6 +146,88 @@ export type WorkspaceSpecJobsResponse = {
   jobs: WorkspaceSpecJobSummary[];
 };
 
+// Plan types
+
+export type PlanStatus =
+  | "draft"
+  | "ready"
+  | "running"
+  | "paused"
+  | "implemented"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type PlanStepStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export type PlanStep = {
+  id: string;
+  planId: string;
+  phaseId: string;
+  sequence: number;
+  title: string;
+  detail: string;
+  acceptance: string[];
+  status: PlanStepStatus;
+  checkedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type PlanPhase = {
+  id: string;
+  planId: string;
+  sequence: number;
+  title: string;
+  summary: string;
+  status: string;
+  implementationChatId: string | null;
+  agentTeamId: string | null;
+  agentTaskId: string | null;
+  commitId: string | null;
+  mergeAttemptCount: number;
+  errorMessage: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  steps: PlanStep[];
+};
+
+export type Plan = {
+  id: string;
+  title: string;
+  overview: string;
+  status: PlanStatus;
+  sortOrder: number;
+  sourceChatId: string | null;
+  activePhaseId: string | null;
+  pauseRequestedAt: string | null;
+  completedAt: string | null;
+  completedByUserAt: string | null;
+  errorMessage: string | null;
+  createdAt: string;
+  updatedAt: string;
+  phases: PlanPhase[];
+};
+
+export type PlansResponse = {
+  plans: Plan[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+  totalPages: number;
+};
+
+export type PlanResponse = {
+  plan: Plan;
+};
+
 // JSON types
 
 export type JsonValue =
@@ -166,6 +249,7 @@ export type QueuedRunSummary = {
   providerId: string | null;
   thinkingLevel: string | null;
   skillIds: string[];
+  sessionMode?: "plan" | null;
   content?: string | null;
 };
 
@@ -300,6 +384,7 @@ export type QueuedMessageRunSummary = {
   providerId: string | null;
   thinkingLevel: string | null;
   skillIds: string[];
+  sessionMode?: "plan" | null;
   assistantMessageId: string | null;
   assistantSequence?: number | null;
 };
@@ -604,6 +689,7 @@ export type ContextUsageRefreshRequest = {
   providerId: string;
   thinkingLevel: string;
   skillIds: string[];
+  sessionMode?: "plan";
   latestResponseUsage: ChatUsage;
 };
 
@@ -1162,6 +1248,16 @@ type SpecSettingsSummary = {
   updateSystemPrompt: string | null;
   defaultGenerationSystemPrompt: string;
   defaultUpdateSystemPrompt: string;
+};
+
+export type PlanMergeAutomationModeSummary = {
+  value: string;
+  label: string;
+};
+
+export type PlanSettingsSummary = {
+  mergeAutomationMode: string;
+  mergeAutomationModes: PlanMergeAutomationModeSummary[];
 };
 
 export type SpecSettingsFormState = {
@@ -1798,6 +1894,7 @@ export type RetryRunRequest = {
   providerId: string;
   thinkingLevel: string;
   skillIds: string[];
+  sessionMode?: "plan";
   teamModeEnabled?: boolean;
   localChatKey?: string;
   pendingUserMessageId?: string;
@@ -1943,6 +2040,7 @@ export type SettingsResponse = {
   webSearch: WebSearchSettingsSummary;
   memory: MemorySettingsSummary;
   spec: SpecSettingsSummary;
+  plan: PlanSettingsSummary;
   prompts: PromptSettingsSummary;
   workspaces: ConfiguredWorkspaceSummary[];
   terminalShells: TerminalShellSummary[];

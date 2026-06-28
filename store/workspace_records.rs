@@ -412,6 +412,119 @@ pub struct ChatSpecSnapshotRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewPlan<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub overview: &'a str,
+    pub status: &'a str,
+    pub source_chat_id: Option<&'a str>,
+    pub phases: Vec<NewPlanPhase<'a>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewPlanPhase<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub summary: &'a str,
+    pub steps: Vec<NewPlanStep<'a>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewPlanStep<'a> {
+    pub id: &'a str,
+    pub title: &'a str,
+    pub detail: &'a str,
+    pub acceptance: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanStepPatch<'a> {
+    pub title: Option<&'a str>,
+    pub detail: Option<&'a str>,
+    pub acceptance: Option<Vec<String>>,
+    pub status: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanPatch<'a> {
+    pub title: Option<&'a str>,
+    pub overview: Option<&'a str>,
+    pub status: Option<&'a str>,
+    pub error_message: Option<Option<&'a str>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanListFilter<'a> {
+    pub view: &'a str,
+    pub status: Option<&'a str>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanListPage {
+    pub plans: Vec<PlanRecord>,
+    pub total_count: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRecord {
+    pub id: String,
+    pub title: String,
+    pub overview: String,
+    pub status: String,
+    pub sort_order: i64,
+    pub source_chat_id: Option<String>,
+    pub active_phase_id: Option<String>,
+    pub pause_requested_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub completed_by_user_at: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub phases: Vec<PlanPhaseRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanPhaseRecord {
+    pub id: String,
+    pub plan_id: String,
+    pub sequence: i64,
+    pub title: String,
+    pub summary: String,
+    pub status: String,
+    pub implementation_chat_id: Option<String>,
+    pub agent_team_id: Option<String>,
+    pub agent_task_id: Option<String>,
+    pub commit_id: Option<String>,
+    pub merge_attempt_count: i64,
+    pub error_message: Option<String>,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub steps: Vec<PlanStepRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStepRecord {
+    pub id: String,
+    pub plan_id: String,
+    pub phase_id: String,
+    pub sequence: i64,
+    pub title: String,
+    pub detail: String,
+    pub acceptance: Vec<String>,
+    pub status: String,
+    pub checked_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChatRecord {
     pub id: String,
     pub title: String,

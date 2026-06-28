@@ -16,7 +16,7 @@ use foco_providers::{
     test_provider_connection,
 };
 use foco_store::{
-    config::{IMAGE_GENERATION_SYSTEM_PROMPT_NAME, PromptSettings, SpecSettings},
+    config::{IMAGE_GENERATION_SYSTEM_PROMPT_NAME, PlanSettings, PromptSettings, SpecSettings},
     model_metadata::{
         MODELS_DEV_API_URL, parse_models_dev_metadata, read_model_metadata_cache,
         write_model_metadata_cache,
@@ -102,6 +102,12 @@ pub(crate) struct ManualSpecSettingsRequest {
     pub(crate) generation_model_id: Option<String>,
     pub(crate) generation_system_prompt: Option<String>,
     pub(crate) update_system_prompt: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManualPlanSettingsRequest {
+    pub(crate) merge_automation_mode: String,
 }
 
 #[derive(Deserialize)]
@@ -244,6 +250,7 @@ pub(crate) struct SettingsResponse {
     pub(crate) web_search: WebSearchSettingsSummary,
     pub(crate) memory: MemorySettingsSummary,
     pub(crate) spec: SpecSettingsSummary,
+    pub(crate) plan: PlanSettingsSummary,
     pub(crate) prompts: PromptSettingsSummary,
     pub(crate) workspaces: Vec<ConfiguredWorkspaceSummary>,
     pub(crate) terminal_shells: Vec<TerminalShellSummary>,
@@ -357,6 +364,20 @@ pub(crate) struct SpecSettingsSummary {
     pub(crate) update_system_prompt: Option<String>,
     pub(crate) default_generation_system_prompt: String,
     pub(crate) default_update_system_prompt: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanSettingsSummary {
+    pub(crate) merge_automation_mode: String,
+    pub(crate) merge_automation_modes: Vec<PlanMergeAutomationModeSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PlanMergeAutomationModeSummary {
+    pub(crate) value: &'static str,
+    pub(crate) label: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1211,6 +1232,22 @@ pub(crate) async fn save_spec_settings(
         generation_model_id: optional_trimmed_string(request.generation_model_id),
         generation_system_prompt: optional_trimmed_string(request.generation_system_prompt),
         update_system_prompt: optional_trimmed_string(request.update_system_prompt),
+    };
+    config
+        .validate(Some(&state.config_file))
+        .map_err(ApiError::from_config_error)?;
+    save_config(&state, config.clone())?;
+
+    settings_response(&state, &config).await
+}
+
+pub(crate) async fn save_plan_settings(
+    State(state): State<AppState>,
+    Json(request): Json<ManualPlanSettingsRequest>,
+) -> Result<Json<SettingsResponse>, ApiError> {
+    let mut config = config_snapshot(&state)?;
+    config.plan = PlanSettings {
+        merge_automation_mode: request.merge_automation_mode.trim().to_string(),
     };
     config
         .validate(Some(&state.config_file))

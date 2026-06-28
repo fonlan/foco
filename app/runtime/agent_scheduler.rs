@@ -65,6 +65,8 @@ pub(crate) struct CoordinatorTaskInput {
     pub(crate) attachments: Vec<ChatAttachmentInput>,
     #[serde(default)]
     pub(crate) skill_ids: Vec<String>,
+    #[serde(default)]
+    pub(crate) session_mode: Option<String>,
     #[serde(default = "default_collaboration_tools_enabled")]
     pub(crate) collaboration_tools_enabled: bool,
     #[serde(default)]
@@ -506,6 +508,7 @@ async fn run_coordinator_task_inner(
             provider_id: model_selection.provider_id,
             thinking_level: model_selection.thinking_level,
             skill_ids: Some(task_input.skill_ids.clone()),
+            session_mode: task_input.session_mode.clone(),
             message: task_input.message.clone(),
             attachments: task_input.attachments.clone(),
         },
@@ -2202,6 +2205,7 @@ mod tests {
             message: "Use override".to_string(),
             attachments: Vec::new(),
             skill_ids: Vec::new(),
+            session_mode: None,
             collaboration_tools_enabled: false,
             defer_until_workspace_idle: false,
             delegated_input: None,

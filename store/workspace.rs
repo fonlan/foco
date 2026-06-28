@@ -43,23 +43,24 @@ pub use workspace_records::{
     NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
     NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
     NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-    PromptContextInjectionRecord, RunEventRecord, ScheduledTaskDueRunClaim, ScheduledTaskRecord,
-    ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TerminalSessionRecord,
-    TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
-    WorkspaceSpecRecord,
+    NewPlan, NewPlanPhase, NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask,
+    NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
+    PlanListFilter, PlanListPage, PlanPatch, PlanPhaseRecord, PlanRecord, PlanStepPatch,
+    PlanStepRecord, PromptContextInjectionRecord, RunEventRecord, ScheduledTaskDueRunClaim,
+    ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate,
+    TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch,
+    ToolCallCountRecord, ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome,
+    WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
     MIGRATION_008, MIGRATION_009, MIGRATION_010, MIGRATION_011, MIGRATION_012, MIGRATION_013,
-    MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, Migration,
+    MIGRATION_014, MIGRATION_015, MIGRATION_018, MIGRATION_019, MIGRATION_020, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 19;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 20;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -101,6 +102,15 @@ const VISIBLE_MESSAGE_FILTER_SQL: &str = r#"
       WHERE private_message_id IS NOT NULL
         AND private_message_id <> ''
   )"#;
+const PLAN_SELECT_BASE_SQL: &str = "SELECT id, title, overview, status, sort_order,
+       source_chat_id, active_phase_id, pause_requested_at, completed_at,
+       completed_by_user_at, error_message, created_at, updated_at
+ FROM plans";
+const PLAN_SELECT_SQL: &str = "SELECT id, title, overview, status, sort_order,
+       source_chat_id, active_phase_id, pause_requested_at, completed_at,
+       completed_by_user_at, error_message, created_at, updated_at
+ FROM plans
+ WHERE id = ?1";
 
 const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -178,6 +188,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 19,
         sql: MIGRATION_019,
+    },
+    Migration {
+        version: 20,
+        sql: MIGRATION_020,
     },
 ];
 
@@ -970,6 +984,686 @@ impl WorkspaceDatabase {
             )
             .optional()
             .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn create_plan(&mut self, plan: NewPlan<'_>) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        validate_plan_status(plan.status)?;
+        let title = required_plan_text("title", plan.title)?;
+        let overview = plan.overview.trim();
+        let source_chat_id = plan
+            .source_chat_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if let Some(source_chat_id) = source_chat_id {
+            let chat_exists: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM chats WHERE id = ?1)",
+                    params![source_chat_id],
+                    |row| row.get(0),
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if !chat_exists {
+                return Err(WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("source chat was not found: {source_chat_id}"),
+                });
+            }
+        }
+        let sort_order = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM plans",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        transaction
+            .execute(
+                "INSERT INTO plans
+                    (id, title, overview, status, sort_order, source_chat_id,
+                     created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                params![
+                    plan.id.trim(),
+                    title,
+                    overview,
+                    plan.status,
+                    sort_order,
+                    source_chat_id,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        for (phase_index, phase) in plan.phases.iter().enumerate() {
+            let sequence = i64::try_from(phase_index).map_err(|source| {
+                WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan phase index overflowed: {source}"),
+                }
+            })?;
+            transaction
+                .execute(
+                    "INSERT INTO plan_phases
+                        (id, plan_id, sequence, title, summary, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
+                    params![
+                        phase.id.trim(),
+                        plan.id.trim(),
+                        sequence,
+                        required_plan_text("phase.title", phase.title)?,
+                        phase.summary.trim(),
+                        now
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            for (step_index, step) in phase.steps.iter().enumerate() {
+                let step_sequence = i64::try_from(step_index).map_err(|source| {
+                    WorkspaceDatabaseError::InvalidPlan {
+                        message: format!("plan step index overflowed: {source}"),
+                    }
+                })?;
+                let acceptance_json = plan_acceptance_json(&step.acceptance)?;
+                transaction
+                    .execute(
+                        "INSERT INTO plan_steps
+                            (id, plan_id, phase_id, sequence, title, detail, acceptance_json,
+                             status, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?8)",
+                        params![
+                            step.id.trim(),
+                            plan.id.trim(),
+                            phase.id.trim(),
+                            step_sequence,
+                            required_plan_text("step.title", step.title)?,
+                            step.detail.trim(),
+                            acceptance_json,
+                            now
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        self.refresh_plan_status_from_steps(plan.id.trim())?;
+        self.plan(plan.id.trim())?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan '{}' was not found after insert", plan.id.trim()),
+            })
+    }
+
+    pub fn plan(&self, id: &str) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
+        let Some(mut plan) = self
+            .connection
+            .query_row(PLAN_SELECT_SQL, params![id.trim()], plan_from_row)
+            .optional()
+            .map_err(|source| self.sqlite_error(source))?
+        else {
+            return Ok(None);
+        };
+        plan.phases = self.plan_phases_for_plan(&plan.id)?;
+        Ok(Some(plan))
+    }
+
+    pub fn plans(
+        &self,
+        filter: PlanListFilter<'_>,
+    ) -> Result<PlanListPage, WorkspaceDatabaseError> {
+        validate_plan_view(filter.view)?;
+        if let Some(status) = filter.status {
+            validate_plan_status(status)?;
+        }
+        if filter.limit <= 0 || filter.offset < 0 {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: "plan pagination limit must be positive and offset must be non-negative"
+                    .to_string(),
+            });
+        }
+        let mut where_clause = String::from(" WHERE 1 = 1");
+        let mut params = Vec::new();
+        if filter.view == "active" {
+            where_clause.push_str(" AND status <> ?");
+            params.push(SqlValue::Text("completed".to_string()));
+        }
+        if let Some(status) = filter.status {
+            where_clause.push_str(" AND status = ?");
+            params.push(SqlValue::Text(status.to_string()));
+        }
+
+        let total_count = self
+            .connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM plans{where_clause}"),
+                params_from_iter(params.clone()),
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        let mut query = String::from(PLAN_SELECT_BASE_SQL);
+        query.push_str(&where_clause);
+        query.push_str(" ORDER BY sort_order ASC, created_at ASC, id ASC LIMIT ? OFFSET ?");
+        params.push(SqlValue::Integer(filter.limit));
+        params.push(SqlValue::Integer(filter.offset));
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(params), plan_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        let mut plans = collect_rows(rows, &self.database_path)?;
+        for plan in &mut plans {
+            plan.phases = self.plan_phases_for_plan(&plan.id)?;
+        }
+
+        Ok(PlanListPage { plans, total_count })
+    }
+
+    pub fn update_plan(
+        &mut self,
+        plan_id: &str,
+        patch: PlanPatch<'_>,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let current = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if current.status == "completed" {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: "completed plans cannot be edited".to_string(),
+            });
+        }
+        let title = match patch.title {
+            Some(title) => required_plan_text("title", title)?,
+            None => current.title,
+        };
+        let overview = patch
+            .overview
+            .map(str::trim)
+            .unwrap_or(current.overview.as_str())
+            .to_string();
+        let status = match patch.status {
+            Some("completed") => {
+                return Err(WorkspaceDatabaseError::InvalidPlan {
+                    message: "use mark_complete to complete a plan".to_string(),
+                });
+            }
+            Some(status) => {
+                validate_plan_status(status)?;
+                status.to_string()
+            }
+            None => current.status,
+        };
+        let error_message = match patch.error_message {
+            Some(Some(message)) => Some(message.trim().to_string()),
+            Some(None) => None,
+            None => current.error_message,
+        };
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET title = ?2,
+                     overview = ?3,
+                     status = ?4,
+                     error_message = ?5,
+                     updated_at = ?6,
+                     completed_at = CASE WHEN ?4 = 'implemented' THEN COALESCE(completed_at, ?6) ELSE completed_at END,
+                     completed_by_user_at = CASE WHEN ?4 = 'completed' THEN COALESCE(completed_by_user_at, ?6) ELSE completed_by_user_at END
+                 WHERE id = ?1",
+                params![plan_id.trim(), title, overview, status, error_message, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after update: {}", plan_id.trim()),
+            })
+    }
+
+    pub fn transition_plan(
+        &mut self,
+        plan_id: &str,
+        action: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        match action {
+            "start" | "resume" => self.start_next_plan_phase(plan_id),
+            "pause" => self.pause_plan(plan_id),
+            "cancel" => self.cancel_plan(plan_id),
+            "mark_complete" => self.mark_plan_complete(plan_id),
+            _ => Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("invalid plan action: {action}"),
+            }),
+        }
+    }
+
+    pub fn mark_plan_complete(
+        &mut self,
+        plan_id: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if !matches!(plan.status.as_str(), "implemented" | "failed" | "cancelled") {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan '{}' cannot be marked complete while {}",
+                    plan.id, plan.status
+                ),
+            });
+        }
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'completed',
+                     completed_at = COALESCE(completed_at, ?2),
+                     completed_by_user_at = ?2,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![plan.id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after completion: {}", plan_id.trim()),
+            })
+    }
+
+    pub fn update_plan_step(
+        &mut self,
+        plan_id: &str,
+        step_id: &str,
+        patch: PlanStepPatch<'_>,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if plan.status == "completed" {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: "completed plan steps cannot be edited".to_string(),
+            });
+        }
+        let current =
+            self.plan_step(step_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan step was not found: {}", step_id.trim()),
+                })?;
+        if current.plan_id != plan.id {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan step '{}' does not belong to plan '{}'",
+                    current.id, plan.id
+                ),
+            });
+        }
+        let title = match patch.title {
+            Some(title) => required_plan_text("step.title", title)?,
+            None => current.title,
+        };
+        let detail = patch
+            .detail
+            .map(str::trim)
+            .unwrap_or(current.detail.as_str())
+            .to_string();
+        let acceptance = match patch.acceptance {
+            Some(acceptance) => plan_acceptance_json(&acceptance)?,
+            None => plan_acceptance_json(&current.acceptance)?,
+        };
+        let status = match patch.status {
+            Some(status) => {
+                validate_plan_step_status(status)?;
+                status.to_string()
+            }
+            None => current.status,
+        };
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_steps
+                 SET title = ?3,
+                     detail = ?4,
+                     acceptance_json = ?5,
+                     status = ?6,
+                     checked_at = CASE WHEN ?6 = 'completed' THEN COALESCE(checked_at, ?7) ELSE NULL END,
+                     updated_at = ?7
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![plan.id, step_id.trim(), title, detail, acceptance, status, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.refresh_plan_status_from_steps(plan_id)
+    }
+
+    fn start_next_plan_phase(
+        &mut self,
+        plan_id: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan '{}' cannot start while {}", plan.id, plan.status),
+            });
+        }
+        let now = now_timestamp();
+        let next_phase_id = self
+            .connection
+            .query_row(
+                "SELECT id FROM plan_phases
+                 WHERE plan_id = ?1 AND status IN ('pending', 'running', 'failed')
+                 ORDER BY sequence ASC
+                 LIMIT 1",
+                params![plan.id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))?;
+        let Some(next_phase_id) = next_phase_id else {
+            self.connection
+                .execute(
+                    "UPDATE plans
+                     SET status = 'implemented',
+                         completed_at = COALESCE(completed_at, ?2),
+                         completed_by_user_at = NULL,
+                         pause_requested_at = NULL,
+                         active_phase_id = NULL,
+                         updated_at = ?2
+                     WHERE id = ?1",
+                    params![plan.id, now],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            return self
+                .plan(plan_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan was not found after start: {}", plan_id.trim()),
+                });
+        };
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'running',
+                     started_at = COALESCE(started_at, ?3),
+                     completed_at = NULL,
+                     updated_at = ?3
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![plan.id, next_phase_id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'running',
+                     active_phase_id = ?2,
+                     pause_requested_at = NULL,
+                     completed_at = NULL,
+                     completed_by_user_at = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1",
+                params![plan_id.trim(), next_phase_id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after start: {}", plan_id.trim()),
+            })
+    }
+
+    fn pause_plan(&mut self, plan_id: &str) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if !matches!(plan.status.as_str(), "running" | "ready") {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan '{}' cannot pause while {}", plan.id, plan.status),
+            });
+        }
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'paused',
+                     pause_requested_at = ?2,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![plan.id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after pause: {}", plan_id.trim()),
+            })
+    }
+
+    fn cancel_plan(&mut self, plan_id: &str) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if plan.status == "completed" {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: "completed plans cannot be cancelled".to_string(),
+            });
+        }
+        let now = now_timestamp();
+        self.connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'cancelled',
+                     completed_at = COALESCE(completed_at, ?2),
+                     updated_at = ?2
+                 WHERE plan_id = ?1 AND status IN ('pending', 'running', 'failed')",
+                params![plan.id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plan_steps
+                 SET status = 'cancelled',
+                     checked_at = NULL,
+                     updated_at = ?2
+                 WHERE plan_id = ?1 AND status IN ('pending', 'running', 'failed')",
+                params![plan_id.trim(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'cancelled',
+                     active_phase_id = NULL,
+                     pause_requested_at = NULL,
+                     completed_at = ?2,
+                     completed_by_user_at = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![plan_id.trim(), now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after cancel: {}", plan_id.trim()),
+            })
+    }
+
+    fn refresh_plan_status_from_steps(
+        &mut self,
+        plan_id: &str,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+            return Ok(plan);
+        }
+        let now = now_timestamp();
+        for phase in &plan.phases {
+            let (total, completed, running, failed, cancelled): (i64, i64, i64, i64, i64) = self
+                .connection
+                .query_row(
+                    "SELECT
+                        COUNT(*),
+                        COUNT(CASE WHEN status = 'completed' THEN 1 END),
+                        COUNT(CASE WHEN status = 'running' THEN 1 END),
+                        COUNT(CASE WHEN status = 'failed' THEN 1 END),
+                        COUNT(CASE WHEN status = 'cancelled' THEN 1 END)
+                     FROM plan_steps
+                     WHERE phase_id = ?1",
+                    params![phase.id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let status = if failed > 0 {
+                "failed"
+            } else if total > 0 && completed == total {
+                "completed"
+            } else if running > 0 || phase.status == "running" {
+                "running"
+            } else if total > 0 && cancelled == total {
+                "cancelled"
+            } else {
+                "pending"
+            };
+            self.connection
+                .execute(
+                    "UPDATE plan_phases
+                     SET status = ?2,
+                         completed_at = CASE WHEN ?2 IN ('completed', 'failed', 'cancelled') THEN COALESCE(completed_at, ?3) ELSE NULL END,
+                         updated_at = ?3
+                     WHERE id = ?1 AND status <> ?2",
+                    params![phase.id, status, now],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+        }
+        let phases = self.plan_phases_for_plan(plan_id)?;
+        let total_phases =
+            i64::try_from(phases.len()).map_err(|source| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase count overflowed: {source}"),
+            })?;
+        let any_failed = phases.iter().any(|phase| phase.status == "failed");
+        let any_running = phases.iter().any(|phase| phase.status == "running");
+        let all_completed =
+            total_phases > 0 && phases.iter().all(|phase| phase.status == "completed");
+        let current_status = self
+            .connection
+            .query_row(
+                "SELECT status FROM plans WHERE id = ?1",
+                params![plan_id.trim()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let next_status = if any_failed {
+            "failed"
+        } else if all_completed {
+            "implemented"
+        } else if current_status == "paused" {
+            "paused"
+        } else if any_running {
+            "running"
+        } else if current_status == "draft" {
+            "draft"
+        } else {
+            "ready"
+        };
+        let active_phase_id = phases
+            .iter()
+            .find(|phase| phase.status == "running")
+            .map(|phase| phase.id.as_str());
+        self.connection
+            .execute(
+                "UPDATE plans
+                 SET status = ?2,
+                     active_phase_id = ?3,
+                     completed_at = CASE WHEN ?2 = 'implemented' THEN COALESCE(completed_at, ?4) ELSE NULL END,
+                     completed_by_user_at = NULL,
+                     updated_at = ?4
+                 WHERE id = ?1",
+                params![plan_id.trim(), next_status, active_phase_id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        self.plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found after refresh: {}", plan_id.trim()),
+            })
+    }
+
+    fn plan_step(&self, id: &str) -> Result<Option<PlanStepRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, plan_id, phase_id, sequence, title, detail, acceptance_json,
+                        status, checked_at, created_at, updated_at
+                 FROM plan_steps
+                 WHERE id = ?1",
+                params![id.trim()],
+                plan_step_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    fn plan_phases_for_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<Vec<PlanPhaseRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, plan_id, sequence, title, summary, status,
+                        implementation_chat_id, agent_team_id, agent_task_id, commit_id,
+                        merge_attempt_count, error_message, started_at, completed_at,
+                        created_at, updated_at
+                 FROM plan_phases
+                 WHERE plan_id = ?1
+                 ORDER BY sequence ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![plan_id.trim()], plan_phase_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        let mut phases = collect_rows(rows, &self.database_path)?;
+        for phase in &mut phases {
+            let mut step_statement = self
+                .connection
+                .prepare(
+                    "SELECT id, plan_id, phase_id, sequence, title, detail, acceptance_json,
+                            status, checked_at, created_at, updated_at
+                     FROM plan_steps
+                     WHERE phase_id = ?1
+                     ORDER BY sequence ASC",
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = step_statement
+                .query_map(params![phase.id], plan_step_from_row)
+                .map_err(|source| self.sqlite_error(source))?;
+            phase.steps = collect_rows(rows, &self.database_path)?;
+        }
+
+        Ok(phases)
     }
 
     pub fn insert_chat(&mut self, id: &str, title: &str) -> Result<(), WorkspaceDatabaseError> {
@@ -7734,6 +8428,9 @@ pub enum WorkspaceDatabaseError {
     InvalidMessageMetadata {
         message: String,
     },
+    InvalidPlan {
+        message: String,
+    },
     InvalidScheduledTaskData {
         message: String,
     },
@@ -7816,6 +8513,9 @@ impl fmt::Display for WorkspaceDatabaseError {
             }
             Self::InvalidMessageMetadata { message } => {
                 write!(formatter, "invalid message metadata: {message}")
+            }
+            Self::InvalidPlan { message } => {
+                write!(formatter, "invalid plan: {message}")
             }
             Self::InvalidScheduledTaskData { message } => {
                 write!(formatter, "invalid scheduled task data: {message}")
@@ -7905,6 +8605,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
             | Self::InvalidMessageMetadata { .. }
+            | Self::InvalidPlan { .. }
             | Self::InvalidScheduledTaskData { .. }
             | Self::InvalidWorkspaceSpec { .. }
             | Self::InvalidToolCall { .. }
@@ -7921,6 +8622,135 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::WorkspaceNotDirectory { .. } => None,
         }
     }
+}
+
+fn plan_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanRecord> {
+    Ok(PlanRecord {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        overview: row.get(2)?,
+        status: row.get(3)?,
+        sort_order: row.get(4)?,
+        source_chat_id: row.get(5)?,
+        active_phase_id: row.get(6)?,
+        pause_requested_at: row.get(7)?,
+        completed_at: row.get(8)?,
+        completed_by_user_at: row.get(9)?,
+        error_message: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+        phases: Vec::new(),
+    })
+}
+
+fn plan_phase_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanPhaseRecord> {
+    Ok(PlanPhaseRecord {
+        id: row.get(0)?,
+        plan_id: row.get(1)?,
+        sequence: row.get(2)?,
+        title: row.get(3)?,
+        summary: row.get(4)?,
+        status: row.get(5)?,
+        implementation_chat_id: row.get(6)?,
+        agent_team_id: row.get(7)?,
+        agent_task_id: row.get(8)?,
+        commit_id: row.get(9)?,
+        merge_attempt_count: row.get(10)?,
+        error_message: row.get(11)?,
+        started_at: row.get(12)?,
+        completed_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        steps: Vec::new(),
+    })
+}
+
+fn plan_step_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanStepRecord> {
+    let acceptance_json: String = row.get(6)?;
+    let acceptance = serde_json::from_str::<Vec<String>>(&acceptance_json).map_err(|source| {
+        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(source))
+    })?;
+
+    Ok(PlanStepRecord {
+        id: row.get(0)?,
+        plan_id: row.get(1)?,
+        phase_id: row.get(2)?,
+        sequence: row.get(3)?,
+        title: row.get(4)?,
+        detail: row.get(5)?,
+        acceptance,
+        status: row.get(7)?,
+        checked_at: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+    })
+}
+
+fn validate_plan_view(view: &str) -> Result<(), WorkspaceDatabaseError> {
+    if matches!(view, "active" | "all") {
+        Ok(())
+    } else {
+        Err(WorkspaceDatabaseError::InvalidPlan {
+            message: format!("unknown plan view: {view}"),
+        })
+    }
+}
+
+fn validate_plan_status(status: &str) -> Result<(), WorkspaceDatabaseError> {
+    if matches!(
+        status,
+        "draft"
+            | "ready"
+            | "running"
+            | "paused"
+            | "implemented"
+            | "completed"
+            | "failed"
+            | "cancelled"
+    ) {
+        Ok(())
+    } else {
+        Err(WorkspaceDatabaseError::InvalidPlan {
+            message: format!("unknown plan status: {status}"),
+        })
+    }
+}
+
+fn validate_plan_step_status(status: &str) -> Result<(), WorkspaceDatabaseError> {
+    if matches!(
+        status,
+        "pending" | "running" | "completed" | "failed" | "cancelled"
+    ) {
+        Ok(())
+    } else {
+        Err(WorkspaceDatabaseError::InvalidPlan {
+            message: format!("unknown plan step status: {status}"),
+        })
+    }
+}
+
+fn required_plan_text(field: &str, value: &str) -> Result<String, WorkspaceDatabaseError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(WorkspaceDatabaseError::InvalidPlan {
+            message: format!("plan {field} must not be empty"),
+        });
+    }
+
+    Ok(value.to_string())
+}
+
+fn plan_acceptance_json(values: &[String]) -> Result<String, WorkspaceDatabaseError> {
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value.trim();
+        if !value.is_empty() {
+            normalized.push(value.to_string());
+        }
+    }
+    serde_json::to_string(&normalized).map_err(|source| WorkspaceDatabaseError::InvalidPlan {
+        message: format!("plan acceptance is invalid JSON: {source}"),
+    })
 }
 
 fn code_graph_symbol_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeGraphSymbolRecord> {

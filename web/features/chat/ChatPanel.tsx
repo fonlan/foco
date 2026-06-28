@@ -8,6 +8,7 @@ import {
   Copy,
   FileText,
   GitBranch,
+  ListChecks,
   LoaderCircle,
   Plus,
   RefreshCw,
@@ -130,6 +131,7 @@ function ChatPanelComponent({
   isLoadingSettings,
   isSendingMessage,
   isSelectingAttachments,
+  isPlanModeEnabled,
   isTeamModeEnabled,
   messages,
   onAddPastedImageAttachments,
@@ -148,6 +150,7 @@ function ChatPanelComponent({
   onRetryRun,
   onSelectAttachments,
   onSubmit,
+  onPlanModeEnabledChange,
   onTeamModeEnabledChange,
   onThinkingLevelChange,
   onToggleSkill,
@@ -189,6 +192,7 @@ function ChatPanelComponent({
   isLoadingSettings: boolean;
   isSendingMessage: boolean;
   isSelectingAttachments: boolean;
+  isPlanModeEnabled: boolean;
   isTeamModeEnabled: boolean;
   messages: ShellMessage[];
   onAddPastedImageAttachments: (files: File[]) => void;
@@ -210,6 +214,7 @@ function ChatPanelComponent({
     event: FormEvent<HTMLFormElement>,
     options?: { schedule?: boolean },
   ) => void;
+  onPlanModeEnabledChange: (value: boolean) => void;
   onTeamModeEnabledChange: (value: boolean) => void;
   onThinkingLevelChange: (value: string) => void;
   onToggleSkill: (skillId: string) => void;
@@ -900,6 +905,20 @@ function ChatPanelComponent({
                   <span className="composer-team-toggle-label">{t("Team")}</span>
                 </button>
               ) : null}
+              <button
+                aria-label={t("Plan mode")}
+                aria-pressed={isPlanModeEnabled}
+                className={`composer-team-toggle ${isPlanModeEnabled
+                    ? "composer-team-toggle-enabled"
+                    : ""
+                  }`}
+                onClick={() => onPlanModeEnabledChange(!isPlanModeEnabled)}
+                title={t("Plan mode")}
+                type="button"
+              >
+                <ListChecks aria-hidden="true" className="size-3.5 shrink-0" />
+                <span className="composer-team-toggle-label">{t("Plan")}</span>
+              </button>
               <ComposerModelProviderMenu
                 ariaLabel={t("Model")}
                 className="composer-model-provider-select max-w-full"

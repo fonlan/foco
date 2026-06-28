@@ -940,6 +940,89 @@ CREATE INDEX memory_extraction_jobs_chat_idx ON memory_extraction_jobs (chat_id)
 CREATE INDEX memory_extraction_jobs_created_idx ON memory_extraction_jobs (created_at);
 "#;
 
+pub(crate) const MIGRATION_020: &str = r#"
+CREATE TABLE plans (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    title TEXT NOT NULL CHECK (length(title) > 0),
+    overview TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN (
+        'draft',
+        'ready',
+        'running',
+        'paused',
+        'implemented',
+        'completed',
+        'failed',
+        'cancelled'
+    )),
+    sort_order INTEGER NOT NULL CHECK (sort_order >= 0),
+    source_chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+    active_phase_id TEXT,
+    pause_requested_at TEXT,
+    completed_at TEXT,
+    completed_by_user_at TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX plans_status_sort_idx ON plans (status, sort_order, created_at);
+CREATE INDEX plans_source_chat_idx ON plans (source_chat_id);
+
+CREATE TABLE plan_phases (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    title TEXT NOT NULL CHECK (length(title) > 0),
+    summary TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN (
+        'pending',
+        'running',
+        'completed',
+        'failed',
+        'cancelled'
+    )),
+    implementation_chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+    agent_team_id TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
+    agent_task_id TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
+    commit_id TEXT,
+    merge_attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (merge_attempt_count >= 0),
+    error_message TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (plan_id, sequence)
+);
+
+CREATE INDEX plan_phases_plan_sequence_idx ON plan_phases (plan_id, sequence);
+CREATE INDEX plan_phases_status_idx ON plan_phases (status);
+
+CREATE TABLE plan_steps (
+    id TEXT PRIMARY KEY NOT NULL CHECK (length(id) > 0),
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+    phase_id TEXT NOT NULL REFERENCES plan_phases(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    title TEXT NOT NULL CHECK (length(title) > 0),
+    detail TEXT NOT NULL DEFAULT '',
+    acceptance_json TEXT NOT NULL DEFAULT '[]' CHECK (json_valid(acceptance_json)),
+    status TEXT NOT NULL CHECK (status IN (
+        'pending',
+        'running',
+        'completed',
+        'failed',
+        'cancelled'
+    )),
+    checked_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (phase_id, sequence)
+);
+
+CREATE INDEX plan_steps_plan_idx ON plan_steps (plan_id);
+CREATE INDEX plan_steps_phase_sequence_idx ON plan_steps (phase_id, sequence);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

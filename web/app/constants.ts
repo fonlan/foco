@@ -26,6 +26,7 @@ export const SETTINGS_SECTION_IDS: SettingsSection[] = [
   "agents",
   "prompts",
   "spec",
+  "plan",
   "web-search",
   "workspaces",
   "hooks",

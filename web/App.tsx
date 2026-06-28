@@ -105,6 +105,9 @@ import type {
   MemoryListResponse,
   MemoryMutationResponse,
   OpenChatTab,
+  Plan,
+  PlanResponse,
+  PlansResponse,
   PendingDeleteChat,
   QueueChatMessageResponse,
   QueuedMessageRunSummary,
@@ -438,6 +441,7 @@ export function App() {
   const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionSettings[]>([]);
   const [defaultAgentRolePrompts, setDefaultAgentRolePrompts] = useState<Record<string, string>>({});
   const [isTeamModeEnabled, setIsTeamModeEnabled] = useState(false);
+  const [isPlanModeEnabled, setIsPlanModeEnabled] = useState(false);
   const [isLoadingAgentDefinitions, setIsLoadingAgentDefinitions] = useState(false);
   const [agentDefinitionsError, setAgentDefinitionsError] = useState<string | null>(null);
   const [agentDefinitionOperationKey, setAgentDefinitionOperationKey] = useState<string | null>(null);
@@ -529,6 +533,10 @@ export function App() {
   const [workspaceSpecOperationKey, setWorkspaceSpecOperationKey] = useState<
     "generate" | "save" | "settings" | null
   >(null);
+  const [activePlans, setActivePlans] = useState<Plan[]>([]);
+  const [isLoadingActivePlans, setIsLoadingActivePlans] = useState(false);
+  const [activePlansError, setActivePlansError] = useState<string | null>(null);
+  const [planOperationKey, setPlanOperationKey] = useState<string | null>(null);
   const [runningChatKeys, setRunningChatKeys] = useState<Set<string>>(
     () => new Set(),
   );
@@ -1445,6 +1453,55 @@ export function App() {
     }
   }, []);
 
+  const loadActivePlans = useCallback(async (workspaceId: string) => {
+    setIsLoadingActivePlans(true);
+    setActivePlansError(null);
+
+    try {
+      const data = await requestJson<PlansResponse>(
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/plans?view=active&limit=50`,
+      );
+      if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+        return null;
+      }
+      setActivePlans(data.plans);
+      return data;
+    } catch (requestError) {
+      setActivePlans([]);
+      setActivePlansError(errorMessage(requestError));
+      return null;
+    } finally {
+      setIsLoadingActivePlans(false);
+    }
+  }, []);
+
+  const runPlanAction = useCallback(
+    async (workspaceId: string, planId: string, action: string) => {
+      const operationKey = `${action}:${planId}`;
+      setPlanOperationKey(operationKey);
+      setActivePlansError(null);
+
+      try {
+        await requestJson<PlanResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/${encodeURIComponent(planId)}/action`,
+          {
+            body: JSON.stringify({ action }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
+        await loadActivePlans(workspaceId);
+      } catch (requestError) {
+        setActivePlansError(errorMessage(requestError));
+      } finally {
+        setPlanOperationKey((current) =>
+          current === operationKey ? null : current,
+        );
+      }
+    },
+    [loadActivePlans],
+  );
+
   // ponytail: poll a queued spec job until it settles, then reload spec content.
   // Ceiling: fixed backoff schedule (~165s total); upgrade path is an SSE/job push.
   const pollWorkspaceSpecJobUntilSettled = useCallback(
@@ -1893,6 +1950,26 @@ export function App() {
   }, [activeWorkspace?.id, contextPanelTab, loadWorkspaceSpec]);
 
   useEffect(() => {
+    if (!activeWorkspace?.id) {
+      setActivePlans([]);
+      setActivePlansError(null);
+      setIsLoadingActivePlans(false);
+      return;
+    }
+
+    if (!isContextPanelOpen || contextPanelTab !== "plan") {
+      return;
+    }
+
+    void loadActivePlans(activeWorkspace.id);
+  }, [
+    activeWorkspace?.id,
+    contextPanelTab,
+    isContextPanelOpen,
+    loadActivePlans,
+  ]);
+
+  useEffect(() => {
     setContextMemoryPages({
       global: { page: 1, pageSize: 10 },
       workspace: { page: 1, pageSize: 10 },
@@ -1905,6 +1982,12 @@ export function App() {
     setWorkspaceSpecPreviewEnabled(false);
     setWorkspaceSpecError(null);
     setWorkspaceSpecConflictMessage(null);
+  }, [activeWorkspace?.id]);
+
+  useEffect(() => {
+    setActivePlans([]);
+    setActivePlansError(null);
+    setPlanOperationKey(null);
   }, [activeWorkspace?.id]);
 
   useEffect(() => {
@@ -4723,10 +4806,18 @@ export function App() {
       modelId: selectedModelId,
       providerId: selectedProviderId,
       skillIds,
-      teamModeEnabled: canUseTeamMode && isTeamModeEnabled,
+      sessionMode: isPlanModeEnabled ? "plan" : undefined,
+      teamModeEnabled: !isPlanModeEnabled && canUseTeamMode && isTeamModeEnabled,
       thinkingLevel: selectedThinkingLevel,
       workspaceId: currentWorkspace.id,
     };
+  }
+
+  function handlePlanModeEnabledChange(value: boolean) {
+    setIsPlanModeEnabled(value);
+    if (value) {
+      setIsTeamModeEnabled(false);
+    }
   }
 
   function activeRunForRequest(request: RetryRunRequest): ActiveRunInfo | null {
@@ -4779,6 +4870,7 @@ export function App() {
           modelId: request.modelId,
           providerId: request.providerId,
           skillIds: request.skillIds.length ? request.skillIds : null,
+          sessionMode: request.sessionMode ?? null,
           teamModeEnabled: request.teamModeEnabled ?? false,
           deferStart: options.deferStart ?? false,
           thinkingLevel: request.thinkingLevel || null,
@@ -6508,6 +6600,7 @@ export function App() {
             modelId: request.modelId,
             providerId: request.providerId,
             skillIds: request.skillIds.length ? request.skillIds : null,
+            sessionMode: request.sessionMode ?? null,
             thinkingLevel: request.thinkingLevel || null,
           }),
           cache: "no-store",
@@ -7539,6 +7632,7 @@ export function App() {
                   defaultAgentRolePrompts={defaultAgentRolePrompts}
                   canLogout={canLogout}
                   canUseNativePicker={canUseNativePicker}
+                  activeWorkspaceId={activeWorkspace?.id ?? activeWorkspaceId ?? null}
                   activeSection={settingsSection}
                   isLoadingAgentDefinitions={isLoadingAgentDefinitions}
                   nativeBrowserToken={nativeBrowserToken}
@@ -8171,6 +8265,7 @@ export function App() {
                   isLoadingMoreMessages={isLoadingOlderActiveChatMessages}
                   isSendingMessage={isSendingMessage}
                   isSelectingAttachments={isSelectingAttachments}
+                  isPlanModeEnabled={isPlanModeEnabled}
                   isTeamModeEnabled={canUseTeamMode && isTeamModeEnabled}
                   messages={messages}
                   readOnly={activeChatReadOnly}
@@ -8195,7 +8290,13 @@ export function App() {
                   onRemoveSkill={handleRemoveSkillForChatPanel}
                   onRetryRun={handleRetryRunForChatPanel}
                   onSubmit={handleSubmitForChatPanel}
-                  onTeamModeEnabledChange={setIsTeamModeEnabled}
+                  onPlanModeEnabledChange={handlePlanModeEnabledChange}
+                  onTeamModeEnabledChange={(value) => {
+                    setIsTeamModeEnabled(value);
+                    if (value) {
+                      setIsPlanModeEnabled(false);
+                    }
+                  }}
                   onThinkingLevelChange={handleThinkingLevelChangeForChatPanel}
                   onToggleSkill={handleToggleSkillForChatPanel}
                   onWithdrawQueuedMessage={handleWithdrawQueuedMessageForChatPanel}
@@ -8257,6 +8358,7 @@ export function App() {
                 isLoadingChatStatistics={isLoadingChatStatistics}
                 isLoadingDiff={isLoadingDiff}
                 isLoadingContextMemories={isLoadingContextMemories}
+                isLoadingPlans={isLoadingActivePlans}
                 isLoadingTodoGraph={isLoadingTodoGraph}
                 isLoadingWorkspaceSpec={isLoadingWorkspaceSpec}
                 isLoadingWorkspaceFiles={isLoadingWorkspaceFiles}
@@ -8273,6 +8375,12 @@ export function App() {
                 onRefreshDiff={handleRefreshDiffForContextPanel}
                 onForgetContextMemory={handleForgetContextMemoryForContextPanel}
                 onMemoryPageChange={goToContextMemoryPage}
+                onPlanAction={(planId, action) => {
+                  const workspaceId = activeWorkspace?.id;
+                  if (workspaceId) {
+                    void runPlanAction(workspaceId, planId, action);
+                  }
+                }}
                 onReloadWorkspaceSpec={handleReloadWorkspaceSpecForContextPanel}
                 onSaveWorkspaceSpec={handleSaveWorkspaceSpecForContextPanel}
                 onGenerateWorkspaceSpec={handleGenerateWorkspaceSpecForContextPanel}
@@ -8287,6 +8395,9 @@ export function App() {
                 setWidth={setDiffPanelWidth}
                 onResizeStart={() => setIsResizingDiffPanel(true)}
                 todoGraph={todoGraph}
+                plans={activePlans}
+                planError={activePlansError}
+                planOperationKey={planOperationKey}
                 workspaceSpec={workspaceSpec}
                 workspaceSpecConflictMessage={workspaceSpecConflictMessage}
                 workspaceSpecDraft={workspaceSpecDraft}

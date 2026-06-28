@@ -20,6 +20,15 @@ pub(crate) async fn prepare_prompt_context(
     let requested_provider_id = optional_trimmed_string(request.provider_id);
     let thinking_level = optional_trimmed_string(request.thinking_level);
     let requested_skill_ids = request.skill_ids;
+    let session_mode = optional_trimmed_string(request.session_mode);
+    if let Some(mode) = session_mode.as_deref() {
+        if mode != "plan" {
+            return Err(ApiError::bad_request(format!(
+                "unsupported session mode: {mode}"
+            )));
+        }
+    }
+    let plan_mode = session_mode.as_deref() == Some("plan");
     let queued_user_message_id = normalized_optional_text(request.queued_user_message_id);
     let attachment_inputs = request.attachments;
     let raw_message = optional_trimmed_string(request.message);
@@ -105,10 +114,14 @@ pub(crate) async fn prepare_prompt_context(
     }
 
     let provider_config = provider_connection_config(provider)?;
-    sync_mcp_workspace(&state.mcp_registry, workspace, config)
-        .await
-        .map_err(ApiError::from_mcp_error)?;
-    let mcp_tools = state.mcp_registry.tool_definitions(&workspace.id).await;
+    let mcp_tools = if plan_mode {
+        Vec::new()
+    } else {
+        sync_mcp_workspace(&state.mcp_registry, workspace, config)
+            .await
+            .map_err(ApiError::from_mcp_error)?;
+        state.mcp_registry.tool_definitions(&workspace.id).await
+    };
     let database = WorkspaceDatabase::open_or_create(&workspace.path)
         .map_err(ApiError::from_workspace_error)?;
     let requested_chat_id = optional_trimmed_string(request.chat_id);
@@ -237,10 +250,17 @@ pub(crate) async fn prepare_prompt_context(
         status.available
     };
     let web_search_available = web_search_enabled(&config.web_search);
-    let builtin_tool_definitions =
+    let mut builtin_tool_definitions =
         builtin_tool_definitions_for_runtime(ripgrep_available, web_search_available);
+    if plan_mode {
+        builtin_tool_definitions.retain(|tool| plan_mode_builtin_tool_allowed(tool.name));
+    }
     let memory_tool_definitions = if config.memory.enabled {
-        memory_tool_definitions()
+        let mut tools = memory_tool_definitions();
+        if plan_mode {
+            tools.retain(|tool| tool.name != MEMORY_WRITE_TOOL_NAME);
+        }
+        tools
     } else {
         Vec::new()
     };
@@ -577,6 +597,30 @@ pub(crate) async fn prepare_prompt_context(
 struct ProjectSpecPromptContext {
     message: Option<NeutralChatMessage>,
     pending_snapshot: Option<PendingChatSpecSnapshot>,
+}
+
+fn plan_mode_builtin_tool_allowed(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        READ_FILE_TOOL
+            | FIND_FILES_TOOL
+            | SEARCH_TEXT_TOOL
+            | GRAPH_FIND_SYMBOLS_TOOL
+            | GRAPH_FIND_CALLERS_TOOL
+            | GRAPH_FIND_CALLEES_TOOL
+            | GRAPH_FIND_REFERENCES_TOOL
+            | GRAPH_RELATED_FILES_TOOL
+            | GRAPH_EXPLORE_TOOL
+            | WEB_SEARCH_TOOL
+            | WEB_FETCH_TOOL
+            | GET_TODO_GRAPH_TOOL
+            | ASK_QUESTION_TOOL
+            | SLEEP_TOOL
+            | CREATE_PLAN_TOOL
+            | GET_PLANS_TOOL
+            | UPDATE_PLAN_TOOL
+            | UPDATE_PLAN_STEP_TOOL
+    )
 }
 
 fn project_spec_prompt_context(

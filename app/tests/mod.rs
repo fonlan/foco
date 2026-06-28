@@ -3823,6 +3823,7 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "Use a tool".to_string(),
             attachments: Vec::new(),
         },
@@ -5019,6 +5020,7 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
             provider_id: Some("provider".to_string()),
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "First Coordinator task".to_string(),
             team_mode_enabled: false,
             defer_start: false,
@@ -5218,6 +5220,7 @@ async fn queue_chat_message_creates_default_team_for_normal_send() {
             provider_id: Some("provider".to_string()),
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "Normal send".to_string(),
             team_mode_enabled: false,
             defer_start: false,
@@ -5303,6 +5306,7 @@ async fn queue_chat_message_defer_start_does_not_wake_scheduler() {
             provider_id: Some("provider".to_string()),
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "Deferred send".to_string(),
             team_mode_enabled: false,
             defer_start: true,
@@ -5356,6 +5360,7 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
             provider_id: Some("provider".to_string()),
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "Scheduled prompt".to_string(),
             team_mode_enabled: false,
             defer_start: false,
@@ -6051,6 +6056,7 @@ async fn queue_chat_message_resumes_paused_coordinator_without_active_work() {
             provider_id: Some("provider".to_string()),
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "Continue after restart".to_string(),
             team_mode_enabled: false,
             defer_start: false,
@@ -10136,6 +10142,7 @@ Search memory before repo work.
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "Hello".to_string(),
             attachments: Vec::new(),
         },
@@ -10272,6 +10279,7 @@ Search memory before repo work.
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "Next".to_string(),
             attachments: Vec::new(),
         },
@@ -10414,6 +10422,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "Hello after creation".to_string(),
             attachments: Vec::new(),
         },
@@ -10533,6 +10542,7 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "Hello after creation".to_string(),
             attachments: Vec::new(),
         },
@@ -10632,6 +10642,7 @@ Use the existing product UI conventions.
             provider_id: None,
             thinking_level: None,
             skill_ids: Some(vec!["workspace:default:web-design-guidelines".to_string()]),
+            session_mode: None,
             message: "Settings single-column layout.".to_string(),
             attachments: Vec::new(),
         },
@@ -10713,6 +10724,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("hello".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -10735,7 +10747,8 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
     let available_tools_message = context
         .provider_request
         .messages
-        .get(1)
+        .iter()
+        .find(|message| message.content.contains("<available_tools>"))
         .expect("available tools message");
     assert_eq!(available_tools_message.role, NeutralChatRole::System);
     assert!(
@@ -10759,6 +10772,86 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
             .messages
             .iter()
             .all(|message| !message.content.contains("<memory>"))
+    );
+
+    drop(context);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prepare_prompt_context_plan_mode_exposes_only_read_and_plan_tools() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-mode-tools-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-mode-tools-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    config.memory.enabled = true;
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    let context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: Some("plan".to_string()),
+            message: Some("draft a plan".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ContextPreview,
+    )
+    .await
+    .expect("plan mode prompt context");
+    let tool_names = context
+        .provider_request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<BTreeSet<_>>();
+
+    assert!(tool_names.contains(READ_FILE_TOOL));
+    assert!(tool_names.contains(CREATE_PLAN_TOOL));
+    assert!(tool_names.contains(GET_PLANS_TOOL));
+    assert!(tool_names.contains(UPDATE_PLAN_TOOL));
+    assert!(tool_names.contains(UPDATE_PLAN_STEP_TOOL));
+    assert!(tool_names.contains(MEMORY_SEARCH_TOOL_NAME));
+    assert!(!tool_names.contains(WRITE_FILE_TOOL));
+    assert!(!tool_names.contains(EDIT_FILE_TOOL));
+    assert!(!tool_names.contains(RUN_COMMAND_TOOL));
+    assert!(!tool_names.contains(CREATE_TODO_GRAPH_TOOL));
+    assert!(!tool_names.contains(UPDATE_TODO_GRAPH_TOOL));
+    assert!(!tool_names.contains(MEMORY_WRITE_TOOL_NAME));
+
+    let available_tools_message = context
+        .provider_request
+        .messages
+        .iter()
+        .find(|message| message.content.contains("<available_tools>"))
+        .expect("available tools message");
+    assert!(
+        available_tools_message
+            .content
+            .contains(&format!(r#"<tool name="{CREATE_PLAN_TOOL}">"#))
+    );
+    assert!(
+        !available_tools_message
+            .content
+            .contains(&format!(r#"<tool name="{WRITE_FILE_TOOL}">"#))
+    );
+    assert!(
+        !available_tools_message
+            .content
+            .contains(&format!(r#"<tool name="{MEMORY_WRITE_TOOL_NAME}">"#))
     );
 
     drop(context);
@@ -10808,6 +10901,7 @@ async fn prepare_prompt_context_rejects_memory_dream_transcript_chat() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("continue".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -10888,6 +10982,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("hello".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -10945,6 +11040,7 @@ async fn prepare_prompt_context_hides_web_search_without_enabled_search_api() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("hello".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -11000,6 +11096,7 @@ async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("hello".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -11094,6 +11191,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("hello".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -11223,6 +11321,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "hello".to_string(),
             attachments: Vec::new(),
         },
@@ -11253,6 +11352,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "next".to_string(),
             attachments: Vec::new(),
         },
@@ -11310,6 +11410,7 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "start with the spec".to_string(),
             attachments: Vec::new(),
         },
@@ -11366,6 +11467,7 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "follow up".to_string(),
             attachments: Vec::new(),
         },
@@ -11419,6 +11521,7 @@ async fn prepare_chat_context_skips_project_spec_when_injection_disabled() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "no spec please".to_string(),
             attachments: Vec::new(),
         },
@@ -11492,6 +11595,7 @@ async fn prepare_prompt_context_preview_uses_saved_project_spec_snapshot() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("preview".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -11555,6 +11659,7 @@ async fn prompt_cache_key_changes_when_new_chat_project_spec_snapshot_changes() 
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("same user text".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -11594,6 +11699,7 @@ async fn prompt_cache_key_changes_when_new_chat_project_spec_snapshot_changes() 
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("same user text".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -11742,6 +11848,7 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("renderer prompt assembly".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -11923,6 +12030,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("继续完成剩下的工作".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -12076,6 +12184,7 @@ async fn prepare_prompt_context_allocates_after_hidden_worker_messages() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("Follow up".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -12176,6 +12285,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "renderer first turn".to_string(),
             attachments: Vec::new(),
         },
@@ -12260,6 +12370,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: "renderer second turn".to_string(),
             attachments: Vec::new(),
         },
@@ -12400,6 +12511,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("现在 markdown 预览支持公式吗？".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -12672,6 +12784,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("Preview workspace memory usage".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -12808,6 +12921,7 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
             provider_id: None,
             thinking_level: None,
             skill_ids: None,
+            session_mode: None,
             message: Some("Preview retrieval memory".to_string()),
             assistant_draft: None,
             assistant_draft_reasoning: None,

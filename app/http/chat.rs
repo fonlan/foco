@@ -47,6 +47,7 @@ pub(crate) struct ChatStreamRequest {
     pub(crate) provider_id: Option<String>,
     pub(crate) thinking_level: Option<String>,
     pub(crate) skill_ids: Option<Vec<String>>,
+    pub(crate) session_mode: Option<String>,
     pub(crate) message: String,
     #[serde(default)]
     pub(crate) attachments: Vec<ChatAttachmentInput>,
@@ -60,6 +61,7 @@ pub(crate) struct QueueChatMessageRequest {
     pub(crate) provider_id: Option<String>,
     pub(crate) thinking_level: Option<String>,
     pub(crate) skill_ids: Option<Vec<String>>,
+    pub(crate) session_mode: Option<String>,
     pub(crate) message: String,
     #[serde(default)]
     pub(crate) team_mode_enabled: bool,
@@ -210,6 +212,7 @@ pub(crate) struct QueuedRunSummary {
     pub(crate) provider_id: Option<String>,
     pub(crate) thinking_level: Option<String>,
     pub(crate) skill_ids: Vec<String>,
+    pub(crate) session_mode: Option<String>,
     pub(crate) content: Option<String>,
 }
 
@@ -327,6 +330,7 @@ pub(crate) struct QueueChatMessageInput {
     pub(crate) provider_id: Option<String>,
     pub(crate) thinking_level: Option<String>,
     pub(crate) skill_ids: Option<Vec<String>>,
+    pub(crate) session_mode: Option<String>,
     pub(crate) message: String,
     pub(crate) team_mode_enabled: bool,
     pub(crate) defer_start: bool,
@@ -362,6 +366,7 @@ pub(crate) async fn queue_chat_message(
             provider_id: request.provider_id,
             thinking_level: request.thinking_level,
             skill_ids: request.skill_ids,
+            session_mode: request.session_mode,
             message: request.message,
             team_mode_enabled: request.team_mode_enabled,
             defer_start: request.defer_start,
@@ -399,6 +404,7 @@ pub(crate) async fn queue_chat_message_internal(
         provider_id,
         thinking_level,
         skill_ids,
+        session_mode,
         message: task_message,
         team_mode_enabled,
         defer_start,
@@ -431,6 +437,7 @@ pub(crate) async fn queue_chat_message_internal(
     let requested_provider_id = provider_id.clone();
     let requested_thinking_level = thinking_level.clone();
     let requested_skill_ids = skill_ids.clone().unwrap_or_default();
+    let requested_session_mode = session_mode.clone();
     let origin_metadata = origin.metadata_value();
     let preallocated_chat_id = if chat_id.is_none() {
         Some(unique_id("chat"))
@@ -448,6 +455,7 @@ pub(crate) async fn queue_chat_message_internal(
             provider_id,
             thinking_level,
             skill_ids,
+            session_mode,
             message: Some(task_message.clone()),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -487,6 +495,7 @@ pub(crate) async fn queue_chat_message_internal(
         requested_provider_id.as_deref(),
         requested_thinking_level.as_deref(),
         &requested_skill_ids,
+        requested_session_mode.as_deref(),
         origin_metadata.as_ref(),
     )?;
 
@@ -505,6 +514,7 @@ pub(crate) async fn queue_chat_message_internal(
             requested_thinking_level.as_deref(),
             &requested_skill_ids,
             message,
+            requested_session_mode.as_deref(),
             origin_metadata.as_ref(),
         )?;
         database
@@ -574,6 +584,7 @@ pub(crate) async fn queue_chat_message_internal(
             message: task_message,
             attachments: task_attachments,
             skill_ids: requested_skill_ids.clone(),
+            session_mode: requested_session_mode.clone(),
             collaboration_tools_enabled: team_mode_enabled,
             defer_until_workspace_idle: defer_start,
             delegated_input: None,
@@ -697,41 +708,16 @@ async fn default_agent_definition(
 }
 
 async fn default_agent_allowed_tools(
-    state: &AppState,
-    config: &GlobalConfig,
+    _state: &AppState,
+    _config: &GlobalConfig,
     prompt_context: &PreparedPromptContext,
 ) -> Result<Vec<String>, ApiError> {
-    let ripgrep_available = {
-        let status = state
-            .ripgrep_status
-            .lock()
-            .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
-        status.available
-    };
-    let mut tools = builtin_tool_definitions_for_runtime(
-        ripgrep_available,
-        crate::runtime::web_search_enabled(&config.web_search),
-    )
-    .into_iter()
-    .map(|definition| definition.name.to_string())
-    .collect::<Vec<_>>();
-
-    if config.memory.enabled {
-        tools.extend(
-            memory_tool_definitions()
-                .into_iter()
-                .map(|definition| definition.name),
-        );
-    }
-
-    tools.extend(
-        state
-            .mcp_registry
-            .tool_definitions(&prompt_context.workspace_id)
-            .await
-            .into_iter()
-            .map(|definition| definition.name),
-    );
+    let mut tools = prompt_context
+        .provider_request
+        .tools
+        .iter()
+        .map(|definition| definition.name.clone())
+        .collect::<Vec<_>>();
     tools.sort();
     tools.dedup();
     Ok(tools)

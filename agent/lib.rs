@@ -872,6 +872,10 @@ const GRAPH_EXPLORE_TOOL_NAME: &str = "graph_explore";
 const CREATE_TODO_GRAPH_TOOL_NAME: &str = "create_todo_graph";
 const UPDATE_TODO_GRAPH_TOOL_NAME: &str = "update_todo_graph";
 const GET_TODO_GRAPH_TOOL_NAME: &str = "get_todo_graph";
+const CREATE_PLAN_TOOL_NAME: &str = "create_plan";
+const GET_PLANS_TOOL_NAME: &str = "get_plans";
+const UPDATE_PLAN_TOOL_NAME: &str = "update_plan";
+const UPDATE_PLAN_STEP_TOOL_NAME: &str = "update_plan_step";
 const AGENT_LIST_TOOL_NAME: &str = "agent_list";
 const AGENT_GET_TASK_TOOL_NAME: &str = "agent_get_task";
 const AGENT_SEND_MESSAGE_TOOL_NAME: &str = "agent_send_message";
@@ -968,6 +972,7 @@ pub enum ToolResource {
     WorkspaceFiles,
     File(String),
     TodoGraph,
+    Plan,
     Memory(String),
     ExternalTool(String),
 }
@@ -1533,6 +1538,16 @@ pub fn tool_resource_locks(
             resource: ToolResource::TodoGraph,
             access: ToolResourceAccess::Read,
         }],
+        CREATE_PLAN_TOOL_NAME | UPDATE_PLAN_TOOL_NAME | UPDATE_PLAN_STEP_TOOL_NAME => {
+            vec![ToolResourceLock {
+                resource: ToolResource::Plan,
+                access: ToolResourceAccess::Write,
+            }]
+        }
+        GET_PLANS_TOOL_NAME => vec![ToolResourceLock {
+            resource: ToolResource::Plan,
+            access: ToolResourceAccess::Read,
+        }],
         AGENT_LIST_TOOL_NAME
         | AGENT_GET_TASK_TOOL_NAME
         | AGENT_SEND_MESSAGE_TOOL_NAME
@@ -1586,6 +1601,7 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | GRAPH_RELATED_FILES_TOOL_NAME
         | GRAPH_EXPLORE_TOOL_NAME
         | GET_TODO_GRAPH_TOOL_NAME
+        | GET_PLANS_TOOL_NAME
         | MEMORY_SEARCH_TOOL_NAME
         | WEB_SEARCH_TOOL_NAME
         | WEB_FETCH_TOOL_NAME
@@ -1603,6 +1619,9 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | EDIT_FILE_TOOL_NAME
         | CREATE_TODO_GRAPH_TOOL_NAME
         | UPDATE_TODO_GRAPH_TOOL_NAME
+        | CREATE_PLAN_TOOL_NAME
+        | UPDATE_PLAN_TOOL_NAME
+        | UPDATE_PLAN_STEP_TOOL_NAME
         | MEMORY_WRITE_TOOL_NAME => ToolEffect::WorkspaceMutation,
         RUN_COMMAND_TOOL_NAME => ToolEffect::ExternalOrUnknown,
         name if name.starts_with(MCP_TOOL_NAME_PREFIX) => ToolEffect::ExternalOrUnknown,
@@ -1748,6 +1767,9 @@ fn tool_call_requires_sequential_execution(tool_name: &str) -> bool {
             | RUN_COMMAND_TOOL_NAME
             | CREATE_TODO_GRAPH_TOOL_NAME
             | UPDATE_TODO_GRAPH_TOOL_NAME
+            | CREATE_PLAN_TOOL_NAME
+            | UPDATE_PLAN_TOOL_NAME
+            | UPDATE_PLAN_STEP_TOOL_NAME
             | MEMORY_WRITE_TOOL_NAME
     ) || tool_name.starts_with(MCP_TOOL_NAME_PREFIX)
 }
@@ -1799,6 +1821,7 @@ fn resources_overlap(first: &ToolResource, second: &ToolResource) -> bool {
         | (ToolResource::File(_), ToolResource::WorkspaceFiles) => true,
         (ToolResource::File(first), ToolResource::File(second)) => first == second,
         (ToolResource::TodoGraph, ToolResource::TodoGraph) => true,
+        (ToolResource::Plan, ToolResource::Plan) => true,
         (ToolResource::Memory(first), ToolResource::Memory(second)) => {
             first == second || first == "all" || second == "all"
         }
@@ -1918,6 +1941,7 @@ impl fmt::Display for ToolResource {
             Self::WorkspaceFiles => write!(formatter, "workspace files"),
             Self::File(path) => write!(formatter, "file '{path}'"),
             Self::TodoGraph => write!(formatter, "current chat todo graph"),
+            Self::Plan => write!(formatter, "workspace plans"),
             Self::Memory(scope) => write!(formatter, "memory scope '{scope}'"),
             Self::ExternalTool(tool_name) => write!(formatter, "external tool '{tool_name}'"),
         }

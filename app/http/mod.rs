@@ -5,6 +5,7 @@ pub mod chat;
 pub mod git;
 pub mod hooks;
 pub mod memory;
+pub mod plans;
 pub mod router;
 pub mod scheduled_tasks;
 pub mod settings;

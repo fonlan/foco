@@ -5,7 +5,7 @@ use axum::{
     extract::DefaultBodyLimit,
     middleware,
     response::Response,
-    routing::{get, post, put},
+    routing::{get, patch, post, put},
 };
 
 use crate::{
@@ -93,6 +93,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
         .route(
             "/api/settings/spec",
             post(crate::http::settings::save_spec_settings),
+        )
+        .route(
+            "/api/settings/plan",
+            post(crate::http::settings::save_plan_settings),
         )
         .route(
             "/api/settings/prompts",
@@ -243,6 +247,22 @@ pub(crate) fn app_router(state: AppState) -> Router {
         .route(
             "/api/workspaces/{workspace_id}/spec/jobs",
             get(crate::http::spec::workspace_spec_jobs),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/plans",
+            get(crate::http::plans::plans).post(crate::http::plans::create_plan),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/plans/{plan_id}",
+            patch(crate::http::plans::update_plan),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/plans/{plan_id}/action",
+            post(crate::http::plans::plan_action),
+        )
+        .route(
+            "/api/workspaces/{workspace_id}/plans/{plan_id}/steps/{step_id}/action",
+            post(crate::http::plans::plan_step_action),
         )
         .route(
             "/api/workspaces/{workspace_id}/hooks/runs",

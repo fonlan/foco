@@ -4,6 +4,7 @@ mod definitions;
 mod errors;
 mod file_tools;
 mod graph_tools;
+mod plan_tools;
 mod todo_tools;
 
 use std::{
@@ -48,6 +49,10 @@ pub const GRAPH_EXPLORE_TOOL: &str = "graph_explore";
 pub const CREATE_TODO_GRAPH_TOOL: &str = "create_todo_graph";
 pub const UPDATE_TODO_GRAPH_TOOL: &str = "update_todo_graph";
 pub const GET_TODO_GRAPH_TOOL: &str = "get_todo_graph";
+pub const CREATE_PLAN_TOOL: &str = "create_plan";
+pub const GET_PLANS_TOOL: &str = "get_plans";
+pub const UPDATE_PLAN_TOOL: &str = "update_plan";
+pub const UPDATE_PLAN_STEP_TOOL: &str = "update_plan_step";
 pub const ASK_QUESTION_TOOL: &str = "ask_question";
 pub const AGENT_LIST_TOOL: &str = "agent_list";
 pub const AGENT_GET_TASK_TOOL: &str = "agent_get_task";
@@ -87,6 +92,7 @@ const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_TODO_GRAPH_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_PLAN_TOOL_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_AGENT_TOOL_TIMEOUT_MS: u64 = 10_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 600_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
@@ -254,6 +260,10 @@ fn execute_builtin_tool_inner(
         CREATE_TODO_GRAPH_TOOL => todo_tools::create_todo_graph(workspace_path, chat_id, arguments),
         UPDATE_TODO_GRAPH_TOOL => todo_tools::update_todo_graph(workspace_path, chat_id, arguments),
         GET_TODO_GRAPH_TOOL => todo_tools::get_todo_graph(workspace_path, chat_id, arguments),
+        CREATE_PLAN_TOOL => plan_tools::create_plan(workspace_path, chat_id, arguments),
+        GET_PLANS_TOOL => plan_tools::get_plans(workspace_path, arguments),
+        UPDATE_PLAN_TOOL => plan_tools::update_plan(workspace_path, arguments),
+        UPDATE_PLAN_STEP_TOOL => plan_tools::update_plan_step(workspace_path, arguments),
         ASK_QUESTION_TOOL => Err(ToolRuntimeError::InvalidArguments(
             "ask_question must be executed through the chat UI question bridge".to_string(),
         )),

@@ -646,6 +646,7 @@ fn scheduled_queue_input(
                 provider_id,
                 thinking_level,
                 skill_ids: Some(skill_ids),
+                session_mode: None,
                 message: prompt,
                 team_mode_enabled: collaboration_tools_enabled,
                 defer_start: false,

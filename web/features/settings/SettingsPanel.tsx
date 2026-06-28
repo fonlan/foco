@@ -103,6 +103,9 @@ import type {
   ModelMetadataRecord,
   ModelMetadataResponse,
   NativeSelectedFile,
+  Plan,
+  PlanResponse,
+  PlansResponse,
   PromptSettingsFormState,
   PromptSettingsSummary,
   ProviderFormState,
@@ -284,6 +287,7 @@ const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
 
 export function SettingsPanel({
   activeSection,
+  activeWorkspaceId,
   agentDefinitionOperationKey,
   agentDefinitions,
   agentDefinitionsError,
@@ -304,6 +308,7 @@ export function SettingsPanel({
   workspaceDialogRevision,
 }: {
   activeSection: SettingsSection;
+  activeWorkspaceId: string | null;
   agentDefinitionOperationKey: string | null;
   agentDefinitions: AgentDefinitionSettings[];
   agentDefinitionsError: string | null;
@@ -349,6 +354,14 @@ export function SettingsPanel({
     useState<PromptSettingsFormState>(() => emptyPromptSettingsForm());
   const [specSettingsForm, setSpecSettingsForm] =
     useState<SpecSettingsFormState>(() => emptySpecSettingsForm());
+  const [planMergeAutomationMode, setPlanMergeAutomationMode] =
+    useState("isolated_auto_once");
+  const [planHistory, setPlanHistory] = useState<Plan[]>([]);
+  const [planHistoryPage, setPlanHistoryPage] = useState(1);
+  const [planHistoryPageSize, setPlanHistoryPageSize] = useState(20);
+  const [planHistoryStatus, setPlanHistoryStatus] = useState("");
+  const [planHistoryTotalCount, setPlanHistoryTotalCount] = useState(0);
+  const [planHistoryTotalPages, setPlanHistoryTotalPages] = useState(0);
   const [memorySettingsForm, setMemorySettingsForm] =
     useState<MemorySettingsFormState>(() => emptyMemorySettingsForm());
   const [memoryFilter, setMemoryFilter] = useState<MemoryFilterState>(() =>
@@ -437,6 +450,10 @@ export function SettingsPanel({
   const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
   const [isSavingPromptSettings, setIsSavingPromptSettings] = useState(false);
   const [isSavingSpecSettings, setIsSavingSpecSettings] = useState(false);
+  const [isSavingPlanSettings, setIsSavingPlanSettings] = useState(false);
+  const [isLoadingPlanHistory, setIsLoadingPlanHistory] = useState(false);
+  const [planHistoryError, setPlanHistoryError] = useState<string | null>(null);
+  const [planHistoryOperationKey, setPlanHistoryOperationKey] = useState<string | null>(null);
   const [isSelectingPromptFile, setIsSelectingPromptFile] = useState(false);
   const [isSavingMemorySettings, setIsSavingMemorySettings] = useState(false);
   const [isLoadingMemories, setIsLoadingMemories] = useState(false);
@@ -540,6 +557,9 @@ export function SettingsPanel({
     null;
   const selectedMemory =
     memories.find((memory) => memory.id === selectedMemoryId) ?? null;
+  const planWorkspace =
+    settings?.workspaces.find((workspace) => workspace.id === activeWorkspaceId) ??
+    null;
   const memoryPaginationItems = auditPaginationItems(
     memoryListMeta.page,
     memoryListMeta.totalPages,
@@ -581,6 +601,16 @@ export function SettingsPanel({
       sortedMemoryDreamJobs.length,
       memoryDreamPageStart + paginatedMemoryDreamJobs.length - 1,
     )
+    : 0;
+  const planHistoryPaginationItems = auditPaginationItems(
+    planHistoryPage,
+    planHistoryTotalPages,
+  );
+  const planHistoryPageStart = planHistory.length
+    ? (planHistoryPage - 1) * planHistoryPageSize + 1
+    : 0;
+  const planHistoryPageEnd = planHistory.length
+    ? Math.min(planHistoryTotalCount, planHistoryPageStart + planHistory.length - 1)
     : 0;
   const memoryDreamDetailJob =
     sortedMemoryDreamJobs.find((job) => job.id === memoryDreamDetailJobId) ??
@@ -843,6 +873,12 @@ export function SettingsPanel({
     });
   }
 
+  function syncPlanSettingsForm(data: SettingsResponse) {
+    setPlanMergeAutomationMode(
+      data.plan.mergeAutomationMode || "isolated_auto_once",
+    );
+  }
+
   function syncMemorySettingsForm(data: SettingsResponse) {
     setMemorySettingsForm({
       enabled: data.memory.enabled,
@@ -904,6 +940,7 @@ export function SettingsPanel({
       syncWebSearchForm(data);
       syncPromptSettingsForm(data);
       syncSpecSettingsForm(data);
+      syncPlanSettingsForm(data);
       syncMemorySettingsForm(data);
       setProviderForm((current) => ({
         ...current,
@@ -1052,6 +1089,49 @@ export function SettingsPanel({
     }
   }, []);
 
+  const loadPlanHistory = useCallback(async () => {
+    if (!activeWorkspaceId) {
+      setPlanHistory([]);
+      setPlanHistoryTotalCount(0);
+      setPlanHistoryTotalPages(0);
+      setPlanHistoryError(null);
+      return;
+    }
+
+    setIsLoadingPlanHistory(true);
+    setPlanHistoryError(null);
+
+    try {
+      const params = new URLSearchParams({
+        page: String(planHistoryPage),
+        pageSize: String(planHistoryPageSize),
+        view: "all",
+      });
+      if (planHistoryStatus) {
+        params.set("status", planHistoryStatus);
+      }
+      const data = await requestJson<PlansResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/plans?${params.toString()}`,
+      );
+      if (data.totalPages > 0 && data.page > data.totalPages) {
+        setPlanHistoryPage(data.totalPages);
+        return;
+      }
+      setPlanHistory(data.plans);
+      setPlanHistoryPage(data.page);
+      setPlanHistoryPageSize(data.pageSize);
+      setPlanHistoryTotalCount(data.totalCount);
+      setPlanHistoryTotalPages(data.totalPages);
+    } catch (requestError) {
+      setPlanHistory([]);
+      setPlanHistoryTotalCount(0);
+      setPlanHistoryTotalPages(0);
+      setPlanHistoryError(errorMessage(requestError));
+    } finally {
+      setIsLoadingPlanHistory(false);
+    }
+  }, [activeWorkspaceId, planHistoryPage, planHistoryPageSize, planHistoryStatus]);
+
   function closeMemoryDreamDetailDialog() {
     setMemoryDreamDetailJobId(null);
     setMemoryDreamChanges([]);
@@ -1079,6 +1159,12 @@ export function SettingsPanel({
       void loadMemoryDreamJobs();
     }
   }, [activeSection, loadMemoryDreamJobs]);
+
+  useEffect(() => {
+    if (activeSection === "plan") {
+      void loadPlanHistory();
+    }
+  }, [activeSection, loadPlanHistory]);
 
   useEffect(() => {
     if (activeSection !== "memory" || !memoryDreamDetailJobId) {
@@ -1720,6 +1806,29 @@ export function SettingsPanel({
     }
   }
 
+  async function savePlanSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setIsSavingPlanSettings(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<SettingsResponse>("/api/settings/plan", {
+        body: JSON.stringify({
+          mergeAutomationMode: planMergeAutomationMode,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      setSettings(data);
+      onSettingsChange(data);
+      syncPlanSettingsForm(data);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingPlanSettings(false);
+    }
+  }
+
   function addSystemPrompt(name: string) {
     const nextName = name.trim();
     if (!nextName) {
@@ -2134,6 +2243,47 @@ export function SettingsPanel({
         positiveIntegerText(value, current),
       ),
     );
+  }
+
+  function goToPlanHistoryPage(page: number) {
+    const maxPage = planHistoryTotalPages || 1;
+    setPlanHistoryPage(Math.min(Math.max(1, page), maxPage));
+  }
+
+  function updatePlanHistoryPageSize(value: string) {
+    setPlanHistoryPage(1);
+    setPlanHistoryPageSize((current) =>
+      Math.min(100, positiveIntegerText(value, current)),
+    );
+  }
+
+  async function runPlanHistoryAction(planId: string, action: string) {
+    if (!activeWorkspaceId) {
+      setPlanHistoryError(t("Select a workspace first."));
+      return;
+    }
+
+    const operationKey = `${action}:${planId}`;
+    setPlanHistoryOperationKey(operationKey);
+    setPlanHistoryError(null);
+
+    try {
+      await requestJson<PlanResponse>(
+        `/api/workspaces/${encodeURIComponent(activeWorkspaceId)}/plans/${encodeURIComponent(planId)}/action`,
+        {
+          body: JSON.stringify({ action }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
+      await loadPlanHistory();
+    } catch (requestError) {
+      setPlanHistoryError(errorMessage(requestError));
+    } finally {
+      setPlanHistoryOperationKey((current) =>
+        current === operationKey ? null : current,
+      );
+    }
   }
 
   function handleMemoryDreamHistoryWheel(event: ReactWheelEvent<HTMLDivElement>) {
@@ -3722,6 +3872,12 @@ export function SettingsPanel({
               onClick={() => onActiveSectionChange("spec")}
             />
             <SettingsNavButton
+              active={activeSection === "plan"}
+              icon={ListChecks}
+              label={t("Plan settings")}
+              onClick={() => onActiveSectionChange("plan")}
+            />
+            <SettingsNavButton
               active={activeSection === "web-search"}
               icon={Search}
               label={t("Web Search")}
@@ -4889,6 +5045,277 @@ export function SettingsPanel({
                   {t("Save")}
                 </button>
               </form>
+            </section>
+          ) : null}
+
+          {activeSection === "plan" ? (
+            <section className="grid gap-4">
+              <form
+                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+                onSubmit={(event) => void savePlanSettings(event)}
+              >
+                <div className="flex items-center gap-2">
+                  <ListChecks aria-hidden="true" className="size-5 text-teal-700" />
+                  <h3 className="text-sm font-semibold text-stone-950">
+                    {t("Plan automation")}
+                  </h3>
+                </div>
+                <label className="mt-4 block">
+                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    {t("Merge automation")}
+                  </span>
+                  <select
+                    aria-label={t("Merge automation")}
+                    className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    onChange={(event) => setPlanMergeAutomationMode(event.target.value)}
+                    value={planMergeAutomationMode}
+                  >
+                    {(settings?.plan.mergeAutomationModes ?? []).map((mode) => (
+                      <option key={mode.value} value={mode.value}>
+                        {t(mode.label)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  aria-label={t("Save plan settings")}
+                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                  disabled={isSavingPlanSettings}
+                  title={t("Save plan settings")}
+                  type="submit"
+                >
+                  {isSavingPlanSettings ? (
+                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                  ) : (
+                    <CheckCircle2 aria-hidden="true" className="size-4" />
+                  )}
+                  {t("Save")}
+                </button>
+              </form>
+
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-stone-950">
+                      {t("Plan history")}
+                    </h3>
+                    <p className="mt-1 truncate text-xs text-stone-500">
+                      {planWorkspace?.name ?? t("No workspace selected")}
+                    </p>
+                  </div>
+                  <button
+                    aria-label={t("Refresh plan history")}
+                    className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                    disabled={isLoadingPlanHistory || !activeWorkspaceId}
+                    onClick={() => void loadPlanHistory()}
+                    title={t("Refresh plan history")}
+                    type="button"
+                  >
+                    {isLoadingPlanHistory ? (
+                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                    ) : (
+                      <RefreshCw aria-hidden="true" className="size-4" />
+                    )}
+                  </button>
+                </div>
+
+                <div className="grid gap-3 border-b border-stone-200 px-4 py-3 md:grid-cols-[minmax(0,1fr)_10rem]">
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Plan status")}
+                    </span>
+                    <select
+                      aria-label={t("Plan status")}
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      onChange={(event) => {
+                        setPlanHistoryPage(1);
+                        setPlanHistoryStatus(event.target.value);
+                      }}
+                      value={planHistoryStatus}
+                    >
+                      <option value="">{t("All statuses")}</option>
+                      {[
+                        "draft",
+                        "ready",
+                        "running",
+                        "paused",
+                        "implemented",
+                        "completed",
+                        "failed",
+                        "cancelled",
+                      ].map((status) => (
+                        <option key={status} value={status}>
+                          {t(planStatusLabel(status))}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      {t("Page size")}
+                    </span>
+                    <input
+                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      inputMode="numeric"
+                      onChange={(event) => updatePlanHistoryPageSize(event.target.value)}
+                      value={planHistoryPageSize}
+                    />
+                  </label>
+                </div>
+
+                {planHistoryError ? (
+                  <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                    {planHistoryError}
+                  </div>
+                ) : null}
+
+                <div className="divide-y divide-stone-100">
+                  {!activeWorkspaceId ? (
+                    <div className="px-4 py-6 text-sm text-stone-500">
+                      {t("No workspace selected")}
+                    </div>
+                  ) : planHistory.length ? (
+                    planHistory.map((plan) => {
+                      const action = planHistoryAction(plan.status);
+                      const operationKey = action ? `${action}:${plan.id}` : null;
+                      const totalSteps = plan.phases.reduce(
+                        (count, phase) => count + phase.steps.length,
+                        0,
+                      );
+                      const completedSteps = plan.phases.reduce(
+                        (count, phase) =>
+                          count + phase.steps.filter((step) => step.status === "completed").length,
+                        0,
+                      );
+
+                      return (
+                        <article className="px-4 py-3" key={plan.id}>
+                          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                            <div className="min-w-0">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-sm font-semibold text-stone-950">
+                                  {plan.title}
+                                </span>
+                                <CapabilityPill
+                                  label={t(planStatusLabel(plan.status))}
+                                  ok={plan.status === "completed" || plan.status === "implemented"}
+                                  tone={planStatusTone(plan.status)}
+                                />
+                                <CapabilityPill
+                                  label={`${completedSteps}/${totalSteps}`}
+                                  ok={completedSteps === totalSteps && totalSteps > 0}
+                                />
+                              </div>
+                              <p className="mt-1 line-clamp-2 text-xs leading-5 text-stone-500">
+                                {plan.overview}
+                              </p>
+                              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-stone-500">
+                                <span>{formatAuditDate(plan.updatedAt, language)}</span>
+                                {plan.completedByUserAt ? (
+                                  <span>{t("Archived")}: {formatAuditDate(plan.completedByUserAt, language)}</span>
+                                ) : null}
+                              </div>
+                            </div>
+                            {action ? (
+                              <button
+                                aria-label={t(planActionLabel(action))}
+                                className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                disabled={planHistoryOperationKey !== null}
+                                onClick={() => void runPlanHistoryAction(plan.id, action)}
+                                title={t(planActionLabel(action))}
+                                type="button"
+                              >
+                                {planHistoryOperationKey === operationKey ? (
+                                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                                ) : (
+                                  <CheckCircle2 aria-hidden="true" className="size-4" />
+                                )}
+                                {t(planActionLabel(action))}
+                              </button>
+                            ) : null}
+                          </div>
+                        </article>
+                      );
+                    })
+                  ) : (
+                    <div className="px-4 py-6 text-sm text-stone-500">
+                      {isLoadingPlanHistory ? t("Loading plans...") : t("No plans")}
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex flex-col gap-3 border-t border-stone-200 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+                  <div className="text-xs font-medium text-stone-500">
+                    {planHistoryTotalCount
+                      ? t("Showing {start}-{end} of {total}", {
+                        end: formatNumber(planHistoryPageEnd, language),
+                        start: formatNumber(planHistoryPageStart, language),
+                        total: formatNumber(planHistoryTotalCount, language),
+                      })
+                      : t("No plans")}
+                  </div>
+                  <nav
+                    aria-label={t("Plan history pagination")}
+                    className="flex flex-wrap items-center gap-1.5"
+                  >
+                    <button
+                      aria-label={t("Previous page")}
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      disabled={isLoadingPlanHistory || planHistoryPage <= 1}
+                      onClick={() => goToPlanHistoryPage(planHistoryPage - 1)}
+                      title={t("Previous page")}
+                      type="button"
+                    >
+                      <ChevronLeft aria-hidden="true" className="size-4" />
+                    </button>
+                    {planHistoryPaginationItems.map((item, index) =>
+                      item === "ellipsis" ? (
+                        <span
+                          aria-hidden="true"
+                          className="inline-flex size-9 items-center justify-center text-stone-400"
+                          key={`plan-history-ellipsis-${index}`}
+                        >
+                          ...
+                        </span>
+                      ) : (
+                        <button
+                          aria-current={item === planHistoryPage ? "page" : undefined}
+                          aria-label={t("Go to page {page}", {
+                            page: formatNumber(item, language),
+                          })}
+                          className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === planHistoryPage
+                              ? "border-teal-700 bg-teal-700 text-white"
+                              : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            }`}
+                          disabled={isLoadingPlanHistory}
+                          key={item}
+                          onClick={() => goToPlanHistoryPage(item)}
+                          title={t("Go to page {page}", {
+                            page: formatNumber(item, language),
+                          })}
+                          type="button"
+                        >
+                          {formatNumber(item, language)}
+                        </button>
+                      ),
+                    )}
+                    <button
+                      aria-label={t("Next page")}
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      disabled={
+                        isLoadingPlanHistory ||
+                        planHistoryTotalPages === 0 ||
+                        planHistoryPage >= planHistoryTotalPages
+                      }
+                      onClick={() => goToPlanHistoryPage(planHistoryPage + 1)}
+                      title={t("Next page")}
+                      type="button"
+                    >
+                      <ChevronRight aria-hidden="true" className="size-4" />
+                    </button>
+                  </nav>
+                </div>
+              </section>
             </section>
           ) : null}
 
@@ -9684,6 +10111,10 @@ function settingsSectionTitle(section: SettingsSection, t: Translate) {
     return t("Spec settings");
   }
 
+  if (section === "plan") {
+    return t("Plan settings");
+  }
+
   if (section === "agents") {
     return t("Agent settings");
   }
@@ -9730,6 +10161,10 @@ function settingsSectionSubtitle(section: SettingsSection, t: Translate) {
 
   if (section === "spec") {
     return t("Auto Spec model and prompts");
+  }
+
+  if (section === "plan") {
+    return t("Plan automation and history");
   }
 
   if (section === "agents") {
@@ -10047,6 +10482,60 @@ function capabilityPillToneClass(tone: CapabilityPillTone) {
     default:
       return "border-teal-200 bg-teal-50 text-teal-800";
   }
+}
+
+function planHistoryAction(status: string) {
+  if (status === "implemented" || status === "failed" || status === "cancelled") {
+    return "mark_complete";
+  }
+
+  return null;
+}
+
+function planActionLabel(action: string) {
+  switch (action) {
+    case "mark_complete":
+      return "Mark complete";
+    default:
+      return action;
+  }
+}
+
+function planStatusLabel(status: string) {
+  switch (status) {
+    case "draft":
+      return "Draft";
+    case "ready":
+      return "Ready";
+    case "running":
+      return "Running";
+    case "paused":
+      return "Paused";
+    case "implemented":
+      return "Implemented";
+    case "completed":
+      return "Completed";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Cancelled";
+    default:
+      return status;
+  }
+}
+
+function planStatusTone(status: string): CapabilityPillTone {
+  if (status === "completed" || status === "implemented") {
+    return "success";
+  }
+  if (status === "running") {
+    return "active";
+  }
+  if (status === "failed" || status === "cancelled") {
+    return "danger";
+  }
+
+  return "muted";
 }
 
 function Warnings({ warnings }: { warnings: string[] }) {

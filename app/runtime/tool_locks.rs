@@ -241,6 +241,7 @@ fn tool_resource_sort_key(resource: &ToolResource) -> String {
         ToolResource::WorkspaceFiles => "workspace-files".to_string(),
         ToolResource::File(path) => format!("file:{path}"),
         ToolResource::TodoGraph => "todo-graph".to_string(),
+        ToolResource::Plan => "plan".to_string(),
         ToolResource::Memory(scope) => format!("memory:{scope}"),
         ToolResource::ExternalTool(tool_name) => format!("external:{tool_name}"),
     }

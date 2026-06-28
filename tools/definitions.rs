@@ -1,11 +1,12 @@
 use serde_json::{Value, json};
 
 use crate::{
-    ASK_QUESTION_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
-    GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
-    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL,
-    READ_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolDefinition,
-    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
+    GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL,
+    GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
+    GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL, READ_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL,
+    SLEEP_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_TODO_GRAPH_TOOL,
+    WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
 };
 
 pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -27,6 +28,10 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         create_todo_graph_definition(),
         update_todo_graph_definition(),
         get_todo_graph_definition(),
+        create_plan_definition(),
+        get_plans_definition(),
+        update_plan_definition(),
+        update_plan_step_definition(),
         ask_question_definition(),
         run_command_definition(),
         sleep_definition(),
@@ -672,6 +677,177 @@ fn get_todo_graph_definition() -> ToolDefinition {
     }
 }
 
+fn create_plan_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: CREATE_PLAN_TOOL,
+        description: "Create a durable workspace plan for the Plan panel. Use stable ids such as plan-*, plan-phase-*, and plan-step-*; phases are ordered as provided and steps are checkable.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Stable unique plan id. Use a plan-* prefix."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Short plan title shown in the Plan panel."
+                },
+                "overview": {
+                    "type": "string",
+                    "description": "Overview describing the plan goal, scope, and important constraints."
+                },
+                "status": {
+                    "type": ["string", "null"],
+                    "enum": ["draft", "ready", null],
+                    "description": "Initial plan status. Null defaults to ready."
+                },
+                "sourceChatId": {
+                    "type": ["string", "null"],
+                    "description": "Optional chat id that produced this plan. Null uses the current chat when available."
+                },
+                "phases": {
+                    "type": "array",
+                    "items": plan_phase_schema(),
+                    "description": "Ordered implementation phases. Each phase is intended to be implemented in its own session."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["id", "title", "overview", "status", "sourceChatId", "phases", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn get_plans_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GET_PLANS_TOOL,
+        description: "Read workspace plans from the Plan panel store. Use view active for the right panel and view all for history.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "view": {
+                    "type": ["string", "null"],
+                    "enum": ["active", "all", null],
+                    "description": "Plan view. active excludes only completed plans; all includes history. Null defaults to active."
+                },
+                "status": {
+                    "type": ["string", "null"],
+                    "enum": ["draft", "ready", "running", "paused", "implemented", "completed", "failed", "cancelled", null],
+                    "description": "Optional status filter. Null returns all statuses allowed by view."
+                },
+                "page": {
+                    "type": ["integer", "null"],
+                    "description": "Optional 1-based page number. Null defaults to 1."
+                },
+                "pageSize": {
+                    "type": ["integer", "null"],
+                    "description": "Optional page size from 1 to 100. Null defaults to 20."
+                },
+                "limit": {
+                    "type": ["integer", "null"],
+                    "description": "Optional alias for pageSize, useful for active view."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["view", "status", "page", "pageSize", "limit", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn update_plan_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: UPDATE_PLAN_TOOL,
+        description: "Patch a durable workspace plan's title, overview, status, or error message without rewriting phases or steps.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "planId": {
+                    "type": "string",
+                    "description": "Plan id to patch."
+                },
+                "title": {
+                    "type": ["string", "null"],
+                    "description": "New plan title, or null to leave unchanged."
+                },
+                "overview": {
+                    "type": ["string", "null"],
+                    "description": "New plan overview, or null to leave unchanged."
+                },
+                "status": {
+                    "type": ["string", "null"],
+                    "enum": ["draft", "ready", "running", "paused", "implemented", "failed", "cancelled", null],
+                    "description": "New plan status, or null to leave unchanged. Use mark_complete action outside this tool for completed."
+                },
+                "errorMessage": {
+                    "type": ["string", "null"],
+                    "description": "Error message to store; an empty string clears it, null leaves it unchanged."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["planId", "title", "overview", "status", "errorMessage", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn update_plan_step_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: UPDATE_PLAN_STEP_TOOL,
+        description: "Patch one checkable step in a durable workspace plan. Completing all steps makes the plan implemented, not completed; users manually mark completed in the Plan panel.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "planId": {
+                    "type": "string",
+                    "description": "Plan id containing the step."
+                },
+                "stepId": {
+                    "type": "string",
+                    "description": "Step id to patch."
+                },
+                "title": {
+                    "type": ["string", "null"],
+                    "description": "New step title, or null to leave unchanged."
+                },
+                "detail": {
+                    "type": ["string", "null"],
+                    "description": "New step detail, or null to leave unchanged."
+                },
+                "acceptance": {
+                    "type": ["array", "null"],
+                    "items": { "type": "string" },
+                    "description": "Complete replacement acceptance criteria, or null to leave unchanged."
+                },
+                "status": {
+                    "type": ["string", "null"],
+                    "enum": ["pending", "running", "completed", "failed", "cancelled", null],
+                    "description": "New step status, or null to leave unchanged."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["planId", "stepId", "title", "detail", "acceptance", "status", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
 fn ask_question_definition() -> ToolDefinition {
     ToolDefinition {
         name: ASK_QUESTION_TOOL,
@@ -787,6 +963,60 @@ fn sleep_definition() -> ToolDefinition {
 
 fn todo_graph_task_schema() -> Value {
     todo_graph_task_schema_with_depth(3)
+}
+
+fn plan_phase_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Stable unique phase id. Use a plan-phase-* prefix."
+            },
+            "title": {
+                "type": "string",
+                "description": "Phase title."
+            },
+            "summary": {
+                "type": ["string", "null"],
+                "description": "Implementation summary and boundaries for this phase. Null stores an empty summary."
+            },
+            "steps": {
+                "type": "array",
+                "items": plan_step_schema(),
+                "description": "Ordered checkable implementation steps for this phase."
+            }
+        },
+        "required": ["id", "title", "summary", "steps"]
+    })
+}
+
+fn plan_step_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Stable unique step id. Use a plan-step-* prefix."
+            },
+            "title": {
+                "type": "string",
+                "description": "Short checkable step title."
+            },
+            "detail": {
+                "type": ["string", "null"],
+                "description": "Concrete implementation detail. Null stores an empty detail."
+            },
+            "acceptance": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Acceptance checks for this step."
+            }
+        },
+        "required": ["id", "title", "detail", "acceptance"]
+    })
 }
 
 fn todo_graph_task_schema_with_depth(depth: usize) -> Value {

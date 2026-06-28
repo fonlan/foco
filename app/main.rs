@@ -64,8 +64,13 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    AGENT_CREATE_INSTANCES_TOOL, CREATE_TODO_GRAPH_TOOL, EDIT_FILE_TOOL, RUN_COMMAND_TOOL,
-    ToolExecution, ToolOutputStream, UPDATE_TODO_GRAPH_TOOL, WRITE_FILE_TOOL, set_ripgrep_path,
+    AGENT_CREATE_INSTANCES_TOOL, ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL,
+    EDIT_FILE_TOOL, FIND_FILES_TOOL, GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL,
+    GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL,
+    GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL, RUN_COMMAND_TOOL,
+    SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolExecution, ToolOutputStream, UPDATE_PLAN_STEP_TOOL,
+    UPDATE_PLAN_TOOL, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    set_ripgrep_path,
 };
 
 use serde::{Deserialize, Serialize};
@@ -1214,6 +1219,7 @@ struct PromptContextRequest {
     provider_id: Option<String>,
     thinking_level: Option<String>,
     skill_ids: Option<Vec<String>>,
+    session_mode: Option<String>,
     message: Option<String>,
     assistant_draft: Option<String>,
     assistant_draft_reasoning: Option<String>,
@@ -1229,6 +1235,7 @@ impl ChatStreamRequest {
             provider_id: self.provider_id,
             thinking_level: self.thinking_level,
             skill_ids: self.skill_ids,
+            session_mode: self.session_mode,
             message: Some(self.message),
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -1246,6 +1253,7 @@ impl ContextUsageRequest {
             provider_id: self.provider_id,
             thinking_level: self.thinking_level,
             skill_ids: self.skill_ids,
+            session_mode: None,
             message: None,
             assistant_draft: None,
             assistant_draft_reasoning: None,
@@ -1593,6 +1601,7 @@ struct QueuedMessageRunSummary {
     provider_id: Option<String>,
     thinking_level: Option<String>,
     skill_ids: Vec<String>,
+    session_mode: Option<String>,
     assistant_message_id: Option<String>,
     assistant_sequence: Option<i64>,
 }
@@ -5878,6 +5887,7 @@ impl ApiError {
             foco_store::workspace::WorkspaceDatabaseError::AgentDomain { .. }
             | foco_store::workspace::WorkspaceDatabaseError::AgentRuntimeJson { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidAgentRuntimeData { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::InvalidPlan { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidScheduledTaskData { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidTodoGraph { .. }
             | foco_store::workspace::WorkspaceDatabaseError::MissingScheduledTask { .. }
@@ -7815,6 +7825,7 @@ fn queued_chat_metadata_json(
     thinking_level: Option<&str>,
     skill_ids: &[String],
     content: &str,
+    session_mode: Option<&str>,
     origin_metadata: Option<&Value>,
 ) -> Result<String, ApiError> {
     let mut metadata = json!({
@@ -7827,6 +7838,7 @@ fn queued_chat_metadata_json(
             "providerId": provider_id,
             "thinkingLevel": thinking_level,
             "skillIds": skill_ids,
+            "sessionMode": session_mode,
             "content": content,
         }
     });
@@ -7846,6 +7858,7 @@ fn queued_user_message_metadata_json(
     provider_id: Option<&str>,
     thinking_level: Option<&str>,
     skill_ids: &[String],
+    session_mode: Option<&str>,
     origin_metadata: Option<&Value>,
 ) -> Result<String, ApiError> {
     let mut metadata = serde_json::from_str::<Value>(&user_message_metadata_json(attachments)?)
@@ -7865,6 +7878,7 @@ fn queued_user_message_metadata_json(
             "providerId": provider_id,
             "thinkingLevel": thinking_level,
             "skillIds": skill_ids,
+            "sessionMode": session_mode,
         }),
     );
     merge_queued_origin_metadata(&mut metadata, origin_metadata, "queued user metadata")?;
@@ -9421,6 +9435,8 @@ fn queued_run_summary_from_chat_metadata(
         string_json_field(queued_run, "providerId", "provider_id").map(str::to_string);
     let thinking_level =
         string_json_field(queued_run, "thinkingLevel", "thinking_level").map(str::to_string);
+    let session_mode =
+        string_json_field(queued_run, "sessionMode", "session_mode").map(str::to_string);
     let assistant_message_id =
         string_json_field(queued_run, "assistantMessageId", "assistant_message_id")
             .map(str::to_string);
@@ -9448,6 +9464,7 @@ fn queued_run_summary_from_chat_metadata(
         provider_id,
         thinking_level,
         skill_ids,
+        session_mode,
         content,
     }))
 }
@@ -9469,6 +9486,8 @@ fn queued_run_summary_from_message_metadata(
         string_json_field(queued_run, "providerId", "provider_id").map(str::to_string);
     let thinking_level =
         string_json_field(queued_run, "thinkingLevel", "thinking_level").map(str::to_string);
+    let session_mode =
+        string_json_field(queued_run, "sessionMode", "session_mode").map(str::to_string);
     let assistant_message_id =
         string_json_field(queued_run, "assistantMessageId", "assistant_message_id")
             .map(str::to_string);
@@ -9492,6 +9511,7 @@ fn queued_run_summary_from_message_metadata(
         provider_id,
         thinking_level,
         skill_ids,
+        session_mode,
         assistant_message_id,
         assistant_sequence,
     }))
