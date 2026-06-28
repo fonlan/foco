@@ -40,6 +40,49 @@ function currentFileTabs() {
 describe("app-shell verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
+  it("filters workspace chats across workspaces and refreshes without navigation", async () => {
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const workspaceRequestCount = () =>
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(([input]) => String(input).includes("/api/workspaces"))
+        .length;
+
+    const initialWorkspaceRequests = workspaceRequestCount();
+    const refreshWorkspacesButton = screen.getByRole("button", {
+      name: "Refresh workspaces",
+    });
+    await userEvent.click(refreshWorkspacesButton);
+
+    await waitFor(() => {
+      expect(workspaceRequestCount()).toBeGreaterThan(initialWorkspaceRequests);
+      expect(refreshWorkspacesButton).not.toBeDisabled();
+    });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Search workspace chats" }),
+    );
+    changeInput(screen.getByRole("searchbox", { name: "Search workspace chats" }), "OLDER CHAT 10");
+
+    expect(within(workspaceList).getByText("Older chat 10")).toBeInTheDocument();
+    expect(within(workspaceList).getByText("Default")).toBeInTheDocument();
+    expect(within(workspaceList).queryByText("Side project")).not.toBeInTheDocument();
+    expect(
+      within(workspaceList).queryByRole("button", {
+        name: /Show \d+ more chats in Default/,
+      }),
+    ).not.toBeInTheDocument();
+
+    changeInput(screen.getByRole("searchbox", { name: "Search workspace chats" }), "missing session");
+
+    expect(await within(workspaceList).findByText("No matching chats")).toBeInTheDocument();
+    expect(within(workspaceList).queryByText("Loading workspaces...")).not.toBeInTheDocument();
+  });
+
   it("renders the workspace sidebar and persisted chat tool results", async () => {
     renderApp();
 

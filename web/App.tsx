@@ -21,6 +21,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Search,
   Settings,
   SlidersHorizontal,
   SquareTerminal,
@@ -365,6 +366,8 @@ export function App() {
   const [workspaceChatVisibleCounts, setWorkspaceChatVisibleCounts] = useState<
     Record<string, number>
   >({});
+  const [workspaceChatSearchOpen, setWorkspaceChatSearchOpen] = useState(false);
+  const [workspaceChatSearchQuery, setWorkspaceChatSearchQuery] = useState("");
   const [viewMode, setViewMode] = useState<ViewMode>(
     initialBrowserRoute.viewMode,
   );
@@ -3075,6 +3078,38 @@ export function App() {
     right: WorkspaceChatListItem,
   ) {
     return Date.parse(right.createdAt) - Date.parse(left.createdAt);
+  }
+
+  function workspaceChatListItemsFor(workspace: WorkspaceSummary) {
+    const persistedWorkspaceChatIds = new Set(
+      workspace.chats.map((chat) => chat.id),
+    );
+    const scheduledChats = scheduledWorkspaceRunsFor(workspace.id)
+      .filter((run) => !persistedWorkspaceChatIds.has(run.chatId))
+      .map(
+        (run): WorkspaceChatListItem => ({
+          activeRun: null,
+          codeChangeStats: { additions: 0, deletions: 0 },
+          createdAt: run.createdAt,
+          id: run.chatId,
+          queuedRun: null,
+          scheduledChatKey: run.chatKey,
+          scheduledRunId: run.id,
+          scheduledStatus: run.status,
+          title: run.title,
+          updatedAt: run.createdAt,
+        }),
+      );
+    const persistedWorkspaceChats: WorkspaceChatListItem[] = workspace.chats.map(
+      (chat) => ({
+        ...chat,
+        scheduledStatus: chat.queuedRun?.status === "queued" ? "queued" : undefined,
+      }),
+    );
+
+    return [...scheduledChats, ...persistedWorkspaceChats].sort(
+      compareWorkspaceChatListItemsByCreatedAtDesc,
+    );
   }
 
   function scheduledWorkspaceRunsFor(workspaceId: string) {
@@ -7700,6 +7735,17 @@ export function App() {
     setIsContextPanelOpen(true);
   });
   const contextPanelFiles = gitDiff?.files ?? EMPTY_GIT_STATUS_FILES;
+  const normalizedWorkspaceChatSearchQuery = workspaceChatSearchQuery
+    .trim()
+    .toLocaleLowerCase();
+  const isWorkspaceSearchActive = normalizedWorkspaceChatSearchQuery.length > 0;
+  const sidebarWorkspaces = isWorkspaceSearchActive
+    ? displayedWorkspaces.filter((workspace) =>
+      workspaceChatListItemsFor(workspace).some((chat) =>
+        chat.title.toLocaleLowerCase().includes(normalizedWorkspaceChatSearchQuery),
+      ),
+    )
+    : displayedWorkspaces;
 
   if (isCheckingAuth) {
     return (
@@ -7907,6 +7953,29 @@ export function App() {
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
                     <button
+                      aria-label={t("Refresh workspaces")}
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      disabled={isLoading}
+                      onClick={() => void refreshWorkspaces()}
+                      title={t("Refresh workspaces")}
+                      type="button"
+                    >
+                      <RefreshCw
+                        aria-hidden="true"
+                        className={`size-4 ${isLoading ? "animate-spin" : ""}`}
+                      />
+                    </button>
+                    <button
+                      aria-label={t("Search workspace chats")}
+                      aria-pressed={workspaceChatSearchOpen}
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      onClick={() => setWorkspaceChatSearchOpen((current) => !current)}
+                      title={t("Search workspace chats")}
+                      type="button"
+                    >
+                      <Search aria-hidden="true" className="size-4" />
+                    </button>
+                    <button
                       aria-label={t("Close")}
                       className="mobile-sidebar-close inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
                       onClick={() => setIsMobileWorkspaceOpen(false)}
@@ -7918,65 +7987,67 @@ export function App() {
                   </div>
                 </div>
 
+                {workspaceChatSearchOpen ? (
+                  <div className="border-b border-stone-200/80 px-3 py-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        aria-label={t("Search workspace chats")}
+                        className="h-9 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        onChange={(event) => setWorkspaceChatSearchQuery(event.target.value)}
+                        placeholder={t("Search chats")}
+                        type="search"
+                        value={workspaceChatSearchQuery}
+                      />
+                      <button
+                        aria-label={t("Clear search")}
+                        className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-500 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-300"
+                        disabled={workspaceChatSearchQuery.length === 0}
+                        onClick={() => setWorkspaceChatSearchQuery("")}
+                        title={t("Clear search")}
+                        type="button"
+                      >
+                        <X aria-hidden="true" className="size-4" />
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
 
                 <nav
                   aria-label={t("Workspace list")}
                   className="workspace-nav panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3"
                 >
-                  {displayedWorkspaces.length ? (
-                    displayedWorkspaces.map((workspace) => {
-                      const isExpanded = expandedWorkspaceId === workspace.id;
+                  {sidebarWorkspaces.length ? (
+                    sidebarWorkspaces.map((workspace) => {
+                      const isExpanded =
+                        isWorkspaceSearchActive || expandedWorkspaceId === workspace.id;
                       const isActive = workspace.id === activeWorkspace?.id;
+                      const workspaceChats = workspaceChatListItemsFor(workspace);
+                      const searchedWorkspaceChats = isWorkspaceSearchActive
+                        ? workspaceChats.filter((chat) =>
+                          chat.title
+                            .toLocaleLowerCase()
+                            .includes(normalizedWorkspaceChatSearchQuery),
+                        )
+                        : workspaceChats;
                       const selectedChatIndex =
                         isActive && activeChatId
-                          ? workspace.chats.findIndex(
-                            (chat) => chat.id === activeChatId,
-                          )
+                          ? workspaceChats.findIndex((chat) => chat.id === activeChatId)
                           : -1;
                       const configuredVisibleChatCount =
                         workspaceChatVisibleCounts[workspace.id] ??
                         WORKSPACE_CHAT_HISTORY_PAGE_SIZE;
-                      const persistedWorkspaceChatIds = new Set(
-                        workspace.chats.map((chat) => chat.id),
-                      );
-                      const scheduledChats = scheduledWorkspaceRunsFor(
-                        workspace.id,
-                      )
-                        .filter((run) => !persistedWorkspaceChatIds.has(run.chatId))
-                        .map(
-                          (run): WorkspaceChatListItem => ({
-                            activeRun: null,
-                            codeChangeStats: { additions: 0, deletions: 0 },
-                            createdAt: run.createdAt,
-                            id: run.chatId,
-                            queuedRun: null,
-                            scheduledChatKey: run.chatKey,
-                            scheduledRunId: run.id,
-                            scheduledStatus: run.status,
-                            title: run.title,
-                            updatedAt: run.createdAt,
-                          }),
-                        );
-                      const persistedWorkspaceChats: WorkspaceChatListItem[] = workspace.chats.map(
-                        (chat) => ({
-                          ...chat,
-                          scheduledStatus:
-                            chat.queuedRun?.status === "queued" ? "queued" : undefined,
-                        }),
-                      );
-                      const workspaceChats: WorkspaceChatListItem[] = [
-                        ...scheduledChats,
-                        ...persistedWorkspaceChats,
-                      ].sort(compareWorkspaceChatListItemsByCreatedAtDesc);
-                      const visibleChatCount =
-                        selectedChatIndex >= configuredVisibleChatCount
+                      const visibleChatCount = isWorkspaceSearchActive
+                        ? searchedWorkspaceChats.length
+                        : selectedChatIndex >= configuredVisibleChatCount
                           ? selectedChatIndex + 1
                           : configuredVisibleChatCount;
-                      const visibleChats = workspaceChats.slice(0, visibleChatCount);
-                      const hiddenChatCount = Math.max(
-                        workspaceChats.length - visibleChats.length,
-                        0,
-                      );
+                      const visibleChats = searchedWorkspaceChats.slice(0, visibleChatCount);
+                      const hiddenChatCount = isWorkspaceSearchActive
+                        ? 0
+                        : Math.max(
+                          workspaceChats.length - visibleChats.length,
+                          0,
+                        );
                       const nextVisibleChatCount = Math.min(
                         WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
                         hiddenChatCount,
@@ -8042,7 +8113,7 @@ export function App() {
                           </div>
                           {isExpanded ? (
                             <div className="mt-1 space-y-1 border-l border-stone-200/80 pl-3 pr-1.5">
-                              {workspaceChats.length > 0 ? (
+                              {visibleChats.length > 0 ? (
                                 <>
                                   {visibleChats.map((chat) => {
                                     const chatKey = chatRunKey(workspace.id, chat.id);
@@ -8211,7 +8282,11 @@ export function App() {
                     })
                   ) : (
                     <div className="mx-2 rounded-lg border border-dashed border-stone-300 bg-white/60 px-3 py-4 text-sm text-stone-500">
-                      {isLoading ? t("Loading workspaces...") : t("No workspaces")}
+                      {isWorkspaceSearchActive
+                        ? t("No matching chats")
+                        : isLoading
+                          ? t("Loading workspaces...")
+                          : t("No workspaces")}
                     </div>
                   )}
                 </nav>

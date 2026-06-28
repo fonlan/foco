@@ -7,6 +7,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
   "zh-CN": {
     "Local workspace": "本地工作区",
     "Refresh workspaces": "刷新工作区",
+    "Search workspace chats": "搜索工作区会话",
+    "Search chats": "搜索会话",
+    "Clear search": "清空搜索",
+    "No matching chats": "没有匹配的会话",
     "Add workspace": "添加工作区",
     "Collapse chat history": "收起聊天历史",
     "Expand chat history": "展开聊天历史",
